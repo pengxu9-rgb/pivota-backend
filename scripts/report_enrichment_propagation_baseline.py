@@ -51,7 +51,11 @@ _IDENTITY_JOIN = """
      AND cp.platform = pe.platform
      AND cp.source_product_id = pe.platform_product_id
     LEFT JOIN agent_pdp_view av ON av.content_key = cp.content_key
+    -- geo 'default' only, because that is the ONLY geo the publish bridge reads
+    -- (_fetch_enrichment_for_canonical hardcodes it). Counting other geos here
+    -- would report rows as stranded that nothing is able to publish.
     WHERE cp.content_key IS NOT NULL
+      AND pe.geo_code = 'default'
 """
 
 # "Carries real content" — an enrichment row can exist with every overlay column
@@ -64,9 +68,20 @@ _HAS_CONTENT = """
                AND btrim(pe.description_markdown) <> ''))
 """
 
+# "Not serving the overlay" must include the DESCRIPTION, not just the list
+# fields. description_markdown is the field the publish bridge primarily carries,
+# and `apv.description` is what serving-eligibility reads
+# (services/index_pipeline_state_service.py) — so a key whose curated description
+# has not propagated is stranded in the way that actually matters, even if it has
+# bullets. Defining stranded on bullets/usage alone mis-sorted rows in BOTH
+# directions.
 _NOT_YET_SERVING = """
       AND av.bullet_points IS NULL
       AND av.usage_scenarios IS NULL
+      AND (av.description IS NULL
+           OR pe.description_markdown IS NULL
+           OR btrim(pe.description_markdown) = ''
+           OR av.description IS DISTINCT FROM pe.description_markdown)
 """
 
 # Labels are dict keys in the JSON output, so they must be UNIQUE — the source
@@ -112,7 +127,10 @@ COHORT_SQL = f"""
         FILTER (WHERE av.content_key IS NOT NULL) AS have_a_view_row,
       COUNT(DISTINCT cp.content_key)
         FILTER (WHERE av.bullet_points IS NOT NULL
-                   OR av.usage_scenarios IS NOT NULL) AS already_propagated
+                   OR av.usage_scenarios IS NOT NULL
+                   OR (pe.description_markdown IS NOT NULL
+                       AND av.description IS NOT DISTINCT FROM pe.description_markdown))
+        AS already_propagated
     {_IDENTITY_JOIN}
 """
 

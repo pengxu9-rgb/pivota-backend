@@ -52,7 +52,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -122,6 +122,43 @@ async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[st
     return [r["content_key"] for r in rows or []]
 
 
+# What the SERVED row currently carries. The cohort query admits a content_key
+# when ANY cluster member has an overlay, but `_fetch_enrichment_for_canonical`
+# publishes only the CANONICAL member's (or a brand-attested one). For a cluster
+# whose overlay sits on a non-canonical, non-attested member, the assembled row
+# therefore carries no overlay — and writing it would REMOVE one that is
+# currently serving, published back when that member was canonical. This job
+# exists to add stranded enrichment; removing any is out of its contract, so
+# such keys are skipped and counted rather than written.
+_CURRENT_OVERLAY_SQL = """
+    SELECT (bullet_points IS NOT NULL) AS has_bullet_points,
+           (usage_scenarios IS NOT NULL) AS has_usage_scenarios,
+           (evidence_profile IS NOT NULL) AS has_evidence_profile
+    FROM agent_pdp_view
+    WHERE content_key = :ck
+"""
+
+
+def _would_downgrade(row: Dict[str, Any], current: Optional[Dict[str, Any]]) -> bool:
+    """True when writing `row` would clear an overlay the served row still has.
+
+    `preserve_*` is checked first: when the overlay READ failed, the UPSERT keeps
+    the published value, so an empty column in the assembled row is not a removal
+    and must not be reported as one.
+    """
+    if not current:
+        return False
+    if not row.get("preserve_enrichment"):
+        if current.get("has_bullet_points") and not row.get("bullet_points"):
+            return True
+        if current.get("has_usage_scenarios") and not row.get("usage_scenarios"):
+            return True
+    if not row.get("preserve_evidence"):
+        if current.get("has_evidence_profile") and not row.get("evidence_profile"):
+            return True
+    return False
+
+
 def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
     """Which overlays the freshly-assembled row carries. Reported in dry-run so
     the operator can see the propagation BEFORE writing, and counted on apply."""
@@ -158,12 +195,14 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "rows_skipped_nothing_to_build": 0,
         "rows_upserted": 0,
         "rows_skipped_no_op_in_dry_run": 0,
+        "rows_skipped_would_downgrade": 0,
         "with_bullet_points": 0,
         "with_usage_scenarios": 0,
         "with_evidence_profile": 0,
         "with_required_disclaimers": 0,
     }
     samples: List[Dict[str, Any]] = []
+    downgrades: List[str] = []
 
     for ck in content_keys:
         # Assemble through the canonical read path so the evidence, enrichment
@@ -174,6 +213,16 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             outcomes["rows_skipped_nothing_to_build"] += 1
             continue
         outcomes["rows_assembled"] += 1
+
+        current = await database.fetch_one(_CURRENT_OVERLAY_SQL, {"ck": ck})
+        if _would_downgrade(row, dict(current) if current else None):
+            # Reported in BOTH modes, and skipped in both: a dry run that does
+            # not surface this would send an operator into --apply believing the
+            # run can only add.
+            outcomes["rows_skipped_would_downgrade"] += 1
+            if len(downgrades) < 20:
+                downgrades.append(ck)
+            continue
 
         flags = _overlay_flags(row)
         for name, present in flags.items():
@@ -203,6 +252,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "applied": bool(args.apply),
         "outcome_counts": outcomes,
         "samples": samples,
+        "skipped_would_downgrade_sample": downgrades,
     }
 
 

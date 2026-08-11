@@ -138,6 +138,35 @@ ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS usage_scenarios JSONB;
 """
 
 
+def _agent_pdp_view_catchup_ddl() -> List[str]:
+    """`ALTER TABLE agent_pdp_view ...` statements from db/migrations, in order.
+
+    agent_pdp_view IS a db.catalog table, so `metadata.create_all` creates it —
+    but db/catalog.py's Table definition is BEHIND the migrations:
+    evidence_profile, required_disclaimers, bullet_points and usage_scenarios
+    exist only in db/migrations/*.sql. Statements naming them therefore failed
+    with UndefinedColumn against a fixture that looked complete.
+
+    Additive ALTERs lifted from the migrations themselves, never hand-written —
+    the 🚨 rule above forbids hand-rolling DDL for a table db.catalog owns, and
+    ADD COLUMN IF NOT EXISTS is safe to replay in the shared database.
+    """
+    out: List[str] = []
+    paths = sorted(
+        (REPO_ROOT / "db" / "migrations").glob("*.sql"),
+        key=lambda p: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.name)],
+    )
+    for path in paths:
+        body = path.read_text(encoding="utf-8")
+        if "agent_pdp_view" not in body:
+            continue
+        for statement in filter(None, (s.strip() for s in body.split(";"))):
+            collapsed = " ".join(statement.split()).lower()
+            if collapsed.startswith("alter table agent_pdp_view") and "add column" in collapsed:
+                out.append(statement)
+    return out
+
+
 def _product_enrichment_ddl() -> str:
     """The real `CREATE TABLE product_enrichment`, lifted from
     db/product_enrichment.py's own AST.
@@ -187,6 +216,7 @@ def prepare() -> Callable[[str], None]:
         _LIGHTWEIGHT_DDL,
         _product_enrichment_ddl(),
         _PRODUCT_ENRICHMENT_COLUMN_GUARDS,
+        *(f"{stmt};" for stmt in _agent_pdp_view_catchup_ddl()),
     ))
     with engine.begin() as conn:
         for stmt in filter(None, (s.strip() for s in ddl.split(";"))):
@@ -389,11 +419,15 @@ def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
     shapes = [
         ("enriched", 0, 0), ("enriched", 10, 5), ("all", 0, 0), ("all", 10, 5),
     ]
-    return [
+    statements = [
         (f"{origin}.build_content_key_query(scope={scope}, limit={limit}, offset={offset})",
          module.build_content_key_query(scope=scope, limit=limit, offset=offset)[0])
         for scope, limit, offset in shapes
     ]
+    # The downgrade guard's read. It runs once per candidate on every pass,
+    # including dry runs, so an unplannable version would abort the whole job.
+    statements.append((f"{origin}._CURRENT_OVERLAY_SQL", module._CURRENT_OVERLAY_SQL))
+    return statements
 
 
 def _collect_enrichment_baseline() -> List[Tuple[str, str]]:
@@ -440,7 +474,7 @@ _MIN_STATEMENTS = {
     "scripts/run_seed_content_audit.py": 4,
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,
-    "scripts/backfill_agent_pdp_view.py": 4,
+    "scripts/backfill_agent_pdp_view.py": 5,
     "scripts/report_enrichment_propagation_baseline.py": 12,
 }
 

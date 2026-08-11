@@ -1182,9 +1182,19 @@ async def build_agent_pdp_view_row(
     """Fetch every source row for a content_key and assemble the view row.
 
     The read half of refresh_agent_pdp_view_for_content_key, split out so a
-    caller can PREVIEW the next row state without writing it. Side-effect-free.
-    Returns None when there is nothing to build (no catalog rows, or too thin a
-    row to be useful — no title).
+    caller can PREVIEW the next row state without writing it. Returns None when
+    there is nothing to build (no catalog rows, or too thin a row to be useful —
+    no title).
+
+    NOT side-effect-free, despite reading like it. It is free of side effects on
+    agent_pdp_view — nothing here writes the view — but the overlay fetch reaches
+    `db.product_enrichment.get_enrichment`, which calls
+    `ensure_product_enrichment_table()` and issues CREATE TABLE / ADD COLUMN /
+    CREATE INDEX. A module-global flag makes that once per process, but the first
+    call takes brief ACCESS EXCLUSIVE locks, and under a read-only role the DDL
+    fails, the flag is never set, and it is retried on EVERY subsequent call.
+    `seller_trust_bulk` has the same shape. So a "dry run" pointed at production
+    still executes DDL there; say so rather than let an operator infer otherwise.
 
     Assembling through this function rather than calling assemble_row directly
     is what keeps the evidence / enrichment / seller-trust overlays attached. A

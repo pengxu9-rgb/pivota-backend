@@ -67,12 +67,21 @@ class _RecordingDB:
 
     is_connected = True
 
-    def __init__(self, content_keys: List[str]) -> None:
+    def __init__(
+        self,
+        content_keys: List[str],
+        current_overlay: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._content_keys = content_keys
+        # What the SERVED row already has, for the downgrade guard.
+        self._current_overlay = current_overlay
         self.executes: List[Dict[str, Any]] = []
 
     async def fetch_all(self, sql: str, params: Dict[str, Any]) -> List[Dict[str, str]]:
         return [{"content_key": ck} for ck in self._content_keys]
+
+    async def fetch_one(self, sql: str, params: Dict[str, Any]):
+        return self._current_overlay
 
     async def execute(self, sql: str, params: Dict[str, Any]) -> None:
         self.executes.append({"sql": sql, "params": params})
@@ -190,3 +199,150 @@ def test_enriched_scope_joins_the_identity_triple_on_source_product_id() -> None
     sql = " ".join(script._ENRICHED_KEYS_SQL.split())
     assert "cp.source_product_id = pe.platform_product_id" in sql
     assert "cp.platform_product_id" not in sql
+
+
+# ---------------------------------------------------------------------------
+# the downgrade guard
+# ---------------------------------------------------------------------------
+# The cohort query admits a content_key when ANY cluster member carries an
+# overlay; the publisher honours only the CANONICAL member's (or a brand-attested
+# one). For a cluster whose overlay sits elsewhere the assembled row has no
+# overlay, and writing it REMOVES one that is currently served. A backfill whose
+# job is to add stranded enrichment must never do that.
+
+def _no_overlay_wired(monkeypatch: pytest.MonkeyPatch, db: _RecordingDB) -> None:
+    async def fake_products(content_key: str, *, db: Any = None):
+        return [dict(_PRODUCT)]
+
+    async def fake_empty_list(product_keys, *, db: Any = None):
+        return []
+
+    async def fake_seed(product_keys, *, db: Any = None):
+        return None
+
+    async def no_evidence(product_keys, *, db: Any = None):
+        return {}
+
+    async def no_enrichment(products):
+        return None  # succeeded, found nothing — NOT a failure
+
+    monkeypatch.setattr(apv, "fetch_products_for_key", fake_products)
+    monkeypatch.setattr(apv, "fetch_skus_for_keys", fake_empty_list)
+    monkeypatch.setattr(apv, "fetch_offers_for_keys", fake_empty_list)
+    monkeypatch.setattr(apv, "fetch_external_seed_for_keys", fake_seed)
+    monkeypatch.setattr(apv, "fetch_evidence_for_keys", no_evidence)
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", no_enrichment)
+    monkeypatch.setattr(apv, "database", db)
+    monkeypatch.setattr(script, "database", db)
+
+
+@pytest.mark.asyncio
+async def test_a_key_whose_overlay_would_be_removed_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _RecordingDB([_CONTENT_KEY], current_overlay={
+        "has_bullet_points": True, "has_usage_scenarios": False,
+        "has_evidence_profile": False,
+    })
+    _no_overlay_wired(monkeypatch, db)
+
+    report = await script._drive(_args(apply=True))
+
+    assert db.executes == [], "wrote a row that would have cleared a served overlay"
+    assert report["outcome_counts"]["rows_skipped_would_downgrade"] == 1
+    assert report["skipped_would_downgrade_sample"] == [_CONTENT_KEY]
+
+
+@pytest.mark.asyncio
+async def test_the_downgrade_is_reported_in_dry_run_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run that hid this would send an operator into --apply believing the
+    run can only add."""
+    db = _RecordingDB([_CONTENT_KEY], current_overlay={
+        "has_bullet_points": False, "has_usage_scenarios": False,
+        "has_evidence_profile": True,
+    })
+    _no_overlay_wired(monkeypatch, db)
+
+    report = await script._drive(_args(apply=False))
+    assert report["outcome_counts"]["rows_skipped_would_downgrade"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_preserved_overlay_is_not_mistaken_for_a_downgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the overlay READ failed, the UPSERT keeps the published value, so the
+    empty column in the assembled row is not a removal and the key must still be
+    written."""
+    db = _RecordingDB([_CONTENT_KEY], current_overlay={
+        "has_bullet_points": True, "has_usage_scenarios": True,
+        "has_evidence_profile": True,
+    })
+    _no_overlay_wired(monkeypatch, db)
+
+    async def failed(products):
+        return apv.FETCH_FAILED
+
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", failed)
+
+    async def failed_evidence(product_keys, *, db: Any = None):
+        raise RuntimeError("evidence store down")
+
+    monkeypatch.setattr(apv, "fetch_evidence_for_keys", failed_evidence)
+
+    report = await script._drive(_args(apply=True))
+    assert report["outcome_counts"]["rows_skipped_would_downgrade"] == 0
+    assert len(db.executes) == 1
+    assert db.executes[0]["params"]["preserve_enrichment"] is True
+    assert db.executes[0]["params"]["preserve_evidence"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_counts_reflect_the_row_not_a_constant(wired) -> None:
+    """`_overlay_flags` hardcoded to all-True survived every other test. These
+    counts are what an operator reads to decide whether --apply is worth running,
+    so pin the FALSE side too — including required_disclaimers, which nothing
+    asserted anywhere."""
+    report = await script._drive(_args(apply=False))
+    counts = report["outcome_counts"]
+    assert counts["with_bullet_points"] == 1
+    assert counts["with_usage_scenarios"] == 1
+    assert counts["with_evidence_profile"] == 1
+    # The seeded product has no disclaimers, so a constant-True flag shows here.
+    assert counts["with_required_disclaimers"] == 0
+    assert report["samples"][0]["required_disclaimers"] is False
+
+
+# ---------------------------------------------------------------------------
+# the argparse contract
+# ---------------------------------------------------------------------------
+# Every other test in this file builds an argparse.Namespace by hand, so the
+# real parser was never exercised: flipping `--apply` to default=True — turning a
+# job that mass-rewrites a serving cache into apply-by-default — was caught by
+# nothing at all. Drive the real parser.
+
+def test_the_parser_defaults_to_a_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["backfill_agent_pdp_view.py"])
+    args = script._parse_args()
+    assert args.apply is False, "this job must never default to writing"
+
+
+def test_the_parser_defaults_to_a_bounded_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["backfill_agent_pdp_view.py"])
+    args = script._parse_args()
+    assert args.limit == 200, "an unbounded default would sweep the whole corpus"
+    assert args.offset == 0
+    assert args.scope == "all"
+
+
+def test_apply_is_opt_in_by_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv",
+        ["backfill_agent_pdp_view.py", "--apply", "--scope", "enriched", "--limit", "0"],
+    )
+    args = script._parse_args()
+    assert args.apply is True
+    assert args.scope == "enriched"
+    assert args.limit == 0
