@@ -14,6 +14,7 @@ import pytest
 
 from scripts.backfill_seller_of_record import (
     BackfillReport,
+    BANNED_BUCKET_MERCHANT_ID,
     EXCLUDED_SOURCE_DOMAINS,
     SellerBackfill,
 )
@@ -99,7 +100,7 @@ class _FakeDb:
         if "product_group_members" in sql and isinstance(self.pgm_banned_rows, list):
             # merchant-checked too: a write binding the wrong constant to
             # :banned must NOT clear the row (re-review nit on #1725)
-            if (params or {}).get("banned") == "external_seed":
+            if (params or {}).get("banned") == BANNED_BUCKET_MERCHANT_ID:
                 self.pgm_banned_rows = [
                     r for r in self.pgm_banned_rows
                     if not (str(r.get("platform")) == str((params or {}).get("platform")) and
