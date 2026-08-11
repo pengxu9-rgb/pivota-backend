@@ -84,8 +84,8 @@ Sampled from prod access logs on 2026-08-11, **every** peer address was in
 `100.64.0.0/10` (RFC 6598 CGNAT) across 12 distinct addresses:
 
 ```
-INFO: 100.64.0.7:20882  - "GET /agent/internal/promotions HTTP/1.1" 200 OK
-INFO: 100.64.0.12:47760 - "GET /agent/internal/promotions HTTP/1.1" 200 OK
+INFO: 100.64.0.7:20882  - "GET /agent/internal/disputes HTTP/1.1" 200 OK
+INFO: 100.64.0.12:47760 - "GET /agent/internal/disputes HTTP/1.1" 200 OK
 ```
 
 Bucketing on that would collapse every external caller into a handful of shared
@@ -192,7 +192,7 @@ produce an auth-trusted caller that is **not** rate-limit-exempt.
   exemption, a control aimed at anonymous abuse takes down authenticated
   commerce.
 - A valid `X-ADMIN-KEY` matching `PROMOTIONS_ADMIN_KEY` or `ADMIN_API_KEY`,
-  compared in constant time. This matters: `/agent/internal/promotions`
+  compared in constant time. This matters: `/agent/internal/disputes`
   authenticates with `X-ADMIN-KEY` rather than the agent dependency, sends no
   `x-api-key`, and is polled internally about every 30s — without the exemption
   the limiter would eventually throttle an internal poller.

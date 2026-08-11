@@ -17,8 +17,7 @@ the fabrication belt cannot quietly grow back:
   is superseded by the deletion.
 """
 import importlib
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient

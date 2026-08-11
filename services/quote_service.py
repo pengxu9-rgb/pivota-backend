@@ -5,12 +5,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
-import asyncio
 import hashlib
 import json
 import os
 import secrets
-import time
 
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
 from services.pcs_hash import sha256_json
@@ -895,19 +893,6 @@ class QuoteService:
         if not isinstance(evidence, dict):
             return {}
         return self._json_safe(evidence)
-
-    def _dedupe_json_objects(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            key = json.dumps(self._json_safe(row), sort_keys=True, separators=(",", ":"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(row)
-        return out
 
     def _json_safe(self, value: Any) -> Any:
         if isinstance(value, Decimal):

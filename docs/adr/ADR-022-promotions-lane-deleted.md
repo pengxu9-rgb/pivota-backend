@@ -43,8 +43,11 @@ Delete the lane end-to-end, everywhere:
 
 - **backend:** promotions/sync/evidence services + routes, the `quote_service`
   applier and background quote-time sync, the order-path legacy discount, the
-  `store_discount_evidence` field on quote/card models and all passthroughs,
-  both tables (migration `125_drop_promotions_tables.sql`).
+  `store_discount_evidence` field on quote/card models and all passthroughs
+  (including `promotions_synced` on the incentives-reconcile response), the
+  `preflight_shopify_discounts` script + its `agent-reliability-suite` workflow
+  step, both tables (migration `125_drop_promotions_tables.sql`; migration 062
+  tombstoned with IF EXISTS guards).
   `savings_presentation_service` is **kept**: it composes quote-truth inputs
   (Shopify `promotion_lines`, discount-code evidence, payment offers); its
   `store_discount_evidence` input is now always absent.
@@ -85,5 +88,12 @@ Enforcement authority follows checkout authority, per order. Concretely:
 ## Recovery
 
 Everything is recoverable at the pre-deletion commit (parent of the commit that
-lands with this ADR). The 17 fixture rows are recreatable via the (also deleted)
-audit scripts at that same commit.
+lands with this ADR). The 17 fixture rows were created by the deleted
+`shopify_discount_fixture_service` (via the deleted sync preflight route) and
+are recreatable from that same commit.
+
+Deliberately NOT deleted, after review: `scripts/check_discount_order_canaries.py`
+and its test. Despite the name it audits the SURVIVING quote-first Shopify
+discount-code path (over-refund invariants, refund-webhook double-count on
+external-PSP orders, missing order links) — invariants written after real paid
+canary defects. Only name-adjacent, not lane-coupled.

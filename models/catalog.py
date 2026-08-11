@@ -79,7 +79,6 @@ class IncentivesReconcileRequest(BaseModel):
 class IncentivesReconcileResponse(BaseModel):
     merchant_id: str
     source_system: str
-    promotions_synced: int
     payment_incentives_synced: int
     offer_links_synced: int
     reconciled_at: datetime
