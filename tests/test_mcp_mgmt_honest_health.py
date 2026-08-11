@@ -8,7 +8,7 @@ unconditional "success" status on sync events whose outcome was never recorded.
 """
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -87,7 +87,15 @@ class TestMcpStatus:
 class TestMcpTestConnection:
     def test_platform_check_declares_itself_config_only(self, client):
         db = _fake_db(fetch_one={"total": 4})
-        with patch("routes.mcp_mgmt.database", db):
+        # Pin the clock so response_time must be the MEASURED elapsed of the DB
+        # call — an exact value no random.randint(anything) can reproduce.
+        fake_clock = MagicMock(side_effect=[100.0, 100.123])
+        # Patch the module-local name, NOT time.monotonic on the stdlib module —
+        # asyncio's event loop clock is time.monotonic, and patching it globally
+        # deadlocks the loop.
+        with patch("routes.mcp_mgmt.database", db), patch(
+            "routes.mcp_mgmt.monotonic", fake_clock
+        ):
             resp = client.post("/mcp/test-connection?platform=shopify", headers=_auth_header())
         assert resp.status_code == 200
         tr = resp.json()["test_result"]
@@ -95,10 +103,8 @@ class TestMcpTestConnection:
         assert tr["live_probe"] is False
         assert tr["connected"] is True
         assert tr["active_stores"] == 4
-        # Measured DB round-trip, not random.randint(50, 200): with an AsyncMock
-        # "database" the elapsed time is ~0ms, far below the old floor of 50.
-        assert isinstance(tr["response_time"], int)
-        assert 0 <= tr["response_time"] < 50
+        assert tr["response_time"] == 123  # int((100.123 - 100.0) * 1000)
+        assert fake_clock.call_count == 2
         assert tr["message"] == (
             "4 active shopify store(s) configured; live platform connectivity was not probed"
         )

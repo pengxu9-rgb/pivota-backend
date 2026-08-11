@@ -9,7 +9,7 @@ fabricate operator-facing telemetry — random.randint "response times", hardcod
 sync time — which made a real outage invisible. None of these endpoints performs
 a LIVE platform connectivity probe; they report configuration state and say so.
 """
-import time
+from time import monotonic
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional, List, Dict, Any
@@ -118,7 +118,7 @@ async def test_mcp_connection(
             if platform not in SUPPORTED_PLATFORMS:
                 raise HTTPException(status_code=400, detail="Invalid platform")
 
-            started = time.monotonic()
+            started = monotonic()
             stores = await database.fetch_one(
                 """
                 SELECT COUNT(*) as total FROM merchant_stores
@@ -126,7 +126,7 @@ async def test_mcp_connection(
                 """,
                 {"platform": platform},
             )
-            elapsed_ms = int((time.monotonic() - started) * 1000)
+            elapsed_ms = int((monotonic() - started) * 1000)
 
             active_stores = stores["total"] if stores else 0
             has_connections = active_stores > 0
@@ -152,7 +152,7 @@ async def test_mcp_connection(
                 }
             }
         else:
-            started = time.monotonic()
+            started = monotonic()
             rows = await database.fetch_all(
                 """
                 SELECT platform, COUNT(*) as total FROM merchant_stores
@@ -160,7 +160,7 @@ async def test_mcp_connection(
                 GROUP BY platform
                 """
             )
-            elapsed_ms = int((time.monotonic() - started) * 1000)
+            elapsed_ms = int((monotonic() - started) * 1000)
 
             counts = {r["platform"]: r["total"] for r in rows}
             platforms = {
@@ -250,7 +250,10 @@ async def get_mcp_analytics(
     try:
         # Get sync statistics. `days` is typed int so .format() was not
         # injectable, but bind it anyway — every statement in this repo must
-        # PREPARE cleanly with bound params (see the CI dialect gate).
+        # PREPARE cleanly with bound params. (The repo's SQL-prepare gate
+        # collector does not walk function-local strings, so this statement is
+        # pinned by tests/test_mcp_mgmt_honest_health.py and was PREPAREd
+        # manually against real Postgres 15.)
         sync_query = """
             SELECT
                 DATE(last_sync) as date,
