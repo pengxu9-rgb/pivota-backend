@@ -193,6 +193,27 @@ async def _build_apv_offer_field_update(
     offers = await fetch_offers_for_keys(product_keys, db=db)
     external_seed = await fetch_external_seed_for_keys(product_keys, db=db)
 
+    # `offers` IS an overlay-carrying column. This script's UPDATE replaces the
+    # whole array (`offers = CAST(:offers AS jsonb)`) and the W8 seller-trust
+    # envelope rides INSIDE each offer object — aggregate_offers sets
+    # `n["seller_trust"]`. So omitting seller_trust_by_id here does not merely
+    # skip an unrelated field: it strips seller trust from every offer of every
+    # row the run touches.
+    #
+    # This file was reviewed and declared safe because it "never updates title,
+    # description or image fields". True, and irrelevant — the column it DOES
+    # update is one of the overlay carriers. A narrow UPDATE is not the same
+    # thing as an overlay-free one.
+    seller_trust_by_id: Dict[str, Dict[str, Any]] = {}
+    try:
+        from services.outcome_aggregation_service import seller_trust_bulk
+
+        seller_trust_by_id = await seller_trust_bulk(
+            [o.get("merchant_id") for o in offers if o.get("merchant_id")]
+        )
+    except Exception:  # noqa: BLE001 — best-effort, mirrors build_agent_pdp_view_row
+        seller_trust_by_id = {}
+
     row = assemble_row(
         content_key=content_key,
         products=products,
@@ -200,6 +221,7 @@ async def _build_apv_offer_field_update(
         offers=offers,
         external_seed=external_seed,
         refresh_source=MAINLINE_REFRESH_SOURCE,
+        seller_trust_by_id=seller_trust_by_id,
     )
     if row is None:
         return None

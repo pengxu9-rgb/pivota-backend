@@ -255,29 +255,54 @@ async def _read_proposal(database):
     ))["refreshed_by_proposal_id"]
 
 
-def test_an_anonymous_refresh_does_not_erase_the_proposal_attribution(db_url) -> None:
-    """Only the seed writer knows a proposal id. Every other rebuild — the
-    reconciler cron, catalog_sync, the backfill, the repair scripts — passes
-    None, and a straight `= EXCLUDED.refreshed_by_proposal_id` made each of them
-    erase what the seed writer had recorded, on a field the agent PDP route
-    serves. COALESCE keeps it."""
+def test_an_anonymous_refresh_CLEARS_the_proposal_attribution(db_url) -> None:
+    """The documented contract, pinned in the direction I originally got wrong.
+
+    Migration 085 defines this pair as a description of THE CURRENT refresh:
+    `refreshed_by_proposal_id` is "the proposal that TRIGGERED THE REFRESH", and
+    `refresh_source` is "free-form provenance for refreshes that did NOT come
+    from a proposal". So a rebuild with no proposal must CLEAR it — the old
+    fashion path wrote `row["refreshed_by_proposal_id"] = None` explicitly for
+    exactly this reason.
+
+    An earlier revision of this PR COALESCEd instead, on the theory that an
+    anonymous rebuild should not erase the seed writer's attribution. That made a
+    wrong value permanent on a field routes/agent_pdp_v1.py serves publicly:
+    nothing anywhere performs a non-NULL -> NULL transition, so a merchant's hand
+    edit would be credited to an unrelated — possibly rejected — proposal
+    forever, while refresh_source correctly said "fashion_field_authoring".
+    """
     async def scenario(database):
         await _upsert(database, _row(refreshed_by_proposal_id=4242))
         after_write = await _read_proposal(database)
-        # An unrelated refresh that knows nothing about proposals.
+        # A rebuild that did NOT come from a proposal.
         await _upsert(database, _row(refreshed_by_proposal_id=None))
         return after_write, await _read_proposal(database)
 
     after_write, after_anonymous = _drive(db_url, scenario)
     assert after_write == 4242
-    assert after_anonymous == 4242, "an anonymous refresh erased the attribution"
+    assert after_anonymous is None, (
+        "an anonymous rebuild left a stale proposal attribution on a served field"
+    )
 
 
-def test_a_newer_proposal_still_replaces_the_old_one(db_url) -> None:
-    """COALESCE must not freeze the field — a later seed commit owns it."""
+def test_a_newer_proposal_replaces_the_old_one(db_url) -> None:
     async def scenario(database):
         await _upsert(database, _row(refreshed_by_proposal_id=4242))
         await _upsert(database, _row(refreshed_by_proposal_id=9999))
         return await _read_proposal(database)
 
     assert _drive(db_url, scenario) == 9999
+
+
+def test_the_proposal_id_binds_as_an_integer(db_url) -> None:
+    """BIGINT column, BIGSERIAL source, and the only caller passes Optional[int].
+    An earlier revision annotated the new kwarg `Optional[str]`; a caller
+    following that signature dies at BIND, which PREPARE cannot see and which
+    this repo has been bitten by before. Drive a real int through the real
+    statement."""
+    async def scenario(database):
+        await _upsert(database, _row(refreshed_by_proposal_id=2**40))
+        return await _read_proposal(database)
+
+    assert _drive(db_url, scenario) == 2**40

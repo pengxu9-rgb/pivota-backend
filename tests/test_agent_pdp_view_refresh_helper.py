@@ -350,12 +350,14 @@ async def test_the_sentinel_is_reached_through_the_real_swallow(
     async def boom(*args, **kwargs):
         raise RuntimeError("connection reset by peer")
 
-    monkeypatch.setattr(pe_module, "get_enrichment", boom)
+    # The bulk, merchant-scoped fetch — the assembler no longer calls
+    # get_enrichment per cluster member.
+    monkeypatch.setattr(pe_module, "get_enrichments_for_products", boom)
     result = await apv._fetch_enrichment_for_canonical([dict(_PRODUCT_FOR_TRISTATE)])
     assert result is apv.FETCH_FAILED
 
     async def nothing(*args, **kwargs):
-        return None
+        return {}
 
-    monkeypatch.setattr(pe_module, "get_enrichment", nothing)
+    monkeypatch.setattr(pe_module, "get_enrichments_for_products", nothing)
     assert await apv._fetch_enrichment_for_canonical([dict(_PRODUCT_FOR_TRISTATE)]) is None

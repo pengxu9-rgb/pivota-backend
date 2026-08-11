@@ -29,6 +29,7 @@ refactor that loses a kwarg.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -61,6 +62,19 @@ _ENRICHMENT = {
     "usage_scenarios": ["Morning routine"],
     "updated_by_employee_id": "emp-1",
 }
+
+# A real offer, so `offers` is NOT structurally empty. Without this the
+# seller-trust assertion below cannot fail: the fixture stubbed
+# fetch_offers_for_keys to [], so aggregate_offers produced no offer objects and
+# a mutant dropping seller_trust_by_id from every rebuild in the repo killed
+# nothing.
+_OFFER = {
+    "offer_id": "of-1", "sku_key": "sk-1", "product_key": "pk-live-1",
+    "merchant_id": "m1", "availability": "in_stock", "currency": "USD",
+    "list_price": "42.00", "merchant_effective_price": "39.00",
+    "estimated_best_price": None, "merchant_name": "AuraGlow Store",
+}
+_SELLER_TRUST = {"m1": {"grade": "A", "n": 12}}
 
 _EVIDENCE = {
     "evidence_profile": {"substantiated_claims": [{"claim": "fragrance free"}]},
@@ -101,6 +115,12 @@ def enriched(monkeypatch: pytest.MonkeyPatch) -> _FakeDB:
     async def empty(product_keys, *, db: Any = None):
         return []
 
+    async def one_offer(product_keys, *, db: Any = None):
+        return [dict(_OFFER)]
+
+    async def trust(merchant_ids):
+        return dict(_SELLER_TRUST)
+
     async def seed_for_keys(product_keys, *, db: Any = None):
         return {"id": "seed-newest-in-group", "seed_data": {}}
 
@@ -115,13 +135,37 @@ def enriched(monkeypatch: pytest.MonkeyPatch) -> _FakeDB:
 
     monkeypatch.setattr(apv, "fetch_products_for_key", products)
     monkeypatch.setattr(apv, "fetch_skus_for_keys", empty)
-    monkeypatch.setattr(apv, "fetch_offers_for_keys", empty)
+    monkeypatch.setattr(apv, "fetch_offers_for_keys", one_offer)
     monkeypatch.setattr(apv, "fetch_external_seed_for_keys", seed_for_keys)
     monkeypatch.setattr(apv, "fetch_external_seed_by_id", seed_by_id)
     monkeypatch.setattr(apv, "fetch_evidence_for_keys", evidence)
     monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", enrichment)
+    import services.outcome_aggregation_service as oas
+    monkeypatch.setattr(oas, "seller_trust_bulk", trust)
     monkeypatch.setattr(apv, "database", db)
     return db
+
+
+_RECOMPUTED: List[str] = []
+
+
+def _stub_recompute(monkeypatch: pytest.MonkeyPatch) -> List[str]:
+    """Record the eligibility recomputes instead of silently no-opping them.
+
+    Every test here used to stub this to a no-op and assert nothing about it, so
+    deleting the recompute from BOTH converted paths passed the entire suite. A
+    rebuild that leaves serving eligibility stale is how a row silently drops out
+    of serving — `apv.description` is one of the inputs the gate reads.
+    """
+    _RECOMPUTED.clear()
+
+    async def record(content_key, reason=""):
+        _RECOMPUTED.append(content_key)
+        return None
+
+    import services.index_pipeline_state_service as ipss
+    monkeypatch.setattr(ipss, "recompute_serving_eligibility", record)
+    return _RECOMPUTED
 
 
 def _assert_overlays_intact(params: Dict[str, Any]) -> None:
@@ -131,6 +175,14 @@ def _assert_overlays_intact(params: Dict[str, Any]) -> None:
     assert params["required_disclaimers"], "required_disclaimers were stripped"
     assert params["description"] == _ENRICHMENT["description_markdown"], (
         "curated copy was replaced by the raw storefront description"
+    )
+    # The FOURTH overlay family, and the one the commit message claimed without
+    # testing: W8 seller trust rides inside each offer object, so a rebuild that
+    # drops seller_trust_by_id silently strips it from the served offers.
+    offers = json.loads(params["offers"]) if isinstance(params["offers"], str) else params["offers"]
+    assert offers, "offers array is empty — the seller-trust assertion below cannot fail"
+    assert offers[0].get("seller_trust") == _SELLER_TRUST["m1"], (
+        "seller_trust was stripped from the offers by a live write path"
     )
 
 
@@ -143,11 +195,7 @@ async def test_a_merchant_fashion_field_edit_keeps_the_overlays(
 
     monkeypatch.setattr(ffa, "database", enriched)
 
-    async def no_recompute(content_key, reason=""):
-        return None
-
-    import services.index_pipeline_state_service as ipss
-    monkeypatch.setattr(ipss, "recompute_serving_eligibility", no_recompute)
+    _stub_recompute(monkeypatch)
 
     await ffa._refresh_view_for_content_key(_CONTENT_KEY)
 
@@ -163,11 +211,7 @@ async def test_a_seed_commit_keeps_the_overlays(
 
     monkeypatch.setattr(sdw, "database", enriched)
 
-    async def no_recompute(content_key, reason=""):
-        return None
-
-    import services.index_pipeline_state_service as ipss
-    monkeypatch.setattr(ipss, "recompute_serving_eligibility", no_recompute)
+    _stub_recompute(monkeypatch)
 
     await sdw.refresh_agent_pdp_view_for_seed(
         seed_id=_SEED_ID, proposal_id=4242, refresh_source="writer_commit:4242",
@@ -201,11 +245,7 @@ async def test_the_seed_path_still_uses_the_TRIGGERING_seed(
     monkeypatch.setattr(apv, "fetch_external_seed_by_id", record_by_id)
     monkeypatch.setattr(apv, "fetch_external_seed_for_keys", must_not_be_used)
 
-    async def no_recompute(content_key, reason=""):
-        return None
-
-    import services.index_pipeline_state_service as ipss
-    monkeypatch.setattr(ipss, "recompute_serving_eligibility", no_recompute)
+    _stub_recompute(monkeypatch)
 
     await sdw.refresh_agent_pdp_view_for_seed(
         seed_id=_SEED_ID, proposal_id=1, refresh_source="writer_commit:1",
@@ -223,11 +263,7 @@ async def test_the_seed_path_still_records_its_proposal(
 
     monkeypatch.setattr(sdw, "database", enriched)
 
-    async def no_recompute(content_key, reason=""):
-        return None
-
-    import services.index_pipeline_state_service as ipss
-    monkeypatch.setattr(ipss, "recompute_serving_eligibility", no_recompute)
+    _stub_recompute(monkeypatch)
 
     await sdw.refresh_agent_pdp_view_for_seed(
         seed_id=_SEED_ID, proposal_id=777, refresh_source="writer_commit:777",
@@ -236,20 +272,19 @@ async def test_the_seed_path_still_records_its_proposal(
 
 
 @pytest.mark.asyncio
-async def test_the_fashion_path_records_no_proposal(
+async def test_the_fashion_path_clears_the_proposal_attribution(
     monkeypatch: pytest.MonkeyPatch, enriched: _FakeDB
 ) -> None:
-    """It has none to record — and the UPSERT COALESCEs, so passing None must
-    not erase an attribution the seed writer previously set."""
+    """It has no proposal, and passing None must CLEAR the column, not inherit
+    the last one. Migration 085 pairs `refreshed_by_proposal_id` with
+    `refresh_source` as a description of THE CURRENT refresh, and the pre-change
+    code wrote None here explicitly. The UPSERT side is pinned in
+    tests/test_agent_pdp_view_overlay_preservation_postgres.py; this pins that
+    the path still passes None rather than something stale."""
     import services.fashion_field_authoring as ffa
 
     monkeypatch.setattr(ffa, "database", enriched)
-
-    async def no_recompute(content_key, reason=""):
-        return None
-
-    import services.index_pipeline_state_service as ipss
-    monkeypatch.setattr(ipss, "recompute_serving_eligibility", no_recompute)
+    _stub_recompute(monkeypatch)
 
     await ffa._refresh_view_for_content_key(_CONTENT_KEY)
     assert enriched.executes[0]["params"]["refreshed_by_proposal_id"] is None
@@ -271,11 +306,58 @@ async def test_both_paths_still_preserve_on_a_failed_overlay_read(
 
     monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", failed)
 
-    async def no_recompute(content_key, reason=""):
-        return None
-
-    import services.index_pipeline_state_service as ipss
-    monkeypatch.setattr(ipss, "recompute_serving_eligibility", no_recompute)
+    _stub_recompute(monkeypatch)
 
     await ffa._refresh_view_for_content_key(_CONTENT_KEY)
+    assert enriched.executes[0]["params"]["preserve_enrichment"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_fashion_path_recomputes_serving_eligibility(
+    monkeypatch: pytest.MonkeyPatch, enriched: _FakeDB
+) -> None:
+    """Deleting this block from both converted paths passed all 10,592 tests."""
+    import services.fashion_field_authoring as ffa
+
+    monkeypatch.setattr(ffa, "database", enriched)
+    recomputed = _stub_recompute(monkeypatch)
+
+    await ffa._refresh_view_for_content_key(_CONTENT_KEY)
+    assert recomputed == [_CONTENT_KEY], "serving eligibility was left stale"
+
+
+@pytest.mark.asyncio
+async def test_the_seed_path_recomputes_serving_eligibility(
+    monkeypatch: pytest.MonkeyPatch, enriched: _FakeDB
+) -> None:
+    import services.seed_data_writer as sdw
+
+    monkeypatch.setattr(sdw, "database", enriched)
+    recomputed = _stub_recompute(monkeypatch)
+
+    await sdw.refresh_agent_pdp_view_for_seed(
+        seed_id=_SEED_ID, proposal_id=1, refresh_source="writer_commit:1",
+    )
+    assert recomputed == [_CONTENT_KEY], "serving eligibility was left stale"
+
+
+@pytest.mark.asyncio
+async def test_the_SEED_path_also_preserves_on_a_failed_overlay_read(
+    monkeypatch: pytest.MonkeyPatch, enriched: _FakeDB
+) -> None:
+    """The sibling test is named "both paths" but drives only the fashion one.
+    The seed path's preserve behaviour was never asserted."""
+    import services.seed_data_writer as sdw
+
+    monkeypatch.setattr(sdw, "database", enriched)
+    _stub_recompute(monkeypatch)
+
+    async def failed(products_):
+        return apv.FETCH_FAILED
+
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", failed)
+
+    await sdw.refresh_agent_pdp_view_for_seed(
+        seed_id=_SEED_ID, proposal_id=5, refresh_source="writer_commit:5",
+    )
     assert enriched.executes[0]["params"]["preserve_enrichment"] is True
