@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import os
 import re
 from collections import Counter, defaultdict
@@ -178,66 +179,126 @@ _MIN_COLLECTED = 2050
 _MIN_PLANNED = 1950
 _MAX_UNCHECKED = 140
 
-# Statements that CANNOT be planned today and are NOT fixed here. Every one is a
-# real defect this commit's two changes (injectable receivers, and column errors
-# on migration-owned tables) made visible for the first time; none is caused by
-# them. They are pinned rather than fixed because each belongs to an unrelated
-# subsystem and this commit is the agent_pdp_view enrichment bridge — fixing
-# billing and partner-settlement SQL here would make it unreviewable.
+# Statements that cannot be planned today and are NOT fixed here, because each
+# belongs to an unrelated subsystem and this commit is the agent_pdp_view
+# enrichment bridge. Pinning is a deferral, not a verdict: entry 3 below is not a
+# defect at all, merely unplannable.
 #
-# Keyed by (file, error substring), not by line number, so an edit above the
-# statement does not silently drop an entry. THIS LIST MAY ONLY SHRINK: the
-# staleness guard below fails if an entry stops matching, so a fixed statement
-# forces its removal instead of rotting here. Do not add to it to make a red
-# gate green — that is the whole failure mode this file exists to prevent.
+# 🚨 KEYED BY STATEMENT FINGERPRINT, NOT BY FILE. The first version keyed on
+# (path, error substring), which granted amnesty to an entire file x error-class:
+# a brand-new broken `SELECT merchant_id, payout_iban, tax_id FROM merchants`
+# appended to routes/billing_routes.py, and a brand-new unsubstituted `.format()`
+# appended to manage_source_quarantine.py, both left the gate GREEN — the two
+# broadest pins swallowed them. Demonstrated, then fixed. The fingerprint hashes
+# the whitespace-normalized SQL, so reformatting or moving a pinned statement
+# keeps its pin while any DIFFERENT statement, in the same file with the same
+# error, fails.
 #
-#   routes/admin_partner_settlements.py  \
-#   routes/admin_partner_subsidies.py     >  SELECT merchant_id FROM merchants.
-#   routes/billing_routes.py:1907        /   db/merchants.py declares that table
-#       with PK `id` and no `merchant_id`, and db/schema_guard.py never adds one.
-#   services/merchant_store_service.py    -  UPDATE merchant_onboarding SET
-#       mcp_connected_at — no migration, model, or schema_guard ALTER declares
-#       that column anywhere in the repo.
-#   scripts/manage_source_quarantine.py   -  the `WHERE {seed_domain_match}`
-#       placeholder is never substituted; the sibling fetch_one 8 lines above
-#       calls .format() on the identical template and this fetch_all does not.
-#   routes/billing_routes.py:396          -  INSERT ... SELECT :business_name
-#       binds one param into both a text and a varchar column.
+# THIS LIST MAY ONLY SHRINK. The staleness guard fails if an entry stops
+# matching, and the count assertion fails if anything unpinned gets excused. Do
+# not add to it to turn a red gate green — that is the failure mode this file
+# exists to prevent. Regenerate a fingerprint with DUMP_UNPLANNABLE=1.
 _KNOWN_UNPLANNABLE = {
-    ("routes/admin_partner_settlements.py", 'column "merchant_id" does not exist'),
-    ("routes/admin_partner_subsidies.py", 'column "merchant_id" does not exist'),
-    ("routes/billing_routes.py", 'column "merchant_id" does not exist'),
-    ("services/merchant_store_service.py", 'column "mcp_connected_at"'),
-    ("scripts/manage_source_quarantine.py", 'syntax error at or near "{"'),
-    ("routes/billing_routes.py", "inconsistent types deduced for parameter"),
+    # (file, error fragment, fingerprint of the exact statement)
+    #
+    # 1-2. Dead lookups inside a bare `except Exception:`. db/merchants.py declares
+    #      `merchants` with PK `id`; there is no `merchant_id`, and schema_guard
+    #      never adds one. Genuinely broken.
+    ("routes/admin_partner_settlements.py", 'column "merchant_id" does not exist', "f848996c6f8c"),
+    ("routes/admin_partner_subsidies.py", 'column "merchant_id" does not exist', "f848996c6f8c"),
+    # 3.   NOT A DEFECT — pinned because it cannot be PLANNED, a different claim.
+    #      routes/billing_routes.py:1907 is guarded at runtime by
+    #      `columns = await _table_columns(db, "merchants")` and returns early when
+    #      `merchant_id` is absent: deliberate schema-variance handling. The gate
+    #      cannot see a runtime guard, so it must be excused rather than "fixed".
+    #      An earlier revision of this list called it a defect. It is not.
+    ("routes/billing_routes.py", 'column "merchant_id" does not exist', "d3136c82750d"),
+    # 4.   One bind reaching both a text and a varchar column.
+    ("routes/billing_routes.py", "inconsistent types deduced for parameter", "6d0ff58c230e"),
+    # 5.   `WHERE {seed_domain_match}` is never substituted — the sibling fetch_one
+    #      eight lines above calls .format() on the identical template.
+    ("scripts/manage_source_quarantine.py", 'syntax error at or near "{"', "6eb33de0dec0"),
+    # 6.   `mcp_connected_at` is declared by no migration, model or schema_guard
+    #      ALTER anywhere in the repo.
+    ("services/merchant_store_service.py", 'column "mcp_connected_at"', "ec6d28aa1ef9"),
+    # 7-8. Surfaced only once the column parser above stopped emitting junk tokens
+    #      (they hid behind unfaithful tables). Both real: `external_product_seeds`
+    #      has no `category` column; `brand_claims` has `verification_status`, not
+    #      `status`, so that VERIFIED-claim lookup can never match and `claimed` is
+    #      always None — under a comment advertising itself as the fix for an
+    #      earlier silent-miss bug.
+    ("services/attached_seed_runtime_evidence.py", 'column "category" does not exist', "7a110251d5f0"),
+    ("services/catalog_enrichment_agent/apply.py", 'column "status" does not exist', "a34e0f691cd4"),
 }
 
 
-def _is_known_unplannable(label: str, message: str) -> bool:
+def _sql_fingerprint(sql: str) -> str:
+    """Stable short hash of whitespace-normalized SQL. Identifies the STATEMENT,
+    not its location, so reformatting or moving it keeps its pin while a
+    genuinely different statement gets a different fingerprint."""
+    return hashlib.sha1(" ".join(sql.split()).encode("utf-8")).hexdigest()[:12]
+
+
+def _is_known_unplannable(label: str, message: str, sql: str) -> bool:
     path = label.split(":", 1)[0]
+    fingerprint = _sql_fingerprint(sql)
     return any(
-        path == known_path and fragment in message
-        for known_path, fragment in _KNOWN_UNPLANNABLE
+        path == known_path and fragment in message and fingerprint == known_fp
+        for known_path, fragment, known_fp in _KNOWN_UNPLANNABLE
     )
 
 
 # ---------------------------------------------------------------------------
 # fixture
 # ---------------------------------------------------------------------------
-_TABLE_DDL_RE = re.compile(
-    r"\b(?:CREATE\s+(?:TEMP\s+|TEMPORARY\s+|UNLOGGED\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?"
-    r"|ALTER\s+TABLE(?:\s+IF\s+EXISTS)?)\s+(?:ONLY\s+)?([A-Za-z0-9_.\"]+)",
+# Identifiers a statement reads or writes.
+#
+# BE HONEST ABOUT THE DIRECTION OF ERROR. Over-inclusion (catching a CTE name, a
+# LATERAL keyword, an alias) does not invent a false failure — but it does add an
+# unknown name to `named`, which then cannot be a subset of `faithful`, which
+# demotes a genuine column defect back to "unchecked". So over-inclusion HIDES
+# defects. It is the safe direction for CI noise and the unsafe one for coverage;
+# both halves are stated here because the first version of this comment claimed
+# only the first and was used to justify not caring.
+#
+# Known escapes, measured: a CTE (`WITH c AS (...)`) contributes `c`; a statement
+# with no FROM at all yields an empty `named` and is excluded by the `named and`
+# guard in the classifier. Each is a statement this gate does not column-check.
+_NOT_A_TABLE = frozenset({"lateral", "only", "unnest", "select"})
+
+_TABLE_REF_RE = re.compile(
+    # The leading quote is load-bearing: `FROM "catalog_products"` matched ZERO
+    # names without it (the class started at [A-Za-z_]), producing an empty
+    # `named` and silently exempting the statement.
+    r"\b(?:FROM|JOIN|UPDATE|INTO|USING)\s+(?:ONLY\s+)?(\"?[A-Za-z_][A-Za-z0-9_.\"]*)",
     re.IGNORECASE,
 )
 
-# Identifiers a statement reads or writes. Over-inclusive ON PURPOSE: a CTE name
-# or an alias caught here can only make a statement look MORE fixture-suspect,
-# i.e. push it back to "unchecked". Under-inclusion is the direction that would
-# invent a false failure, so the regex errs the other way.
-_TABLE_REF_RE = re.compile(
-    r"\b(?:FROM|JOIN|UPDATE|INTO|USING)\s+(?:ONLY\s+)?([A-Za-z_][A-Za-z0-9_.\"]*)",
-    re.IGNORECASE,
-)
+# Comments and string literals must go before ANY column-list parsing. A `--`
+# comment contributed a literal `--` "column"; a comma inside a comment or inside
+# a DEFAULT 'x,y' literal split one column definition into two. Both produce
+# tokens that can never appear in information_schema, which pins the table as
+# permanently unfaithful — measured, 90 of 99 unfaithful tables were unfaithful
+# for exactly this reason, silently disabling the wrong-column check on them.
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+
+
+def _strip_sql_noise(sql: str) -> str:
+    """Drop comments and blank out string literals, so neither can contribute a
+    token or a spurious comma to a column list. Only ever used for PARSING —
+    _apply_migrations executes the untouched original."""
+    sql = _BLOCK_COMMENT_RE.sub(" ", sql)
+    sql = _LINE_COMMENT_RE.sub(" ", sql)
+    return _STRING_LITERAL_RE.sub("''", sql)
+
+
+# The name at the head of a column definition: a quoted identifier (which may
+# contain spaces) or a bare one. Anchored so `UNIQUE(a, b)` yields `unique` —
+# splitting on whitespace yielded `unique(a,`, which matched nothing in
+# _NOT_A_COLUMN and was therefore recorded as a column.
+_COLUMN_NAME_RE = re.compile(r'\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))')
 
 
 def _bare_table(name: str) -> str:
@@ -246,7 +307,8 @@ def _bare_table(name: str) -> str:
 
 
 def _tables_named_in(sql: str) -> set:
-    return {_bare_table(m) for m in _TABLE_REF_RE.findall(sql)}
+    named = {_bare_table(m) for m in _TABLE_REF_RE.findall(_strip_sql_noise(sql))}
+    return {t for t in named if t and t not in _NOT_A_TABLE}
 
 
 _ADD_COLUMN_RE = re.compile(
@@ -288,13 +350,13 @@ def _columns_declared_in_create(body: str, open_paren: int) -> set:
             item.append(ch)
     out = set()
     for raw_item in items:
-        tokens = raw_item.strip().split()
-        if not tokens:
+        match = _COLUMN_NAME_RE.match(raw_item)
+        if not match:
             continue
-        first = tokens[0].replace('"', "").lower()
-        if first in _NOT_A_COLUMN:
+        name = (match.group(1) or match.group(2)).lower()
+        if name in _NOT_A_COLUMN:
             continue
-        out.add(first)
+        out.add(name)
     return out
 
 
@@ -308,7 +370,10 @@ def _columns_declared_by_migrations() -> Dict[str, set]:
     """
     declared: Dict[str, set] = defaultdict(set)
     for path in (REPO_ROOT / "db" / "migrations").glob("*.sql"):
-        body = path.read_text(encoding="utf-8")
+        # Noise stripped BEFORE the regexes run, so a comma inside a comment or a
+        # string literal cannot split a column definition and a `--` cannot be
+        # read as a column name.
+        body = _strip_sql_noise(path.read_text(encoding="utf-8"))
         for match in _CREATE_TABLE_RE.finditer(body):
             table = _bare_table(match.group(1))
             declared[table] |= _columns_declared_in_create(body, match.end() - 1)
@@ -319,14 +384,8 @@ def _columns_declared_by_migrations() -> Dict[str, set]:
     return declared
 
 
-def _apply_migrations(raw) -> Tuple[int, int, set]:
-    """Apply db/migrations/*.sql in version order. Returns (applied, failed, suspect).
-
-    `suspect` is every table named by a CREATE/ALTER TABLE in a migration that did
-    NOT apply. Those tables exist in the fixture only in whatever shape
-    `metadata.create_all` or the startup DDL gave them, so a column missing on one
-    is a fixture hole and nothing can be concluded from it. A column missing on any
-    OTHER table is a real defect — see the classification comment on _FIXTURE_GAP.
+def _apply_migrations(raw) -> Tuple[int, int]:
+    """Apply db/migrations/*.sql in version order. Returns (applied, failed).
 
     Failures are tolerated: a dozen migrations target tables this repo creates
     from application code rather than DDL, and a migration that cannot apply
@@ -467,9 +526,18 @@ def prepare():
                 # column for is one whose shape they do not own — it comes from a
                 # model or from application bootstrap — and `set() <= anything` is
                 # vacuously true, so without this it would count as faithful on the
-                # strength of no evidence at all. `merchants` is the live example:
-                # nothing in db/migrations CREATEs it, and treating the fixture's
-                # copy as authoritative reported three sound statements as defects.
+                # strength of no evidence at all. `product_enrichment` is the live
+                # example: 0 migration-declared columns (db/product_enrichment.py
+                # owns it), so it is correctly NOT faithful and column errors
+                # against it stay unchecked — including, ironically, one of the two
+                # tables this commit's own fix is about.
+                #
+                # This is a WEAKER guarantee than "the fixture matches production".
+                # `merchants` has 7 declared columns from migration 103 and so
+                # counts as faithful, even though its CREATE lives in
+                # db/merchants.py — seven applied ALTERs is the whole evidence base.
+                # That is why entry 3 of _KNOWN_UNPLANNABLE is a false positive
+                # rather than a defect.
                 if cols and table in actual and cols <= actual[table]
             }
         finally:
@@ -815,10 +883,15 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
                 name = "UndefinedColumnError:real"
             classes[name] += 1
             if name not in _FIXTURE_GAP:
-                if _is_known_unplannable(label, str(exc)):
-                    known_hits.add((label.split(":", 1)[0], str(exc)))
+                if _is_known_unplannable(label, str(exc), sql):
+                    known_hits.add(
+                        (label.split(":", 1)[0], str(exc), _sql_fingerprint(sql))
+                    )
                     classes["known_unplannable"] += 1
                     continue
+                if os.getenv("DUMP_UNPLANNABLE"):
+                    print(f'    ("{label.split(":", 1)[0]}", '
+                          f'"{str(exc).splitlines()[0][:60]}", "{_sql_fingerprint(sql)}"),')
                 body = " ".join(sql.split())[:200]
                 defects[name].append(f"  {label}\n    !! {name}: {exc}\n    {body}")
 
@@ -834,18 +907,31 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
     # ledger being updated. Left alone it turns into permanent cover for a future
     # defect at the same path — the exemption stays, the statement it excused is
     # gone, and the next broken statement in that file inherits the pass.
-    matched_paths = {path for path, _ in known_hits}
     stale = sorted(
-        f"{path} :: {fragment}"
-        for path, fragment in _KNOWN_UNPLANNABLE
-        if path not in matched_paths
-        or not any(fragment in message for p, message in known_hits if p == path)
+        f"{path} :: {fragment} :: {fingerprint}"
+        for path, fragment, fingerprint in _KNOWN_UNPLANNABLE
+        if not any(
+            p == path and fragment in message and fp == fingerprint
+            for p, message, fp in known_hits
+        )
     )
     assert not stale, (
         f"{len(stale)} entr(y/ies) in _KNOWN_UNPLANNABLE no longer match a failing "
         "statement. If you fixed one, delete its line — an exemption that outlives "
-        "its defect silently excuses the next one at that path.\n  "
+        "its statement is dead weight. If you only REFORMATTED the statement, "
+        "regenerate its fingerprint with DUMP_UNPLANNABLE=1.\n  "
         + "\n  ".join(stale)
+    )
+
+    # The other direction: nothing may be excused that is not pinned. Compared on
+    # (path, fingerprint) so one pinned statement appearing at two call sites is
+    # still one entry. Without this the permissive bucket could grow in silence.
+    distinct_excused = {(path, fp) for path, _msg, fp in known_hits}
+    expected_excused = {(path, fp) for path, _frag, fp in _KNOWN_UNPLANNABLE}
+    assert distinct_excused == expected_excused, (
+        "the set of excused statements does not match _KNOWN_UNPLANNABLE.\n"
+        f"  excused but not pinned: {sorted(distinct_excused - expected_excused)}\n"
+        f"  pinned but not excused: {sorted(expected_excused - distinct_excused)}"
     )
 
     total_defects = sum(len(v) for v in defects.values())
@@ -921,3 +1007,118 @@ def test_a_fixture_gap_is_reported_as_unchecked_not_as_a_pass(prepare) -> None:
     with pytest.raises(Exception) as caught:
         prepare("SELECT * FROM a_table_that_does_not_exist WHERE x = :x")
     assert type(caught.value).__name__ in _FIXTURE_GAP
+
+
+# ---------------------------------------------------------------------------
+# self-tests for the classifier machinery
+# ---------------------------------------------------------------------------
+# None of the helpers below had any coverage when they were introduced, and the
+# column parser shipped with a defect that made 90 of 99 unfaithful tables
+# unfaithful for bogus reasons — silently disabling the wrong-column check on
+# them. A table-driven test catches that outright, so here it is. These need no
+# database; they live in this file because they test THIS file.
+
+@pytest.mark.parametrize("body,expected", [
+    ("CREATE TABLE t (a int, b text)", {"a", "b"}),
+    # constraints must not read as columns, with OR WITHOUT a space before "("
+    ("CREATE TABLE t (a int, UNIQUE(a, b))", {"a"}),
+    ("CREATE TABLE t (a int, UNIQUE (a, b))", {"a"}),
+    ("CREATE TABLE t (a int, CHECK(a > 0))", {"a"}),
+    ("CREATE TABLE t (a int, b int, PRIMARY KEY (a, b))", {"a", "b"}),
+    ("CREATE TABLE t (a int, CONSTRAINT c FOREIGN KEY (a) REFERENCES u(id))", {"a"}),
+    # a line comment must contribute neither a column nor a comma
+    ("CREATE TABLE t (\n  -- the id, and more\n  a int,\n  b int\n)", {"a", "b"}),
+    ("CREATE TABLE t (a int, -- note, with comma\n b int)", {"a", "b"}),
+    ("CREATE TABLE t (/* x, y */ a int, b int)", {"a", "b"}),
+    # a comma inside a string literal must not split a definition
+    ("CREATE TABLE t (a text DEFAULT 'x,y', b int)", {"a", "b"}),
+    # quoted identifiers, including one containing a space
+    ('CREATE TABLE t ("b c" int, d int)', {"b c", "d"}),
+    # nested type parens
+    ("CREATE TABLE t (a numeric(10, 2), b int)", {"a", "b"}),
+])
+def test_the_column_parser_reads_real_ddl_shapes(body: str, expected: set) -> None:
+    match = _CREATE_TABLE_RE.search(body)
+    assert match, body
+    assert _columns_declared_in_create(_strip_sql_noise(body), match.end() - 1) == expected
+
+
+def test_no_declared_column_is_parse_debris() -> None:
+    """The assertion that would have caught the original parser bug.
+
+    Every name the parser attributes to a table must LOOK like an identifier. A
+    junk token (`unique(a,`, `--`, `y'`) can never appear in information_schema,
+    so the table it is attributed to becomes permanently unfaithful and its
+    column errors are written off as fixture gaps forever — the check silently
+    switches itself off, with no failing test anywhere.
+    """
+    legal = re.compile(r"^[a-z_][a-z0-9_$ ]*$")
+    debris = sorted(
+        f"{table}.{column}"
+        for table, columns in _columns_declared_by_migrations().items()
+        for column in columns
+        if not legal.match(column)
+    )
+    assert not debris, (
+        f"{len(debris)} parsed 'column' name(s) are not identifiers — the column "
+        "parser is mis-reading migration DDL, which silently exempts their tables "
+        "from the wrong-column check:\n  " + "\n  ".join(debris[:40])
+    )
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ("SELECT 1 FROM catalog_products", {"catalog_products"}),
+    ("SELECT 1 FROM catalog_products cp", {"catalog_products"}),
+    ("SELECT 1 FROM public.catalog_products", {"catalog_products"}),
+    # the quoted form matched NOTHING before the leading `"?` was added, which
+    # emptied `named` and silently exempted the statement
+    ('SELECT 1 FROM "catalog_products"', {"catalog_products"}),
+    ('SELECT 1 FROM public."catalog_products"', {"catalog_products"}),
+    ("UPDATE agent_pdp_view SET x = 1", {"agent_pdp_view"}),
+    ("INSERT INTO agent_pdp_view (a) VALUES (1)", {"agent_pdp_view"}),
+    ("DELETE FROM agent_pdp_view WHERE x = 1", {"agent_pdp_view"}),
+    ("SELECT 1 FROM a JOIN b ON a.i = b.i", {"a", "b"}),
+    # `LATERAL` is a keyword, not a table. The subquery alias `s` follows the
+    # closing paren with no FROM/JOIN before it, so it is never captured either.
+    ("SELECT 1 FROM a JOIN LATERAL (SELECT 1) s ON true", {"a"}),
+    # a FROM inside a string literal must not be scanned
+    ("SELECT 1 FROM a WHERE x = 'FROM zzz'", {"a"}),
+])
+def test_table_reference_extraction(sql: str, expected: set) -> None:
+    assert _tables_named_in(sql) == expected
+
+
+def test_a_cte_name_is_still_mistaken_for_a_table() -> None:
+    """A KNOWN, UNFIXED escape, pinned so it stays visible rather than folklore.
+
+    `_tables_named_in` cannot tell a CTE from a table, so a statement using one
+    carries an unknown name, fails the faithful-subset test, and is exempted from
+    the wrong-column check. That direction HIDES defects. Asserted here so that
+    the day someone teaches the collector about CTEs, this test fails and the
+    limit gets deleted from the docs along with it.
+    """
+    assert _tables_named_in("WITH c AS (SELECT 1) SELECT * FROM c") == {"c"}
+
+
+def test_fingerprint_ignores_formatting_but_not_content() -> None:
+    a = "SELECT merchant_id   FROM\n  merchants"
+    b = "SELECT merchant_id FROM merchants"
+    c = "SELECT merchant_id, tax_id FROM merchants"
+    assert _sql_fingerprint(a) == _sql_fingerprint(b)
+    assert _sql_fingerprint(a) != _sql_fingerprint(c)
+
+
+def test_a_pin_excuses_only_its_own_statement() -> None:
+    """The hole this keying closes: keyed on (path, error) alone, a pin was an
+    amnesty for a whole file x error-class, and a brand-new broken statement in a
+    pinned file stayed green."""
+    pinned_path, pinned_fragment, pinned_fp = sorted(_KNOWN_UNPLANNABLE)[0]
+    label = f"{pinned_path}:1"
+    message = f"blah {pinned_fragment} blah"
+
+    # A different statement in the same file, failing the same way, is NOT excused.
+    assert not _is_known_unplannable(label, message, "SELECT something_else FROM merchants")
+    # A different file carrying the pinned statement is NOT excused either.
+    assert not _is_known_unplannable("routes/other.py", message, "x")
+    # And every pin still carries a fingerprint.
+    assert all(len(fp) == 12 for _p, _f, fp in _KNOWN_UNPLANNABLE)
