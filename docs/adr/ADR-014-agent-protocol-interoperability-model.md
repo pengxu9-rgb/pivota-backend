@@ -164,3 +164,34 @@ Decisive factor: **multi-protocol is the product, the protocols are unsettled, a
 ## Rollback
 
 Framework-level; adds no runtime behavior on its own. Reversing means not building the adapter registry (leave protocol handling as per-protocol code — Option B), a reversible if costlier path. The canonical spine already exists in embryo (`payment_execution_routes`; the ADR-013 ledger joins once built); this ADR **formalizes and de-scatters** it rather than introducing new runtime surface.
+
+---
+
+## Amendment 2026-08-11 — two landscape notes corrected by the code
+
+The 2026-08 two-repo audit found the Landscape note above stale in two places.
+The framework itself (one canonical spine, protocols as edge adapters) is
+unchanged; both corrections are edge-inventory facts:
+
+1. **UCP is the external Universal Commerce Protocol, not "Pivota's own
+   internal commerce surface."** The gateway's `safety-kernel/src/protocol/
+   ucpProfile.js` implements the public UCP spec (target version `2026-01-23`):
+   `/.well-known/ucp` business profile with `ucp_version`, transport bindings,
+   capability intersection, published signing keys, plus the detached-JWS order
+   webhook receiver (ADR-021 PR #1894). The "spine-side, no adapter" call below
+   ("UCP's place") is superseded for the external protocol: UCP has an edge
+   adapter like every other protocol. The internal `ucp` protocol-TIER label on
+   the backend charge lane (`GUARDED_PROTOCOLS`) keeps its name for wire
+   compatibility but should be read as "UCP-tier charge", not as a claim that
+   UCP is internal.
+2. **The external OpenAI/Stripe ACP adapter EXISTS** — `safety-kernel/src/
+   protocol/acpRestAdapter.js` + `acpRestRoutes.js` mount the five
+   checkout-session REST endpoints + product feed under `/acp` with the ACP
+   HMAC signature scheme, flag-gated by `AGENT_CHECKOUT_ACP_REST_ENABLED`
+   (off in prod as of this amendment). "External OpenAI/Stripe ACP would get
+   its own adapter if/when integrated" is therefore done, not pending. The
+   backend "ACP" tier naming note above remains correct.
+
+Also recorded for the layer table: x402 remains unimplemented everywhere — the
+backend's fictional `X402Adapter` (which was never an implementation) was
+deleted 2026-08-11 rather than kept as a placeholder.
