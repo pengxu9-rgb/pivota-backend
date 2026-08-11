@@ -174,16 +174,159 @@ _FIXTURE_GAP = {
 #
 # Small slack on each so unrelated PRs that add or remove a query do not have to
 # touch this file; a real regression moves these by far more.
-_MIN_COLLECTED = 1900
-_MIN_PLANNED = 1800
+_MIN_COLLECTED = 2050
+_MIN_PLANNED = 1950
 _MAX_UNCHECKED = 140
+
+# Statements that CANNOT be planned today and are NOT fixed here. Every one is a
+# real defect this commit's two changes (injectable receivers, and column errors
+# on migration-owned tables) made visible for the first time; none is caused by
+# them. They are pinned rather than fixed because each belongs to an unrelated
+# subsystem and this commit is the agent_pdp_view enrichment bridge — fixing
+# billing and partner-settlement SQL here would make it unreviewable.
+#
+# Keyed by (file, error substring), not by line number, so an edit above the
+# statement does not silently drop an entry. THIS LIST MAY ONLY SHRINK: the
+# staleness guard below fails if an entry stops matching, so a fixed statement
+# forces its removal instead of rotting here. Do not add to it to make a red
+# gate green — that is the whole failure mode this file exists to prevent.
+#
+#   routes/admin_partner_settlements.py  \
+#   routes/admin_partner_subsidies.py     >  SELECT merchant_id FROM merchants.
+#   routes/billing_routes.py:1907        /   db/merchants.py declares that table
+#       with PK `id` and no `merchant_id`, and db/schema_guard.py never adds one.
+#   services/merchant_store_service.py    -  UPDATE merchant_onboarding SET
+#       mcp_connected_at — no migration, model, or schema_guard ALTER declares
+#       that column anywhere in the repo.
+#   scripts/manage_source_quarantine.py   -  the `WHERE {seed_domain_match}`
+#       placeholder is never substituted; the sibling fetch_one 8 lines above
+#       calls .format() on the identical template and this fetch_all does not.
+#   routes/billing_routes.py:396          -  INSERT ... SELECT :business_name
+#       binds one param into both a text and a varchar column.
+_KNOWN_UNPLANNABLE = {
+    ("routes/admin_partner_settlements.py", 'column "merchant_id" does not exist'),
+    ("routes/admin_partner_subsidies.py", 'column "merchant_id" does not exist'),
+    ("routes/billing_routes.py", 'column "merchant_id" does not exist'),
+    ("services/merchant_store_service.py", 'column "mcp_connected_at"'),
+    ("scripts/manage_source_quarantine.py", 'syntax error at or near "{"'),
+    ("routes/billing_routes.py", "inconsistent types deduced for parameter"),
+}
+
+
+def _is_known_unplannable(label: str, message: str) -> bool:
+    path = label.split(":", 1)[0]
+    return any(
+        path == known_path and fragment in message
+        for known_path, fragment in _KNOWN_UNPLANNABLE
+    )
 
 
 # ---------------------------------------------------------------------------
 # fixture
 # ---------------------------------------------------------------------------
-def _apply_migrations(raw) -> Tuple[int, int]:
-    """Apply db/migrations/*.sql in version order. Returns (applied, failed).
+_TABLE_DDL_RE = re.compile(
+    r"\b(?:CREATE\s+(?:TEMP\s+|TEMPORARY\s+|UNLOGGED\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?"
+    r"|ALTER\s+TABLE(?:\s+IF\s+EXISTS)?)\s+(?:ONLY\s+)?([A-Za-z0-9_.\"]+)",
+    re.IGNORECASE,
+)
+
+# Identifiers a statement reads or writes. Over-inclusive ON PURPOSE: a CTE name
+# or an alias caught here can only make a statement look MORE fixture-suspect,
+# i.e. push it back to "unchecked". Under-inclusion is the direction that would
+# invent a false failure, so the regex errs the other way.
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN|UPDATE|INTO|USING)\s+(?:ONLY\s+)?([A-Za-z_][A-Za-z0-9_.\"]*)",
+    re.IGNORECASE,
+)
+
+
+def _bare_table(name: str) -> str:
+    """`public."Foo"` -> `foo`. Schema-qualified and quoted forms collapse."""
+    return name.replace('"', "").rsplit(".", 1)[-1].lower()
+
+
+def _tables_named_in(sql: str) -> set:
+    return {_bare_table(m) for m in _TABLE_REF_RE.findall(sql)}
+
+
+_ADD_COLUMN_RE = re.compile(
+    r"\bALTER\s+TABLE(?:\s+IF\s+EXISTS)?\s+(?:ONLY\s+)?([A-Za-z0-9_.\"]+)"
+    r"(.*?)(?=;|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_ADD_COLUMN_NAME_RE = re.compile(
+    r"\bADD\s+COLUMN(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z0-9_\"]+)", re.IGNORECASE
+)
+_CREATE_TABLE_RE = re.compile(
+    r"\bCREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:ONLY\s+)?([A-Za-z0-9_.\"]+)\s*\(",
+    re.IGNORECASE,
+)
+# Words that start a table CONSTRAINT clause rather than a column definition.
+_NOT_A_COLUMN = {
+    "primary", "foreign", "unique", "check", "constraint", "exclude", "like", "partition",
+}
+
+
+def _columns_declared_in_create(body: str, open_paren: int) -> set:
+    """Column names from a CREATE TABLE parenthesised body, by depth-0 commas."""
+    depth, item, items = 0, [], []
+    for ch in body[open_paren:]:
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                items.append("".join(item))
+                break
+        if depth == 1 and ch == ",":
+            items.append("".join(item))
+            item = []
+            continue
+        if depth >= 1:
+            item.append(ch)
+    out = set()
+    for raw_item in items:
+        tokens = raw_item.strip().split()
+        if not tokens:
+            continue
+        first = tokens[0].replace('"', "").lower()
+        if first in _NOT_A_COLUMN:
+            continue
+        out.add(first)
+    return out
+
+
+def _columns_declared_by_migrations() -> Dict[str, set]:
+    """table -> every column name db/migrations/*.sql declares for it.
+
+    The yardstick for "did the fixture build this table faithfully". Compared
+    against information_schema at fixture time; a table missing any declared
+    column is one whose column errors prove nothing. Reading the migrations
+    rather than hand-listing tables keeps this correct as schema changes land.
+    """
+    declared: Dict[str, set] = defaultdict(set)
+    for path in (REPO_ROOT / "db" / "migrations").glob("*.sql"):
+        body = path.read_text(encoding="utf-8")
+        for match in _CREATE_TABLE_RE.finditer(body):
+            table = _bare_table(match.group(1))
+            declared[table] |= _columns_declared_in_create(body, match.end() - 1)
+        for table_name, tail in _ADD_COLUMN_RE.findall(body):
+            table = _bare_table(table_name)
+            for col in _ADD_COLUMN_NAME_RE.findall(tail):
+                declared[table].add(col.replace('"', "").lower())
+    return declared
+
+
+def _apply_migrations(raw) -> Tuple[int, int, set]:
+    """Apply db/migrations/*.sql in version order. Returns (applied, failed, suspect).
+
+    `suspect` is every table named by a CREATE/ALTER TABLE in a migration that did
+    NOT apply. Those tables exist in the fixture only in whatever shape
+    `metadata.create_all` or the startup DDL gave them, so a column missing on one
+    is a fixture hole and nothing can be concluded from it. A column missing on any
+    OTHER table is a real defect — see the classification comment on _FIXTURE_GAP.
 
     Failures are tolerated: a dozen migrations target tables this repo creates
     from application code rather than DDL, and a migration that cannot apply
@@ -212,8 +355,9 @@ def _apply_migrations(raw) -> Tuple[int, int]:
     )
     for path in paths:
         cursor = raw.cursor()
+        body = path.read_text(encoding="utf-8")
         try:
-            cursor.execute(path.read_text(encoding="utf-8"))
+            cursor.execute(body)
             applied += 1
         except Exception:  # noqa: BLE001 — see docstring: a failed migration costs coverage only
             failed += 1
@@ -301,15 +445,48 @@ def prepare():
                 finally:
                     cursor.close()
             applied, failed = _apply_migrations(raw)
+            # Which tables did the fixture actually build faithfully? A table is
+            # faithful when it carries every column the migrations declare for
+            # it. Computed AFTER the migrations, from information_schema, so it
+            # reflects what was really built rather than what was attempted.
+            actual: Dict[str, set] = defaultdict(set)
+            cursor = raw.cursor()
+            try:
+                cursor.execute(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public'"
+                )
+                for table_name, column_name in cursor.fetchall():
+                    actual[table_name.lower()].add(column_name.lower())
+            finally:
+                cursor.close()
+            declared = _columns_declared_by_migrations()
+            faithful = {
+                table for table, cols in declared.items()
+                # `cols` must be NON-EMPTY. A table the migrations never declare a
+                # column for is one whose shape they do not own — it comes from a
+                # model or from application bootstrap — and `set() <= anything` is
+                # vacuously true, so without this it would count as faithful on the
+                # strength of no evidence at all. `merchants` is the live example:
+                # nothing in db/migrations CREATEs it, and treating the fixture's
+                # copy as authoritative reported three sound statements as defects.
+                if cols and table in actual and cols <= actual[table]
+            }
         finally:
             raw.close()
-        print(f"\n[sql-prepare-gate] db={_GATE_DB} migrations applied={applied} failed={failed}")
+        print(f"\n[sql-prepare-gate] db={_GATE_DB} migrations applied={applied} "
+              f"failed={failed} | faithful tables={len(faithful)}/{len(declared)}")
 
         loop = asyncio.new_event_loop()
         pg = loop.run_until_complete(asyncpg.connect(url.replace("+asyncpg", "")))
 
         def _prepare(sql: str) -> None:
             loop.run_until_complete(pg.prepare(_to_positional(sql)))
+
+        # Tables the fixture built with every column the migrations declare. The
+        # classifier reads this to tell "this column is genuinely wrong" from "we
+        # never built the table that would have had it".
+        _prepare.faithful_tables = faithful
 
         try:
             yield _prepare
@@ -350,6 +527,30 @@ def _to_positional(sql: str) -> str:
             order.append(match.group(1))
     numbered = {name: f"${i}" for i, name in enumerate(order, start=1)}
     return _PYFORMAT.sub(lambda m: numbered[m.group(1)], rendered).replace("%%", "%")
+
+
+# Receivers that ARE a `databases.Database` handle, so their SQL uses the same
+# `:name` bind syntax this gate compiles. `database` is the module-level handle;
+# the rest are the injectable-handle idiom that exists for testability —
+#
+#     async def f(..., db: Any = None):
+#         read_db = db or database
+#         await read_db.fetch_one("SELECT ...")
+#
+# Sweeping only `database` made every such call site INVISIBLE: 361 call sites,
+# 212 of them with directly-collectable literal SQL. That blind spot is not
+# incidental — it tracks precisely the modules written to be unit-testable, and
+# it is how a `SELECT ... WHERE platform_product_id = :x` against a table whose
+# column is `source_product_id` reached production in
+# services/agent_pdp_view_assembler.py, inside a best-effort `except` that
+# swallowed the UndefinedColumn on every call.
+#
+# DELIBERATELY EXCLUDED: `conn`, `cur`, `cursor`, `tx`, `connection`. Those are
+# raw asyncpg/DBAPI handles whose SQL is written with `$1` or `%s` positional
+# binds, not `:name`. Feeding them to the `:name` -> `$n` compiler below would
+# report the bind DIALECT as a planning failure. Covering them needs a second
+# compile path, not an entry here.
+_DB_RECEIVERS = frozenset({"database", "db", "read_db", "write_db", "_db"})
 
 
 def _receiver_name(func: ast.Attribute) -> str | None:
@@ -546,7 +747,7 @@ def collect_statements() -> List[Tuple[str, str]]:
                 func = node.func
                 if not isinstance(func, ast.Attribute) or func.attr not in _DB_METHODS:
                     continue
-                if _receiver_name(func) != "database" or not node.args:
+                if _receiver_name(func) not in _DB_RECEIVERS or not node.args:
                     continue
                 first = node.args[0]
                 resolved: List[str] = []
@@ -578,6 +779,7 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
 
     classes: Counter = Counter()
     defects: Dict[str, List[str]] = defaultdict(list)
+    known_hits: set = set()
 
     for label, sql in statements:
         try:
@@ -594,8 +796,29 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
             classes["planned"] += 1
         except Exception as exc:  # noqa: BLE001
             name = type(exc).__name__
+            named = _tables_named_in(sql)
+            if (
+                name == "UndefinedColumnError"
+                and named
+                and named <= getattr(prepare, "faithful_tables", set())
+            ):
+                # Every table this statement names carries all the columns the
+                # migrations declare for it, so the fixture's copy IS the real
+                # schema and the column genuinely does not exist. Postgres
+                # resolves relations before columns, so reaching a column error
+                # already proves the tables resolved; the faithfulness check
+                # above removes the one remaining fixture excuse, a table left
+                # half-built. Blanket-exempting UndefinedColumnError instead let
+                # a `WHERE platform_product_id = :x` against catalog_products —
+                # whose column is `source_product_id` — sit in production inside
+                # a best-effort `except`, dead on every call.
+                name = "UndefinedColumnError:real"
             classes[name] += 1
             if name not in _FIXTURE_GAP:
+                if _is_known_unplannable(label, str(exc)):
+                    known_hits.add((label.split(":", 1)[0], str(exc)))
+                    classes["known_unplannable"] += 1
+                    continue
                 body = " ".join(sql.split())[:200]
                 defects[name].append(f"  {label}\n    !! {name}: {exc}\n    {body}")
 
@@ -604,7 +827,26 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
 
     with capsys.disabled():
         print(f"\n[sql-prepare-gate] {len(statements)} collected | {planned} planned | "
-              f"{unchecked} unchecked (fixture gaps)")
+              f"{unchecked} unchecked (fixture gaps) | "
+              f"{classes['known_unplannable']} known-unplannable (pinned)")
+
+    # A pin that no longer matches anything is debt that was paid without the
+    # ledger being updated. Left alone it turns into permanent cover for a future
+    # defect at the same path — the exemption stays, the statement it excused is
+    # gone, and the next broken statement in that file inherits the pass.
+    matched_paths = {path for path, _ in known_hits}
+    stale = sorted(
+        f"{path} :: {fragment}"
+        for path, fragment in _KNOWN_UNPLANNABLE
+        if path not in matched_paths
+        or not any(fragment in message for p, message in known_hits if p == path)
+    )
+    assert not stale, (
+        f"{len(stale)} entr(y/ies) in _KNOWN_UNPLANNABLE no longer match a failing "
+        "statement. If you fixed one, delete its line — an exemption that outlives "
+        "its defect silently excuses the next one at that path.\n  "
+        + "\n  ".join(stale)
+    )
 
     total_defects = sum(len(v) for v in defects.values())
     assert not total_defects, (

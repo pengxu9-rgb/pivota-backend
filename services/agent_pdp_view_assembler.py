@@ -1324,11 +1324,19 @@ async def refresh_agent_pdp_view_for_enrichment_write(
         return False
     read_db = db or database
     try:
+        # The enrichment domain calls this identifier `platform_product_id`
+        # (it is the param name on upsert_enrichment / get_enrichment); on
+        # catalog_products the SAME value is stored as `source_product_id`.
+        # The column below MUST use the catalog spelling — see
+        # _fetch_enrichment_for_canonical, which builds the identical triple.
+        # Shipped as `platform_product_id`, which is not a column on this
+        # table, so every call raised UndefinedColumn into the best-effort
+        # except below and this bridge silently never propagated anything.
         row = await read_db.fetch_one(
             "SELECT content_key FROM catalog_products "
             "WHERE merchant_id = :merchant_id "
             "  AND platform = :platform "
-            "  AND platform_product_id = :platform_product_id "
+            "  AND source_product_id = :platform_product_id "
             "  AND content_key IS NOT NULL "
             "LIMIT 1",
             {
