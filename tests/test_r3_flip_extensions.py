@@ -37,7 +37,10 @@ def _assert_binds_match(sql, params):
 
 class _FakeDb:
     def __init__(self, *, products=None, listing_exists=False, pgm_target_exists=False,
-                 cascade=None):
+                 cascade=None, pgm_banned_rows=None):
+        # None -> one banned row keyed on the first hunted pid (the pre-fix
+        # single-row world); [] -> no banned rows; list -> exactly those.
+        self.pgm_banned_rows = pgm_banned_rows
         self.cascade = cascade or []
         self.products = products or []
         self.listing_exists = listing_exists
@@ -62,6 +65,12 @@ class _FakeDb:
                      "pivota_canonical_url": "u", "content_key": "ck"} for p in self.products]
         if "FROM catalog_skus" in sql:
             return []
+        if "FROM product_group_members" in sql and "ANY(:pids)" in sql:
+            if self.pgm_banned_rows is None:
+                pid = (params or {}).get("pids", [""])[0]
+                return [{"platform": "external_seed", "platform_product_id": pid,
+                         "product_group_id": "grp_banned"}]
+            return self.pgm_banned_rows
         return []
 
     async def fetch_one(self, sql, params=None):
@@ -71,6 +80,10 @@ class _FakeDb:
             if str(ref).startswith("external_seed:"):
                 return {"?column?": 1} if self.listing_exists else None
             return {"?column?": 1} if getattr(self, "new_ref_exists", False) else None
+        if "count(*)" in sql and "FROM product_group_members" in sql:
+            rows = self.pgm_banned_rows
+            n = 1 if rows is None else len(rows)
+            return {"c": n}
         if "count(*)" in sql:
             return {"c": 0}
         if "FROM product_group_members WHERE merchant_id = :obs" in sql:
@@ -657,3 +670,106 @@ class TestRetryWiring:
         # produce two copies here.
         assert report.review_queue["catalog_execute_skips"] == [{"product_key": "pk_skip"}]
         assert len(report.parity) == 1
+
+
+class TestGroupMembershipAllCandidateIds:
+    """Verifier catch 2026-08-11 (pgm_banned_left=77 after the first 1,000):
+    pgm rows key on seed external ids and foreign platforms too — the hunt
+    must enumerate banned rows across ALL candidate ids on ANY platform,
+    exactly the verifier's join, then move/retire each under its own
+    (platform, pid). Third instance of the every-id class."""
+
+    @pytest.mark.asyncio
+    async def test_seed_keyed_row_on_a_foreign_platform_is_moved(self):
+        db = _FakeDb(pgm_banned_rows=[
+            {"platform": "amazon", "platform_product_id": "ext_seed_9",
+             "product_group_id": "grp_banned"}])
+        row = dict(ROW, listing_product_ids=["x1", "ext_seed_9"])
+        stats = await _backfill(db)._resubject_group_membership(
+            row, "merch_obs_aaaa0000aaaa0000")
+        assert stats == {"moved": 1, "retired": 0}
+        assert len(db.executed) == 1
+        sql, params = db.executed[0]
+        assert sql.startswith("UPDATE product_group_members SET merchant_id = :obs")
+        # moved under ITS OWN key, not the catalog row's
+        assert params["spid"] == "ext_seed_9"
+        assert params["platform"] == "amazon"
+
+    @pytest.mark.asyncio
+    async def test_every_banned_row_is_handled_not_just_the_first(self):
+        db = _FakeDb(pgm_target_exists=True, pgm_banned_rows=[
+            {"platform": "external_seed", "platform_product_id": "x1",
+             "product_group_id": "grp_banned"},
+            {"platform": "amazon", "platform_product_id": "ext_seed_9",
+             "product_group_id": "grp_banned"}])
+        row = dict(ROW, listing_product_ids=["x1", "ext_seed_9"])
+        stats = await _backfill(db)._resubject_group_membership(
+            row, "merch_obs_aaaa0000aaaa0000")
+        # observed rows already exist (pgm_target_exists) -> both retired
+        assert stats == {"moved": 0, "retired": 2}
+        assert all(sql.startswith("DELETE FROM product_group_members")
+                   for sql, _ in db.executed)
+        assert {p["spid"] for _, p in db.executed} == {"x1", "ext_seed_9"}
+
+    @pytest.mark.asyncio
+    async def test_no_banned_rows_means_no_writes(self):
+        db = _FakeDb(pgm_banned_rows=[])
+        stats = await _backfill(db)._resubject_group_membership(
+            ROW, "merch_obs_aaaa0000aaaa0000")
+        assert stats == {"moved": 0, "retired": 0}
+        assert db.executed == []
+
+
+class TestRepairPgmStragglers:
+    @pytest.mark.asyncio
+    async def test_execute_repair_moves_the_stranded_pgm_rows(self):
+        db = _FakeDb(listing_exists=False, pgm_banned_rows=[
+            {"platform": "amazon", "platform_product_id": "ext_seed_9",
+             "product_group_id": "grp_banned"}])
+        db.products = [ROW]
+
+        async def fetch_all(sql, params=None, _orig=db.fetch_all):
+            _assert_binds_match(sql, params)
+            if "FROM a9_4_backfill_checkpoint ck" in sql:
+                return [{"product_key": ROW["product_key"],
+                         "observed_id": "merch_obs_aaaa0000aaaa0000",
+                         "source_product_id": "x1",
+                         "seed_listing_ids": ["ext_seed_9"]}]
+            return await _orig(sql, params)
+
+        db.fetch_all = fetch_all
+        bf = SellerBackfill(database=db, si_mod=None, execute=True, batch_size=25)
+        report = BackfillReport(mode="execute", started_at="t",
+                                phases=["repair-listings"], batch_size=25)
+        await bf.repair_listings(report)
+        stats = report.catalog["listing_repair"]
+        assert stats["pgm_stale_found"] == 1
+        assert stats["pgm_moved"] == 1
+        assert stats["pgm_retired"] == 0
+        assert any(sql.startswith("UPDATE product_group_members") and
+                   p["spid"] == "ext_seed_9" for sql, p in db.executed)
+
+    @pytest.mark.asyncio
+    async def test_dry_run_repair_counts_but_never_writes(self):
+        db = _FakeDb(listing_exists=False, pgm_banned_rows=[
+            {"platform": "amazon", "platform_product_id": "ext_seed_9",
+             "product_group_id": "grp_banned"}])
+
+        async def fetch_all(sql, params=None, _orig=db.fetch_all):
+            _assert_binds_match(sql, params)
+            if "FROM a9_4_backfill_checkpoint ck" in sql:
+                return [{"product_key": ROW["product_key"],
+                         "observed_id": "merch_obs_aaaa0000aaaa0000",
+                         "source_product_id": "x1",
+                         "seed_listing_ids": ["ext_seed_9"]}]
+            return await _orig(sql, params)
+
+        db.fetch_all = fetch_all
+        bf = _backfill(db)  # execute=False
+        report = BackfillReport(mode="dry_run", started_at="t",
+                                phases=["repair-listings"], batch_size=25)
+        await bf.repair_listings(report)
+        stats = report.catalog["listing_repair"]
+        assert stats["pgm_stale_found"] == 1
+        assert stats["pgm_moved"] == 0
+        assert db.executed == []
