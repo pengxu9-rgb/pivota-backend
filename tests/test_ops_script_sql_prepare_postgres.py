@@ -124,6 +124,77 @@ ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS platform_product_id t
 ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS is_primary boolean;
 """
 
+# Columns the enrichment statements touch. Belt-and-braces on top of the real
+# CREATE lifted below: if a sibling gate file ever lands a narrower
+# `product_enrichment` stub first, `CREATE TABLE IF NOT EXISTS` silently keeps
+# the narrower shape (the #1651 hazard this file's header describes), and these
+# additive ALTERs are what keep the gate honest instead of red for the wrong
+# reason. Types mirror db/product_enrichment.py.
+_PRODUCT_ENRICHMENT_COLUMN_GUARDS = """
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS geo_code VARCHAR(16);
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS description_markdown TEXT;
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS bullet_points JSONB;
+ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS usage_scenarios JSONB;
+"""
+
+
+def _agent_pdp_view_catchup_ddl() -> List[str]:
+    """`ALTER TABLE agent_pdp_view ...` statements from db/migrations, in order.
+
+    agent_pdp_view IS a db.catalog table, so `metadata.create_all` creates it —
+    but db/catalog.py's Table definition is BEHIND the migrations:
+    evidence_profile, required_disclaimers, bullet_points and usage_scenarios
+    exist only in db/migrations/*.sql. Statements naming them therefore failed
+    with UndefinedColumn against a fixture that looked complete.
+
+    Additive ALTERs lifted from the migrations themselves, never hand-written —
+    the 🚨 rule above forbids hand-rolling DDL for a table db.catalog owns, and
+    ADD COLUMN IF NOT EXISTS is safe to replay in the shared database.
+    """
+    out: List[str] = []
+    paths = sorted(
+        (REPO_ROOT / "db" / "migrations").glob("*.sql"),
+        key=lambda p: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.name)],
+    )
+    for path in paths:
+        body = path.read_text(encoding="utf-8")
+        if "agent_pdp_view" not in body:
+            continue
+        for statement in filter(None, (s.strip() for s in body.split(";"))):
+            collapsed = " ".join(statement.split()).lower()
+            if collapsed.startswith("alter table agent_pdp_view") and "add column" in collapsed:
+                out.append(statement)
+    return out
+
+
+def _product_enrichment_ddl() -> str:
+    """The real `CREATE TABLE product_enrichment`, lifted from
+    db/product_enrichment.py's own AST.
+
+    That table is owned by db/product_enrichment.py, not db.catalog, so
+    `metadata.create_all` above does not create it and the enrichment statements
+    fail with UndefinedTable — a fixture gap reported as a defect.
+
+    Lifted rather than hand-copied for the reason the sibling gate's header
+    gives: a stub drifts from the real schema silently, and PREPARE resolves
+    parameter types THROUGH column types, so a column typed `text` where
+    production has `jsonb` changes whether a cast is required. This is the same
+    DDL the application runs at startup.
+    """
+    source = (REPO_ROOT / "db" / "product_enrichment.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source, filename="product_enrichment.py")):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "CREATE TABLE IF NOT EXISTS product_enrichment" in node.value
+        ):
+            return node.value
+    raise AssertionError(
+        "could not find the CREATE TABLE for product_enrichment in "
+        "db/product_enrichment.py — it moved or was renamed. Do not paste a stub "
+        "here; find the real DDL, or this gate silently plans against a fiction."
+    )
+
 
 @pytest.fixture(scope="module")
 def prepare() -> Callable[[str], None]:
@@ -141,8 +212,14 @@ def prepare() -> Callable[[str], None]:
 
     engine = create_engine(DATABASE_URL)
     metadata.create_all(engine, checkfirst=True)
+    ddl = "\n".join((
+        _LIGHTWEIGHT_DDL,
+        _product_enrichment_ddl(),
+        _PRODUCT_ENRICHMENT_COLUMN_GUARDS,
+        *(f"{stmt};" for stmt in _agent_pdp_view_catchup_ddl()),
+    ))
     with engine.begin() as conn:
-        for stmt in filter(None, (s.strip() for s in _LIGHTWEIGHT_DDL.split(";"))):
+        for stmt in filter(None, (s.strip() for s in ddl.split(";"))):
             conn.execute(text(stmt))
     engine.dispose()
 
@@ -330,6 +407,51 @@ def _collect_source_pdp_offer_image_repair() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
+    """The enriched-cohort join is the statement that matters here. It maps
+    product_enrichment.platform_product_id -> catalog_products.source_product_id;
+    naming the wrong column is what killed the on-write publish bridge, and here
+    it would not raise — an unplannable or empty cohort query reads as "nothing
+    to backfill", which is indistinguishable from success."""
+    import scripts.backfill_agent_pdp_view as module
+
+    origin = "backfill_agent_pdp_view"
+    shapes = [
+        ("enriched", 0, 0), ("enriched", 10, 5), ("all", 0, 0), ("all", 10, 5),
+    ]
+    statements = [
+        (f"{origin}.build_content_key_query(scope={scope}, limit={limit}, offset={offset})",
+         module.build_content_key_query(scope=scope, limit=limit, offset=offset)[0])
+        for scope, limit, offset in shapes
+    ]
+    # The downgrade guard's read. It runs once per candidate on every pass,
+    # including dry runs, so an unplannable version would abort the whole job.
+    statements.append((f"{origin}._CURRENT_OVERLAY_SQL", module._CURRENT_OVERLAY_SQL))
+    return statements
+
+
+def _collect_enrichment_baseline() -> List[Tuple[str, str]]:
+    """Read-only report, but its statements still have to PLAN. A baseline that
+    dies on the first query is an outage in the middle of an ops run, and one
+    that silently returns zero would be read as "nothing to backfill"."""
+    import scripts.report_enrichment_propagation_baseline as module
+
+    origin = "report_enrichment_propagation_baseline"
+    statements = [
+        (f"{origin}.{name}", sql) for name, sql in (
+            ("IDENTITY_JOIN_SANITY_SQL", module.IDENTITY_JOIN_SANITY_SQL),
+            ("COHORT_SQL", module.COHORT_SQL),
+            ("STRANDED_SQL", module.STRANDED_SQL),
+            ("STRANDED_BY_BRAND_SQL", module.STRANDED_BY_BRAND_SQL),
+        )
+    ]
+    statements += [
+        (f"{origin}.SOURCE_COUNTS[{i}] {label.strip()}", sql)
+        for i, (label, sql) in enumerate(module.SOURCE_COUNTS)
+    ]
+    return statements
+
+
 # module path -> collector. The completeness guard below reads this same list,
 # so a script cannot be registered here and left half-covered in silence.
 _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
@@ -337,6 +459,8 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/run_seed_content_audit.py": _collect_seed_content_audit,
     "scripts/source_pdp_content_repair.py": _collect_source_pdp_content_repair,
     "scripts/source_pdp_offer_image_repair.py": _collect_source_pdp_offer_image_repair,
+    "scripts/backfill_agent_pdp_view.py": _collect_backfill_agent_pdp_view,
+    "scripts/report_enrichment_propagation_baseline.py": _collect_enrichment_baseline,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -350,6 +474,8 @@ _MIN_STATEMENTS = {
     "scripts/run_seed_content_audit.py": 4,
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,
+    "scripts/backfill_agent_pdp_view.py": 5,
+    "scripts/report_enrichment_propagation_baseline.py": 12,
 }
 
 

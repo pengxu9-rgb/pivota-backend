@@ -978,12 +978,26 @@ UPSERT_SQL = """
       pivota_signature_id = EXCLUDED.pivota_signature_id,
       product_group_id = EXCLUDED.product_group_id,
       brand = EXCLUDED.brand,
-      title = EXCLUDED.title,
-      description = EXCLUDED.description,
-      bullet_points = EXCLUDED.bullet_points,
-      usage_scenarios = EXCLUDED.usage_scenarios,
-      evidence_profile = EXCLUDED.evidence_profile,
-      required_disclaimers = EXCLUDED.required_disclaimers,
+      -- Overlay-derived columns. When the overlay READ failed (as opposed to
+      -- succeeding and finding nothing) the assembled row carries no values for
+      -- these, so assigning from EXCLUDED would erase what is already published.
+      -- Keep the current value in that case; a genuine removal still propagates,
+      -- because a successful fetch that found nothing leaves the flag false.
+      -- The CASTs are required: an untyped bind compared inside CASE is one of
+      -- the IndeterminateDatatype shapes the prepare gate rejects.
+      title = CASE WHEN CAST(:preserve_enrichment AS boolean)
+                   THEN agent_pdp_view.title ELSE EXCLUDED.title END,
+      description = CASE WHEN CAST(:preserve_enrichment AS boolean)
+                   THEN agent_pdp_view.description ELSE EXCLUDED.description END,
+      bullet_points = CASE WHEN CAST(:preserve_enrichment AS boolean)
+                   THEN agent_pdp_view.bullet_points ELSE EXCLUDED.bullet_points END,
+      usage_scenarios = CASE WHEN CAST(:preserve_enrichment AS boolean)
+                   THEN agent_pdp_view.usage_scenarios ELSE EXCLUDED.usage_scenarios END,
+      evidence_profile = CASE WHEN CAST(:preserve_evidence AS boolean)
+                   THEN agent_pdp_view.evidence_profile ELSE EXCLUDED.evidence_profile END,
+      required_disclaimers = CASE WHEN CAST(:preserve_evidence AS boolean)
+                   THEN agent_pdp_view.required_disclaimers
+                   ELSE EXCLUDED.required_disclaimers END,
       image_url = EXCLUDED.image_url,
       image_urls = EXCLUDED.image_urls,
       currency = EXCLUDED.currency,
@@ -1042,7 +1056,36 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     # fashion fields are plain text + float and pass through unchanged.
     params["size_guide"] = to_jsonb(row.get("size_guide"))
     params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
+    # Default FALSE, so every existing caller that builds a row without going
+    # through build_agent_pdp_view_row keeps the previous overwrite semantics
+    # rather than silently preserving stale overlays.
+    params["preserve_enrichment"] = bool(row.get("preserve_enrichment"))
+    params["preserve_evidence"] = bool(row.get("preserve_evidence"))
     return params
+
+
+class _FetchFailed:
+    """Sentinel: the overlay fetch ITSELF failed, as opposed to succeeding and
+    finding nothing.
+
+    Without this distinction both outcomes arrive as None, `assemble_row` builds
+    a row with the overlay columns empty, and UPSERT_SQL — which assigns every
+    column from EXCLUDED — writes those empties over a row that was serving real
+    curated copy. A transient `get_enrichment` hiccup during one reconciler pass
+    therefore strips the overlay permanently: the write stamps refreshed_at=NOW(),
+    and the reconciler only re-selects keys whose truth timestamps moved PAST
+    refreshed_at, so the repaired-by-the-next-sweep assumption does not hold. The
+    row silently stops serving its enrichment until unrelated catalog truth
+    changes.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<overlay-fetch-failed>"
+
+
+FETCH_FAILED = _FetchFailed()
 
 
 async def _fetch_enrichment_for_canonical(
@@ -1070,6 +1113,7 @@ async def _fetch_enrichment_for_canonical(
     # the entity, even if attest keyed it to a non-canonical seed beside a synced
     # product that wins pick_canonical), else fall back to the canonical's overlay.
     canonical_overlay: Optional[Dict[str, Any]] = None
+    any_fetch_failed = False
     for product in products:
         ident = (
             product.get("merchant_id"),
@@ -1085,6 +1129,7 @@ async def _fetch_enrichment_for_canonical(
                 "agent_pdp_view enrichment overlay fetch failed (best-effort): %s",
                 str(exc)[:200],
             )
+            any_fetch_failed = True
             continue
         if not overlay:
             continue
@@ -1092,6 +1137,11 @@ async def _fetch_enrichment_for_canonical(
             return overlay  # authoritative brand copy — wins immediately
         if ident == canonical_key:
             canonical_overlay = overlay
+    if canonical_overlay is None and any_fetch_failed:
+        # We have no overlay AND at least one read errored, so "there is no
+        # overlay" is not a conclusion we are entitled to draw. Say so, and let
+        # the caller preserve whatever is already published.
+        return FETCH_FAILED
     return canonical_overlay
 
 
@@ -1114,9 +1164,49 @@ async def refresh_agent_pdp_view_for_content_key(
     wraps this best-effort so a stale PDP cache never breaks ingest.
     """
     read_db = db or database
+    row = await build_agent_pdp_view_row(
+        content_key, refresh_source=refresh_source, db=read_db
+    )
+    if row is None:
+        return False
+    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
+    return True
+
+
+async def build_agent_pdp_view_row(
+    content_key: str,
+    *,
+    refresh_source: str,
+    db: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch every source row for a content_key and assemble the view row.
+
+    The read half of refresh_agent_pdp_view_for_content_key, split out so a
+    caller can PREVIEW the next row state without writing it. Returns None when
+    there is nothing to build (no catalog rows, or too thin a row to be useful —
+    no title).
+
+    NOT side-effect-free, despite reading like it. It is free of side effects on
+    agent_pdp_view — nothing here writes the view — but the overlay fetch reaches
+    `db.product_enrichment.get_enrichment`, which calls
+    `ensure_product_enrichment_table()` and issues CREATE TABLE / ADD COLUMN /
+    CREATE INDEX. A module-global flag makes that once per process, but the first
+    call takes brief ACCESS EXCLUSIVE locks, and under a read-only role the DDL
+    fails, the flag is never set, and it is retried on EVERY subsequent call.
+    `seller_trust_bulk` has the same shape. So a "dry run" pointed at production
+    still executes DDL there; say so rather than let an operator infer otherwise.
+
+    Assembling through this function rather than calling assemble_row directly
+    is what keeps the evidence / enrichment / seller-trust overlays attached. A
+    caller that skips it gets a row with those fields None, and UPSERT_SQL sets
+    every column from EXCLUDED — so writing such a row DELETES the enrichment,
+    evidence_profile and required_disclaimers already serving on it. That is not
+    hypothetical: scripts/backfill_agent_pdp_view.py did exactly this.
+    """
+    read_db = db or database
     products = await fetch_products_for_key(content_key, db=read_db)
     if not products:
-        return False
+        return None
     product_keys = [p["product_key"] for p in products if p.get("product_key")]
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
@@ -1126,7 +1216,14 @@ async def refresh_agent_pdp_view_for_content_key(
     # fetch to members safe to attribute to the served row, so we never bake
     # Brand A's substantiated claim onto Brand B (see evidence_safe_product_keys).
     evidence_keys = evidence_safe_product_keys(products, skus)
-    evidence = await fetch_evidence_for_keys(evidence_keys, db=read_db)
+    try:
+        evidence = await fetch_evidence_for_keys(evidence_keys, db=read_db)
+    except Exception as exc:  # noqa: BLE001 — see _FetchFailed
+        logger.warning(
+            "agent_pdp_view evidence fetch failed; preserving published evidence: %s",
+            str(exc)[:200],
+        )
+        evidence = FETCH_FAILED
     # E2 publish bridge: overlay the Pivota enrichment (generated/curated
     # description_markdown) so it reaches the served PDP AND the
     # serving-eligibility gate. Best-effort; None keeps the raw description.
@@ -1147,21 +1244,27 @@ async def refresh_agent_pdp_view_for_content_key(
             str(exc)[:200],
         )
 
+    # Resolve the tri-state. A failed fetch contributes NO values and instead
+    # tells the write to keep whatever is already published for those columns;
+    # a successful fetch that found nothing writes empties as before, so a
+    # genuine removal (an employee deleting enrichment) still propagates.
+    preserve_enrichment = enrichment is FETCH_FAILED
+    preserve_evidence = evidence is FETCH_FAILED
     row = assemble_row(
         content_key=content_key,
         products=products,
         skus=skus,
         offers=offers,
         external_seed=external_seed,
-        evidence=evidence,
+        evidence=None if preserve_evidence else evidence,
         refresh_source=refresh_source,
-        enrichment=enrichment,
+        enrichment=None if preserve_enrichment else enrichment,
         seller_trust_by_id=seller_trust_by_id,
     )
-    if row is None:
-        return False
-    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
-    return True
+    if row is not None:
+        row["preserve_enrichment"] = preserve_enrichment
+        row["preserve_evidence"] = preserve_evidence
+    return row
 
 
 # ---------------------------------------------------------------------
@@ -1324,11 +1427,19 @@ async def refresh_agent_pdp_view_for_enrichment_write(
         return False
     read_db = db or database
     try:
+        # The enrichment domain calls this identifier `platform_product_id`
+        # (it is the param name on upsert_enrichment / get_enrichment); on
+        # catalog_products the SAME value is stored as `source_product_id`.
+        # The column below MUST use the catalog spelling — see
+        # _fetch_enrichment_for_canonical, which builds the identical triple.
+        # Shipped as `platform_product_id`, which is not a column on this
+        # table, so every call raised UndefinedColumn into the best-effort
+        # except below and this bridge silently never propagated anything.
         row = await read_db.fetch_one(
             "SELECT content_key FROM catalog_products "
             "WHERE merchant_id = :merchant_id "
             "  AND platform = :platform "
-            "  AND platform_product_id = :platform_product_id "
+            "  AND source_product_id = :platform_product_id "
             "  AND content_key IS NOT NULL "
             "LIMIT 1",
             {

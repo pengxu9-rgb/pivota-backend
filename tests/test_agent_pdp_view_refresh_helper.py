@@ -1,6 +1,20 @@
 """Tests for refresh_agent_pdp_view_for_content_key — the canonical
 fetch->assemble->upsert orchestration used by the catalog_sync auto-servable
-hook (so a fresh internal-merchant SKU gets an APV row before recompute)."""
+hook (so a fresh internal-merchant SKU gets an APV row before recompute).
+
+🚨 WHAT THE _FakeDB CASES BELOW CANNOT PROVE. `_FakeDB.fetch_one` returns a
+canned row whatever SQL it is handed, so the enrichment-write cases assert only
+the CONTROL FLOW around the bridge — the flag gate, the identity guard, the
+best-effort swallow. They cannot see whether the statement is valid, and they
+did not: all four passed for weeks while the bridge queried
+`catalog_products.platform_product_id`, a column that does not exist, so every
+real call raised UndefinedColumn into the swallow and the bridge was dead.
+
+The statement itself is constrained in two other places, and both are load
+bearing: tests/test_enrichment_bridge_and_cohort_postgres.py EXECUTES it against
+a real catalog_products row (reverting the column turns it red), and the
+repo-wide prepare gate plans it. Do not add a case here that claims the bridge
+"works" — this file cannot support that claim."""
 
 from __future__ import annotations
 
@@ -13,6 +27,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services import agent_pdp_view_assembler as apv  # noqa: E402
+
+_PRODUCT_FOR_TRISTATE = {
+    "product_key": "pk-1", "merchant_id": "m1", "platform": "shopify",
+    "source_product_id": "sp-1", "title": "Glow Serum",
+    "description": "A long enough description for the agent PDP view row.",
+    "brand": "AuraGlow",
+}
 
 
 class _FakeDB:
@@ -250,3 +271,91 @@ async def test_enrichment_write_refresh_swallows_errors(monkeypatch: pytest.Monk
         "m1", "shopify", "sp-1", db=_BoomDB()
     )
     assert out is False
+
+
+# ---------------------------------------------------------------------------
+# tri-state overlay fetch
+# ---------------------------------------------------------------------------
+# A failed overlay READ and a successful read that finds NOTHING both used to
+# arrive as None, so the write could not tell "preserve what is published" from
+# "the operator deleted it". These pin the distinction at the point it is made;
+# tests/test_agent_pdp_view_overlay_preservation_postgres.py proves the UPSERT
+# then honours it against real Postgres.
+
+@pytest.mark.asyncio
+async def test_a_failed_enrichment_fetch_asks_the_write_to_preserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fetches(monkeypatch, products=[dict(_PRODUCT_FOR_TRISTATE)])
+
+    async def boom(products):
+        return apv.FETCH_FAILED
+
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", boom)
+    row = await apv.build_agent_pdp_view_row("ck-1", refresh_source="t", db=_FakeDB())
+    assert row is not None
+    assert row["preserve_enrichment"] is True
+    assert row["preserve_evidence"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_successful_fetch_finding_nothing_does_not_preserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The half that keeps this a tri-state rather than a never-downgrade rule:
+    a genuine removal must still reach the served row."""
+    _patch_fetches(monkeypatch, products=[dict(_PRODUCT_FOR_TRISTATE)])
+
+    async def absent(products):
+        return None
+
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", absent)
+    row = await apv.build_agent_pdp_view_row("ck-1", refresh_source="t", db=_FakeDB())
+    assert row is not None
+    assert row["preserve_enrichment"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_evidence_fetch_preserves_evidence_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fetches(monkeypatch, products=[dict(_PRODUCT_FOR_TRISTATE)])
+
+    async def boom(product_keys, *, db=None):
+        raise RuntimeError("evidence store down")
+
+    async def absent(products):
+        return None
+
+    monkeypatch.setattr(apv, "fetch_evidence_for_keys", boom)
+    monkeypatch.setattr(apv, "_fetch_enrichment_for_canonical", absent)
+    row = await apv.build_agent_pdp_view_row("ck-1", refresh_source="t", db=_FakeDB())
+    assert row is not None
+    assert row["preserve_evidence"] is True
+    assert row["preserve_enrichment"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_sentinel_is_reached_through_the_real_swallow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the REAL _fetch_enrichment_for_canonical, not a stub of it.
+
+    The per-member `except ... continue` inside it is the actual source of the
+    ambiguity; a test that replaces the whole function cannot show that a raising
+    get_enrichment now yields FETCH_FAILED rather than None.
+    """
+    import db.product_enrichment as pe_module
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("connection reset by peer")
+
+    monkeypatch.setattr(pe_module, "get_enrichment", boom)
+    result = await apv._fetch_enrichment_for_canonical([dict(_PRODUCT_FOR_TRISTATE)])
+    assert result is apv.FETCH_FAILED
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(pe_module, "get_enrichment", nothing)
+    assert await apv._fetch_enrichment_for_canonical([dict(_PRODUCT_FOR_TRISTATE)]) is None
