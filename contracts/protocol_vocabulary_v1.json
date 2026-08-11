@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "authority": "pivota-backend: services/agent_checkout_kill_switch.py (guarded_protocols) + services/protocols/__init__.py (labels). Mirrored byte-identical into PIVOTA-Agent contracts/protocol_vocabulary_v1.json; both repos pin this file's sha256 in a test, so changing the vocabulary anywhere forces a conscious re-mirror (same mechanism as the content_key corpus, #1696/#1942).",
+  "guarded_protocols": ["acp", "ap2", "ucp"],
+  "default_protocol": "pdp_direct",
+  "known_protocol_labels": ["acp_session", "creator_token", "mcp_session", "pdp_direct", "resume_order", "ucp_session"],
+  "gateway_delegated_lane_protocol": "acp"
+}
