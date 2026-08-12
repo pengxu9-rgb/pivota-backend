@@ -28,9 +28,11 @@ API_VERSION_BY_PLATFORM = {
     "bigcommerce": "v3",
 }
 
+# No prefix here: main.py mounts this router at the real prefix AND at the
+# legacy /mcp alias, so the rename cannot break a caller mid-deploy.
 router = APIRouter()
 
-@router.get("/mcp/status")
+@router.get("/status")
 async def get_mcp_status(
     current_user: dict = Depends(get_current_user)
 ):
@@ -97,7 +99,7 @@ async def get_mcp_status(
             }
         }
 
-@router.post("/mcp/test-connection")
+@router.post("/test-connection")
 async def test_mcp_connection(
     platform: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
@@ -189,7 +191,7 @@ async def test_mcp_connection(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Connection test failed: {str(e)}")
 
-@router.get("/mcp/merchants")
+@router.get("/merchants")
 async def get_mcp_merchants(
     current_user: dict = Depends(get_current_user)
 ):
@@ -238,7 +240,7 @@ async def get_mcp_merchants(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get MCP merchants: {str(e)}")
 
-@router.get("/mcp/analytics")
+@router.get("/analytics")
 async def get_mcp_analytics(
     days: int = 30,
     current_user: dict = Depends(get_current_user)
@@ -311,7 +313,7 @@ async def get_mcp_analytics(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get MCP analytics: {str(e)}")
 
-@router.post("/mcp/sync-all")
+@router.post("/sync-all")
 async def sync_all_stores(
     current_user: dict = Depends(get_current_user)
 ):
@@ -420,7 +422,7 @@ async def sync_all_stores(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to sync stores: {str(e)}")
 
-@router.get("/mcp/logs")
+@router.get("/logs")
 async def get_mcp_logs(
     limit: int = 50,
     current_user: dict = Depends(get_current_user)

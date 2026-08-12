@@ -235,6 +235,11 @@ from routes.admin_amazon_orders import router as admin_amazon_orders_router
 from routes.admin_amazon_fulfillment import router as admin_amazon_fulfillment_router
 from routes.products_cache_maintenance import router as products_cache_maintenance_router
 from routes.mcp_e2e_test import router as mcp_e2e_test_router
+from routes.platform_connector_prefix import (
+    LEGACY_MCP_PREFIX,
+    PLATFORM_CONNECTORS_PREFIX,
+    legacy_mcp_prefix_deprecation,
+)
 from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
 from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
@@ -905,7 +910,15 @@ if (
 else:
     logger.info("⏭️  Readiness audit / UCP thin-slice router disabled")
 app.include_router(products_cache_maintenance_router)  # Products cache maintenance
-app.include_router(mcp_e2e_test_router)  # MCP end-to-end integration test
+# Platform-connector test (Shopify/Wix/Woo/BigCommerce connection check).
+# Canonical prefix + a WORKING legacy /mcp alias — see routes/platform_connector_prefix.
+app.include_router(mcp_e2e_test_router, prefix=PLATFORM_CONNECTORS_PREFIX)
+app.include_router(
+    mcp_e2e_test_router,
+    prefix=LEGACY_MCP_PREFIX,
+    dependencies=[Depends(legacy_mcp_prefix_deprecation)],
+    include_in_schema=False,
+)
 app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
@@ -1021,7 +1034,14 @@ app.include_router(employee_products_router)  # Employee products endpoints (MVP
 app.include_router(employee_pdp_governance_router)  # Employee PDP governance projection/review
 app.include_router(employee_kb_monitoring_router)  # Aurora KB v0 monitoring summary
 app.include_router(employees_security_router)  # Employees and security
-app.include_router(mcp_mgmt_router)  # MCP management
+# Platform-connector management (status / test-connection / analytics / logs).
+app.include_router(mcp_mgmt_router, prefix=PLATFORM_CONNECTORS_PREFIX)
+app.include_router(
+    mcp_mgmt_router,
+    prefix=LEGACY_MCP_PREFIX,
+    dependencies=[Depends(legacy_mcp_prefix_deprecation)],
+    include_in_schema=False,
+)
 app.include_router(employee_reviews_router)  # Employee Reviews Center (imports/governance)
 app.include_router(buyer_reviews_router)  # Buyer Reviews (submission; default disabled)
 app.include_router(questions_router)  # Buyer Questions (UGC)
@@ -1127,8 +1147,16 @@ app.include_router(simple_ws_router)  # Simple WebSocket
 app.include_router(product_quality_router)  # Internal product quality preview (Merchant Portal)
 
 if MCP_AVAILABLE:
-    app.include_router(mcp_router)
-    logger.info("✅ MCP router included")
+    # Retired simulation surface: every endpoint answers 501. Mounted at both
+    # prefixes purely so anything still pointed at it gets the refusal.
+    app.include_router(mcp_router, prefix=PLATFORM_CONNECTORS_PREFIX)
+    app.include_router(
+        mcp_router,
+        prefix=LEGACY_MCP_PREFIX,
+        dependencies=[Depends(legacy_mcp_prefix_deprecation)],
+        include_in_schema=False,
+    )
+    logger.info("✅ Legacy connector simulation router included (all endpoints 501)")
 
 if OPERATIONS_AVAILABLE:
     app.include_router(operations_router)
