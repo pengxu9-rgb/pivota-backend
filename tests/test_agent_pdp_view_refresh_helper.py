@@ -18,6 +18,7 @@ repo-wide prepare gate plans it. Do not add a case here that claims the bridge
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -394,6 +395,7 @@ async def test_an_unresolvable_identity_is_logged_not_swallowed(
     monkeypatch: pytest.MonkeyPatch, caplog
 ) -> None:
     monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    apv._UNRESOLVABLE_WARNED.clear()
     db = _IdentityDB(None)  # no catalog row under this triple
 
     with caplog.at_level(logging.WARNING, logger=apv.logger.name):
@@ -402,17 +404,16 @@ async def test_an_unresolvable_identity_is_logged_not_swallowed(
         )
 
     assert out is False
-    records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
     hits = [
-        m for m in records
-        if m.get("event") == "enrichment_write_pdp_refresh_unresolvable"
+        json.loads(r.getMessage()) for r in caplog.records
+        if isinstance(r.msg, str) and "enrichment_write_pdp_refresh_unresolvable" in r.msg
     ]
     assert hits, "an unresolvable enrichment write was swallowed silently"
     assert hits[0]["reason"] == "no_catalog_row_for_identity"
     # The identity must be IN the log — a warning that does not say which product
     # drifted cannot be acted on.
     assert hits[0]["merchant_id"] == "m-drifted"
-    assert hits[0]["platform_product_id"] == "sp-old-slug"
+    assert hits[0]["example_platform_product_id"] == "sp-old-slug"
 
 
 @pytest.mark.asyncio
@@ -424,6 +425,7 @@ async def test_an_unkeyed_product_is_reported_as_its_own_reason(
     "no catalog row" would send someone hunting for identity drift that is not
     there."""
     monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    apv._UNRESOLVABLE_WARNED.clear()
     db = _IdentityDB({"content_key": None})
 
     with caplog.at_level(logging.WARNING, logger=apv.logger.name):
@@ -433,37 +435,153 @@ async def test_an_unkeyed_product_is_reported_as_its_own_reason(
 
     assert out is False
     hits = [
-        r.msg for r in caplog.records
-        if isinstance(r.msg, dict)
-        and r.msg.get("event") == "enrichment_write_pdp_refresh_unresolvable"
+        json.loads(r.getMessage()) for r in caplog.records
+        if isinstance(r.msg, str) and "enrichment_write_pdp_refresh_unresolvable" in r.msg
     ]
-    assert hits and hits[0]["reason"] == "catalog_row_has_null_content_key"
+    assert hits and hits[0]["reason"] == "catalog_row_has_no_content_key"
+
+
+class _PredicateHonouringCatalog:
+    """A fake catalog that EVALUATES the lookup's content_key predicate.
+
+    The test this replaces asserted on SQL TEXT. That is the anti-pattern
+    tests/test_enrichment_bridge_and_cohort_postgres.py exists to eliminate, and
+    it failed the same way: `AND NOT (content_key IS NULL)` — semantically the
+    exact filter the widening removed, spelled differently — passed the grep and
+    every other test in the repo. This fake holds ONE row under the identity with
+    content_key=None and applies whatever NULL-ness condition the statement
+    carries, so any spelling that filters unkeyed rows makes the row vanish and
+    the reason flips to no_catalog_row_for_identity.
+    """
+
+    ROW = {"merchant_id": "m1", "platform": "shopify",
+           "source_product_id": "sp-1", "content_key": None}
+
+    def __init__(self) -> None:
+        self.params_seen: List[Dict[str, Any]] = []
+
+    async def fetch_one(self, sql: str, params: Dict[str, Any]):
+        self.params_seen.append(dict(params))
+        normalized = " ".join(sql.split()).lower()
+        if (self.ROW["merchant_id"] != params.get("merchant_id")
+                or self.ROW["platform"] != params.get("platform")
+                or self.ROW["source_product_id"] != params.get("platform_product_id")):
+            return None
+        # Any spelling that demands a non-NULL content_key excludes this row.
+        excludes_unkeyed = (
+            "content_key is not null" in normalized
+            or "not (content_key is null)" in normalized
+            or "btrim(content_key) <> ''" in normalized
+            or "coalesce(content_key" in normalized
+        )
+        if excludes_unkeyed and self.ROW["content_key"] is None:
+            return None
+        return {"content_key": self.ROW["content_key"]}
+
+    async def execute(self, sql: str, params: Dict[str, Any]) -> None:
+        raise AssertionError("must not write for an unkeyed product")
 
 
 @pytest.mark.asyncio
-async def test_the_lookup_does_not_filter_out_unkeyed_rows(
-    monkeypatch: pytest.MonkeyPatch
+async def test_an_unkeyed_row_reaches_the_bridge_and_is_named_correctly(
+    monkeypatch: pytest.MonkeyPatch, caplog
 ) -> None:
-    """The predicate must NOT carry `content_key IS NOT NULL`.
+    """One behavioural test covering what five separate gaps left unconstrained:
+    the widened predicate, the reason code, the logged identity, the exact bound
+    params, the logger the record lands on, and its level."""
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    apv._UNRESOLVABLE_WARNED.clear()
+    db = _PredicateHonouringCatalog()
 
-    With that filter an unkeyed product returned no row and was reported as
-    "no catalog row for identity" — the wrong diagnosis, and one that would send
-    someone looking for an id-space migration that never happened. Widening is
-    safe because (merchant_id, platform, source_product_id) is UNIQUE
-    (idx_catalog_products_source_identity, migration 058), so at most one row can
-    match either way.
+    with caplog.at_level(logging.DEBUG, logger=apv.logger.name):
+        out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+            "m1", "shopify", "sp-1", db=db
+        )
+
+    assert out is False
+    # The identity was bound to the RIGHT parameters — a fake that ignores params
+    # cannot catch merchant_id and platform_product_id being swapped.
+    assert db.params_seen == [
+        {"merchant_id": "m1", "platform": "shopify", "platform_product_id": "sp-1"}
+    ]
+    records = [
+        r for r in caplog.records
+        if isinstance(r.msg, str) and "enrichment_write_pdp_refresh_unresolvable" in r.msg
+    ]
+    assert records, "an unkeyed product produced no warning"
+    record = records[0]
+    # WARNING exactly. ERROR still satisfies caplog's floor but would become a
+    # billed Sentry event (main.py initialises the SDK at sample_rate=1.0, whose
+    # LoggingIntegration promotes ERROR from breadcrumb to event).
+    assert record.levelno == logging.WARNING, f"level is {record.levelname}"
+    # On THIS module's logger — caplog's handler is on the root, so without this
+    # the warnings could move to a logger prod filters out and stay green.
+    assert record.name == apv.logger.name
+    payload = json.loads(record.getMessage())  # must be parseable JSON, not a repr
+    assert payload["reason"] == "catalog_row_has_no_content_key"
+    assert payload["merchant_id"] == "m1"
+    assert payload["example_platform_product_id"] == "sp-1"
+
+
+@pytest.mark.asyncio
+async def test_a_whitespace_content_key_never_reaches_the_refresh(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """'   ' is truthy. Without .strip() it skipped both branches and was passed
+    to refresh_agent_pdp_view_for_content_key, which would assemble and UPSERT an
+    agent_pdp_view row keyed on whitespace."""
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+
+    for blank in ("", "   ", "\t"):
+        apv._UNRESOLVABLE_WARNED.clear()
+        caplog.clear()
+        db = _IdentityDB({"content_key": blank})
+        with caplog.at_level(logging.WARNING, logger=apv.logger.name):
+            out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+                "m1", "shopify", "sp-1", db=db
+            )
+        assert out is False, f"{blank!r} was treated as a usable content_key"
+        payloads = [
+            json.loads(r.getMessage()) for r in caplog.records
+            if isinstance(r.msg, str) and "unresolvable" in r.msg
+        ]
+        assert payloads and payloads[0]["reason"] == "catalog_row_has_no_content_key", (
+            f"{blank!r} did not report as an unkeyed row"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_batch_over_one_merchant_emits_one_line_not_hundreds(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """The alert has to survive an ordinary worker pass.
+
+    jobs/product_enrichment_worker.py walks every cached row for a merchant and
+    the bulk endpoint allows 1000, against a corpus with 248 known-unresolvable
+    rows. One line per write would saturate on day one and be muted, hiding the
+    next drift exactly as the silence did.
     """
     monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
-    db = _IdentityDB({"content_key": None})
+    apv._UNRESOLVABLE_WARNED.clear()
+    db = _IdentityDB(None)
 
-    await apv.refresh_agent_pdp_view_for_enrichment_write("m1", "shopify", "sp-1", db=db)
+    with caplog.at_level(logging.WARNING, logger=apv.logger.name):
+        for i in range(200):
+            await apv.refresh_agent_pdp_view_for_enrichment_write(
+                "m-stale", "shopify", f"sp-{i}", db=db
+            )
+        # A DIFFERENT merchant is still worth its own line — that shape is what
+        # separates an id-space migration from one merchant's stale cache.
+        await apv.refresh_agent_pdp_view_for_enrichment_write(
+            "m-other", "shopify", "sp-x", db=db
+        )
 
-    assert db.sql_seen, "the catalog lookup never ran"
-    sql = " ".join(db.sql_seen[0].split())
-    assert "content_key IS NOT NULL" not in sql, (
-        "the lookup filters out unkeyed rows again, so an unkeyed product is "
-        "misreported as a missing one"
-    )
+    payloads = [
+        json.loads(r.getMessage()) for r in caplog.records
+        if isinstance(r.msg, str) and "unresolvable" in r.msg
+    ]
+    assert len(payloads) == 2, f"expected 2 lines (one per merchant), got {len(payloads)}"
+    assert {p["merchant_id"] for p in payloads} == {"m-stale", "m-other"}
 
 
 @pytest.mark.asyncio
@@ -491,6 +609,5 @@ async def test_a_resolvable_identity_logs_no_warning(
     assert out is True
     assert not [
         r for r in caplog.records
-        if isinstance(r.msg, dict)
-        and r.msg.get("event") == "enrichment_write_pdp_refresh_unresolvable"
+        if isinstance(r.msg, str) and "enrichment_write_pdp_refresh_unresolvable" in r.msg
     ], "the happy path emitted a drift warning"
