@@ -1477,6 +1477,59 @@ def _propagate_enrichment_on_write_enabled() -> bool:
     }
 
 
+# Distinct (reason, merchant_id, platform) combinations already warned about in
+# this process. See _warn_unresolvable_once.
+_UNRESOLVABLE_WARNED: set = set()
+_UNRESOLVABLE_WARN_CAP = 512
+
+
+def _warn_unresolvable_once(
+    reason: str,
+    merchant_id: str,
+    platform: str,
+    platform_product_id: str,
+) -> None:
+    """Warn at most once per (reason, merchant, platform) per process.
+
+    ONE LINE PER WRITE WOULD SATURATE THE ALERT ON DAY ONE, defeating the point.
+    The bridge is reached from paths keyed on the products_cache identity space —
+    jobs/product_enrichment_worker.py walks every non-expired cached row for a
+    merchant, and routes/merchant_products.py's bulk endpoint allows up to 1000 —
+    while it resolves against catalog_products. A cached product that was never
+    catalog-synced is therefore unresolvable as a matter of course, not as drift,
+    and prod already carries 248 such rows. Per-write WARNING would emit hundreds
+    of lines on an ordinary worker pass, be muted within a day, and hide the next
+    real drift exactly as the silence did.
+
+    Deduping on (reason, merchant, platform) bounds the volume while keeping the
+    discriminating signal: a routine pass over one merchant's stale cache
+    collapses to ONE line, whereas an id-space migration moving products out from
+    under many merchants still produces one line per merchant. The SHAPE of the
+    burst separates them, which the raw count never could.
+
+    JSON, not a bare dict. This app configures no root log handler, so records
+    fall through to `logging.lastResort` and a dict `msg` renders as a
+    single-quoted Python repr that no JSON pipeline can parse a field out of.
+    middleware/structured_logging.py:118 is the working precedent.
+    """
+    key = (reason, merchant_id, platform)
+    if key in _UNRESOLVABLE_WARNED:
+        return
+    if len(_UNRESOLVABLE_WARNED) >= _UNRESOLVABLE_WARN_CAP:
+        return  # 512 distinct merchant/platform pairs is already ample signal
+    _UNRESOLVABLE_WARNED.add(key)
+    logger.warning(json.dumps({
+        "event": "enrichment_write_pdp_refresh_unresolvable",
+        "reason": reason,
+        "merchant_id": merchant_id,
+        "platform": platform,
+        # The FIRST offending id only: this line stands for every write sharing
+        # this (reason, merchant, platform), not just the one that emitted it.
+        "example_platform_product_id": platform_product_id,
+        "note": "further occurrences for this merchant/platform are suppressed",
+    }))
+
+
 async def refresh_agent_pdp_view_for_enrichment_write(
     merchant_id: Optional[str],
     platform: Optional[str],
@@ -1512,12 +1565,19 @@ async def refresh_agent_pdp_view_for_enrichment_write(
         # Shipped as `platform_product_id`, which is not a column on this
         # table, so every call raised UndefinedColumn into the best-effort
         # except below and this bridge silently never propagated anything.
+        # No `AND content_key IS NOT NULL` here, deliberately. The filter used to
+        # be in this predicate, which collapsed two different situations into one
+        # empty result: "no product under this identity" and "the product exists
+        # but has not been content-keyed yet". Those want different fixes, and the
+        # warnings below can only tell them apart if the row comes back either
+        # way. Safe to widen: (merchant_id, platform, source_product_id) is UNIQUE
+        # (idx_catalog_products_source_identity, migration 058), so at most one
+        # row matches and dropping the filter cannot change WHICH row is picked.
         row = await read_db.fetch_one(
             "SELECT content_key FROM catalog_products "
             "WHERE merchant_id = :merchant_id "
             "  AND platform = :platform "
             "  AND source_product_id = :platform_product_id "
-            "  AND content_key IS NOT NULL "
             "LIMIT 1",
             {
                 "merchant_id": str(merchant_id),
@@ -1525,10 +1585,50 @@ async def refresh_agent_pdp_view_for_enrichment_write(
                 "platform_product_id": str(platform_product_id),
             },
         )
+        # WHY THESE TWO WARNINGS EXIST. Both branches below mean "enrichment was
+        # just written against an identity the catalog cannot resolve", and both
+        # used to return False in silence. That silence is how 248 of 360
+        # product_enrichment rows (69%, measured 2026-08-11) drifted into being
+        # unjoinable without anyone noticing: catalog_products was re-keyed by the
+        # ADR-009 / A9-4 id-space migration and by delete-and-recreate on two
+        # merchants, while product_enrichment kept the old spelling. Nothing
+        # re-keys the overlay when identity moves, so the only signal available is
+        # at write time — here.
+        #
+        # The two cases are logged separately because they call for different
+        # fixes. NO ROW means no product exists under this triple at all —
+        # identity drift, or enrichment written for a products_cache-only product
+        # that was never catalog-synced (jobs/product_enrichment_worker.py
+        # iterates products_cache and can still mint these). NULL CONTENT_KEY
+        # means the product exists but has not been content-keyed yet, which is a
+        # sequencing issue that resolves itself once the key is minted, and needs
+        # no intervention.
+        #
+        # WARNING, not error: the enrichment write itself succeeded and the caller
+        # is best-effort. Volume is one line per unresolvable write, so a burst
+        # means a migration moved ids out from under the overlay — which is
+        # exactly the thing worth paging on.
         if not row:
+            _warn_unresolvable_once(
+                "no_catalog_row_for_identity",
+                str(merchant_id), str(platform), str(platform_product_id),
+            )
             return False
-        content_key = str(dict(row).get("content_key") or "")
+        # .strip() is load-bearing, not tidiness. Without it a whitespace-only
+        # content_key ('   ') is TRUTHY, skips both branches, and is handed to
+        # refresh_agent_pdp_view_for_content_key — which assembles and UPSERTs an
+        # agent_pdp_view row keyed on whitespace. An empty string took the branch
+        # below and reported "null_content_key", a lie about the column that
+        # sends an operator to `WHERE content_key IS NULL` to find nothing. The
+        # repo's canonical unkeyed test is `IS NULL OR btrim(...) = ''`
+        # (scripts/backfill_pg_singleton.py:154); this matches it, so NULL, ''
+        # and '   ' all land in one honestly-named branch.
+        content_key = str(dict(row).get("content_key") or "").strip()
         if not content_key:
+            _warn_unresolvable_once(
+                "catalog_row_has_no_content_key",
+                str(merchant_id), str(platform), str(platform_product_id),
+            )
             return False
         return await refresh_agent_pdp_view_for_content_key(
             content_key,
