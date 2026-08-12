@@ -18,6 +18,7 @@ repo-wide prepare gate plans it. Do not add a case here that claims the bridge
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -361,3 +362,135 @@ async def test_the_sentinel_is_reached_through_the_real_swallow(
 
     monkeypatch.setattr(pe_module, "get_enrichments_for_products", nothing)
     assert await apv._fetch_enrichment_for_canonical([dict(_PRODUCT_FOR_TRISTATE)]) is None
+
+
+# ---------------------------------------------------------------------------
+# unresolvable-identity warnings
+# ---------------------------------------------------------------------------
+# 248 of 360 product_enrichment rows (69%, measured 2026-08-11) are unjoinable:
+# catalog_products was re-keyed under them and nothing re-keys the overlay. The
+# bridge saw every one of those writes and returned False in silence, so the
+# drift was invisible until someone went looking. These pin the only signal that
+# exists at write time.
+
+class _IdentityDB:
+    """Returns whatever the catalog lookup should yield; records the SQL so the
+    widened predicate can be asserted on the statement actually sent."""
+
+    def __init__(self, row):
+        self._row = row
+        self.sql_seen: List[str] = []
+
+    async def fetch_one(self, sql: str, params: Dict[str, Any]):
+        self.sql_seen.append(sql)
+        return self._row
+
+    async def execute(self, sql: str, params: Dict[str, Any]) -> None:
+        raise AssertionError("must not write when the identity is unresolvable")
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_identity_is_logged_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    db = _IdentityDB(None)  # no catalog row under this triple
+
+    with caplog.at_level(logging.WARNING, logger=apv.logger.name):
+        out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+            "m-drifted", "shopify", "sp-old-slug", db=db
+        )
+
+    assert out is False
+    records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
+    hits = [
+        m for m in records
+        if m.get("event") == "enrichment_write_pdp_refresh_unresolvable"
+    ]
+    assert hits, "an unresolvable enrichment write was swallowed silently"
+    assert hits[0]["reason"] == "no_catalog_row_for_identity"
+    # The identity must be IN the log — a warning that does not say which product
+    # drifted cannot be acted on.
+    assert hits[0]["merchant_id"] == "m-drifted"
+    assert hits[0]["platform_product_id"] == "sp-old-slug"
+
+
+@pytest.mark.asyncio
+async def test_an_unkeyed_product_is_reported_as_its_own_reason(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A product that exists but is not content-keyed yet is a DIFFERENT problem
+    from one that does not exist: it needs no intervention. Reporting both as
+    "no catalog row" would send someone hunting for identity drift that is not
+    there."""
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    db = _IdentityDB({"content_key": None})
+
+    with caplog.at_level(logging.WARNING, logger=apv.logger.name):
+        out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+            "m1", "shopify", "sp-1", db=db
+        )
+
+    assert out is False
+    hits = [
+        r.msg for r in caplog.records
+        if isinstance(r.msg, dict)
+        and r.msg.get("event") == "enrichment_write_pdp_refresh_unresolvable"
+    ]
+    assert hits and hits[0]["reason"] == "catalog_row_has_null_content_key"
+
+
+@pytest.mark.asyncio
+async def test_the_lookup_does_not_filter_out_unkeyed_rows(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The predicate must NOT carry `content_key IS NOT NULL`.
+
+    With that filter an unkeyed product returned no row and was reported as
+    "no catalog row for identity" — the wrong diagnosis, and one that would send
+    someone looking for an id-space migration that never happened. Widening is
+    safe because (merchant_id, platform, source_product_id) is UNIQUE
+    (idx_catalog_products_source_identity, migration 058), so at most one row can
+    match either way.
+    """
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    db = _IdentityDB({"content_key": None})
+
+    await apv.refresh_agent_pdp_view_for_enrichment_write("m1", "shopify", "sp-1", db=db)
+
+    assert db.sql_seen, "the catalog lookup never ran"
+    sql = " ".join(db.sql_seen[0].split())
+    assert "content_key IS NOT NULL" not in sql, (
+        "the lookup filters out unkeyed rows again, so an unkeyed product is "
+        "misreported as a missing one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_resolvable_identity_logs_no_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """The happy path must stay quiet, or the signal is worthless."""
+    monkeypatch.setenv("SERVE_PDP_ENRICHMENT_ON_WRITE", "1")
+    _patch_fetches(
+        monkeypatch,
+        products=[{
+            "product_key": "pk-1", "merchant_id": "m1", "platform": "shopify",
+            "source_product_id": "sp-1", "title": "Glow Serum",
+            "description": "A long enough description for the agent PDP view row.",
+            "brand": "AuraGlow",
+        }],
+    )
+    db = _FakeDB(fetch_one_result={"content_key": "ck-resolved"})
+
+    with caplog.at_level(logging.WARNING, logger=apv.logger.name):
+        out = await apv.refresh_agent_pdp_view_for_enrichment_write(
+            "m1", "shopify", "sp-1", db=db
+        )
+
+    assert out is True
+    assert not [
+        r for r in caplog.records
+        if isinstance(r.msg, dict)
+        and r.msg.get("event") == "enrichment_write_pdp_refresh_unresolvable"
+    ], "the happy path emitted a drift warning"

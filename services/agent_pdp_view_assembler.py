@@ -1512,12 +1512,19 @@ async def refresh_agent_pdp_view_for_enrichment_write(
         # Shipped as `platform_product_id`, which is not a column on this
         # table, so every call raised UndefinedColumn into the best-effort
         # except below and this bridge silently never propagated anything.
+        # No `AND content_key IS NOT NULL` here, deliberately. The filter used to
+        # be in this predicate, which collapsed two different situations into one
+        # empty result: "no product under this identity" and "the product exists
+        # but has not been content-keyed yet". Those want different fixes, and the
+        # warnings below can only tell them apart if the row comes back either
+        # way. Safe to widen: (merchant_id, platform, source_product_id) is UNIQUE
+        # (idx_catalog_products_source_identity, migration 058), so at most one
+        # row matches and dropping the filter cannot change WHICH row is picked.
         row = await read_db.fetch_one(
             "SELECT content_key FROM catalog_products "
             "WHERE merchant_id = :merchant_id "
             "  AND platform = :platform "
             "  AND source_product_id = :platform_product_id "
-            "  AND content_key IS NOT NULL "
             "LIMIT 1",
             {
                 "merchant_id": str(merchant_id),
@@ -1525,10 +1532,47 @@ async def refresh_agent_pdp_view_for_enrichment_write(
                 "platform_product_id": str(platform_product_id),
             },
         )
+        # WHY THESE TWO WARNINGS EXIST. Both branches below mean "enrichment was
+        # just written against an identity the catalog cannot resolve", and both
+        # used to return False in silence. That silence is how 248 of 360
+        # product_enrichment rows (69%, measured 2026-08-11) drifted into being
+        # unjoinable without anyone noticing: catalog_products was re-keyed by the
+        # ADR-009 / A9-4 id-space migration and by delete-and-recreate on two
+        # merchants, while product_enrichment kept the old spelling. Nothing
+        # re-keys the overlay when identity moves, so the only signal available is
+        # at write time — here.
+        #
+        # The two cases are logged separately because they call for different
+        # fixes. NO ROW means no product exists under this triple at all —
+        # identity drift, or enrichment written for a products_cache-only product
+        # that was never catalog-synced (jobs/product_enrichment_worker.py
+        # iterates products_cache and can still mint these). NULL CONTENT_KEY
+        # means the product exists but has not been content-keyed yet, which is a
+        # sequencing issue that resolves itself once the key is minted, and needs
+        # no intervention.
+        #
+        # WARNING, not error: the enrichment write itself succeeded and the caller
+        # is best-effort. Volume is one line per unresolvable write, so a burst
+        # means a migration moved ids out from under the overlay — which is
+        # exactly the thing worth paging on.
         if not row:
+            logger.warning({
+                "event": "enrichment_write_pdp_refresh_unresolvable",
+                "reason": "no_catalog_row_for_identity",
+                "merchant_id": str(merchant_id),
+                "platform": str(platform),
+                "platform_product_id": str(platform_product_id),
+            })
             return False
         content_key = str(dict(row).get("content_key") or "")
         if not content_key:
+            logger.warning({
+                "event": "enrichment_write_pdp_refresh_unresolvable",
+                "reason": "catalog_row_has_null_content_key",
+                "merchant_id": str(merchant_id),
+                "platform": str(platform),
+                "platform_product_id": str(platform_product_id),
+            })
             return False
         return await refresh_agent_pdp_view_for_content_key(
             content_key,
