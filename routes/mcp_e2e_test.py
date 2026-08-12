@@ -18,7 +18,9 @@ from adapters.bigcommerce_adapter import (
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/mcp", tags=["mcp-e2e-test"])
+# No prefix here: main.py mounts this router at the real prefix AND at the
+# legacy /mcp alias (the employee portal still calls /mcp/test/{id}).
+router = APIRouter(tags=["platform-connector-test"])
 
 class MCPTestResult(BaseModel):
     component: str

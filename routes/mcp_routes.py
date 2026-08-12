@@ -1,6 +1,15 @@
 """
-MCP (Merchant Communication Protocol) API Routes
-Simulates agent-merchant communication for the full order flow
+Legacy "MCP" (Merchant Communication Protocol) simulation routes — FAIL CLOSED.
+
+This module never talked to a merchant. It is an in-memory SIMULATION over the
+hardcoded fixture in `ai_router/merchant_store.py` ("Cool Shoes EU", "Red
+Sneakers Size 42", ...). A prior audit fail-closed the WRITES (they raise 501);
+the READS were left serving that fixture, and were still doing so in production
+(GET /mcp/inventory/merchants returned the fake catalog) until 2026-08-11.
+
+Every endpoint now refuses with 501. Nothing here is a real inventory, order, or
+health signal. The whole module is a deletion candidate — it is kept only so the
+refusal is discoverable by anything still pointed at these paths.
 """
 
 from fastapi import APIRouter, HTTPException
@@ -18,7 +27,9 @@ from ai_router.merchant_store import (
 )
 from utils.logger import logger
 
-router = APIRouter(prefix="/mcp", tags=["mcp"])
+# No prefix here: main.py mounts this router at the real prefix AND at the
+# legacy /mcp alias (see PLATFORM_CONNECTORS_PREFIX / LEGACY_MCP_PREFIX).
+router = APIRouter(tags=["platform-connectors-legacy-simulation"])
 
 # Request/Response Models
 class InventoryItem(BaseModel):
@@ -72,6 +83,13 @@ class OrderStatusUpdate(BaseModel):
 @router.get("/inventory/merchants", response_model=Dict[str, MerchantInfo])
 async def get_inventory_merchants():
     """Get the legacy inventory snapshot across all merchants"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         merchants = get_all_merchants()
         result = {}
@@ -102,6 +120,13 @@ async def get_inventory_merchants():
 @router.get("/merchants/{merchant_id}/inventory")
 async def get_merchant_inventory_endpoint(merchant_id: str):
     """Get specific merchant inventory"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         inventory = get_merchant_inventory(merchant_id)
         if not inventory:
@@ -166,6 +191,13 @@ async def create_order_endpoint(request: CreateOrderRequest):
 @router.get("/orders/{order_id}", response_model=OrderResponse)
 async def get_order_endpoint(order_id: str):
     """Get order by ID"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         order = get_order(order_id)
         if not order:
@@ -181,6 +213,13 @@ async def get_order_endpoint(order_id: str):
 @router.get("/orders/agent/{agent_id}")
 async def get_agent_orders(agent_id: str):
     """Get all orders for an agent"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         orders = get_orders_by_agent(agent_id)
         return {
@@ -195,6 +234,13 @@ async def get_agent_orders(agent_id: str):
 @router.get("/orders/merchant/{merchant_id}")
 async def get_merchant_orders(merchant_id: str):
     """Get all orders for a merchant"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         orders = get_orders_by_merchant(merchant_id)
         return {
@@ -271,6 +317,13 @@ async def cancel_order_endpoint(order_id: str):
 @router.get("/inventory/summary")
 async def get_inventory_summary_endpoint():
     """Get inventory summary across all merchants"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         return get_inventory_summary()
     except Exception as e:
@@ -280,6 +333,13 @@ async def get_inventory_summary_endpoint():
 @router.get("/orders/summary")
 async def get_orders_summary_endpoint():
     """Get orders summary"""
+    # FAIL CLOSED: this endpoint read from an in-memory SIMULATION fixture
+    # (ai_router/merchant_store.py), not from any merchant. It served that
+    # fabricated inventory/order data in production until 2026-08-11.
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )
     try:
         return get_orders_summary()
     except Exception as e:
@@ -288,10 +348,13 @@ async def get_orders_summary_endpoint():
 
 @router.get("/health")
 async def health_check():
-    """MCP API health check"""
-    return {
-        "status": "healthy",
-        "service": "MCP API",
-        "merchants_count": len(get_all_merchants()),
-        "orders_count": len(get_orders_by_agent("dummy"))  # This will be 0, just for count
-    }
+    """Disabled-surface marker.
+
+    This used to answer "healthy" and count rows in the simulation fixture,
+    which read as a live integration health signal. It is not one.
+    """
+    raise HTTPException(
+        status_code=501,
+        detail="This endpoint is a simulation surface and is disabled. It never "
+               "reflected real merchant inventory or orders; use the production catalog / order APIs.",
+    )

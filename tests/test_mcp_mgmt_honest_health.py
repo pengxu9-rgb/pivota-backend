@@ -1,6 +1,9 @@
 """
 routes/mcp_mgmt.py honesty contract — every value is DB-derived or measured.
 
+(Paths are the canonical /platform-connectors/* prefix; the legacy /mcp/*
+alias is covered by tests/test_platform_connectors_prefix.py.)
+
 These tests kill the fabrication mutants the old implementation shipped:
 random.randint "response times", hardcoded "connected"/"healthy"/"99.9% uptime",
 datetime.now() presented as last_sync, per-request uuid log ids, and an
@@ -46,7 +49,7 @@ class TestMcpStatus:
             fetch_all=[{"total": 3, "platform": "shopify"}],
         )
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.get("/mcp/status", headers=_auth_header())
+            resp = client.get("/platform-connectors/status", headers=_auth_header())
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "success"
@@ -65,7 +68,7 @@ class TestMcpStatus:
     def test_status_with_zero_stores_is_not_connected(self, client):
         db = _fake_db(fetch_one=[{"total": 0}, {"max_sync": None}], fetch_all=[])
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.get("/mcp/status", headers=_auth_header())
+            resp = client.get("/platform-connectors/status", headers=_auth_header())
         mcp = resp.json()["mcp_status"]
         assert mcp["connected"] is False
         assert mcp["last_sync"] is None
@@ -76,7 +79,7 @@ class TestMcpStatus:
             fetch_all=AsyncMock(side_effect=RuntimeError("db down")),
         )
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.get("/mcp/status", headers=_auth_header())
+            resp = client.get("/platform-connectors/status", headers=_auth_header())
         body = resp.json()
         # The old shape reported status "success" during a DB outage.
         assert body["status"] == "error"
@@ -96,7 +99,7 @@ class TestMcpTestConnection:
         with patch("routes.mcp_mgmt.database", db), patch(
             "routes.mcp_mgmt.monotonic", fake_clock
         ):
-            resp = client.post("/mcp/test-connection?platform=shopify", headers=_auth_header())
+            resp = client.post("/platform-connectors/test-connection?platform=shopify", headers=_auth_header())
         assert resp.status_code == 200
         tr = resp.json()["test_result"]
         assert tr["check"] == "store_configuration_only"
@@ -112,7 +115,7 @@ class TestMcpTestConnection:
     def test_platform_check_with_no_stores_says_so(self, client):
         db = _fake_db(fetch_one={"total": 0})
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.post("/mcp/test-connection?platform=wix", headers=_auth_header())
+            resp = client.post("/platform-connectors/test-connection?platform=wix", headers=_auth_header())
         tr = resp.json()["test_result"]
         assert tr["connected"] is False
         assert tr["active_stores"] == 0
@@ -123,7 +126,7 @@ class TestMcpTestConnection:
     def test_all_platforms_branch_is_db_derived_not_hardcoded(self, client):
         db = _fake_db(fetch_all=[{"platform": "shopify", "total": 2}])
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.post("/mcp/test-connection", headers=_auth_header())
+            resp = client.post("/platform-connectors/test-connection", headers=_auth_header())
         tr = resp.json()["test_result"]
         assert tr["check"] == "store_configuration_only"
         assert tr["live_probe"] is False
@@ -139,7 +142,7 @@ class TestMcpTestConnection:
     def test_all_platforms_branch_with_nothing_configured(self, client):
         db = _fake_db(fetch_all=[])
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.post("/mcp/test-connection", headers=_auth_header())
+            resp = client.post("/platform-connectors/test-connection", headers=_auth_header())
         tr = resp.json()["test_result"]
         # The old branch answered "healthy"/"connected" unconditionally.
         assert tr["overall"] == "no_active_stores"
@@ -156,8 +159,8 @@ class TestMcpLogs:
         }]
         db = _fake_db(fetch_all=rows)
         with patch("routes.mcp_mgmt.database", db):
-            first = client.get("/mcp/logs", headers=_auth_header()).json()
-            second = client.get("/mcp/logs", headers=_auth_header()).json()
+            first = client.get("/platform-connectors/logs", headers=_auth_header()).json()
+            second = client.get("/platform-connectors/logs", headers=_auth_header()).json()
         assert first["source"] == "derived_from_store_last_sync"
         (log,) = first["logs"]
         # Same event, same id across requests (was uuid4 per page load).
@@ -172,7 +175,7 @@ class TestMcpAnalytics:
     def test_days_is_bound_not_interpolated(self, client):
         db = _fake_db(fetch_all=[])
         with patch("routes.mcp_mgmt.database", db):
-            resp = client.get("/mcp/analytics?days=7", headers=_auth_header())
+            resp = client.get("/platform-connectors/analytics?days=7", headers=_auth_header())
         assert resp.status_code == 200
         sync_call = db.fetch_all.await_args_list[0]
         query = sync_call.args[0]
@@ -186,5 +189,5 @@ class TestAuthz:
         token = create_access_token(
             {"sub": "user_m", "email": "m@example.com", "role": "merchant"}
         )
-        resp = client.get("/mcp/status", headers={"Authorization": f"Bearer {token}"})
+        resp = client.get("/platform-connectors/status", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 403
