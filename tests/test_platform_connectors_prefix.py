@@ -118,17 +118,21 @@ class TestRetiredSimulationStaysDead:
             assert "Cool Shoes EU" not in body
             assert "SHOE_RED_42" not in body
 
-    def test_shadowed_summary_handler_also_refuses(self, client):
+    @pytest.mark.asyncio
+    async def test_shadowed_summary_handler_also_refuses(self):
         """get_orders_summary_endpoint is unreachable by path (see note above),
-        so call it directly — a fail-close it never exercises is not a fail-close."""
-        import asyncio
+        so call it directly — a fail-close it never exercises is not a fail-close.
 
+        Awaited under pytest-asyncio (pytest.ini: asyncio_mode=auto), NOT via
+        asyncio.get_event_loop().run_until_complete(): that raises on 3.10+ when
+        no loop is running, and closes the loop out from under later tests.
+        """
         from fastapi import HTTPException
 
         from routes.mcp_routes import get_orders_summary_endpoint
 
         with pytest.raises(HTTPException) as exc:
-            asyncio.get_event_loop().run_until_complete(get_orders_summary_endpoint())
+            await get_orders_summary_endpoint()
         assert exc.value.status_code == 501
 
     def test_simulation_writes_still_refuse(self, client):
