@@ -373,12 +373,6 @@ from routes.reviews_invitation_shortlink import router as reviews_invitation_sho
 
 # Service routers (only include what exists)
 try:
-    from routes.mcp_routes import router as mcp_router
-    MCP_AVAILABLE = True
-except ImportError:
-    MCP_AVAILABLE = False
-
-try:
     from routes.operations_routes import router as operations_router
     OPERATIONS_AVAILABLE = True
 except ImportError:
@@ -1145,18 +1139,6 @@ app.include_router(demo_data_router)  # Demo data management
 # [DELETED] test_data_router router registration removed (file not in Git)
 app.include_router(simple_ws_router)  # Simple WebSocket
 app.include_router(product_quality_router)  # Internal product quality preview (Merchant Portal)
-
-if MCP_AVAILABLE:
-    # Retired simulation surface: every endpoint answers 501. Mounted at both
-    # prefixes purely so anything still pointed at it gets the refusal.
-    app.include_router(mcp_router, prefix=PLATFORM_CONNECTORS_PREFIX)
-    app.include_router(
-        mcp_router,
-        prefix=LEGACY_MCP_PREFIX,
-        dependencies=[Depends(legacy_mcp_prefix_deprecation)],
-        include_in_schema=False,
-    )
-    logger.info("✅ Legacy connector simulation router included (all endpoints 501)")
 
 if OPERATIONS_AVAILABLE:
     app.include_router(operations_router)
