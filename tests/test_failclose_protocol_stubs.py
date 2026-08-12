@@ -1,24 +1,18 @@
-"""Fail-closed contract for two protocol stubs (mock/stub production audit).
+"""Fail-closed contract for the x402 quote stub (mock/stub production audit).
 
-Locks in that neither endpoint can silently return fabricated data again:
-- /ap2/x402/quote must never invent a 1:1 FX rate for a real cross-currency pair
-  when the rate snapshot is missing/stale — it must raise.
-- /mcp/orders writes (in-memory simulation store) must refuse, never fake an order.
+/ap2/x402/quote must never invent a 1:1 FX rate for a real cross-currency pair
+when the rate snapshot is missing/stale — it must raise.
+
+The companion half of this file covered /mcp/orders, whose in-memory simulation
+store was fail-closed to 501. That whole surface (routes/mcp_routes.py + the
+ai_router fixture package) was DELETED on 2026-08-12; the paths are now 404 and
+tests/test_platform_connectors_prefix.py asserts they stay gone.
 """
 import pytest
 from fastapi import HTTPException
 
 from routes import ap2_routes
 from routes.ap2_routes import AP2ExchangeRateRequest, get_exchange_quote
-from routes.mcp_routes import (
-    CreateOrderRequest,
-    OrderItemRequest,
-    OrderStatusUpdate,
-    cancel_order_endpoint,
-    create_order_endpoint,
-    update_order_status_endpoint,
-)
-
 
 @pytest.mark.asyncio
 async def test_x402_quote_same_currency_is_legitimate_1to1():
@@ -54,24 +48,3 @@ async def test_x402_quote_pair_missing_from_snapshot_fails_closed(monkeypatch):
             AP2ExchangeRateRequest(from_currency="USD", to_currency="EUR", amount=10.0)
         )
     assert ei.value.status_code == 503
-
-
-@pytest.mark.asyncio
-async def test_mcp_order_writes_are_disabled_501():
-    req = CreateOrderRequest(
-        agent_id="a", merchant_id="m",
-        items=[OrderItemRequest(sku="s", quantity=1, unit_price=1.0)],
-    )
-    with pytest.raises(HTTPException) as ei:
-        await create_order_endpoint(req)
-    assert ei.value.status_code == 501
-
-    with pytest.raises(HTTPException) as ei:
-        await update_order_status_endpoint(
-            "ord_x", OrderStatusUpdate(order_id="ord_x", status="paid")
-        )
-    assert ei.value.status_code == 501
-
-    with pytest.raises(HTTPException) as ei:
-        await cancel_order_endpoint("ord_x")
-    assert ei.value.status_code == 501
