@@ -48,6 +48,9 @@ def _fake_db():
 SIMULATION_GETS = [
     "/inventory/merchants",
     "/inventory/summary",
+    # NOTE: "/orders/summary" is captured by "/orders/{order_id}" (decorator
+    # order), so it exercises get_order_endpoint, not the summary handler. Both
+    # refuse; the summary handler is covered directly below.
     "/orders/summary",
     "/orders/ord_1",
     "/orders/agent/agent_1",
@@ -64,17 +67,21 @@ class TestCanonicalPrefix:
         assert resp.json()["status"] == "success"
 
     def test_connector_test_route_answers_under_platform_connectors(self, client):
-        # Reaches the handler (auth/validation beyond this point is that route's
-        # own contract); the point is that the path EXISTS at the new prefix.
+        # == 200, not != 404: a GET-only mount answers 405 and a broken admin
+        # check answers 403, and both would pass a mere "not 404".
         resp = client.post(f"{PLATFORM_CONNECTORS_PREFIX}/test/merch_1", headers=_auth_header())
-        assert resp.status_code != 404
+        assert resp.status_code == 200
 
 
 class TestLegacyAliasStillWorks:
     def test_employee_portal_path_is_not_broken(self, client):
-        """The portal calls POST /mcp/test/{merchant_id}. It must not 404."""
+        """The portal calls POST /mcp/test/{merchant_id} — it must still WORK.
+
+        Asserting 200 rather than "not 404": the portal breaks just as hard on a
+        405 (wrong method registered) or a 403 (role check lost in the re-mount).
+        """
         resp = client.post(f"{LEGACY_MCP_PREFIX}/test/merch_1", headers=_auth_header())
-        assert resp.status_code != 404
+        assert resp.status_code == 200
 
     def test_alias_serves_the_same_payload_and_marks_deprecation(self, client):
         with patch("routes.mcp_mgmt.database", _fake_db()):
@@ -111,9 +118,24 @@ class TestRetiredSimulationStaysDead:
             assert "Cool Shoes EU" not in body
             assert "SHOE_RED_42" not in body
 
+    def test_shadowed_summary_handler_also_refuses(self, client):
+        """get_orders_summary_endpoint is unreachable by path (see note above),
+        so call it directly — a fail-close it never exercises is not a fail-close."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from routes.mcp_routes import get_orders_summary_endpoint
+
+        with pytest.raises(HTTPException) as exc:
+            asyncio.get_event_loop().run_until_complete(get_orders_summary_endpoint())
+        assert exc.value.status_code == 501
+
     def test_simulation_writes_still_refuse(self, client):
         resp = client.post(
             f"{PLATFORM_CONNECTORS_PREFIX}/orders",
             json={"agent_id": "a", "merchant_id": "m", "items": []},
         )
-        assert resp.status_code in (422, 501)
+        # == 501, not "in (422, 501)": a body-validation rejection would prove
+        # nothing about the endpoint being fail-closed.
+        assert resp.status_code == 501
