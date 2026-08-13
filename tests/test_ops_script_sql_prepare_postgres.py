@@ -456,6 +456,24 @@ def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
     return statements
 
 
+def _collect_quality_scale_population() -> List[Tuple[str, str]]:
+    """Read-only report, but its statements still have to PLAN — and three of
+    them carry binds (:current_rules_version, :threshold) whose types Postgres
+    must infer, which is exactly the class this gate exists for."""
+    import scripts.report_quality_scale_population as module
+
+    origin = "report_quality_scale_population"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            # _LATEST is a fragment the other four embed, but it is a valid
+            # standalone SELECT and the completeness guard rightly refuses to
+            # let a SQL constant escape unplanned.
+            "_LATEST_SQL",
+            "BY_VERSION_SQL", "STALE_AND_BLOCKED_SQL", "BANDS_SQL", "BY_PLATFORM_SQL",
+        )
+    ]
+
+
 def _collect_enrichment_join_diagnosis() -> List[Tuple[str, str]]:
     """Every constant the join-diagnosis report sends. Same reasoning as the
     baseline: a diagnosis whose SQL cannot be planned is an outage mid-ops-run,
@@ -508,6 +526,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/backfill_agent_pdp_view.py": _collect_backfill_agent_pdp_view,
     "scripts/report_enrichment_propagation_baseline.py": _collect_enrichment_baseline,
     "scripts/report_enrichment_join_diagnosis.py": _collect_enrichment_join_diagnosis,
+    "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -524,6 +543,7 @@ _MIN_STATEMENTS = {
     "scripts/backfill_agent_pdp_view.py": 5,
     "scripts/report_enrichment_propagation_baseline.py": 12,
     "scripts/report_enrichment_join_diagnosis.py": 13,
+    "scripts/report_quality_scale_population.py": 5,
 }
 
 
@@ -613,6 +633,36 @@ def test_the_cast_renderer_does_not_eat_postgres_cast_syntax() -> None:
 _SQL_CONSTANT = re.compile(r"(?:SQL|QUERY)$")
 
 
+def _sql_constant_text(node: ast.AST) -> str | None:
+    """The statically-known text of a string constant, f-string included.
+
+    F-STRINGS WERE INVISIBLE HERE. The scan only accepted `ast.Constant`, so a
+    constant assigned from an f-string that interpolates a shared fragment
+    escaped this guard entirely —
+    and composing SQL from a shared fragment is the normal idiom in these
+    reports. scripts/report_enrichment_join_diagnosis.py has NINE such constants
+    and satisfied the "declares at least one" assertion only because one
+    unrelated constant happens to be a plain string. A guard that promises "no
+    SQL constant escapes" while silently skipping the most common spelling is
+    the weaker-than-advertised failure this file exists to prevent.
+
+    For an f-string, the literal text up to the FIRST interpolation is the
+    signature: it is all that is knowable without executing the module, and it
+    is what the head-matching below already does for `.format()` templates.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: List[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                break  # first interpolation ends the statically-known head
+        return "".join(parts) or None
+    return None
+
+
 def _module_level_sql_constants(path: Path) -> List[Tuple[str, str]]:
     """Module-level `NAME = "...sql..."` constants whose name ends in SQL/QUERY."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -620,11 +670,12 @@ def _module_level_sql_constants(path: Path) -> List[Tuple[str, str]]:
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+        text = _sql_constant_text(node.value)
+        if text is None:
             continue
         for target in node.targets:
             if isinstance(target, ast.Name) and _SQL_CONSTANT.search(target.id):
-                found.append((target.id, node.value.value))
+                found.append((target.id, text))
     return found
 
 
