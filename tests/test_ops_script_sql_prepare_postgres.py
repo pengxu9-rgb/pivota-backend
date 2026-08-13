@@ -124,6 +124,30 @@ ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS platform_product_id t
 ALTER TABLE product_group_members ADD COLUMN IF NOT EXISTS is_primary boolean;
 """
 
+# product_quality_snapshot is a LIVE instance of the #1651 hazard, not a
+# hypothetical one. tests/test_dead_quality_component_canary_postgres.py runs
+# `DROP TABLE IF EXISTS product_quality_snapshot; CREATE TABLE ... (id,
+# snapshot_date, details)` — a three-column stub — and these gate files share ONE
+# database. It sorts earlier, so its DROP wins outright; a plain
+# CREATE TABLE IF NOT EXISTS here then inherits the narrow shape and the
+# join-diagnosis scale query dies on UndefinedColumn: merchant_id.
+#
+# Additive ALTERs are the documented answer: they repair whatever shape the
+# sibling leaves without fighting it for ownership of the CREATE. Types mirror
+# db/product_quality.py. (This is also why the gate must be run against the
+# SHARED database to be trusted — a local sandbox built from
+# metadata.create_all has the real table and passes while CI does not.)
+_PRODUCT_QUALITY_SNAPSHOT_GUARDS = """
+CREATE TABLE IF NOT EXISTS product_quality_snapshot (id bigserial PRIMARY KEY);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS merchant_id VARCHAR(100);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS platform VARCHAR(50);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS platform_product_id VARCHAR(200);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS geo_code VARCHAR(16);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS rules_version VARCHAR(32);
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS content_quality_score DOUBLE PRECISION;
+ALTER TABLE product_quality_snapshot ADD COLUMN IF NOT EXISTS snapshot_date TIMESTAMP;
+"""
+
 # Columns the enrichment statements touch. Belt-and-braces on top of the real
 # CREATE lifted below: if a sibling gate file ever lands a narrower
 # `product_enrichment` stub first, `CREATE TABLE IF NOT EXISTS` silently keeps
@@ -217,6 +241,7 @@ def prepare() -> Callable[[str], None]:
         _LIGHTWEIGHT_DDL,
         _product_enrichment_ddl(),
         _PRODUCT_ENRICHMENT_COLUMN_GUARDS,
+        _PRODUCT_QUALITY_SNAPSHOT_GUARDS,
         *(f"{stmt};" for stmt in _agent_pdp_view_catchup_ddl()),
     ))
     with engine.begin() as conn:
