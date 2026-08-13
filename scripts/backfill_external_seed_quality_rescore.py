@@ -78,7 +78,11 @@ from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
 )
-from services.product_quality_service import SOURCE_BACKED_COMPONENTS_RULES_VERSION
+from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
+from services.product_quality_service import (
+    SOURCE_BACKED_COMPONENTS_RULES_VERSION,
+    preview_quality,
+)
 
 TOOL = "external_brand_crawl"
 
@@ -105,7 +109,9 @@ TOOL = "external_brand_crawl"
 #     most recently updated seed. (Postgres-only; this script is prod-only.)
 FETCH = """
     SELECT DISTINCT ON (p.product_key)
-           p.product_key, p.source_product_id, p.title, p.description, p.brand,
+           p.product_key, p.merchant_id, p.source_product_id,
+           ips.serving_eligible AS is_serving_eligible,
+           p.title, p.description, p.brand,
            p.product_type, p.category_kind, p.image_url,
            eps.id AS seed_id, eps.price_amount, bsi.raw_inci,
            COALESCE(
@@ -167,12 +173,29 @@ def _coerce_sections(value: Any) -> Optional[list]:
 
 
 async def _rescored_ids() -> set:
+    """Products already carrying a current-version snapshot — keyed by the FULL
+    identity triple, not platform_product_id alone.
+
+    The pid-only version silently skipped an UNSCORED product whenever any other
+    merchant/platform had already been rescored under the same
+    platform_product_id (crawl seeds use slug-ish ids, so cross-merchant
+    collisions are real), and conversely counted a product "done" on the
+    strength of someone else's snapshot. Side effect of scoping, accepted and
+    deliberate: historical snapshots written under the FALLBACK merchant no
+    longer mark the real product done, so those products become re-scorable —
+    which is the fix for them, not a regression (their fallback snapshots are
+    unfindable by the eligibility classifier anyway).
+    """
     rows = await database.fetch_all(
-        "SELECT DISTINCT platform_product_id AS pid FROM product_quality_snapshot "
+        "SELECT DISTINCT merchant_id, platform, platform_product_id "
+        "FROM product_quality_snapshot "
         "WHERE rules_version = :v",
         {"v": SOURCE_BACKED_COMPONENTS_RULES_VERSION},
     )
-    return {dict(r)["pid"] for r in rows}
+    return {
+        (d["merchant_id"], d["platform"], d["platform_product_id"])
+        for d in (dict(r) for r in rows)
+    }
 
 
 # Bounds for the pool recycle (see _reset_connection).
@@ -320,7 +343,10 @@ async def run(
             )
         ]
         done = set() if force else await _rescored_ids()
-        todo = [r for r in rows if r["source_product_id"] not in done]
+        todo = [
+            r for r in rows
+            if (r["merchant_id"], "external_seed", r["source_product_id"]) not in done
+        ]
         if offset:
             todo = todo[offset:]
         if limit:
@@ -350,6 +376,7 @@ async def run(
         consec_fail = 0      # hard exceptions in a row
         consec_no_write = 0  # summaries that persisted nothing, in a row
         promoted: list[str] = []  # product_keys that flipped serving_eligible
+        would_demote = 0  # eligible rows whose preview scored below the bar
         recycles = 0  # run-level pool-recycle budget (see _MAX_RECYCLES)
         trust_wrote = 0
         for i, r in enumerate(todo, 1):
@@ -379,6 +406,30 @@ async def run(
                     category=r["category_kind"], raw_inci=r["raw_inci"],
                     pdp_details_sections=_coerce_sections(r.get("pdp_details_sections")),
                 )
+                # PROMOTE-ONLY, enforced rather than emergent. The default FETCH
+                # already excludes serving-eligible rows, so this guard is inert
+                # on an ordinary run — but --include-eligible removes that filter,
+                # and product_quality_snapshot is APPEND-ONLY with the eligibility
+                # lateral taking the LATEST row: writing a lower score for a
+                # currently-public product demotes it and fires IndexNow on the
+                # way down. So for an eligible candidate, PREVIEW the score first
+                # (same payload, same source-backed components, no write) and
+                # refuse the row when it would land below the bar. Dark rows are
+                # exempt: a low rescore leaves them exactly as dark as before.
+                if r.get("is_serving_eligible"):
+                    preview_score = preview_quality(
+                        qp, score_source_backed_components=True
+                    ).get("content_quality_score") or 0.0
+                    if preview_score < QUALITY_SCORE_THRESHOLD:
+                        would_demote += 1
+                        consec_fail = consec_no_write = 0
+                        print(
+                            f"  [SKIP would-demote] {epid} preview="
+                            f"{preview_score:.1f} < {QUALITY_SCORE_THRESHOLD} "
+                            f"and row is currently serving",
+                            flush=True,
+                        )
+                        continue
                 # per-product timeout so a dead socket errors out, never hangs
                 summary = await asyncio.wait_for(
                     make_external_seed_servable(
@@ -471,7 +522,7 @@ async def run(
         # promoted = actually flipped to public (step 2). Keeping the three apart is
         # what makes "wrote=1322 eligible=0 promoted=0" diagnosable instead of a
         # mystery — step-1 and step-2 failures are otherwise indistinguishable.
-        print(f"\nDONE: wrote={ok} eligible={eligible} fail={fail} "
+        print(f"\nDONE: wrote={ok} eligible={eligible} would_demote_skipped={would_demote} fail={fail} "
               f"no_write={silent} (of {len(todo)}); PROMOTED to public: {trust_wrote}")
     finally:
         await database.disconnect()

@@ -474,6 +474,18 @@ def _collect_quality_scale_population() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_inci_quality() -> List[Tuple[str, str]]:
+    import scripts.report_inci_ingestion_quality as module
+
+    origin = "report_inci_ingestion_quality"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "TOTALS_SQL", "GATE_FAIL_SAMPLES_SQL", "BOILERPLATE_SQL",
+            "PROVENANCE_SQL", "FRESHNESS_SQL", "REACH_SQL",
+        )
+    ]
+
+
 def _collect_depth_scorecard() -> List[Tuple[str, str]]:
     """The holistic then-vs-now scorecard. Same argument as its siblings: a
     scoreboard whose SQL cannot be planned reports nothing, and one that
@@ -542,6 +554,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_enrichment_propagation_baseline.py": _collect_enrichment_baseline,
     "scripts/report_enrichment_join_diagnosis.py": _collect_enrichment_join_diagnosis,
     "scripts/report_agent_depth_scorecard.py": _collect_depth_scorecard,
+    "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
 }
 
@@ -560,6 +573,7 @@ _MIN_STATEMENTS = {
     "scripts/report_enrichment_propagation_baseline.py": 12,
     "scripts/report_enrichment_join_diagnosis.py": 13,
     "scripts/report_agent_depth_scorecard.py": 6,
+    "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/report_quality_scale_population.py": 5,
 }
 
