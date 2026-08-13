@@ -134,6 +134,9 @@ async def validate_authorization_request(store: OAuthStore, params: Dict[str, An
     resource = str(params.get("resource") or "").strip()
     if not resource:
         raise OAuthFlowError("invalid_target", "resource (RFC 8707) is required")
+    if resource not in core.allowed_resources():
+        # exact-match allowlist; unset MCP_OAUTH_AS_ALLOWED_RESOURCES allows nothing
+        raise OAuthFlowError("invalid_target", "resource is not an allowed audience")
     scope = str(params.get("scope") or "").strip() or " ".join(core.DEFAULT_SCOPES)
     return {
         "client_id": client_id,

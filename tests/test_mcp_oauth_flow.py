@@ -41,6 +41,7 @@ def _as_env(monkeypatch):
     monkeypatch.setenv("MCP_OAUTH_AS_ISSUER", ISSUER)
     monkeypatch.setenv("MCP_OAUTH_AS_ALLOW_EPHEMERAL_KEY", "1")
     monkeypatch.setenv("MCP_OAUTH_AS_KEY_ID", "flow-kid")
+    monkeypatch.setenv("MCP_OAUTH_AS_ALLOWED_RESOURCES", RESOURCE)
     core._KEY_CACHE.clear()
     yield
     core._KEY_CACHE.clear()
@@ -202,3 +203,60 @@ def test_validate_rejects_bad_requests():
         run(validate_authorization_request(store, {**base, "code_challenge_method": "plain"}))
     with pytest.raises(OAuthFlowError):  # missing resource
         run(validate_authorization_request(store, {**base, "resource": ""}))
+
+
+def _expect_invalid_target(store, base, resource):
+    with pytest.raises(OAuthFlowError) as exc:
+        run(validate_authorization_request(store, {**base, "resource": resource}))
+    assert exc.value.error == "invalid_target"
+
+
+def test_resource_allowlist_exact_match_only(monkeypatch):
+    store = InMemoryStore()
+    reg = run(_register(store))
+    _, challenge = pkce_pair()
+    base = {"response_type": "code", "client_id": reg["client_id"], "redirect_uri": REDIRECT,
+            "code_challenge": challenge, "code_challenge_method": "S256", "resource": RESOURCE}
+
+    # the listed value passes and is bound verbatim
+    validated = run(validate_authorization_request(store, base))
+    assert validated["resource"] == RESOURCE
+
+    # near-misses of the listed value must all refuse: matching looser than byte-exact
+    # (prefix, substring, extension) would mint audiences nobody allowed
+    _expect_invalid_target(store, base, RESOURCE + "/x")     # extension
+    _expect_invalid_target(store, base, RESOURCE + "/")      # trailing slash
+    _expect_invalid_target(store, base, RESOURCE[:-1])       # truncation
+    _expect_invalid_target(store, base, RESOURCE.upper())    # case variant
+    _expect_invalid_target(store, base, "https://evil.example/mcp")
+
+
+def test_resource_allowlist_fails_closed_when_unset(monkeypatch):
+    store = InMemoryStore()
+    reg = run(_register(store))
+    _, challenge = pkce_pair()
+    base = {"response_type": "code", "client_id": reg["client_id"], "redirect_uri": REDIRECT,
+            "code_challenge": challenge, "code_challenge_method": "S256", "resource": RESOURCE}
+
+    monkeypatch.delenv("MCP_OAUTH_AS_ALLOWED_RESOURCES", raising=False)
+    _expect_invalid_target(store, base, RESOURCE)
+
+    monkeypatch.setenv("MCP_OAUTH_AS_ALLOWED_RESOURCES", "   ")
+    _expect_invalid_target(store, base, RESOURCE)
+
+
+def test_resource_allowlist_multiple_values(monkeypatch):
+    store = InMemoryStore()
+    reg = run(_register(store))
+    _, challenge = pkce_pair()
+    second = "https://commerce.mcp.pivota.cc/mcp"
+    monkeypatch.setenv("MCP_OAUTH_AS_ALLOWED_RESOURCES", f" {RESOURCE} , {second} ")
+    base = {"response_type": "code", "client_id": reg["client_id"], "redirect_uri": REDIRECT,
+            "code_challenge": challenge, "code_challenge_method": "S256", "resource": second}
+
+    validated = run(validate_authorization_request(store, base))
+    assert validated["resource"] == second
+    validated = run(validate_authorization_request(store, {**base, "resource": RESOURCE}))
+    assert validated["resource"] == RESOURCE
+    # the comma-join of the two entries is NOT itself an allowed value
+    _expect_invalid_target(store, base, f"{RESOURCE},{second}")
