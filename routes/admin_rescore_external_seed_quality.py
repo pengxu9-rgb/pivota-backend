@@ -97,6 +97,8 @@ async def _run_chunk(req: RescoreRequest) -> Dict[str, Any]:
         _coerce_sections,
         _flush_trust,
         _rescored_ids,
+        demotion_preview,
+        filter_todo,
     )
     from services.external_seed_servability import (
         build_servable_quality_payload,
@@ -116,7 +118,12 @@ async def _run_chunk(req: RescoreRequest) -> Dict[str, Any]:
         )
     ]
     done = await _rescored_ids()
-    todo = [r for r in rows if r["source_product_id"] not in done]
+    # filter_todo, NOT an inline comparison. _rescored_ids returns identity
+    # TRIPLES; the previous inline check compared a bare source_product_id
+    # against them, which is always-False membership — the route re-scored the
+    # same first `limit` rows on every call, appending a fresh snapshot each
+    # time, and could never advance past its first chunk.
+    todo = filter_todo(rows, done)
     selected = todo[: req.limit]
 
     # Reported over the FULL candidate set, matching the CLI's own preflight line,
@@ -133,6 +140,7 @@ async def _run_chunk(req: RescoreRequest) -> Dict[str, Any]:
         "with_inci": with_inci,
         "with_sections": with_sections,
         "wrote": 0,
+        "would_demote_skipped": 0,
         "eligible": 0,
         "promoted_to_public": 0,
         "no_write": 0,
@@ -155,7 +163,7 @@ async def _run_chunk(req: RescoreRequest) -> Dict[str, Any]:
         notes.append("dry_run — no writes; pass mode=apply to write")
         return result
 
-    wrote = eligible = silent = failed = 0
+    wrote = eligible = silent = failed = would_demote = 0
     promoted: List[str] = []
     trust_wrote = 0
 
@@ -173,6 +181,18 @@ async def _run_chunk(req: RescoreRequest) -> Dict[str, Any]:
                 raw_inci=r["raw_inci"],
                 pdp_details_sections=_coerce_sections(r.get("pdp_details_sections")),
             )
+            # Same promote-only guard as the CLI, from the same module — this
+            # route is the venue the prod runbook names for include_eligible
+            # runs, i.e. exactly the case the guard exists for. It previously
+            # had NO guard: a currently-public row scoring below the bar was
+            # demoted and IndexNow fired on the way down.
+            preview_score = demotion_preview(r, qp)
+            if preview_score is not None:
+                would_demote += 1
+                logger.warning(
+                    "rescore SKIP would-demote %s preview=%.1f", epid, preview_score
+                )
+                continue
             summary = await make_external_seed_servable(
                 # seed_id comes from the row — never rebuilt from a tool constant.
                 product_key=r["product_key"],
@@ -219,6 +239,7 @@ async def _run_chunk(req: RescoreRequest) -> Dict[str, Any]:
     result.update(
         wrote=wrote,
         eligible=eligible,
+        would_demote_skipped=would_demote,
         promoted_to_public=trust_wrote,
         no_write=silent,
         failed=failed,

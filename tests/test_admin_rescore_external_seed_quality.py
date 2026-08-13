@@ -31,6 +31,13 @@ ROUTE_PATH = (
 
 ROW = {
     "product_key": "prod::merch_x::external_seed::abc",
+    # merchant_id + is_serving_eligible joined the FETCH contract with the
+    # promote-only guard. Their ABSENCE here is why the route's broken
+    # always-False done-check went undetected: without merchant_id the triple
+    # path KeyErrors loudly, but the old fixture predates the column, so the
+    # route tests exercised a contract the route no longer runs against.
+    "merchant_id": "merch_x",
+    "is_serving_eligible": False,
     "source_product_id": "brand_us_123",
     "seed_id": "seed-1",
     "title": "Centella Calming Gel Cream",
@@ -180,6 +187,71 @@ async def test_one_bad_row_does_not_end_the_chunk(monkeypatch, patched):
     monkeypatch.setattr(svc, "make_external_seed_servable", boom)
     out = await mod._run_chunk(mod.RescoreRequest(mode="apply", limit=10))
     assert out["failed"] == 1 and out["wrote"] == 0
+
+
+@pytest.mark.asyncio
+async def test_route_skips_already_rescored_by_identity_triple(monkeypatch, patched):
+    """The route's done-check compared a bare source_product_id against a set of
+    TRIPLES — always-False membership, proven by execution in review: the route
+    re-scored a row its own counter reported as already_rescored=1, and could
+    never advance past its first chunk (every apply selected the same rows and
+    appended a fresh snapshot each call). Must go through filter_todo."""
+    import scripts.backfill_external_seed_quality_rescore as cli
+    mod, calls = patched
+
+    async def done_has_this_row():
+        return {("merch_x", "external_seed", "brand_us_123")}
+
+    monkeypatch.setattr(cli, "_rescored_ids", done_has_this_row)
+    out = await mod._run_chunk(mod.RescoreRequest(mode="apply", limit=10))
+
+    assert out["candidates"] == 0, "an already-rescored row survived the filter"
+    assert calls["servable"] == [], "the route re-scored a done row"
+
+
+@pytest.mark.asyncio
+async def test_route_refuses_a_would_demote_row(monkeypatch, patched):
+    """The route is the venue the prod runbook names for include_eligible runs
+    and previously had NO guard: a currently-public row scoring below the bar
+    was demoted, and IndexNow fired on the down transition."""
+    import scripts.backfill_external_seed_quality_rescore as cli
+    mod, calls = patched
+
+    class EligibleRowDB:
+        async def fetch_all(self, *_a, **_k):
+            return [{**ROW, "is_serving_eligible": True}]
+
+    monkeypatch.setattr(mod, "database", EligibleRowDB())
+    monkeypatch.setattr(cli, "preview_quality",
+                        lambda qp, score_source_backed_components=None:
+                        {"content_quality_score": 60.0})
+
+    out = await mod._run_chunk(
+        mod.RescoreRequest(mode="apply", limit=10, include_eligible=True))
+
+    assert calls["servable"] == [], "a would-demote row reached the write path"
+    assert out["would_demote_skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_route_lets_a_high_scoring_eligible_row_through(monkeypatch, patched):
+    import scripts.backfill_external_seed_quality_rescore as cli
+    mod, calls = patched
+
+    class EligibleRowDB:
+        async def fetch_all(self, *_a, **_k):
+            return [{**ROW, "is_serving_eligible": True}]
+
+    monkeypatch.setattr(mod, "database", EligibleRowDB())
+    monkeypatch.setattr(cli, "preview_quality",
+                        lambda qp, score_source_backed_components=None:
+                        {"content_quality_score": 88.0})
+
+    out = await mod._run_chunk(
+        mod.RescoreRequest(mode="apply", limit=10, include_eligible=True))
+
+    assert len(calls["servable"]) == 1
+    assert out["would_demote_skipped"] == 0
 
 
 def test_limit_is_capped():

@@ -43,7 +43,12 @@ class _FakeDB:
 
 def _row(pk: str, epid: str) -> Dict[str, Any]:
     return {
-        "product_key": pk, "source_product_id": epid, "title": "t", "description": "d",
+        # merchant_id + is_serving_eligible joined the FETCH contract with the
+        # promote-only guard: the triple-scoped done-set needs the merchant, and
+        # the guard needs per-row eligibility. False = the dark-row default,
+        # which keeps these tests exercising the ordinary backlog path.
+        "product_key": pk, "merchant_id": "m1", "is_serving_eligible": False,
+        "source_product_id": epid, "title": "t", "description": "d",
         "brand": "b", "product_type": None, "category_kind": "skincare", "image_url": "i",
         "seed_id": f"seed_{epid}", "price_amount": 10, "raw_inci": None,
         "pdp_details_sections": [{"title": "x", "body": "y"}],
