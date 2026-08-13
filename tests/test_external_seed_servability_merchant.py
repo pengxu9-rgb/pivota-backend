@@ -10,30 +10,71 @@ import services.external_seed_servability as mod
 
 
 class _FakeDB:
-    """Returns only the columns the statement actually SELECTs.
+    """Answers the identity lookup, honouring BOTH halves of the statement.
 
-    A fake that hands back its whole canned row regardless of the query cannot
-    tell "the code reads this column" from "the code forgot to ask for it".
-    Measured: with a projection-blind fake, deleting `platform` from the SELECT
-    list passed every test here while production would fall back to
-    EXTERNAL_SEED_PLATFORM and silently reinstate the blind spot.
+    PROJECTION. Returns only the columns the SQL actually SELECTs. A fake that
+    hands back its whole canned row cannot tell "the code reads this column"
+    from "the code forgot to ask for it" — measured: with a projection-blind
+    fake, deleting `platform` from the SELECT list passed every test here while
+    production fell back to EXTERNAL_SEED_PLATFORM and silently reinstated the
+    blind spot.
+
+    SELECTION. Also records the table, predicate column and bound value, because
+    hardening the projection alone left three mutants alive across all 48 tests:
+    binding `seed_id` instead of `product_key`, matching on `content_key`, and
+    reading FROM external_product_seeds. Each resolves a DIFFERENT product's
+    merchant+platform and writes the snapshot under a wrong identity — exactly
+    the failure class this module exists to prevent.
+
+    Fails CLOSED. A statement this cannot parse raises, rather than returning
+    everything and hiding whatever the code got wrong.
     """
 
     def __init__(self, row):
         self._row = row
+        self.calls: list = []
 
     @staticmethod
-    def _selected(sql):
-        match = re.search(r"SELECT\s+(.*?)\s+FROM", " ".join(sql.split()), re.IGNORECASE)
+    def _columns(sql):
+        one_line = " ".join(sql.split())
+        match = re.search(r"\bSELECT\s+(.*?)\s+\bFROM\b", one_line, re.IGNORECASE)
         if not match:
-            return None
-        return [c.strip() for c in match.group(1).split(",")]
+            raise AssertionError(f"_FakeDB cannot parse the SELECT list of: {one_line!r}")
+        body = re.sub(r"^DISTINCT\s+", "", match.group(1).strip(), flags=re.IGNORECASE)
+        if body.strip() in ("*",):
+            return None  # whole row, legitimately
+        cols = []
+        for item in body.split(","):
+            item = item.strip()
+            # `cp.platform` -> platform; `platform AS plat` -> plat (the key the
+            # caller reads); bare `platform` -> platform.
+            alias = re.search(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)$", item, re.IGNORECASE)
+            name = alias.group(1) if alias else item.split()[-1]
+            cols.append(name.rsplit(".", 1)[-1])
+        return cols
+
+    @staticmethod
+    def _table(sql):
+        one_line = " ".join(sql.split())
+        match = re.search(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", one_line, re.IGNORECASE)
+        return match.group(1).lower() if match else None
+
+    @staticmethod
+    def _predicate_column(sql):
+        one_line = " ".join(sql.split())
+        match = re.search(r"\bWHERE\s+([A-Za-z_][A-Za-z0-9_.]*)\s*=", one_line, re.IGNORECASE)
+        return match.group(1).rsplit(".", 1)[-1].lower() if match else None
 
     async def fetch_one(self, sql, params=None):
+        cols = self._columns(sql)  # raises on an unparseable statement
+        self.calls.append({
+            "table": self._table(sql),
+            "predicate_column": self._predicate_column(sql),
+            "params": dict(params or {}),
+        })
         if self._row is None:
             return None
-        cols = self._selected(sql)
-        if cols is None or "*" in cols:
+        if cols is None:
             return dict(self._row)
         return {c: self._row.get(c) for c in cols}
 
@@ -210,3 +251,48 @@ async def test_an_external_seed_product_is_unchanged(monkeypatch):
         product_key="p", seed_id="s", source_product_id="y", quality_payload={}, db=db,
     )
     assert captured["platform"] == "external_seed"
+
+
+async def test_the_identity_lookup_reads_the_right_row(monkeypatch):
+    """Hardening the projection left the SELECTION unverified: binding seed_id
+    instead of product_key, matching on content_key, or reading FROM
+    external_product_seeds all survived every test. Each resolves a DIFFERENT
+    product's merchant+platform, which is the exact failure this module exists
+    to prevent."""
+    _patch_common(monkeypatch)
+
+    async def _fqe(**kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "full_quality_eval", _fqe)
+    db = _FakeDB({"merchant_id": "merch_obs_x", "platform": "url_audit",
+                  "content_key": "ck_x"})
+
+    await mod.make_external_seed_servable(
+        product_key="prod::merch_obs_x::url_audit::hbn_1",
+        seed_id="external_brand_crawl::hbn_1",
+        source_product_id="hbn_1",
+        quality_payload={},
+        db=db,
+    )
+
+    lookup = db.calls[0]
+    assert lookup["table"] == "catalog_products", (
+        f"identity resolved from {lookup['table']}, not catalog_products"
+    )
+    assert lookup["predicate_column"] == "product_key", (
+        f"identity matched on {lookup['predicate_column']}, not product_key"
+    )
+    # The bound VALUE must be the product_key, not the seed_id — they are
+    # different identifiers for different things and both are in scope here.
+    assert list(lookup["params"].values()) == ["prod::merch_obs_x::url_audit::hbn_1"]
+
+
+def test_the_fake_fails_closed_on_an_unparseable_statement():
+    """A fake that returns everything when it cannot parse hides whatever the
+    code got wrong. Measured: the previous version fell back to the whole canned
+    row for any statement without a FROM clause."""
+    import pytest as _pytest
+
+    with _pytest.raises(AssertionError, match="cannot parse"):
+        _FakeDB._columns("SELECT catalog_identity(:pk)")
