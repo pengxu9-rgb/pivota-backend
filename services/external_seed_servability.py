@@ -141,16 +141,29 @@ async def make_external_seed_servable(
     # index_eligible never flip for every merch_obs_-keyed seed. Fall back to
     # the legacy merchant only when the catalog row is missing (pre-ADR-009
     # rows resolve to "external_seed" anyway, so this is correct for both).
+    #
+    # THE SAME ARGUMENT APPLIES TO PLATFORM, and it was left hardcoded when the
+    # merchant half was fixed. _ELIGIBILITY_LATERAL_JOINS
+    # (services/index_pipeline_state_service.py) matches the snapshot on
+    # `platform = cp.platform` exactly as it matches on merchant, so a product
+    # whose catalog row says `url_audit` or `brand_authored` had its snapshot
+    # written under `external_seed` and the classifier could never find it. Its
+    # score therefore froze at whatever an older path last wrote — measured
+    # 2026-08-11: HBN Double Retinol and both Anuko rows still carry `v1-lite`
+    # scores while the gate compares against the v3 71.4 bar.
     quality_merchant_id = EXTERNAL_SEED_MERCHANT_ID
+    quality_platform = EXTERNAL_SEED_PLATFORM
     content_key: Optional[str] = None
     try:
         cp = await db.fetch_one(
-            "SELECT merchant_id, content_key FROM catalog_products WHERE product_key = :pk",
+            "SELECT merchant_id, platform, content_key FROM catalog_products "
+            "WHERE product_key = :pk",
             {"pk": product_key},
         )
         if cp:
             cp = dict(cp)
             quality_merchant_id = str(cp.get("merchant_id") or "").strip() or EXTERNAL_SEED_MERCHANT_ID
+            quality_platform = str(cp.get("platform") or "").strip() or EXTERNAL_SEED_PLATFORM
             content_key = cp.get("content_key")
     except Exception:  # noqa: BLE001 -- fall back to legacy merchant, never raise
         logger.exception("catalog identity lookup failed for %s", product_key)
@@ -164,7 +177,7 @@ async def make_external_seed_servable(
     try:
         await full_quality_eval(
             merchant_id=quality_merchant_id,
-            platform=EXTERNAL_SEED_PLATFORM,
+            platform=quality_platform,
             platform_product_id=source_product_id,
             geo_code="default",
             payload=quality_payload,
