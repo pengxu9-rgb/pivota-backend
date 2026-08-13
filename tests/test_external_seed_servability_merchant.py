@@ -100,6 +100,8 @@ async def test_snapshot_written_under_real_merch_obs_merchant(monkeypatch):
     async def _fqe(*, merchant_id, platform, platform_product_id, geo_code, payload, score_source_backed_components):
         captured["merchant_id"] = merchant_id
         captured["platform_product_id"] = platform_product_id
+        captured["geo_code"] = geo_code
+        captured["score_source_backed_components"] = score_source_backed_components
 
     monkeypatch.setattr(mod, "full_quality_eval", _fqe)
     db = _FakeDB({"merchant_id": "merch_obs_abc123", "content_key": "ck_x"})
@@ -115,6 +117,14 @@ async def test_snapshot_written_under_real_merch_obs_merchant(monkeypatch):
     assert captured["merchant_id"] == "merch_obs_abc123"
     assert captured["merchant_id"] != mod.EXTERNAL_SEED_MERCHANT_ID
     assert captured["platform_product_id"] == "goongbe_us_1"
+    # Repo-wide surviving mutant until now: flipping this kwarg to False passed
+    # every test while silently dropping the INCI/attribute components and
+    # writing the snapshot as v1-lite instead of v3 — the exact scale drift the
+    # 2026-08-13 population report measured at 24.6% of the corpus. External
+    # seeds ARE the source-backed case; this True must not depend on the env
+    # flag, or unset-flag environments regress seeds too.
+    assert captured["score_source_backed_components"] is True
+    assert captured["geo_code"] == "default"
     assert summary["quality"] is True
     assert summary["serving_eligible"] is True
 
