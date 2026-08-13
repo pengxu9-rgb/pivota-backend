@@ -194,8 +194,16 @@ def _request_secret() -> bytes:
     return secret.encode("utf-8")
 
 
+# A signed consent blob is only meant to survive the seconds between rendering the consent page
+# and the buyer clicking approve. Bounding its lifetime shrinks the replay window for a captured
+# blob (a captured blob was otherwise valid forever). Full CSRF hardening of the account-session
+# consent path is tracked separately — see the PR notes.
+CONSENT_REQUEST_TTL_SECONDS = 600
+
+
 def _sign_request(validated: Dict[str, Any]) -> str:
-    blob = json.dumps(validated, sort_keys=True, separators=(",", ":"))
+    payload = {**validated, "_iat": int(time.time())}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     mac = hmac.new(_request_secret(), blob.encode("utf-8"), sha256).hexdigest()
     import base64
     return base64.urlsafe_b64encode(blob.encode("utf-8")).decode() + "." + mac
@@ -211,7 +219,60 @@ def _verify_request(signed: str) -> Dict[str, Any]:
     expected = hmac.new(_request_secret(), blob.encode("utf-8"), sha256).hexdigest()
     if not hmac.compare_digest(expected, mac):
         raise OAuthFlowError("invalid_request", "bad consent request signature")
-    return json.loads(blob)
+    payload = json.loads(blob)
+    iat = payload.pop("_iat", None)
+    if not isinstance(iat, int) or int(time.time()) - iat > CONSENT_REQUEST_TTL_SECONDS:
+        raise OAuthFlowError("invalid_request", "consent request expired")
+    return payload
+
+
+# ---------------------------------------------------------------- guest subject cookie
+
+GUEST_COOKIE_NAME = "mcp_guest_subject"
+# 400 days — the practical browser ceiling; refreshed on each authorize so an active guest keeps
+# one stable user_ref (and thus one order history) across sessions.
+GUEST_COOKIE_MAX_AGE = 400 * 24 * 60 * 60
+
+
+def _sign_guest_cookie(subject: str) -> str:
+    mac = hmac.new(_request_secret(), subject.encode("utf-8"), sha256).hexdigest()
+    return f"{subject}.{mac}"
+
+
+def _read_guest_cookie(request: Request) -> Optional[str]:
+    """Return the signed cookie's subject iff the signature verifies AND it is a guest subject.
+
+    Signing prevents an attacker from pinning a victim's browser to an arbitrary/crafted subject
+    (fixation): a tampered value fails the MAC and is ignored, so a fresh subject is minted.
+    The namespace re-check is belt-and-suspenders against any value that somehow verified.
+    """
+    raw = request.cookies.get(GUEST_COOKIE_NAME)
+    if not raw or "." not in raw:
+        return None
+    subject, _, mac = raw.rpartition(".")
+    if not subject or not mac:
+        return None
+    try:
+        expected = hmac.new(_request_secret(), subject.encode("utf-8"), sha256).hexdigest()
+    except OAuthFlowError:
+        return None
+    if not hmac.compare_digest(expected, mac):
+        return None
+    if not core.is_guest_subject(subject):
+        return None
+    return subject
+
+
+def _set_guest_cookie(response: RedirectResponse, subject: str) -> None:
+    response.set_cookie(
+        GUEST_COOKIE_NAME,
+        _sign_guest_cookie(subject),
+        max_age=GUEST_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
 
 
 # ---------------------------------------------------------------- buyer login seam
@@ -304,14 +365,22 @@ async def authorize(request: Request):
         return _err(e)
 
     subject = await resolve_buyer_subject(request)
-    if not subject:
+    if not subject and not core.guest_subjects_enabled():
         return _login_redirect(request)
 
-    # logged in -> show consent (signed request prevents tampering between GET and POST)
+    # Either a logged-in buyer, or (guest mode) an anonymous visitor who will be assigned a
+    # pseudonymous subject at approve-time. Consent is still required — it is the one
+    # human-present checkpoint, and the signed request pins client/redirect/scope/resource
+    # between GET and POST. The subject is NOT carried in the signed blob; it is resolved
+    # again at the decision step (account session or guest cookie), so consent cannot smuggle
+    # a subject.
     signed = _sign_request(validated)
     client = await get_store().get_client(validated["client_id"])
     client_name = html.escape((client or {}).get("client_name") or validated["client_id"])
-    scope = html.escape(validated["scope"])
+    # Show the buyer the scope they will ACTUALLY be granted, not the raw request — a guest who
+    # asked for pivota.account sees only pivota.checkout.
+    effective_scope = core.clamp_scope_for_subject(validated["scope"], subject or core.new_guest_subject())
+    scope = html.escape(effective_scope)
     state = html.escape(validated["state"])
     page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Authorize</title></head>
 <body><h2>Authorize {client_name}</h2>
@@ -339,9 +408,14 @@ async def authorize_decision(
     except OAuthFlowError as e:
         return _err(e)
 
+    # Resolve identity in priority order: a real account session wins; else (guest mode) reuse
+    # this browser's existing guest subject; else mint a fresh one on approval. A guest subject
+    # is minted ONLY on an explicit approve — a deny never creates one.
     subject = await resolve_buyer_subject(request)
     if not subject:
-        return _login_redirect(request)
+        if not core.guest_subjects_enabled():
+            return _login_redirect(request)
+        subject = _read_guest_cookie(request) or core.new_guest_subject()
 
     redirect_uri = validated["redirect_uri"]
     if decision != "approve":
@@ -352,9 +426,14 @@ async def authorize_decision(
         code = await flow.issue_authorization_code(get_store(), validated=validated, subject=subject)
     except OAuthFlowError as e:
         return _err(e)
-    await _record_agent_consent(subject, validated["client_id"], validated["scope"])
+    granted_scope = core.clamp_scope_for_subject(validated["scope"], subject)
+    await _record_agent_consent(subject, validated["client_id"], granted_scope)
     q = urlencode({"code": code, "state": validated.get("state", "")})
-    return RedirectResponse(f"{redirect_uri}?{q}", status_code=302)
+    resp = RedirectResponse(f"{redirect_uri}?{q}", status_code=302)
+    # Persist (or refresh) the guest cookie so the same browser keeps one stable subject.
+    if core.is_guest_subject(subject):
+        _set_guest_cookie(resp, subject)
+    return resp
 
 
 @router.post("/oauth/token")

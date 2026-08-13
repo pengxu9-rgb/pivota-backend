@@ -138,6 +138,11 @@ async def validate_authorization_request(store: OAuthStore, params: Dict[str, An
         # exact-match allowlist; unset MCP_OAUTH_AS_ALLOWED_RESOURCES allows nothing
         raise OAuthFlowError("invalid_target", "resource is not an allowed audience")
     scope = str(params.get("scope") or "").strip() or " ".join(core.DEFAULT_SCOPES)
+    unsupported = [s for s in scope.split() if s not in core.SUPPORTED_SCOPES]
+    if unsupported:
+        # refuse unknown scopes outright rather than silently dropping them, so a client
+        # never believes it holds a scope the AS won't grant
+        raise OAuthFlowError("invalid_scope", f"unsupported scope(s): {' '.join(unsupported)}")
     return {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -156,13 +161,17 @@ async def issue_authorization_code(
         raise OAuthFlowError("access_denied", "no authenticated subject", status=401)
     now = now or _now()
     code = core.new_authorization_code()
+    # Clamp to what this subject may hold. A guest subject is stripped of pivota.account here —
+    # the stored code (and every token minted from it, incl. refreshes) carries only the
+    # clamped scope, so the reduction cannot be undone downstream.
+    granted_scope = core.clamp_scope_for_subject(validated["scope"], subject)
     await store.save_code(
         core.hash_secret(code),
         {
             "client_id": validated["client_id"],
             "redirect_uri": validated["redirect_uri"],
             "code_challenge": validated["code_challenge"],
-            "scope": validated["scope"],
+            "scope": granted_scope,
             "resource": validated["resource"],
             "subject": subject,
             "expires_at": now + AUTH_CODE_TTL_SECONDS,
