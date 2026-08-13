@@ -19,13 +19,16 @@ Stage progression (highest satisfied stage wins):
   crawled       → external_offer_snapshots row for the domain exists
   extracted     → source document present:
                   external seed title OR agent_pdp_view title+description
-  quality_gated → content_quality_score >= 65 AND has_image AND has_price
+  quality_gated → content_quality_score >= QUALITY_SCORE_THRESHOLD AND has_image
+                  AND has_price
                   AND description_length >= 50
   shadow_indexed → serving_eligible=TRUE AND agent_pdp_view refreshed_at IS NOT NULL
   public_indexed → serving_eligible=TRUE AND apv.pdp_lifecycle_stage='published'
 
 Serving eligibility (ALL must be true):
-  - content_quality_score >= 65        (scale is 0-100, see services/product_quality_service.py)
+  - content_quality_score >= QUALITY_SCORE_THRESHOLD  (0-100 scale; the constant
+    lives in services/index_pipeline_state_service.py and is 71.4, not 65 —
+    see services/product_quality_service.py for why the scale moved)
   - has_image = TRUE  (agent_pdp_view.image_url non-null/non-empty)
   - has_price = TRUE  (catalog_offers row with list_price > 0)
   - description_length >= 50 (agent_pdp_view.description stripped)
@@ -44,7 +47,7 @@ Blocker codes (first failing check wins):
   non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
   no_seed           — no external seed and no APV-backed source document
   no_extraction     — a source row exists but no usable source title/document
-  low_quality       — content_quality_score < 65 (0-100 scale)
+  low_quality       — content_quality_score < QUALITY_SCORE_THRESHOLD (0-100 scale)
   no_image          — image_url null or empty
   no_price          — no catalog_offers row with list_price > 0
   short_description — description present but stripped length < 50

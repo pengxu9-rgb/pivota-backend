@@ -224,6 +224,52 @@ COHORT_BLOCKED_SAMPLES_SQL = f"""
     LIMIT 40
 """
 
+# 5d. WHICH SCALE each blocked row's score is on. The gate compares against
+#     QUALITY_SCORE_THRESHOLD = 71.4, raised from 65.0 in lockstep with dropping
+#     the dead `summary` component (7 terms -> 6, every score rescaled by 7/6,
+#     #1612). services/product_quality_service.py warns that stored scores stay
+#     on the OLD scale until re-scored and that comparing the two "silently mixes
+#     scales" — old-scale 61.2 is equivalent to new-scale 71.4.
+#
+#     So a row still carrying a pre-v3 rules_version is being measured against a
+#     bar meant for the other scale, and could be demoted for arithmetic rather
+#     than for content. Scores alone cannot answer this — 66.7 is both 4/6 (new)
+#     and a plausible 7-term value — so read the recorded rules_version instead
+#     of inferring from the number, which is exactly the mistake this query
+#     exists to avoid.
+COHORT_BLOCKED_SCALE_SQL = f"""
+    WITH cohort AS (
+      SELECT DISTINCT cp.content_key, cp.merchant_id, cp.platform,
+             cp.source_product_id, cp.brand, cp.title
+      FROM product_enrichment pe
+      JOIN catalog_products cp ON {_JOIN}
+      WHERE cp.content_key IS NOT NULL AND pe.geo_code = 'default'
+    ),
+    latest_snapshot AS (
+      SELECT DISTINCT ON (merchant_id, platform, platform_product_id)
+             merchant_id, platform, platform_product_id,
+             rules_version, content_quality_score, snapshot_date
+      FROM product_quality_snapshot
+      ORDER BY merchant_id, platform, platform_product_id, snapshot_date DESC
+    )
+    SELECT
+      c.brand, c.title,
+      COALESCE(ips.blocker_code, '(no pipeline row)') AS blocker_code,
+      ips.content_quality_score AS gate_score,
+      COALESCE(q.rules_version, '(no snapshot)') AS rules_version,
+      q.content_quality_score AS snapshot_score
+    FROM cohort c
+    LEFT JOIN index_pipeline_state ips ON ips.content_key = c.content_key
+    LEFT JOIN latest_snapshot q
+           ON q.merchant_id = c.merchant_id
+          AND q.platform = c.platform
+          AND q.platform_product_id = c.source_product_id
+    WHERE ips.serving_eligible IS DISTINCT FROM TRUE
+      AND COALESCE(ips.blocker_code, '') = 'low_quality'
+    ORDER BY ips.content_quality_score DESC NULLS LAST
+    LIMIT 40
+"""
+
 # 6. The inverse: rows SERVING an overlay whose enrichment no longer resolves.
 #    The publish bridge can never refresh these — they are frozen copies.
 ORPHANED_SERVING_SQL = f"""
@@ -306,6 +352,9 @@ async def collect() -> Dict[str, Any]:
     out["cohort_blocked_samples"] = [
         dict(r) for r in (await database.fetch_all(COHORT_BLOCKED_SAMPLES_SQL) or [])
     ]
+    out["low_quality_scale"] = [
+        dict(r) for r in (await database.fetch_all(COHORT_BLOCKED_SCALE_SQL) or [])
+    ]
     out["orphaned_serving"] = dict(
         await database.fetch_one(ORPHANED_SERVING_SQL) or {}
     )
@@ -383,6 +432,21 @@ def render(report: Dict[str, Any]) -> str:
         lines.append(
             f"  {str(r['blocker_code'])[:20]:<21} {str(r['brand'])[:16]:<17} "
             f"{str(r['title'])[:38]:<39} q={r['quality_score']}{detail}"
+        )
+
+    lines.append("\n=== 5d. which SCALE each low_quality score is on "
+                 "(gate compares against 71.4) ===")
+    lines.append(f"  {'brand':<18}{'title':<34}{'gate':>7}{'snap':>7}  rules_version")
+    rows = report.get("low_quality_scale") or []
+    if not rows:
+        lines.append("  (no low_quality keys)")
+    for r in rows:
+        gate = r.get("gate_score")
+        snap = r.get("snapshot_score")
+        lines.append(
+            f"  {str(r.get('brand'))[:17]:<18}{str(r.get('title'))[:33]:<34}"
+            f"{(round(gate, 1) if gate is not None else '-'):>7}"
+            f"{(round(snap, 1) if snap is not None else '-'):>7}  {r.get('rules_version')}"
         )
 
     lines.append("\n=== 6. serving an overlay whose enrichment no longer resolves ===")
