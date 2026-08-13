@@ -126,7 +126,7 @@ H1_SQL = f"""
 # different product's URL.
 _H2_ESCAPED_ID = (
     r"""replace(replace(replace(pe.platform_product_id,"""
-    r""" '', '\'), '%', '\%'), '_', '\_')"""
+    r""" '\', '\\'), '%', '\%'), '_', '\_')"""
 )
 H2_SQL = f"""
     SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
