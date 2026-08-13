@@ -112,8 +112,11 @@ ORPHANS_SQL = f"""
 
 # H0: the identity that moved is the MERCHANT, not the product id — the same
 # (platform, source_product_id) exists under a different (resolved) merchant.
-# This is the strongest evidence: the id equality is exact, and prod fan-out
-# is 1 target per orphan.
+# RESTRICTED to external_seed: only there do product ids live in a global
+# content-slug namespace where cross-merchant equality means identity. On
+# shopify/wix, ids are per-store, so a cross-store equal id is coincidence —
+# and H0's top rank would let that coincidence outrank correct same-merchant
+# evidence and publish one tenant's copy on another tenant's PDP.
 H0_SQL = f"""
     SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
            cp.merchant_id AS new_merchant_id,
@@ -123,7 +126,8 @@ H0_SQL = f"""
       ON cp.platform = pe.platform
      AND cp.source_product_id = pe.platform_product_id
      AND cp.merchant_id <> pe.merchant_id
-    WHERE {_ORPHAN_GUARD}
+    WHERE pe.platform = 'external_seed'
+      AND {_ORPHAN_GUARD}
 """
 
 # H1: the dead id is a seed's external_product_id; the seed is attached to a
@@ -411,9 +415,12 @@ async def _drive(apply: bool, limit: Optional[int]) -> int:
             print(f"  {m['hypothesis'][:4]}  {m['old_id'][:38]:<40} -> "
                   f"{m['new_id'][:28]:<30} {str(m['title'])[:30]}{move}")
         for r in report["rejected"]:
-            print(f"  REJ  {r['old_id'][:38]:<40} {r['reason']}")
+            print(f"  REJ  {r['old_id'][:38]:<40} "
+                  f"[-> {r['new_merchant_id']}/{r['new_id'][:24]}] {r['reason']}")
         for o in report["target_occupied"]:
-            print(f"  OCC  {o['old_id'][:38]:<40} target already enriched")
+            print(f"  OCC  {o['old_id'][:38]:<40} "
+                  f"[-> {o['new_merchant_id']}/{o['new_id'][:24]}] "
+                  f"target already enriched")
         if not apply:
             print("DRY-RUN — pass --apply to re-key the accepted matches.")
             return 0
