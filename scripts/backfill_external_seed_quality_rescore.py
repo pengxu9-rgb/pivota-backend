@@ -121,9 +121,33 @@ FETCH = """
         CAST(:source_prefix AS TEXT) IS NULL
         OR p.source_ref LIKE CAST(:source_prefix AS TEXT)
     )
-      -- snapshots are written under platform='external_seed'; the eligibility
-      -- lateral matches on platform, so scoring any other platform's rows here
-      -- writes snapshots nothing will ever read.
+      -- KEEP THIS FILTER. Its original rationale is now WRONG, and the real
+      -- one is more serious, so do not delete it on the strength of the old
+      -- comment.
+      --
+      -- It used to read: "snapshots are written under platform='external_seed',
+      -- so scoring any other platform's rows here writes snapshots nothing will
+      -- ever read." That stopped being true when make_external_seed_servable
+      -- started resolving the platform from catalog_products (it had already
+      -- done so for merchant_id). Scoring a url_audit row now writes a snapshot
+      -- the eligibility lateral WILL read — which is precisely why widening this
+      -- filter became more dangerous, not less.
+      --
+      -- THE REAL REASON: product_quality_snapshot is APPEND-ONLY
+      -- (services/product_quality_service.py:908 is a bare insert(), no
+      -- ON CONFLICT) and the eligibility lateral takes the LATEST row per
+      -- (merchant, platform, product). For a non-external_seed product an
+      -- incumbent snapshot already exists under its own platform, written by a
+      -- richer path. Scoring it here appends a NEWER one computed from
+      -- build_servable_quality_payload's narrow field set, which then wins the
+      -- ORDER BY — so a currently-public row can be scored BELOW the 71.4 bar
+      -- and demoted. `--include-eligible` removes the one guard
+      -- (NOT ips.serving_eligible) that keeps this run promote-only, and
+      -- recompute_serving_eligibility fires IndexNow on the down transition too,
+      -- asking search engines to re-crawl a URL that just went dark.
+      --
+      -- Widening this is a real piece of work: it needs a promote-only guard
+      -- that compares against the incumbent score, not just a wider WHERE.
       AND p.platform = 'external_seed'
       AND (CAST(:include_eligible AS INTEGER) = 1 OR NOT ips.serving_eligible)
     ORDER BY p.product_key, eps.updated_at DESC NULLS LAST, eps.id
