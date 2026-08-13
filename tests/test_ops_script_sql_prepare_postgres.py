@@ -482,7 +482,7 @@ def _collect_reattribution() -> List[Tuple[str, str]]:
     origin = "reattribute_orphaned_enrichment"
     return [
         (f"{origin}.{name}", getattr(module, name)) for name in (
-            "ORPHANS_SQL", "H1_SQL", "H2_SQL", "H3_SQL", "H4_SQL",
+            "ORPHANS_SQL", "H0_SQL", "H1_SQL", "H2_SQL", "H3_SQL", "H4_SQL",
             "TARGET_OCCUPIED_SQL", "REKEY_SQL",
         )
     ]
@@ -589,7 +589,7 @@ _MIN_STATEMENTS = {
     "scripts/report_enrichment_join_diagnosis.py": 13,
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
-    "scripts/reattribute_orphaned_enrichment.py": 7,
+    "scripts/reattribute_orphaned_enrichment.py": 8,
     "scripts/report_quality_scale_population.py": 5,
 }
 
