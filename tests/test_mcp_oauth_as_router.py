@@ -257,6 +257,33 @@ def test_guest_cannot_obtain_account_scope(guest_client):
     assert claims["scope"] == "pivota.checkout"
 
 
+def test_guest_refresh_cannot_widen_scope(guest_client):
+    # A guest's refresh must re-mint from the STORED (clamped) scope, never from a scope the
+    # client re-supplies at /token — otherwise a guest could refresh its way into pivota.account.
+    reg = guest_client.post("/oauth/register", json={"redirect_uris": [REDIRECT]})
+    client_id = reg.json()["client_id"]
+    verifier, challenge = pkce_pair()
+    signed = _authorize_and_get_signed(guest_client, client_id, challenge)
+    dec = guest_client.post("/oauth/authorize/decision",
+                            data={"signed_request": signed, "decision": "approve", "state": "g1"},
+                            follow_redirects=False)
+    code = re.search(r"[?&]code=([^&]+)", dec.headers["location"]).group(1)
+    tok = guest_client.post("/oauth/token", data={
+        "grant_type": "authorization_code", "client_id": client_id, "code": code,
+        "redirect_uri": REDIRECT, "code_verifier": verifier})
+    refresh_token = tok.json()["refresh_token"]
+
+    # attempt to widen on refresh
+    tok2 = guest_client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": client_id,
+        "refresh_token": refresh_token, "scope": "pivota.checkout pivota.account"})
+    assert tok2.status_code == 200, tok2.text
+    claims = _decode(guest_client, tok2.json()["access_token"])
+    assert "pivota.account" not in claims["scope"].split()
+    assert claims["scope"] == "pivota.checkout"
+    assert claims["sub"].startswith("mcpguest_")
+
+
 def test_authorize_rejects_unsupported_scope(guest_client):
     reg = guest_client.post("/oauth/register", json={"redirect_uris": [REDIRECT]})
     client_id = reg.json()["client_id"]
