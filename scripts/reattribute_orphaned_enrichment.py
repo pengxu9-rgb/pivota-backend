@@ -21,6 +21,12 @@ evidence, hypothesis by hypothesis, never by guessing.
 THE HYPOTHESES, each measured separately in the dry run so the mapping's
 evidence is visible before anything moves:
 
+  H0 cross-merchant id  a catalog row exists on the SAME platform with the
+                        SAME source_product_id under a DIFFERENT merchant.
+                        Prod diagnosis 2026-08-14: this is the A9-4
+                        re-parenting — 208/208 external_seed orphans map to
+                        exactly one merch_obs_* seller, zero occupied targets.
+                        The repair axis is merchant_id, not the product id.
   H1 seed external id   eps.external_product_id = pe.platform_product_id and
                         the seed is attached to a live catalog row.
   H2 seed URL slug      the dead id appears as a path segment of an attached
@@ -40,9 +46,11 @@ product's curated claims onto another, which is worse than the gap):
   * TARGET VACANCY: skipped if ANY enrichment row already exists at the target
     identity (any geo) — never clobber; ADR-001 precedence is not re-litigated
     here.
-  * SAME MERCHANT+PLATFORM only: re-keying across either is out of scope.
-  * Re-key is an UPDATE of platform_product_id (preserves authorship metadata
-    and created_at), then the row is republished through the canonical refresh
+  * SAME PLATFORM only: H0 deliberately crosses merchants (that is the axis
+    A9-4 moved) but never platforms; H1-H4 stay within merchant+platform.
+  * Re-key is an UPDATE of merchant_id and/or platform_product_id (preserves
+    authorship metadata and created_at), then the row is republished through
+    the canonical refresh
     and serving eligibility is recomputed — the same sequence the (now-working)
     on-write bridge performs.
 
@@ -102,10 +110,27 @@ ORPHANS_SQL = f"""
     ORDER BY pe.merchant_id, pe.platform, pe.platform_product_id
 """
 
+# H0: the identity that moved is the MERCHANT, not the product id — the same
+# (platform, source_product_id) exists under a different (resolved) merchant.
+# This is the strongest evidence: the id equality is exact, and prod fan-out
+# is 1 target per orphan.
+H0_SQL = f"""
+    SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
+           cp.merchant_id AS new_merchant_id,
+           cp.source_product_id AS new_id, cp.content_key, cp.title
+    FROM product_enrichment pe
+    JOIN catalog_products cp
+      ON cp.platform = pe.platform
+     AND cp.source_product_id = pe.platform_product_id
+     AND cp.merchant_id <> pe.merchant_id
+    WHERE {_ORPHAN_GUARD}
+"""
+
 # H1: the dead id is a seed's external_product_id; the seed is attached to a
 # live catalog row in the same merchant+platform.
 H1_SQL = f"""
     SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
+           cp.merchant_id AS new_merchant_id,
            cp.source_product_id AS new_id, cp.content_key, cp.title
     FROM product_enrichment pe
     JOIN external_product_seeds eps
@@ -130,6 +155,7 @@ _H2_ESCAPED_ID = (
 )
 H2_SQL = f"""
     SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
+           cp.merchant_id AS new_merchant_id,
            cp.source_product_id AS new_id, cp.content_key, cp.title
     FROM product_enrichment pe
     JOIN external_product_seeds eps
@@ -150,6 +176,7 @@ H2_SQL = f"""
 # H3: exact (case/space-normalized) title match via title_override.
 H3_SQL = f"""
     SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
+           cp.merchant_id AS new_merchant_id,
            cp.source_product_id AS new_id, cp.content_key, cp.title
     FROM product_enrichment pe
     JOIN catalog_products cp
@@ -164,6 +191,7 @@ H3_SQL = f"""
 # erased most, so this recovers only what still serves).
 H4_SQL = f"""
     SELECT pe.merchant_id, pe.platform, pe.platform_product_id AS old_id,
+           cp.merchant_id AS new_merchant_id,
            cp.source_product_id AS new_id, cp.content_key, cp.title
     FROM product_enrichment pe
     JOIN agent_pdp_view av
@@ -179,7 +207,7 @@ H4_SQL = f"""
 # Target vacancy: any enrichment row already at the candidate new identity.
 TARGET_OCCUPIED_SQL = """
     SELECT 1 FROM product_enrichment
-    WHERE merchant_id = :merchant_id
+    WHERE merchant_id = :new_merchant_id
       AND platform = :platform
       AND platform_product_id = :new_id
     LIMIT 1
@@ -190,13 +218,15 @@ TARGET_OCCUPIED_SQL = """
 # blocked the guard), so only the UPDATE's own rowcount can tell them apart.
 REKEY_SQL = """
     UPDATE product_enrichment
-    SET platform_product_id = :new_id, updated_at = NOW()
+    SET merchant_id = :new_merchant_id,
+        platform_product_id = :new_id,
+        updated_at = NOW()
     WHERE merchant_id = :merchant_id
       AND platform = :platform
       AND platform_product_id = :old_id
       AND NOT EXISTS (
         SELECT 1 FROM product_enrichment t
-        WHERE t.merchant_id = :merchant_id
+        WHERE t.merchant_id = :new_merchant_id
           AND t.platform = :platform
           AND t.platform_product_id = :new_id
       )
@@ -204,6 +234,7 @@ REKEY_SQL = """
 """
 
 _HYPOTHESES: List[Tuple[str, str]] = [
+    ("H0_xmerchant_exact_id", H0_SQL),
     ("H1_seed_external_id", H1_SQL),
     ("H2_seed_url_slug", H2_SQL),
     ("H3_title_override", H3_SQL),
@@ -244,21 +275,21 @@ def pick_matches(
         winners = [h for h in hits
                    if _HYP_RANK.get(h["hypothesis"], len(_HYP_RANK)) == best]
         winning_hyp = winners[0]["hypothesis"]
-        new_ids = {w["new_id"] for w in winners}
-        if len(new_ids) > 1:
+        targets = {(w["new_merchant_id"], w["new_id"]) for w in winners}
+        if len(targets) > 1:
             rejected.append({**winners[0], "reason":
-                             f"ambiguous: {len(new_ids)} targets within {winning_hyp}"})
+                             f"ambiguous: {len(targets)} targets within {winning_hyp}"})
             continue
         provisional.append(winners[0])
 
     target_counts: Dict[Tuple[str, str, str], int] = {}
     for m in provisional:
-        t = (m["merchant_id"], m["platform"], m["new_id"])
+        t = (m["new_merchant_id"], m["platform"], m["new_id"])
         target_counts[t] = target_counts.get(t, 0) + 1
 
     accepted: List[Dict[str, Any]] = []
     for m in provisional:
-        t = (m["merchant_id"], m["platform"], m["new_id"])
+        t = (m["new_merchant_id"], m["platform"], m["new_id"])
         if target_counts[t] > 1:
             rejected.append({**m, "reason":
                              f"collision: {target_counts[t]} orphans map to this target"})
@@ -285,7 +316,7 @@ async def collect() -> Dict[str, Any]:
     occupied: List[Dict[str, Any]] = []
     for m in accepted:
         row = await database.fetch_one(TARGET_OCCUPIED_SQL, {
-            "merchant_id": m["merchant_id"], "platform": m["platform"],
+            "new_merchant_id": m["new_merchant_id"], "platform": m["platform"],
             "new_id": m["new_id"],
         })
         (occupied if row else vacant).append(m)
@@ -335,6 +366,7 @@ async def apply_matches(matches: List[Dict[str, Any]], limit: Optional[int]) -> 
         moved_rows = await database.fetch_all(REKEY_SQL, {
             "merchant_id": m["merchant_id"], "platform": m["platform"],
             "old_id": m["old_id"], "new_id": m["new_id"],
+            "new_merchant_id": m["new_merchant_id"],
         })
         if not moved_rows:
             skipped += 1
@@ -374,8 +406,10 @@ async def _drive(apply: bool, limit: Optional[int]) -> int:
         # The FULL mapping, not a preview: this printout is what the operator
         # approves before --apply, so it must show everything that would move.
         for m in report["accepted"]:
+            move = ("" if m["new_merchant_id"] == m["merchant_id"]
+                    else f"  [{m['merchant_id']} -> {m['new_merchant_id']}]")
             print(f"  {m['hypothesis'][:4]}  {m['old_id'][:38]:<40} -> "
-                  f"{m['new_id'][:28]:<30} {str(m['title'])[:30]}")
+                  f"{m['new_id'][:28]:<30} {str(m['title'])[:30]}{move}")
         for r in report["rejected"]:
             print(f"  REJ  {r['old_id'][:38]:<40} {r['reason']}")
         for o in report["target_occupied"]:

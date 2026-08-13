@@ -21,8 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.reattribute_orphaned_enrichment import pick_matches  # noqa: E402
 
 
-def _hit(old: str, new: str, hyp: str, merchant: str = "m1") -> Dict[str, Any]:
+def _hit(old: str, new: str, hyp: str, merchant: str = "m1",
+         new_merchant: str | None = None) -> Dict[str, Any]:
     return {"merchant_id": merchant, "platform": "external_seed",
+            "new_merchant_id": new_merchant if new_merchant is not None else merchant,
             "old_id": old, "new_id": new, "hypothesis": hyp,
             "content_key": f"ck-{new}", "title": f"T {new}"}
 
@@ -94,3 +96,64 @@ def test_merchants_are_isolated() -> None:
     ])
     assert len(accepted) == 2
     assert rejected == []
+
+
+def test_h0_cross_merchant_match_is_accepted() -> None:
+    """H0 moves the MERCHANT axis (A9-4 re-parenting): same platform + product
+    id under a resolved seller merchant is a valid single target."""
+    accepted, rejected = pick_matches([
+        _hit("slug-1", "slug-1", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_a"),
+    ])
+    assert len(accepted) == 1
+    assert accepted[0]["new_merchant_id"] == "merch_obs_a"
+    assert rejected == []
+
+
+def test_h0_outranks_h1_when_they_disagree() -> None:
+    accepted, _ = pick_matches([
+        _hit("slug-1", "other-id", "H1_seed_external_id",
+             merchant="external_seed"),
+        _hit("slug-1", "slug-1", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_a"),
+    ])
+    assert len(accepted) == 1
+    assert accepted[0]["hypothesis"] == "H0_xmerchant_exact_id"
+
+
+def test_same_new_id_under_different_new_merchants_is_not_a_collision() -> None:
+    """The bilateral rule guards the full target identity (new_merchant,
+    platform, new_id) — two orphans landing on the SAME product id under two
+    DIFFERENT sellers are two different rows, not a collision."""
+    accepted, rejected = pick_matches([
+        _hit("old-1", "shared-id", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_a"),
+        _hit("old-2", "shared-id", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_b"),
+    ])
+    assert len(accepted) == 2
+    assert rejected == []
+
+
+def test_two_orphans_onto_one_cross_merchant_target_are_both_rejected() -> None:
+    accepted, rejected = pick_matches([
+        _hit("old-1", "shared-id", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_a"),
+        _hit("old-2", "shared-id", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_a"),
+    ])
+    assert accepted == []
+    assert len(rejected) == 2 and all("collision" in r["reason"] for r in rejected)
+
+
+def test_two_new_merchants_for_one_orphan_within_h0_is_ambiguous() -> None:
+    """Same product id under TWO resolved sellers: the evidence cannot say
+    which seller's row should carry this orphan's copy — reject."""
+    accepted, rejected = pick_matches([
+        _hit("old-1", "old-1", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_a"),
+        _hit("old-1", "old-1", "H0_xmerchant_exact_id",
+             merchant="external_seed", new_merchant="merch_obs_b"),
+    ])
+    assert accepted == []
+    assert len(rejected) == 1 and "ambiguous" in rejected[0]["reason"]
