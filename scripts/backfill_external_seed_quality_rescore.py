@@ -172,6 +172,52 @@ def _coerce_sections(value: Any) -> Optional[list]:
     return list(value) if isinstance(value, (list, tuple)) else None
 
 
+def candidate_key(row: Dict[str, Any]) -> tuple:
+    """The identity triple a row's snapshot will be written under.
+
+    Merchant is normalized EXACTLY as make_external_seed_servable does
+    (str/strip with the external_seed fallback) — an un-normalized key never
+    matches its own snapshot, so the row re-appends one snapshot per run
+    forever while being counted wrote=ok.
+    """
+    merchant = str(row.get("merchant_id") or "").strip() or "external_seed"
+    return (merchant, "external_seed", row["source_product_id"])
+
+
+def filter_todo(rows: list, done: set) -> list:
+    """Candidates minus the already-rescored, by FULL identity triple.
+
+    Shared by the CLI and routes/admin_rescore_external_seed_quality (which
+    imports by reference). Do not inline this in either venue: the last time
+    the two computed it separately, a type change on one side turned the
+    other's membership check into always-False.
+    """
+    return [r for r in rows if candidate_key(r) not in done]
+
+
+def demotion_preview(row: Dict[str, Any], qp: Dict[str, Any]) -> Optional[float]:
+    """Return the previewed score when writing this row WOULD DEMOTE it.
+
+    None means proceed. Only currently-serving rows can be demoted; dark rows
+    always proceed — a low rescore leaves them exactly as dark as before, and
+    guarding them would freeze the backlog this script exists to move.
+
+    The preview is faithful to the write by construction: the SAME qp object
+    goes to preview_quality here and to full_quality_eval inside
+    make_external_seed_servable, with the same score_source_backed_components.
+    NARROW CLAIM, deliberately: this guards the low_quality demotion path
+    ONLY. The write also refreshes agent_pdp_view and recomputes the full
+    blocker ladder, so an eligible row can still lose eligibility for OTHER
+    reasons (no_image, short_description) if the refresh degrades the row.
+    """
+    if not row.get("is_serving_eligible"):
+        return None
+    score = preview_quality(
+        qp, score_source_backed_components=True
+    ).get("content_quality_score") or 0.0
+    return score if score < QUALITY_SCORE_THRESHOLD else None
+
+
 async def _rescored_ids() -> set:
     """Products already carrying a current-version snapshot — keyed by the FULL
     identity triple, not platform_product_id alone.
@@ -343,10 +389,7 @@ async def run(
             )
         ]
         done = set() if force else await _rescored_ids()
-        todo = [
-            r for r in rows
-            if (r["merchant_id"], "external_seed", r["source_product_id"]) not in done
-        ]
+        todo = filter_todo(rows, done)
         if offset:
             todo = todo[offset:]
         if limit:
@@ -406,30 +449,25 @@ async def run(
                     category=r["category_kind"], raw_inci=r["raw_inci"],
                     pdp_details_sections=_coerce_sections(r.get("pdp_details_sections")),
                 )
-                # PROMOTE-ONLY, enforced rather than emergent. The default FETCH
-                # already excludes serving-eligible rows, so this guard is inert
-                # on an ordinary run — but --include-eligible removes that filter,
-                # and product_quality_snapshot is APPEND-ONLY with the eligibility
-                # lateral taking the LATEST row: writing a lower score for a
-                # currently-public product demotes it and fires IndexNow on the
-                # way down. So for an eligible candidate, PREVIEW the score first
-                # (same payload, same source-backed components, no write) and
-                # refuse the row when it would land below the bar. Dark rows are
-                # exempt: a low rescore leaves them exactly as dark as before.
-                if r.get("is_serving_eligible"):
-                    preview_score = preview_quality(
-                        qp, score_source_backed_components=True
-                    ).get("content_quality_score") or 0.0
-                    if preview_score < QUALITY_SCORE_THRESHOLD:
-                        would_demote += 1
-                        consec_fail = consec_no_write = 0
-                        print(
-                            f"  [SKIP would-demote] {epid} preview="
-                            f"{preview_score:.1f} < {QUALITY_SCORE_THRESHOLD} "
-                            f"and row is currently serving",
-                            flush=True,
-                        )
-                        continue
+                # Guard against the low_quality demotion path (see
+                # demotion_preview for the exact, deliberately narrow claim).
+                # Inert on a default run; bites under --include-eligible.
+                # The skip deliberately does NOT touch consec_fail /
+                # consec_no_write: previewing is pure local CPU and carries
+                # zero information about connection health, so resetting them
+                # here erased accumulated evidence of a poisoned pool — a
+                # measured 20-consecutive-no-write run sailed past both
+                # breakers when skips interleaved with the failures.
+                preview_score = demotion_preview(r, qp)
+                if preview_score is not None:
+                    would_demote += 1
+                    print(
+                        f"  [SKIP would-demote] {epid} preview="
+                        f"{preview_score:.1f} < {QUALITY_SCORE_THRESHOLD} "
+                        f"and row is currently serving",
+                        flush=True,
+                    )
+                    continue
                 # per-product timeout so a dead socket errors out, never hangs
                 summary = await asyncio.wait_for(
                     make_external_seed_servable(

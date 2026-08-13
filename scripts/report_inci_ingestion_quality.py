@@ -105,13 +105,18 @@ FRESHNESS_SQL = """
     LIMIT 10
 """
 
+# INNER JOIN to catalog_products drops beauty_sku_ingredients rows whose
+# product no longer exists — so `inci_products` here can be LOWER than
+# `products_with_inci` in section 1, and the difference IS the orphan count.
+# Deliberate: orphaned INCI cannot reach any serving surface, so it does not
+# belong in a reach metric; the gap is visible by comparing the two sections.
 REACH_SQL = """
     SELECT
-      COUNT(DISTINCT bsi.product_key) AS inci_products,
+      COUNT(DISTINCT bsi.product_key) AS inci_reachable_products,
       COUNT(DISTINCT bsi.product_key) FILTER (
         WHERE ips.serving_eligible IS TRUE) AS serving_eligible,
       COUNT(DISTINCT bsi.product_key) FILTER (
-        WHERE av.evidence_profile IS NOT NULL) AS evidence_on_served_row
+        WHERE av.evidence_profile IS NOT NULL) AS evidence_profile_present
     FROM beauty_sku_ingredients bsi
     JOIN catalog_products cp ON cp.product_key = bsi.product_key
     LEFT JOIN index_pipeline_state ips ON ips.content_key = cp.content_key

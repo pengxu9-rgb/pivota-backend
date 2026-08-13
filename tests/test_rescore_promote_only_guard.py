@@ -84,6 +84,13 @@ def harness(monkeypatch: pytest.MonkeyPatch):
         return {"quality": True, "serving_eligible": True}
 
     def fake_preview(payload, score_source_backed_components=None):
+        # The preview is only faithful to the write if BOTH use the source-backed
+        # components. A survived mutant flipped this to False with green tests —
+        # conservative in that direction (under-scores, over-skips), but the
+        # symmetric drift on the write side would under-block. Pin it.
+        assert score_source_backed_components is True, (
+            "guard preview must score source-backed components, like the write"
+        )
         # Keyed by title so each candidate can carry its own score.
         title = str(payload.get("title") or payload.get("title_canonical") or "")
         pid = title.replace("Product ", "")
@@ -119,6 +126,21 @@ async def test_an_eligible_row_scoring_above_the_bar_proceeds(harness) -> None:
 
     await mod.run(apply=True, limit=None, include_eligible=True, skip_trust=True)
     assert harness["calls"] == ["p-high"]
+
+
+@pytest.mark.asyncio
+async def test_a_score_exactly_at_the_bar_proceeds(harness) -> None:
+    """71.4 exactly IS eligible (the gate is >= threshold), so the guard must
+    let it through. A survived mutant turned `<` into `<=` with green tests —
+    every prior fixture score sat far from the boundary. Fractional component
+    scores land exactly on the bar in prod (three of the blocked keys read
+    71.4000015...), so this is a real edge, not pedantry."""
+    import scripts.backfill_external_seed_quality_rescore as m
+    harness["scores"]["p-edge"] = m.QUALITY_SCORE_THRESHOLD
+    harness["install"](_FakeDB([_row("p-edge", eligible=True)]))
+
+    await mod.run(apply=True, limit=None, include_eligible=True, skip_trust=True)
+    assert harness["calls"] == ["p-edge"], "a row AT the bar was refused"
 
 
 @pytest.mark.asyncio
