@@ -28,6 +28,7 @@ def client(monkeypatch):
     monkeypatch.setenv("MCP_OAUTH_AS_KEY_ID", "router-kid")
     monkeypatch.setenv("MCP_OAUTH_AS_STORE", "memory")
     monkeypatch.setenv("MCP_OAUTH_AS_REQUEST_SECRET", "router-test-secret-0123456789")
+    monkeypatch.setenv("MCP_OAUTH_AS_ALLOWED_RESOURCES", RESOURCE)
     core._KEY_CACHE.clear()
     as_router._MEMORY_STORE.clients.clear()
     as_router._MEMORY_STORE.codes.clear()
@@ -115,6 +116,18 @@ def test_deny_redirects_with_access_denied(client):
                       follow_redirects=False)
     assert dec.status_code == 302
     assert "error=access_denied" in dec.headers["location"]
+
+
+def test_authorize_refuses_unlisted_resource(client):
+    reg = client.post("/oauth/register", json={"redirect_uris": [REDIRECT]})
+    client_id = reg.json()["client_id"]
+    _, challenge = pkce_pair()
+    auth = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": client_id, "redirect_uri": REDIRECT,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+        "resource": RESOURCE + "/other"})
+    assert auth.status_code == 400
+    assert auth.json()["error"] == "invalid_target"
 
 
 def test_disabled_returns_404(monkeypatch):

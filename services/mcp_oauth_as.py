@@ -63,6 +63,18 @@ def key_id() -> str:
     return (os.getenv("MCP_OAUTH_AS_KEY_ID") or "pivota-mcp-as-1").strip()
 
 
+def allowed_resources() -> List[str]:
+    """Exact resource URLs (RFC 8707) this AS may bind tokens to.
+
+    Fail closed: unset/empty means NO resource is acceptable — the AS must never mint
+    an audience nobody deliberately allowed. Matching is byte-exact (the RS compares
+    `aud` to its resource string byte-exactly, so anything looser here mints tokens
+    the RS would accept for a resource we never approved).
+    """
+    raw = os.getenv("MCP_OAUTH_AS_ALLOWED_RESOURCES") or ""
+    return [v.strip() for v in raw.split(",") if v.strip()]
+
+
 def _load_private_key():
     """Load the RSA private key from env, or generate an ephemeral one (dev/test only).
 

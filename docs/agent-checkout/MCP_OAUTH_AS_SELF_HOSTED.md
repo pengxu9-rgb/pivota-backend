@@ -46,8 +46,14 @@ MCP_OAUTH_AS_ISSUER=https://api.pivota.cc            # must match the iss the RS
 MCP_OAUTH_AS_PRIVATE_KEY_PEM=<RSA private key PEM>   # REQUIRED in prod (stable JWKS across instances)
 MCP_OAUTH_AS_KEY_ID=pivota-mcp-as-1
 MCP_OAUTH_AS_REQUEST_SECRET=<random>                 # HMAC for the consent step (or reuse CONFIRMATION_SECRET)
+MCP_OAUTH_AS_ALLOWED_RESOURCES=https://commerce.mcp.pivota.cc/mcp  # REQUIRED; comma-separated exact URLs; unset = every authorize fails invalid_target
 MCP_OAUTH_AS_LOGIN_URL=https://<accounts-login-ui>   # must honor ?next= and set the accounts cookie
 ```
+
+Note on removing an entry from `MCP_OAUTH_AS_ALLOWED_RESOURCES`: the allowlist is enforced at
+/oauth/authorize only. Refresh tokens already issued for a removed resource keep re-minting
+access tokens with that audience for up to 30 days — removal is NOT an instant kill switch.
+To revoke immediately, also mark that resource's rows revoked in `mcp_oauth_refresh`.
 
 Generate the key once:
 `openssl genrsa 2048` → set as `MCP_OAUTH_AS_PRIVATE_KEY_PEM` (literal `\n` escapes are accepted).
