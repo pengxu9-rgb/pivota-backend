@@ -171,6 +171,59 @@ COHORT_STATUS_SQL = f"""
     LEFT JOIN agent_pdp_view av ON av.content_key = c.content_key
 """
 
+# 5b. WHY the enriched-but-not-serving keys are blocked. index_pipeline_state
+#     records a first-failing-check-wins `blocker_code` (migration 098 documents
+#     the ladder). Enrichment is NOT one of the checks — the gate reads
+#     description/image/price/quality — so a key blocked here is one the overlay
+#     work cannot rescue on its own, and knowing WHICH check fails is what says
+#     whether the remaining coverage gap is a content problem, a price/offer
+#     problem, or an identity problem. The has_image / has_price / description
+#     columns are carried alongside because the blocker names them.
+COHORT_BLOCKERS_SQL = f"""
+    WITH cohort AS (
+      SELECT DISTINCT cp.content_key
+      FROM product_enrichment pe
+      JOIN catalog_products cp ON {_JOIN}
+      WHERE cp.content_key IS NOT NULL AND pe.geo_code = 'default'
+    )
+    SELECT
+      COALESCE(ips.blocker_code, '(no pipeline row)') AS blocker_code,
+      COALESCE(ips.pipeline_stage, '(none)') AS pipeline_stage,
+      COUNT(*) AS content_keys,
+      COUNT(*) FILTER (WHERE ips.has_image IS TRUE) AS has_image,
+      COUNT(*) FILTER (WHERE ips.has_price IS TRUE) AS has_price,
+      COUNT(*) FILTER (WHERE COALESCE(ips.description_length, 0) >= 50) AS desc_ge_50,
+      COUNT(*) FILTER (WHERE av.bullet_points IS NOT NULL
+                          OR av.usage_scenarios IS NOT NULL) AS overlay_is_published
+    FROM cohort c
+    LEFT JOIN index_pipeline_state ips ON ips.content_key = c.content_key
+    LEFT JOIN agent_pdp_view av ON av.content_key = c.content_key
+    WHERE ips.serving_eligible IS DISTINCT FROM TRUE
+    GROUP BY 1, 2
+    ORDER BY content_keys DESC, blocker_code ASC
+"""
+
+# 5c. The individual blocked keys, so the breakdown is actionable rather than
+#     just a histogram — blocker_detail carries the specific reason.
+COHORT_BLOCKED_SAMPLES_SQL = f"""
+    WITH cohort AS (
+      SELECT DISTINCT cp.content_key, cp.brand, cp.title, cp.merchant_id
+      FROM product_enrichment pe
+      JOIN catalog_products cp ON {_JOIN}
+      WHERE cp.content_key IS NOT NULL AND pe.geo_code = 'default'
+    )
+    SELECT
+      c.content_key, c.brand, c.title, c.merchant_id,
+      COALESCE(ips.blocker_code, '(no pipeline row)') AS blocker_code,
+      LEFT(COALESCE(ips.blocker_detail, ''), 60) AS blocker_detail,
+      COALESCE(ips.content_quality_score, -1) AS quality_score
+    FROM cohort c
+    LEFT JOIN index_pipeline_state ips ON ips.content_key = c.content_key
+    WHERE ips.serving_eligible IS DISTINCT FROM TRUE
+    ORDER BY blocker_code ASC, c.brand ASC NULLS LAST
+    LIMIT 40
+"""
+
 # 6. The inverse: rows SERVING an overlay whose enrichment no longer resolves.
 #    The publish bridge can never refresh these — they are frozen copies.
 ORPHANED_SERVING_SQL = f"""
@@ -247,6 +300,12 @@ async def collect() -> Dict[str, Any]:
     out["cohort_recommendation_status"] = dict(
         await database.fetch_one(COHORT_STATUS_SQL) or {}
     )
+    out["cohort_blockers"] = [
+        dict(r) for r in (await database.fetch_all(COHORT_BLOCKERS_SQL) or [])
+    ]
+    out["cohort_blocked_samples"] = [
+        dict(r) for r in (await database.fetch_all(COHORT_BLOCKED_SAMPLES_SQL) or [])
+    ]
     out["orphaned_serving"] = dict(
         await database.fetch_one(ORPHANED_SERVING_SQL) or {}
     )
@@ -305,6 +364,26 @@ def render(report: Dict[str, Any]) -> str:
     lines.append("\n=== 5. joinable cohort in the recommendation surface ===")
     for k, v in report["cohort_recommendation_status"].items():
         lines.append(f"  {k:<40} {v}")
+
+    lines.append("\n=== 5b. why the enriched cohort is NOT serving-eligible ===")
+    lines.append(f"  {'blocker_code':<24}{'stage':<16}{'keys':>5}{'img':>5}"
+                 f"{'price':>7}{'desc50':>8}{'published':>11}")
+    if not report.get("cohort_blockers"):
+        lines.append("  (none — every enriched key is serving-eligible)")
+    for b in report.get("cohort_blockers") or []:
+        lines.append(
+            f"  {str(b['blocker_code'])[:23]:<24}{str(b['pipeline_stage'])[:15]:<16}"
+            f"{b['content_keys']:>5}{b['has_image']:>5}{b['has_price']:>7}"
+            f"{b['desc_ge_50']:>8}{b['overlay_is_published']:>11}"
+        )
+
+    lines.append("\n=== 5c. the blocked keys ===")
+    for r in report.get("cohort_blocked_samples") or []:
+        detail = f" | {r['blocker_detail']}" if r.get("blocker_detail") else ""
+        lines.append(
+            f"  {str(r['blocker_code'])[:20]:<21} {str(r['brand'])[:16]:<17} "
+            f"{str(r['title'])[:38]:<39} q={r['quality_score']}{detail}"
+        )
 
     lines.append("\n=== 6. serving an overlay whose enrichment no longer resolves ===")
     for k, v in report["orphaned_serving"].items():
