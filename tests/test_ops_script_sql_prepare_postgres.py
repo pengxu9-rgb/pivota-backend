@@ -474,6 +474,20 @@ def _collect_quality_scale_population() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_reattribution() -> List[Tuple[str, str]]:
+    """The re-attribution script WRITES (rekey + republish), so an unplannable
+    statement here is an aborted repair mid-run, not just a wrong report."""
+    import scripts.reattribute_orphaned_enrichment as module
+
+    origin = "reattribute_orphaned_enrichment"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "ORPHANS_SQL", "H1_SQL", "H2_SQL", "H3_SQL", "H4_SQL",
+            "TARGET_OCCUPIED_SQL", "REKEY_SQL",
+        )
+    ]
+
+
 def _collect_inci_quality() -> List[Tuple[str, str]]:
     import scripts.report_inci_ingestion_quality as module
 
@@ -555,6 +569,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_enrichment_join_diagnosis.py": _collect_enrichment_join_diagnosis,
     "scripts/report_agent_depth_scorecard.py": _collect_depth_scorecard,
     "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
+    "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
 }
 
@@ -574,6 +589,7 @@ _MIN_STATEMENTS = {
     "scripts/report_enrichment_join_diagnosis.py": 13,
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
+    "scripts/reattribute_orphaned_enrichment.py": 7,
     "scripts/report_quality_scale_population.py": 5,
 }
 
