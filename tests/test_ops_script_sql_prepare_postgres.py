@@ -474,6 +474,21 @@ def _collect_quality_scale_population() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_depth_scorecard() -> List[Tuple[str, str]]:
+    """The holistic then-vs-now scorecard. Same argument as its siblings: a
+    scoreboard whose SQL cannot be planned reports nothing, and one that
+    silently errors mid-collection reports a PARTIAL picture as the whole."""
+    import scripts.report_agent_depth_scorecard as module
+
+    origin = "report_agent_depth_scorecard"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "APV_DEPTH_SQL", "INDEX_SURFACE_SQL", "INDEX_BLOCKERS_SQL",
+            "INCI_INGESTED_SQL", "INCI_CAPTURED_SQL", "ENRICHMENT_INPUT_SQL",
+        )
+    ]
+
+
 def _collect_enrichment_join_diagnosis() -> List[Tuple[str, str]]:
     """Every constant the join-diagnosis report sends. Same reasoning as the
     baseline: a diagnosis whose SQL cannot be planned is an outage mid-ops-run,
@@ -526,6 +541,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/backfill_agent_pdp_view.py": _collect_backfill_agent_pdp_view,
     "scripts/report_enrichment_propagation_baseline.py": _collect_enrichment_baseline,
     "scripts/report_enrichment_join_diagnosis.py": _collect_enrichment_join_diagnosis,
+    "scripts/report_agent_depth_scorecard.py": _collect_depth_scorecard,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
 }
 
@@ -543,6 +559,7 @@ _MIN_STATEMENTS = {
     "scripts/backfill_agent_pdp_view.py": 5,
     "scripts/report_enrichment_propagation_baseline.py": 12,
     "scripts/report_enrichment_join_diagnosis.py": 13,
+    "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_quality_scale_population.py": 5,
 }
 
