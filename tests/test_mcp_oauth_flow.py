@@ -260,3 +260,53 @@ def test_resource_allowlist_multiple_values(monkeypatch):
     assert validated["resource"] == RESOURCE
     # the comma-join of the two entries is NOT itself an allowed value
     _expect_invalid_target(store, base, f"{RESOURCE},{second}")
+
+
+# ---------------------------------------------------------------- scope validation + clamp
+
+def test_validate_rejects_unsupported_scope():
+    store = InMemoryStore()
+    reg = run(_register(store))
+    _, challenge = pkce_pair()
+    base = {"response_type": "code", "client_id": reg["client_id"], "redirect_uri": REDIRECT,
+            "code_challenge": challenge, "code_challenge_method": "S256", "resource": RESOURCE}
+    for bad in ("pivota.admin", "pivota.checkout pivota.admin", "openid"):
+        with pytest.raises(OAuthFlowError) as exc:
+            run(validate_authorization_request(store, {**base, "scope": bad}))
+        assert exc.value.error == "invalid_scope"
+    # supported scopes pass
+    ok = run(validate_authorization_request(store, {**base, "scope": "pivota.checkout pivota.account"}))
+    assert ok["scope"] == "pivota.checkout pivota.account"
+
+
+def test_clamp_scope_strips_account_for_guest():
+    guest = core.new_guest_subject()
+    assert core.is_guest_subject(guest)
+    # a guest that asked for both scopes keeps only checkout
+    assert core.clamp_scope_for_subject("pivota.checkout pivota.account", guest) == "pivota.checkout"
+    # even asking for account alone yields the default, never account
+    assert core.clamp_scope_for_subject("pivota.account", guest) == "pivota.checkout"
+    # an account subject keeps both, order-preserving
+    assert core.clamp_scope_for_subject("pivota.checkout pivota.account", "u_abc123") == \
+        "pivota.checkout pivota.account"
+
+
+def test_guest_subject_namespace_is_collision_free():
+    guest = core.new_guest_subject()
+    # never matches an account subject (`u_…`), an identity uuid, or the UGC guest form (`guest:…`)
+    assert not guest.startswith("u_")
+    assert ":" not in guest
+    assert core.is_guest_subject(guest)
+    assert not core.is_guest_subject("u_deadbeef")
+    assert not core.is_guest_subject("guest:abcdef")
+    assert not core.is_guest_subject(None)
+
+
+def test_issue_code_stores_clamped_scope_for_guest():
+    store = InMemoryStore()
+    guest = core.new_guest_subject()
+    validated = {"client_id": "c1", "redirect_uri": REDIRECT, "code_challenge": "x",
+                 "scope": "pivota.checkout pivota.account", "resource": RESOURCE}
+    code = run(issue_authorization_code(store, validated=validated, subject=guest))
+    stored = store.codes[core.hash_secret(code)]
+    assert stored["scope"] == "pivota.checkout"  # account stripped at issue time, not just display

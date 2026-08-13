@@ -38,6 +38,19 @@ ALG = "RS256"
 ACCESS_TOKEN_TTL_SECONDS_DEFAULT = 3600
 DEFAULT_SCOPES = ["pivota.checkout"]
 
+# Every scope the AS will grant to anyone. A request for anything outside this set is
+# refused at /authorize (invalid_scope) rather than silently dropped.
+SUPPORTED_SCOPES = ["pivota.checkout", "pivota.account"]
+# Scopes a guest (non-account) subject may ever hold. `pivota.account` — vault reads and
+# after-sales mutations — is deliberately absent: a consent-minted guest can never obtain it,
+# no matter what the client asks for. Enforced by clamp_scope_for_subject at code-issue time.
+GUEST_SCOPES = ["pivota.checkout"]
+
+# Namespace for consent-minted pseudonymous subjects (channel 2 native MCP clients). Chosen so
+# it can NEVER equal an account subject (`u_<hex>` from db.accounts) or an identity_id or the
+# UGC guest form (`guest:<digest>`, colon-delimited) — no shared prefix, no colon.
+GUEST_SUBJECT_PREFIX = "mcpguest_"
+
 
 class McpOAuthAsError(Exception):
     """Configuration or protocol error in the AS core."""
@@ -173,6 +186,35 @@ def verify_pkce(*, code_verifier: str, code_challenge: str, method: str = "S256"
     return secrets.compare_digest(expected, code_challenge)
 
 
+# --------------------------------------------------------------------------- guest subjects
+
+def guest_subjects_enabled() -> bool:
+    """Channel-2 guest minting is OFF unless explicitly enabled; flag-off is byte-identical to
+    the login-required behavior that shipped before this feature."""
+    return (os.getenv("MCP_OAUTH_AS_GUEST_SUBJECTS") or "").strip() == "1"
+
+
+def new_guest_subject() -> str:
+    return GUEST_SUBJECT_PREFIX + secrets.token_urlsafe(18)
+
+
+def is_guest_subject(subject: Optional[str]) -> bool:
+    return isinstance(subject, str) and subject.startswith(GUEST_SUBJECT_PREFIX)
+
+
+def clamp_scope_for_subject(scope: str, subject: str) -> str:
+    """Reduce a requested scope string to what `subject` is allowed to hold, order-preserving.
+
+    Guest subjects are clamped to GUEST_SCOPES — a guest that asked for `pivota.account` gets
+    only `pivota.checkout` back, never the account scope. Account subjects keep any supported
+    scope. Callers pass a scope already validated against SUPPORTED_SCOPES.
+    """
+    requested = [s for s in (scope or "").split() if s]
+    allowed = set(GUEST_SCOPES) if is_guest_subject(subject) else set(SUPPORTED_SCOPES)
+    kept = [s for s in requested if s in allowed]
+    return " ".join(kept) if kept else " ".join(DEFAULT_SCOPES)
+
+
 # --------------------------------------------------------------------------- DCR / codes
 
 def new_client_id() -> str:
@@ -262,7 +304,7 @@ def authorization_server_metadata() -> Dict[str, Any]:
         "token_endpoint": f"{iss}/oauth/token",
         "registration_endpoint": f"{iss}/oauth/register",
         "jwks_uri": f"{iss}/.well-known/jwks.json",
-        "scopes_supported": list(DEFAULT_SCOPES),
+        "scopes_supported": list(SUPPORTED_SCOPES),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
