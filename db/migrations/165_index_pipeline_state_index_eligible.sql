@@ -9,7 +9,9 @@
 -- `index_eligible` is the PARALLEL, OFFER-FREE quality+trust+identity floor that
 -- drives the citation READ surface. It is the full serving_eligible predicate set
 -- MINUS has_price:
---   content_quality_score >= 65 AND has_image AND description_length >= 50 AND
+--   content_quality_score >= QUALITY_SCORE_THRESHOLD (see
+--   services/index_pipeline_state_service.py; 71.4 since #1612, NOT the 65 this
+--   line used to state) AND has_image AND description_length >= 50 AND
 --   identity_resolved AND source_document_present AND seed_audit OK AND
 --   not domain regression AND catalog_products.sync_status = 'live'.
 -- has_image is REQUIRED (a citation without an image is not a usable PDP).

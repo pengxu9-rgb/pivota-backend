@@ -44,6 +44,7 @@ from typing import Any, Dict, List
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
+from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.agent_pdp_view_assembler import (  # noqa: E402
     refresh_agent_pdp_view_for_content_key,
 )
@@ -210,7 +211,16 @@ async def run(apply: bool, limit: int) -> int:
         for row in rows:
             score = preview_quality(_payload_for(row), score_source_backed_components=True)[
                 "content_quality_score"]
-            dist["quality>=65" if (score or 0) >= 65 else "quality<65"] += 1
+            # Bucket against the REAL gate, not a hardcoded 65. This line said 65
+            # until 2026-08-11 while the gate has been QUALITY_SCORE_THRESHOLD
+            # (71.4) since #1612 — and it scores with
+            # score_source_backed_components=True, i.e. the SIX-component scale,
+            # so comparing to 65 measured a new-scale score against the old bar
+            # and told the operator more rows would promote than actually can.
+            bucket = (f"quality>={QUALITY_SCORE_THRESHOLD}"
+                      if (score or 0) >= QUALITY_SCORE_THRESHOLD
+                      else f"quality<{QUALITY_SCORE_THRESHOLD}")
+            dist[bucket] += 1
             dist[f"stage:{row.get('pdp_lifecycle_stage')}"] += 1
         print(f"[dry] {dict(dist)}")
         print("[dry] no writes. Re-run with --apply.")

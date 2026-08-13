@@ -8,17 +8,26 @@
 --   discovered    → catalog_products row with content_key exists
 --   crawled       → external_offer_snapshots row exists for the domain
 --   extracted     → seed_data non-empty with title present
---   quality_gated → content_quality_score >= 65 AND has_image AND has_price
+--   quality_gated → content_quality_score >= QUALITY_SCORE_THRESHOLD AND has_image
+--                   AND has_price
 --                   AND description_length >= 50
 --   shadow_indexed → serving_eligible=TRUE AND agent_pdp_view row exists
 --   public_indexed → serving_eligible=TRUE AND apv.pdp_lifecycle_stage='published'
+--
+-- THE THRESHOLD LIVES IN CODE, NOT HERE. This header said 65 until 2026-08-11;
+-- the real bar has been services.index_pipeline_state_service.QUALITY_SCORE_THRESHOLD (71.4 since 2026-07-28, #1612)
+-- since it was raised from 65.0 IN LOCKSTEP with dropping the dead `summary`
+-- component from the scorer (7 terms -> 6, so every score rescales by 7/6 —
+-- holding 65 would have been a ~16% widening). A stale number here is not
+-- harmless: it sent a 2026-08-11 investigation looking for a threshold bug that
+-- did not exist. Read the constant.
 --
 -- blocker_code values (first failing check wins):
 --   not_live          — catalog_products.sync_status is not 'live'
 --   non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
 --   no_seed           — no external_product_seeds row linked to this content_key
 --   no_extraction     — seed_data null or title missing
---   low_quality       — content_quality_score < 65
+--   low_quality       — content_quality_score < QUALITY_SCORE_THRESHOLD
 --   no_image          — image_url null/empty after extraction
 --   no_price          — no catalog_offers row with list_price > 0
 --   short_description — description present but < 50 chars after strip
