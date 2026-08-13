@@ -469,7 +469,7 @@ def _collect_enrichment_join_diagnosis() -> List[Tuple[str, str]]:
             "SAMPLE_ENRICHMENT_IDS_SQL", "SAMPLE_CATALOG_IDS_SQL",
             "TREND_SQL", "COHORT_STATUS_SQL",
             "COHORT_BLOCKERS_SQL", "COHORT_BLOCKED_SAMPLES_SQL",
-            "COHORT_BLOCKED_SCALE_SQL",
+            "COHORT_BLOCKED_SCALE_SQL", "RESCORE_REACHABILITY_SQL",
             "ORPHANED_SERVING_SQL",
             "COHORT_KEYS_SQL", "PLAIN_PRODUCT_SQL",
         )
@@ -523,7 +523,7 @@ _MIN_STATEMENTS = {
     "scripts/source_pdp_offer_image_repair.py": 6,
     "scripts/backfill_agent_pdp_view.py": 5,
     "scripts/report_enrichment_propagation_baseline.py": 12,
-    "scripts/report_enrichment_join_diagnosis.py": 12,
+    "scripts/report_enrichment_join_diagnosis.py": 13,
 }
 
 

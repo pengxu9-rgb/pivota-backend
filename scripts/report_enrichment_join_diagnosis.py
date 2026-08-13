@@ -270,6 +270,53 @@ COHORT_BLOCKED_SCALE_SQL = f"""
     LIMIT 40
 """
 
+# 5e. CAN scripts/backfill_external_seed_quality_rescore even reach these keys?
+#
+#     The stale-scale finding (5d) suggests re-scoring the v1-lite rows. Before
+#     running anything, check the tool actually applies: that script has NO
+#     product selector — its flags are --apply/--limit/--tool-prefix/--force/
+#     --include-eligible/--offset/--trust-flush-every/--skip-trust — so it
+#     processes its whole candidate set, and `--limit N` takes an arbitrary
+#     alphabetical slice (the candidate query is ORDER BY p.product_key). A
+#     measured dry run reported 341 to-rescore, none of them ours.
+#
+#     It is also not merely a rescore: it runs make_external_seed_servable and
+#     then upsert_catalog_row_trust, which flips catalog_row_trust.serving_decision
+#     to `public` — the field public readers gate on.
+#
+#     So this reproduces that script's OWN candidate predicate per key, rather
+#     than assuming. Each column is one conjunct of its WHERE clause plus the
+#     `_rescored_ids()` skip, so a FALSE says exactly which conjunct excludes the
+#     row. Reproduced from the script rather than eyeballed, because "the tool
+#     does not apply here" is only worth reporting if it is checked.
+RESCORE_REACHABILITY_SQL = f"""
+    WITH cohort AS (
+      SELECT DISTINCT cp.content_key, cp.product_key, cp.platform,
+             cp.source_product_id, cp.source_ref, cp.brand, cp.title
+      FROM product_enrichment pe
+      JOIN catalog_products cp ON {_JOIN}
+      WHERE cp.content_key IS NOT NULL AND pe.geo_code = 'default'
+    )
+    SELECT
+      c.brand, c.title, c.platform,
+      (c.platform = 'external_seed') AS platform_ok,
+      EXISTS (SELECT 1 FROM external_product_seeds eps
+              WHERE eps.attached_product_key = c.product_key) AS has_seed_attachment,
+      (ips.content_key IS NOT NULL) AS has_pipeline_row,
+      (ips.serving_eligible IS NOT TRUE) AS not_already_eligible,
+      NOT EXISTS (
+        SELECT 1 FROM product_quality_snapshot q
+        WHERE q.platform_product_id = c.source_product_id
+          AND q.rules_version = :current_rules_version
+      ) AS not_already_rescored
+    FROM cohort c
+    LEFT JOIN index_pipeline_state ips ON ips.content_key = c.content_key
+    WHERE ips.serving_eligible IS DISTINCT FROM TRUE
+      AND COALESCE(ips.blocker_code, '') = 'low_quality'
+    ORDER BY c.brand ASC NULLS LAST
+    LIMIT 40
+"""
+
 # 6. The inverse: rows SERVING an overlay whose enrichment no longer resolves.
 #    The publish bridge can never refresh these — they are frozen copies.
 ORPHANED_SERVING_SQL = f"""
@@ -354,6 +401,17 @@ async def collect() -> Dict[str, Any]:
     ]
     out["low_quality_scale"] = [
         dict(r) for r in (await database.fetch_all(COHORT_BLOCKED_SCALE_SQL) or [])
+    ]
+    # Import the constant the rescore script itself skips on, so this probe
+    # cannot drift from the tool it is predicting.
+    from services.product_quality_service import (
+        SOURCE_BACKED_COMPONENTS_RULES_VERSION,
+    )
+    out["rescore_reachability"] = [
+        dict(r) for r in (await database.fetch_all(
+            RESCORE_REACHABILITY_SQL,
+            {"current_rules_version": SOURCE_BACKED_COMPONENTS_RULES_VERSION},
+        ) or [])
     ]
     out["orphaned_serving"] = dict(
         await database.fetch_one(ORPHANED_SERVING_SQL) or {}
@@ -447,6 +505,24 @@ def render(report: Dict[str, Any]) -> str:
             f"  {str(r.get('brand'))[:17]:<18}{str(r.get('title'))[:33]:<34}"
             f"{(round(gate, 1) if gate is not None else '-'):>7}"
             f"{(round(snap, 1) if snap is not None else '-'):>7}  {r.get('rules_version')}"
+        )
+
+    lines.append("\n=== 5e. can the rescore script reach the low_quality keys? ===")
+    lines.append(f"  {'brand':<16}{'platform':<16}{'plat':>6}{'seed':>6}{'ips':>5}"
+                 f"{'notElig':>9}{'notV3':>7}  REACHABLE")
+    reach = report.get("rescore_reachability") or []
+    if not reach:
+        lines.append("  (no low_quality keys)")
+    for r in reach:
+        conjuncts = [r.get("platform_ok"), r.get("has_seed_attachment"),
+                     r.get("has_pipeline_row"), r.get("not_already_eligible"),
+                     r.get("not_already_rescored")]
+        def y(v): return "Y" if v else "n"
+        lines.append(
+            f"  {str(r.get('brand'))[:15]:<16}{str(r.get('platform'))[:15]:<16}"
+            f"{y(conjuncts[0]):>6}{y(conjuncts[1]):>6}{y(conjuncts[2]):>5}"
+            f"{y(conjuncts[3]):>9}{y(conjuncts[4]):>7}  "
+            f"{'YES' if all(conjuncts) else 'no'}"
         )
 
     lines.append("\n=== 6. serving an overlay whose enrichment no longer resolves ===")
