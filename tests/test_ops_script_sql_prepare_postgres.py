@@ -474,6 +474,19 @@ def _collect_quality_scale_population() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_us_market_capture() -> List[Tuple[str, str]]:
+    """The capture script WRITES offers; an unplannable statement is an
+    aborted capture mid-run."""
+    import scripts.capture_us_market_offers as module
+
+    origin = "capture_us_market_offers"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "CANDIDATES_SQL", "OFFER_UPSERT_SQL",
+        )
+    ]
+
+
 def _collect_reattribution() -> List[Tuple[str, str]]:
     """The re-attribution script WRITES (rekey + republish), so an unplannable
     statement here is an aborted repair mid-run, not just a wrong report."""
@@ -570,6 +583,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_agent_depth_scorecard.py": _collect_depth_scorecard,
     "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
     "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
+    "scripts/capture_us_market_offers.py": _collect_us_market_capture,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
 }
 
@@ -590,6 +604,7 @@ _MIN_STATEMENTS = {
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
+    "scripts/capture_us_market_offers.py": 2,
     "scripts/report_quality_scale_population.py": 5,
 }
 
