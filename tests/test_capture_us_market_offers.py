@@ -17,6 +17,7 @@ from scripts.capture_us_market_offers import (  # noqa: E402
     derive_us_offer_id,
     handle_from_url,
     plan_offer,
+    select_capturable,
 )
 from services.external_offer_dual_write import (  # noqa: E402
     derive_mirror_offer_id,
@@ -62,6 +63,48 @@ def test_plan_offer_builds_usd_row_in_currency_units() -> None:
     assert row["availability"] == "in_stock"
     assert row["offer_id"] == derive_us_offer_id(_CAND["product_key"])
     assert row["source_system"] == "us_market_capture"
+
+
+def test_us_offer_shares_the_canonical_sku_row() -> None:
+    """pivot_query_service INNER JOINs offers via sku_key; an invented
+    suffix would hide the US offer from every sku-joined lane."""
+    from services.external_offer_dual_write import derive_mirror_sku_key
+    row = plan_offer(_CAND, 2500, True)
+    assert row["sku_key"] == derive_mirror_sku_key(_CAND["product_key"])
+
+
+def _cand(pk: str, url: str, dom: str):
+    return {"content_key": f"ck-{pk}", "product_key": pk, "merchant_id": "m",
+            "canonical_url": url, "source_domain": dom}
+
+
+def test_select_capturable_rejects_domain_mismatch() -> None:
+    """The handle comes from canonical_url but the fetch goes to
+    source_domain — a mismatched pair would price the WRONG store's
+    product (Path-C sibling-domain seed attribution)."""
+    by_domain, skipped = select_capturable([
+        _cand("pk1", "https://storea.com/products/serum", "storeb.com"),
+    ])
+    assert by_domain == {}
+    assert skipped == [("pk1", "domain_mismatch")]
+
+
+def test_select_capturable_accepts_www_and_matching_host() -> None:
+    by_domain, skipped = select_capturable([
+        _cand("pk1", "https://www.storea.com/products/serum", "storea.com"),
+    ])
+    assert list(by_domain) == ["storea.com"] and skipped == []
+
+
+def test_select_capturable_rejects_multi_domain_products() -> None:
+    """One product reachable via two domains would plan one offer_id twice
+    and let sort order pick the surviving price — ambiguity is rejected."""
+    by_domain, skipped = select_capturable([
+        _cand("pk1", "https://storea.com/products/serum", "storea.com"),
+        _cand("pk1", "https://storea.com/products/serum", "storeb.com"),
+    ])
+    assert by_domain == {}
+    assert skipped == [("pk1", "ambiguous_domains")]
 
 
 def test_plan_offer_refuses_non_positive_prices() -> None:

@@ -58,11 +58,18 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import database  # noqa: E402
+from services.external_offer_dual_write import (  # noqa: E402
+    derive_mirror_sku_key,
+)
 
 REFRESH_SOURCE = "us_market_offer_capture"
 SOURCE_SYSTEM = "us_market_capture"
 OFFER_ID_PREFIX = "offer:us_market:"
 REQUEST_GAP_SECONDS = 0.6
+# Re-verify the session is still presenting USD every N product reads; a
+# decayed localization cookie would silently relabel home-currency prices as
+# USD — the exact defect class (#1636/#1642) this lane must never reintroduce.
+SESSION_RECHECK_EVERY = 25
 
 # Blocked products with a foreign-priced offer, one row per (product, domain).
 # canonical_url supplies the Shopify handle (its final path segment).
@@ -95,7 +102,7 @@ OFFER_UPSERT_SQL = """
       (:offer_id, :sku_key, :product_key, :merchant_id,
        'external_referral', 'observed', 'referral_only',
        'brand_direct', TRUE, 'redirect',
-       'US', 'online', :availability, 'USD',
+       'US', 'external_referral', :availability, 'USD',
        :list_price, 0.9,
        :source_system, :source_domain, CAST(:offer_payload AS jsonb))
     ON CONFLICT (offer_id) DO UPDATE SET
@@ -130,6 +137,46 @@ def handle_from_url(url: Optional[str]) -> Optional[str]:
     return handle
 
 
+def _host(url: Optional[str]) -> Optional[str]:
+    if not url or not isinstance(url, str):
+        return None
+    host = (urlsplit(url.strip()).hostname or "").lower()
+    return host[4:] if host.startswith("www.") else (host or None)
+
+
+def select_capturable(candidates: List[Dict[str, Any]],
+                      ) -> Tuple[Dict[str, List[Dict[str, Any]]],
+                                 List[Tuple[str, str]]]:
+    """Partition candidates into {domain: rows} safe to capture, plus counted
+    skips. Two refusals, both wrong-price-publish vectors:
+
+      * domain_mismatch — the handle comes from canonical_url but the fetch
+        goes to the offer's source_domain; Path-C attaches sibling-domain
+        seeds, so a mismatched pair would price the WRONG store's product.
+      * ambiguous_domains — one product reachable via several domains would
+        plan the same offer_id more than once and let sort order pick the
+        surviving price; like the reattribution matcher, ambiguity is
+        rejected, never resolved by accident.
+    """
+    by_product: Dict[str, List[Dict[str, Any]]] = {}
+    for c in candidates:
+        by_product.setdefault(c["product_key"], []).append(c)
+
+    by_domain: Dict[str, List[Dict[str, Any]]] = {}
+    skipped: List[Tuple[str, str]] = []
+    for product_key, rows in sorted(by_product.items()):
+        domains = {r["source_domain"] for r in rows}
+        if len(domains) > 1:
+            skipped.append((product_key, "ambiguous_domains"))
+            continue
+        row = rows[0]
+        if _host(row["canonical_url"]) != row["source_domain"]:
+            skipped.append((product_key, "domain_mismatch"))
+            continue
+        by_domain.setdefault(row["source_domain"], []).append(row)
+    return by_domain, skipped
+
+
 def plan_offer(candidate: Dict[str, Any], price_cents: int,
                available: bool) -> Optional[Dict[str, Any]]:
     """Build the upsert params for one captured US price, or None when the
@@ -146,7 +193,10 @@ def plan_offer(candidate: Dict[str, Any], price_cents: int,
     }
     return {
         "offer_id": derive_us_offer_id(product_key),
-        "sku_key": f"{product_key}::us_market",
+        # The one canonical SKU: retailer/US offers deliberately SHARE the
+        # mirror's sku row — a dangling sku_key would hide this offer from
+        # every sku-joined read lane (pivot_query_service INNER JOINs on it).
+        "sku_key": derive_mirror_sku_key(product_key),
         "product_key": product_key,
         "merchant_id": candidate["merchant_id"],
         "availability": "in_stock" if available else "out_of_stock",
@@ -186,13 +236,36 @@ async def establish_us_session(client: Any, domain: str) -> bool:
     return bool(cart) and cart.get("currency") == "USD"
 
 
+async def _session_is_usd(client: Any, domain: str) -> bool:
+    cart = await _fetch_json(client, f"https://{domain}/cart.js")
+    return bool(cart) and cart.get("currency") == "USD"
+
+
 async def capture_domain(domain: str, candidates: List[Dict[str, Any]],
                          ) -> Dict[str, Any]:
-    """Capture US prices for one domain's candidates inside one US session."""
+    """Capture US prices for one domain's candidates inside one US session.
+
+    Prices captured since the last PASSING /cart.js check are held in a
+    pending buffer and committed only when the next check still reports USD —
+    /products/<handle>.js carries no currency field, so a decayed session can
+    only be detected out-of-band, and everything read since the last proof
+    must be discarded, never trusted."""
     import httpx
 
     planned: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
     skipped: List[Tuple[str, str]] = []
+
+    async def checkpoint(client: Any) -> None:
+        nonlocal planned, pending
+        if not pending:
+            return
+        if await _session_is_usd(client, domain):
+            planned.extend(pending)
+        else:
+            skipped.extend((r["product_key"], "us_session_lost") for r in pending)
+        pending = []
+
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=20.0,
         headers={"User-Agent": "Mozilla/5.0 (compatible; PivotaBot/1.0)"},
@@ -201,6 +274,7 @@ async def capture_domain(domain: str, candidates: List[Dict[str, Any]],
             return {"domain": domain, "us_market": False,
                     "planned": [], "skipped": [(c["product_key"], "no_us_session")
                                                for c in candidates]}
+        since_check = 0
         for c in candidates:
             handle = handle_from_url(c["canonical_url"])
             if not handle:
@@ -217,7 +291,12 @@ async def capture_domain(domain: str, candidates: List[Dict[str, Any]],
                 skipped.append((c["product_key"], "no_positive_us_price"))
                 continue
             row["content_key"] = c["content_key"]
-            planned.append(row)
+            pending.append(row)
+            since_check += 1
+            if since_check >= SESSION_RECHECK_EVERY:
+                await checkpoint(client)
+                since_check = 0
+        await checkpoint(client)
     return {"domain": domain, "us_market": True,
             "planned": planned, "skipped": skipped}
 
@@ -256,12 +335,14 @@ async def _drive(apply: bool, only_domain: Optional[str],
     finally:
         await database.disconnect()
 
-    by_domain: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        by_domain.setdefault(r["source_domain"], []).append(r)
+    by_domain, pre_skipped = select_capturable(rows)
     if only_domain:
         by_domain = {d: c for d, c in by_domain.items() if d == only_domain}
-    print(f"candidates={len(rows)} across {len(by_domain)} domains", flush=True)
+    pre_reasons: Dict[str, int] = {}
+    for _, why in pre_skipped:
+        pre_reasons[why] = pre_reasons.get(why, 0) + 1
+    print(f"candidates={len(rows)} across {len(by_domain)} domains "
+          f"(pre-skipped: {pre_reasons})", flush=True)
 
     all_planned: List[Dict[str, Any]] = []
     for domain in sorted(by_domain):
