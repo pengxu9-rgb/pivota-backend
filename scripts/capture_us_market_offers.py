@@ -165,15 +165,18 @@ def select_capturable(candidates: List[Dict[str, Any]],
     by_domain: Dict[str, List[Dict[str, Any]]] = {}
     skipped: List[Tuple[str, str]] = []
     for product_key, rows in sorted(by_product.items()):
-        domains = {r["source_domain"] for r in rows}
+        # Normalize BOTH sides: a www./case/whitespace variant in the stored
+        # source_domain must not fake a mismatch or split one domain into two.
+        domains = {_host(f"https://{r['source_domain']}") for r in rows}
         if len(domains) > 1:
             skipped.append((product_key, "ambiguous_domains"))
             continue
         row = rows[0]
-        if _host(row["canonical_url"]) != row["source_domain"]:
+        domain = domains.pop()
+        if not domain or _host(row["canonical_url"]) != domain:
             skipped.append((product_key, "domain_mismatch"))
             continue
-        by_domain.setdefault(row["source_domain"], []).append(row)
+        by_domain.setdefault(domain, []).append(row)
     return by_domain, skipped
 
 
