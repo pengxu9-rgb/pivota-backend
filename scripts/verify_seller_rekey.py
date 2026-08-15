@@ -87,6 +87,44 @@ SELECT coalesce(source_system, '?') AS lane, count(*) AS remaining
 FROM catalog_products WHERE merchant_id = 'external_seed' GROUP BY 1 ORDER BY 2 DESC
 """
 
+# GLOBAL sentinel residue — every seller column of every public table,
+# counted without any checkpoint scope, straight from information_schema.
+# Deliberately NOT routed through the flip's discover_cascade_tables: a
+# grader that shares the tool's reflection (and its CASCADE_DENYLIST) shares
+# its blind spots — the class that hid 77 pgm rows behind five green
+# parities. Excludes only catalog_merchants (the sentinel's own identity
+# row). The catalog phase's Q1/Q2 grade the moved cohort; the rig-retirement
+# step (which never enters the checkpoint) and any stray writer are graded
+# HERE. Wanted 0 across the board once catalog_products is empty; reported
+# (not failed) before that, because dependents of an unmoved row
+# legitimately share the sentinel.
+SELLER_COLUMNS_SQL = """
+SELECT c.table_name, c.column_name
+  FROM information_schema.columns c
+  JOIN information_schema.tables t
+    ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+ WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+   AND c.column_name IN ('merchant_id', 'primary_merchant_id')
+   AND c.table_name <> 'catalog_merchants'
+ ORDER BY 1, 2
+"""
+
+
+async def global_residue(database) -> dict:
+    from scripts.backfill_seller_of_record import BANNED_BUCKET_MERCHANT_ID
+
+    out = {}
+    for r in await database.fetch_all(SELLER_COLUMNS_SQL):
+        d = dict(r)
+        table, col = d["table_name"], d["column_name"]
+        row = await database.fetch_one(
+            f"SELECT count(*) AS c FROM {table} WHERE {col} = :banned",
+            {"banned": BANNED_BUCKET_MERCHANT_ID})
+        n = int(dict(row)["c"]) if row else 0
+        # a table with BOTH seller columns is keyed once, summed
+        out[table] = out.get(table, 0) + n
+    return out
+
 
 async def main() -> int:
     from db.database import database
@@ -97,6 +135,7 @@ async def main() -> int:
         r2 = dict(await database.fetch_one(Q2))
         lanes = {dict(r)["lane"]: dict(r)["remaining"]
                  for r in await database.fetch_all(SENTINEL_LANES)}
+        glob = await global_residue(database)
     finally:
         await database.disconnect()
 
@@ -111,10 +150,17 @@ async def main() -> int:
         failures.append(f"old_refs_left={r2['old_refs_left']}")
     if r2["pgm_banned_left"]:
         failures.append(f"pgm_banned_left={r2['pgm_banned_left']}")
+    # Once catalog_products holds no sentinel rows, NOTHING else may either:
+    # a dependent still on the sentinel is an orphan no re-key can reach.
+    if glob["catalog_products"] == 0:
+        for table, n in glob.items():
+            if n:
+                failures.append(f"global_residue:{table}={n}")
 
     print(json.dumps({"verdict": "FAIL" if failures else "OK",
                       "failures": failures, "rows": r1, "cascades": r2,
-                      "sentinel_lanes_remaining": lanes}, indent=1))
+                      "sentinel_lanes_remaining": lanes,
+                      "global_sentinel_residue": glob}, indent=1))
     return 1 if failures else 0
 
 

@@ -1,0 +1,55 @@
+name: ADR-009 Rig Retirement
+
+# ADR-009 closing step: retire the 50 test-rig rows the A9-4 flip excluded
+# (scripts/suppress_external_seed_rig_rows.py). DRY-RUN unless apply=true.
+# Same channel as the flip/verify workflows: GitHub runners reach the DB
+# reliably. Grade the result with adr009-rekey-verify.yml afterwards.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Perform writes (false = read-only dry-run)"
+        type: boolean
+        default: false
+
+# One retirement at a time; a second dispatch queues.
+concurrency:
+  group: adr009-rig-retire
+  cancel-in-progress: false
+
+jobs:
+  rig-retire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Retire rig rows (dry-run unless apply=true)
+        env:
+          RIG_APPLY: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          if [ "$RIG_APPLY" = "true" ]; then
+            echo "::warning::APPLY run — production writes"
+            python -m scripts.suppress_external_seed_rig_rows --apply
+          else
+            python -m scripts.suppress_external_seed_rig_rows
+          fi
