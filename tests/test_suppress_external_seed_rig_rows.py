@@ -277,41 +277,64 @@ class TestApply:
 
 class TestVerifierGlobalResidue:
     """The verifier grades the rig retirement (and any stray writer) with a
-    GLOBAL residue over every seller column of every public base table, read
-    straight from information_schema — NOT through the flip's reflection, so
-    the grader cannot share the tool's blind spots. Fails only once
-    catalog_products is empty; reports before that."""
+    GLOBAL residue over every text-typed seller column of every public base
+    table, read straight from information_schema — NOT through the flip's
+    reflection. It splits tables by a PRINCIPLED rule, not a list: a table
+    with a product-scope column is OWNERSHIP (fails on residue once the
+    bucket is empty); one without is HISTORY (a record of what happened —
+    reported, never failed, never rewritten)."""
+
+    class _V:
+        def __init__(self, counts):
+            self.counts, self.counted = counts, []
+
+        async def fetch_all(self, sql, params=None):
+            assert "information_schema.columns" in sql
+            assert "data_type IN" in sql          # int seller cols raise DataError
+            assert "product_scoped" in sql
+            return [
+                {"table_name": "catalog_products", "column_name": "merchant_id", "product_scoped": True},
+                {"table_name": "catalog_offers", "column_name": "merchant_id", "product_scoped": True},
+                {"table_name": "beauty_sku_ingredients", "column_name": "primary_merchant_id",
+                 "product_scoped": True},
+                {"table_name": "product_group_members", "column_name": "merchant_id",
+                 "product_scoped": False},   # keys on platform_product_id, not a scope col
+                {"table_name": "agent_product_events", "column_name": "merchant_id",
+                 "product_scoped": False},
+            ]
+
+        async def fetch_one(self, sql, params=None):
+            _assert_binds_match(sql, params)
+            assert params["banned"] == BANNED_BUCKET_MERCHANT_ID
+            self.counted.append(sql)
+            for t, n in self.counts.items():
+                if f"FROM {t} " in sql:
+                    return {"c": n}
+            return {"c": 0}
 
     @pytest.mark.asyncio
-    async def test_counts_every_seller_column_of_every_public_table(self):
+    async def test_splits_ownership_from_history_by_product_scope(self):
         import scripts.verify_seller_rekey as ver
 
-        class _V:
-            def __init__(self): self.counted = []
-            async def fetch_all(self, sql, params=None):
-                assert "information_schema.columns" in sql
-                # the schema query itself must exclude non-text seller columns:
-                # an integer merchant_id raised DataError on the first live run
-                assert "data_type IN" in sql
-                return [{"table_name": "beauty_sku_ingredients", "column_name": "primary_merchant_id"},
-                        {"table_name": "catalog_offers", "column_name": "merchant_id"},
-                        {"table_name": "catalog_products", "column_name": "merchant_id"},
-                        {"table_name": "commerce_attribution_edges", "column_name": "merchant_id"},
-                        {"table_name": "product_group_members", "column_name": "merchant_id"}]
-            async def fetch_one(self, sql, params=None):
-                _assert_binds_match(sql, params)
-                assert params["banned"] == BANNED_BUCKET_MERCHANT_ID
-                self.counted.append(sql)
-                return {"c": 0}
-
-        v = _V()
+        v = self._V({"catalog_products": 0, "catalog_offers": 12,
+                     "agent_product_events": 151698, "product_group_members": 0})
         out = await ver.global_residue(v)
-        # every table the schema names, including ones the flip's reflection
-        # denylists (edges) — the grader is wider than the tool by design
-        assert set(out) == {"beauty_sku_ingredients", "catalog_offers", "catalog_products",
-                            "commerce_attribution_edges", "product_group_members"}
+        # product-scoped residue is an orphan -> ownership; event rows are history
+        assert out["ownership"] == {"catalog_products": 0, "catalog_offers": 12}
+        assert out["history"] == {"agent_product_events": 151698}
+        # the reflected seller column is honoured per table
         assert any("FROM beauty_sku_ingredients WHERE primary_merchant_id" in q for q in v.counted)
-        assert any("FROM commerce_attribution_edges WHERE merchant_id" in q for q in v.counted)
+
+    def test_only_ownership_residue_fails_once_the_bucket_is_empty(self):
+        from scripts.verify_seller_rekey import orphan_failures  # the REAL rule
+        assert orphan_failures({"ownership": {"catalog_products": 0, "catalog_offers": 12},
+                                "history": {"agent_product_events": 151698}}) == \
+            ["orphan_residue:catalog_offers=12"]
+        assert orphan_failures({"ownership": {"catalog_products": 0},
+                                "history": {"agent_product_events": 151698}}) == []
+        # while the bucket still holds rows, dependents legitimately share it
+        assert orphan_failures({"ownership": {"catalog_products": 50, "catalog_offers": 12},
+                                "history": {}}) == []
 
 
 class TestRekeyDoor:
