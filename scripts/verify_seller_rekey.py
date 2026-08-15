@@ -87,22 +87,30 @@ SELECT coalesce(source_system, '?') AS lane, count(*) AS remaining
 FROM catalog_products WHERE merchant_id = 'external_seed' GROUP BY 1 ORDER BY 2 DESC
 """
 
-# GLOBAL sentinel residue — every seller column of every public table,
-# counted without any checkpoint scope, straight from information_schema.
-# Deliberately NOT routed through the flip's discover_cascade_tables: a
-# grader that shares the tool's reflection (and its CASCADE_DENYLIST) shares
-# its blind spots — the class that hid 77 pgm rows behind five green
-# parities. Excludes only catalog_merchants (the sentinel's own identity
-# row). The catalog phase's Q1/Q2 grade the moved cohort; the rig-retirement
-# step (which never enters the checkpoint) and any stray writer are graded
-# HERE. Wanted 0 across the board once catalog_products is empty; reported
-# (not failed) before that, because dependents of an unmoved row
-# legitimately share the sentinel.
-# Text-typed seller columns only: an integer merchant_id cannot hold the
-# sentinel by construction, and asking it raises (asyncpg DataError on the
-# first live run, 2026-08-15 — one public table keys merchants by int).
+# GLOBAL sentinel residue — every text-typed seller column of every public
+# base table, counted without any checkpoint scope, straight from
+# information_schema (deliberately NOT through the flip's reflection or its
+# CASCADE_DENYLIST: a grader sharing the tool's blind spots is no grader).
+#
+# Two classes, and the distinction is PRINCIPLED, not a hand-picked list:
+#   ownership — the table ALSO carries a product-scope column (product_key /
+#               content_key / sku_key): the row belongs to a product and its
+#               merchant is the product's seller-of-record. Sentinel residue
+#               here after catalog_products is empty is an ORPHAN no re-key can
+#               reach — FAILS.
+#   history   — no product-scope column: events, logs, snapshots, runs,
+#               telemetry. A row that recorded 'external_seed' at event time
+#               is a TRUE record of what happened; rewriting it falsifies
+#               history. REPORTED, never failed. (First live run 2026-08-15:
+#               ~220k such rows across 14 tables, e.g. agent_product_events
+#               151,698 — correct as they stand.)
+# The catalog phase's Q1/Q2 grade the moved cohort; the rig-retirement step
+# (which never enters the checkpoint) and any stray writer are graded HERE.
 SELLER_COLUMNS_SQL = """
-SELECT c.table_name, c.column_name
+SELECT c.table_name, c.column_name,
+       EXISTS (SELECT 1 FROM information_schema.columns s
+                WHERE s.table_schema = c.table_schema AND s.table_name = c.table_name
+                  AND s.column_name IN ('product_key', 'content_key', 'sku_key')) AS product_scoped
   FROM information_schema.columns c
   JOIN information_schema.tables t
     ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -115,9 +123,11 @@ SELECT c.table_name, c.column_name
 
 
 async def global_residue(database) -> dict:
+    """Returns {"ownership": {table: n}, "history": {table: n}} — nonzero
+    entries only, plus the catalog_products count under "ownership" always."""
     from scripts.backfill_seller_of_record import BANNED_BUCKET_MERCHANT_ID
 
-    out = {}
+    out = {"ownership": {}, "history": {}}
     for r in await database.fetch_all(SELLER_COLUMNS_SQL):
         d = dict(r)
         table, col = d["table_name"], d["column_name"]
@@ -125,9 +135,20 @@ async def global_residue(database) -> dict:
             f"SELECT count(*) AS c FROM {table} WHERE {col} = :banned",
             {"banned": BANNED_BUCKET_MERCHANT_ID})
         n = int(dict(row)["c"]) if row else 0
-        # a table with BOTH seller columns is keyed once, summed
-        out[table] = out.get(table, 0) + n
+        bucket = "ownership" if (d["product_scoped"] or table == "catalog_products") else "history"
+        if n or table == "catalog_products":
+            out[bucket][table] = out[bucket].get(table, 0) + n
     return out
+
+
+def orphan_failures(glob: dict) -> list:
+    """Once catalog_products holds no sentinel rows, no OWNERSHIP table may
+    either: a product-scoped row still on the sentinel is an orphan no re-key
+    can reach. History tables are reported, never failed. While the bucket
+    still holds rows, dependents legitimately share it — no failure."""
+    if glob["ownership"].get("catalog_products", 0) != 0:
+        return []
+    return [f"orphan_residue:{t}={n}" for t, n in glob["ownership"].items() if n]
 
 
 async def main() -> int:
@@ -154,12 +175,7 @@ async def main() -> int:
         failures.append(f"old_refs_left={r2['old_refs_left']}")
     if r2["pgm_banned_left"]:
         failures.append(f"pgm_banned_left={r2['pgm_banned_left']}")
-    # Once catalog_products holds no sentinel rows, NOTHING else may either:
-    # a dependent still on the sentinel is an orphan no re-key can reach.
-    if glob["catalog_products"] == 0:
-        for table, n in glob.items():
-            if n:
-                failures.append(f"global_residue:{table}={n}")
+    failures.extend(orphan_failures(glob))
 
     print(json.dumps({"verdict": "FAIL" if failures else "OK",
                       "failures": failures, "rows": r1, "cascades": r2,
