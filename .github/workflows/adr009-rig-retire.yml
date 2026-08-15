@@ -13,6 +13,11 @@ on:
         type: boolean
         default: false
 
+# One retirement at a time; a second dispatch queues.
+concurrency:
+  group: adr009-rig-retire
+  cancel-in-progress: false
+
 jobs:
   rig-retire:
     runs-on: ubuntu-latest

@@ -87,6 +87,32 @@ SELECT coalesce(source_system, '?') AS lane, count(*) AS remaining
 FROM catalog_products WHERE merchant_id = 'external_seed' GROUP BY 1 ORDER BY 2 DESC
 """
 
+# GLOBAL sentinel residue — every table that carries a seller column, counted
+# without any checkpoint scope. The catalog phase's Q1/Q2 grade the moved
+# cohort; the rig-retirement step (which never enters the checkpoint) and any
+# future stray writer are graded HERE. The table set is REFLECTED with the
+# flip's own discover_cascade_tables — a hand-picked list here would be
+# exactly the drift the flip's reflection exists to prevent — plus the two
+# tables reflection cannot see (no product-scope column). Wanted 0 across the
+# board once catalog_products is empty; reported (not failed) before that,
+# because dependents of an unmoved row legitimately share the sentinel.
+UNREFLECTED = ("product_group_members", "pdp_identity_listing")
+
+
+async def global_residue(database) -> dict:
+    from scripts.backfill_seller_of_record import SellerBackfill
+
+    bf = SellerBackfill(database=database, si_mod=None, execute=False, batch_size=1)
+    cascade = await bf.discover_cascade_tables()
+    cols = {"catalog_products": "merchant_id", **{t: "merchant_id" for t in UNREFLECTED},
+            **{t["table"]: t["seller_col"] for t in cascade}}
+    out = {}
+    for t in cols:
+        row = await database.fetch_one(
+            f"SELECT count(*) AS c FROM {t} WHERE {cols[t]} = 'external_seed'")
+        out[t] = int(dict(row)["c"]) if row else 0
+    return out
+
 
 async def main() -> int:
     from db.database import database
@@ -97,6 +123,7 @@ async def main() -> int:
         r2 = dict(await database.fetch_one(Q2))
         lanes = {dict(r)["lane"]: dict(r)["remaining"]
                  for r in await database.fetch_all(SENTINEL_LANES)}
+        glob = await global_residue(database)
     finally:
         await database.disconnect()
 
@@ -111,10 +138,17 @@ async def main() -> int:
         failures.append(f"old_refs_left={r2['old_refs_left']}")
     if r2["pgm_banned_left"]:
         failures.append(f"pgm_banned_left={r2['pgm_banned_left']}")
+    # Once catalog_products holds no sentinel rows, NOTHING else may either:
+    # a dependent still on the sentinel is an orphan no re-key can reach.
+    if glob["catalog_products"] == 0:
+        for table, n in glob.items():
+            if n:
+                failures.append(f"global_residue:{table}={n}")
 
     print(json.dumps({"verdict": "FAIL" if failures else "OK",
                       "failures": failures, "rows": r1, "cascades": r2,
-                      "sentinel_lanes_remaining": lanes}, indent=1))
+                      "sentinel_lanes_remaining": lanes,
+                      "global_sentinel_residue": glob}, indent=1))
     return 1 if failures else 0
 
 
