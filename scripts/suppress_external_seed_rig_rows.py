@@ -100,16 +100,6 @@ SELECT DISTINCT merchant_id, status
  WHERE domain = ANY(:domains)
 """
 
-# Sig-frozen at import, like the flip's own statements.
-for _sql in (
-    "UPDATE catalog_products SET suppression_reason = :reason, suppressed_at = "
-    "COALESCE(suppressed_at, NOW()), suppression_metadata = CAST(:meta AS jsonb), "
-    "updated_at = NOW() WHERE product_key = ANY(:pks) AND merchant_id = :banned",
-    "UPDATE catalog_products SET merchant_id = :rig, updated_at = NOW() "
-    "WHERE product_key = ANY(:pks) AND merchant_id = :banned AND suppression_reason = :reason",
-):
-    assert_sig_frozen_sql(_sql)
-
 TOMBSTONE_SQL = """
 UPDATE catalog_products
    SET suppression_reason = :reason,
@@ -125,6 +115,11 @@ UPDATE catalog_products
  WHERE product_key = ANY(:pks) AND merchant_id = :banned
    AND suppression_reason = :reason
 """
+
+# Sig-frozen at import, on the constants THEMSELVES (an assert over string
+# copies stays green when the constant is edited — review nit on #1752).
+for _sql in (TOMBSTONE_SQL, REKEY_SQL):
+    assert_sig_frozen_sql(_sql)
 
 
 async def _run(apply: bool) -> int:
@@ -197,8 +192,15 @@ async def _run(apply: bool) -> int:
         # Prior tombstone provenance is CARRIED, not discarded (the re-key
         # predicate needs one uniform reason, so a prior reason is overwritten
         # in place and preserved here).
+        def _as_obj(v):
+            if isinstance(v, str):
+                try:
+                    return json.loads(v)
+                except ValueError:
+                    return v
+            return v
         prior = {str(r["product_key"]): {"reason": r.get("suppression_reason"),
-                                         "metadata": r.get("suppression_metadata")}
+                                         "metadata": _as_obj(r.get("suppression_metadata"))}
                  for r in rows if r.get("suppression_reason")}
         meta = json.dumps({
             "script": "suppress_external_seed_rig_rows",

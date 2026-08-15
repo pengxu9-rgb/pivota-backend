@@ -87,30 +87,42 @@ SELECT coalesce(source_system, '?') AS lane, count(*) AS remaining
 FROM catalog_products WHERE merchant_id = 'external_seed' GROUP BY 1 ORDER BY 2 DESC
 """
 
-# GLOBAL sentinel residue — every table that carries a seller column, counted
-# without any checkpoint scope. The catalog phase's Q1/Q2 grade the moved
-# cohort; the rig-retirement step (which never enters the checkpoint) and any
-# future stray writer are graded HERE. The table set is REFLECTED with the
-# flip's own discover_cascade_tables — a hand-picked list here would be
-# exactly the drift the flip's reflection exists to prevent — plus the two
-# tables reflection cannot see (no product-scope column). Wanted 0 across the
-# board once catalog_products is empty; reported (not failed) before that,
-# because dependents of an unmoved row legitimately share the sentinel.
-UNREFLECTED = ("product_group_members", "pdp_identity_listing")
+# GLOBAL sentinel residue — every seller column of every public table,
+# counted without any checkpoint scope, straight from information_schema.
+# Deliberately NOT routed through the flip's discover_cascade_tables: a
+# grader that shares the tool's reflection (and its CASCADE_DENYLIST) shares
+# its blind spots — the class that hid 77 pgm rows behind five green
+# parities. Excludes only catalog_merchants (the sentinel's own identity
+# row). The catalog phase's Q1/Q2 grade the moved cohort; the rig-retirement
+# step (which never enters the checkpoint) and any stray writer are graded
+# HERE. Wanted 0 across the board once catalog_products is empty; reported
+# (not failed) before that, because dependents of an unmoved row
+# legitimately share the sentinel.
+SELLER_COLUMNS_SQL = """
+SELECT c.table_name, c.column_name
+  FROM information_schema.columns c
+  JOIN information_schema.tables t
+    ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+ WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+   AND c.column_name IN ('merchant_id', 'primary_merchant_id')
+   AND c.table_name <> 'catalog_merchants'
+ ORDER BY 1, 2
+"""
 
 
 async def global_residue(database) -> dict:
-    from scripts.backfill_seller_of_record import SellerBackfill
+    from scripts.backfill_seller_of_record import BANNED_BUCKET_MERCHANT_ID
 
-    bf = SellerBackfill(database=database, si_mod=None, execute=False, batch_size=1)
-    cascade = await bf.discover_cascade_tables()
-    cols = {"catalog_products": "merchant_id", **{t: "merchant_id" for t in UNREFLECTED},
-            **{t["table"]: t["seller_col"] for t in cascade}}
     out = {}
-    for t in cols:
+    for r in await database.fetch_all(SELLER_COLUMNS_SQL):
+        d = dict(r)
+        table, col = d["table_name"], d["column_name"]
         row = await database.fetch_one(
-            f"SELECT count(*) AS c FROM {t} WHERE {cols[t]} = 'external_seed'")
-        out[t] = int(dict(row)["c"]) if row else 0
+            f"SELECT count(*) AS c FROM {table} WHERE {col} = :banned",
+            {"banned": BANNED_BUCKET_MERCHANT_ID})
+        n = int(dict(row)["c"]) if row else 0
+        # a table with BOTH seller columns is keyed once, summed
+        out[table] = out.get(table, 0) + n
     return out
 
 

@@ -277,31 +277,57 @@ class TestApply:
 
 class TestVerifierGlobalResidue:
     """The verifier grades the rig retirement (and any stray writer) with a
-    GLOBAL residue over the same reflected table set the flip cascades
-    through — never a hand-picked list. Fails only once catalog_products is
-    empty; reports before that."""
+    GLOBAL residue over every seller column of every public base table, read
+    straight from information_schema — NOT through the flip's reflection, so
+    the grader cannot share the tool's blind spots. Fails only once
+    catalog_products is empty; reports before that."""
 
     @pytest.mark.asyncio
-    async def test_reflects_the_flip_cascade_tables_plus_the_two_unreflected(self):
+    async def test_counts_every_seller_column_of_every_public_table(self):
         import scripts.verify_seller_rekey as ver
 
         class _V:
             def __init__(self): self.counted = []
             async def fetch_all(self, sql, params=None):
-                if "FROM information_schema.columns" in sql:
-                    return [{"table_name": "catalog_offers", "column_name": "merchant_id"},
-                            {"table_name": "catalog_offers", "column_name": "product_key"},
-                            {"table_name": "beauty_sku_ingredients", "column_name": "primary_merchant_id"},
-                            {"table_name": "beauty_sku_ingredients", "column_name": "sku_key"}]
-                return []
+                assert "information_schema.columns" in sql
+                return [{"table_name": "beauty_sku_ingredients", "column_name": "primary_merchant_id"},
+                        {"table_name": "catalog_offers", "column_name": "merchant_id"},
+                        {"table_name": "catalog_products", "column_name": "merchant_id"},
+                        {"table_name": "commerce_attribution_edges", "column_name": "merchant_id"},
+                        {"table_name": "product_group_members", "column_name": "merchant_id"}]
             async def fetch_one(self, sql, params=None):
+                _assert_binds_match(sql, params)
+                assert params["banned"] == BANNED_BUCKET_MERCHANT_ID
                 self.counted.append(sql)
                 return {"c": 0}
 
         v = _V()
         out = await ver.global_residue(v)
-        assert set(out) == {"catalog_products", "product_group_members", "pdp_identity_listing",
-                            "catalog_offers", "beauty_sku_ingredients"}
-        # the reflected seller column is honoured per table
+        # every table the schema names, including ones the flip's reflection
+        # denylists (edges) — the grader is wider than the tool by design
+        assert set(out) == {"beauty_sku_ingredients", "catalog_offers", "catalog_products",
+                            "commerce_attribution_edges", "product_group_members"}
         assert any("FROM beauty_sku_ingredients WHERE primary_merchant_id" in q for q in v.counted)
-        assert any("FROM catalog_offers WHERE merchant_id" in q for q in v.counted)
+        assert any("FROM commerce_attribution_edges WHERE merchant_id" in q for q in v.counted)
+
+
+class TestRekeyDoor:
+    @pytest.mark.asyncio
+    async def test_a_rekey_that_affects_nothing_rolls_the_step_back(self, wire):
+        # Review mutant M2: a re-key UPDATE that silently no-ops must be caught
+        # INSIDE the transaction by the left!=0 door and rolled back — never
+        # discovered only by the post-commit count.
+        db = wire(TestApply()._db(), known={RIG})
+        real_execute = db.execute
+
+        async def leaky(sql, params=None):
+            if sql.lstrip().startswith("UPDATE catalog_products") and "SET merchant_id = :rig" in sql:
+                _assert_binds_match(sql, params)
+                db.executed.append((" ".join(sql.split()), dict(params or {})))
+                return  # rows stay under the sentinel
+            return await real_execute(sql, params)
+
+        db.execute = leaky
+        with pytest.raises(RuntimeError, match="still under the sentinel after re-key"):
+            await mod._run(apply=True)
+        assert db.txn_events == ["begin", "rollback"]
