@@ -290,6 +290,9 @@ class TestVerifierGlobalResidue:
             def __init__(self): self.counted = []
             async def fetch_all(self, sql, params=None):
                 assert "information_schema.columns" in sql
+                # the schema query itself must exclude non-text seller columns:
+                # an integer merchant_id raised DataError on the first live run
+                assert "data_type IN" in sql
                 return [{"table_name": "beauty_sku_ingredients", "column_name": "primary_merchant_id"},
                         {"table_name": "catalog_offers", "column_name": "merchant_id"},
                         {"table_name": "catalog_products", "column_name": "merchant_id"},

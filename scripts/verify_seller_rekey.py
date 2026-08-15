@@ -98,6 +98,9 @@ FROM catalog_products WHERE merchant_id = 'external_seed' GROUP BY 1 ORDER BY 2 
 # HERE. Wanted 0 across the board once catalog_products is empty; reported
 # (not failed) before that, because dependents of an unmoved row
 # legitimately share the sentinel.
+# Text-typed seller columns only: an integer merchant_id cannot hold the
+# sentinel by construction, and asking it raises (asyncpg DataError on the
+# first live run, 2026-08-15 — one public table keys merchants by int).
 SELLER_COLUMNS_SQL = """
 SELECT c.table_name, c.column_name
   FROM information_schema.columns c
@@ -105,6 +108,7 @@ SELECT c.table_name, c.column_name
     ON t.table_schema = c.table_schema AND t.table_name = c.table_name
  WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
    AND c.column_name IN ('merchant_id', 'primary_merchant_id')
+   AND c.data_type IN ('text', 'character varying', 'character')
    AND c.table_name <> 'catalog_merchants'
  ORDER BY 1, 2
 """
