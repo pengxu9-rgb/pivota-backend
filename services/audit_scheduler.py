@@ -42,6 +42,14 @@ Job registration happens at start-up time. Currently registers:
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
+
+Every job registered here goes through `_add_job`, which wraps it with
+services.scheduler_job_runner.wrap_job: each run executes in a fresh
+contextvars.Context (its own `databases` Connection — on databases 0.7.0 all
+jobs otherwise SHARE the Connection this startup context created, the root
+cause of the #1754 all-jobs wedge) and is bounded by `_JOB_RUN_DEADLINES`.
+Per-run state is on /__scheduler_health (`runs`, `stalled`); an operator can
+force a run with POST /admin/scheduler/jobs/{id}/run-now.
 """
 
 from __future__ import annotations
@@ -66,6 +74,72 @@ _BOOT_DIAG = None   # type: Optional[dict]
 
 _STATE_NAMES = {0: "STOPPED", 1: "RUNNING", 2: "PAUSED"}
 
+# Per-job RUN DEADLINE (seconds) — issue #1754. Every job registered through
+# `_add_job` runs isolated (fresh contextvars.Context => its own `databases`
+# Connection, see services/scheduler_job_runner.py) AND bounded by this
+# deadline: on expiry the run is cancelled/abandoned so the job's next tick can
+# proceed instead of `max_instances=1` skipping it forever. Values are backstops
+# against a WEDGE (an await that never returns), not performance budgets — each
+# is set well above the job's worst legitimate runtime. A job missing from this
+# table gets `_DEFAULT_RUN_DEADLINE_SECONDS` and a boot warning;
+# tests/test_scheduler_job_isolation.py fails if a registered job lacks an
+# explicit entry, so nobody inherits the default by accident.
+_DEFAULT_RUN_DEADLINE_SECONDS = 3600.0
+_JOB_RUN_DEADLINES = {
+    # daily / weekly crons: heavy sweeps, up to 2h
+    "daily_audit_check": 7200,
+    "nightly_index_health": 7200,
+    "outcome_aggregation_daily": 7200,
+    "catalog_invariant_sweep": 7200,
+    "identity_reconcile_sweep": 7200,
+    "gmv_aggregation_daily": 3600,
+    "audit_stability_canary": 1800,
+    # 6-hourly catalog sweeps (bounded per run, stalest-first)
+    "pdp_scope_backfill": 7200,
+    "catalog_row_trust_backfill": 7200,
+    "agent_pdp_view_reconcile": 7200,
+    "pdp_will_render_reconcile": 7200,
+    # monthly money crons (external calls, must never wedge silently)
+    "invoice_generation_monthly": 3600,
+    "partner_settlement_monthly": 3600,
+    "settlement_file_generate": 3600,
+    "settlement_file_transfer": 3600,
+    # hourly-ish
+    "store_lifecycle_reconciliation": 1800,
+    "audit_health_tick": 600,
+    "catalog_onboard_queue_drain": 1500,
+    "external_conversion_poll": 600,
+    "external_seed_catalog_materialization": 600,
+    # queue drainers: MAX_RUNS_PER_TICK runs each; audits are multi-minute
+    # (LONG_STAGE_LEASE_SECONDS=900) so 3 of them fit in 45 min; a cancelled
+    # run is re-queued by the lease reapers.
+    "audit_run_worker_tick": 2700,
+    "executor_run_worker_tick": 300,
+    "verification_run_worker_tick": 300,
+    "quality_backfill_drain_tick": 600,
+    # DB-only reapers (60s / 5min cadence)
+    "audit_run_lease_reaper": 120,
+    "audit_run_abandoned_reaper": 120,
+    "executor_run_lease_reaper": 120,
+    "verification_run_lease_reaper": 120,
+    "metering_expire_reservations": 120,
+    "stamp_attribution_reaper": 120,
+    # money path: 50 orders x (PSP verify + finalize + Shopify order); 2 ticks'
+    # worth so a slow PSP is not cut off, but a wedge is bounded at 10 min.
+    "payment_reconcile_tick": 600,
+}
+
+
+def run_deadline_for(job_id: str) -> float:
+    d = _JOB_RUN_DEADLINES.get(job_id)
+    if d is None:
+        logger.warning(
+            "audit_scheduler: job %r has no entry in _JOB_RUN_DEADLINES; using "
+            "default %gs", job_id, _DEFAULT_RUN_DEADLINE_SECONDS,
+        )
+        return _DEFAULT_RUN_DEADLINE_SECONDS
+    return float(d)
+
 
 def scheduler_diagnostics() -> dict:
     """Read-only report of the scheduler's real runtime state for
@@ -82,6 +156,18 @@ def scheduler_diagnostics() -> dict:
                 fireable += 1
     except Exception:  # noqa: BLE001
         pass
+    # Per-job run registry (issue #1754): is anything running, for how long,
+    # last outcome, deadline hits, zombies. `stalled` names jobs whose run has
+    # outlived its deadline+grace — should always be empty; non-empty means the
+    # watchdog itself is not firing.
+    runs: dict = {}
+    stalled: dict = {}
+    try:
+        from services.scheduler_job_runner import registry_snapshot, stalled_jobs
+        runs = registry_snapshot()
+        stalled = stalled_jobs()
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "state": state,
         "state_name": _STATE_NAMES.get(state, "UNKNOWN") if state is not None else "NOT_STARTED",
@@ -89,6 +175,8 @@ def scheduler_diagnostics() -> dict:
         "boot_diag": _BOOT_DIAG,
         "worker_enabled": _queue_worker_enabled(),
         "fireable_job_count": fireable,
+        "runs": runs,
+        "stalled": stalled,
     }
 
 
@@ -156,15 +244,28 @@ async def start_scheduler() -> None:
                 os.getenv("RAILWAY_ENVIRONMENT"),
             )
 
-        def _add_job(*args, **kwargs):
+        from services.scheduler_job_runner import wrap_job
+
+        def _add_job(func, *args, **kwargs):
             # Register a scheduled job ONLY on the production worker. Prod+staging
             # share one Postgres, so a staging service must NOT double-fire these
             # singleton prod crons (daily audit check, settlement, billing,
             # reconcile, backfills) or drain the shared queues. Gates everything
             # uniformly — the explicit `if worker_enabled:` blocks below are now
             # redundant but harmless.
+            #
+            # Every job is wrapped by services.scheduler_job_runner.wrap_job
+            # (issue #1754): each RUN executes in a fresh contextvars.Context —
+            # so it gets its OWN `databases` Connection instead of the one this
+            # startup context inherited into every job task on databases 0.7.0 —
+            # and is bounded by the job's run deadline, so a run that never
+            # completes cannot make `max_instances=1` skip every future tick.
             if worker_enabled:
-                scheduler.add_job(*args, **kwargs)
+                job_id = kwargs.get("id") or getattr(func, "__name__", repr(func))
+                wrapped = wrap_job(
+                    job_id, func, deadline_seconds=run_deadline_for(job_id),
+                )
+                scheduler.add_job(wrapped, *args, **kwargs)
 
         # Register the daily check that picks up due merchants. Hour
         # chosen to land off-peak (most merchants in US/EU; 03:00 UTC

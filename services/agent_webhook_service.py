@@ -1256,7 +1256,11 @@ async def start_agent_webhook_retry_worker() -> None:
     if _retry_worker_task and not _retry_worker_task.done():
         return
     _retry_worker_stop = asyncio.Event()
-    _retry_worker_task = asyncio.create_task(_retry_worker_loop(_retry_worker_stop))
+    # Fresh context => own `databases` Connection (issue #1754: startup-spawned
+    # workers otherwise share the startup context's Connection with each other
+    # and, before the fix, with every scheduler job).
+    from services.scheduler_job_runner import spawn_isolated
+    _retry_worker_task = spawn_isolated(_retry_worker_loop(_retry_worker_stop), name="agent_webhook_retry_worker")
 
 
 async def stop_agent_webhook_retry_worker() -> None:

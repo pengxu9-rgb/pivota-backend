@@ -37,6 +37,24 @@ _MANAGEABLE_JOB_IDS = frozenset(
 )
 
 
+# Jobs an operator may force to run out-of-band (issue #1754). Each run goes
+# through the same isolated, deadline-bounded path as the scheduler, so it is
+# safe even while a scheduled run is wedged. All of these are idempotent
+# sweeps/reapers; the money-path reconciler is the reason this exists.
+_RUNNABLE_JOB_IDS = frozenset(
+    {
+        "payment_reconcile_tick",
+        "stamp_attribution_reaper",
+        "metering_expire_reservations",
+        "audit_run_lease_reaper",
+        "audit_run_abandoned_reaper",
+        "executor_run_lease_reaper",
+        "verification_run_lease_reaper",
+        "external_conversion_poll",
+    }
+)
+
+
 def _job_state(job: Any) -> dict[str, Any]:
     next_run = getattr(job, "next_run_time", None)
     return {
@@ -70,6 +88,66 @@ async def list_managed_scheduler_jobs(
         else:
             jobs.append({"id": job_id, "paused": None, "next_run_time": None, "registered": False})
     return {"jobs": jobs}
+
+
+# NOTE: these two are declared BEFORE the generic `/{job_id}/{action}` route
+# below, which would otherwise capture "run-now" / "cancel-running" as an
+# invalid action.
+@router.get("/admin/scheduler/runs", response_model=None)
+async def list_scheduler_runs(
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any]:
+    """Per-job run registry WITH last error text (the public
+    /__scheduler_health carries the same minus error text)."""
+    from services.scheduler_job_runner import registry_snapshot, stalled_jobs
+
+    return {"runs": registry_snapshot(include_error_text=True), "stalled": stalled_jobs()}
+
+
+@router.post("/admin/scheduler/jobs/{job_id}/run-now", response_model=None)
+async def run_scheduler_job_now(
+    job_id: str,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any] | JSONResponse:
+    """Force ONE out-of-band run of an allowlisted job (issue #1754 — the
+    payment reconciler must be forceable when its scheduled runs are wedged).
+    Runs through the isolated, deadline-bounded runner; returns the outcome."""
+    if job_id not in _RUNNABLE_JOB_IDS:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "job_not_runnable", "allowed_values": sorted(_RUNNABLE_JOB_IDS)},
+        )
+    from services.scheduler_job_runner import run_job_now
+
+    try:
+        outcome = await run_job_now(job_id)
+    except KeyError:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "job_not_registered", "job_id": job_id},
+        )
+    logger.warning(
+        "scheduler job RUN-NOW by admin=%s -> job_id=%s outcome=%s",
+        (current_admin or {}).get("email"), job_id, outcome.get("outcome"),
+    )
+    return outcome
+
+
+@router.post("/admin/scheduler/jobs/{job_id}/cancel-running", response_model=None)
+async def cancel_running_scheduler_job(
+    job_id: str,
+    current_admin: dict = Depends(require_admin),
+) -> dict[str, Any]:
+    """Cancel every in-flight run (and alive zombie) of a job. Any registered
+    job — this only ever frees a slot, never starts work."""
+    from services.scheduler_job_runner import cancel_running
+
+    n = cancel_running(job_id)
+    logger.warning(
+        "scheduler job CANCEL-RUNNING by admin=%s -> job_id=%s cancelled=%d",
+        (current_admin or {}).get("email"), job_id, n,
+    )
+    return {"job_id": job_id, "cancelled": n}
 
 
 @router.post("/admin/scheduler/jobs/{job_id}/{action}", response_model=None)
