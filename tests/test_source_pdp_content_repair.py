@@ -233,7 +233,14 @@ def test_float_or_none_accepts_decimal_strings() -> None:
 def test_candidate_query_targets_content_blockers() -> None:
     sql, values = repair.build_candidate_query(limit=10)
 
-    assert "ips.blocker_code IN ('no_seed', 'short_description', 'low_quality')" in sql
+    # 'not_scored' rides with 'low_quality': the 2026-08-15 split separated
+    # never-scored from scored-below-bar, and this cohort must keep BOTH or a
+    # mass unscoring (the A9-4 re-key stranded 6,424 rows) becomes invisible to
+    # the very tool meant to repair it.
+    assert (
+        "ips.blocker_code IN ('no_seed', 'short_description', 'low_quality', 'not_scored')"
+        in sql
+    )
     assert "CAST(:content_key AS text) IS NULL" in sql
     assert "CAST(:content_key AS text) IS NOT NULL" in sql
     assert values["min_existing_description_length"] == repair.MIN_EXISTING_DESCRIPTION_LENGTH

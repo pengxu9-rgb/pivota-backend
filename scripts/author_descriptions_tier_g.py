@@ -131,7 +131,9 @@ JOIN beauty_sku_ingredients bsi
   ON bsi.sku_key = cp.product_key || '::canonical'
 LEFT JOIN agent_pdp_view apv ON apv.content_key = ips.content_key
 WHERE ips.serving_eligible IS FALSE
-  AND ips.blocker_code IN ('low_quality', 'short_description')
+  -- 'not_scored' rides with 'low_quality' — see the 2026-08-15 blocker split;
+  -- these were one code, and an unscored row is still a description candidate.
+  AND ips.blocker_code IN ('low_quality', 'short_description', 'not_scored')
   AND nullif(btrim(coalesce(bsi.raw_inci, '')), '') IS NOT NULL
   AND length(btrim(coalesce(cp.cp_description, ''))) < :min_existing_description_length
 ORDER BY ips.content_key ASC

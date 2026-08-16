@@ -349,8 +349,8 @@ async def _insert_product(
 async def _ips_row(content_key: str) -> Optional[Dict[str, Any]]:
     row = await database.fetch_one(
         """
-        SELECT serving_eligible, index_eligible, blocker_code, pipeline_stage,
-               content_quality_score
+        SELECT serving_eligible, index_eligible, blocker_code, blocker_detail,
+               pipeline_stage, content_quality_score
         FROM index_pipeline_state
         WHERE content_key = :content_key
         """,
@@ -388,6 +388,7 @@ async def test_recompute_happy_path_upserts_serving_eligible_true() -> None:
         ("not_live", {"sync_status": "archived"}, "not_live"),
         ("no_seed", {"seed": False, "apv": False}, "no_seed"),
         ("low_quality", {"quality_score": 64.9}, "low_quality"),
+        ("not_scored", {"quality_score": None}, "not_scored"),
         ("no_image", {"image_url": ""}, "no_image"),
         ("no_price", {"has_price": False}, "no_price"),
         ("short_desc", {"description": "too short"}, "short_description"),
@@ -475,6 +476,58 @@ async def test_recompute_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unscored_and_low_quality_are_distinct_codes_but_both_ineligible() -> None:
+    """The A9-4 regression (2026-08-14) in one test.
+
+    A NULL ``content_quality_score`` and a real sub-threshold score are
+    DIFFERENT facts and must not share a blocker code — collapsing them hid a
+    mass reset of 4,882 content_keys inside what looked like a quality metric.
+
+    The contrast is the point: both rows sit in the SAME ladder position and
+    differ only in unmeasured-null vs measured-low, so a mutation that reverts
+    either arm to the shared ``low_quality`` fails here. The paired
+    ineligibility assertions are equally load-bearing in the other direction —
+    they are what stops a future "fix" from letting the unscored cohort serve.
+    Unmeasured must never buy permission.
+    """
+    was_connected = await _prepare_db()
+    try:
+        unscored_ids = await _insert_product("contrast_unscored", quality_score=None)
+        scored_ids = await _insert_product("contrast_lowscore", quality_score=64.9)
+
+        unscored_result = await svc.recompute_serving_eligibility(
+            unscored_ids["content_key"]
+        )
+        scored_result = await svc.recompute_serving_eligibility(
+            scored_ids["content_key"]
+        )
+
+        unscored_row = await _ips_row(unscored_ids["content_key"])
+        scored_row = await _ips_row(scored_ids["content_key"])
+
+        assert unscored_row is not None
+        assert scored_row is not None
+
+        # The codes separate...
+        assert unscored_row["blocker_code"] == "not_scored"
+        assert scored_row["blocker_code"] == "low_quality"
+        assert unscored_row["blocker_code"] != scored_row["blocker_code"]
+
+        # ...and the detail names the actual state rather than implying a verdict.
+        assert "NULL" in (unscored_row["blocker_detail"] or "")
+
+        # ...but NEITHER may serve, on either gate.
+        assert unscored_result is False
+        assert scored_result is False
+        for row in (unscored_row, scored_row):
+            assert bool(row["serving_eligible"]) is False
+            assert bool(row["index_eligible"]) is False
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
 async def test_recompute_handles_concurrent_partial_quality_data() -> None:
     was_connected = await _prepare_db()
     try:
@@ -506,7 +559,8 @@ async def test_recompute_handles_concurrent_partial_quality_data() -> None:
 
         assert first is False
         assert first_row is not None
-        assert first_row["blocker_code"] == "low_quality"
+        # No snapshot exists yet — that is UNSCORED, not a quality verdict.
+        assert first_row["blocker_code"] == "not_scored"
         assert second is True
         assert second_row is not None
         assert bool(second_row["serving_eligible"]) is True

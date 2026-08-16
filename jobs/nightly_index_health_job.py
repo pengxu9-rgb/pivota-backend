@@ -47,6 +47,7 @@ Blocker codes (first failing check wins):
   non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
   no_seed           — no external seed and no APV-backed source document
   no_extraction     — a source row exists but no usable source title/document
+  not_scored        — content_quality_score IS NULL (never scored; NOT a quality verdict)
   low_quality       — content_quality_score < QUALITY_SCORE_THRESHOLD (0-100 scale)
   no_image          — image_url null or empty
   no_price          — no catalog_offers row with list_price > 0

@@ -265,7 +265,10 @@ COHORT_BLOCKED_SCALE_SQL = f"""
           AND q.platform = c.platform
           AND q.platform_product_id = c.source_product_id
     WHERE ips.serving_eligible IS DISTINCT FROM TRUE
-      AND COALESCE(ips.blocker_code, '') = 'low_quality'
+      -- 'not_scored' rides with 'low_quality' (2026-08-15 split). The
+      -- report's cohort is 'blocked on content quality'; keying on
+      -- 'low_quality' alone would silently drop every unscored row.
+      AND COALESCE(ips.blocker_code, '') IN ('low_quality', 'not_scored')
     ORDER BY ips.content_quality_score DESC NULLS LAST
     LIMIT 40
 """
@@ -312,7 +315,10 @@ RESCORE_REACHABILITY_SQL = f"""
     FROM cohort c
     LEFT JOIN index_pipeline_state ips ON ips.content_key = c.content_key
     WHERE ips.serving_eligible IS DISTINCT FROM TRUE
-      AND COALESCE(ips.blocker_code, '') = 'low_quality'
+      -- 'not_scored' rides with 'low_quality' (2026-08-15 split). The
+      -- report's cohort is 'blocked on content quality'; keying on
+      -- 'low_quality' alone would silently drop every unscored row.
+      AND COALESCE(ips.blocker_code, '') IN ('low_quality', 'not_scored')
     ORDER BY c.brand ASC NULLS LAST
     LIMIT 40
 """

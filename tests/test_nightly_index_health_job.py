@@ -369,7 +369,13 @@ def test_no_seed_apv_backed_product_can_be_indexed():
     assert state["seed_audit_status"] == "not_audited"
 
 
-def test_no_seed_apv_backed_product_without_quality_is_low_quality_not_no_seed():
+def test_no_seed_apv_backed_product_without_quality_is_not_scored_not_no_seed():
+    """The point is the LADDER: an APV-backed row with no seed must fall through
+    the seed checks to the quality rung, not stop at `no_seed`.
+
+    Which quality rung it lands on is the 2026-08-15 split: a missing snapshot is
+    `not_scored`, and only a snapshot BELOW the threshold is `low_quality`. This
+    row has no snapshot at all."""
     state = _classify_product(
         _full_row(
             seed_data_json=None,
@@ -383,7 +389,8 @@ def test_no_seed_apv_backed_product_without_quality_is_low_quality_not_no_seed()
         regression_domains=set(),
     )
     assert state["serving_eligible"] is False
-    assert state["blocker_code"] == "low_quality"
+    assert state["blocker_code"] == "not_scored"
+    assert state["blocker_code"] != "no_seed"  # the rung this test is named for
     assert state["pipeline_stage"] == "extracted"
 
 

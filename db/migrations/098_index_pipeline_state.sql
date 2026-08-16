@@ -27,6 +27,7 @@
 --   non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
 --   no_seed           — no external_product_seeds row linked to this content_key
 --   no_extraction     — seed_data null or title missing
+--   not_scored        — content_quality_score IS NULL (never scored; NOT a verdict)
 --   low_quality       — content_quality_score < QUALITY_SCORE_THRESHOLD
 --   no_image          — image_url null/empty after extraction
 --   no_price          — no catalog_offers row with list_price > 0
