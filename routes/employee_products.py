@@ -16,6 +16,7 @@ import csv
 import io
 import json
 import hashlib
+import logging
 import re
 from urllib.parse import urlparse
 from urllib.parse import parse_qsl, urlencode, urlunparse
@@ -25,6 +26,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from pydantic import BaseModel, Field
 import uuid
 
+from db._ddl_guard import apply_ddl_statements
 from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
@@ -71,11 +73,31 @@ from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_ke
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
+logger = logging.getLogger(__name__)
+
 _EXTERNAL_SEEDS_TABLE_READY = False
 _EXTERNAL_SEEDS_TABLE_LOCK = asyncio.Lock()
 
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = False
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
+
+# Column backfill for deployments whose employee_external_seed_import_tasks
+# predates these columns. Kept per-statement tolerant (see
+# db/_ddl_guard.py): `ADD COLUMN IF NOT EXISTS` is Postgres-only syntax and
+# fails outright on the SQLite envs some tests run against, so one failure
+# must not abort the rest of the list. It must not silently memoize either —
+# a swallowed ALTER leaves the column permanently absent while the module
+# reports ready.
+_EXTERNAL_SEED_IMPORT_TASKS_BACKFILL_STATEMENTS = [
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_by_employee_id TEXT;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS errors TEXT NOT NULL DEFAULT '[]';",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS seed_ids TEXT NOT NULL DEFAULT '[]';",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS stats TEXT NOT NULL DEFAULT '{}';",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS error TEXT;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;",
+]
 
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = False
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_LOCK = asyncio.Lock()
@@ -345,34 +367,16 @@ async def _ensure_external_seed_import_tasks_table() -> None:
             """
         )
 
-        # Backfill columns for older deployments (best-effort).
-        try:
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_by_employee_id TEXT;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_count INTEGER NOT NULL DEFAULT 0;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS errors TEXT NOT NULL DEFAULT '[]';"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS seed_ids TEXT NOT NULL DEFAULT '[]';"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS stats TEXT NOT NULL DEFAULT '{}';"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS error TEXT;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;"
-            )
-        except Exception:
-            pass
+        # Backfill columns for older deployments (best-effort per statement,
+        # but the result gates memoization: a swallowed ALTER used to still
+        # set the ready flag, so the missing column was never retried for the
+        # rest of the process lifetime).
+        backfill_ok = await apply_ddl_statements(
+            _EXTERNAL_SEED_IMPORT_TASKS_BACKFILL_STATEMENTS,
+            label="_ensure_external_seed_import_tasks_table",
+            logger=logger,
+            execute=database.execute,
+        )
 
         await database.execute(
             "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_status ON employee_external_seed_import_tasks(status);"
@@ -380,7 +384,7 @@ async def _ensure_external_seed_import_tasks_table() -> None:
         await database.execute(
             "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);"
         )
-        _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = True
+        _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = backfill_ok
 
 
 async def _ensure_employee_pci_kb_scope_reviews_table() -> None:

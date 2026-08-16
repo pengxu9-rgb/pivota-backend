@@ -55,6 +55,14 @@ DDL_MAX_ATTEMPTS = 3
 # warning per statement per pass.
 _MAX_STATEMENT_WARNINGS = 5
 
+# Statement prefix carried in the warning. The point of the log is to name
+# the object that is now missing, and that name sits at the END of the
+# statement: the eight `ALTER TABLE employee_external_seed_import_tasks ADD
+# COLUMN IF NOT EXISTS <col>` statements in routes/employee_products.py share
+# a 73-character prefix, so an 80-character cut reported all of them as the
+# same line with seven characters of column name.
+_STATEMENT_LOG_CHARS = 160
+
 # label -> consecutive failed passes.
 _attempts: Dict[str, int] = {}
 
@@ -82,7 +90,7 @@ async def apply_ddl_statements(
             if failed_stmts <= _MAX_STATEMENT_WARNINGS:
                 logger.warning(
                     "%s skip stmt: %s | %s",
-                    label, str(exc)[:120], stmt[:80],
+                    label, str(exc)[:120], stmt[:_STATEMENT_LOG_CHARS],
                 )
 
     if failed_stmts == 0:
