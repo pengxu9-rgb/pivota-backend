@@ -86,8 +86,9 @@ _STATE_NAMES = {0: "STOPPED", 1: "RUNNING", 2: "PAUSED"}
 # explicit entry, so nobody inherits the default by accident.
 _DEFAULT_RUN_DEADLINE_SECONDS = 3600.0
 _JOB_RUN_DEADLINES = {
-    # daily / weekly crons: heavy sweeps, up to 2h
-    "daily_audit_check": 7200,
+    # daily / weekly crons: heavy sweeps. daily_audit_check runs LLM audits
+    # INLINE (gather of 3, each routinely >15 min): 4h.
+    "daily_audit_check": 14400,
     "nightly_index_health": 7200,
     "outcome_aggregation_daily": 7200,
     "catalog_invariant_sweep": 7200,
@@ -110,13 +111,17 @@ _JOB_RUN_DEADLINES = {
     "catalog_onboard_queue_drain": 1500,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
-    # queue drainers: MAX_RUNS_PER_TICK runs each; audits are multi-minute
-    # (LONG_STAGE_LEASE_SECONDS=900) so 3 of them fit in 45 min; a cancelled
-    # run is re-queued by the lease reapers.
-    "audit_run_worker_tick": 2700,
-    "executor_run_worker_tick": 300,
+    # queue drainers: MAX_RUNS_PER_TICK runs each, serial. Audits routinely
+    # run >15 min each (a cut run loses its LLM spend and re-runs after the
+    # 15-min lease expires) so 3 get 2h; executor agents (sitemap fetch, GSC
+    # submit for large catalogs) can be slow and side-effecting, 30 min. The
+    # quality backfill walks an UNCAPPED catalog; its tick requeues the row on
+    # cancel (db.product_quality_backfill_jobs.requeue_quality_backfill_job)
+    # so a cut run resumes rather than stranding the merchant.
+    "audit_run_worker_tick": 7200,
+    "executor_run_worker_tick": 1800,
     "verification_run_worker_tick": 300,
-    "quality_backfill_drain_tick": 600,
+    "quality_backfill_drain_tick": 3600,
     # DB-only reapers (60s / 5min cadence)
     "audit_run_lease_reaper": 120,
     "audit_run_abandoned_reaper": 120,

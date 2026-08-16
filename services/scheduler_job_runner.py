@@ -65,6 +65,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 
 
+class JobRunCancelled(RuntimeError):
+    """The run's own task was cancelled (operator `cancel-running`), as
+    opposed to the wrapper being cancelled — which propagates CancelledError."""
+
+
 class JobDeadlineExceeded(RuntimeError):
     """A run exceeded its deadline and was cancelled (or abandoned)."""
 
@@ -86,6 +91,7 @@ def _now_iso() -> str:
 class JobRunState:
     job_id: str
     deadline_seconds: float
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS
     runs_started: int = 0
     runs_ok: int = 0
     runs_failed: int = 0
@@ -95,6 +101,7 @@ class JobRunState:
     last_started_at: Optional[str] = None
     last_finished_at: Optional[str] = None
     last_duration_ms: Optional[int] = None
+    max_duration_ms: Optional[int] = None  # to tune _JOB_RUN_DEADLINES from data
     last_outcome: Optional[str] = None
     last_error_type: Optional[str] = None
     last_error: Optional[str] = None
@@ -124,6 +131,7 @@ class JobRunState:
             "last_started_at": self.last_started_at,
             "last_finished_at": self.last_finished_at,
             "last_duration_ms": self.last_duration_ms,
+            "max_duration_ms": self.max_duration_ms,
             "last_outcome": self.last_outcome,
             "last_error_type": self.last_error_type,
         }
@@ -137,14 +145,76 @@ _REGISTRY: Dict[str, JobRunState] = {}
 _WRAPPED: Dict[str, Callable[..., Awaitable[Any]]] = {}
 
 
-def _state(job_id: str, deadline_seconds: float) -> JobRunState:
+def _state(
+    job_id: str, deadline_seconds: float,
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+) -> JobRunState:
     st = _REGISTRY.get(job_id)
     if st is None:
-        st = JobRunState(job_id=job_id, deadline_seconds=float(deadline_seconds))
+        st = JobRunState(job_id=job_id, deadline_seconds=float(deadline_seconds),
+                         cancel_grace_seconds=float(cancel_grace_seconds))
         _REGISTRY[job_id] = st
     else:
         st.deadline_seconds = float(deadline_seconds)
+        st.cancel_grace_seconds = float(cancel_grace_seconds)
     return st
+
+
+def _spawn_in_new_context(coro: Awaitable[Any], name: Optional[str]):
+    """(task, context) — the context is kept so a zombie's own DB connection
+    can be found and terminated (see `_terminate_run_connection`)."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.Context()
+    task = ctx.run(loop.create_task, coro)
+    if name:
+        try:
+            task.set_name(name)
+        except Exception:  # pragma: no cover - cosmetic
+            pass
+    return task, ctx
+
+
+def _terminate_run_connection(ctx: contextvars.Context, task: asyncio.Task) -> bool:
+    """Best-effort: close the raw asyncpg connection a ZOMBIE run holds.
+
+    A run cancelled mid-command puts asyncpg into its cancelling state; the
+    pool release then waits for the original socket to answer, which on a dead
+    socket is forever — so an abandoned run would hold one of `max_size` pool
+    slots permanently. Terminating the raw connection makes asyncpg raise
+    inside the zombie (unwinding it) and lets the pool discard the holder.
+    Reaches into `databases` internals (0.7.0 ContextVar / 0.9.0 per-task map)
+    and asyncpg's `Connection.terminate()`; every step is guarded — a miss
+    just leaves the pre-existing leak.
+    """
+    try:
+        from db.database import database
+    except Exception:  # noqa: BLE001
+        return False
+    conn = None
+    try:
+        cv = getattr(database, "_connection_context", None)  # databases 0.7.0
+        if cv is not None:
+            try:
+                conn = ctx.run(cv.get)
+            except LookupError:
+                conn = None
+        if conn is None:
+            cmap = getattr(database, "_connection_map", None)  # databases >= 0.8
+            if cmap is not None:
+                conn = cmap.get(task)
+    except Exception:  # noqa: BLE001
+        conn = None
+    if conn is None:
+        return False
+    try:
+        raw = getattr(getattr(conn, "_connection", None), "_connection", None)
+        terminate = getattr(raw, "terminate", None)
+        if raw is not None and callable(terminate) and not raw.is_closed():
+            terminate()
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def spawn_isolated(coro: Awaitable[Any], *, name: Optional[str] = None) -> asyncio.Task:
@@ -156,13 +226,7 @@ def spawn_isolated(coro: Awaitable[Any], *, name: Optional[str] = None) -> async
     checkout. Use this for every long-lived worker spawned at startup and for
     every scheduler run.
     """
-    loop = asyncio.get_running_loop()
-    task = contextvars.Context().run(loop.create_task, coro)
-    if name:
-        try:
-            task.set_name(name)
-        except Exception:  # pragma: no cover - cosmetic
-            pass
+    task, _ctx = _spawn_in_new_context(coro, name)
     return task
 
 
@@ -185,8 +249,8 @@ async def run_isolated(
       next tick runs.
     * The wrapper itself being cancelled (scheduler shutdown) cancels the run.
     """
-    st = _state(job_id, deadline_seconds)
-    task = spawn_isolated(func(*args, **kwargs), name=f"job:{job_id}")
+    st = _state(job_id, deadline_seconds, cancel_grace_seconds)
+    task, ctx = _spawn_in_new_context(func(*args, **kwargs), f"job:{job_id}")
     t0 = time.monotonic()
     st.runs_started += 1
     st.last_started_at = _now_iso()
@@ -196,6 +260,7 @@ async def run_isolated(
         st.active.pop(task, None)
         st.last_finished_at = _now_iso()
         st.last_duration_ms = int((time.monotonic() - t0) * 1000)
+        st.max_duration_ms = max(st.max_duration_ms or 0, st.last_duration_ms)
         st.last_outcome = outcome
         if exc is not None:
             st.last_error_type = type(exc).__name__
@@ -204,21 +269,44 @@ async def run_isolated(
             st.last_error_type = None
             st.last_error = None
 
+    def _adopt_as_zombie(reason: str) -> None:
+        # The run is being abandoned while (possibly) still alive: keep it
+        # visible and cancellable, never let its exception go unretrieved,
+        # and cut its DB connection so it cannot hold a pool slot forever.
+        task.add_done_callback(_swallow_task_result)
+        if not task.done():
+            st.zombie_count += 1
+            st.zombies.add(task)
+            terminated = _terminate_run_connection(ctx, task)
+            logger.error(
+                "scheduler job %r: run ABANDONED as a zombie (%s)%s — it stays visible "
+                "on /__scheduler_health and reachable via cancel-running. "
+                "(issue #1754 wedge class)",
+                job_id, reason,
+                "; its DB connection was terminated" if terminated else "",
+            )
+
     try:
         done, _pending = await asyncio.wait({task}, timeout=deadline_seconds)
     except asyncio.CancelledError:
+        # The WRAPPER was cancelled (scheduler shutdown/restart). Cancel the
+        # run too, but do not lose track of it if it will not unwind (#1756
+        # review finding 1).
         task.cancel()
         st.runs_cancelled += 1
         _finish("cancelled")
+        _adopt_as_zombie("wrapper cancelled while the run was in flight")
         raise
 
     if task in done:
         try:
             result = task.result()
-        except asyncio.CancelledError as exc:
+        except asyncio.CancelledError:
+            # The RUN's task was cancelled (operator cancel-running), not us.
             st.runs_cancelled += 1
-            _finish("cancelled", exc)
-            raise
+            err = JobRunCancelled(f"job {job_id!r} run was cancelled")
+            _finish("cancelled", err)
+            raise err
         except BaseException as exc:
             st.runs_failed += 1
             _finish("error", exc)
@@ -234,25 +322,21 @@ async def run_isolated(
     except asyncio.CancelledError:
         st.runs_cancelled += 1
         _finish("cancelled")
+        _adopt_as_zombie("wrapper cancelled during the grace window")
         raise
     zombie = task not in done2
     st.runs_deadline_exceeded += 1
-    if zombie:
-        st.zombie_count += 1
-        st.zombies.add(task)
-        # Do not let a zombie's eventual exception surface as "never retrieved".
-        task.add_done_callback(_swallow_task_result)
-    else:
-        _swallow_task_result(task)
     err = JobDeadlineExceeded(job_id, deadline_seconds, zombie=zombie)
     _finish("deadline_exceeded", err)
-    logger.error(
-        "scheduler job %r exceeded its %gs run deadline — %s. The job's slot is free; "
-        "its next tick will run. (issue #1754 wedge class)",
-        job_id, deadline_seconds,
-        "run ABANDONED as a zombie (did not unwind within %gs grace)" % cancel_grace_seconds
-        if zombie else "run cancelled cleanly",
-    )
+    if zombie:
+        _adopt_as_zombie("did not unwind within %gs grace after the deadline" % cancel_grace_seconds)
+    else:
+        _swallow_task_result(task)
+        logger.error(
+            "scheduler job %r exceeded its %gs run deadline; run cancelled cleanly. "
+            "The job's slot is free; its next tick will run. (issue #1754 wedge class)",
+            job_id, deadline_seconds,
+        )
     raise err
 
 
@@ -274,6 +358,11 @@ def wrap_job(
     """Return the scheduler-facing callable for `func`: same name (so
     APScheduler log lines are unchanged), but every invocation goes through
     `run_isolated`. Registered under `job_id` for `run_job_now`."""
+    if not asyncio.iscoroutinefunction(func):
+        # A sync job would run inline on the loop and then hand
+        # `create_task` a non-awaitable. Every registered job is async today;
+        # fail loudly at registration rather than on every tick.
+        raise TypeError(f"wrap_job({job_id!r}): {func!r} must be an `async def`")
 
     async def _isolated_job(*args: Any, **kwargs: Any) -> Any:
         return await run_isolated(
@@ -285,7 +374,7 @@ def wrap_job(
 
     functools.update_wrapper(_isolated_job, func)
     _isolated_job.__wrapped_job_id__ = job_id  # type: ignore[attr-defined]
-    _state(job_id, deadline_seconds)
+    _state(job_id, deadline_seconds, cancel_grace_seconds)
     _WRAPPED[job_id] = _isolated_job
     return _isolated_job
 
@@ -310,6 +399,9 @@ async def run_job_now(job_id: str) -> Dict[str, Any]:
             outcome["result"] = result if isinstance(result, (dict, list, str, int, float, bool)) else repr(result)
     except JobDeadlineExceeded as exc:
         outcome["outcome"] = "deadline_exceeded"
+        outcome["error"] = str(exc)
+    except JobRunCancelled as exc:
+        outcome["outcome"] = "cancelled"
         outcome["error"] = str(exc)
     except Exception as exc:  # noqa: BLE001
         outcome["outcome"] = "error"
@@ -345,7 +437,7 @@ def stalled_jobs(*, now: Optional[float] = None) -> Dict[str, float]:
     for jid, st in _REGISTRY.items():
         for t0 in st.active.values():
             age = now - t0
-            if age > st.deadline_seconds + DEFAULT_CANCEL_GRACE_SECONDS:
+            if age > st.deadline_seconds + st.cancel_grace_seconds:
                 out[jid] = max(out.get(jid, 0.0), round(age, 1))
     return out
 

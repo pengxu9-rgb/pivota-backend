@@ -29,6 +29,7 @@ import pytest
 import services.scheduler_job_runner as runner
 from services.scheduler_job_runner import (
     JobDeadlineExceeded,
+    JobRunCancelled,
     cancel_running,
     registry_snapshot,
     run_job_now,
@@ -122,6 +123,7 @@ async def test_a_run_that_never_completes_does_not_starve_its_own_future_ticks()
     sched.add_job(
         wrap_job("wedged", wedged, deadline_seconds=0.25, cancel_grace_seconds=0.1),
         "interval", seconds=0.2, id="wedged", max_instances=1, coalesce=True,
+        misfire_grace_time=None,  # CI stalls must not turn ticks into misfires
     )
     sched.start()
     try:
@@ -169,10 +171,12 @@ async def test_one_wedged_job_does_not_starve_other_jobs():
     sched.add_job(
         wrap_job("a_wedged", a_wedged, deadline_seconds=0.6, cancel_grace_seconds=0.1),
         "interval", seconds=0.2, id="a_wedged", max_instances=1, coalesce=True,
+        misfire_grace_time=None,
     )
     sched.add_job(
         wrap_job("b_query", b_query, deadline_seconds=1.0, cancel_grace_seconds=0.1),
         "interval", seconds=0.2, id="b_query", max_instances=1, coalesce=True,
+        misfire_grace_time=None,
     )
     sched.start()
     try:
@@ -268,6 +272,93 @@ async def test_run_job_now_forces_an_out_of_band_run_through_the_same_path():
         await run_job_now("not_registered")
 
 
+async def test_wrapper_cancelled_while_run_ignores_cancel_keeps_the_run_visible():
+    """Review finding on #1756: scheduler shutdown / admin restart cancels the
+    WRAPPER. If the run will not unwind, it must not become a ghost — it stays
+    a zombie on the registry (visible, cancellable, exception retrieved)."""
+    stage2 = asyncio.Event()
+
+    async def stubborn():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await stage2.wait()
+
+    fn = wrap_job("ghost", stubborn, deadline_seconds=10)
+    wrapper = asyncio.ensure_future(fn())
+    await asyncio.sleep(0.05)
+    wrapper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wrapper
+    snap = registry_snapshot()["ghost"]
+    assert snap["running"] == 0
+    assert snap["zombies_alive"] == 1 and snap["zombie_count"] == 1, snap
+    assert snap["last_outcome"] == "cancelled"
+    assert cancel_running("ghost") == 1
+    stage2.set()
+    await asyncio.sleep(0.05)
+    assert registry_snapshot()["ghost"]["zombies_alive"] == 0
+
+
+async def test_cancel_running_on_a_live_run_reports_cancelled_not_a_stray_cancellederror():
+    started = asyncio.Event()
+
+    async def slow():
+        started.set()
+        await asyncio.Event().wait()
+
+    fn = wrap_job("payment_reconcile_tick", slow, deadline_seconds=10)
+    t = asyncio.ensure_future(run_job_now("payment_reconcile_tick"))
+    await started.wait()
+    assert cancel_running("payment_reconcile_tick") == 1
+    out = await asyncio.wait_for(t, 5)
+    assert out["outcome"] == "cancelled", out
+    with pytest.raises(JobRunCancelled):
+        t2 = asyncio.ensure_future(fn())
+        await asyncio.sleep(0.02)
+        cancel_running("payment_reconcile_tick")
+        await asyncio.wait_for(t2, 5)
+
+
+def test_wrap_job_rejects_a_sync_function():
+    def sync_job():
+        return None
+
+    with pytest.raises(TypeError):
+        wrap_job("sync", sync_job, deadline_seconds=1)
+
+
+async def test_quality_backfill_tick_requeues_its_row_when_cancelled_mid_run(monkeypatch):
+    """A cancelled run (deadline / shutdown) must not strand the job row in
+    `running` — nothing in production would ever pick it up again."""
+    import services.product_quality_backfill_service as svc
+
+    events = []
+
+    async def fake_requeue(job_id):
+        events.append(("requeue", job_id))
+        return True
+
+    async def hang(*a, **k):
+        await asyncio.Event().wait()
+
+    async def fake_complete(job_id, **kw):
+        events.append(("complete", job_id, kw.get("status")))
+        return None
+
+    monkeypatch.setattr(svc, "requeue_quality_backfill_job", fake_requeue)
+    monkeypatch.setattr(svc, "complete_quality_backfill_job", fake_complete)
+    monkeypatch.setattr(svc, "_load_cached_rows", hang)
+    task = asyncio.ensure_future(
+        svc._process_claimed_quality_backfill_job({"job_id": "job-1", "merchant_id": "m-1"})
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [("requeue", "job-1")]
+
+
 # --------------------------------------------------------------------------
 # 3. every registered job is wrapped and has an explicit deadline
 # --------------------------------------------------------------------------
@@ -312,7 +403,7 @@ async def test_start_scheduler_wraps_every_job_and_every_job_has_an_explicit_dea
     # the money-path job is registered, wrapped, and forceable
     assert "payment_reconcile_tick" in runner.registered_job_ids()
     for jid, d in sched._JOB_RUN_DEADLINES.items():
-        assert 0 < d <= 7200, (jid, d)
+        assert 0 < d <= 14400, (jid, d)
 
 
 def test_scheduler_health_carries_the_run_registry(monkeypatch):
