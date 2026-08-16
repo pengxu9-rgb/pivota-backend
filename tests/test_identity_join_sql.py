@@ -196,6 +196,14 @@ _ALLOWED = {
     "services/identity_join_sql.py",
     # This file.
     "tests/test_identity_join_sql.py",
+    # READ-ONLY orphan recon (ADR-009). Its listing subqueries are cross-merchant
+    # ON PURPOSE: a listing left under the retired sentinel is classified by
+    # counting the catalog rows that carry its product_id under ANY merchant
+    # (`n_products`, `merchants[]`) — the fan-out this lint forbids in a serving
+    # join is the measurement here. The minted lane is read through its own
+    # seed subquery (`n_seeds_attached_live`), never through source_product_id.
+    # Nothing it emits is served or written.
+    "scripts/recon_sentinel_orphans.py",
 }
 
 
