@@ -596,9 +596,10 @@ async def ensure_audit_evidence_tables() -> None:
 
     A pass in which any statement failed does NOT memoize, so a
     transient failure (e.g. a CREATE INDEX cut by the statement
-    timeout while blocked on a lock) retries on the next call rather
+    timeout while blocked on a lock) retries on a later call rather
     than leaving a UNIQUE idempotency index silently absent for the
-    process lifetime. See db/_ddl_guard.py."""
+    process lifetime. Retries are paced by wall time and carry only
+    the statements that failed. See db/_ddl_guard.py."""
     global _DDL_READY
     if _DDL_READY:
         return

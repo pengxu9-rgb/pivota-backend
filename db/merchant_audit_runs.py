@@ -278,7 +278,8 @@ async def ensure_merchant_audit_runs_table() -> None:
     """Best-effort ensure-table helper. Mirrors the schema_guard
     pattern — swallows errors and lets the route continue even if DDL
     fails. Memoizes once every statement has succeeded; a pass with a
-    failure retries on the next call instead (see db/_ddl_guard.py)."""
+    failure retries on a later call instead, paced by wall time (see
+    db/_ddl_guard.py)."""
     global _DDL_READY
     if _DDL_READY:
         return
