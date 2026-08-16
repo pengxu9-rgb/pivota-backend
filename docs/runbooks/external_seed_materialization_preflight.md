@@ -62,11 +62,19 @@ whether to do any work at all, so a disagreement is silently lost mirroring.
 They share `_WINNER_ORDER_BY` and `_CANDIDATE_FILTERS` by construction, and
 `tests/test_missing_mirror_count_equivalence_postgres.py` pins the rest.
 
-Verified against the report chain on live production data before shipping:
+Checked against the report chain on live production data before shipping:
 
-* the winning seed row is identical for **all 11,352** groups;
+* the winning seed row is identical for all 11,352 groups;
 * the `missing` sets are identical live (0 = 0) and with the identity join
-  forced to miss (9 = 9, which exercises the attached-backlink anti-join).
+  forced to miss (9 = 9, which does exercise the attached-backlink anti-join).
+
+**Do not over-trust that production run.** Measured the same day, production has
+0 duplicate `external_product_id` groups, 0 over-length ids, 0 blank titles, 0
+NULL/uppercase/padded statuses and 0 lowercase markets — so every group is a
+singleton and it could not exercise the winner ranking (`DISTINCT ON` vs
+`row_number() = 1`) or any candidate filter at all. It proves the anti-joins on
+real data and nothing more. The fixture test is the real proof of the rest: it
+constructs the duplicate groups and dirty values production happens to lack.
 
 ## Verifying after deploy
 

@@ -75,6 +75,13 @@ _SEEDS = [
     #    equivalence is unaffected — but no fixture can cover it, and this row
     #    exercises the length rule, not the product_key rule.
     ("s-longkey", "k" * 220, "US", "Long Key", "active", None, "2026-08-01", "2026-07-01"),
+    # -- NULL status: coalesce(status,'') = '' != 'active', so NOT missing.
+    #    Pins the coalesce DEFAULT — flip it to 'active' and this row silently
+    #    becomes mirrorable. Production has 0 NULL statuses, so only a fixture
+    #    can catch it.
+    ("s-null-status", "epid-nullstatus", "US", "Null Status", None, None, "2026-08-01", "2026-07-01"),
+    # -- whitespace-padded status: NOT btrimmed, so ' active ' is INACTIVE.
+    ("s-padded-status", "epid-paddedstatus", "US", "Padded Status", " active ", None, "2026-08-01", "2026-07-01"),
     # -- status case-folding, BOTH call sites of lower(coalesce(status,'')):
     #    (a) an 'ACTIVE' seed is active, so it is a mirrorable winner: MISSING
     ("s-upper-active", "epid-upperactive", "US", "Upper Active", "ACTIVE", None, "2026-08-01", "2026-07-01"),
@@ -373,6 +380,7 @@ def test_both_chains_share_the_ranking_and_filter_fragments() -> None:
         MISSING_MIRROR_CTES,
         _CANDIDATE_FILTERS,
         _WINNER_ORDER_BY,
+        _active_status,
     )
 
     for chain_name, chain in (
@@ -381,3 +389,48 @@ def test_both_chains_share_the_ranking_and_filter_fragments() -> None:
     ):
         assert _WINNER_ORDER_BY in chain, f"{chain_name} no longer shares the ranking"
         assert _CANDIDATE_FILTERS in chain, f"{chain_name} no longer shares the filters"
+
+    # The active-status predicate is the third shared piece, and the one most
+    # easily hand-copied back in: it appears under three different aliases.
+    assert _active_status() in COMMON_CTES
+    assert _active_status("eps") in MISSING_MIRROR_CTES
+    assert _active_status("a") in MISSING_MIRROR_CTES
+    # No chain may carry a hand-written spelling of it alongside the shared one.
+    for chain_name, chain in (
+        ("COMMON_CTES", COMMON_CTES),
+        ("MISSING_MIRROR_CTES", MISSING_MIRROR_CTES),
+    ):
+        assert "= 'active'" not in chain.replace(_active_status(), "").replace(
+            _active_status("eps"), ""
+        ).replace(_active_status("a"), ""), (
+            f"{chain_name} spells the active-status predicate by hand somewhere"
+        )
+
+
+def test_status_predicate_is_never_hand_written_in_the_module() -> None:
+    """SOURCE-level guard, because the string-level one above cannot see this.
+
+    Inlining `lower(coalesce(eps.status, '')) = 'active'` back into a chain
+    renders a byte-identical SQL string, so every runtime assertion still
+    passes — the drift only becomes visible later, when someone edits one copy.
+    The rendered-SQL tests are blind to it by construction; only the source is.
+
+    `_active_status` itself builds the predicate around `{column}`, so it never
+    matches. The unrelated `status = 'active'` in the catalog_merchants upsert
+    does not match either — this looks for the coalesce wrapper specifically.
+    """
+    import re
+    from pathlib import Path
+
+    import scripts.mirror_external_seeds_to_catalog_products as mirror
+
+    source = Path(mirror.__file__).read_text(encoding="utf-8")
+    hand_written = re.findall(
+        r"lower\(coalesce\([a-zA-Z_]*\.?status", source
+    )
+
+    assert hand_written == [], (
+        "the active-status predicate is spelled by hand "
+        f"{len(hand_written)} time(s) in the module; concatenate "
+        "_active_status(alias) instead so the two chains cannot drift"
+    )

@@ -676,10 +676,25 @@ async def _required_schema() -> Dict[str, Any]:
 # JSON paths like '{snapshot,description}' whose braces would be eaten.
 # ---------------------------------------------------------------------------
 
+def _active_status(alias: str = "") -> str:
+    """The one definition of "this seed is active".
+
+    Deliberately NOT btrimmed and NOT NULL-tolerant beyond `coalesce(..., '')`:
+    a NULL or whitespace-padded status is INACTIVE. Both chains and the report's
+    own `external_active` metric concatenate this, so the case-folding and the
+    coalesce default cannot drift between them — the equivalence tests pin
+    NULL, uppercase and padded statuses against it.
+    """
+    column = f"{alias}.status" if alias else "status"
+    return f"lower(coalesce({column}, '')) = 'active'"
+
+
 # Which seed row represents its external_product_id group: prefer the US market
 # row, then the freshest, with `id` as the final deterministic tiebreak. Used as
 # the row_number() window ORDER BY in COMMON_CTES and as the DISTINCT ON ORDER BY
 # tail in MISSING_MIRROR_CTES; both alias external_product_seeds as `eps`.
+# NOTE `eps.market = 'US'` is case-SENSITIVE: a lowercase 'us' row is not
+# preferred. Pinned by a fixture row rather than left to inference.
 _WINNER_ORDER_BY = """
         CASE WHEN eps.market = 'US' THEN 0 ELSE 1 END,
         eps.updated_at DESC NULLS LAST,
@@ -703,7 +718,9 @@ COMMON_CTES = (
 WITH active_all AS (
   SELECT *
   FROM external_product_seeds
-  WHERE lower(coalesce(status, '')) = 'active'
+  WHERE """
+    + _active_status()
+    + """
 ),
 active_standalone AS (
   SELECT *
@@ -862,10 +879,14 @@ missing AS (
 #     so it is NULL exactly when no row matched.
 #   * The attached-backlink NOT EXISTS is inlined against external_product_seeds
 #     with the `active_all` status predicate carried onto it.
-# Verified against the report chain on live production data (2026-08-17): the
-# winning seed row is identical for all 11,352 groups, and the resulting
-# `missing` sets are identical both live and with the identity join forced to
-# miss. tests/test_missing_mirror_count_equivalence_postgres.py pins it.
+# Checked against the report chain on live production data (2026-08-17): same
+# winning seed row for all 11,352 groups, and identical `missing` sets both live
+# and with the identity join forced to miss (9 rows, which does exercise the
+# attached-backlink anti-join). Do NOT over-trust that run: production currently
+# has 0 duplicate external_product_id groups, 0 over-length ids and 0 blank
+# titles, so it could not exercise the winner ranking or the candidate filters
+# at all. tests/test_missing_mirror_count_equivalence_postgres.py is the real
+# proof of those — it constructs the duplicate groups production lacks.
 # ---------------------------------------------------------------------------
 MISSING_MIRROR_CTES = (
     """
@@ -874,7 +895,9 @@ WITH ranked AS (
     eps.external_product_id AS external_product_id,
     eps.title AS title
   FROM external_product_seeds eps
-  WHERE lower(coalesce(eps.status, '')) = 'active'
+  WHERE """
+    + _active_status("eps")
+    + """
     AND nullif(btrim(coalesce(eps.external_product_id, '')), '') IS NOT NULL
   ORDER BY
     eps.external_product_id,"""
@@ -900,7 +923,9 @@ missing AS (
       FROM external_product_seeds a
       JOIN catalog_products cp_attached
         ON cp_attached.product_key = a.attached_product_key
-      WHERE lower(coalesce(a.status, '')) = 'active'
+      WHERE """
+    + _active_status("a")
+    + """
         AND a.external_product_id = c.external_product_id
     )
 )
@@ -940,9 +965,21 @@ async def count_missing_catalog_mirrors() -> int:
 
 
 async def count_external_seed_mirrors_with_signature() -> int:
-    """Mirrored catalog rows carrying a minted sig_*. Cheap indexed count, split
-    out of the report so the materialization job can report its headline number
-    without paying for the rest of it."""
+    """LEGACY-COHORT count: sig_*-carrying rows under the singleton
+    merchant_id='external_seed' bucket.
+
+    Read the name literally — this is NOT "mirrored rows with a signature".
+    ADR-009 D2 moved mirroring onto per-brand observed sellers (merch_obs_*),
+    and MERCHANT_ID is BANNED_BUCKET_MERCHANT_ID, which `_apply` raises on rather
+    than write, so this number is structurally frozen: production reads 0 here
+    while `platform='external_seed' AND pivota_signature_id IS NOT NULL` across
+    all merchants reads 12,298 (measured 2026-08-17).
+
+    Kept exactly as the report's `catalog_products_external_seed_with_sig` total
+    spelled it, so the materialization job's summary key keeps its existing
+    meaning. Changing it to the platform-wide count would be a behaviour change,
+    not a bug fix — decide that separately from the preflight work.
+    """
     return await _fetch_scalar(
         """
         SELECT count(*)
@@ -970,7 +1007,9 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
         + """
         SELECT
           (SELECT count(*) FROM external_product_seeds) AS external_total,
-          (SELECT count(*) FROM external_product_seeds WHERE lower(coalesce(status, '')) = 'active') AS external_active,
+          (SELECT count(*) FROM external_product_seeds WHERE """
+        + _active_status()
+        + """) AS external_active,
           (SELECT count(*) FROM active_all) AS active_all,
           (SELECT count(*) FROM active_standalone) AS active_standalone,
           (SELECT count(*) FROM active_attached) AS active_attached,
