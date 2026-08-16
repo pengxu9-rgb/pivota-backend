@@ -1,0 +1,65 @@
+name: ADR-009 Orphan Recon
+
+# On-demand READ-ONLY reconnaissance of the sentinel residue the verifier
+# reports on ownership tables after the flip (scripts/recon_sentinel_orphans.py).
+# Prints one JSON document; writes nothing. Same runner channel as the verify
+# workflow, for the same reason: GitHub's runners reach the database reliably
+# while the Railway proxy / ssh edge degrade for hours at a time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      also_history:
+        description: "history-bucket tables to classify too (comma-separated)"
+        required: false
+        default: "pdp_identity_listing,product_enrichment"
+      sample:
+        description: "sample rows per table"
+        required: false
+        default: "5"
+
+# One recon at a time: each run opens a prod connection, and two concurrent
+# dispatches double that for no extra information.
+concurrency:
+  group: adr009-orphan-recon
+  cancel-in-progress: false
+
+# The job holds the prod DATABASE_URL; it needs nothing from the GitHub API
+# beyond reading the checkout.
+permissions:
+  contents: read
+
+jobs:
+  orphan-recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Recon (read-only; prints JSON)
+        # Inputs reach the shell as environment variables, never as text
+        # interpolated into the run body (tests/test_workflow_no_run_body_interpolation.py).
+        env:
+          RECON_ALSO_HISTORY: ${{ inputs.also_history }}
+          RECON_SAMPLE: ${{ inputs.sample }}
+        run: |
+          python -m scripts.recon_sentinel_orphans \
+            --also-history "$RECON_ALSO_HISTORY" \
+            --sample "$RECON_SAMPLE"
