@@ -26,17 +26,41 @@ a re-score: no scorer runs, no content is re-read, no score CHANGES. Measured on
 prod 2026-08-15: 6,424 of 6,466 unscored rows have snapshots under exactly one
 other merchant and NONE under their current merchant; zero are ambiguous.
 
-PROVENANCE IS THE WHOLE SAFETY ARGUMENT. The cohort is not "rows that look
-unscored" — it is bounded by the flip's OWN checkpoint table, and every row must
-satisfy all three of:
-  * ``a9_4_backfill_checkpoint`` has it done in the catalog phase;
-  * the donor holding its snapshots IS that checkpoint's ``previous_value``;
-  * its current ``catalog_products.merchant_id`` IS that checkpoint's
-    ``observed_id`` (so the flip's result is still standing and we are not
-    fighting a later, deliberate re-key).
-All three held for 6,424/6,424 when measured. A row that fails any of them is
-left alone — this tool repairs the flip's cascade miss and nothing else, and it
-can never merge two genuinely different merchants' quality history.
+PROVENANCE IS THE WHOLE SAFETY ARGUMENT, and the obvious version of it is a
+TRAP. ``a9_4_backfill_checkpoint.previous_value`` looks like a per-row record of
+where each product came from; it is not. The catalog phase writes it as the
+literal constant ``BANNED_BUCKET_MERCHANT_ID`` for every row
+(``backfill_seller_of_record.py``, ``previous_value=BANNED_BUCKET_MERCHANT_ID``),
+so prod holds exactly one distinct value, ``'external_seed'``. Requiring
+"donor == previous_value" therefore says only "the donor is in the legacy
+bucket" — and rows legitimately REMAIN in that bucket after the flip (the review
+and listing-conflict lanes keep it and get no checkpoint row;
+``services/pdp_identity_recovery`` still mints new ones). Against that predicate
+a live ``external_seed`` product sharing a ``(platform, source_product_id)``
+would have had its score moved onto somebody else's row, plausibly and
+permanently. An earlier draft of this tool shipped exactly that predicate.
+
+The real link is the KEY the snapshot table is addressed by. A snapshot row is
+identified by ``(merchant_id, platform, platform_product_id)``, and the catalog's
+unique index is ``(merchant_id, platform, source_product_id)`` — so
+``(platform, source_product_id)`` alone is NOT unique across merchants, and that
+is precisely the gap. Every row must therefore satisfy:
+
+  * ``a9_4_backfill_checkpoint`` has it done in the catalog phase, and its
+    current ``catalog_products.merchant_id`` IS that checkpoint's
+    ``observed_id`` — the flip moved it and its result is still standing, so we
+    are not fighting a later, deliberate re-key;
+  * **no other ``catalog_products`` row shares its ``(platform,
+    source_product_id)``** — with the natural key unique, a snapshot under that
+    key can only ever have been scored for THIS product;
+  * exactly ONE merchant holds snapshots for that key (so "the donor" is a
+    single, well-defined row set), and the destination is empty.
+
+Measured on prod 2026-08-16: 8,061 moved rows have an empty destination, and
+**8,061 of 8,061 have a unique ``(platform, source_product_id)``** — the unique-key
+conjunct costs nothing today and is what makes the tool safe by construction
+rather than by luck. 7,499 also have exactly one donor and form the cohort.
+A row failing any conjunct is left alone.
 
 Safe to re-run: a repaired product no longer has an empty destination, so it
 leaves the cohort. There is no unique index on
@@ -80,41 +104,63 @@ CONFIRM_TOKEN = "REPAIR_A9_4_QUALITY_SNAPSHOTS"
 # The cohort, stated as the three provenance conjuncts in the module docstring.
 # `previous_value <> observed_id` keeps a no-op checkpoint row from selecting a
 # product whose "donor" and "target" are the same merchant.
+# Written as two GROUP BY aggregates rather than correlated subqueries per row.
+# The catalog's unique index is (merchant_id, platform, source_product_id), so a
+# lookup keyed on (platform, source_product_id) cannot use it as a prefix and a
+# correlated NOT EXISTS degrades to a scan PER CANDIDATE — measured: it did not
+# finish inside four minutes against prod. One pass over each table instead.
 COHORT_SQL = """
 WITH moved AS (
     SELECT k.ref_id AS product_key,
-           k.observed_id,
-           k.previous_value
+           k.observed_id
       FROM a9_4_backfill_checkpoint k
      WHERE k.phase = 'catalog'
        AND k.status = 'done'
        AND k.observed_id IS NOT NULL
-       AND k.previous_value IS NOT NULL
-       AND k.previous_value <> k.observed_id
+),
+catalog_key AS (
+    SELECT platform, source_product_id, count(*) AS rows_on_key
+      FROM catalog_products
+     WHERE platform IS NOT NULL AND source_product_id IS NOT NULL
+     GROUP BY platform, source_product_id
+),
+snapshot_key AS (
+    SELECT platform,
+           platform_product_id,
+           count(DISTINCT merchant_id) AS donor_count,
+           min(merchant_id) AS donor_merchant
+      FROM product_quality_snapshot
+     WHERE platform IS NOT NULL AND platform_product_id IS NOT NULL
+     GROUP BY platform, platform_product_id
 )
 SELECT cp.product_key,
        cp.content_key,
        cp.platform,
        cp.source_product_id,
-       m.observed_id,
-       m.previous_value
+       cp.merchant_id AS observed_id,
+       sk.donor_merchant
   FROM moved m
   JOIN catalog_products cp ON cp.product_key = m.product_key
+  JOIN catalog_key ck
+    ON ck.platform = cp.platform AND ck.source_product_id = cp.source_product_id
+  JOIN snapshot_key sk
+    ON sk.platform = cp.platform AND sk.platform_product_id = cp.source_product_id
  WHERE cp.merchant_id = m.observed_id
    AND cp.platform IS NOT NULL
    AND cp.source_product_id IS NOT NULL
-   -- destination is empty: nothing to clobber, and this is what makes re-runs safe
-   AND NOT EXISTS (
-       SELECT 1 FROM product_quality_snapshot p
-        WHERE p.platform = cp.platform
-          AND p.platform_product_id = cp.source_product_id
-          AND p.merchant_id = m.observed_id)
-   -- donor is exactly the merchant the flip moved this row OFF of
-   AND EXISTS (
-       SELECT 1 FROM product_quality_snapshot p
-        WHERE p.platform = cp.platform
-          AND p.platform_product_id = cp.source_product_id
-          AND p.merchant_id = m.previous_value)
+   -- THE PROVENANCE CONJUNCT. `(platform, source_product_id)` is the key the
+   -- snapshot table is addressed by, and it is NOT unique across merchants (the
+   -- catalog's unique index includes merchant_id). Unless this product is the
+   -- ONLY catalog row holding that key, a snapshot under it could belong to a
+   -- different product — including one still legitimately sitting in the legacy
+   -- bucket — and adopting it would silently graft another product's score on.
+   AND ck.rows_on_key = 1
+   -- Exactly one merchant holds snapshots for the key, so `donor_merchant` is
+   -- well defined rather than an arbitrary pick among several...
+   AND sk.donor_count = 1
+   -- ...and that merchant is not us, which is also what makes the destination
+   -- provably empty and therefore makes a re-run a no-op.
+   AND sk.donor_merchant <> cp.merchant_id
  ORDER BY cp.product_key
 """
 
@@ -157,13 +203,16 @@ async def _load_cohort() -> List[Dict[str, Any]]:
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     cohort = await _load_cohort()
+    if args.limit and args.limit > 0:
+        cohort = cohort[: args.limit]
     report: Dict[str, Any] = {
         "cohort": len(cohort),
         "applied": False,
+        "snapshots_to_repoint": 0,
         "snapshots_repointed": 0,
         "products_repointed": 0,
         "content_keys_recomputed": 0,
-        "became_serving_eligible": 0,
+        "serving_eligible_after": 0,
         "trust_rows_written": 0,
         "failures": [],
     }
@@ -173,11 +222,26 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     report["sample"] = [
         {
             "product_key": r["product_key"],
-            "from": r["previous_value"],
+            "from": r["donor_merchant"],
             "to": r["observed_id"],
         }
         for r in cohort[:5]
     ]
+
+    # Counted in BOTH modes: a dry run whose write volume always reads 0 is a
+    # rehearsal that cannot be checked against the apply.
+    for row in cohort:
+        report["snapshots_to_repoint"] += int(
+            await database.fetch_val(
+                DONOR_ROWS_SQL,
+                {
+                    "platform": row["platform"],
+                    "spid": row["source_product_id"],
+                    "old_merchant": row["donor_merchant"],
+                },
+            )
+            or 0
+        )
 
     if not args.apply:
         return report
@@ -185,21 +249,38 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     report["applied"] = True
 
     # Step 1 — re-point the snapshots so the classifier's lookup resolves again.
+    # `repaired` carries only the products whose UPDATE actually landed, so a
+    # failure cannot ride into steps 2 and 3 as though it had succeeded.
+    repaired: List[Dict[str, Any]] = []
     for row in cohort:
         try:
-            binds = {
-                "new_merchant": row["observed_id"],
-                "old_merchant": row["previous_value"],
-                "platform": row["platform"],
-                "spid": row["source_product_id"],
-            }
-            moving = await database.fetch_val(
-                DONOR_ROWS_SQL,
-                {k: binds[k] for k in ("platform", "spid", "old_merchant")},
+            moving = int(
+                await database.fetch_val(
+                    DONOR_ROWS_SQL,
+                    {
+                        "platform": row["platform"],
+                        "spid": row["source_product_id"],
+                        "old_merchant": row["donor_merchant"],
+                    },
+                )
+                or 0
             )
-            await database.execute(REPOINT_SQL, binds)
+            if not moving:
+                # Raced: something moved or deleted the donor rows since the
+                # cohort was read. Not an error, but not a repair either.
+                continue
+            await database.execute(
+                REPOINT_SQL,
+                {
+                    "new_merchant": row["observed_id"],
+                    "old_merchant": row["donor_merchant"],
+                    "platform": row["platform"],
+                    "spid": row["source_product_id"],
+                },
+            )
+            repaired.append(row)
             report["products_repointed"] += 1
-            report["snapshots_repointed"] += int(moving or 0)
+            report["snapshots_repointed"] += moving
         except Exception as exc:  # one product must never abort the run
             report["failures"].append(
                 {"product_key": row["product_key"], "stage": "repoint", "error": str(exc)}
@@ -207,13 +288,16 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Step 2 — reclassify. The score is only an INPUT to index_pipeline_state;
     # without this the restored score sits unread and nothing re-serves.
-    content_keys = sorted({r["content_key"] for r in cohort if r.get("content_key")})
+    content_keys = sorted({r["content_key"] for r in repaired if r.get("content_key")})
     for ck in content_keys:
         try:
-            became_eligible = await recompute_serving_eligibility(ck, reason="a9_4_quality_repair")
+            # NB: the return is the RECOMPUTED state, not a transition — this
+            # counts rows serving after the repair, which is why it is not
+            # named `became_*`.
+            eligible = await recompute_serving_eligibility(ck, reason="a9_4_quality_repair")
             report["content_keys_recomputed"] += 1
-            if became_eligible:
-                report["became_serving_eligible"] += 1
+            if eligible:
+                report["serving_eligible_after"] += 1
         except Exception as exc:
             report["failures"].append(
                 {"content_key": ck, "stage": "recompute", "error": str(exc)}
@@ -224,7 +308,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     # sibling external-seed rescore learned this the hard way (proven live
     # 2026-07-23), so promote durably here instead of waiting for a cron.
     if not args.skip_trust:
-        product_keys = [r["product_key"] for r in cohort]
+        product_keys = [r["product_key"] for r in repaired]
         for i in range(0, len(product_keys), args.trust_chunk):
             chunk = product_keys[i : i + args.trust_chunk]
             try:
@@ -261,6 +345,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help="Product keys per catalog_row_trust batch (default 200).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Process at most N products (0 = all). Use for a canary apply.",
     )
     return parser
 

@@ -70,13 +70,17 @@ LEFT JOIN catalog_merchants cm ON cm.merchant_id = cp.merchant_id
 # sits under the exact merchant the checkpoint moved it off? That is provable
 # from the checkpoint alone, needs no table taxonomy, and catches any future
 # dependent stranded the same way. Want 0.
+# Deliberately does NOT reference `previous_value`. The catalog phase writes it
+# as a constant ('external_seed'), so it carries no per-row provenance, and rows
+# predating its ADD COLUMN carry NULL — a NULL-excluding predicate here would
+# report 0 stranded for exactly the oldest, most-stranded rows. The question is
+# asked structurally instead: does this moved row have no score under its
+# current merchant while some other merchant holds one for its key?
 Q_STRANDED_QUALITY = """
 WITH moved AS (
-  SELECT ref_id AS pk, observed_id, previous_value
+  SELECT ref_id AS pk, observed_id
   FROM a9_4_backfill_checkpoint
-  WHERE phase = 'catalog' AND status = 'done'
-    AND previous_value IS NOT NULL AND observed_id IS NOT NULL
-    AND previous_value <> observed_id)
+  WHERE phase = 'catalog' AND status = 'done' AND observed_id IS NOT NULL)
 SELECT count(*) AS stranded_quality_snapshots
 FROM moved m
 JOIN catalog_products cp ON cp.product_key = m.pk
@@ -86,12 +90,12 @@ WHERE cp.merchant_id = m.observed_id
       SELECT 1 FROM product_quality_snapshot p
        WHERE p.platform = cp.platform
          AND p.platform_product_id = cp.source_product_id
-         AND p.merchant_id = m.observed_id)
+         AND p.merchant_id = cp.merchant_id)
   AND EXISTS (
       SELECT 1 FROM product_quality_snapshot p
        WHERE p.platform = cp.platform
          AND p.platform_product_id = cp.source_product_id
-         AND p.merchant_id = m.previous_value)
+         AND p.merchant_id <> cp.merchant_id)
 """
 
 Q2 = """

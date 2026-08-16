@@ -145,7 +145,11 @@ JOIN canonical_product cp
 LEFT JOIN agent_pdp_view apv
   ON apv.content_key = ips.content_key
 WHERE ips.serving_eligible IS FALSE
-  AND ips.blocker_code IN ('no_seed', 'short_description', 'low_quality')
+  -- 'not_scored' rides with 'low_quality': before the 2026-08-15 split these
+  -- were one code, and dropping it here would silently shrink this cohort by
+  -- exactly the rows a mass unscoring produces — the 6,424 the A9-4 re-key
+  -- stranded would have become invisible to their own repair tool.
+  AND ips.blocker_code IN ('no_seed', 'short_description', 'low_quality', 'not_scored')
   AND nullif(btrim(coalesce(cp.canonical_url, '')), '') IS NOT NULL
   AND (
     CAST(:content_key AS text) IS NOT NULL
