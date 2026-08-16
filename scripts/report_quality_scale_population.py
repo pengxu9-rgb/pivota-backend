@@ -85,7 +85,10 @@ STALE_AND_BLOCKED_SQL = f"""
      AND cp.source_product_id = l.platform_product_id
     JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
     WHERE ips.serving_eligible IS DISTINCT FROM TRUE
-      AND COALESCE(ips.blocker_code, '') = 'low_quality'
+      -- 'not_scored' rides with 'low_quality' (2026-08-15 split). This
+      -- report's `no_score` band counts UNSCORED rows, so keying on
+      -- 'low_quality' alone would make that band structurally 0.
+      AND COALESCE(ips.blocker_code, '') IN ('low_quality', 'not_scored')
       AND COALESCE(l.rules_version, '') <> :current_rules_version
     GROUP BY 1, 2
     ORDER BY blocked_low_quality DESC, rules_version ASC
@@ -105,7 +108,10 @@ BANDS_SQL = f"""
        AND cp.source_product_id = l.platform_product_id
       JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
       WHERE ips.serving_eligible IS DISTINCT FROM TRUE
-        AND COALESCE(ips.blocker_code, '') = 'low_quality'
+        -- 'not_scored' rides with 'low_quality' (2026-08-15 split). The
+        -- `no_score` band below counts UNSCORED rows, so keying on
+        -- 'low_quality' alone would make that band structurally 0.
+        AND COALESCE(ips.blocker_code, '') IN ('low_quality', 'not_scored')
         AND COALESCE(l.rules_version, '') <> :current_rules_version
     )
     SELECT

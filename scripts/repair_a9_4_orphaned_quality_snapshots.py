@@ -23,8 +23,10 @@ sitemap only because the agent-ui publish cron was independently wedged.
 
 **The scores were never lost — they were orphaned.** This is a re-pointing, not
 a re-score: no scorer runs, no content is re-read, no score CHANGES. Measured on
-prod 2026-08-15: 6,424 of 6,466 unscored rows have snapshots under exactly one
-other merchant and NONE under their current merchant; zero are ambiguous.
+prod 2026-08-15: 6,424 of the 6,466 rows then reading unscored have snapshots
+under exactly one other merchant and NONE under their current merchant. (That
+counts the rows the classifier had already re-read; the cohort measured below is
+larger and drawn on orphan-ness rather than on present state.)
 
 PROVENANCE IS THE WHOLE SAFETY ARGUMENT, and the obvious version of it is a
 TRAP. ``a9_4_backfill_checkpoint.previous_value`` looks like a per-row record of
@@ -46,6 +48,13 @@ unique index is ``(merchant_id, platform, source_product_id)`` — so
 ``(platform, source_product_id)`` alone is NOT unique across merchants, and that
 is precisely the gap. Every row must therefore satisfy:
 
+  * the donor IS the legacy bucket. ``run_catalog`` selects its batch with
+    ``WHERE cp.merchant_id = :banned``, so every moved row sat in that bucket
+    and its orphaned snapshots are under it BY CONSTRUCTION. This is the
+    conjunct the unique-key count only approximates: ``rows_on_key`` is
+    measured over the LIVE catalog, but nothing in production deletes a quality
+    snapshot, so a since-deleted sibling leaves its score under a key that now
+    looks unique and the survivor would inherit it;
   * ``a9_4_backfill_checkpoint`` has it done in the catalog phase, and its
     current ``catalog_products.merchant_id`` IS that checkpoint's
     ``observed_id`` — the flip moved it and its result is still standing, so we
@@ -92,6 +101,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from db.database import database  # noqa: E402
+from scripts.backfill_seller_of_record import (  # noqa: E402
+    BANNED_BUCKET_MERCHANT_ID,
+)
 from services.catalog_row_trust_upserter import (  # noqa: E402
     upsert_catalog_row_trust_many,
 )
@@ -101,9 +113,8 @@ from services.index_pipeline_state_service import (  # noqa: E402
 
 CONFIRM_TOKEN = "REPAIR_A9_4_QUALITY_SNAPSHOTS"
 
-# The cohort, stated as the three provenance conjuncts in the module docstring.
-# `previous_value <> observed_id` keeps a no-op checkpoint row from selecting a
-# product whose "donor" and "target" are the same merchant.
+# The cohort, stated as the provenance conjuncts in the module docstring.
+#
 # Written as two GROUP BY aggregates rather than correlated subqueries per row.
 # The catalog's unique index is (merchant_id, platform, source_product_id), so a
 # lookup keyed on (platform, source_product_id) cannot use it as a prefix and a
@@ -161,6 +172,24 @@ SELECT cp.product_key,
    -- ...and that merchant is not us, which is also what makes the destination
    -- provably empty and therefore makes a re-run a no-op.
    AND sk.donor_merchant <> cp.merchant_id
+   -- AND THE DONOR IS THE LEGACY BUCKET ITSELF. `rows_on_key` is counted over
+   -- the LIVE catalog while the snapshot is adopted from HISTORY, and nothing
+   -- in production ever deletes a quality snapshot (`routes/merchant_products`
+   -- deletes catalog_products and cleans product_enrichment, not this table).
+   -- So a sibling that has since been DELETED leaves its score behind under a
+   -- key that now looks unique, and the survivor would inherit it — silently,
+   -- permanently, and scored for a different merchant's product. Case or
+   -- whitespace drift between the two tables opens the same hole.
+   --
+   -- This closes it by construction rather than by observation: `run_catalog`
+   -- selects its batch with a `cp.merchant_id = <bucket>` filter (do NOT write
+   -- that bind name here -- a colon inside a SQL comment is still parsed as a
+   -- parameter), so EVERY row in `moved` sat in the bucket, and the unique
+   -- index (merchant_id, platform, source_product_id) makes the natural key
+   -- unique — the property `rows_on_key` only approximates. Measured: all
+   -- 7,499 cohort rows already have `donor_merchant = 'external_seed'`, so
+   -- this costs nothing and removes the whole class.
+   AND sk.donor_merchant = :banned
  ORDER BY cp.product_key
 """
 
@@ -197,15 +226,20 @@ async def _disconnect_if_needed(was_connected: bool) -> None:
 
 
 async def _load_cohort() -> List[Dict[str, Any]]:
-    rows = await database.fetch_all(COHORT_SQL)
+    rows = await database.fetch_all(COHORT_SQL, {"banned": BANNED_BUCKET_MERCHANT_ID})
     return [dict(r) for r in (rows or [])]
 
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     cohort = await _load_cohort()
+    # Report the TRUE population alongside the slice actually processed — a
+    # canary that reports only its own limit tells you nothing about how much
+    # work remains.
+    population = len(cohort)
     if args.limit and args.limit > 0:
         cohort = cohort[: args.limit]
     report: Dict[str, Any] = {
+        "cohort_total": population,
         "cohort": len(cohort),
         "applied": False,
         "snapshots_to_repoint": 0,
@@ -362,7 +396,21 @@ async def _main_async(args: argparse.Namespace) -> int:
     finally:
         await _disconnect_if_needed(was_connected)
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
-    return 1 if report["failures"] else 0
+    if report["failures"]:
+        return 1
+    # `recompute_serving_eligibility` never raises — it logs and returns a
+    # value — so "no failures" does NOT mean the repair achieved anything. An
+    # apply that repointed rows and promoted none is the exact silent-no-op an
+    # operator would read as success; say so in the exit code.
+    if report["applied"] and report["products_repointed"] and not report["serving_eligible_after"]:
+        print(
+            "repointed %d product(s) and NONE became serving_eligible — "
+            "check index_pipeline_state before re-running"
+            % report["products_repointed"],
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def main() -> int:

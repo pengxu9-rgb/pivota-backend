@@ -39,6 +39,7 @@ from typing import Optional, Set
 import pytest
 
 from db.database import database
+from scripts.backfill_seller_of_record import BANNED_BUCKET_MERCHANT_ID
 from scripts.repair_a9_4_orphaned_quality_snapshots import (
     COHORT_SQL,
     DONOR_ROWS_SQL,
@@ -145,7 +146,10 @@ async def _snapshot(
 
 
 async def _cohort() -> Set[str]:
-    rows = await database.fetch_all(COHORT_SQL)
+    # OLD is the real BANNED_BUCKET_MERCHANT_ID, so this binds the same value
+    # the script does rather than a test-only stand-in.
+    assert OLD == BANNED_BUCKET_MERCHANT_ID
+    rows = await database.fetch_all(COHORT_SQL, {"banned": BANNED_BUCKET_MERCHANT_ID})
     return {dict(r)["product_key"] for r in (rows or [])}
 
 
@@ -168,11 +172,10 @@ async def test_cohort_selects_only_the_flips_own_orphans(db) -> None:
     await _product("nodonor", merchant=NEW)
     await _checkpoint("nodonor", observed=NEW, previous=OLD)
 
-    # SELECTED — donor is some merchant other than the legacy bucket. With the
-    # natural key unique to this product (asserted by the conjunct, and by the
-    # dedicated tests below), a snapshot under that key can only have been
-    # scored FOR this product, whichever merchant currently holds it. Donor
-    # identity is not the safety property; key uniqueness is.
+    # NOT selected — donor is some merchant other than the legacy bucket. Every
+    # row the flip moved came OUT of that bucket (`run_catalog` scans
+    # `WHERE cp.merchant_id = :banned`), so a donor anywhere else did not score
+    # this product and must not be adopted, however unique the live key looks.
     await _product("otherdonor", merchant=NEW)
     await _checkpoint("otherdonor", observed=NEW, previous=OLD)
     await _snapshot("otherdonor", merchant=THIRD)
@@ -193,7 +196,31 @@ async def test_cohort_selects_only_the_flips_own_orphans(db) -> None:
     await _checkpoint("noop", observed=NEW, previous=NEW)
     await _snapshot("noop", merchant=NEW)
 
-    assert await _cohort() == {"happy", "otherdonor"}
+    assert await _cohort() == {"happy"}
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_siblings_orphan_score_is_never_inherited(db) -> None:
+    """`rows_on_key` counts the LIVE catalog; snapshots are HISTORY.
+
+    Nothing in production deletes `product_quality_snapshot` — the product
+    delete path cleans `product_enrichment` and leaves this table alone — so a
+    sibling that has since been removed leaves its score behind under a key that
+    NOW looks unique. Counting live rows cannot see that, and the survivor would
+    inherit a score computed for a different merchant's product: silent,
+    permanent, and indistinguishable from a real measurement afterwards.
+
+    Only the donor-is-the-bucket conjunct rejects it. `merch_third` here stands
+    for the deleted sibling's merchant, whose snapshot outlived its row.
+    """
+    shared = "sp_orphaned"
+
+    await _product("survivor", merchant=NEW, spid=shared)
+    await _checkpoint("survivor", observed=NEW, previous=OLD)
+    # The dead sibling's row is gone; only its snapshot remains.
+    await _snapshot("ghost", merchant=THIRD, spid=shared)
+
+    assert await _cohort() == set()
 
 
 @pytest.mark.asyncio

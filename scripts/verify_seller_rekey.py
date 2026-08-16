@@ -70,32 +70,51 @@ LEFT JOIN catalog_merchants cm ON cm.merchant_id = cp.merchant_id
 # sits under the exact merchant the checkpoint moved it off? That is provable
 # from the checkpoint alone, needs no table taxonomy, and catches any future
 # dependent stranded the same way. Want 0.
-# Deliberately does NOT reference `previous_value`. The catalog phase writes it
-# as a constant ('external_seed'), so it carries no per-row provenance, and rows
-# predating its ADD COLUMN carry NULL — a NULL-excluding predicate here would
-# report 0 stranded for exactly the oldest, most-stranded rows. The question is
-# asked structurally instead: does this moved row have no score under its
-# current merchant while some other merchant holds one for its key?
+# Deliberately does NOT reference `previous_value`: the catalog phase writes it
+# as a constant, so it carries no per-row provenance, and rows predating its ADD
+# COLUMN carry NULL — a NULL-excluding predicate would report 0 stranded for
+# exactly the oldest rows.
+#
+# THIS MUST MATCH THE REPAIR'S COHORT, not merely overlap it. A looser "no score
+# here, some score elsewhere" test is a strict SUPERSET: it also counts rows the
+# repair deliberately skips (a shared natural key, several donor merchants),
+# which are not stranded at all — their score belongs to a different live
+# product and they are honestly unscored. Counting those would leave this gate
+# red forever after a complete repair, and a gate that can never go green
+# teaches operators to ignore it just as effectively as the false-green this
+# metric was added to replace. Same conjuncts as
+# scripts/repair_a9_4_orphaned_quality_snapshots.COHORT_SQL; if that predicate
+# moves, this one moves with it.
 Q_STRANDED_QUALITY = """
 WITH moved AS (
   SELECT ref_id AS pk, observed_id
   FROM a9_4_backfill_checkpoint
-  WHERE phase = 'catalog' AND status = 'done' AND observed_id IS NOT NULL)
+  WHERE phase = 'catalog' AND status = 'done' AND observed_id IS NOT NULL),
+catalog_key AS (
+  SELECT platform, source_product_id, count(*) AS rows_on_key
+  FROM catalog_products
+  WHERE platform IS NOT NULL AND source_product_id IS NOT NULL
+  GROUP BY platform, source_product_id),
+snapshot_key AS (
+  SELECT platform, platform_product_id,
+         count(DISTINCT merchant_id) AS donor_count,
+         min(merchant_id) AS donor_merchant
+  FROM product_quality_snapshot
+  WHERE platform IS NOT NULL AND platform_product_id IS NOT NULL
+  GROUP BY platform, platform_product_id)
 SELECT count(*) AS stranded_quality_snapshots
 FROM moved m
 JOIN catalog_products cp ON cp.product_key = m.pk
+JOIN catalog_key ck
+  ON ck.platform = cp.platform AND ck.source_product_id = cp.source_product_id
+JOIN snapshot_key sk
+  ON sk.platform = cp.platform AND sk.platform_product_id = cp.source_product_id
 WHERE cp.merchant_id = m.observed_id
   AND cp.platform IS NOT NULL AND cp.source_product_id IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM product_quality_snapshot p
-       WHERE p.platform = cp.platform
-         AND p.platform_product_id = cp.source_product_id
-         AND p.merchant_id = cp.merchant_id)
-  AND EXISTS (
-      SELECT 1 FROM product_quality_snapshot p
-       WHERE p.platform = cp.platform
-         AND p.platform_product_id = cp.source_product_id
-         AND p.merchant_id <> cp.merchant_id)
+  AND ck.rows_on_key = 1
+  AND sk.donor_count = 1
+  AND sk.donor_merchant <> cp.merchant_id
+  AND sk.donor_merchant = 'external_seed'
 """
 
 Q2 = """
