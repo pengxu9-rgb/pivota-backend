@@ -58,6 +58,13 @@ CREATE TABLE review_interactions (
 CREATE TABLE review_featured (
   id bigserial PRIMARY KEY,
   review_id bigint REFERENCES product_reviews(id) ON DELETE CASCADE);
+-- The FKs a hardcoded "migration 040" list misses (review 2026-08-17).
+CREATE TABLE buyer_review_ownership (
+  id bigserial PRIMARY KEY,
+  review_id bigint REFERENCES product_reviews(id) ON DELETE CASCADE);
+CREATE TABLE buyer_review_idempotency_keys (
+  id bigserial PRIMARY KEY, idem_key text,
+  review_id bigint REFERENCES product_reviews(id) ON DELETE SET NULL);
 -- tables the verifier's residue sweep walks
 CREATE TABLE evidence_items (
   evidence_id text, merchant_id text, product_key text, content_key varchar(40));
@@ -142,6 +149,15 @@ def gate():
     admin.dispose()
 
 
+async def _apply(db, tables, run_id):
+    """apply() consumes a plan — never a fresh read (review 2026-08-17)."""
+    from scripts import dispose_sentinel_orphans as d
+
+    p = await d.plan(db, tables)
+    assert p["doors_failed"] == [], p["doors_failed"]
+    return await d.apply(db, tables, run_id, p)
+
+
 def _run(coro_fn):
     import databases
 
@@ -189,7 +205,7 @@ def test_dry_run_changes_nothing(gate):
 def test_rekey_follows_each_offer_own_product_and_spares_non_residue(gate):
     from scripts import dispose_sentinel_orphans as d
 
-    _run(lambda db: d.apply(db, ["catalog_offers"], "run-1"))
+    _run(lambda db: _apply(db, ["catalog_offers"], "run-1"))
     got = {r["offer_id"]: r["merchant_id"] for r in
            _rows("SELECT offer_id, merchant_id FROM catalog_offers")}
     # Each residue offer took ITS OWN product's seller — one merchant for all
@@ -237,20 +253,66 @@ def test_delete_removes_only_residue_reviews_and_cascades_children(gate):
     from scripts import dispose_sentinel_orphans as d
 
     assert _scalar("SELECT count(*) FROM media_assets") == 2
-    _run(lambda db: d.apply(db, ["product_reviews"], "run-2"))
+    _run(lambda db: _apply(db, ["product_reviews"], "run-2"))
     left = _rows("SELECT merchant_id, status FROM product_reviews ORDER BY id")
     assert [r["merchant_id"] for r in left] == [_A, _C]
     assert _scalar("SELECT count(*) FROM media_assets") == 0   # cascaded
 
 
-def test_the_plan_dump_carries_the_children_that_the_delete_will_take(gate):
+def test_the_plan_dump_carries_every_fk_child_and_the_full_row(gate):
+    """The dump is the ONLY reversal record for a hard DELETE. Asserting a row
+    COUNT would pass on a dump that recorded nothing but ids — the mutant that
+    degraded the dump to {"id": ...} survived exactly that (review 2026-08-17).
+    So: every FK child the graph names, and every column of the parent rows."""
     from scripts import dispose_sentinel_orphans as d
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine(_gate_url(), future=True)
+    with eng.begin() as c:
+        rid = c.execute(text("SELECT id FROM product_reviews WHERE merchant_id = :m"
+                             " ORDER BY id LIMIT 1"), {"m": _B}).scalar()
+        c.execute(text("INSERT INTO buyer_review_ownership (review_id) VALUES (:r)"), {"r": rid})
+        c.execute(text("INSERT INTO buyer_review_idempotency_keys (idem_key, review_id)"
+                       " VALUES ('k1', :r)"), {"r": rid})
+    eng.dispose()
 
     out = _run(lambda db: d.plan(db, ["product_reviews"]))
-    kids = out["tables"]["product_reviews"]["cascaded_children"]
-    assert len(kids["media_assets"]) == 2, "a delete that loses children silently is unreversible"
-    assert kids["review_replies"] == []
-    assert len(out["tables"]["product_reviews"]["dump"]) == 2
+    rev = out["tables"]["product_reviews"]
+    kids = rev["cascaded_children"]
+    # Derived from the FK graph, so the two tables a migration-040 list misses
+    # are present, and the SET NULL parent is labelled as such.
+    assert {"media_assets", "review_replies", "review_interactions", "review_featured",
+            "buyer_review_ownership", "buyer_review_idempotency_keys"} <= set(kids)
+    assert len(kids["media_assets"]["rows"]) == 2
+    assert len(kids["buyer_review_ownership"]["rows"]) == 1
+    assert kids["media_assets"]["on_delete"] == "cascade"
+    assert kids["buyer_review_idempotency_keys"]["on_delete"] == "set null"
+    assert len(kids["buyer_review_idempotency_keys"]["rows"]) == 1
+    # Full parent rows, not a count and not just ids.
+    assert len(rev["dump"]) == 2
+    for row in rev["dump"]:
+        assert {"id", "product_key", "merchant_id", "status"} <= set(row)
+
+
+def test_the_delete_takes_the_children_the_dump_recorded(gate):
+    from scripts import dispose_sentinel_orphans as d
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine(_gate_url(), future=True)
+    with eng.begin() as c:
+        rid = c.execute(text("SELECT id FROM product_reviews WHERE merchant_id = :m"
+                             " ORDER BY id LIMIT 1"), {"m": _B}).scalar()
+        c.execute(text("INSERT INTO buyer_review_ownership (review_id) VALUES (:r)"), {"r": rid})
+        c.execute(text("INSERT INTO buyer_review_idempotency_keys (idem_key, review_id)"
+                       " VALUES ('k1', :r)"), {"r": rid})
+    eng.dispose()
+
+    _run(lambda db: _apply(db, ["product_reviews"], "run-kids"))
+    assert _scalar("SELECT count(*) FROM buyer_review_ownership") == 0     # cascaded
+    # SET NULL: the row SURVIVES with a cleared FK, which is why the dump has
+    # to record it — a re-insert of the parent does not restore this link.
+    assert _scalar("SELECT count(*) FROM buyer_review_idempotency_keys") == 1
+    assert _scalar("SELECT review_id FROM buyer_review_idempotency_keys") is None
 
 
 def test_doors_abort_before_any_write_when_a_review_resolves(gate):
@@ -284,34 +346,109 @@ def test_doors_abort_while_the_bucket_still_holds_rows(gate):
     assert any("D1" in f for f in out["doors_failed"])
 
 
-def test_the_in_transaction_residue_assertion_rolls_the_whole_table_back(gate):
-    """Force the post-write count to be non-zero by having a concurrent-looking
-    row appear inside the transaction's own view: the tool must raise AND leave
-    every row untouched. An assertion that reports but does not roll back would
-    pass a weaker test — this one checks the DATA afterwards."""
+def test_the_residue_guard_rolls_the_table_back_in_its_OWN_transaction(gate):
+    """The guard must roll back on its own, with NO outer transaction helping.
+
+    The first version of this test wrapped apply() in its own transaction, which
+    turned apply()'s transaction into a savepoint and let the outer rollback hide
+    whether an inner one existed at all — a mutant that ran the write with no
+    transaction survived it (review 2026-08-17). Here apply() is called at top
+    level: if it does not own a transaction, the partial write COMMITS and the
+    row counts below change.
+    """
     from scripts import dispose_sentinel_orphans as d
+    from sqlalchemy import create_engine, text
 
-    async def sabotage(db):
-        async with db.transaction():
-            # A residue offer whose product is missing: the UPDATE's join finds
-            # no catalog row, so it survives the re-key and the guard must fire.
-            await db.execute(
-                "INSERT INTO catalog_offers (offer_id, product_key, merchant_id)"
-                " VALUES ('o_ghost', 'pk_missing', :b)", {"b": _B})
-            with pytest.raises(RuntimeError, match="still holds"):
-                await d.apply(db, ["catalog_offers"], "run-3")
-            raise _Rollback()
+    # A residue offer whose product does not exist: the re-key's join finds no
+    # catalog row, so it survives the UPDATE and the zero-residue guard fires.
+    # It is inserted AFTER the plan, so the plan/current mismatch check is what
+    # trips first — both paths must roll back.
+    eng = create_engine(_gate_url(), future=True)
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO catalog_offers (offer_id, product_key, merchant_id)"
+                       " VALUES ('o_ghost', 'pk_missing', :b)"), {"b": _B})
+    eng.dispose()
 
-    class _Rollback(Exception):
-        pass
+    async def go(db):
+        p = await d.plan(db, ["catalog_offers"])
+        # o_ghost IS genuine residue (so the plan/current sets agree), but its
+        # product does not exist, so the re-key's join skips it and it is STILL
+        # residue after the UPDATE — which is what the zero-residue guard is
+        # for. Only D2's verdict is dropped, so the guard is what fires.
+        assert any("D2" in f for f in p["doors_failed"])
+        p["doors_failed"] = []
+        with pytest.raises(RuntimeError, match="still holds"):
+            await d.apply(db, ["catalog_offers"], "run-3", p)
 
-    try:
-        _run(sabotage)
-    except _Rollback:
-        pass
-    # Nothing moved: the inner transaction rolled back on the raise.
+    _run(go)
+    # The guard rolled back the WHOLE table: the three good offers, which the
+    # UPDATE did move inside the transaction, are back on the sentinel. Without
+    # a transaction they would have committed and this reads 1.
     assert _scalar("SELECT count(*) FROM catalog_offers WHERE merchant_id = :b",
+                   {"b": _B}) == 4
+    for oid in ("o_a", "o_c", "o_tomb"):
+        assert _scalar("SELECT merchant_id FROM catalog_offers WHERE offer_id = :o",
+                       {"o": oid}) == _B
+
+
+def test_the_rekey_skips_an_offer_whose_product_is_still_on_the_sentinel(gate):
+    """`cp.merchant_id <> :banned`, at the statement level.
+
+    Re-keying a bucket row onto the bucket is a no-op in value but still a
+    WRITE: it bumps updated_at and reports rows-affected, so a run could look
+    like it moved something it did not. The conjunct makes the statement skip
+    it outright."""
+    from scripts import dispose_sentinel_orphans as d
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine(_gate_url(), future=True)
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO catalog_products (product_key, merchant_id)"
+                       " VALUES ('pk_still_bucket', :b)"), {"b": _B})
+        c.execute(text("INSERT INTO catalog_offers (offer_id, product_key, merchant_id,"
+                       " created_at, updated_at) VALUES ('o_bucket', 'pk_still_bucket', :b,"
+                       " now(), now())"), {"b": _B})
+    eng.dispose()
+
+    async def go(db):
+        await db.execute(d.OFFERS_REKEY_SQL, {"offer_ids": ["o_bucket"], "banned": _B})
+
+    _run(go)
+    assert _scalar("SELECT merchant_id FROM catalog_offers WHERE offer_id = 'o_bucket'") == _B
+    assert _scalar("SELECT (updated_at > created_at) FROM catalog_offers"
+                   " WHERE offer_id = 'o_bucket'") is False, "the row was rewritten"
+
+
+def test_apply_refuses_a_population_that_changed_since_the_plan(gate):
+    """THE CORE FIX (review 2026-08-17). apply() used to re-read the population,
+    so a row that became residue after the plan was written with NO door having
+    examined it and NO dump recording it. Now the plan's id set is binding."""
+    from scripts import dispose_sentinel_orphans as d
+    from sqlalchemy import create_engine, text
+
+    async def go(db):
+        p = await d.plan(db, ["product_reviews"])
+        assert p["doors_failed"] == []
+        planned = {r["id"] for r in p["tables"]["product_reviews"]["dump"]}
+        # A review that would have FAILED D5 and D6 arrives after the plan.
+        eng = create_engine(_gate_url(), future=True)
+        with eng.begin() as c:
+            c.execute(text("INSERT INTO catalog_products (product_key, merchant_id)"
+                           " VALUES ('pk_live', :m)"), {"m": _A})
+            c.execute(text("INSERT INTO product_reviews (product_key, merchant_id, status)"
+                           " VALUES ('pk_live', :b, 'active')"), {"b": _B})
+        eng.dispose()
+        with pytest.raises(RuntimeError, match="residue changed"):
+            await d.apply(db, ["product_reviews"], "run-race", p)
+        return planned
+
+    _run(go)
+    # The late arrival — serving, resolving, never dumped — is still there,
+    # and so is everything else.
+    assert _scalar("SELECT count(*) FROM product_reviews WHERE merchant_id = :b",
                    {"b": _B}) == 3
+    assert _scalar("SELECT count(*) FROM product_reviews WHERE status = 'active'"
+                   " AND merchant_id = :b", {"b": _B}) == 1
 
 
 def test_verifier_splits_ownership_unscoped_and_history_per_row(gate):
@@ -345,7 +482,7 @@ def test_verifier_reports_ok_once_the_scoped_orphans_are_disposed(gate):
     from scripts.verify_seller_rekey import global_residue, orphan_failures
     from sqlalchemy import create_engine, text
 
-    _run(lambda db: d.apply(db, list(d.ALL_TABLES), "run-4"))
+    _run(lambda db: _apply(db, list(d.ALL_TABLES), "run-4"))
     eng = create_engine(_gate_url(), future=True)
     with eng.begin() as c:  # the one scoped orphan this tool does not own
         c.execute(text("DELETE FROM evidence_items WHERE evidence_id = 'e_scoped'"))

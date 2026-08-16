@@ -285,13 +285,25 @@ class TestVerifierGlobalResidue:
     reported, never failed, never rewritten)."""
 
     class _V:
-        def __init__(self, counts):
+        def __init__(self, counts, scope_cols=None, splits=None):
             self.counts, self.counted = counts, []
+            # Which product-scope columns each table carries, and how its
+            # sentinel rows split scoped/unscoped. Defaults keep the pre-split
+            # behaviour: a scoped table whose rows all NAME a product.
+            self.scope_cols = scope_cols if scope_cols is not None else {
+                "catalog_offers": ["product_key"],
+                "beauty_sku_ingredients": ["sku_key"],
+            }
+            self.splits = splits or {}
 
         async def fetch_all(self, sql, params=None):
             assert "information_schema.columns" in sql
+            # The scope-columns probe: EVERY product-scope column the table has.
+            if "product_scoped" not in sql:
+                _assert_binds_match(sql, params)
+                return [{"column_name": c}
+                        for c in self.scope_cols.get(params["table"], [])]
             assert "data_type IN" in sql          # int seller cols raise DataError
-            assert "product_scoped" in sql
             return [
                 {"table_name": "catalog_products", "column_name": "merchant_id", "product_scoped": True},
                 {"table_name": "catalog_offers", "column_name": "merchant_id", "product_scoped": True},
@@ -305,8 +317,16 @@ class TestVerifierGlobalResidue:
 
         async def fetch_one(self, sql, params=None):
             _assert_binds_match(sql, params)
-            assert params["banned"] == BANNED_BUCKET_MERCHANT_ID
             self.counted.append(sql)
+            assert params["banned"] == BANNED_BUCKET_MERCHANT_ID
+            # A product-scoped table is counted scoped/unscoped in one pass,
+            # over ALL its scope columns (num_nonnulls).
+            if "AS scoped" in sql:
+                for t, n in self.counts.items():
+                    if f"FROM {t} " in sql:
+                        scoped, unscoped = self.splits.get(t, (n, 0))
+                        return {"scoped": scoped, "unscoped": unscoped}
+                return {"scoped": 0, "unscoped": 0}
             for t, n in self.counts.items():
                 if f"FROM {t} " in sql:
                     return {"c": n}
@@ -322,8 +342,55 @@ class TestVerifierGlobalResidue:
         # product-scoped residue is an orphan -> ownership; event rows are history
         assert out["ownership"] == {"catalog_products": 0, "catalog_offers": 12}
         assert out["history"] == {"agent_product_events": 151698}
+        assert out["unscoped"] == {}
         # the reflected seller column is honoured per table
         assert any("FROM beauty_sku_ingredients WHERE primary_merchant_id" in q for q in v.counted)
+
+    @pytest.mark.asyncio
+    async def test_null_scope_rows_are_reported_unscoped_and_scoped_ones_still_fail(self):
+        """The third bucket, and the guarantee that it is not a loophole: rows
+        with a NULL scope key are tenant attribution (no product to follow), but
+        a row in the SAME table that NAMES a product is still an orphan and must
+        still reach `ownership` and still fail."""
+        import scripts.verify_seller_rekey as ver
+
+        v = self._V({"catalog_products": 0, "catalog_offers": 12, "agent_product_events": 3},
+                    scope_cols={"catalog_offers": ["product_key"],
+                                "beauty_sku_ingredients": ["sku_key"]},
+                    splits={"catalog_offers": (2, 10)})
+        out = await ver.global_residue(v)
+        assert out["ownership"] == {"catalog_products": 0, "catalog_offers": 2}
+        assert out["unscoped"] == {"catalog_offers": 10}
+        assert ver.orphan_failures(out) == ["orphan_residue:catalog_offers=2"]
+
+    @pytest.mark.asyncio
+    async def test_a_wholly_unscoped_table_stops_failing_but_stays_visible(self):
+        import scripts.verify_seller_rekey as ver
+
+        v = self._V({"catalog_products": 0, "catalog_offers": 317},
+                    scope_cols={"catalog_offers": ["product_key"]},
+                    splits={"catalog_offers": (0, 317)})
+        out = await ver.global_residue(v)
+        assert "catalog_offers" not in out["ownership"]
+        assert out["unscoped"] == {"catalog_offers": 317}
+        assert ver.orphan_failures(out) == []      # reported, never failed
+
+    @pytest.mark.asyncio
+    async def test_a_table_with_TWO_scope_columns_is_judged_on_all_of_them(self):
+        """beauty_compatibility_rules / catalog_quote_snapshots carry BOTH
+        product_key and sku_key, both nullable. Reading only the first by
+        precedence excuses a sku-scoped row whose product_key is NULL — real
+        ownership residue, silently forgiven. The count must span every scope
+        column the table has."""
+        import scripts.verify_seller_rekey as ver
+
+        v = self._V({"catalog_products": 0, "catalog_offers": 1},
+                    scope_cols={"catalog_offers": ["product_key", "sku_key"]})
+        await ver.global_residue(v)
+        counted = [q for q in v.counted if "AS scoped" in q]
+        assert counted, "the scoped/unscoped split never ran"
+        assert "num_nonnulls(product_key, sku_key)" in counted[0], (
+            f"the split must span BOTH scope columns; got: {counted[0]}")
 
     def test_only_ownership_residue_fails_once_the_bucket_is_empty(self):
         from scripts.verify_seller_rekey import orphan_failures  # the REAL rule

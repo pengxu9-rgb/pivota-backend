@@ -65,14 +65,33 @@ jobs:
         env:
           DISPOSE_APPLY: ${{ inputs.apply }}
           DISPOSE_TABLES: ${{ inputs.tables }}
+          DISPOSE_DUMP: dispose_dump.json
         run: |
           set -euo pipefail
           if [ "$DISPOSE_APPLY" = "true" ]; then
             echo "::warning::APPLY run — production writes (re-key + DELETE)"
-            python -m scripts.dispose_sentinel_orphans --tables "$DISPOSE_TABLES" --apply
+            python -m scripts.dispose_sentinel_orphans \
+              --tables "$DISPOSE_TABLES" --dump-file "$DISPOSE_DUMP" --apply
           else
-            python -m scripts.dispose_sentinel_orphans --tables "$DISPOSE_TABLES"
+            python -m scripts.dispose_sentinel_orphans \
+              --tables "$DISPOSE_TABLES" --dump-file "$DISPOSE_DUMP"
           fi
 
+      # The dump is the ONLY reversal record for a hard DELETE, and the run log
+      # is subject to retention — keep it as an artifact. `always()` because a
+      # run that failed midway is exactly when the record matters most.
+      - name: Upload the row dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispose-dump-${{ github.run_id }}
+          path: dispose_dump.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      # `always()`: if the dispose step exits non-zero AFTER one table's
+      # transaction committed, the half-applied state is precisely what needs
+      # grading. The sibling adr009-rekey-flip.yml does the same.
       - name: Grade with the independent verifier (read-only)
+        if: always()
         run: python -m scripts.verify_seller_rekey

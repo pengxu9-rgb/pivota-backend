@@ -53,6 +53,12 @@ class FakeDB:
                                     "product_scoped": bool(
                                         names & {"product_key", "content_key", "sku_key"})})
             return out
+        # The verifier's SCOPE_COLUMNS_SQL shares a prefix with the recon's
+        # COLUMNS_SQL; answering it with the FULL column list makes the split
+        # count over merchant_id/created_at too, which is nonsense.
+        if "column_name IN ('product_key', 'content_key', 'sku_key')" in flat:
+            return [{"column_name": c} for c, _ in self.schema[params["table"]]
+                    if c in ("product_key", "content_key", "sku_key")]
         if "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = :table" in flat:
             return [{"column_name": c, "data_type": dt, "is_nullable": "YES"}
                     for c, dt in self.schema[params["table"]]]
@@ -83,12 +89,11 @@ class FakeDB:
                 if cand in cols:
                     return {"column_name": cand}
             return None
-        # The scoped/unscoped count for a product-scoped table.
-        m = re.match(r"SELECT count\(\*\) FILTER \(WHERE (\w+) IS NOT NULL\) AS scoped, "
-                     r"count\(\*\) FILTER \(WHERE \w+ IS NULL\) AS unscoped FROM (\w+) "
-                     r"WHERE (\w+) = :banned", flat)
-        if m:
-            table = m.group(2)
+        # The scoped/unscoped count for a product-scoped table, over ALL its
+        # scope columns (num_nonnulls).
+        m = re.search(r"AS unscoped FROM (\w+) WHERE \w+ = :banned", flat)
+        if m and "AS scoped" in flat:
+            table = m.group(1)
             return {"scoped": self.scoped.get(table, self.residue.get(table, 0)),
                     "unscoped": self.unscoped.get(table, 0)}
         m = re.match(r"SELECT count\(\*\) AS c FROM (\w+) WHERE (\w+) = :banned", flat)

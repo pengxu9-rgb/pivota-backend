@@ -181,6 +181,33 @@ confirmed to die under mutation. Fixed in the same PR:
   raised `CannotCoerceError` on the live run. Cast added; the gate fixture now
   uses `json` to match prod.
 
+## Review round 2 (2026-08-17) — what the adversarial pass changed
+Three findings were real defects in the first cut of the disposition tool, each
+reproduced on a real engine:
+1. **`apply()` re-read the population** instead of consuming the plan, so any
+   row that became residue in the plan→apply window was written with no door
+   having examined it and no dump recording it. Reproduced: a review inserted
+   after the plan — still SERVING, and whose `product_key` resolves — was
+   deleted, and it appeared in no dump. Now the plan's id set is binding and a
+   mismatch aborts the table.
+2. **The cascade-child list was hardcoded and incomplete.** Derived from
+   `pg_constraint` instead. The live dry-run then found
+   **`buyer_review_user_subject` = 9 rows** (created at runtime by
+   `services/ugc_capabilities_service.py`, invisible to anyone reading migration
+   040) plus `buyer_review_ownership` and a SET-NULL parent — i.e. the original
+   "reversible by re-insert" claim was false by 9 rows.
+3. **The verifier's `unscoped` bucket was a loophole** for tables carrying more
+   than one scope column (`beauty_compatibility_rules`,
+   `catalog_quote_snapshots` carry both `product_key` and `sku_key`): a
+   sku-scoped row with a NULL `product_key` was excused. The split now spans
+   every scope column (`num_nonnulls`).
+
+Also: the row dump is written to a file and uploaded as a workflow artifact
+(the run log is subject to retention and was the only copy); the printed copy
+redacts review text and account ids; an unreadable cascade child is now door
+**D7** rather than a recorded-and-ignored note; the verifier step runs under
+`if: always()` so a half-applied state still gets graded.
+
 ## Execution (founder gated 2026-08-17)
 Built as `scripts/dispose_sentinel_orphans.py` + `.github/workflows/adr009-orphan-dispose.yml`
 (dry-run default; `apply=true` is a separate dispatch). Prod dry-run 2026-08-17:

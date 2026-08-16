@@ -57,6 +57,9 @@ that would stop the run:
       reviews are NOT orphans and deleting them would destroy live content.
   D6  no review row is publicly visible (status <> 'active'). Deleting serving
       content is a different decision than cleaning up a retired canary.
+  D7  every cascade child named by the FK graph could be READ. A child that
+      cannot be dumped is a hole in the reversal record, and a delete whose
+      children vanish unrecorded is not reversible.
 The residue for the tables this touches must be ZERO afterwards, asserted
 inside the transaction — not printed, asserted.
 
@@ -75,6 +78,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -114,12 +118,48 @@ SELECT r.*,
  ORDER BY r.id
 """
 
-# Children that FK to product_reviews with ON DELETE CASCADE (migration 040).
-# Dumped before the delete so the run log alone is enough to re-insert.
-REVIEW_CHILD_TABLES = ("media_assets", "review_replies", "review_interactions",
-                       "review_featured")
+# Children of product_reviews, DERIVED FROM THE FK GRAPH — never a list.
+#
+# The first cut hardcoded the four tables migration 040 creates and called the
+# delete "reversible by re-insert". It was not: `buyer_review_ownership`
+# (migration 042) and `buyer_review_user_subject` (created at runtime by
+# services/ugc_capabilities_service.py) also CASCADE, and
+# `buyer_review_idempotency_keys.review_id` is ON DELETE SET NULL — mutated,
+# not deleted, and recorded nowhere. Two of the three are invisible to anyone
+# reading migration 040, which is exactly why the house rule says derive from
+# the schema rather than write the identities down.
+#
+# confdeltype is carried so the dump says WHAT will happen to each child:
+# 'c' cascade (row disappears), 'n' set null (row survives, FK cleared),
+# 'a'/'r' no action/restrict (the delete would fail — worth seeing).
+REVIEW_CHILDREN_SQL = """
+SELECT c.conrelid::regclass::text AS child_table,
+       a.attname                  AS fk_column,
+       -- ::text because confdeltype is Postgres "char", which asyncpg hands
+       -- back as BYTES (b'c'), and a bytes key silently misses every lookup.
+       c.confdeltype::text        AS on_delete
+  FROM pg_constraint c
+  JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
+  JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+ WHERE c.contype = 'f'
+   AND c.confrelid = 'product_reviews'::regclass
+ ORDER BY 1, 2
+"""
+
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _ident(name: str) -> str:
+    """Names come from pg_constraint, but they are still interpolated, so they
+    still have to be checked — a name that cannot be safely interpolated aborts
+    rather than being skipped."""
+    if not _IDENT.match(name or ""):
+        raise RuntimeError(f"refusing to interpolate identifier {name!r}")
+    return name
 
 BUCKET_SQL = "SELECT count(*) AS c FROM catalog_products WHERE merchant_id = :banned"
+
+_ON_DELETE = {"c": "cascade", "n": "set null", "a": "no action", "r": "restrict", "d": "set default"}
 
 # -- writes -----------------------------------------------------------------
 
@@ -220,21 +260,31 @@ async def plan(db, tables: List[str]) -> Dict[str, Any]:
         reviews = await _rows(db, REVIEWS_SQL, banned)
         doors = review_doors(bucket, reviews)
         ids = [int(r["id"]) for r in reviews]
-        children: Dict[str, List[Dict[str, Any]]] = {}
-        for child in REVIEW_CHILD_TABLES:
+        children: Dict[str, Any] = {}
+        unreadable: List[str] = []
+        for fk in await _rows(db, REVIEW_CHILDREN_SQL):
+            table, col = _ident(fk["child_table"]), _ident(fk["fk_column"])
+            entry: Dict[str, Any] = {"fk_column": col,
+                                     "on_delete": _ON_DELETE.get(fk["on_delete"], fk["on_delete"])}
             try:
-                children[child] = await _rows(
-                    db, f"SELECT * FROM {child} WHERE review_id = ANY(:ids)", {"ids": ids})
+                entry["rows"] = await _rows(
+                    db, f"SELECT * FROM {table} WHERE {col} = ANY(:ids)", {"ids": ids})
             except Exception as exc:  # noqa: BLE001
-                # A child table absent from this database is a schema fact, not
-                # a reason to delete blind: record it, and let the door layer
-                # decide. It is never silently treated as "no rows".
-                children[child] = [{"__unreadable__": str(exc)[:160]}]
+                # A child the FK graph names but that cannot be read is a hole
+                # in the reversal record, so it ABORTS. Recording it and
+                # deleting anyway is the silent-fallback shape: the rows would
+                # be destroyed with nothing written down.
+                entry["unreadable"] = str(exc)[:200]
+                unreadable.append(f"{table}.{col}")
+            children[table] = _jsonable(entry)
+        if unreadable:
+            doors = doors + [f"D7 cascade children could not be read, so the delete would "
+                             f"destroy rows with no reversal record: {unreadable}"]
         out["tables"]["product_reviews"] = {
             "action": "delete_with_row_dump",
             "rows": len(reviews),
             "dump": [_jsonable(r) for r in reviews],
-            "cascaded_children": {k: _jsonable(v) for k, v in children.items()},
+            "cascaded_children": children,
             "doors_failed": doors,
         }
         out["doors_failed"].extend(doors)
@@ -242,16 +292,36 @@ async def plan(db, tables: List[str]) -> Dict[str, Any]:
     return _jsonable(out)
 
 
-async def apply(db, tables: List[str], run_id: str) -> Dict[str, Any]:
-    """Per-table transaction. Residue for the touched table must be zero
-    INSIDE the transaction, or the whole table's change rolls back."""
+async def apply(db, tables: List[str], run_id: str, plan_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Write exactly the rows `plan_result` described, in a per-table transaction.
+
+    THE POPULATION COMES FROM THE PLAN, NEVER FROM A FRESH READ. The doors and
+    the dump both belong to `plan()`; re-reading here would write rows that no
+    door examined and no dump recorded — measured on a real engine
+    (review 2026-08-17): a review inserted after the plan, still SERVING and
+    with a product_key that resolves, was deleted by a re-reading apply(), and
+    it appeared in no dump, so the run log could not even restore it. Two
+    doors would have refused it and neither ran.
+
+    So: the id list is the plan's, and inside the transaction the CURRENT
+    residue set must still equal the planned set. A row that joined or left
+    the population in between aborts the table and rolls it back — the
+    disagreement is the signal, not something to reconcile silently.
+    """
     banned = BANNED_BUCKET_MERCHANT_ID
     result: Dict[str, Any] = {"run_id": run_id, "applied": {}}
+    if plan_result.get("doors_failed"):
+        raise RuntimeError(f"refusing to apply: doors failed {plan_result['doors_failed']}")
 
     if "catalog_offers" in tables:
-        offers = await _rows(db, OFFERS_SQL, {"banned": banned})
-        ids = [str(o["offer_id"]) for o in offers]
+        planned = plan_result["tables"]["catalog_offers"]["plan"]
+        ids = [str(p["offer_id"]) for p in planned]
         async with db.transaction():
+            current = {str(o["offer_id"]) for o in await _rows(db, OFFERS_SQL, {"banned": banned})}
+            if current != set(ids):
+                raise RuntimeError(
+                    f"catalog_offers residue changed since the plan (rolled back): "
+                    f"added={sorted(current - set(ids))} removed={sorted(set(ids) - current)}")
             await db.execute(OFFERS_REKEY_SQL, {"offer_ids": ids, "banned": banned})
             left = await _count(
                 db, "SELECT count(*) AS c FROM catalog_offers WHERE merchant_id = :banned",
@@ -263,13 +333,25 @@ async def apply(db, tables: List[str], run_id: str) -> Dict[str, Any]:
         result["applied"]["catalog_offers"] = {"rekeyed": len(ids)}
 
     if "product_reviews" in tables:
-        reviews = await _rows(db, REVIEWS_SQL, {"banned": banned})
-        ids = [int(r["id"]) for r in reviews]
+        planned = plan_result["tables"]["product_reviews"]["dump"]
+        ids = [int(r["id"]) for r in planned]
         async with db.transaction():
+            current = {int(r["id"]) for r in await _rows(db, REVIEWS_SQL, {"banned": banned})}
+            if current != set(ids):
+                raise RuntimeError(
+                    f"product_reviews residue changed since the plan (rolled back): "
+                    f"added={sorted(current - set(ids))} removed={sorted(set(ids) - current)}")
             await db.execute(REVIEWS_DELETE_SQL, {"ids": ids, "banned": banned})
             left = await _count(
                 db, "SELECT count(*) AS c FROM product_reviews WHERE merchant_id = :banned",
                 {"banned": banned})
+            # Defense in depth, and honestly so: with the set check above
+            # passing, the DELETE removes every residue row, so a single
+            # session cannot make this fire and its mutant is unkillable from
+            # one connection. It still guards the READ COMMITTED case where
+            # another session commits a new sentinel review in between. The
+            # offers twin above IS reachable (its join skips a row whose
+            # product is missing) and IS mutation-tested.
             if left:
                 raise RuntimeError(
                     f"product_reviews still holds {left} sentinel row(s) after delete "
@@ -279,26 +361,68 @@ async def apply(db, tables: List[str], run_id: str) -> Dict[str, Any]:
     return result
 
 
-async def _run(tables: List[str], do_apply: bool) -> int:
+# Columns of the review dump that carry user-authored text or an account id.
+# The FULL row still goes to the dump FILE (that is the reversal record); only
+# the copy printed to the run log is redacted, because a CI log is readable by
+# everyone with repo access and this tool is reusable on rows that are not QA
+# canaries.
+_REDACTED_REVIEW_FIELDS = ("body", "body_redacted", "redaction", "title",
+                           "author_user_id", "risk_flags", "editor_note")
+
+
+def _redacted_for_log(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(p, default=str))
+    rev = out.get("tables", {}).get("product_reviews")
+    if not rev:
+        return out
+    for row in rev.get("dump", []):
+        for f in _REDACTED_REVIEW_FIELDS:
+            if row.get(f) is not None:
+                row[f] = f"<redacted {len(str(row[f]))} chars — see the dump file>"
+    for child in rev.get("cascaded_children", {}).values():
+        if isinstance(child, dict) and isinstance(child.get("rows"), list):
+            child["rows"] = f"<{len(child['rows'])} row(s) — see the dump file>"
+    return out
+
+
+def _write_dump(path: Optional[str], payload: Dict[str, Any]) -> Optional[str]:
+    """The reversal record. Written and FLUSHED before any write happens; a
+    log-only dump is subject to log retention, which is not a place to keep the
+    only copy of rows a hard DELETE is about to remove."""
+    if not path:
+        return None
+    f = Path(path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(payload, indent=1, default=str), encoding="utf-8")
+    return str(f)
+
+
+async def _run(tables: List[str], do_apply: bool, dump_file: Optional[str]) -> int:
     from db.database import database
 
     await database.connect()
     try:
         p = await plan(database, tables)
         if p["doors_failed"]:
-            print(json.dumps({"mode": "abort", "reason": "doors failed", **p}, indent=1))
+            written = _write_dump(dump_file, {"mode": "abort", **p})
+            print(json.dumps({"mode": "abort", "reason": "doors failed",
+                              "dump_file": written, **_redacted_for_log(p)}, indent=1))
             print("DOORS FAILED — nothing was written:", file=sys.stderr)
             for d in p["doors_failed"]:
                 print(f"  {d}", file=sys.stderr)
             return 2
         if not do_apply:
-            print(json.dumps({"mode": "dry-run", **p}, indent=1))
+            written = _write_dump(dump_file, {"mode": "dry-run", **p})
+            print(json.dumps({"mode": "dry-run", "dump_file": written,
+                              **_redacted_for_log(p)}, indent=1))
             return 0
         run_id = str(uuid.uuid4())
-        # The dump is printed BEFORE the write, so a run log that ends in a
-        # crash still contains everything needed to re-insert.
-        print(json.dumps({"mode": "apply", "run_id": run_id, "pre_write_plan": p}, indent=1))
-        res = await apply(database, tables, run_id)
+        # The dump lands BEFORE the write, so a run that dies mid-apply still
+        # leaves everything needed to re-insert.
+        written = _write_dump(dump_file, {"mode": "apply", "run_id": run_id, "pre_write_plan": p})
+        print(json.dumps({"mode": "apply", "run_id": run_id, "dump_file": written,
+                          "pre_write_plan": _redacted_for_log(p)}, indent=1))
+        res = await apply(database, tables, run_id, p)
         post = await plan(database, tables)
         remaining = {t: d["rows"] for t, d in post["tables"].items() if d["rows"]}
         print(json.dumps({"mode": "applied", **res, "remaining": remaining}, indent=1))
@@ -315,6 +439,9 @@ def _parse(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--tables", default=",".join(ALL_TABLES),
                     help=f"comma-separated subset of {','.join(ALL_TABLES)}")
     ap.add_argument("--apply", action="store_true", help="execute (default: dry-run)")
+    ap.add_argument("--dump-file", default="dispose_sentinel_orphans_dump.json",
+                    help="where the FULL (unredacted) plan is written; the reversal "
+                         "record. Empty string disables it.")
     args = ap.parse_args(argv)
     tables = [t.strip() for t in args.tables.split(",") if t.strip()]
     unknown = [t for t in tables if t not in ALL_TABLES]
@@ -328,7 +455,7 @@ def _parse(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse(argv)
-    return asyncio.run(_run(args.table_list, args.apply))
+    return asyncio.run(_run(args.table_list, args.apply, args.dump_file or None))
 
 
 if __name__ == "__main__":

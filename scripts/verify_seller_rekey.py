@@ -198,14 +198,23 @@ SELECT c.table_name, c.column_name,
 """
 
 
-# Which product-scope column a table carries, for the ownership/unscoped split.
-# Same three keys, same precedence, as the flip's discover_cascade_tables.
-SCOPE_COLUMN_SQL = """
+# EVERY product-scope column a table carries — not the first by precedence.
+#
+# A table with more than one is the case that makes this matter, and two real
+# ones exist: beauty_compatibility_rules and catalog_quote_snapshots (db/catalog.py)
+# both carry product_key AND sku_key, both nullable. Picking one column by
+# precedence and filing the row by THAT column's nullness excuses a sku-scoped
+# row whose product_key happens to be NULL — genuine ownership residue, silently
+# forgiven (measured against this file's own fixture, review 2026-08-17).
+#
+# So a row is SCOPED when ANY of its scope columns is non-NULL, and unscoped
+# only when they are ALL NULL — the honest reading of "this row names no
+# product".
+SCOPE_COLUMNS_SQL = """
 SELECT column_name FROM information_schema.columns
  WHERE table_schema = 'public' AND table_name = :table
    AND column_name IN ('product_key', 'content_key', 'sku_key')
  ORDER BY array_position(ARRAY['product_key','content_key','sku_key'], column_name)
- LIMIT 1
 """
 
 
@@ -240,15 +249,18 @@ async def global_residue(database) -> dict:
         d = dict(r)
         table, col = d["table_name"], d["column_name"]
         product_scoped = bool(d["product_scoped"]) or table == "catalog_products"
-        scope_col = None
+        scope_cols: list = []
         if product_scoped and table != "catalog_products":
-            srow = await database.fetch_one(SCOPE_COLUMN_SQL, {"table": table})
-            scope_col = dict(srow)["column_name"] if srow else None
+            scope_cols = [dict(r)["column_name"] for r in
+                          await database.fetch_all(SCOPE_COLUMNS_SQL, {"table": table})]
 
-        if scope_col:
+        if scope_cols:
+            # Scoped when ANY scope column names something; unscoped only when
+            # every one of them is NULL.
+            names = ", ".join(scope_cols)
             row = await database.fetch_one(
-                f"SELECT count(*) FILTER (WHERE {scope_col} IS NOT NULL) AS scoped, "
-                f"       count(*) FILTER (WHERE {scope_col} IS NULL) AS unscoped "
+                f"SELECT count(*) FILTER (WHERE num_nonnulls({names}) > 0) AS scoped, "
+                f"       count(*) FILTER (WHERE num_nonnulls({names}) = 0) AS unscoped "
                 f"  FROM {table} WHERE {col} = :banned",
                 {"banned": BANNED_BUCKET_MERCHANT_ID})
             dd = dict(row) if row else {"scoped": 0, "unscoped": 0}
