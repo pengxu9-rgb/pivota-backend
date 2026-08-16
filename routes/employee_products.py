@@ -16,6 +16,7 @@ import csv
 import io
 import json
 import hashlib
+import logging
 import re
 from urllib.parse import urlparse
 from urllib.parse import parse_qsl, urlencode, urlunparse
@@ -25,6 +26,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from pydantic import BaseModel, Field
 import uuid
 
+from db._ddl_guard import apply_ddl_statements
 from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
@@ -71,11 +73,59 @@ from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_ke
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
+logger = logging.getLogger(__name__)
+
 _EXTERNAL_SEEDS_TABLE_READY = False
 _EXTERNAL_SEEDS_TABLE_LOCK = asyncio.Lock()
 
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = False
 _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
+
+# The whole DDL pass for employee_external_seed_import_tasks: create, then
+# backfill the columns that deployments predating them are missing, then the
+# indexes. Per-statement tolerant via db/_ddl_guard.py (`ADD COLUMN IF NOT
+# EXISTS` is Postgres-only syntax and fails outright on the SQLite envs some
+# tests run against, so one failure must not abort the rest), and the guard's
+# return value gates memoization — a swallowed ALTER used to leave the column
+# permanently absent while the module reported ready.
+#
+# Every statement belongs in this list, including the CREATE ones. The guard
+# retries without a cap, so anything left outside it would re-run on every
+# accessor call for as long as one statement keeps failing, and on Postgres
+# `CREATE TABLE`/`CREATE INDEX ... IF NOT EXISTS` take the table lock BEFORE
+# evaluating IF NOT EXISTS. Inside the list they are paced by the guard's
+# cooldown and dropped from the retry set as soon as they succeed.
+_EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS employee_external_seed_import_tasks (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'pending',
+      market TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      created_by_employee_id TEXT NULL,
+      created_count INTEGER NOT NULL DEFAULT 0,
+      updated_count INTEGER NOT NULL DEFAULT 0,
+      errors TEXT NOT NULL DEFAULT '[]',
+      seed_ids TEXT NOT NULL DEFAULT '[]',
+      stats TEXT NOT NULL DEFAULT '{}',
+      error TEXT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at TIMESTAMPTZ NULL
+    );
+    """,
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_by_employee_id TEXT;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS errors TEXT NOT NULL DEFAULT '[]';",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS seed_ids TEXT NOT NULL DEFAULT '[]';",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS stats TEXT NOT NULL DEFAULT '{}';",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS error TEXT;",
+    "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;",
+    "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_status ON employee_external_seed_import_tasks(status);",
+    "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);",
+]
 
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = False
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_LOCK = asyncio.Lock()
@@ -323,64 +373,16 @@ async def _ensure_external_seed_import_tasks_table() -> None:
     async with _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK:
         if _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY:
             return
-        await database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS employee_external_seed_import_tasks (
-              id TEXT PRIMARY KEY,
-              status TEXT NOT NULL DEFAULT 'pending',
-              market TEXT NOT NULL,
-              tool TEXT NOT NULL,
-              mode TEXT NOT NULL,
-              created_by_employee_id TEXT NULL,
-              created_count INTEGER NOT NULL DEFAULT 0,
-              updated_count INTEGER NOT NULL DEFAULT 0,
-              errors TEXT NOT NULL DEFAULT '[]',
-              seed_ids TEXT NOT NULL DEFAULT '[]',
-              stats TEXT NOT NULL DEFAULT '{}',
-              error TEXT NULL,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              finished_at TIMESTAMPTZ NULL
-            );
-            """
+        # The guard's return value gates memoization: the column backfill
+        # used to sit in a bare `except Exception: pass`, so a swallowed
+        # ALTER left the column permanently absent while this module
+        # reported ready for the rest of the process lifetime.
+        _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = await apply_ddl_statements(
+            _EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS,
+            label="_ensure_external_seed_import_tasks_table",
+            logger=logger,
+            execute=database.execute,
         )
-
-        # Backfill columns for older deployments (best-effort).
-        try:
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_by_employee_id TEXT;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS created_count INTEGER NOT NULL DEFAULT 0;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS errors TEXT NOT NULL DEFAULT '[]';"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS seed_ids TEXT NOT NULL DEFAULT '[]';"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS stats TEXT NOT NULL DEFAULT '{}';"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS error TEXT;"
-            )
-            await database.execute(
-                "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;"
-            )
-        except Exception:
-            pass
-
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_status ON employee_external_seed_import_tasks(status);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);"
-        )
-        _EXTERNAL_SEED_IMPORT_TASKS_TABLE_READY = True
 
 
 async def _ensure_employee_pci_kb_scope_reviews_table() -> None:
