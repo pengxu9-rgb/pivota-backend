@@ -37,11 +37,18 @@ elected catalog row and self-heals). Global residue as measured:
   candidates up front (with `cp.merchant_id` as it was: still the sentinel), then
   probes each store over HTTP for minutes, then upserts. The flip moved those
   products and cascaded `catalog_offers` in between; the upsert landed after
-  the cascade with the stale merchant. A TOCTOU, not a stray writer.
+  the cascade with the stale merchant. A TOCTOU, not a stray writer. (Confirmed
+  in code: `CANDIDATES_SQL` is fetched once at `capture_us_market_offers.py:337`
+  carrying `cp.merchant_id`, the per-domain HTTP probing starts at `:351`, and
+  `plan_offer` at `:204` stamps `candidate["merchant_id"]` — the snapshot
+  value, by then minutes stale.)
 - Disposition: `UPDATE catalog_offers o SET merchant_id = cp.merchant_id FROM
   catalog_products cp WHERE cp.product_key = o.product_key AND o.merchant_id =
   <sentinel> AND cp.merchant_id <> <sentinel>` — abort if any residue row's
   product is missing (none is today). `offer_id` is the PK, so no conflict.
+  Door re-measured 2026-08-16: of the 12, `product_missing = 0` and
+  `target_still_sentinel = 0`, so the door passes today and would abort loudly
+  if either became non-zero before the apply.
 - Writer hardening (same PR, primary route): the capture upsert should stamp
   `merchant_id` from the catalog row **at write time** (subselect on
   `product_key`), never from the candidate snapshot.
@@ -59,10 +66,15 @@ elected catalog row and self-heals). Global residue as measured:
 - All 9 are `source_type=native / source_system=accounts / unverified / no
   author`, titles "Pivota QA DS moderation … canary", "Pivota QA TEST review
   20260520_…" — the 2026-05-20 moderation canary run, not merchant content.
-- Recommendation: hard-delete the 9 rows, printing every row as JSON in the
-  run log first (reversible by re-insert). Re-keying would publish QA fixtures
-  onto a real seller's PDP; `status='removed'` + re-key keeps them out of
-  readers but still moves QA rows onto a live tenant. Founder's call.
+- **Already out of every public reader**: `status` is `removed` on 8 and
+  `under_review` on 1. So this is cleanup, not an exposure — nothing is
+  serving today, and the "re-key + `status='removed'`" variant is a near
+  no-op that would still park QA rows on a live tenant.
+- A delete cascades 6 `media_assets` rows (`ON DELETE CASCADE`, migration 040);
+  no `review_replies` / `review_interactions` / `review_featured` rows exist.
+  The row dump must include the media rows.
+- Recommendation: hard-delete the 9 rows (+ 6 cascaded media), printing every
+  row as JSON in the run log first (reversible by re-insert). Founder's call.
 
 ### evidence_items = 5, action_plan_items = 2, niche_target_outcomes = 317 → **(a) reclassify**
 - Every row has a NULL scope column (`product_key` / `content_key`). Their
@@ -87,7 +99,11 @@ elected catalog row and self-heals). Global residue as measured:
 - All 8: same platform, same `source_product_id`, product exists under
   `merch_obs_*` (3 sellers), **target identity vacant**, all carry bullets.
   This is exactly the tool's H0 (cross-merchant exact id, restricted to
-  `external_seed`) with bilateral uniqueness and vacancy satisfied.
+  `external_seed`) with bilateral uniqueness and vacancy satisfied. Re-checked
+  2026-08-16 against the tool's OWN preconditions: `products_cache` holds 0 rows
+  under the sentinel (so its orphan guard, which requires absence from BOTH
+  `catalog_products` and `products_cache`, passes on all 8), and no two orphans
+  map to one target (bilateral uniqueness holds).
 - `product_enrichment` has no product-scope column, so the flip's reflection
   never saw it; the earlier re-attribution run (2026-08-14) preceded these
   products' move. Re-run the tool: dry-run first (expect 8 accepted under H0),
