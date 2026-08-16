@@ -11,7 +11,11 @@ verdict from the checkpoint table and the live rows, independently:
   servable         moved rows admitted by the D2 public gate                      (want == moved)
   stranded_quality_snapshots
                    moved rows whose quality score is still addressed by the
-                   merchant they were moved OFF — servable, yet unpublishable  (want 0)
+                   merchant they were moved OFF **and which the repair tool
+                   would fix** — servable, yet unpublishable                   (want 0)
+                   Deliberately NOT every stranded row: see the note above the
+                   query for why counting the unrepairable ones would hold this
+                   gate red forever.
   old_refs_left    identity listings still under 'external_seed:' for moved rows  (want 0)
   new_refs         listings under the new '<observed>:<pid>' refs
   overrides_on_new operator overrides attached to the NEW refs (work preserved)

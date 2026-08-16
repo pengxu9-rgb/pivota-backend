@@ -173,22 +173,30 @@ SELECT cp.product_key,
    -- provably empty and therefore makes a re-run a no-op.
    AND sk.donor_merchant <> cp.merchant_id
    -- AND THE DONOR IS THE LEGACY BUCKET ITSELF. `rows_on_key` is counted over
-   -- the LIVE catalog while the snapshot is adopted from HISTORY, and nothing
-   -- in production ever deletes a quality snapshot (`routes/merchant_products`
-   -- deletes catalog_products and cleans product_enrichment, not this table).
-   -- So a sibling that has since been DELETED leaves its score behind under a
-   -- key that now looks unique, and the survivor would inherit it — silently,
-   -- permanently, and scored for a different merchant's product. Case or
-   -- whitespace drift between the two tables opens the same hole.
+   -- the LIVE catalog while the snapshot is adopted from HISTORY, and no code
+   -- path deletes a quality snapshot, so a sibling that has since gone away
+   -- leaves its score under a key that NOW looks unique and the survivor would
+   -- inherit it. Case or whitespace drift between the two tables opens the same
+   -- hole. `run_catalog` selects its batch with a `cp.merchant_id = <bucket>`
+   -- filter (do NOT write that bind name here -- a colon inside a SQL comment
+   -- is still parsed as a parameter), so every row in `moved` sat in the
+   -- bucket; requiring the donor to be that same bucket rejects every ghost
+   -- left under a DIFFERENT merchant. Measured: all 7,499 cohort rows already
+   -- have `donor_merchant = 'external_seed'`, so it costs nothing.
    --
-   -- This closes it by construction rather than by observation: `run_catalog`
-   -- selects its batch with a `cp.merchant_id = <bucket>` filter (do NOT write
-   -- that bind name here -- a colon inside a SQL comment is still parsed as a
-   -- parameter), so EVERY row in `moved` sat in the bucket, and the unique
-   -- index (merchant_id, platform, source_product_id) makes the natural key
-   -- unique — the property `rows_on_key` only approximates. Measured: all
-   -- 7,499 cohort rows already have `donor_merchant = 'external_seed'`, so
-   -- this costs nothing and removes the whole class.
+   -- THIS NARROWS THE CLASS, IT DOES NOT CLOSE IT — and saying otherwise is
+   -- what carried two earlier versions of this predicate through review. The
+   -- residual: a row that was itself in the bucket on this key, vanished, and
+   -- left its snapshot behind, after which a DIFFERENT row took the same
+   -- `(external_seed, platform, source_product_id)` and was then moved. The
+   -- unique index makes the key unique at any INSTANT, not across time.
+   -- Accepted, with the reasons stated rather than assumed: `product_key` is
+   -- derived from (merchant, platform, source id) and the flip preserves it,
+   -- so such a successor shares the ghost's product_key — the inherited score
+   -- describes the SAME source page and the worst case is a stale score, not
+   -- another merchant's. And this repo has no delete path that can produce the
+   -- shape: the only `DELETE FROM catalog_products` is scoped to
+   -- `platform = 'brand_authored'`, which this cohort never is.
    AND sk.donor_merchant = :banned
  ORDER BY cp.product_key
 """
@@ -263,9 +271,10 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     ]
 
     # Counted in BOTH modes: a dry run whose write volume always reads 0 is a
-    # rehearsal that cannot be checked against the apply.
+    # rehearsal that cannot be checked against the apply. Cached on the row so
+    # the apply below does not ask again — one query per product, not two.
     for row in cohort:
-        report["snapshots_to_repoint"] += int(
+        row["_donor_rows"] = int(
             await database.fetch_val(
                 DONOR_ROWS_SQL,
                 {
@@ -276,6 +285,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             )
             or 0
         )
+        report["snapshots_to_repoint"] += row["_donor_rows"]
 
     if not args.apply:
         return report
@@ -288,20 +298,12 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     repaired: List[Dict[str, Any]] = []
     for row in cohort:
         try:
-            moving = int(
-                await database.fetch_val(
-                    DONOR_ROWS_SQL,
-                    {
-                        "platform": row["platform"],
-                        "spid": row["source_product_id"],
-                        "old_merchant": row["donor_merchant"],
-                    },
-                )
-                or 0
-            )
+            moving = int(row.get("_donor_rows") or 0)
             if not moving:
-                # Raced: something moved or deleted the donor rows since the
-                # cohort was read. Not an error, but not a repair either.
+                # Defensive only: the cohort requires a donor holding rows, so
+                # this should be unreachable. If it ever fires, the UPDATE would
+                # match nothing — do not count it as a repair or feed it to the
+                # recompute and trust steps.
                 continue
             await database.execute(
                 REPOINT_SQL,
@@ -399,17 +401,29 @@ async def _main_async(args: argparse.Namespace) -> int:
     if report["failures"]:
         return 1
     # `recompute_serving_eligibility` never raises — it logs and returns a
-    # value — so "no failures" does NOT mean the repair achieved anything. An
-    # apply that repointed rows and promoted none is the exact silent-no-op an
-    # operator would read as success; say so in the exit code.
+    # value — so "no failures" does NOT mean the repair achieved anything, and
+    # a run that repointed thousands of rows while promoting none is the exact
+    # silent no-op an operator reads as success.
+    #
+    # But zero promotions is only ANOMALOUS over the whole cohort. Plenty of
+    # individual rows are legitimately repaired and still blocked: ~927 of the
+    # 7,499 are `suppressed`, others are `not_live`, and a restored score can
+    # sit below the threshold. So a --limit canary that happens to draw only
+    # such rows is a CORRECT run, and failing it would train the operator to
+    # ignore the signal. Warn always; fail only on a full-cohort run, where
+    # zero promotions cannot be explained by an unlucky slice.
     if report["applied"] and report["products_repointed"] and not report["serving_eligible_after"]:
         print(
-            "repointed %d product(s) and NONE became serving_eligible — "
-            "check index_pipeline_state before re-running"
+            "WARNING: repointed %d product(s) and none became serving_eligible"
             % report["products_repointed"],
             file=sys.stderr,
         )
-        return 1
+        if not args.limit:
+            print(
+                "that is the whole cohort — check index_pipeline_state before re-running",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

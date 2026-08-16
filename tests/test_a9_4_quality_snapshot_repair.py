@@ -224,6 +224,36 @@ async def test_a_deleted_siblings_orphan_score_is_never_inherited(db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_ghost_left_inside_the_bucket_is_the_accepted_residual(db) -> None:
+    """THE LIMIT OF THE GUARANTEE, pinned so nobody mistakes it for closed.
+
+    The donor-is-the-bucket conjunct rejects a ghost left under any OTHER
+    merchant. It cannot reject one left under the bucket itself: the unique
+    index makes `(external_seed, platform, source_product_id)` unique at any
+    INSTANT, not across time, so a bucket row that vanished and left its
+    snapshot behind can be succeeded on the same key by a row that is then
+    moved — and that successor IS selected.
+
+    This test asserts the residual rather than hiding it. Two earlier versions
+    of this predicate shipped because a test picked the variant that passed
+    and the comment claimed the class was closed; the honest statement is that
+    the class is NARROWED. It is accepted because `product_key` is derived from
+    (merchant, platform, source id) and the flip preserves it, so ghost and
+    successor share a product_key: the inherited score describes the same
+    source page, making the worst case a STALE score rather than a different
+    merchant's. If that ever stops holding, this test is where to start.
+    """
+    shared = "sp_reborn"
+
+    await _product("reborn", merchant=NEW, spid=shared)
+    await _checkpoint("reborn", observed=NEW, previous=OLD)
+    # The ghost: scored while the vanished row sat in the bucket on this key.
+    await _snapshot("ghost", merchant=OLD, spid=shared, score=12.0)
+
+    assert await _cohort() == {"reborn"}
+
+
+@pytest.mark.asyncio
 async def test_a_live_bucket_row_sharing_the_natural_key_is_never_harvested(db) -> None:
     """THE DEFECT AN EARLIER DRAFT SHIPPED, pinned as a test.
 
