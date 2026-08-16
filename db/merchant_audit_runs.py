@@ -107,6 +107,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
+from db._ddl_guard import apply_ddl_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -275,8 +276,9 @@ _DDL_STATEMENTS = [
 
 async def ensure_merchant_audit_runs_table() -> None:
     """Best-effort ensure-table helper. Mirrors the schema_guard
-    pattern — runs once per process, swallows errors, lets the route
-    continue even if DDL fails."""
+    pattern — swallows errors and lets the route continue even if DDL
+    fails. Memoizes once every statement has succeeded; a pass with a
+    failure retries on the next call instead (see db/_ddl_guard.py)."""
     global _DDL_READY
     if _DDL_READY:
         return
@@ -288,16 +290,12 @@ async def ensure_merchant_audit_runs_table() -> None:
         # for hermetic test environments. Some statements (partial
         # indexes with WHERE ... IN, ADD COLUMN IF NOT EXISTS) are
         # Postgres-flavored and fail-and-skip is fine on SQLite.
-        for stmt in _DDL_STATEMENTS:
-            try:
-                await database.execute(stmt)
-            except Exception as exc:
-                logger.debug(
-                    "ensure_merchant_audit_runs_table skip stmt "
-                    "(best-effort): %s | %s",
-                    str(exc)[:120], stmt[:100],
-                )
-        _DDL_READY = True
+        _DDL_READY = await apply_ddl_statements(
+            _DDL_STATEMENTS,
+            label="ensure_merchant_audit_runs_table",
+            logger=logger,
+            execute=database.execute,
+        )
 
 
 def _now_utc() -> datetime:

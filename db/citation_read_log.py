@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import Column, DateTime, Integer, Table, Text
 
+from db._ddl_guard import apply_ddl_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -97,15 +98,12 @@ async def ensure_citation_read_log_table() -> None:
     async with _DDL_LOCK:
         if _DDL_READY:
             return
-        for stmt in _DDL_STATEMENTS:
-            try:
-                await database.execute(stmt)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "ensure_citation_read_log_table skip stmt: %s | %s",
-                    str(exc)[:120], stmt[:80],
-                )
-        _DDL_READY = True
+        _DDL_READY = await apply_ddl_statements(
+            _DDL_STATEMENTS,
+            label="ensure_citation_read_log_table",
+            logger=logger,
+            execute=database.execute,
+        )
 
 
 def _now_utc() -> datetime:
