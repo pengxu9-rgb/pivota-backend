@@ -56,7 +56,13 @@ class FakeDB:
             or re.search(r"FROM (\w+) WHERE merchant_id = :banned", flat)
         assert m, f"unexpected fetch_all: {flat}"
         table = m.group(1)
-        # classification GROUP BYs, scope-null count, samples: one synthetic row
+        # classification GROUP BYs, scope-null count, key-space rate, samples:
+        # one synthetic row each. The two count queries are distinguished by
+        # their projections — answering both with one shape would let a swap
+        # between them go unnoticed here.
+        if "resolves" in flat:
+            return [{"total": self.residue[table], "scoped": self.residue[table],
+                     "resolves": self.residue[table]}]
         if "count(*) AS total" in flat:
             return [{"total": self.residue[table], "scope_null": 0}]
         return [{"n": self.residue[table], "marker": table}]
@@ -126,7 +132,9 @@ def test_every_statement_binds_the_banned_sentinel_and_the_flip_phase_never_a_li
     assert classify, "classification joins never ran"
     for s, p in classify:
         assert "banned" in p and "phase" in p  # bound, never inlined
-        assert p["phase"] == recon.CHECKPOINT_PHASE
+        # The LITERAL, not recon.CHECKPOINT_PHASE — an assertion that reads the
+        # constant it claims to pin passes for every value the constant takes.
+        assert p["phase"] == "catalog"
         assert "'external_seed'" not in s and "'catalog'" not in s.replace(
             "ck.phase = :phase", "")
 

@@ -51,7 +51,10 @@ elected catalog row and self-heals). Global residue as measured:
   if either became non-zero before the apply.
 - Writer hardening (same PR, primary route): the capture upsert should stamp
   `merchant_id` from the catalog row **at write time** (subselect on
-  `product_key`), never from the candidate snapshot.
+  `product_key`), never from the candidate snapshot. Hardening alone cannot
+  repair the existing 12: `OFFER_UPSERT_SQL`'s `ON CONFLICT (offer_id) DO
+  UPDATE` does not touch `merchant_id`, so a re-run would leave them as they
+  are. The re-key UPDATE is mandatory, not optional.
 
 ### product_reviews = 9 → **(c) delete with a row dump** (alt: re-key + `status='removed'`)
 - The reviews service builds its OWN key namespace: `product_key =
@@ -137,12 +140,40 @@ elected catalog row and self-heals). Global residue as measured:
    Recommend rule 2 for `product_enrichment` (schema-derived, no hand list) and
    an explicit, reasoned entry for `pdp_identity_listing`.
 
-## Recon-tool notes (fix in the disposition PR)
-- `by_product` for `product_reviews` joins on catalog `product_key`; the table
-  keys in its own namespace, so the join reads "product missing" for a product
-  that exists. The recon must resolve reviews by `(platform, platform_product_id)`.
-- Everything else classified correctly against prod (12/12 offers, 8/8
-  enrichment, 103/103 listings resolved by seed).
+## Recon-tool notes
+Adversarial review (2026-08-16) mutated the script 23 ways; 12 mutants survived
+the fake-DB suite, so the recon now also carries a real-Postgres gate
+(`tests/test_recon_sentinel_orphans_postgres.py`) whose assertions were each
+confirmed to die under mutation. Fixed in the same PR:
+- `by_product` for `product_reviews` joined on catalog `product_key` while the
+  table keys in its OWN namespace, reporting "product missing" for a product
+  that exists — the right disposition for the wrong reason. Every table now
+  reports `scope_key_space` (`resolves_to_catalog` k/N, `keys_are_catalog_keys`),
+  so a foreign key space is loud instead of silently mimicking deletion.
+  Measured: `product_reviews` 0/9, `catalog_offers` 12/12.
+- `n_seeds_attached_live` did not test suppression — a seed attached to a
+  tombstoned product counted as live, and the listing disposition rests on that
+  column. Now `n_seeds_attached_unsuppressed`, with `n_seeds_active` beside it.
+- `has_content` treated an empty bullet array as content (`'[]' IS NOT NULL`).
+- The enrichment classifier now reports the re-attribution tool's ACTUAL
+  preconditions — `n_cache_rows` (its orphan guard also requires absence from
+  `products_cache`), `target_occupied`, `n_orphans_to_same_target` — rather than
+  implying vacancy the tool never measured. **Note the H0 restriction is
+  `platform = 'external_seed'`, a platform test, not a merchant test.**
+- Seller-column precedence now matches the flip's (`merchant_id` over
+  `primary_merchant_id`); the identifier guard runs over the whole seller
+  surface BEFORE any count, since the verifier's `global_residue` interpolates
+  names unguarded and runs first.
+- Sample reports `ordered_by` (null when a table has no timestamp column, so an
+  arbitrary sample is not read as "the newest N"); `--sample < 1` aborts.
+- The identity-join lint exemption was **removed**: aliasing the id in the CTE
+  keeps the cross-merchant measurement and leaves the file under both lints
+  permanently, which is strictly better than a file-scoped mute (that test's own
+  header documents why).
+- A prod-only dialect defect the local fixture missed: `bullet_points` is `json`
+  in prod (the fresh-DB backstop DDL says JSONB), so `coalesce(...,'[]'::jsonb)`
+  raised `CannotCoerceError` on the live run. Cast added; the gate fixture now
+  uses `json` to match prod.
 
 ## Proposed disposition tool (task 3, only after founder gates the above)
 `scripts/dispose_sentinel_orphans.py --tables catalog_offers,product_reviews [--apply]`
@@ -161,10 +192,14 @@ Mapped read-only in PIVOTA-Agent: **22 production files, ~155 sentinel-merchant
 comparison sites** (62 in `src/server.js`), 7 independent constant definitions
 of the literal, and a shrink-only ratchet
 (`tests/scripts/external_seed_merchant_literal_ratchet.test.js` + baseline JSON)
-that must be lowered in the same PR — but whose regex misses every camelCase
-`merchantId === 'external_seed'` site (⚠ ~14 unbaselined readers, e.g.
-`pdpIngredientAuthority.js:956`, `catalogServingIndex.js:449`, `pdpBuilder.js:248`,
-`findProductsSearchRouteEntry.js:125/383`). Highest-leverage fixes: the two
+that must be lowered in the same PR — but whose regex leaves ~14 readers
+unbaselined, by **two** distinct evasions (verified 2026-08-16): camelCase
+(`src/pdpBuilder.js:248`, `src/services/catalogServingIndex.js:449`) and, more
+often, a WRAPPER around a snake_case field the regex needs adjacent to the
+operator — `asString(product?.merchant_id) === …`
+(`src/services/pdpIngredientAuthority.js:956`), `String(x?.merchant_id || '')
+.trim() === …` (`src/findProductsSearchRouteEntry.js:125/383`). The wrapper
+class is the wider gap; a ratchet regex fix must cover both. Highest-leverage fixes: the two
 minting sites `src/pdpConfig.js:21` (`inferCanonicalPdpMerchantId`) and
 `src/productIntelResolve.js:6` (`inferMerchantIdFromProductId`) that still turn
 any `ext_` id into a `merchant_id: 'external_seed'` ref — refs that now join

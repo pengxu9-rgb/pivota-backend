@@ -18,6 +18,17 @@ on:
         required: false
         default: "5"
 
+# One recon at a time: each run opens a prod connection, and two concurrent
+# dispatches double that for no extra information.
+concurrency:
+  group: adr009-orphan-recon
+  cancel-in-progress: false
+
+# The job holds the prod DATABASE_URL; it needs nothing from the GitHub API
+# beyond reading the checkout.
+permissions:
+  contents: read
+
 jobs:
   orphan-recon:
     runs-on: ubuntu-latest
