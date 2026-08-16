@@ -908,6 +908,15 @@ missing AS (
 )
 
 
+# The single spelling of the schema-preflight failure. Both `_build_report` and
+# the materialization job (which runs `_required_schema()` on its own rather
+# than building a report) surface it, and a caller that hardcoded its own copy
+# would drift silently — the job's tests assert against THIS constant.
+SCHEMA_REQUIRED_ERROR = (
+    "required tables or catalog_products identity unique index missing"
+)
+
+
 async def _fetch_scalar(sql: str, values: Optional[Dict[str, Any]] = None) -> int:
     value = await database.fetch_val(sql, values or {})
     return int(value or 0)
@@ -953,7 +962,7 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
             "ok": False,
             "apply": apply,
             "schema": schema,
-            "error": "required tables or catalog_products identity unique index missing",
+            "error": SCHEMA_REQUIRED_ERROR,
         }
 
     totals_sql = (
@@ -1087,7 +1096,12 @@ def _seller_domain_for_row(row_dict: Dict[str, Any]) -> str:
     return ""
 
 
-async def _apply(limit: int) -> int:
+async def _apply(limit: int) -> Dict[str, Any]:
+    """Returns ``{"inserted": int, "vertical_guard": dict}``.
+
+    (Was annotated ``-> int`` while returning this dict — every caller already
+    subscripts the result, so the annotation was simply wrong.)
+    """
     # ADR-009 D2: Path B no longer stuffs every crawled brand under the singleton
     # 'external_seed' merchant. Each row now resolves-or-mints its own per-brand
     # observed seller (services/seller_identity.ensure_observed_seller), which

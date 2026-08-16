@@ -68,8 +68,26 @@ _SEEDS = [
     ("s-tie-b", "epid-tie", "GB", "Loser By Id", "active", None, "2026-08-02", "2026-07-01"),
     # -- over-length external_product_id (>128): skipped. Group-invariant filter.
     ("s-long", "e" * 129, "US", "Too Long", "active", None, "2026-08-01", "2026-07-01"),
-    # -- product_key would exceed 255 (prefix is 36 chars): skipped
+    # -- 220 chars: also rejected by the >128 rule. NOTE the second filter,
+    #    length('prod::external_seed::external_seed::' || epid) <= 255, is
+    #    unreachable: the prefix is 36 chars, so it can only trip at epid length
+    #    > 219, which the <= 128 rule already excludes. Both chains carry it, so
+    #    equivalence is unaffected — but no fixture can cover it, and this row
+    #    exercises the length rule, not the product_key rule.
     ("s-longkey", "k" * 220, "US", "Long Key", "active", None, "2026-08-01", "2026-07-01"),
+    # -- status case-folding, BOTH call sites of lower(coalesce(status,'')):
+    #    (a) an 'ACTIVE' seed is active, so it is a mirrorable winner: MISSING
+    ("s-upper-active", "epid-upperactive", "US", "Upper Active", "ACTIVE", None, "2026-08-01", "2026-07-01"),
+    #    (b) a 'Active' carrier attached to a live row suppresses its group, so
+    #        the inlined attached-anti-join must case-fold too: NOT missing
+    ("s-mixed-case-att", "epid-mixedcaseatt", "GB", "Mixed Case Att", "Active", "prod::agent::slug-4", "2026-08-09", "2026-07-01"),
+    ("s-mixed-case-win", "epid-mixedcaseatt", "US", "Mixed Case Win", "active", None, "2026-08-05", "2026-07-01"),
+    # -- market is compared case-SENSITIVELY (`eps.market = 'US'`), so a
+    #    lowercase 'us' row is NOT preferred and the fresher GB row wins. Under
+    #    a case-insensitive comparison the 'us' row would win and its blank
+    #    title would skip the group, so this pins the exact spelling.
+    ("s-lowermkt-us", "epid-lowermkt", "us", "   ", "active", None, "2026-08-05", "2026-07-01"),
+    ("s-lowermkt-gb", "epid-lowermkt", "GB", "Lowercase Market", "active", None, "2026-08-09", "2026-07-01"),
     # -- attached_product_key resolves to a live catalog row => group is present
     #    even though no platform+source_product_id row matches
     ("s-attached", "epid-attached", "US", "Attached", "active", "prod::agent::slug-1", "2026-08-01", "2026-07-01"),
@@ -97,6 +115,12 @@ _CATALOG = [
     ("prod::agent::slug-1", "merch_obs_acme", "shopify", "some-title-slug-1"),
     ("prod::agent::slug-2", "merch_obs_acme", "shopify", "some-title-slug-2"),
     ("prod::agent::slug-3", "merch_obs_acme", "shopify", "some-title-slug-3"),
+    ("prod::agent::slug-4", "merch_obs_acme", "shopify", "some-title-slug-4"),
+    # A DIFFERENT platform whose source_product_id collides with a still-missing
+    # seed's external_product_id. The identity anti-join is scoped to
+    # platform='external_seed', so this must NOT mark epid-solo as mirrored —
+    # drop that literal and a genuinely-missing seed is suppressed forever.
+    ("prod::shopify::collides-with-solo", "merch_obs_acme", "shopify", "epid-solo"),
 ]
 
 # Winners that survive every filter and have no mirror. Written out literally so
@@ -107,6 +131,8 @@ _EXPECTED_MISSING = {
     "epid-nullupd",
     "epid-dangling",
     "epid-inactatt",
+    "epid-upperactive",
+    "epid-lowermkt",
 }
 
 
@@ -272,6 +298,55 @@ async def test_count_helper_returns_the_chain_count(engine) -> None:
     # It must go through the cheap chain, not the report chain.
     assert "DISTINCT ON" in captured["sql"]
     assert "seed_data" not in captured["sql"]
+
+
+@pytest.mark.asyncio
+async def test_signature_count_helper_scopes_all_three_predicates(engine) -> None:
+    """`count_external_seed_mirrors_with_signature()` had no coverage at all.
+
+    Each row below is excluded by exactly ONE of its three predicates, so
+    dropping any one of them changes the count.
+    """
+    import scripts.mirror_external_seeds_to_catalog_products as mirror
+    from sqlalchemy import text
+
+    with engine.begin() as c:
+        for pk, mid, plat, sig in (
+            ("sig-yes-1", "external_seed", "external_seed", "sig_aaa"),  # counted
+            ("sig-yes-2", "external_seed", "external_seed", "sig_bbb"),  # counted
+            ("sig-null", "external_seed", "external_seed", None),        # no sig
+            ("sig-other-merchant", "merch_obs_acme", "external_seed", "sig_ccc"),
+            ("sig-other-platform", "external_seed", "shopify", "sig_ddd"),
+        ):
+            c.execute(
+                text(
+                    "INSERT INTO catalog_products (product_key, merchant_id,"
+                    " platform, source_product_id, pivota_signature_id)"
+                    " VALUES (:pk, :mid, :plat, :pk, :sig)"
+                ),
+                {"pk": pk, "mid": mid, "plat": plat, "sig": sig},
+            )
+
+    class _FakeDB:
+        async def fetch_val(self, sql, values=None):
+            stmt = text(sql)
+            with engine.connect() as c:
+                return c.execute(stmt, values or {}).scalar()
+
+    original = mirror.database
+    mirror.database = _FakeDB()
+    try:
+        count = await mirror.count_external_seed_mirrors_with_signature()
+    finally:
+        mirror.database = original
+        with engine.begin() as c:
+            c.execute(
+                text(
+                    "DELETE FROM catalog_products WHERE product_key LIKE 'sig-%'"
+                )
+            )
+
+    assert count == 2
 
 
 def test_cheap_chain_never_reads_seed_data(engine) -> None:

@@ -107,10 +107,19 @@ async def _count_mirrors_with_signature() -> int:
     return await count_external_seed_mirrors_with_signature()
 
 
-async def _apply_mirror(limit: int) -> int:
+async def _apply_mirror(limit: int) -> Dict[str, Any]:
+    """Passthrough of `_apply`'s `{"inserted": int, "vertical_guard": dict}`."""
     from scripts.mirror_external_seeds_to_catalog_products import _apply
 
     return await _apply(limit)
+
+
+async def _schema_required_error() -> str:
+    from scripts.mirror_external_seeds_to_catalog_products import (
+        SCHEMA_REQUIRED_ERROR,
+    )
+
+    return SCHEMA_REQUIRED_ERROR
 
 
 async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
@@ -147,9 +156,7 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
                 "ok": False,
                 "applied": False,
                 "batch_size": batch_size,
-                "error": (
-                    "required tables or catalog_products identity unique index missing"
-                ),
+                "error": await _schema_required_error(),
                 "schema": schema,
             }
 
@@ -165,8 +172,15 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
                 "missing_after": 0,
             }
 
-        inserted = await _apply_mirror(batch_size)
-        summary = {
+        apply_result = await _apply_mirror(batch_size)
+        # `_apply` returns {"inserted": int, "vertical_guard": dict}. Unwrapping
+        # matters twice over: the raw dict was being logged under a key named
+        # `inserted_catalog_products` (an int on the no-work path above, so the
+        # same key had two types), and the guard it carries was dropped on the
+        # floor by the only caller that runs unattended.
+        inserted = int(apply_result.get("inserted") or 0)
+        vertical_guard = apply_result.get("vertical_guard") or {}
+        summary: Dict[str, Any] = {
             "ok": True,
             "applied": True,
             "batch_size": batch_size,
@@ -176,7 +190,21 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
             "catalog_products_external_seed_with_sig": (
                 await _count_mirrors_with_signature()
             ),
+            "vertical_guard": vertical_guard,
         }
+        # Fix Plan B T3 intake brake, same verdict the CLI `_run` reaches: when
+        # too large a share of the batch carried no machine-readable vertical,
+        # the run is NOT clean. `_run` sets report ok=False (-> non-zero exit);
+        # this job is the caller that actually ingests unattended every 15
+        # minutes, and it used to reach neither that nor the stderr line.
+        if vertical_guard.get("should_fail"):
+            summary["ok"] = False
+            summary["warnings"] = [vertical_guard.get("summary")]
+            logger.warning(
+                "external_seed_materialization: unresolved-vertical intake brake "
+                "tripped (%s); run not treated as clean",
+                vertical_guard.get("summary"),
+            )
         logger.info("external_seed_materialization: %s", summary)
         return summary
     finally:
