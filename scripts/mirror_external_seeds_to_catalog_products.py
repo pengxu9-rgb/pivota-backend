@@ -661,11 +661,66 @@ async def _required_schema() -> Dict[str, Any]:
     }
 
 
-COMMON_CTES = """
+# ---------------------------------------------------------------------------
+# Shared predicate fragments.
+#
+# Two SQL chains derive the SAME candidate set below: COMMON_CTES (the full
+# report — carries every seed column plus the seed_data-derived text) and
+# MISSING_MIRROR_CTES (the cheap "is anything missing?" chain). They MUST agree
+# on which seed row wins its external_product_id group and on which winners are
+# mirrorable, or the cheap chain reports "no work" while the report says there
+# is. These fragments are concatenated into both so a change to the ranking or
+# the candidate filters lands in both by construction — do not inline them.
+#
+# Plain concatenation, never .format()/f-strings: COMMON_CTES contains literal
+# JSON paths like '{snapshot,description}' whose braces would be eaten.
+# ---------------------------------------------------------------------------
+
+def _active_status(alias: str = "") -> str:
+    """The one definition of "this seed is active".
+
+    Deliberately NOT btrimmed and NOT NULL-tolerant beyond `coalesce(..., '')`:
+    a NULL or whitespace-padded status is INACTIVE. Both chains and the report's
+    own `external_active` metric concatenate this, so the case-folding and the
+    coalesce default cannot drift between them — the equivalence tests pin
+    NULL, uppercase and padded statuses against it.
+    """
+    column = f"{alias}.status" if alias else "status"
+    return f"lower(coalesce({column}, '')) = 'active'"
+
+
+# Which seed row represents its external_product_id group: prefer the US market
+# row, then the freshest, with `id` as the final deterministic tiebreak. Used as
+# the row_number() window ORDER BY in COMMON_CTES and as the DISTINCT ON ORDER BY
+# tail in MISSING_MIRROR_CTES; both alias external_product_seeds as `eps`.
+# NOTE `eps.market = 'US'` is case-SENSITIVE: a lowercase 'us' row is not
+# preferred. Pinned by a fixture row rather than left to inference.
+_WINNER_ORDER_BY = """
+        CASE WHEN eps.market = 'US' THEN 0 ELSE 1 END,
+        eps.updated_at DESC NULLS LAST,
+        eps.created_at DESC NULLS LAST,
+        eps.id ASC
+"""
+
+# A group winner is mirrorable only if its identifiers fit the catalog columns
+# (catalog_products.source_product_id is VARCHAR(128), product_key VARCHAR(255))
+# and it carries a title (catalog_products.title is NOT NULL). Selected from the
+# winner CTE in both chains, so column names are unqualified in both.
+_CANDIDATE_FILTERS = """
+    length(external_product_id) <= 128
+    AND length('prod::external_seed::external_seed::' || external_product_id) <= 255
+    AND nullif(btrim(coalesce(title, '')), '') IS NOT NULL
+"""
+
+
+COMMON_CTES = (
+    """
 WITH active_all AS (
   SELECT *
   FROM external_product_seeds
-  WHERE lower(coalesce(status, '')) = 'active'
+  WHERE """
+    + _active_status()
+    + """
 ),
 active_standalone AS (
   SELECT *
@@ -686,12 +741,9 @@ ranked AS (
     eps.*,
     row_number() OVER (
       PARTITION BY eps.external_product_id
-      ORDER BY
-        CASE WHEN eps.market = 'US' THEN 0 ELSE 1 END,
-        eps.updated_at DESC NULLS LAST,
-        eps.created_at DESC NULLS LAST,
-        eps.id ASC
-    ) AS rn,
+      ORDER BY"""
+    + _WINNER_ORDER_BY
+    + """    ) AS rn,
     count(*) OVER (PARTITION BY eps.external_product_id) AS duplicate_count,
     nullif(
       btrim(
@@ -756,10 +808,9 @@ candidates AS (
   SELECT *
   FROM ranked
   WHERE rn = 1
-    AND length(external_product_id) <= 128
-    AND length('prod::external_seed::external_seed::' || external_product_id) <= 255
-    AND nullif(btrim(coalesce(title, '')), '') IS NOT NULL
-),
+    AND"""
+    + _CANDIDATE_FILTERS
+    + """),
 missing AS (
   -- A seed is "missing" only if it has NO mirrored catalog_products row yet,
   -- under EITHER identity: the legacy singleton merchant_id='external_seed'
@@ -799,11 +850,146 @@ missing AS (
     )
 )
 """
+)
+
+
+# ---------------------------------------------------------------------------
+# Cheap missing-mirror chain.
+#
+# Same `missing` set as COMMON_CTES, derived WITHOUT touching seed_data.
+#
+# COMMON_CTES exists to build the full report, so its `ranked` CTE does
+# `SELECT eps.*` plus a dozen `seed_data #>>` extractions per row. That forces
+# Postgres to detoast the whole JSONB column and materialize it through a sort:
+# external_product_seeds is 12,627 rows whose main heap is only ~25 MB, but its
+# TOAST segment is ~207 MB, and none of it is needed to answer "does any active
+# seed still lack a catalog mirror?". Measured on production 2026-08-17: the
+# report chain never once completed in under 69s (mean ~125s, 2,595 calls over
+# 36 days = ~83 hours of database time), while this chain answers the same
+# question in ~0.15s off `idx_catalog_products_source_product_id_lookup` and
+# `catalog_products_pkey`.
+#
+# Derivation, mirroring COMMON_CTES step for step:
+#   * DISTINCT ON (external_product_id) with _WINNER_ORDER_BY == row_number()
+#     OVER (PARTITION BY external_product_id ORDER BY <same>) = 1. Only the
+#     winner's `title` is projected, because that is the one per-row column
+#     _CANDIDATE_FILTERS reads; the two length checks are group-invariant.
+#   * The LEFT JOIN ... WHERE cp.product_key IS NULL anti-join becomes NOT
+#     EXISTS. Equivalent because product_key is catalog_products' primary key,
+#     so it is NULL exactly when no row matched.
+#   * The attached-backlink NOT EXISTS is inlined against external_product_seeds
+#     with the `active_all` status predicate carried onto it.
+# Checked against the report chain on live production data (2026-08-17): same
+# winning seed row for all 11,352 groups, and identical `missing` sets both live
+# and with the identity join forced to miss (9 rows, which does exercise the
+# attached-backlink anti-join). Do NOT over-trust that run: production currently
+# has 0 duplicate external_product_id groups, 0 over-length ids and 0 blank
+# titles, so it could not exercise the winner ranking or the candidate filters
+# at all. tests/test_missing_mirror_count_equivalence_postgres.py is the real
+# proof of those — it constructs the duplicate groups production lacks.
+# ---------------------------------------------------------------------------
+MISSING_MIRROR_CTES = (
+    """
+WITH ranked AS (
+  SELECT DISTINCT ON (eps.external_product_id)
+    eps.external_product_id AS external_product_id,
+    eps.title AS title
+  FROM external_product_seeds eps
+  WHERE """
+    + _active_status("eps")
+    + """
+    AND nullif(btrim(coalesce(eps.external_product_id, '')), '') IS NOT NULL
+  ORDER BY
+    eps.external_product_id,"""
+    + _WINNER_ORDER_BY
+    + """),
+candidates AS (
+  SELECT external_product_id
+  FROM ranked
+  WHERE"""
+    + _CANDIDATE_FILTERS
+    + """),
+missing AS (
+  SELECT c.external_product_id
+  FROM candidates c
+  WHERE NOT EXISTS (
+      SELECT 1
+      FROM catalog_products cp
+      WHERE cp.platform = 'external_seed'
+        AND cp.source_product_id = c.external_product_id
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM external_product_seeds a
+      JOIN catalog_products cp_attached
+        ON cp_attached.product_key = a.attached_product_key
+      WHERE """
+    + _active_status("a")
+    + """
+        AND a.external_product_id = c.external_product_id
+    )
+)
+"""
+)
+
+
+# The single spelling of the schema-preflight failure. Both `_build_report` and
+# the materialization job (which runs `_required_schema()` on its own rather
+# than building a report) surface it, and a caller that hardcoded its own copy
+# would drift silently — the job's tests assert against THIS constant.
+SCHEMA_REQUIRED_ERROR = (
+    "required tables or catalog_products identity unique index missing"
+)
 
 
 async def _fetch_scalar(sql: str, values: Optional[Dict[str, Any]] = None) -> int:
     value = await database.fetch_val(sql, values or {})
     return int(value or 0)
+
+
+async def count_missing_catalog_mirrors() -> int:
+    """How many active seeds still have no catalog mirror.
+
+    Identical to the report's `totals.missing_catalog_products`, but derived
+    from MISSING_MIRROR_CTES instead of building the whole report — see that
+    constant for why. Callers that only need to know whether there is work to
+    do should use this and build the report only when it returns > 0.
+
+    The count is exact rather than bounded by a LIMIT: the DISTINCT ON sort
+    over the (narrow) seed rows dominates and cannot be short-circuited, so a
+    bound would save nothing measurable — production timings are ~0.15s for the
+    exact count vs ~0.11s for LIMIT 1 — while costing operators an honest number
+    in the job's log line.
+    """
+    return await _fetch_scalar(MISSING_MIRROR_CTES + "SELECT count(*) FROM missing")
+
+
+async def count_external_seed_mirrors_with_signature() -> int:
+    """LEGACY-COHORT count: sig_*-carrying rows under the singleton
+    merchant_id='external_seed' bucket.
+
+    Read the name literally — this is NOT "mirrored rows with a signature".
+    ADR-009 D2 moved mirroring onto per-brand observed sellers (merch_obs_*),
+    and MERCHANT_ID is BANNED_BUCKET_MERCHANT_ID, which `_apply` raises on rather
+    than write, so this number is structurally frozen: production reads 0 here
+    while `platform='external_seed' AND pivota_signature_id IS NOT NULL` across
+    all merchants reads 12,298 (measured 2026-08-17).
+
+    Kept exactly as the report's `catalog_products_external_seed_with_sig` total
+    spelled it, so the materialization job's summary key keeps its existing
+    meaning. Changing it to the platform-wide count would be a behaviour change,
+    not a bug fix — decide that separately from the preflight work.
+    """
+    return await _fetch_scalar(
+        """
+        SELECT count(*)
+        FROM catalog_products
+        WHERE merchant_id = :merchant_id
+          AND platform = :platform
+          AND pivota_signature_id IS NOT NULL
+        """,
+        {"merchant_id": MERCHANT_ID, "platform": PLATFORM},
+    )
 
 
 async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[str, Any]:
@@ -813,7 +999,7 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
             "ok": False,
             "apply": apply,
             "schema": schema,
-            "error": "required tables or catalog_products identity unique index missing",
+            "error": SCHEMA_REQUIRED_ERROR,
         }
 
     totals_sql = (
@@ -821,7 +1007,9 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
         + """
         SELECT
           (SELECT count(*) FROM external_product_seeds) AS external_total,
-          (SELECT count(*) FROM external_product_seeds WHERE lower(coalesce(status, '')) = 'active') AS external_active,
+          (SELECT count(*) FROM external_product_seeds WHERE """
+        + _active_status()
+        + """) AS external_active,
           (SELECT count(*) FROM active_all) AS active_all,
           (SELECT count(*) FROM active_standalone) AS active_standalone,
           (SELECT count(*) FROM active_attached) AS active_attached,
@@ -947,7 +1135,12 @@ def _seller_domain_for_row(row_dict: Dict[str, Any]) -> str:
     return ""
 
 
-async def _apply(limit: int) -> int:
+async def _apply(limit: int) -> Dict[str, Any]:
+    """Returns ``{"inserted": int, "vertical_guard": dict}``.
+
+    (Was annotated ``-> int`` while returning this dict — every caller already
+    subscripts the result, so the annotation was simply wrong.)
+    """
     # ADR-009 D2: Path B no longer stuffs every crawled brand under the singleton
     # 'external_seed' merchant. Each row now resolves-or-mints its own per-brand
     # observed seller (services/seller_identity.ensure_observed_seller), which
