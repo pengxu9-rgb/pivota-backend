@@ -319,13 +319,35 @@ def _classify_product(
                 "source row present but title is missing in seed snapshot/top-level "
                 "and no APV title+description fallback is available"
             )
-    elif quality_score is None or quality_score < QUALITY_SCORE_THRESHOLD:
-        blocker_code = "low_quality"
+    # NEVER SCORED and SCORED BADLY are different facts and get different codes.
+    #
+    # They used to share `low_quality`, with the distinction living only in
+    # `blocker_detail` prose. That cost a 53% catalog outage: the ADR-009 A9-4
+    # re-key (2026-08-14) re-consolidated 6,950 content_keys and left 4,882 of
+    # them with a NULL `content_quality_score`, and every dashboard, cohort
+    # count and GROUP BY read the resulting demotion as a quality verdict on
+    # the merchant's page. It was not — those rows carry 99.8% images, 97.1%
+    # price and 554-char average descriptions; they had simply never been
+    # scored. The sitemap-eligible set halved (8,222 -> 3,884 content_keys) and
+    # nothing reported a defect, because "lots of low_quality rows" is exactly
+    # what a healthy pipeline looks like when a thin-content cohort lands.
+    #
+    # `serving_eligible` and `index_eligible` below are computed from the RAW
+    # predicates (`quality_score is not None and >= THRESHOLD`), never from
+    # `blocker_code`, so this split is diagnostic ONLY: an unscored row stays
+    # ineligible exactly as before. That is deliberate and must stay that way —
+    # unmeasured must never buy permission to serve. What changes is that the
+    # unmeasured cohort is now COUNTABLE, so the next mass reset is visible as
+    # itself instead of hiding inside a quality metric.
+    elif quality_score is None:
+        blocker_code = "not_scored"
         blocker_detail = (
-            f"content_quality_score={quality_score} < {QUALITY_SCORE_THRESHOLD}"
-            if quality_score is not None
-            else "no quality snapshot found"
+            "no quality snapshot found (content_quality_score IS NULL) — "
+            "never scored, NOT scored below the bar"
         )
+    elif quality_score < QUALITY_SCORE_THRESHOLD:
+        blocker_code = "low_quality"
+        blocker_detail = f"content_quality_score={quality_score} < {QUALITY_SCORE_THRESHOLD}"
     elif not has_image:
         blocker_code = "no_image"
         blocker_detail = "agent_pdp_view.image_url is null or empty"

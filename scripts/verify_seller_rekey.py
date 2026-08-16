@@ -9,6 +9,9 @@ verdict from the checkpoint table and the live rows, independently:
   still_sentinel   moved rows whose catalog row still carries the banned bucket   (want 0)
   mismatched       moved rows whose merchant differs from the checkpointed target (want 0)
   servable         moved rows admitted by the D2 public gate                      (want == moved)
+  stranded_quality_snapshots
+                   moved rows whose quality score is still addressed by the
+                   merchant they were moved OFF — servable, yet unpublishable  (want 0)
   old_refs_left    identity listings still under 'external_seed:' for moved rows  (want 0)
   new_refs         listings under the new '<observed>:<pid>' refs
   overrides_on_new operator overrides attached to the NEW refs (work preserved)
@@ -43,6 +46,52 @@ SELECT count(*) AS moved,
 FROM moved m
 JOIN catalog_products cp ON cp.product_key = m.pk
 LEFT JOIN catalog_merchants cm ON cm.merchant_id = cp.merchant_id
+"""
+
+# STATE THE RE-KEY STRANDED — the check this verifier was missing on 2026-08-14.
+#
+# `servable` above is the D2 merchant gate (indexable + status + content_key).
+# It is a STRICTLY WEAKER predicate than the one that actually publishes a URL,
+# which also requires `index_pipeline_state.serving_eligible IS TRUE`. So the
+# flip graded `servable: 11099 == moved` — a clean pass — while the
+# sitemap-eligible set was halving underneath it, 8,222 -> 3,884 content_keys.
+#
+# The cause was a cascade MISS, not a bad re-key: `product_quality_snapshot`
+# carries `merchant_id` but scopes products by `(platform, platform_product_id)`
+# rather than product_key/content_key/sku_key, so `discover_cascade_tables`
+# skipped it and `global_residue` files it under `history`. The classifier,
+# however, reads it as CURRENT STATE with a lookup keyed on the row's present
+# owner — so the instant `catalog_products.merchant_id` moved, the score read
+# NULL and the row stopped serving. 6,424 products, every one still holding a
+# perfectly good score under the merchant it was moved off.
+#
+# This query asks the OUTCOME question instead of re-litigating which tables are
+# ownership and which are history: is a moved row unscored HERE while its score
+# sits under the exact merchant the checkpoint moved it off? That is provable
+# from the checkpoint alone, needs no table taxonomy, and catches any future
+# dependent stranded the same way. Want 0.
+Q_STRANDED_QUALITY = """
+WITH moved AS (
+  SELECT ref_id AS pk, observed_id, previous_value
+  FROM a9_4_backfill_checkpoint
+  WHERE phase = 'catalog' AND status = 'done'
+    AND previous_value IS NOT NULL AND observed_id IS NOT NULL
+    AND previous_value <> observed_id)
+SELECT count(*) AS stranded_quality_snapshots
+FROM moved m
+JOIN catalog_products cp ON cp.product_key = m.pk
+WHERE cp.merchant_id = m.observed_id
+  AND cp.platform IS NOT NULL AND cp.source_product_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM product_quality_snapshot p
+       WHERE p.platform = cp.platform
+         AND p.platform_product_id = cp.source_product_id
+         AND p.merchant_id = m.observed_id)
+  AND EXISTS (
+      SELECT 1 FROM product_quality_snapshot p
+       WHERE p.platform = cp.platform
+         AND p.platform_product_id = cp.source_product_id
+         AND p.merchant_id = m.previous_value)
 """
 
 Q2 = """
@@ -158,6 +207,7 @@ async def main() -> int:
     try:
         r1 = dict(await database.fetch_one(Q1))
         r2 = dict(await database.fetch_one(Q2))
+        stranded = dict(await database.fetch_one(Q_STRANDED_QUALITY))
         lanes = {dict(r)["lane"]: dict(r)["remaining"]
                  for r in await database.fetch_all(SENTINEL_LANES)}
         glob = await global_residue(database)
@@ -171,6 +221,13 @@ async def main() -> int:
         failures.append(f"mismatched={r1['mismatched']}")
     if r1["servable"] != r1["moved"]:
         failures.append(f"servable={r1['servable']} != moved={r1['moved']}")
+    if stranded["stranded_quality_snapshots"]:
+        # Not cosmetic: each of these is a row that still passes `servable` and
+        # still cannot be published, because its quality score is addressed by a
+        # merchant it no longer has.
+        failures.append(
+            f"stranded_quality_snapshots={stranded['stranded_quality_snapshots']}"
+        )
     if r2["old_refs_left"]:
         failures.append(f"old_refs_left={r2['old_refs_left']}")
     if r2["pgm_banned_left"]:
@@ -179,6 +236,7 @@ async def main() -> int:
 
     print(json.dumps({"verdict": "FAIL" if failures else "OK",
                       "failures": failures, "rows": r1, "cascades": r2,
+                      "stranded_state": stranded,
                       "sentinel_lanes_remaining": lanes,
                       "global_sentinel_residue": glob}, indent=1))
     return 1 if failures else 0

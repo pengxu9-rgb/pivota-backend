@@ -86,6 +86,25 @@ pytestmark = pytest.mark.skipif(
 # (external_product_seeds) and 098 (index_pipeline_state) because PREPARE
 # resolves parameter types THROUGH the column types — see KNOWN LIMIT above.
 _LIGHTWEIGHT_DDL = """
+-- The A9-4 checkpoint is created at RUNTIME by ensure_checkpoint_table, so it
+-- is not on the shared MetaData and metadata.create_all cannot provision it.
+-- The re-key verifier and the quality-snapshot repair both plan against it, and
+-- an unplannable statement in either is a grader that crashes instead of
+-- grading. Declared minimally here for the same reason as everything else in
+-- this block: PREPARE needs the shape, not the data.
+CREATE TABLE IF NOT EXISTS a9_4_backfill_checkpoint (phase text, ref_id text);
+ALTER TABLE a9_4_backfill_checkpoint ADD COLUMN IF NOT EXISTS observed_id text;
+ALTER TABLE a9_4_backfill_checkpoint ADD COLUMN IF NOT EXISTS previous_value text;
+ALTER TABLE a9_4_backfill_checkpoint ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE a9_4_backfill_checkpoint ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+
+-- Identity-listing trio the re-key verifier's cascade query counts against.
+CREATE TABLE IF NOT EXISTS pdp_identity_listing (product_id text);
+ALTER TABLE pdp_identity_listing ADD COLUMN IF NOT EXISTS merchant_id text;
+ALTER TABLE pdp_identity_listing ADD COLUMN IF NOT EXISTS source_listing_ref text;
+CREATE TABLE IF NOT EXISTS pdp_identity_override (source_listing_ref text);
+CREATE TABLE IF NOT EXISTS pdp_identity_review_queue (source_listing_ref text);
+
 CREATE TABLE IF NOT EXISTS external_product_seeds (id text);
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS market text;
@@ -487,6 +506,34 @@ def _collect_us_market_capture() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_a9_4_quality_repair() -> List[Tuple[str, str]]:
+    """The repair REWRITES a merchant column, so an unplannable statement here
+    aborts mid-repair and leaves the cohort half-restored — the worst of both
+    states. COHORT_SQL is also the tool's entire safety argument, so it has to
+    plan on the production dialect before it is ever allowed to select rows."""
+    import scripts.repair_a9_4_orphaned_quality_snapshots as module
+
+    origin = "repair_a9_4_orphaned_quality_snapshots"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "COHORT_SQL", "REPOINT_SQL", "DONOR_ROWS_SQL",
+        )
+    ]
+
+
+def _collect_verify_seller_rekey() -> List[Tuple[str, str]]:
+    """The grader's own statements. An unplannable one here means the verifier
+    crashes instead of grading — which reads as "no failures reported"."""
+    import scripts.verify_seller_rekey as module
+
+    origin = "verify_seller_rekey"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "Q1", "Q2", "Q_STRANDED_QUALITY", "SENTINEL_LANES", "SELLER_COLUMNS_SQL",
+        )
+    ]
+
+
 def _collect_reattribution() -> List[Tuple[str, str]]:
     """The re-attribution script WRITES (rekey + republish), so an unplannable
     statement here is an aborted repair mid-run, not just a wrong report."""
@@ -585,6 +632,8 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
     "scripts/capture_us_market_offers.py": _collect_us_market_capture,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
+    "scripts/repair_a9_4_orphaned_quality_snapshots.py": _collect_a9_4_quality_repair,
+    "scripts/verify_seller_rekey.py": _collect_verify_seller_rekey,
 }
 
 # What each collector yields TODAY, not a slack lower bound. Guards the failure
@@ -606,6 +655,8 @@ _MIN_STATEMENTS = {
     "scripts/reattribute_orphaned_enrichment.py": 8,
     "scripts/capture_us_market_offers.py": 2,
     "scripts/report_quality_scale_population.py": 5,
+    "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
+    "scripts/verify_seller_rekey.py": 5,
 }
 
 

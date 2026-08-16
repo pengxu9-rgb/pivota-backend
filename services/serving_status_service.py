@@ -25,6 +25,9 @@ BLOCKER_CODE_TO_REASON: Dict[str, str] = {
     "no_seed": "We're still preparing this product for AI shopping agents. Re-sync if it doesn't appear shortly.",
     "no_extraction": "We couldn't read this product's details. Make sure it has a clear title and description, then re-sync.",
     "low_quality": "This product page is too thin for shopping agents to recommend confidently. Add a fuller description, a clear image, and key details.",
+    # Distinct from low_quality on purpose: we have not scored this page yet, so
+    # telling the merchant their content is thin would be a false accusation.
+    "not_scored": "We're still scoring this product for AI shopping agents. No action needed — this usually resolves on its own shortly.",
     "no_image": "This product has no image. Add a product photo so shopping agents can show it.",
     "no_price": "This product has no price. Add a price so shopping agents can quote and check it out.",
     "short_description": "This product's description is too short. Add a few sentences describing what it is and who it's for.",
