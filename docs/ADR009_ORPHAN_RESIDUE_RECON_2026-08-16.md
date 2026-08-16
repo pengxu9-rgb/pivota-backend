@@ -101,6 +101,10 @@ elected catalog row and self-heals). Global residue as measured:
 ### product_enrichment = 8 → **(b) via the existing primitive** (`scripts/reattribute_orphaned_enrichment.py`)
 - All 8: same platform, same `source_product_id`, product exists under
   `merch_obs_*` (3 sellers), **target identity vacant**, all carry bullets.
+  Re-measured by the hardened tool 2026-08-16: `n_cache_rows=0`,
+  `target_occupied=false`, `n_orphans_to_same_target=1`, `has_content=true` on
+  all 8 — i.e. every H0 precondition now comes from the recon itself rather
+  than a side probe.
   This is exactly the tool's H0 (cross-merchant exact id, restricted to
   `external_seed`) with bilateral uniqueness and vacancy satisfied. Re-checked
   2026-08-16 against the tool's OWN preconditions: `products_cache` holds 0 rows
@@ -116,7 +120,9 @@ elected catalog row and self-heals). Global residue as measured:
 ### pdp_identity_listing = 103 → **(b) migrate refs, optional / lowest priority** (alt: leave as history)
 - `product_id` matches no catalog row's `source_product_id`; every one matches a
   seed that is `inactive` (102) or `review_blocked` (1), **unattached**, with
-  `seller_ref = merch_obs_*` (7 sellers). Nothing serves them today.
+  `seller_ref = merch_obs_*` (7 sellers). Nothing serves them today —
+  independently confirmed by the hardened tool: `n_seeds_active = 0` and
+  `n_seeds_attached_unsuppressed = 0` for all 103.
 - Operator work attached: 91 active `approve_live_read`, 18 active
   `force_review_required`, 10 inactive. `new-ref` conflict check
   (`<seller_ref>:<product_id>` already present): **0**.
