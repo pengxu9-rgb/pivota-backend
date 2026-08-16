@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,7 @@ from db.product_quality_backfill_jobs import (
     claim_quality_backfill_job,
     complete_quality_backfill_job,
     get_quality_backfill_job,
+    requeue_quality_backfill_job,
     update_quality_backfill_job_progress,
 )
 from db.products import get_cached_products, products_cache
@@ -172,6 +174,17 @@ async def _process_claimed_quality_backfill_job(job: Dict[str, Any]) -> Dict[str
             errors_sample=errors_sample,
         )
         return completed or job
+    except asyncio.CancelledError:
+        # Cancelled mid-run (scheduler run deadline / shutdown — issue #1754):
+        # do NOT strand the row in `running`, which nothing else recovers.
+        # Best-effort requeue; the next tick resumes it (scored products are
+        # skipped), then let the cancellation propagate.
+        try:
+            await requeue_quality_backfill_job(job_id)
+            logger.warning("Quality backfill job %s cancelled mid-run; requeued", job_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Quality backfill job %s cancelled; requeue failed", job_id, exc_info=True)
+        raise
     except Exception as exc:
         logger.exception("Quality backfill job %s failed", job_id)
         failed += 1

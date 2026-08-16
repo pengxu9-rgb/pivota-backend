@@ -68,7 +68,11 @@ def _ensure_worker() -> None:
         _QUEUE_LOOP = loop
         _WORKER = None
     if _WORKER is None or _WORKER.done():
-        _WORKER = loop.create_task(_flush_loop(_QUEUE))
+        # Fresh context => own `databases` Connection (issue #1754): this
+        # singleton is spawned from whatever request/job first enqueues and
+        # must not inherit — and then keep alive — that context's Connection.
+        from services.scheduler_job_runner import spawn_isolated
+        _WORKER = spawn_isolated(_flush_loop(_QUEUE), name="agent_decision_event_flush")
 
 
 async def _enqueue(op: str, payload: Dict[str, Any]) -> None:

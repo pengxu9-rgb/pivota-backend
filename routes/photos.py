@@ -498,7 +498,9 @@ def start_photo_cleanup_loop() -> None:
         return
     if _photo_cleanup_task and not _photo_cleanup_task.done():
         return
-    _photo_cleanup_task = loop.create_task(_photo_cleanup_loop())
+    # Fresh context => own `databases` Connection (issue #1754).
+    from services.scheduler_job_runner import spawn_isolated
+    _photo_cleanup_task = spawn_isolated(_photo_cleanup_loop(), name="photo_cleanup_loop")
 
 
 async def _run_qc(upload_id: str) -> None:

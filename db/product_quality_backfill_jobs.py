@@ -274,6 +274,29 @@ async def requeue_stale_quality_backfill_jobs(
         return 0
 
 
+async def requeue_quality_backfill_job(job_id: str) -> bool:
+    """Put ONE running job back to `queued` (issue #1754 follow-up).
+
+    The scheduler now bounds every run by a deadline and cancels it on
+    expiry; a CancelledError bypasses the tick's `except Exception ->
+    status='failed'` path, and nothing in production requeues a `running`
+    row (`requeue_stale_quality_backfill_jobs` is only called by the dormant
+    jobs/product_quality_backfill_worker loop). Without this the merchant's
+    job would sit `running` forever and never become audit-ready. Products
+    that already have scores are skipped on the re-run (`missing_only`), so a
+    requeued job resumes cheaply rather than starting over.
+    """
+    await ensure_product_quality_backfill_jobs_table()
+    query = """
+    UPDATE product_quality_backfill_jobs
+    SET status = 'queued', started_at = NULL, finished_at = NULL
+    WHERE job_id = :job_id AND status = 'running'
+    RETURNING job_id
+    """
+    row = await database.fetch_one(query, {"job_id": job_id})
+    return row is not None
+
+
 async def update_quality_backfill_job_progress(
     job_id: str,
     *,
