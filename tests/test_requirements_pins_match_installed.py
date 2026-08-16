@@ -34,18 +34,27 @@ _REQUIREMENTS = Path(__file__).resolve().parent.parent / "requirements.txt"
 
 # name==version, tolerating extras (`uvicorn[standard]==1.2`) and trailing
 # comments. Anything that is not an exact pin (`<`, `>=`, unpinned) is skipped —
-# those are deliberately allowed to float.
-_EXACT_PIN = re.compile(r"^\s*([A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*==\s*([^\s;#]+)")
+# those are deliberately allowed to float. The name must START alphanumeric so a
+# pip option line (`--only-binary==:all:`) is not parsed as a package.
+_EXACT_PIN = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([^\s;#]+)")
+
+
+def _normalize(name: str) -> str:
+    """PEP 503 name normalization. `SQLAlchemy`, `sqlalchemy` and `python_pptx`
+    are the same distribution; keying on the raw requirements.txt spelling would
+    make a cosmetic rename (e.g. what `pip-compile` emits) look like a dropped
+    pin."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def _exact_pins() -> dict[str, str]:
+    """{normalized name: pinned version}. `importlib.metadata.version()` accepts
+    any spelling, so normalizing here loses nothing."""
     pins: dict[str, str] = {}
     for line in _REQUIREMENTS.read_text(encoding="utf-8").splitlines():
-        if line.lstrip().startswith("#"):
-            continue
         m = _EXACT_PIN.match(line)
         if m:
-            pins[m.group(1)] = m.group(2)
+            pins[_normalize(m.group(1))] = m.group(2)
     return pins
 
 
@@ -54,7 +63,7 @@ def test_requirements_txt_declares_the_pins_this_guard_exists_for():
     being exact pins, this file's premise is gone and someone must revisit it —
     rather than the check quietly narrowing to nothing."""
     pins = _exact_pins()
-    for name in ("databases", "SQLAlchemy"):
+    for name in ("databases", "sqlalchemy"):
         assert name in pins, (
             f"{name} is no longer an exact `==` pin in requirements.txt. "
             "tests/test_scheduler_job_isolation.py depends on the pinned "
