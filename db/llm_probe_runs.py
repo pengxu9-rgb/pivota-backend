@@ -36,6 +36,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 
+from db._ddl_guard import apply_ddl_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -129,15 +130,12 @@ async def ensure_llm_probe_runs_table() -> None:
     async with _DDL_LOCK:
         if _DDL_READY:
             return
-        for stmt in _DDL_STATEMENTS:
-            try:
-                await database.execute(stmt)
-            except Exception as exc:
-                logger.debug(
-                    "ensure_llm_probe_runs_table skip stmt: %s | %s",
-                    str(exc)[:120], stmt[:80],
-                )
-        _DDL_READY = True
+        _DDL_READY = await apply_ddl_statements(
+            _DDL_STATEMENTS,
+            label="ensure_llm_probe_runs_table",
+            logger=logger,
+            execute=database.execute,
+        )
 
 
 def _now_utc() -> datetime:

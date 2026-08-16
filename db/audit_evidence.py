@@ -39,6 +39,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
+from db._ddl_guard import apply_ddl_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
@@ -591,22 +592,26 @@ _DDL_STATEMENTS = [
 async def ensure_audit_evidence_tables() -> None:
     """Per-statement-tolerant backstop. Postgres prod runs the .sql
     migration directly; this inline DDL covers hermetic test envs
-    where partial-index syntax isn't supported (matches P2.1/P3.1)."""
+    where partial-index syntax isn't supported (matches P2.1/P3.1).
+
+    A pass in which any statement failed does NOT memoize, so a
+    transient failure (e.g. a CREATE INDEX cut by the statement
+    timeout while blocked on a lock) retries on a later call rather
+    than leaving a UNIQUE idempotency index silently absent for the
+    process lifetime. Retries are paced by wall time and carry only
+    the statements that failed. See db/_ddl_guard.py."""
     global _DDL_READY
     if _DDL_READY:
         return
     async with _DDL_LOCK:
         if _DDL_READY:
             return
-        for stmt in _DDL_STATEMENTS:
-            try:
-                await database.execute(stmt)
-            except Exception as exc:
-                logger.debug(
-                    "ensure_audit_evidence_tables skip stmt: %s | %s",
-                    str(exc)[:120], stmt[:80],
-                )
-        _DDL_READY = True
+        _DDL_READY = await apply_ddl_statements(
+            _DDL_STATEMENTS,
+            label="ensure_audit_evidence_tables",
+            logger=logger,
+            execute=database.execute,
+        )
 
 
 def _now_utc() -> datetime:
