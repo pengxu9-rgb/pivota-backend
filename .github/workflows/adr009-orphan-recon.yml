@@ -43,7 +43,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: Recon (read-only; prints JSON)
-        run: >
-          python -m scripts.recon_sentinel_orphans
-          --also-history "${{ github.event.inputs.also_history }}"
-          --sample "${{ github.event.inputs.sample }}"
+        # Inputs reach the shell as environment variables, never as text
+        # interpolated into the run body (tests/test_workflow_no_run_body_interpolation.py).
+        env:
+          RECON_ALSO_HISTORY: ${{ inputs.also_history }}
+          RECON_SAMPLE: ${{ inputs.sample }}
+        run: |
+          python -m scripts.recon_sentinel_orphans \
+            --also-history "$RECON_ALSO_HISTORY" \
+            --sample "$RECON_SAMPLE"
