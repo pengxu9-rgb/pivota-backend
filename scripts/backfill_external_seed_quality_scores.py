@@ -38,6 +38,8 @@ from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from db.database import database
+from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many
+from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
 from services.product_quality_service import (
     build_quality_payload,
     full_quality_eval,
@@ -46,15 +48,13 @@ from services.product_quality_service import (
 
 logger = logging.getLogger(__name__)
 
-# Keep in sync with services/index_pipeline_state_service.QUALITY_SCORE_THRESHOLD.
-QUALITY_SCORE_THRESHOLD = 65
-
 # One row per catalog_products row (not per content_key): a content_key can carry
 # several source listings, and the classifier elects a winner among them, so every
 # candidate row needs a snapshot for the elected one to be scored.
 COHORT_SQL = """
 SELECT
     ips.content_key,
+    cp.product_key,
     cp.merchant_id,
     cp.platform,
     cp.source_product_id,
@@ -62,7 +62,8 @@ SELECT
     COALESCE(NULLIF(apv.description, ''), NULLIF(cp.description, ''), '') AS description,
     COALESCE(NULLIF(apv.brand, ''), NULLIF(cp.brand, ''), '')             AS brand,
     COALESCE(NULLIF(apv.image_url, ''), NULLIF(cp.image_url, ''), '')     AS image_url,
-    apv.price_min                                                         AS price,
+    -- Same price the gate reads for has_price, with the PDP view as fallback.
+    COALESCE(offer.list_price, apv.price_min)                             AS price,
     COALESCE(NULLIF(cp.product_type, ''), NULLIF(cp.category, ''), '')    AS product_type,
     apv.bullet_points                                                     AS bullet_points,
     apv.usage_scenarios                                                   AS usage_scenarios,
@@ -75,8 +76,18 @@ JOIN catalog_products cp
   ON cp.content_key = ips.content_key
 LEFT JOIN agent_pdp_view apv
   ON apv.content_key = ips.content_key
-WHERE ips.content_quality_score IS NULL
-  AND ips.blocker_code = 'low_quality'
+LEFT JOIN LATERAL (
+    SELECT co.list_price
+    FROM catalog_offers co
+    WHERE co.product_key = cp.product_key
+      AND co.list_price > 0
+    ORDER BY co.list_price ASC
+    LIMIT 1
+) offer ON true
+-- Keyed on the blocker, not on a NULL score: a row that was already scored
+-- from an incomplete payload carries a stale number that must be recomputed
+-- too, and a genuinely thin row simply stays blocked on the new score.
+WHERE ips.blocker_code = 'low_quality'
   AND cp.source_product_id IS NOT NULL
   AND cp.merchant_id IS NOT NULL
   AND cp.platform IS NOT NULL
@@ -90,6 +101,24 @@ def _coerce_list(value: Any) -> List[Any]:
     return []
 
 
+def _coerce_price(value: Any) -> Optional[float]:
+    """Hand the scorer a float, never a Decimal.
+
+    `price_ok` in product_quality_service is
+    `isinstance(price_value, (int, float)) and price_value > 0`, and NUMERIC
+    columns arrive from asyncpg as `Decimal` — which is not an int or a float,
+    so a perfectly good price scores 0. That one component is the difference
+    between 66.7 and 83.3 against a 71.4 threshold, i.e. between the whole
+    cohort staying blocked and clearing the gate.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     """Assemble the scorer payload from the same content the serving layer shows."""
     product_data = {
@@ -97,7 +126,7 @@ def _build_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         "description": row.get("description") or "",
         "brand": row.get("brand") or "",
         "image_url": row.get("image_url") or "",
-        "price": row.get("price"),
+        "price": _coerce_price(row.get("price")),
         "product_type": row.get("product_type") or "",
     }
     enrichment = {
@@ -145,6 +174,7 @@ async def run(*, apply: bool, limit: Optional[int]) -> Dict[str, Any]:
         would_stay_blocked = 0
         applied = 0
         failed = 0
+        scored_product_keys: List[str] = []
 
         for row in rows:
             payload = _build_payload(row)
@@ -172,6 +202,7 @@ async def run(*, apply: bool, limit: Optional[int]) -> Dict[str, Any]:
                     payload=payload,
                 )
                 applied += 1
+                scored_product_keys.append(str(row["product_key"]))
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 logger.warning(
@@ -182,6 +213,17 @@ async def run(*, apply: bool, limit: Optional[int]) -> Dict[str, Any]:
                     exc,
                 )
 
+        # recompute_serving_eligibility only rewrites index_pipeline_state. The
+        # column the serving surface actually reads is
+        # catalog_row_trust.serving_decision, which is derived separately — so a
+        # score that never reaches the trust row flips nothing a shopper can see.
+        trust_rows_written = 0
+        if apply and scored_product_keys:
+            trust_rows_written = await upsert_catalog_row_trust_many(
+                db=database,
+                product_keys=scored_product_keys,
+            )
+
         summary = {
             "mode": "apply" if apply else "dry_run",
             "rows_examined": len(rows),
@@ -189,6 +231,7 @@ async def run(*, apply: bool, limit: Optional[int]) -> Dict[str, Any]:
             "would_become_serving_eligible": would_pass,
             "would_stay_blocked": would_stay_blocked,
             "snapshots_written": applied,
+            "trust_rows_written": trust_rows_written,
             "failures": failed,
         }
         return summary
