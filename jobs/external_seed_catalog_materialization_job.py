@@ -85,18 +85,26 @@ async def _release_materialization_lock() -> None:
         logger.warning("external_seed_materialization: advisory unlock failed: %s", exc)
 
 
-def _missing_count(report: Dict[str, Any]) -> int:
-    totals = report.get("totals") or {}
-    try:
-        return int(totals.get("missing_catalog_products") or 0)
-    except (TypeError, ValueError):
-        return 0
+async def _required_schema() -> Dict[str, Any]:
+    from scripts.mirror_external_seeds_to_catalog_products import _required_schema as _schema
+
+    return await _schema()
 
 
-async def _build_mirror_report(*, sample_limit: int, limit: int, apply: bool):
-    from scripts.mirror_external_seeds_to_catalog_products import _build_report
+async def _count_missing_mirrors() -> int:
+    from scripts.mirror_external_seeds_to_catalog_products import (
+        count_missing_catalog_mirrors,
+    )
 
-    return await _build_report(sample_limit=sample_limit, limit=limit, apply=apply)
+    return await count_missing_catalog_mirrors()
+
+
+async def _count_mirrors_with_signature() -> int:
+    from scripts.mirror_external_seeds_to_catalog_products import (
+        count_external_seed_mirrors_with_signature,
+    )
+
+    return await count_external_seed_mirrors_with_signature()
 
 
 async def _apply_mirror(limit: int) -> int:
@@ -111,6 +119,15 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
     The mirror script owns the write contract and is idempotent. This wrapper
     only schedules it in small batches after crawl/backfill sessions create
     fresh external_product_seeds rows.
+
+    The tick decides whether there is work with the mirror script's cheap
+    `count_missing_catalog_mirrors()` (~0.15s), never by building the full
+    report. It used to call `_build_report(sample_limit=0)` purely to read
+    `totals.missing_catalog_products`, which meant every quiet tick paid a full
+    seed_data-detoasting report build — measured on production 2026-08-17 at a
+    ~125s mean that never once completed under 69s, ~83 hours of database time
+    over 36 days, on a seed table that has been flat since 2026-07-20. Nothing
+    here consumed the rest of the report, so nothing else needs it.
     """
     if not _is_enabled():
         return {"ok": True, "skipped": "disabled", "applied": False}
@@ -121,25 +138,22 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
         return {"ok": True, "skipped": "lock_not_acquired", "applied": False}
 
     try:
-        before = await _build_mirror_report(
-            sample_limit=0,
-            limit=batch_size,
-            apply=False,
-        )
-        if not before.get("ok"):
+        schema = await _required_schema()
+        if not schema.get("ok"):
             logger.warning(
-                "external_seed_materialization: preflight failed: %s",
-                before.get("error") or before,
+                "external_seed_materialization: preflight failed: %s", schema,
             )
             return {
                 "ok": False,
                 "applied": False,
                 "batch_size": batch_size,
-                "error": before.get("error") or "preflight_failed",
-                "schema": before.get("schema"),
+                "error": (
+                    "required tables or catalog_products identity unique index missing"
+                ),
+                "schema": schema,
             }
 
-        missing_before = _missing_count(before)
+        missing_before = await _count_missing_mirrors()
         if missing_before <= 0:
             logger.info("external_seed_materialization: no missing mirrors")
             return {
@@ -152,21 +166,15 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
             }
 
         inserted = await _apply_mirror(batch_size)
-        after = await _build_mirror_report(
-            sample_limit=0,
-            limit=batch_size,
-            apply=True,
-        )
-        missing_after = _missing_count(after)
         summary = {
-            "ok": bool(after.get("ok")),
+            "ok": True,
             "applied": True,
             "batch_size": batch_size,
             "missing_before": missing_before,
             "inserted_catalog_products": inserted,
-            "missing_after": missing_after,
+            "missing_after": await _count_missing_mirrors(),
             "catalog_products_external_seed_with_sig": (
-                (after.get("totals") or {}).get("catalog_products_external_seed_with_sig")
+                await _count_mirrors_with_signature()
             ),
         }
         logger.info("external_seed_materialization: %s", summary)

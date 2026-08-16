@@ -254,7 +254,9 @@ async def catalog_products_invariants(
     _: None = Depends(require_admin_key),
 ) -> Dict[str, Any]:
     """Audit invariants for external seed -> catalog_products migration."""
-    from scripts.mirror_external_seeds_to_catalog_products import COMMON_CTES
+    from scripts.mirror_external_seeds_to_catalog_products import (
+        count_missing_catalog_mirrors,
+    )
 
     legacy_external_seed_catalog_rows = await database.fetch_val(
         """
@@ -289,13 +291,10 @@ async def catalog_products_invariants(
         ) d
         """
     )
-    missing_external_mirror = await database.fetch_val(
-        COMMON_CTES
-        + """
-        SELECT count(*)
-        FROM missing
-        """
-    )
+    # Same number the report's totals.missing_catalog_products carries, off the
+    # cheap chain: this endpoint wants the count, not the seed_data-derived
+    # columns COMMON_CTES exists to build (~50s vs ~0.15s on production).
+    missing_external_mirror = await count_missing_catalog_mirrors()
     null_category_path = await database.fetch_val(
         """
         SELECT count(*)
