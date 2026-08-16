@@ -518,6 +518,21 @@ def _collect_a9_4_quality_repair() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_dispose_sentinel_orphans() -> List[Tuple[str, str]]:
+    """The disposition tool RE-KEYS and DELETES production rows; an unplannable
+    statement is an aborted run with a partially-disposed table. Its two write
+    statements and both population reads are driven here."""
+    import scripts.dispose_sentinel_orphans as module
+
+    origin = "dispose_sentinel_orphans"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "OFFERS_SQL", "REVIEWS_SQL", "BUCKET_SQL",
+            "OFFERS_REKEY_SQL", "REVIEWS_DELETE_SQL",
+        )
+    ]
+
+
 # NOT covered: scripts/verify_seller_rekey.py. Its Q2 counts against
 # pdp_identity_listing / _override / _review_queue, and provisioning those here
 # breaks later gate files — `test_quarantine_domain_chain_postgres` issues a
@@ -626,6 +641,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
     "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
     "scripts/capture_us_market_offers.py": _collect_us_market_capture,
+    "scripts/dispose_sentinel_orphans.py": _collect_dispose_sentinel_orphans,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": _collect_a9_4_quality_repair,
 }
@@ -648,6 +664,7 @@ _MIN_STATEMENTS = {
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
     "scripts/capture_us_market_offers.py": 2,
+    "scripts/dispose_sentinel_orphans.py": 5,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
 }

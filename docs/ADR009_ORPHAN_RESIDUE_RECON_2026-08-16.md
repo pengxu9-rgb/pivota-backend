@@ -181,7 +181,29 @@ confirmed to die under mutation. Fixed in the same PR:
   raised `CannotCoerceError` on the live run. Cast added; the gate fixture now
   uses `json` to match prod.
 
-## Proposed disposition tool (task 3, only after founder gates the above)
+## Execution (founder gated 2026-08-17)
+Built as `scripts/dispose_sentinel_orphans.py` + `.github/workflows/adr009-orphan-dispose.yml`
+(dry-run default; `apply=true` is a separate dispatch). Prod dry-run 2026-08-17:
+all doors pass, 12 offers plan onto 6 distinct `merch_obs_*` sellers, 9 reviews
+dumped with 6 cascaded `media_assets`.
+
+On the one review that does not read like a canary: id 9320 "Eczema improvement
+question" is the `needs_human_review` arm of the same battery — its own body
+ends "please review before showing this", same product, same guest-actor
+pattern, same three-minute window as the other eight, and its risk_flags carry
+`moderation_decision: needs_human_review` with `employee_review_queue: true`.
+Deleting it also removes that one item from the employee review queue.
+
+The verifier change ships in the same PR: ownership counts only rows whose
+scope key is NOT NULL; NULL-scope sentinel rows move to a reported `unscoped`
+bucket. After the apply, expected verdict OK with `unscoped` = evidence_items 5,
+action_plan_items 2, niche_target_outcomes 317.
+
+The writer is hardened in the same PR: `capture_us_market_offers` now reads the
+seller from the catalog row inside the upsert (both the insert and the
+ON CONFLICT refresh), so the TOCTOU cannot recur.
+
+## Original proposal (superseded by the section above)
 `scripts/dispose_sentinel_orphans.py --tables catalog_offers,product_reviews [--apply]`
 - dry-run default; per-table transaction; every row about to change/delete
   printed as JSON before the write; doors: bucket must be 0, every offer's

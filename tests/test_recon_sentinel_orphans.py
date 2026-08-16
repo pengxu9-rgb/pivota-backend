@@ -26,9 +26,13 @@ def _assert_binds_match(sql, params):
 class FakeDB:
     """schema: {table: [(column, data_type)]}; residue: {table: n}."""
 
-    def __init__(self, schema, residue):
+    def __init__(self, schema, residue, scoped=None, unscoped=None):
         self.schema = schema
         self.residue = residue
+        # scoped/unscoped default to "all rows are scoped", so a test that does
+        # not care about the split keeps the pre-split behaviour.
+        self.scoped = scoped or {}
+        self.unscoped = unscoped or {}
         self.statements = []
 
     async def execute(self, sql, params=None):  # pragma: no cover - must never run
@@ -71,6 +75,22 @@ class FakeDB:
         _assert_binds_match(sql, params)
         flat = " ".join(sql.split())
         self.statements.append((flat, dict(params or {})))
+        # The verifier's scope-column probe: which product-scope key the table
+        # carries, driving the ownership/unscoped split.
+        if "information_schema.columns" in flat and "content_key" in flat:
+            cols = [c for c, _ in self.schema.get(params["table"], [])]
+            for cand in ("product_key", "content_key", "sku_key"):
+                if cand in cols:
+                    return {"column_name": cand}
+            return None
+        # The scoped/unscoped count for a product-scoped table.
+        m = re.match(r"SELECT count\(\*\) FILTER \(WHERE (\w+) IS NOT NULL\) AS scoped, "
+                     r"count\(\*\) FILTER \(WHERE \w+ IS NULL\) AS unscoped FROM (\w+) "
+                     r"WHERE (\w+) = :banned", flat)
+        if m:
+            table = m.group(2)
+            return {"scoped": self.scoped.get(table, self.residue.get(table, 0)),
+                    "unscoped": self.unscoped.get(table, 0)}
         m = re.match(r"SELECT count\(\*\) AS c FROM (\w+) WHERE (\w+) = :banned", flat)
         assert m, f"unexpected fetch_one: {flat}"
         return {"c": self.residue.get(m.group(1), 0)}
@@ -159,3 +179,23 @@ def test_identifier_guard_refuses_injection_shaped_names():
         with pytest.raises(RuntimeError):
             recon._ident(bad)
     assert recon._ident("catalog_offers") == "catalog_offers"
+
+
+def test_unscoped_tables_are_classified_too_and_a_split_table_reports_both_halves():
+    """The verifier stops FAILING NULL-scope rows; the recon must not stop
+    SHOWING them, or the tenant rows become invisible the moment they are
+    forgiven. A table holding both halves keeps the ownership label (that is
+    the half an operator must act on) and carries the split alongside."""
+    residue = dict(RESIDUE, evidence_items=7)
+    schema = dict(SCHEMA, evidence_items=[("product_key", TEXT), ("merchant_id", TEXT)])
+    # 5 of the 7 evidence_items rows carry a NULL product_key; niche is all-NULL.
+    db = FakeDB(schema, residue,
+                scoped={"evidence_items": 2, "niche_target_outcomes": 0},
+                unscoped={"evidence_items": 5, "niche_target_outcomes": 317})
+    out = _run(db)
+    ev = out["tables"]["evidence_items"]
+    assert ev["verifier_bucket"] == "ownership"
+    assert ev["residue_split"] == {"ownership": 2, "unscoped": 5}
+    niche = out["tables"]["niche_target_outcomes"]
+    assert niche["verifier_bucket"] == "unscoped"
+    assert niche["residue_split"] == {"unscoped": 317}

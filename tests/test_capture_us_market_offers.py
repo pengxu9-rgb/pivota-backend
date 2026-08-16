@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.capture_us_market_offers import (  # noqa: E402
+    OFFER_UPSERT_SQL,
     derive_us_offer_id,
     handle_from_url,
     plan_offer,
@@ -117,3 +118,49 @@ def test_plan_offer_refuses_non_positive_prices() -> None:
 def test_plan_offer_marks_unavailable_stock() -> None:
     row = plan_offer(_CAND, 2500, False)
     assert row is not None and row["availability"] == "out_of_stock"
+
+
+def test_the_upsert_reads_the_seller_from_the_catalog_row_not_the_scan_snapshot():
+    """THE TOCTOU THAT PRODUCED 12 ORPHANS (ADR-009).
+
+    CANDIDATES_SQL is fetched once, then every storefront is probed over HTTP
+    for minutes before any upsert runs. On 2026-08-14 the A9-4 flip re-keyed
+    these products and cascaded catalog_offers during that window, and 12
+    offers landed afterwards carrying the retired sentinel — orphans no cascade
+    could reach, repairable only by scripts/dispose_sentinel_orphans.py because
+    ON CONFLICT DO UPDATE did not touch merchant_id either.
+
+    So the seller must be read from the catalog row IN the statement, on both
+    the insert and the refresh path.
+    """
+    flat = " ".join(OFFER_UPSERT_SQL.split())
+    assert "cp.merchant_id" in flat, "the insert must read the seller from catalog_products"
+    # The bind is CAST on BOTH occurrences: it sits in the INSERT's column list
+    # and in this predicate, and Postgres deduces one type per parameter per
+    # statement — casting only one turns IndeterminateDatatype into
+    # AmbiguousParameter rather than fixing it (the repo's PREPARE gate caught
+    # exactly that here).
+    assert "FROM catalog_products cp" in flat
+    assert "WHERE cp.product_key = CAST(:product_key AS text)" in flat
+    assert flat.count("CAST(:product_key AS text)") == 2
+    assert "merchant_id = EXCLUDED.merchant_id" in flat, (
+        "without this a row written before a re-key keeps the stale seller forever")
+    assert ":merchant_id" not in flat, "the snapshot value must not be bound at all"
+
+
+def test_plan_offer_does_not_carry_a_merchant_and_its_binds_match_the_statement():
+    """Both sides of the contract, driven together.
+
+    `databases`/SQLAlchemy text() rejects a params key the statement does not
+    name AND a named bind with no value, so a drift in either direction is a
+    hard runtime failure on every write — exactly the class that aborted the
+    2026-08-07 canary batch. Asserting only one side would let the other rot.
+    """
+    import re
+
+    row = plan_offer(_CAND, 2500, True)
+    assert "merchant_id" not in row, (
+        "the stale scan-time seller must not be passed; the statement reads it live")
+    named = set(re.findall(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)", OFFER_UPSERT_SQL))
+    assert named == set(row), (
+        f"bind mismatch: SQL names {sorted(named)}, plan_offer gives {sorted(row)}")

@@ -371,6 +371,14 @@ async def recon(db, *, also_history: List[str], sample: int) -> Dict[str, Any]:
         # bucket row itself, which is graded by the verifier, not classified.
         if table != "catalog_products":
             targets[table] = "ownership"
+    # The verifier reports NULL-scope sentinel rows in their own bucket (tenant
+    # attribution, never failed). Classify them too: "reported, not failed" is a
+    # reason to keep them VISIBLE, not a reason to stop looking. A table holding
+    # both a scoped and an unscoped sentinel row keeps the ownership label here
+    # — the failing half is the one an operator must act on — and its per-row
+    # split stays readable in global_residue.
+    for table in glob.get("unscoped", {}):
+        targets.setdefault(table, "unscoped")
     for table in also_history:
         if table not in seller_cols:
             raise RuntimeError(f"--also-history names {table!r}, which carries no text seller column")
@@ -392,6 +400,10 @@ async def recon(db, *, also_history: List[str], sample: int) -> Dict[str, Any]:
             "seller_col": seller_col,
             "scope_col": scope,
             "residue": glob[targets[table]][table],
+            # A table can hold both; showing only the labelled half would hide
+            # the other from anyone reading a single table's report.
+            "residue_split": {b: glob[b][table] for b in ("ownership", "unscoped", "history")
+                              if table in glob.get(b, {})},
             "columns": {c: d["data_type"] for c, d in cols.items()},
         }
         if scope:
