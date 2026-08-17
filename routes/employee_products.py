@@ -83,11 +83,14 @@ _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
 
 # The whole DDL pass for employee_external_seed_import_tasks: create, then
 # backfill the columns that deployments predating them are missing, then the
-# indexes. Per-statement tolerant via db/_ddl_guard.py (`ADD COLUMN IF NOT
-# EXISTS` is Postgres-only syntax and fails outright on the SQLite envs some
-# tests run against, so one failure must not abort the rest), and the guard's
-# return value gates memoization — a swallowed ALTER used to leave the column
-# permanently absent while the module reported ready.
+# indexes. Per-statement tolerant via db/_ddl_guard.py, so one failure must
+# not abort the rest, and the guard's return value gates memoization — a
+# swallowed ALTER used to leave the column permanently absent while the module
+# reported ready. On the hermetic SQLite envs some tests run against, all
+# eleven fail: `DEFAULT NOW()` is a syntax error there, so the CREATE dies
+# first and the rest cascade to "no such table". These endpoints have never
+# worked on SQLite; the change is that the failure is now logged and retried
+# rather than raised.
 #
 # Every statement belongs in this list, including the CREATE ones. The guard
 # retries without a cap, so anything left outside it would re-run on every
