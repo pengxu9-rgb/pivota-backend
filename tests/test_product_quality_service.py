@@ -147,10 +147,6 @@ def test_scores_source_backed_summary_and_attributes_when_enabled() -> None:
         "optional_components_enabled": True,
         "summary_length": 101,
         "attribute_signal_count": 3,
-        # This payload supplies a real source document, so a snapshot written
-        # from it was genuinely evaluated under the source-backed rules and the
-        # rescore's resumability filter may skip it.
-        "source_roots_present": True,
     }
     assert {item["code"] for item in result["problems"]} == {"insufficient_bullets"}
 
