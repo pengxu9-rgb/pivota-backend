@@ -1,0 +1,97 @@
+name: ADR-009 Orphan Disposition
+
+# ADR-009 closing step: dispose of the orphan residue the flip could not reach
+# (scripts/dispose_sentinel_orphans.py) — re-key the 12 stale-merchant capture
+# offers, delete the 9 retired QA-canary reviews. DRY-RUN unless apply=true.
+# Same channel as the flip/verify/retire workflows: GitHub runners reach the DB
+# reliably where the public proxy degrades for hours.
+#
+# The tool never grades its own writes. Run adr009-rekey-verify.yml afterwards
+# and read the verdict there — an apply run that printed "applied" is not the
+# same thing as a graded one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Perform writes (false = read-only dry-run)"
+        type: boolean
+        default: false
+      tables:
+        description: "Which dispositions to run"
+        type: choice
+        options:
+          - catalog_offers,product_reviews
+          - catalog_offers
+          - product_reviews
+        default: catalog_offers,product_reviews
+
+# One disposition at a time; a second dispatch queues rather than racing it.
+concurrency:
+  group: adr009-orphan-dispose
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  orphan-dispose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Inputs reach the shell as environment variables, never interpolated
+      # into the run body (tests/test_workflow_no_run_body_interpolation.py).
+      # `tables` is a choice input, so its value is one of the options above.
+      - name: Dispose (dry-run unless apply=true)
+        env:
+          DISPOSE_APPLY: ${{ inputs.apply }}
+          DISPOSE_TABLES: ${{ inputs.tables }}
+          DISPOSE_DUMP: dispose_dump.json
+        run: |
+          set -euo pipefail
+          if [ "$DISPOSE_APPLY" = "true" ]; then
+            echo "::warning::APPLY run — production writes (re-key + DELETE)"
+            python -m scripts.dispose_sentinel_orphans \
+              --tables "$DISPOSE_TABLES" --dump-file "$DISPOSE_DUMP" --apply
+          else
+            python -m scripts.dispose_sentinel_orphans \
+              --tables "$DISPOSE_TABLES" --dump-file "$DISPOSE_DUMP"
+          fi
+
+      # The dump is the ONLY reversal record for a hard DELETE, and the run log
+      # is subject to retention — keep it as an artifact. `always()` because a
+      # run that failed midway is exactly when the record matters most.
+      - name: Upload the row dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispose-dump-${{ github.run_id }}
+          path: dispose_dump.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      # `always()`: if the dispose step exits non-zero AFTER one table's
+      # transaction committed, the half-applied state is precisely what needs
+      # grading. The sibling adr009-rekey-flip.yml does the same.
+      - name: Grade with the independent verifier (read-only)
+        if: always()
+        run: python -m scripts.verify_seller_rekey

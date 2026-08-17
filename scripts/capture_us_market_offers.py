@@ -90,6 +90,22 @@ CANDIDATES_SQL = """
 
 # Same column set as the mirror/attach writers; ON CONFLICT refreshes only the
 # mutable price/availability facts — identity/provenance columns stay put.
+#
+# merchant_id is READ FROM THE CATALOG ROW IN THIS STATEMENT, not carried from
+# the candidate row. CANDIDATES_SQL is fetched once, then every domain is
+# probed over HTTP for minutes before any upsert runs, so a candidate's
+# merchant_id is a snapshot that a concurrent re-key invalidates. That happened:
+# the A9-4 flip moved these products and cascaded catalog_offers while the
+# 2026-08-14 02:09-02:23 capture was probing, and 12 offers landed after the
+# cascade carrying the retired sentinel — orphans no cascade could reach
+# (ADR-009; repaired by scripts/dispose_sentinel_orphans.py, which was needed
+# precisely because ON CONFLICT DO UPDATE below does not touch merchant_id, so
+# re-running the capture could never have fixed them).
+#
+# The subselect makes the write self-consistent: whatever the catalog says at
+# COMMIT time is what the offer carries. A product that vanished between the
+# scan and the write inserts nothing rather than inventing a seller — the
+# INSERT ... SELECT yields no row, which is the fail-closed direction.
 OFFER_UPSERT_SQL = """
     INSERT INTO catalog_offers
       (offer_id, sku_key, product_key, merchant_id,
@@ -98,17 +114,22 @@ OFFER_UPSERT_SQL = """
        market, channel, availability, currency,
        list_price, price_confidence,
        source_system, source_domain, offer_payload)
-    VALUES
-      (:offer_id, :sku_key, :product_key, :merchant_id,
+    SELECT
+       :offer_id, :sku_key, CAST(:product_key AS text), cp.merchant_id,
        'external_referral', 'observed', 'referral_only',
        'brand_direct', TRUE, 'redirect',
        'US', 'external_referral', :availability, 'USD',
        :list_price, 0.9,
-       :source_system, :source_domain, CAST(:offer_payload AS jsonb))
+       :source_system, :source_domain, CAST(:offer_payload AS jsonb)
+      FROM catalog_products cp
+     WHERE cp.product_key = CAST(:product_key AS text)
     ON CONFLICT (offer_id) DO UPDATE SET
       availability = EXCLUDED.availability,
       list_price = EXCLUDED.list_price,
       offer_payload = EXCLUDED.offer_payload,
+      -- The seller follows the catalog on refresh too; without this an offer
+      -- written before a re-key keeps the stale merchant forever.
+      merchant_id = EXCLUDED.merchant_id,
       updated_at = NOW()
 """
 
@@ -201,7 +222,10 @@ def plan_offer(candidate: Dict[str, Any], price_cents: int,
         # every sku-joined read lane (pivot_query_service INNER JOINs on it).
         "sku_key": derive_mirror_sku_key(product_key),
         "product_key": product_key,
-        "merchant_id": candidate["merchant_id"],
+        # NO merchant_id. The upsert reads the seller from the catalog row at
+        # write time, and `databases`/SQLAlchemy text() rejects a params key
+        # the statement does not name — passing the stale snapshot here would
+        # raise ArgumentError on every write, not merely re-introduce the bug.
         "availability": "in_stock" if available else "out_of_stock",
         "list_price": price_cents / 100.0,
         "source_system": SOURCE_SYSTEM,

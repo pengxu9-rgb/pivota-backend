@@ -118,6 +118,18 @@ ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_kind text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data jsonb;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS created_at timestamptz;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+-- product_reviews: keyed in the REVIEWS service's own namespace
+-- (merchant|platform|id), which is why the catalog cascade never reached it.
+-- scripts/dispose_sentinel_orphans.py PREPAREs against it, and metadata does
+-- not register it, so the gate needs it here or those statements cannot plan.
+CREATE TABLE IF NOT EXISTS product_reviews (id bigserial PRIMARY KEY);
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS product_key text;
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS sku_key text;
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS merchant_id text;
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS platform text;
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS platform_product_id text;
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE product_reviews ADD COLUMN IF NOT EXISTS created_at timestamptz;
 CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY);
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS pivota_signature_id text;
 ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS merchant_id text;
@@ -518,6 +530,22 @@ def _collect_a9_4_quality_repair() -> List[Tuple[str, str]]:
     ]
 
 
+def _collect_dispose_sentinel_orphans() -> List[Tuple[str, str]]:
+    """The disposition tool RE-KEYS and DELETES production rows; an unplannable
+    statement is an aborted run with a partially-disposed table. Its two write
+    statements and both population reads are driven here."""
+    import scripts.dispose_sentinel_orphans as module
+
+    origin = "dispose_sentinel_orphans"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "OFFERS_SQL", "REVIEWS_SQL", "BUCKET_SQL", "REVIEW_CHILDREN_SQL",
+            "OFFERS_LOCKED_SQL", "REVIEWS_LOCKED_SQL",
+            "OFFERS_REKEY_SQL", "REVIEWS_DELETE_SQL",
+        )
+    ]
+
+
 # NOT covered: scripts/verify_seller_rekey.py. Its Q2 counts against
 # pdp_identity_listing / _override / _review_queue, and provisioning those here
 # breaks later gate files — `test_quarantine_domain_chain_postgres` issues a
@@ -626,6 +654,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
     "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
     "scripts/capture_us_market_offers.py": _collect_us_market_capture,
+    "scripts/dispose_sentinel_orphans.py": _collect_dispose_sentinel_orphans,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": _collect_a9_4_quality_repair,
 }
@@ -648,6 +677,7 @@ _MIN_STATEMENTS = {
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
     "scripts/capture_us_market_offers.py": 2,
+    "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
 }

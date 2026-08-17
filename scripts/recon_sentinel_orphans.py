@@ -329,11 +329,14 @@ async def _scope_match_rate(db, table: str, seller_col: str, scope_col: str,
             "keys_are_catalog_keys": bool(d["scoped"]) and bool(d["resolves"])}
 
 
-async def _scope_nulls(db, table: str, seller_col: str, scope_col: str, banned: str) -> Dict[str, int]:
-    t, sc, sk = _ident(table), _ident(seller_col), _ident(scope_col)
+async def _scope_nulls(db, table: str, seller_col: str, scope_cols: List[str], banned: str) -> Dict[str, int]:
+    t, sc = _ident(table), _ident(seller_col)
+    # NULL across EVERY scope column the table has — matching the verifier's
+    # num_nonnulls split, so the two tools cannot disagree about a row.
+    names = ", ".join(_ident(c) for c in (scope_cols or []))
     row = await _fetch(db, f"""
         SELECT count(*) AS total,
-               count(*) FILTER (WHERE {sk} IS NULL) AS scope_null
+               count(*) FILTER (WHERE num_nonnulls({names}) = 0) AS scope_null
           FROM {t} WHERE {sc} = :banned
     """, {"banned": banned})
     return {"total": int(row[0]["total"]), "scope_null": int(row[0]["scope_null"])}
@@ -371,6 +374,14 @@ async def recon(db, *, also_history: List[str], sample: int) -> Dict[str, Any]:
         # bucket row itself, which is graded by the verifier, not classified.
         if table != "catalog_products":
             targets[table] = "ownership"
+    # The verifier reports NULL-scope sentinel rows in their own bucket (tenant
+    # attribution, never failed). Classify them too: "reported, not failed" is a
+    # reason to keep them VISIBLE, not a reason to stop looking. A table holding
+    # both a scoped and an unscoped sentinel row keeps the ownership label here
+    # — the failing half is the one an operator must act on — and its per-row
+    # split stays readable in global_residue.
+    for table in glob.get("unscoped", {}):
+        targets.setdefault(table, "unscoped")
     for table in also_history:
         if table not in seller_cols:
             raise RuntimeError(f"--also-history names {table!r}, which carries no text seller column")
@@ -386,16 +397,28 @@ async def recon(db, *, also_history: List[str], sample: int) -> Dict[str, Any]:
     for table in sorted(targets):
         seller_col, _ = seller_cols[table]
         cols = await _columns(db, table)
-        scope = next((c for c in ("product_key", "content_key", "sku_key") if c in cols), None)
+        # Every scope column the table carries, finest first. Reporting only
+        # the first would repeat, in the diagnostic, the very defect the
+        # verifier's split fixes: beauty_compatibility_rules and
+        # catalog_quote_snapshots carry a nullable product_key AND sku_key, so
+        # a genuinely sku-scoped row reads "scope is NULL" off product_key
+        # alone — and the recon would then contradict the grader.
+        all_scopes = [c for c in ("product_key", "content_key", "sku_key") if c in cols]
+        scope = all_scopes[0] if all_scopes else None
         rep: Dict[str, Any] = {
             "verifier_bucket": targets[table],
             "seller_col": seller_col,
             "scope_col": scope,
+            "scope_cols": all_scopes,
             "residue": glob[targets[table]][table],
+            # A table can hold both; showing only the labelled half would hide
+            # the other from anyone reading a single table's report.
+            "residue_split": {b: glob[b][table] for b in ("ownership", "unscoped", "history")
+                              if table in glob.get(b, {})},
             "columns": {c: d["data_type"] for c, d in cols.items()},
         }
         if scope:
-            rep["scope_nulls"] = await _scope_nulls(db, table, seller_col, scope, banned)
+            rep["scope_nulls"] = await _scope_nulls(db, table, seller_col, all_scopes, banned)
             rep["scope_key_space"] = await _scope_match_rate(
                 db, table, seller_col, scope, banned)
             if scope == "product_key":

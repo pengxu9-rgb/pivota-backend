@@ -181,7 +181,56 @@ confirmed to die under mutation. Fixed in the same PR:
   raised `CannotCoerceError` on the live run. Cast added; the gate fixture now
   uses `json` to match prod.
 
-## Proposed disposition tool (task 3, only after founder gates the above)
+## Review round 2 (2026-08-17) — what the adversarial pass changed
+Three findings were real defects in the first cut of the disposition tool, each
+reproduced on a real engine:
+1. **`apply()` re-read the population** instead of consuming the plan, so any
+   row that became residue in the plan→apply window was written with no door
+   having examined it and no dump recording it. Reproduced: a review inserted
+   after the plan — still SERVING, and whose `product_key` resolves — was
+   deleted, and it appeared in no dump. Now the plan's id set is binding and a
+   mismatch aborts the table.
+2. **The cascade-child list was hardcoded and incomplete.** Derived from
+   `pg_constraint` instead. The live dry-run then found
+   **`buyer_review_user_subject` = 9 rows** (created at runtime by
+   `services/ugc_capabilities_service.py`, invisible to anyone reading migration
+   040) plus `buyer_review_ownership` and a SET-NULL parent — i.e. the original
+   "reversible by re-insert" claim was false by 9 rows.
+3. **The verifier's `unscoped` bucket was a loophole** for tables carrying more
+   than one scope column (`beauty_compatibility_rules`,
+   `catalog_quote_snapshots` carry both `product_key` and `sku_key`): a
+   sku-scoped row with a NULL `product_key` was excused. The split now spans
+   every scope column (`num_nonnulls`).
+
+Also: the row dump is written to a file and uploaded as a workflow artifact
+(the run log is subject to retention and was the only copy); the printed copy
+redacts review text and account ids; an unreadable cascade child is now door
+**D7** rather than a recorded-and-ignored note; the verifier step runs under
+`if: always()` so a half-applied state still gets graded.
+
+## Execution (founder gated 2026-08-17)
+Built as `scripts/dispose_sentinel_orphans.py` + `.github/workflows/adr009-orphan-dispose.yml`
+(dry-run default; `apply=true` is a separate dispatch). Prod dry-run 2026-08-17:
+all doors pass, 12 offers plan onto 6 distinct `merch_obs_*` sellers, 9 reviews
+dumped with 6 cascaded `media_assets`.
+
+On the one review that does not read like a canary: id 9320 "Eczema improvement
+question" is the `needs_human_review` arm of the same battery — its own body
+ends "please review before showing this", same product, same guest-actor
+pattern, same three-minute window as the other eight, and its risk_flags carry
+`moderation_decision: needs_human_review` with `employee_review_queue: true`.
+Deleting it also removes that one item from the employee review queue.
+
+The verifier change ships in the same PR: ownership counts only rows whose
+scope key is NOT NULL; NULL-scope sentinel rows move to a reported `unscoped`
+bucket. After the apply, expected verdict OK with `unscoped` = evidence_items 5,
+action_plan_items 2, niche_target_outcomes 317.
+
+The writer is hardened in the same PR: `capture_us_market_offers` now reads the
+seller from the catalog row inside the upsert (both the insert and the
+ON CONFLICT refresh), so the TOCTOU cannot recur.
+
+## Original proposal (superseded by the section above)
 `scripts/dispose_sentinel_orphans.py --tables catalog_offers,product_reviews [--apply]`
 - dry-run default; per-table transaction; every row about to change/delete
   printed as JSON before the write; doors: bucket must be 0, every offer's

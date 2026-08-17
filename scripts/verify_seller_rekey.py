@@ -198,20 +198,84 @@ SELECT c.table_name, c.column_name,
 """
 
 
+# EVERY product-scope column a table carries — not the first by precedence.
+#
+# A table with more than one is the case that makes this matter, and two real
+# ones exist: beauty_compatibility_rules and catalog_quote_snapshots (db/catalog.py)
+# both carry product_key AND sku_key, both nullable. Picking one column by
+# precedence and filing the row by THAT column's nullness excuses a sku-scoped
+# row whose product_key happens to be NULL — genuine ownership residue, silently
+# forgiven (measured against this file's own fixture, review 2026-08-17).
+#
+# So a row is SCOPED when ANY of its scope columns is non-NULL, and unscoped
+# only when they are ALL NULL — the honest reading of "this row names no
+# product".
+SCOPE_COLUMNS_SQL = """
+SELECT column_name FROM information_schema.columns
+ WHERE table_schema = 'public' AND table_name = :table
+   AND column_name IN ('product_key', 'content_key', 'sku_key')
+ ORDER BY array_position(ARRAY['product_key','content_key','sku_key'], column_name)
+"""
+
+
 async def global_residue(database) -> dict:
-    """Returns {"ownership": {table: n}, "history": {table: n}} — nonzero
-    entries only, plus the catalog_products count under "ownership" always."""
+    """Returns {"ownership": {t: n}, "unscoped": {t: n}, "history": {t: n}} —
+    nonzero entries only, plus the catalog_products count under "ownership".
+
+    THE THIRD BUCKET, and why it is not a loophole. A product-scoped table's
+    sentinel row is an orphan only if it actually names a product. Three tables
+    carry a scope column that is NULL on every sentinel row (measured
+    2026-08-16: evidence_items 5, action_plan_items 2, niche_target_outcomes
+    317) because their merchant_id is the audit's TENANT, not a seller — two BD
+    audit runs were executed FOR the retired bucket on 2026-06-30, and
+    migration 088 added merchant_id to those tables expressly for tenancy
+    ("tenancy is single-layer … add merchant_id"), while niche_target_outcomes'
+    content_key came later (migration 158) and NO writer fills it
+    (services/niche_outcomes.py inserts merchant_id + query + run only).
+
+    No re-key can follow a NULL scope, and rewriting the tenant would move one
+    tenant's audit history onto another. So these are REPORTED, never failed —
+    the same treatment history tables get, for the same reason.
+
+    What this deliberately does NOT do is excuse a row that names a product.
+    A sentinel row WITH a scope key is still an orphan and still FAILS, so a
+    writer that stamps the sentinel on a real product cannot hide here; and
+    because the split is counted per row, a table can appear in both buckets.
+    """
     from scripts.backfill_seller_of_record import BANNED_BUCKET_MERCHANT_ID
 
-    out = {"ownership": {}, "history": {}}
+    out = {"ownership": {}, "unscoped": {}, "history": {}}
     for r in await database.fetch_all(SELLER_COLUMNS_SQL):
         d = dict(r)
         table, col = d["table_name"], d["column_name"]
+        product_scoped = bool(d["product_scoped"]) or table == "catalog_products"
+        scope_cols: list = []
+        if product_scoped and table != "catalog_products":
+            scope_cols = [dict(r)["column_name"] for r in
+                          await database.fetch_all(SCOPE_COLUMNS_SQL, {"table": table})]
+
+        if scope_cols:
+            # Scoped when ANY scope column names something; unscoped only when
+            # every one of them is NULL.
+            names = ", ".join(scope_cols)
+            row = await database.fetch_one(
+                f"SELECT count(*) FILTER (WHERE num_nonnulls({names}) > 0) AS scoped, "
+                f"       count(*) FILTER (WHERE num_nonnulls({names}) = 0) AS unscoped "
+                f"  FROM {table} WHERE {col} = :banned",
+                {"banned": BANNED_BUCKET_MERCHANT_ID})
+            dd = dict(row) if row else {"scoped": 0, "unscoped": 0}
+            scoped, unscoped = int(dd["scoped"]), int(dd["unscoped"])
+            if scoped:
+                out["ownership"][table] = out["ownership"].get(table, 0) + scoped
+            if unscoped:
+                out["unscoped"][table] = out["unscoped"].get(table, 0) + unscoped
+            continue
+
         row = await database.fetch_one(
             f"SELECT count(*) AS c FROM {table} WHERE {col} = :banned",
             {"banned": BANNED_BUCKET_MERCHANT_ID})
         n = int(dict(row)["c"]) if row else 0
-        bucket = "ownership" if (d["product_scoped"] or table == "catalog_products") else "history"
+        bucket = "ownership" if product_scoped else "history"
         if n or table == "catalog_products":
             out[bucket][table] = out[bucket].get(table, 0) + n
     return out
@@ -265,7 +329,13 @@ async def main() -> int:
                       "failures": failures, "rows": r1, "cascades": r2,
                       "stranded_state": stranded,
                       "sentinel_lanes_remaining": lanes,
-                      "global_sentinel_residue": glob}, indent=1))
+                      "global_sentinel_residue": glob,
+                      "unscoped_note": (
+                          "unscoped = product-scoped tables whose sentinel rows carry a NULL "
+                          "scope key: tenant attribution (audit runs executed FOR the retired "
+                          "bucket), not seller-of-record. Reported, never failed — no re-key "
+                          "can follow a NULL scope. A sentinel row that NAMES a product still "
+                          "fails under ownership.")}, indent=1))
     return 1 if failures else 0
 
 
