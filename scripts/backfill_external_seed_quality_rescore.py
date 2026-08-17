@@ -232,10 +232,26 @@ async def _rescored_ids() -> set:
     which is the fix for them, not a regression (their fallback snapshots are
     unfindable by the eligibility classifier anyway).
     """
+    # The stamp alone is not evidence the row was evaluated against a source
+    # document. `full_quality_eval` promotes rules_version whenever the
+    # source-backed FLAG is on, so a caller passing a payload with no
+    # `product_payload` / `seed_data` root — where both source-backed components
+    # score 0 by construction — still gets stamped. Skipping on the stamp alone
+    # then locks those rows out of the very rescore that would score them
+    # properly: 5,495 rows landed in exactly that state on 2026-08-17 and needed
+    # --force to recover.
+    #
+    # `source_roots_present` is recorded by preview_quality. Only an explicit
+    # `false` re-opens a row; absent (snapshots written before the field existed)
+    # keeps counting as rescored, so this does not re-open the historical corpus.
     rows = await database.fetch_all(
         "SELECT DISTINCT merchant_id, platform, platform_product_id "
         "FROM product_quality_snapshot "
-        "WHERE rules_version = :v",
+        "WHERE rules_version = :v "
+        "  AND COALESCE("
+        "        (details -> 'source_backed_fields' ->> 'source_roots_present')::boolean,"
+        "        TRUE"
+        "      ) IS TRUE",
         {"v": SOURCE_BACKED_COMPONENTS_RULES_VERSION},
     )
     return {

@@ -243,6 +243,30 @@ def _source_backed_roots(
     return product_payload, seed_data, snapshot
 
 
+def payload_has_source_backed_roots(payload: Dict[str, Any]) -> bool:
+    """True when the caller actually supplied a source document to score against.
+
+    `_source_backed_roots` falls back to the flat payload when no
+    `product_payload` is given, so the source-backed components silently score 0
+    for a caller that never passed a source document at all. That is a different
+    thing from a caller that passed a real source which happened to be thin — and
+    only the second one has actually been evaluated under the source-backed rules.
+
+    The distinction matters because `full_quality_eval` stamps
+    SOURCE_BACKED_COMPONENTS_RULES_VERSION onto the snapshot and the canonical
+    rescore skips anything already carrying that stamp. A row scored WITHOUT a
+    source document but stamped as though it had one is locked out of the rescore
+    that would have scored it properly. Not hypothetical: it happened to 5,495
+    rows on 2026-08-17 and needed --force to undo.
+    """
+    if not isinstance(payload, dict):
+        return False
+    return bool(
+        _as_source_dict(payload.get("product_payload"))
+        or _as_source_dict(payload.get("seed_data") or payload.get("seed_data_json"))
+    )
+
+
 def source_backed_summary_text(payload: Dict[str, Any]) -> str:
     product_payload, seed_data, snapshot = _source_backed_roots(payload)
     return _first_source_text(
@@ -853,6 +877,9 @@ def preview_quality(
             "optional_components_enabled": True,
             "summary_length": len(source_summary),
             "attribute_signal_count": source_attribute_signal_count,
+            # Whether a source document was supplied at all, as distinct from a
+            # supplied-but-thin one. Gates the rules_version stamp below.
+            "source_roots_present": payload_has_source_backed_roots(payload),
         }
     return result
 
@@ -881,6 +908,14 @@ async def full_quality_eval(
         payload,
         score_source_backed_components=score_source_backed_components,
     )
+    # NOTE: the stamp deliberately does NOT depend on whether a source document
+    # was actually supplied. Gating it on that was tried and reverted: it pushes
+    # root-less rows back to v1-lite, which is the corpus-scale drift
+    # tests/test_quality_rules_version_selection.py exists to prevent (24.6% of
+    # the corpus had silently regressed onto superseded scales for two weeks).
+    # The related hazard — a root-less snapshot being SKIPPED forever by the
+    # canonical rescore because it carries this stamp — is fixed in that script's
+    # resumability filter instead, using `source_backed_fields.source_roots_present`.
     effective_rules_version = rules_version
     if (
         rules_version == DEFAULT_QUALITY_RULES_VERSION
