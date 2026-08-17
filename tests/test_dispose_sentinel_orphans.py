@@ -88,11 +88,12 @@ class ReadOnlyFake:
         self.reviews = reviews if reviews is not None else [_review()]
         # The FK graph, as pg_constraint would report it.
         self.children_fks = children_fks if children_fks is not None else [
-            {"child_table": "media_assets", "fk_column": "review_id", "on_delete": "c"},
-            {"child_table": "buyer_review_ownership", "fk_column": "review_id",
-             "on_delete": "c"},
-            {"child_table": "buyer_review_idempotency_keys", "fk_column": "review_id",
-             "on_delete": "n"},
+            {"child_schema": "public", "child_table": "media_assets",
+             "fk_column": "review_id", "on_delete": "c"},
+            {"child_schema": "public", "child_table": "buyer_review_ownership",
+             "fk_column": "review_id", "on_delete": "c"},
+            {"child_schema": "public", "child_table": "buyer_review_idempotency_keys",
+             "fk_column": "review_id", "on_delete": "n"},
         ]
 
     async def execute(self, sql, params=None):  # pragma: no cover
@@ -168,17 +169,42 @@ def test_cascade_children_come_from_the_fk_graph_not_a_hardcoded_list():
     which made the 'reversible by re-insert' claim false."""
     out = _plan(ReadOnlyFake(), tables=("product_reviews",))
     kids = out["tables"]["product_reviews"]["cascaded_children"]
-    assert set(kids) == {"media_assets", "buyer_review_ownership",
-                         "buyer_review_idempotency_keys"}
+    # keyed table.COLUMN, so two FKs from one table cannot overwrite each other
+    assert set(kids) == {"media_assets.review_id", "buyer_review_ownership.review_id",
+                         "buyer_review_idempotency_keys.review_id"}
     # the dump says WHAT happens to each child, so a SET NULL parent is not
     # mistaken for an untouched one
-    assert kids["media_assets"]["on_delete"] == "cascade"
-    assert kids["buyer_review_idempotency_keys"]["on_delete"] == "set null"
+    assert kids["media_assets.review_id"]["on_delete"] == "cascade"
+    assert kids["buyer_review_idempotency_keys.review_id"]["on_delete"] == "set null"
+
+
+def test_two_FKs_from_ONE_child_table_are_both_recorded():
+    """review_replies can hold review_id AND parent_review_id, both CASCADE.
+    Keying the dump by table alone let the second silently overwrite the
+    first, and the rows reached only by the losing FK were deleted with no
+    reversal record — the exact failure deriving from pg_constraint exists to
+    prevent."""
+    fks = [{"child_schema": "public", "child_table": "review_replies",
+            "fk_column": "review_id", "on_delete": "c"},
+           {"child_schema": "public", "child_table": "review_replies",
+            "fk_column": "parent_review_id", "on_delete": "c"}]
+    out = _plan(ReadOnlyFake(children_fks=fks), tables=("product_reviews",))
+    kids = out["tables"]["product_reviews"]["cascaded_children"]
+    assert set(kids) == {"review_replies.review_id", "review_replies.parent_review_id"}
+
+
+def test_a_child_outside_public_is_a_door_not_a_traceback():
+    """_ident would reject a schema-qualified name with an uncaught traceback,
+    which on a destructive tool reads as a crash rather than a refusal."""
+    fks = [{"child_schema": "audit", "child_table": "review_log",
+            "fk_column": "review_id", "on_delete": "c"}]
+    out = _plan(ReadOnlyFake(children_fks=fks), tables=("product_reviews",))
+    assert any("D7" in f and "public schema" in f for f in out["doors_failed"])
 
 
 def test_a_child_identifier_that_cannot_be_interpolated_aborts():
-    bad = [{"child_table": "media assets; DROP TABLE x", "fk_column": "review_id",
-            "on_delete": "c"}]
+    bad = [{"child_schema": "public", "child_table": "media assets; DROP TABLE x",
+            "fk_column": "review_id", "on_delete": "c"}]
     with pytest.raises(RuntimeError, match="refusing to interpolate"):
         _plan(ReadOnlyFake(children_fks=bad), tables=("product_reviews",))
 
@@ -313,6 +339,11 @@ def test_the_log_copy_redacts_review_text_but_the_dump_file_does_not():
     assert red["tables"]["product_reviews"]["dump"][0]["body"].startswith("<redacted")
     assert red["tables"]["product_reviews"]["dump"][0]["author_user_id"].startswith("<redacted")
     assert red["tables"]["product_reviews"]["dump"][0]["status"] == "removed"   # not secret
+    # ALLOWLIST: a column nobody has thought about yet is redacted BY DEFAULT.
+    full2 = {"tables": {"product_reviews": {"dump": [
+        {"id": 1, "reviewer_email": "a@b.c", "status": "removed"}]}}}
+    assert d._redacted_for_log(full2)["tables"]["product_reviews"]["dump"][0][
+        "reviewer_email"].startswith("<redacted")
     # the original is untouched — the file still gets everything
     assert full["tables"]["product_reviews"]["dump"][0]["body"] == "private text"
 
@@ -356,3 +387,55 @@ def test_apply_only_touches_the_tables_it_was_given():
                     "product_reviews": {"dump": [{"id": 1}]}}}
     asyncio.run(d.apply(t, ["catalog_offers"], "rid", p))
     assert t.seen and all("product_reviews" not in s for s in t.seen)
+
+
+def test_apply_unions_the_per_table_door_verdicts_not_just_the_top_level_list():
+    """plan() records verdicts in two places; reading one left a gap."""
+    import asyncio
+
+    p = {"doors_failed": [],
+         "tables": {"catalog_offers": {"plan": [], "doors_failed": ["D2 boom"]}}}
+    with pytest.raises(RuntimeError, match="doors failed"):
+        asyncio.run(d.apply(ReadOnlyFake(), ["catalog_offers"], "rid", p))
+
+
+def test_write_dump_writes_the_rows_and_refuses_to_clobber(tmp_path):
+    """_write_dump had no test at all: deleting its write survived. It is the
+    ONLY reversal record for a hard DELETE, so a second run overwriting the
+    first is how that record is lost."""
+    target = tmp_path / "nested" / "dump.json"
+    payload = {"mode": "dry-run", "tables": {"product_reviews": {"dump": [{"id": 1}]}}}
+    written = d._write_dump(str(target), payload)
+    assert written and target.exists()
+    import json as _j
+    assert _j.loads(target.read_text())["tables"]["product_reviews"]["dump"][0]["id"] == 1
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        d._write_dump(str(target), payload)
+    assert d._write_dump(None, payload) is None
+
+
+def test_run_writes_the_WHOLE_row_to_the_file_and_a_redacted_copy_to_the_log(tmp_path, capsys, monkeypatch):
+    """The wiring, not the helper. Swapping which payload is redacted survived
+    in BOTH directions because every _run test monkeypatched _write_dump."""
+    import asyncio
+    import json as _j
+
+    secret = "private review text"
+
+    async def _plan_fn(db, tables):
+        return {"banned": _B, "catalog_products_under_sentinel": 0, "doors_failed": [],
+                "tables": {"product_reviews": {"rows": 1, "dump": [
+                    {"id": 1, "body": secret, "status": "removed"}]}}}
+
+    class _DB:
+        async def connect(self): pass
+        async def disconnect(self): pass
+
+    import db.database as dbmod
+    monkeypatch.setattr(dbmod, "database", _DB(), raising=False)
+    monkeypatch.setattr(d, "plan", _plan_fn)
+    target = tmp_path / "dump.json"
+    rc = asyncio.run(d._run(["product_reviews"], False, str(target)))
+    assert rc == 0
+    assert secret in _j.loads(target.read_text())["tables"]["product_reviews"]["dump"][0]["body"]
+    assert secret not in capsys.readouterr().out

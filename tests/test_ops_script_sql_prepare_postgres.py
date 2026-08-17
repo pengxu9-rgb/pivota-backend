@@ -540,6 +540,7 @@ def _collect_dispose_sentinel_orphans() -> List[Tuple[str, str]]:
     return [
         (f"{origin}.{name}", getattr(module, name)) for name in (
             "OFFERS_SQL", "REVIEWS_SQL", "BUCKET_SQL", "REVIEW_CHILDREN_SQL",
+            "OFFERS_LOCKED_SQL", "REVIEWS_LOCKED_SQL",
             "OFFERS_REKEY_SQL", "REVIEWS_DELETE_SQL",
         )
     ]
@@ -676,7 +677,7 @@ _MIN_STATEMENTS = {
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
     "scripts/capture_us_market_offers.py": 2,
-    "scripts/dispose_sentinel_orphans.py": 6,
+    "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
 }

@@ -133,17 +133,25 @@ SELECT r.*,
 # 'c' cascade (row disappears), 'n' set null (row survives, FK cleared),
 # 'a'/'r' no action/restrict (the delete would fail — worth seeing).
 REVIEW_CHILDREN_SQL = """
-SELECT c.conrelid::regclass::text AS child_table,
-       a.attname                  AS fk_column,
-       -- ::text because confdeltype is Postgres "char", which asyncpg hands
-       -- back as BYTES (b'c'), and a bytes key silently misses every lookup.
-       c.confdeltype::text        AS on_delete
+SELECT n.nspname            AS child_schema,
+       cl.relname           AS child_table,
+       a.attname            AS fk_column,
+       c.confdeltype::text  AS on_delete
   FROM pg_constraint c
-  JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
-  JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+  JOIN pg_class cl     ON cl.oid = c.conrelid
+  JOIN pg_namespace n  ON n.oid = cl.relnamespace
+  -- conkey and confkey are PARALLEL arrays: unnesting them together is what
+  -- keeps a multi-column FK's OTHER columns out. Unnesting conkey alone
+  -- yielded e.g. the `tenant` half of (review_id, tenant), and the tool then
+  -- queried `WHERE tenant = ANY(<review ids>)` — a type error that surfaced as
+  -- an unreadable child and aborted the whole run on a legitimate schema.
+  JOIN unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(attnum, refattnum, ord) ON TRUE
+  JOIN pg_attribute a  ON a.attrelid = c.conrelid  AND a.attnum = k.attnum
+  JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = k.refattnum
  WHERE c.contype = 'f'
    AND c.confrelid = 'product_reviews'::regclass
- ORDER BY 1, 2
+   AND ra.attname = 'id'
+ ORDER BY 1, 2, 3
 """
 
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -158,6 +166,15 @@ def _ident(name: str) -> str:
     return name
 
 BUCKET_SQL = "SELECT count(*) AS c FROM catalog_products WHERE merchant_id = :banned"
+
+# The same populations, row-locked, for the in-transaction re-check. The id set
+# agreeing is NOT enough: a review that is `removed` at plan time and `active`
+# at write time keeps its id, so a set comparison waves it through while D5/D6
+# would both have refused it (reproduced, review round 2). The doors are
+# therefore re-evaluated inside the transaction on these rows, and FOR UPDATE
+# holds them so nothing can change between the re-check and the write.
+OFFERS_LOCKED_SQL = OFFERS_SQL + "\n FOR UPDATE OF o"
+REVIEWS_LOCKED_SQL = REVIEWS_SQL + "\n FOR UPDATE OF r"
 
 _ON_DELETE = {"c": "cascade", "n": "set null", "a": "no action", "r": "restrict", "d": "set default"}
 
@@ -263,7 +280,24 @@ async def plan(db, tables: List[str]) -> Dict[str, Any]:
         children: Dict[str, Any] = {}
         unreadable: List[str] = []
         for fk in await _rows(db, REVIEW_CHILDREN_SQL):
-            table, col = _ident(fk["child_table"]), _ident(fk["fk_column"])
+            schema, table, col = fk["child_schema"], fk["child_table"], fk["fk_column"]
+            # A child outside `public` is a door, not a crash: _ident would
+            # reject the qualified name with an uncaught traceback, which on a
+            # destructive tool reads as a bug rather than a refusal.
+            if schema != "public":
+                unreadable.append(f"{schema}.{table}.{col} (outside the public schema)")
+                children[f"{schema}.{table}.{col}"] = {
+                    "fk_column": col, "on_delete": _ON_DELETE.get(fk["on_delete"], fk["on_delete"]),
+                    "unreadable": "child table is not in the public schema"}
+                continue
+            table, col = _ident(table), _ident(col)
+            # Keyed by table.COLUMN: one child table can hold TWO FKs to
+            # product_reviews (review_id and parent_review_id, both CASCADE),
+            # and keying by table alone let the second overwrite the first —
+            # the rows reached only by the losing FK were deleted with no
+            # reversal record, which is the exact failure deriving from
+            # pg_constraint was meant to end.
+            key = f"{table}.{col}"
             entry: Dict[str, Any] = {"fk_column": col,
                                      "on_delete": _ON_DELETE.get(fk["on_delete"], fk["on_delete"])}
             try:
@@ -275,8 +309,8 @@ async def plan(db, tables: List[str]) -> Dict[str, Any]:
                 # deleting anyway is the silent-fallback shape: the rows would
                 # be destroyed with nothing written down.
                 entry["unreadable"] = str(exc)[:200]
-                unreadable.append(f"{table}.{col}")
-            children[table] = _jsonable(entry)
+                unreadable.append(key)
+            children[key] = _jsonable(entry)
         if unreadable:
             doors = doors + [f"D7 cascade children could not be read, so the delete would "
                              f"destroy rows with no reversal record: {unreadable}"]
@@ -310,22 +344,36 @@ async def apply(db, tables: List[str], run_id: str, plan_result: Dict[str, Any])
     """
     banned = BANNED_BUCKET_MERCHANT_ID
     result: Dict[str, Any] = {"run_id": run_id, "applied": {}}
-    if plan_result.get("doors_failed"):
-        raise RuntimeError(f"refusing to apply: doors failed {plan_result['doors_failed']}")
+    # plan() records verdicts in TWO places; reading only the top-level list
+    # left a gap a test was already walking through.
+    failed = list(plan_result.get("doors_failed") or [])
+    for t in tables:
+        failed.extend((plan_result.get("tables", {}).get(t) or {}).get("doors_failed") or [])
+    if failed:
+        raise RuntimeError(f"refusing to apply: doors failed {sorted(set(failed))}")
 
     if "catalog_offers" in tables:
         planned = plan_result["tables"]["catalog_offers"]["plan"]
         ids = [str(p["offer_id"]) for p in planned]
         async with db.transaction():
-            current = {str(o["offer_id"]) for o in await _rows(db, OFFERS_SQL, {"banned": banned})}
+            rows = await _rows(db, OFFERS_LOCKED_SQL, {"banned": banned})
+            current = {str(o["offer_id"]) for o in rows}
             if current != set(ids):
                 raise RuntimeError(
                     f"catalog_offers residue changed since the plan (rolled back): "
                     f"added={sorted(current - set(ids))} removed={sorted(set(ids) - current)}")
+            # Same ids can still mean different ROWS — re-run the doors on the
+            # locked rows, not just their keys.
+            redoors = offer_doors(0, rows)
+            if redoors:
+                raise RuntimeError(
+                    f"catalog_offers rows changed since the plan (rolled back): {redoors}")
             await db.execute(OFFERS_REKEY_SQL, {"offer_ids": ids, "banned": banned})
             left = await _count(
                 db, "SELECT count(*) AS c FROM catalog_offers WHERE merchant_id = :banned",
                 {"banned": banned})
+            # Same standing as the reviews guard below: unreachable while the
+            # doors pass, kept for the READ COMMITTED window.
             if left:
                 raise RuntimeError(
                     f"catalog_offers still holds {left} sentinel row(s) after re-key "
@@ -336,22 +384,29 @@ async def apply(db, tables: List[str], run_id: str, plan_result: Dict[str, Any])
         planned = plan_result["tables"]["product_reviews"]["dump"]
         ids = [int(r["id"]) for r in planned]
         async with db.transaction():
-            current = {int(r["id"]) for r in await _rows(db, REVIEWS_SQL, {"banned": banned})}
+            rows = await _rows(db, REVIEWS_LOCKED_SQL, {"banned": banned})
+            current = {int(r["id"]) for r in rows}
             if current != set(ids):
                 raise RuntimeError(
                     f"product_reviews residue changed since the plan (rolled back): "
                     f"added={sorted(current - set(ids))} removed={sorted(set(ids) - current)}")
+            # A row that turned `active`, or whose product_key started
+            # resolving, keeps its id — so re-run D5/D6 on the locked rows.
+            redoors = review_doors(0, rows)
+            if redoors:
+                raise RuntimeError(
+                    f"product_reviews rows changed since the plan (rolled back): {redoors}")
             await db.execute(REVIEWS_DELETE_SQL, {"ids": ids, "banned": banned})
             left = await _count(
                 db, "SELECT count(*) AS c FROM product_reviews WHERE merchant_id = :banned",
                 {"banned": banned})
-            # Defense in depth, and honestly so: with the set check above
-            # passing, the DELETE removes every residue row, so a single
-            # session cannot make this fire and its mutant is unkillable from
-            # one connection. It still guards the READ COMMITTED case where
-            # another session commits a new sentinel review in between. The
-            # offers twin above IS reachable (its join skips a row whose
-            # product is missing) and IS mutation-tested.
+            # Defense in depth, and honestly so: with the set check and the
+            # door re-check above passing, the DELETE removes every residue
+            # row, so a single session cannot make this fire and its mutant is
+            # unkillable from one connection. It still guards the READ
+            # COMMITTED window in which another session commits a new sentinel
+            # review between the locked re-read and the write. The offers twin
+            # is unreachable for the same reason, and says so there too.
             if left:
                 raise RuntimeError(
                     f"product_reviews still holds {left} sentinel row(s) after delete "
@@ -361,13 +416,18 @@ async def apply(db, tables: List[str], run_id: str, plan_result: Dict[str, Any])
     return result
 
 
-# Columns of the review dump that carry user-authored text or an account id.
-# The FULL row still goes to the dump FILE (that is the reversal record); only
-# the copy printed to the run log is redacted, because a CI log is readable by
-# everyone with repo access and this tool is reusable on rows that are not QA
-# canaries.
-_REDACTED_REVIEW_FIELDS = ("body", "body_redacted", "redaction", "title",
-                           "author_user_id", "risk_flags", "editor_note")
+# The review columns that are safe to PRINT. An ALLOWLIST, not a denylist: a
+# denylist leaks every column added after it is written (a future
+# `reviewer_email` would print by default), and the house rule from the
+# security-test review is allowlist-never-denylist. The FULL row still goes to
+# the dump FILE — that is the reversal record; only the copy printed to the run
+# log is reduced, because a CI log is readable by everyone with repo access and
+# this tool is reusable on rows that are not QA canaries.
+_LOGGABLE_REVIEW_FIELDS = frozenset({
+    "id", "product_key", "sku_key", "merchant_id", "platform", "platform_product_id",
+    "status", "source_type", "source_system", "verification", "rating", "group_id",
+    "media_count", "created_at", "updated_at", "scope_resolves",
+})
 
 
 def _redacted_for_log(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -376,8 +436,8 @@ def _redacted_for_log(p: Dict[str, Any]) -> Dict[str, Any]:
     if not rev:
         return out
     for row in rev.get("dump", []):
-        for f in _REDACTED_REVIEW_FIELDS:
-            if row.get(f) is not None:
+        for f in list(row):
+            if f not in _LOGGABLE_REVIEW_FIELDS and row.get(f) is not None:
                 row[f] = f"<redacted {len(str(row[f]))} chars — see the dump file>"
     for child in rev.get("cascaded_children", {}).values():
         if isinstance(child, dict) and isinstance(child.get("rows"), list):
@@ -392,6 +452,11 @@ def _write_dump(path: Optional[str], payload: Dict[str, Any]) -> Optional[str]:
     if not path:
         return None
     f = Path(path)
+    if f.exists():
+        # The docstring calls this the ONLY reversal record for a hard DELETE;
+        # a second run silently overwriting the first is how that record is
+        # lost. Refuse rather than clobber.
+        raise RuntimeError(f"refusing to overwrite an existing dump file: {f}")
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(payload, indent=1, default=str), encoding="utf-8")
     return str(f)
