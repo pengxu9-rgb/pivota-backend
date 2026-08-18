@@ -798,6 +798,45 @@ def seed_route_resolves_sql(cp_alias: str = "cp") -> str:
     )
 
 
+def is_seed_routed_lane(
+    *,
+    merchant_id: str | None,
+    platform: str | None,
+    source_system: str | None,
+    source_product_id: str | None,
+) -> bool:
+    """Is this row's PDP content routed through ``external_product_seeds``?
+
+    The VALUE twin of ``_seed_routed_lane`` (the SQL form above) and of the
+    gateway's ``pdpRenderability.isSeedRoutedLane``. Extracted from
+    :func:`pdp_route_resolvable`, which inlined it, so the trust policy can ask
+    the same question without a third copy — ADR-009's whole lesson is that this
+    predicate was derived per site and drifted.
+
+    Note there is deliberately NO ``merch_obs_`` arm: this answers "is the row
+    seed-ROUTED" from row evidence. "Is this SELLER scraped supply" is the
+    different question :func:`is_observed_seller_merchant_id` answers.
+    """
+    lowered_id = (source_product_id or "").strip().lower()
+    return (
+        (merchant_id or "") == EXTERNAL_SEED_MERCHANT_ID
+        or (platform or "").strip().lower() == EXTERNAL_SEED_MERCHANT_ID
+        or (source_system or "").strip().lower() in SEED_ROUTED_SOURCE_SYSTEMS
+        or lowered_id[:4] in _EXTERNAL_SEED_ID_PREFIXES
+    )
+
+
+def is_observed_seller_merchant_id(merchant_id: str | None) -> bool:
+    """Is this seller a per-brand observed seller (the brand's own D2C crawl)?
+
+    Narrower than the lane on purpose: the retired shared bucket is scraped
+    supply but is nobody's storefront, so callers that exempt a brand from
+    identity-COVERAGE gates must ask THIS. Twin of the gateway's
+    ``externalSeedLane.isObservedSellerMerchantId``.
+    """
+    return str(merchant_id or "").strip().startswith("merch_obs_")
+
+
 def pdp_route_resolvable(
     *,
     merchant_id: str | None,
@@ -817,14 +856,12 @@ def pdp_route_resolvable(
     here is unchanged, and the extra lane lives entirely inside the value it is
     handed.
     """
-    lowered_id = (source_product_id or "").strip().lower()
-    seed_routed = (
-        (merchant_id or "") == EXTERNAL_SEED_MERCHANT_ID
-        or (platform or "").strip().lower() == EXTERNAL_SEED_MERCHANT_ID
-        or (source_system or "").strip().lower() in SEED_ROUTED_SOURCE_SYSTEMS
-        or lowered_id[:4] in _EXTERNAL_SEED_ID_PREFIXES
-    )
-    if seed_routed:
+    if is_seed_routed_lane(
+        merchant_id=merchant_id,
+        platform=platform,
+        source_system=source_system,
+        source_product_id=source_product_id,
+    ):
         return bool(seed_route_ok)
     plat = (platform or "").strip().lower()
     if plat in MERCHANT_SYNCED_PLATFORMS:

@@ -862,6 +862,21 @@ def test_policy_version_is_pinned_to_the_node_twin():
     (NON_CANONICAL_DUPLICATE), which moves 121 measured prod rows
     'public' -> 'shadow'.
 
+    c1.v0.7 -> c1.v0.8 on 2026-08-17 (ADR-009): both seed-lane predicates here
+    stopped naming the retired sentinel seller and now ask
+    pdp_renderability.is_seed_routed_lane / .is_observed_seller_merchant_id.
+    Two derivations move:
+      * _derive_verification_source — it tested the sentinel merchant, which no
+        catalog row carries since the A9-4 re-key, so scraped rows fell through
+        to the platform arms and labelled themselves 'shopify_sync'.
+      * is_external_seed_content — the hand-rolled trio lacked the source_system
+        and seed-id arms, so a mirrored row whose platform is its UPSTREAM's
+        (the minted lane) missed the identity-coverage gate.
+    Measured on prod 2026-08-17: the widened arms catch ZERO rows the old trio
+    did not, so the serving blast radius is 0 — the bump is for the DERIVATION
+    change, which is what the twin has to agree with. The paired PIVOTA-Agent PR
+    is #2014; merge THIS one first.
+
     🚨 THE PAIRED PIVOTA-Agent PR IS NOT OPTIONAL AND IS NOT JUST THIS STRING.
     The twin must also (a) select the per-row priced-offer EXISTS in
     src/services/catalogRowTrustUpserter.js — the mirror of
@@ -870,7 +885,7 @@ def test_policy_version_is_pinned_to_the_node_twin():
     its index gate. Ship only this bump and the twin keeps re-deriving those 4
     price-less PDPs 'public' on its next identity event for them.
     """
-    assert POLICY_VERSION == "c1.v0.7"
+    assert POLICY_VERSION == "c1.v0.8"
 
 
 # ---- TEST/DEMO MERCHANT GATE (2026-07-27) -----------------------------------
@@ -1024,3 +1039,100 @@ def test_non_canonical_duplicate_is_in_the_reason_vocabulary():
     from services.catalog_trust_policy import REASON_CODE_VOCABULARY
 
     assert REASON_CODES.NON_CANONICAL_DUPLICATE in REASON_CODE_VOCABULARY
+
+
+# ---- ADR-009 c1.v0.8: both seed predicates follow the LANE -------------------
+#
+# Byte-for-byte the same cases as the PIVOTA-Agent twin's
+# tests/catalog_trust_policy.node.test.cjs, so a future one-sided edit shows up
+# as a diff between two files that are meant to agree.
+#
+# NOTE: verification_source names whichever freshness SIGNAL is newest, not the
+# row's class — so each fixture makes the product's own sync the most recent, or
+# 'identity_resolver' wins and the test measures the picker, not the classifier.
+
+
+def test_verification_source_a_rekeyed_mirror_row_is_a_scrape_not_a_sync():
+    trust = call(
+        product=active_merchant_product(
+            merchant_id="merch_obs_7f3a2b1c9d4e5f60",
+            platform="shopify",
+            source_system="external_product_seeds_mirror_v1",
+            last_seen_in_sync_at=NOW,
+        ),
+        ips=eligible_ips(last_extracted_at=days_ago(5), quality_scored_at=days_ago(5)),
+    )
+    assert trust["verification_source"] == "external_seed_scrape"
+
+
+def test_verification_source_the_minted_lane_is_a_scrape_too():
+    """No ext_ id and the UPSTREAM's platform — the shape the old trio missed."""
+    trust = call(
+        product=active_merchant_product(
+            merchant_id="merch_obs_7f3a2b1c9d4e5f60",
+            platform="shopify",
+            source_system="catalog_enrichment_agent_v1",
+            source_product_id="ilia-the-spf-and-go-makeup-edit",
+            last_seen_in_sync_at=NOW,
+        ),
+        ips=eligible_ips(last_extracted_at=days_ago(5), quality_scored_at=days_ago(5)),
+    )
+    assert trust["verification_source"] == "external_seed_scrape"
+
+
+def test_verification_source_preservation_the_retired_sentinel_is_still_a_scrape():
+    trust = call(
+        product=active_merchant_product(
+            merchant_id="external_seed",
+            platform="external_seed",
+            source_system="external_product_seeds",
+            last_seen_in_sync_at=NOW,
+        ),
+    )
+    assert trust["verification_source"] == "external_seed_scrape"
+
+
+def test_verification_source_control_a_connected_merchant_still_reports_a_sync():
+    """Without this, every assertion above would pass on a function that
+    returned 'external_seed_scrape' unconditionally."""
+    trust = call(
+        product=active_merchant_product(last_seen_in_sync_at=NOW),
+        ips=eligible_ips(last_extracted_at=days_ago(5), quality_scored_at=days_ago(5)),
+    )
+    assert trust["verification_source"] == "shopify_sync"
+
+
+def test_seed_content_is_recognised_by_its_lane_under_any_seller():
+    """The arm the hand-rolled trio lacked: platform is the UPSTREAM's, and the
+    seller is neither the retired lump nor an observed seller. Classified by
+    merchant alone this reads FIRST-PARTY and skips the identity-coverage gate,
+    i.e. scraped content would serve as brand-official.
+
+    NOT the retired rig id, which short-circuits on TEST_MERCHANT_EXCLUDED
+    before this gate is reached.
+    """
+    trust = call(
+        product=active_merchant_product(
+            merchant_id="merch_924da2be8503e5f7",
+            platform="shopify",
+            source_system="external_product_seeds_mirror_v1",
+        ),
+        identity=approved_identity(identity_confidence=None),
+    )
+    assert REASON_CODES.IDENTITY_CONFIDENCE_NULL in trust["serving_reason_codes"]
+    assert (
+        REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY
+        not in trust["serving_reason_codes"]
+    )
+
+
+def test_control_a_genuinely_first_party_merchant_is_still_exempt():
+    """Proves the assertion above discriminates rather than always holding."""
+    trust = call(
+        product=active_merchant_product(),
+        identity=approved_identity(identity_confidence=None),
+    )
+    assert (
+        REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY
+        in trust["serving_reason_codes"]
+    )
