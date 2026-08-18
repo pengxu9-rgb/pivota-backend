@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from typing import Optional
@@ -8,7 +9,7 @@ from typing import Optional
 from fastapi import HTTPException, status
 
 from db.database import database
-from utils.transient_errors import is_asyncpg_busy_error
+from utils.transient_errors import is_asyncpg_busy_error, is_asyncpg_pool_gone_error
 
 
 logger = logging.getLogger(__name__)
@@ -333,6 +334,34 @@ async def connect_database_with_timeout(timeout_seconds: float, *, db=None) -> N
     logger.info("Connected to database %s", getattr(db, "url", "<unknown>"))
 
 
+# Concurrent callers share ONE recovery attempt, and share its failure.
+#
+# `ensure_database_ready` runs on /auth/login, /quote and /order — the paths
+# that arrive in BURSTS. Without coalescing, every request in a burst runs the
+# whole teardown/rebuild independently, and each abandonment strands a pool.
+# MEASURED against real Postgres driving this function: pool max_size=2 held
+# busy, 5 concurrent callers, 9 server backends stranded permanently and 4 of
+# the 5 requests failed. One attempt leaks at most one pool; five leak five.
+#
+# A plain `asyncio.Lock` is NOT equivalent and was rejected once already: it
+# serialises the followers behind the leader instead of letting them adopt its
+# result, which turned a leak into a latency queue (6s -> 123s). Followers here
+# await the SAME future and take the leader's outcome, success or failure.
+#
+# Bound to the running loop, not to import time: a module-level Future/Lock
+# binds to whichever loop imported the module, and this module is imported by
+# CLIs and tests that create their own.
+_recovery_inflight: "Optional[asyncio.Future]" = None
+_recovery_loop: "Optional[asyncio.AbstractEventLoop]" = None
+
+
+def _reset_recovery_single_flight() -> None:
+    """Test seam: drop any in-flight recovery state."""
+    global _recovery_inflight, _recovery_loop
+    _recovery_inflight = None
+    _recovery_loop = None
+
+
 async def ensure_database_ready(
     *,
     connect_timeout_seconds: float = 3.0,
@@ -345,6 +374,22 @@ async def ensure_database_ready(
     Production startup is intentionally allowed to continue in degraded mode when DB
     connection times out. That keeps the service deployable, but quote/order flows need
     a way to recover later when the DB becomes reachable again.
+
+    TWO RULES, both learned from the 2026-08-18 wedge (and almost certainly the
+    2026-08-05/06 one):
+
+    1. A FAILED PROBE IS NOT A DEAD POOL. `SELECT 1` under a timeout cannot
+       tell a dead pool from a slow or merely saturated one — a saturated
+       pool's probe queues behind `acquire` and times out identically. This
+       function used to rebuild on that guess, and rebuilding ABANDONS the
+       pool: nothing references it afterwards, so its server connections stay
+       open until Postgres reaps them. Under load that is self-amplifying,
+       because each abandonment removes the capacity that made the next probe
+       time out. The teardown is now gated on `_pool_is_provably_dead()`, the
+       same local-fact test the supervisor already uses; a probe failure on a
+       live pool fails the request FAST and leaves the pool alone.
+    2. ONE RECOVERY AT A TIME, shared by everyone in the burst — see the
+       single-flight note above.
     """
 
     async def _connect_once() -> None:
@@ -367,34 +412,131 @@ async def ensure_database_ready(
                 message="database readiness probe failed",
             ) from exc
 
-    if not getattr(database, "is_connected", False):
+    async def _recover() -> None:
+        """The destructive path. Only reached when the pool is provably dead."""
+        try:
+            if getattr(database, "is_connected", False):
+                await asyncio.wait_for(
+                    database.disconnect(), timeout=disconnect_timeout_seconds
+                )
+        except Exception as exc:
+            logger.warning(f"Database disconnect during recovery failed: {exc}")
+        finally:
+            _force_mark_database_disconnected()
+
         await _connect_once()
+
+        try:
+            await _probe_once("reconnect_probe")
+        except DatabaseUnavailableError as exc:
+            if is_asyncpg_busy_error(exc.__cause__ or exc):
+                _force_mark_database_disconnected()
+            raise
+
+    if not getattr(database, "is_connected", False):
+        # Nothing to abandon: there is no pool to protect, so connect directly.
+        # Still single-flighted, or a burst against a down database opens a
+        # fresh pool per request (each stranding min_size backends on timeout).
+        await _run_single_flight(_connect_once_then_probe(_connect_once, _probe_once))
+        return
 
     try:
         await _probe_once("probe")
         return
     except DatabaseUnavailableError as first_err:
+        # Two independent proofs of death, and nothing weaker counts:
+        #   * the pool object itself is gone/closed (`_pool_is_provably_dead`), or
+        #   * the probe error SAYS the pool is closed/closing.
+        # A bare timeout is neither — that is the saturated-pool case.
+        pool_gone = _pool_is_provably_dead() or is_asyncpg_pool_gone_error(
+            first_err.__cause__ or first_err
+        )
+        if not pool_gone:
+            # Slow or saturated, NOT dead. Rebuilding here is what wedged prod:
+            # it abandons a working pool and leaks its connections. Fail the
+            # request; the pool recovers on its own when the load drains.
+            logger.warning(
+                "Database readiness probe failed but the pool is alive; "
+                "failing fast without rebuilding",
+                extra={"phase": first_err.phase, "error_type": first_err.error_type},
+            )
+            raise
         logger.warning(
-            "Database readiness probe failed; attempting one reconnect",
+            "Database readiness probe failed and the pool is provably dead; "
+            "attempting one reconnect",
             extra={"phase": first_err.phase, "error_type": first_err.error_type},
         )
 
-    try:
-        if getattr(database, "is_connected", False):
-            await asyncio.wait_for(database.disconnect(), timeout=disconnect_timeout_seconds)
-    except Exception as exc:
-        logger.warning(f"Database disconnect during recovery failed: {exc}")
-    finally:
-        _force_mark_database_disconnected()
+    await _run_single_flight(_recover())
 
-    await _connect_once()
 
+def _connect_once_then_probe(connect, probe):
+    async def _run() -> None:
+        await connect()
+        await probe("probe")
+    return _run()
+
+
+async def _run_single_flight(coro) -> None:
+    """Run `coro` once; concurrent callers await the same result.
+
+    The leader's exception propagates to every follower — adopting the failure
+    is the point. A follower that instead retried on its own would reintroduce
+    exactly the herd this exists to remove.
+    """
+    global _recovery_inflight, _recovery_loop
+
+    loop = asyncio.get_running_loop()
+    if _recovery_inflight is not None and not _recovery_inflight.done() and _recovery_loop is loop:
+        coro.close()  # we are not running it; do not leave it un-awaited
+        await asyncio.shield(_recovery_inflight)
+        return
+
+    fut = loop.create_future()
+    _recovery_inflight = fut
+    _recovery_loop = loop
     try:
-        await _probe_once("reconnect_probe")
-    except DatabaseUnavailableError as exc:
-        if is_asyncpg_busy_error(exc.__cause__ or exc):
-            _force_mark_database_disconnected()
+        await coro
+    except asyncio.CancelledError:
+        # THE LEADER'S CANCELLATION IS NOT THE FOLLOWERS' BUSINESS.
+        #
+        # Storing it on the future would hand every follower a CancelledError
+        # they never asked for: `asyncio.shield` sees a future whose EXCEPTION
+        # is CancelledError (not a cancelled future) and re-raises it inside
+        # request tasks that are perfectly healthy. Those tasks would then
+        # unwind as cancelled — no response body, no `Retry-After` — instead of
+        # getting the 503 that `routes/auth.py`, `routes/quote_routes.py` and
+        # `routes/order_routes.py` are all written against. One cancelled
+        # leader (a deploy mid-outage, a TaskGroup sibling failing) would take
+        # N unrelated requests down with it, which is a coupling the pre-
+        # single-flight code did not have.
+        #
+        # So followers get the honest domain answer — "we could not establish
+        # readiness" — and the next arrival is free to lead a fresh attempt.
+        if not fut.done():
+            fut.set_exception(
+                DatabaseUnavailableError(
+                    phase="recovery_cancelled",
+                    error_type="CancelledError",
+                    message="database recovery was cancelled before it completed",
+                )
+            )
         raise
+    except BaseException as exc:
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
+    else:
+        if not fut.done():
+            fut.set_result(None)
+    finally:
+        # Never leave a completed future's exception unretrieved.
+        if fut.done() and not fut.cancelled():
+            with contextlib.suppress(Exception):
+                fut.exception()
+        if _recovery_inflight is fut:
+            _recovery_inflight = None
+            _recovery_loop = None
 
 
 DEFAULT_RECONNECT_SUPERVISOR_INTERVAL_SECONDS = 30.0
@@ -528,8 +670,24 @@ async def run_database_reconnect_supervisor(
       * pool EXHAUSTED on a healthy database       — deliberately NOT touched
     The last one is the whole point: it is indistinguishable from a slow
     database without guessing, and guessing is what destroyed live pools in
-    rounds 18 and 19. Request traffic through `ensure_database_ready` remains
-    its only repair.
+    rounds 18 and 19.
+
+    ⚠️ THAT LAST LINE USED TO SAY request traffic through
+    `ensure_database_ready` was its repair. THAT IS NO LONGER TRUE, and the
+    change was deliberate: reading saturation as death is what wedged prod on
+    2026-08-18 (a burst of 5 concurrent recoveries stranded 9 backends
+    permanently, measured), so the request path now refuses the same case. NO
+    PATH REPAIRS AN ALIVE-BUT-UNUSABLE POOL ANY MORE — not this supervisor,
+    not the request path.
+
+    What that costs, stated rather than discovered later: a pool whose sockets
+    are half-open (a silent partition) has `_closed` False and an unreachable
+    server, so asyncpg never notices and nothing rebuilds. Measured against the
+    louder shapes, they still self-heal: killing every backend with
+    `pg_terminate_backend` under a live pool RECOVERS, because asyncpg's holder
+    sees `is_closed()` and reconnects. The half-open case is the residual, and
+    it is accepted because the alternative — inferring death from a timeout —
+    is the incident.
 
     NOT AN APSCHEDULER JOB: during the 2026-08-05/06 incident every scheduler
     job was wedged at max_instances, and a repair mechanism must not share

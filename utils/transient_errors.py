@@ -10,6 +10,33 @@ _ASYNC_PG_POOL_CLOSING_SUBSTR = "pool is closing"
 _ASYNC_PG_POOL_CLOSED_SUBSTR = "pool is closed"
 
 
+def _matches_in_cause_chain(err: BaseException, substrings: tuple) -> bool:
+    seen: Set[int] = set()
+    cur: Optional[BaseException] = err
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur).lower()
+        if any(sub in text for sub in substrings):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def is_asyncpg_pool_gone_error(err: BaseException) -> bool:
+    """True only when the error says the POOL ITSELF is closed or closing.
+
+    Deliberately NARROWER than `is_asyncpg_busy_error`, which also matches
+    "another operation is in progress" — a busy or poisoned CONNECTION, which
+    says nothing about the pool. Callers use this one to decide whether to tear
+    a pool down, and that decision must never be made on an ambiguous signal:
+    rebuilding a live pool abandons it, and its server connections then stay
+    open until Postgres reaps them (the 2026-08-18 wedge).
+    """
+    return _matches_in_cause_chain(
+        err, (_ASYNC_PG_POOL_CLOSED_SUBSTR, _ASYNC_PG_POOL_CLOSING_SUBSTR)
+    )
+
+
 def is_asyncpg_busy_error(err: BaseException) -> bool:
     """
     asyncpg raises `InterfaceError: cannot perform operation: another operation is in progress`
