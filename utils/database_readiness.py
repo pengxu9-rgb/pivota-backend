@@ -325,6 +325,34 @@ async def connect_database_with_timeout(timeout_seconds: float, *, db=None) -> N
         _terminate_quietly(pool)
         raise
 
+    # RE-CHECK, because the guard above is a check-then-act across an await.
+    #
+    # `_pool is None` was true when we looked, but filling the pool suspends,
+    # and the reconnect SUPERVISOR runs `connect_database_with_timeout` on its
+    # own timer outside the request path's single flight. Both entrants
+    # therefore observe `None`, both fill, and the second assignment silently
+    # overwrites the first — orphaning a fully-connected pool that nothing
+    # holds a reference to, so `disconnect()` can never reach it. That is the
+    # same leak the guard above exists to prevent, arriving through the door it
+    # does not cover; the window is the whole fill, 2s (login) to 10s
+    # (supervisor), and it opens precisely during the outage both paths exist
+    # to repair. MEASURED on real Postgres, MIN_SIZE=4, two concurrent
+    # connects: 8 backends opened, 4 still stranded after a clean disconnect().
+    #
+    # Losing the race is not an error — the database IS connected, by the
+    # winner — so terminate what WE built and return success. `_pool` and
+    # `is_connected` are assigned with no await between them, so a caller that
+    # sees the pool also sees the flag.
+    #
+    # This keeps the invariant a lock would have to buy: every pool this
+    # function creates is either published or terminated, under any
+    # interleaving. A lock is deliberately NOT used — the module's own history
+    # (rounds 16-19) is that serialising this path turned a leak into a
+    # 6s -> 123s latency queue.
+    if backend._pool is not None:
+        _terminate_quietly(pool)
+        return
+
     # Publish in the library's order: the pool first, then the flag that tells
     # every other caller the pool is there.
     backend._pool = pool
