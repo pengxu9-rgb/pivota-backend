@@ -74,12 +74,11 @@ NETWORK_MARKERS = (
 # ---------------------------------------------------------------------------
 # THE RATCHET — measured 2026-08-18, and it is DEBT, not a standard.
 # ---------------------------------------------------------------------------
-# 24 sites across 9 files hold a DB transaction open across a Stripe round-trip,
-# several of them on live request paths: the Stripe webhook handler
-# (`routes/billing_routes._handle_checkout_session_completed`), PSP connect on
-# three surfaces, refunds, and settlement transfers. Any one of them can wedge
-# the process the way 2026-08-18 wedged it, because the held Connection is
-# shared across tasks on the 0.7.0 pin.
+# 7 awaits across 2 files hold a DB transaction open across a Stripe round-trip.
+# Both are in the monetization lane and neither is live today (see BASELINE),
+# so this is debt with no current exposure — not an emergency, and not a
+# standard either: the held Connection is shared across tasks on the 0.7.0
+# pin, so if either lane is promoted it can wedge the process.
 #
 # They are NOT fixed here on purpose. Every one is a money path where the
 # transaction exists to keep the DB row and the Stripe object consistent, and
@@ -91,17 +90,16 @@ NETWORK_MARKERS = (
 #
 # So this is a ratchet, per FILE so that fixing one site cannot silently pay for
 # a new one somewhere else. The numbers may only go DOWN. A new file, or a file
-# getting worse, fails.
+# getting worse, fails. Keep the counts HONEST: see _callee_texts for why an
+# over-count is worse than useless.
 BASELINE = {
-    "routes/admin_api.py": 1,
-    "routes/admin_partners.py": 1,
-    "routes/billing_routes.py": 3,
-    "routes/manage_integrations.py": 1,
-    "routes/merchant_api_extensions.py": 1,
-    "services/billing/credit_overage_billing.py": 5,
-    "services/invoice_generation_service.py": 7,
-    "services/refund_service.py": 1,
-    "services/settlement_file_service.py": 4,
+    # Monetization lane only, and NEITHER is reachable today: the T7 billing
+    # cron is registered PAUSED (next_run_time=None) in services/audit_scheduler
+    # with only routes/shakeout_debug.py otherwise calling it, and
+    # create_overage_invoice has no caller at all outside a comment. Real debt,
+    # zero current exposure — which is why they are counted rather than rushed.
+    "services/billing/credit_overage_billing.py": 3,
+    "services/invoice_generation_service.py": 4,
 }
 
 
@@ -129,6 +127,34 @@ def _enclosing_function(tree: ast.AST, lineno: int) -> str:
     return best
 
 
+def _callee_texts(node: ast.Await) -> List[str]:
+    """What is being CALLED — never the argument text.
+
+    Matching the whole `ast.unparse(await_node)` is the trap this function
+    exists to avoid: an `await db.execute("... stripe_customer_id ...")` renders
+    its SQL into the string, so a substring test for "stripe" flags a plain
+    database write as a network call. The first version of this gate did exactly
+    that and reported 24 violations across 9 files — including the Stripe
+    webhook handler, refunds and PSP connect — when the true number was 7 in 2.
+    Inflated counts are not a harmless overestimate here: they hand each file
+    headroom a REAL violation can then occupy without failing the ratchet.
+
+    For `asyncio.to_thread(fn, ...)` / `run_in_executor(None, fn, ...)` the
+    callee is the wrapper, so the arguments are inspected too — that is where
+    the blocking Stripe SDK call actually is.
+    """
+    out: List[str] = []
+    value = node.value
+    if isinstance(value, ast.Call):
+        rendered = ast.unparse(value.func)
+        out.append(rendered)
+        if "to_thread" in rendered or "run_in_executor" in rendered:
+            out.extend(ast.unparse(arg) for arg in value.args)
+    else:
+        out.append(ast.unparse(value))
+    return out
+
+
 def _findings() -> List[Tuple[str, str, str, int, str]]:
     out: List[Tuple[str, str, str, int, str]] = []
     for path in _iter_python_files():
@@ -147,12 +173,12 @@ def _findings() -> List[Tuple[str, str, str, int, str]]:
             for inner in ast.walk(node):
                 if not isinstance(inner, ast.Await):
                     continue
-                rendered = ast.unparse(inner)
+                texts = _callee_texts(inner)
                 for marker in NETWORK_MARKERS:
-                    if marker in rendered:
+                    if any(marker in t for t in texts):
                         out.append(
                             (rel, _enclosing_function(tree, inner.lineno), marker,
-                             inner.lineno, rendered[:120])
+                             inner.lineno, texts[0][:100])
                         )
                         break
     return out
