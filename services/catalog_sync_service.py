@@ -987,6 +987,37 @@ async def ingest_standard_products(
             logger.warning("Catalog ingest: failed to parse StandardProduct merchant=%s platform=%s err=%s", merchant_id, platform, exc)
             continue
 
+        # Classify the category BEFORE opening the transaction.
+        #
+        # This await can make an LLM call. Inside the transaction it pinned a
+        # pooled connection and held an open Postgres transaction — row locks
+        # included — for the whole round-trip, once PER PRODUCT, on a path
+        # reachable from routes/universal_product_sync.py. A sync of N products
+        # therefore serialised N LLM calls each under an open transaction.
+        #
+        # There is a second, quieter hazard: `databases==0.7.0` parks the
+        # `Connection` in a ContextVar, so a task spawned from a context that
+        # already touched the DB shares this one. Such a sibling's queries JOIN
+        # the open transaction — measured: a sibling read the holder's
+        # uncommitted row — and lose their writes if the holder rolls back.
+        #
+        # (This is NOT the explanation for the 2026-08-18 wedge; that remains
+        # open. An earlier version of this comment said it was. The holder does
+        # not block siblings: a sibling query ran in 0.000s while a holder slept
+        # 1.0s inside its transaction.)
+        #
+        # The fold is pure — regex, then httpx — touches no tables, and reads
+        # only off `product`, so it hoists with no behaviour change.
+        _description_for_ingest = product.description_text or product.description
+        _category_fold = await fold_category_with_llm_fallback(
+            merchant_id=merchant_id,
+            category=product.product_type,
+            product_type=product.product_type,
+            title=product.title,
+            description=_description_for_ingest,
+            variants=product.variants,
+        )
+
         async with database.transaction():
             source_pid = str(product.product_id or product.id)
             product_key = make_catalog_product_key(merchant_id, platform, source_pid)
@@ -1075,7 +1106,6 @@ async def ingest_standard_products(
                 merchant_id, platform, source_pid,
             )
 
-            _description_for_ingest = product.description_text or product.description
             _tags_for_ingest = list(product.tags or [])
             _taxonomy_v1 = derive_taxonomy_v1(
                 price=product.price,
@@ -1090,14 +1120,7 @@ async def ingest_standard_products(
             # path is 'llm_category_v1' with a per-product_type cache
             # so a merchant's catalog of 600 "Dog Harness" rows triggers
             # one LLM call. See plans/let-s-build-a-full-breezy-taco.md.
-            _category_fold = await fold_category_with_llm_fallback(
-                merchant_id=merchant_id,
-                category=product.product_type,
-                product_type=product.product_type,
-                title=product.title,
-                description=_description_for_ingest,
-                variants=product.variants,
-            )
+            # (_category_fold computed above, outside the transaction)
             if _category_fold is not None:
                 (_cat_label, _cat_path), _cat_source, _cat_confidence = _category_fold
             else:
