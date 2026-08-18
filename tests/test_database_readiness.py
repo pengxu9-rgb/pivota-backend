@@ -333,3 +333,168 @@ async def test_connect_with_timeout_refuses_to_publish_over_a_live_pool(
 
     assert recorded == [], "no second pool may be built for a backend that has one"
 
+
+
+# ---------------------------------------------------------------------------
+# The `_pool_is_provably_dead()` arm of the teardown gate.
+#
+# Added because a mutant that deleted it — `_pool_is_provably_dead() or ...`
+# -> `False or ...` — survived all 53 tests in this directory. Every
+# FakeDatabase here lacks `_backend`, so the predicate returned False in every
+# existing test and the arm was load-bearing but unconstrained.
+#
+# It is the ONLY thing that recovers `_pool is None` while the wrapper still
+# says `is_connected` — the shape that raises `AssertionError: DatabaseBackend
+# is not running`, which this workstream identifies as the 12.5h-outage
+# fingerprint. `is_asyncpg_pool_gone_error` does NOT match it (the message has
+# no "pool is closed"/"pool is closing" substring), so without this arm the
+# request path would refuse to repair the very incident it was written for.
+# ---------------------------------------------------------------------------
+
+
+class _DeadPoolBackend:
+    """A backend whose pool object is gone — `_pool_is_provably_dead()` True."""
+
+    def __init__(self) -> None:
+        self._pool = None
+
+
+class _FakeDatabaseWithDeadPool:
+    """`is_connected` True while the pool underneath is gone.
+
+    Reproduces the real signature: `databases` leaves the wrapper marked
+    connected, so the probe raises AssertionError rather than any asyncpg
+    'pool is closed' error.
+    """
+
+    def __init__(self) -> None:
+        self.is_connected = True
+        self._backend = _DeadPoolBackend()
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    async def execute(self, *_a, **_kw):
+        # Exactly the real signature: `databases` asserts the backend is
+        # running, and it only stops once a fresh pool exists.
+        if self._backend._pool is None:
+            raise AssertionError("DatabaseBackend is not running")
+        return 1
+
+    async def connect(self):
+        self.connect_calls += 1
+        self.is_connected = True
+        self._backend._pool = object()  # a fresh pool: no longer provably dead
+
+    async def disconnect(self):
+        self.disconnect_calls += 1
+        self.is_connected = False
+
+
+@pytest.mark.asyncio
+async def test_provably_dead_pool_is_repaired_even_though_no_asyncpg_error_matches(
+    monkeypatch,
+) -> None:
+    """`_pool is None` must still be repaired by the request path."""
+    fake = _FakeDatabaseWithDeadPool()
+    monkeypatch.setattr(readiness, "database", fake)
+    readiness._reset_recovery_single_flight()
+
+    # Precondition: the predicate fires, and the error-string classifier does NOT —
+    # so this arm is the only thing that can authorise the rebuild.
+    assert readiness._pool_is_provably_dead() is True
+    assert readiness.is_asyncpg_pool_gone_error(
+        AssertionError("DatabaseBackend is not running")
+    ) is False
+
+    await readiness.ensure_database_ready()
+
+    assert fake.connect_calls == 1, "a provably dead pool was not rebuilt"
+
+
+@pytest.mark.asyncio
+async def test_a_live_pool_that_merely_times_out_is_never_torn_down(monkeypatch) -> None:
+    """The saturation case: alive pool, slow probe — must NOT rebuild.
+
+    This is the 2026-08-18 wedge in one test. Paired with the test above so the
+    gate is driven BOTH ways: rebuild on local fact, refuse on inference.
+    """
+
+    class _LivePoolBackend:
+        def __init__(self) -> None:
+            self._pool = object()  # alive, not closed
+
+    class _SaturatedDatabase:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self._backend = _LivePoolBackend()
+            self.connect_calls = 0
+            self.disconnect_calls = 0
+
+        async def execute(self, *_a, **_kw):
+            raise asyncio.TimeoutError()
+
+        async def connect(self):
+            self.connect_calls += 1
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    fake = _SaturatedDatabase()
+    monkeypatch.setattr(readiness, "database", fake)
+    readiness._reset_recovery_single_flight()
+
+    assert readiness._pool_is_provably_dead() is False
+
+    with pytest.raises(readiness.DatabaseUnavailableError):
+        await readiness.ensure_database_ready()
+
+    assert fake.disconnect_calls == 0, "tore down a pool that was merely saturated"
+    assert fake.connect_calls == 0, "rebuilt a pool that was merely saturated"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_leader_does_not_cancel_its_followers(monkeypatch) -> None:
+    """A cancelled leader must hand followers a 503, not its own cancellation.
+
+    Single-flight COUPLES callers that used to be independent, so the leader's
+    task state must not leak into them. Storing `CancelledError` on the shared
+    future makes `asyncio.shield` re-raise it inside follower tasks that were
+    never cancelled: they unwind with no response body and no `Retry-After`,
+    instead of the `DatabaseUnavailableError` -> 503 contract that
+    routes/auth.py, routes/quote_routes.py and routes/order_routes.py are all
+    written against. One cancelled leader (a deploy landing mid-outage, a
+    TaskGroup sibling failing) would otherwise take N healthy requests with it.
+    """
+    started = asyncio.Event()
+
+    class _HangingDatabase:
+        def __init__(self) -> None:
+            self.is_connected = False
+
+        async def connect(self):
+            started.set()
+            await asyncio.Event().wait()  # never completes; the leader is cancelled
+
+        async def execute(self, *_a, **_kw):
+            return 1
+
+        async def disconnect(self):
+            self.is_connected = False
+
+    monkeypatch.setattr(readiness, "database", _HangingDatabase())
+    readiness._reset_recovery_single_flight()
+
+    leader = asyncio.create_task(readiness.ensure_database_ready())
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    followers = [asyncio.create_task(readiness.ensure_database_ready()) for _ in range(3)]
+    await asyncio.sleep(0.05)  # let them queue behind the leader
+
+    leader.cancel()
+    results = await asyncio.wait_for(
+        asyncio.gather(*followers, return_exceptions=True), timeout=5
+    )
+
+    assert all(
+        isinstance(r, readiness.DatabaseUnavailableError) for r in results
+    ), f"followers must get the domain error, got {[type(r).__name__ for r in results]}"

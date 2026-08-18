@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from typing import Optional
@@ -496,6 +497,31 @@ async def _run_single_flight(coro) -> None:
     _recovery_loop = loop
     try:
         await coro
+    except asyncio.CancelledError:
+        # THE LEADER'S CANCELLATION IS NOT THE FOLLOWERS' BUSINESS.
+        #
+        # Storing it on the future would hand every follower a CancelledError
+        # they never asked for: `asyncio.shield` sees a future whose EXCEPTION
+        # is CancelledError (not a cancelled future) and re-raises it inside
+        # request tasks that are perfectly healthy. Those tasks would then
+        # unwind as cancelled — no response body, no `Retry-After` — instead of
+        # getting the 503 that `routes/auth.py`, `routes/quote_routes.py` and
+        # `routes/order_routes.py` are all written against. One cancelled
+        # leader (a deploy mid-outage, a TaskGroup sibling failing) would take
+        # N unrelated requests down with it, which is a coupling the pre-
+        # single-flight code did not have.
+        #
+        # So followers get the honest domain answer — "we could not establish
+        # readiness" — and the next arrival is free to lead a fresh attempt.
+        if not fut.done():
+            fut.set_exception(
+                DatabaseUnavailableError(
+                    phase="recovery_cancelled",
+                    error_type="CancelledError",
+                    message="database recovery was cancelled before it completed",
+                )
+            )
+        raise
     except BaseException as exc:
         if not fut.done():
             fut.set_exception(exc)
@@ -505,7 +531,9 @@ async def _run_single_flight(coro) -> None:
             fut.set_result(None)
     finally:
         # Never leave a completed future's exception unretrieved.
-        fut.exception() if fut.done() and not fut.cancelled() else None
+        if fut.done() and not fut.cancelled():
+            with contextlib.suppress(Exception):
+                fut.exception()
         if _recovery_inflight is fut:
             _recovery_inflight = None
             _recovery_loop = None
@@ -642,8 +670,24 @@ async def run_database_reconnect_supervisor(
       * pool EXHAUSTED on a healthy database       — deliberately NOT touched
     The last one is the whole point: it is indistinguishable from a slow
     database without guessing, and guessing is what destroyed live pools in
-    rounds 18 and 19. Request traffic through `ensure_database_ready` remains
-    its only repair.
+    rounds 18 and 19.
+
+    ⚠️ THAT LAST LINE USED TO SAY request traffic through
+    `ensure_database_ready` was its repair. THAT IS NO LONGER TRUE, and the
+    change was deliberate: reading saturation as death is what wedged prod on
+    2026-08-18 (a burst of 5 concurrent recoveries stranded 9 backends
+    permanently, measured), so the request path now refuses the same case. NO
+    PATH REPAIRS AN ALIVE-BUT-UNUSABLE POOL ANY MORE — not this supervisor,
+    not the request path.
+
+    What that costs, stated rather than discovered later: a pool whose sockets
+    are half-open (a silent partition) has `_closed` False and an unreachable
+    server, so asyncpg never notices and nothing rebuilds. Measured against the
+    louder shapes, they still self-heal: killing every backend with
+    `pg_terminate_backend` under a live pool RECOVERS, because asyncpg's holder
+    sees `is_closed()` and reconnects. The half-open case is the residual, and
+    it is accepted because the alternative — inferring death from a timeout —
+    is the incident.
 
     NOT AN APSCHEDULER JOB: during the 2026-08-05/06 incident every scheduler
     job was wedged at max_instances, and a repair mechanism must not share
