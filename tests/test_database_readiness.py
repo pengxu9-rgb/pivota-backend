@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from utils import database_readiness as readiness
@@ -57,16 +59,62 @@ async def test_ensure_database_ready_connects_when_startup_left_db_disconnected(
 
 
 @pytest.mark.asyncio
-async def test_ensure_database_ready_reconnects_after_probe_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_probe_timeout_on_a_LIVE_pool_fails_fast_and_rebuilds_nothing() -> None:
+    """The 2026-08-18 wedge, as a unit test.
+
+    This used to assert the opposite — a bare probe timeout triggered a
+    disconnect + reconnect. That is the defect: a timeout cannot distinguish a
+    dead pool from a slow or merely SATURATED one (a saturated pool's probe
+    queues behind `acquire` and times out identically), and rebuilding ABANDONS
+    the pool, whose server connections then stay open until Postgres reaps
+    them. Measured against real Postgres driving this function: 5 concurrent
+    callers against a saturated max_size=2 pool stranded 9 backends permanently.
+
+    So a timeout on a live pool must fail the request and touch nothing.
+    """
+    import utils.database_readiness as readiness_mod
+
     fake_db = FakeDatabase(connected=True, execute_results=[TimeoutError("stale"), 1])
-    monkeypatch.setattr(readiness, "database", fake_db)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(readiness_mod, "database", fake_db)
+        readiness_mod._reset_recovery_single_flight()
+        with pytest.raises(readiness.DatabaseUnavailableError):
+            await readiness.ensure_database_ready()
 
-    await readiness.ensure_database_ready()
-
-    assert fake_db.disconnect_calls == 1
-    assert fake_db.connect_calls == 1
-    assert fake_db.execute_calls == 2
+    assert fake_db.disconnect_calls == 0, "tore down a pool that was merely slow"
+    assert fake_db.connect_calls == 0, "rebuilt a pool that was merely slow"
+    assert fake_db.execute_calls == 1, "probed again instead of failing fast"
     assert fake_db.is_connected is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callers_share_one_recovery_and_its_failure() -> None:
+    """Single-flight: a burst must produce ONE recovery attempt, not N.
+
+    `ensure_database_ready` runs on login/quote/order — the bursty paths.
+    Without coalescing each caller runs the full teardown/rebuild, and each
+    abandonment strands a pool's worth of server connections. Followers must
+    adopt the leader's FAILURE too; a follower that retried on its own would
+    rebuild the herd this exists to remove.
+    """
+    import utils.database_readiness as readiness_mod
+
+    fake_db = FakeDatabase(connected=False, connect_raises=TimeoutError("db down"))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(readiness_mod, "database", fake_db)
+        readiness_mod._reset_recovery_single_flight()
+        results = await asyncio.gather(
+            *[readiness.ensure_database_ready() for _ in range(5)],
+            return_exceptions=True,
+        )
+
+    assert all(isinstance(r, readiness.DatabaseUnavailableError) for r in results), (
+        "every caller must see the failure, not just the leader"
+    )
+    assert fake_db.connect_calls == 1, (
+        f"expected ONE coalesced connect for 5 concurrent callers, got "
+        f"{fake_db.connect_calls} — the herd is back"
+    )
 
 
 @pytest.mark.asyncio
