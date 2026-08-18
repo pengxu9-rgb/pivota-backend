@@ -498,3 +498,79 @@ async def test_a_cancelled_leader_does_not_cancel_its_followers(monkeypatch) -> 
     assert all(
         isinstance(r, readiness.DatabaseUnavailableError) for r in results
     ), f"followers must get the domain error, got {[type(r).__name__ for r in results]}"
+
+
+# ---------------------------------------------------------------------------
+# connect_database_with_timeout: the check-then-act window across the fill.
+#
+# The supervisor calls this on its own timer, OUTSIDE the request path's single
+# flight, so two entrants can both observe `_pool is None`, both fill, and the
+# second assignment orphans the first pool — unreachable by `disconnect()`.
+# Measured on real Postgres before the fix: MIN_SIZE=4, two concurrent
+# connects, 8 backends opened and 4 still stranded after a clean disconnect().
+# ---------------------------------------------------------------------------
+
+
+class _RacingPool:
+    """A pool whose fill can be released on command, so both callers are
+    provably inside the window at the same time."""
+
+    def __init__(self, gate: asyncio.Event, opened: list) -> None:
+        self._gate = gate
+        self._opened = opened
+        self.terminated = False
+
+    def __await__(self):
+        async def _fill():
+            await self._gate.wait()
+            self._opened.append(self)
+            return self
+        return _fill().__await__()
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+
+class _RacingBackend:
+    def __init__(self) -> None:
+        self._pool = None
+
+
+class _RacingDatabase:
+    def __init__(self) -> None:
+        self._backend = _RacingBackend()
+        self.is_connected = False
+        self.url = "postgresql://fake/racing"
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_connects_never_orphan_a_pool(monkeypatch) -> None:
+    """The loser must terminate ITS OWN pool, not overwrite the winner's.
+
+    Without the post-fill re-check both callers assign `backend._pool`, and the
+    first fully-connected pool becomes unreachable — a permanent server-side
+    connection leak that no `disconnect()` can reach.
+    """
+    gate = asyncio.Event()
+    opened: list = []
+    db = _RacingDatabase()
+
+    monkeypatch.setattr(readiness, "_postgres_backend", lambda _db: _db._backend)
+    monkeypatch.setattr(readiness, "_new_pool", lambda _backend: _RacingPool(gate, opened))
+
+    a = asyncio.create_task(readiness.connect_database_with_timeout(10, db=db))
+    b = asyncio.create_task(readiness.connect_database_with_timeout(10, db=db))
+    await asyncio.sleep(0.05)          # both are now inside the fill
+
+    gate.set()                          # release both fills together
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=5)
+
+    assert len(opened) == 2, "test did not actually produce two concurrent fills"
+    installed = db._backend._pool
+    assert installed is not None
+    # Exactly one pool is installed; the other is terminated, not orphaned.
+    losers = [p for p in opened if p is not installed]
+    assert len(losers) == 1
+    assert losers[0].terminated is True, "the losing pool was orphaned, not terminated"
+    assert installed.terminated is False, "the installed pool must stay alive"
+    assert db.is_connected is True
