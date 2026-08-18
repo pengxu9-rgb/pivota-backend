@@ -1,42 +1,48 @@
 """A DB transaction must not span a network call.
 
-THE INCIDENT THIS PREVENTS (2026-08-18). The backend wedged: `/health` 503 with
-`db_ok:false`, every `/api/canonical/products` request 504 in a flat 4.0s, live
-PDPs 404, and the scheduler log full of `maximum number of running instances
-reached (1)`. It took a redeploy to clear, and it was the second time.
+WHAT THIS IS, AND WHAT IT IS NOT. It is not the explanation for the 2026-08-18
+backend wedge. An earlier version of this file claimed to be, and that claim was
+disproven by execution against the pinned library — the correction is recorded
+below because a wrong root cause in a gate file outlives the person who wrote
+it. **That outage is still unexplained.**
 
-The database was innocent, and that is the part worth remembering. Postgres
-showed **23 connections, every one IDLE, zero active queries, zero
-idle-in-transaction**, and the exact COUNT the route was "timing out" on
-returned in **0.03s** over a direct asyncpg connection from inside the same
-container. Nothing was waiting on the database, and nothing was waiting for a
-free pool slot either.
+WHAT IS ACTUALLY WRONG with a network call inside `async with
+database.transaction():`, verified on `databases==0.7.0` (the prod pin):
 
-WHY A NETWORK CALL INSIDE A TRANSACTION DOES THIS. The prod pin is
-`databases==0.7.0`, which parks ONE `Connection` object in a `ContextVar` that
-every task in the context inherits (`databases/core.py`), and that object owns
-an `asyncio.Lock` (`self._query_lock`, `self._connection_lock`). So a task that
-holds the connection across non-DB I/O does not merely occupy one of the 20 pool
-slots — it SERIALIZES every sibling task behind an in-process lock. Pool size is
-irrelevant (the connections were idle); an acquire timeout would not have helped
-either (nobody was blocked in `acquire`), and in any case `databases` calls
-`pool.acquire()` with no timeout at all, so exhaustion queues forever rather
-than failing fast. The only thing that actually bounds the damage is not holding
-the connection across the call.
+1. It holds a pooled connection AND an open Postgres transaction for the full
+   duration of the call. `services/catalog_sync_service.ingest_standard_products`
+   opened one PER PRODUCT and awaited an LLM classification inside it, on a path
+   reachable from `routes/universal_product_sync.py` — so one HTTP request could
+   pin N connections in series, each for an LLM round-trip, holding row locks
+   the whole time.
+2. Worse, and less obvious: when the `Connection` IS inherited (0.7.0 parks it
+   in a `ContextVar`, so any task spawned from a context that already touched
+   the DB gets the same object), a sibling task's queries silently JOIN the
+   holder's open transaction. Measured: while a holder sat inside a transaction
+   "calling the network", a sibling's `SELECT count(*)` returned the holder's
+   UNCOMMITTED row. If the holder then rolls back, the sibling's writes go with
+   it, and nothing raises.
 
-WHAT THIS GATE DOES. It walks the `async with database.transaction()` /
+WHAT WAS CLAIMED AND IS FALSE, so nobody re-derives it: that the holder
+SERIALIZES its siblings behind `Connection`'s `asyncio.Lock`s. It does not.
+`_query_lock` is taken per query, not for the block, and `Transaction.start()`
+releases `_transaction_lock` before `__aenter__` returns. Measured: a sibling
+query completed in 0.000s while the holder slept 1.0s inside its transaction.
+The outage evidence argues the same way — a task parked inside a transaction
+shows up as `idle in transaction` in `pg_stat_activity`, and the outage snapshot
+had 23 connections, all plain `idle`, zero in transaction.
+
+WHAT THIS GATE DOES. It walks `async with database.transaction()` /
 `database.connection()` blocks in the serving tree and fails when one contains an
-`await` that looks like network or thread-hop I/O. It is a static check, so it
-cannot see everything — a network call behind an indirection it cannot name will
-pass. That is accepted: it catches the shape that actually bit us twice, and it
-catches it at review time instead of at 504 time.
+`await` that reaches a network client — directly, via `asyncio.to_thread` /
+`run_in_executor`, or through one level of same-module helper. It is static, so
+it misses plenty: a transaction bound to a variable or opened by decorator, a
+`gather()` of network coroutines, an `async for` over a stream, an aliased
+import, or a helper more than one level deep. None of those shapes exist in the
+tree today; the check catches the ones that do and catches them at review time.
 
-Fix the finding by HOISTING the call above the `async with`, not by widening the
-allowlist. The 2026-08-18 fix did exactly that in
-`services/catalog_sync_service.ingest_standard_products`, where an LLM category
-classification sat inside a per-product transaction on a path reachable from
-`routes/universal_product_sync.py` — i.e. one HTTP request could open N
-transactions, each spanning an LLM round-trip.
+Fix a finding by HOISTING the call above the `async with` — not by widening
+NETWORK_MARKERS or raising BASELINE.
 """
 
 from __future__ import annotations
@@ -63,7 +69,7 @@ NETWORK_MARKERS = (
     "requests.",
     "openai",
     "anthropic",
-    "stripe",
+    "stripe_client",
     "asyncio.to_thread",
     "run_in_executor",
     "classify_via_llm",
@@ -93,12 +99,19 @@ NETWORK_MARKERS = (
 # getting worse, fails. Keep the counts HONEST: see _callee_texts for why an
 # over-count is worse than useless.
 BASELINE = {
-    # Monetization lane only, and NEITHER is reachable today: the T7 billing
-    # cron is registered PAUSED (next_run_time=None) in services/audit_scheduler
-    # with only routes/shakeout_debug.py otherwise calling it, and
-    # create_overage_invoice has no caller at all outside a comment. Real debt,
-    # zero current exposure — which is why they are counted rather than rushed.
-    "services/billing/credit_overage_billing.py": 3,
+    # Monetization lane only. Neither is reachable in production today: the T7
+    # billing cron is registered PAUSED (next_run_time=None) in
+    # services/audit_scheduler.py, and create_overage_invoice has no production
+    # caller. "Paused" is one authenticated admin resume away, though
+    # (routes/admin_scheduler_jobs.py exposes it), so this is debt with a short
+    # fuse, not debt that can be forgotten.
+    #
+    # Each is a money path where the transaction exists to keep the DB row and
+    # the Stripe object consistent, so each needs its own change — Stripe object
+    # first, then a SHORT transaction for the write, with an idempotency key and
+    # a reconciliation path for the window between. That is why they are counted
+    # here rather than rewritten inside an availability fix.
+    "services/billing/credit_overage_billing.py": 2,
     "services/invoice_generation_service.py": 4,
 }
 
@@ -155,6 +168,43 @@ def _callee_texts(node: ast.Await) -> List[str]:
     return out
 
 
+def _local_async_defs(tree: ast.AST) -> dict:
+    return {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _leaf_marker(texts: List[str]) -> str:
+    for marker in NETWORK_MARKERS:
+        if any(marker in t for t in texts):
+            return marker
+    return ""
+
+
+def _marker_via_local_helper(texts: List[str], defs: dict) -> str:
+    """Resolve ONE level through a same-module helper.
+
+    Name matching alone cannot separate `_create_stripe_invoice` (which does
+    `asyncio.to_thread(stripe_client.v1...)`) from
+    `_stripe_customer_id_for_merchant` (two SELECTs, no Stripe API) — both carry
+    "stripe" in the name. So markers match real client symbols only, and a bare
+    local callee is resolved by looking at what ITS body calls. One level is
+    enough for the shapes present and keeps this a static check.
+    """
+    for text in texts:
+        fn = defs.get(text)
+        if fn is None:
+            continue
+        for inner in ast.walk(fn):
+            if isinstance(inner, ast.Await):
+                found = _leaf_marker(_callee_texts(inner))
+                if found:
+                    return found
+    return ""
+
+
 def _findings() -> List[Tuple[str, str, str, int, str]]:
     out: List[Tuple[str, str, str, int, str]] = []
     for path in _iter_python_files():
@@ -164,6 +214,7 @@ def _findings() -> List[Tuple[str, str, str, int, str]]:
         except (OSError, SyntaxError):
             continue
         rel = path.relative_to(REPO_ROOT).as_posix()
+        defs = _local_async_defs(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.AsyncWith):
                 continue
@@ -174,13 +225,12 @@ def _findings() -> List[Tuple[str, str, str, int, str]]:
                 if not isinstance(inner, ast.Await):
                     continue
                 texts = _callee_texts(inner)
-                for marker in NETWORK_MARKERS:
-                    if any(marker in t for t in texts):
-                        out.append(
-                            (rel, _enclosing_function(tree, inner.lineno), marker,
-                             inner.lineno, texts[0][:100])
-                        )
-                        break
+                marker = _leaf_marker(texts) or _marker_via_local_helper(texts, defs)
+                if marker:
+                    out.append(
+                        (rel, _enclosing_function(tree, inner.lineno), marker,
+                         inner.lineno, texts[0][:100])
+                    )
     return out
 
 
@@ -205,11 +255,11 @@ def test_no_new_network_io_inside_a_db_transaction() -> None:
     assert not regressions, (
         "A database transaction now spans a network call in a place it did not "
         "before.\n\n"
-        "On the `databases==0.7.0` prod pin the Connection is shared across "
-        "tasks via a ContextVar and guarded by an asyncio.Lock, so holding it "
-        "across network I/O serializes every sibling task and wedges the "
-        "process — 2026-08-18: 23 connections all idle, zero active queries, "
-        "total outage, cleared only by redeploy.\n\n"
+        "A transaction that spans a network call holds a pooled connection and an "
+        "open Postgres transaction — with its row locks — for the whole call, "
+        "and on the databases==0.7.0 pin a sibling task that inherited the same "
+        "Connection will silently JOIN that transaction and lose its writes if "
+        "the holder rolls back.\n\n"
         "HOIST the call above the `async with`. Do not raise BASELINE.\n\n"
         + "\n".join(regressions)
     )
@@ -231,27 +281,49 @@ def test_the_ratchet_only_goes_down() -> None:
 
 
 def test_the_gate_can_actually_see_a_violation() -> None:
-    """The detector must fail on the real shape, or the ratchet is decoration.
+    """Drive `_callee_texts` ITSELF, and pin the false positive it exists for.
 
-    Guards the failure this repo keeps meeting: a gate that runs, asserts
-    something, and would stay green through the regression it is named for.
+    The first version of this test re-implemented detection inline with
+    `any(m in ast.unparse(node))` — the very matching the detector had just
+    stopped using — so it passed even with `_callee_texts` stubbed to return [].
+    A self-test that does not call the thing it certifies is decoration.
     """
-    tree = ast.parse(
+    def scan(src: str) -> List[str]:
+        tree = ast.parse(src)
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncWith):
+                continue
+            ctx = " ".join(ast.unparse(i.context_expr) for i in node.items)
+            if "transaction()" not in ctx:
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Await) and any(
+                    m in t for t in _callee_texts(inner) for m in NETWORK_MARKERS
+                ):
+                    found.append(ast.unparse(inner))
+        return found
+
+    wrapped = (
         "async def f():\n"
         "    async with database.transaction():\n"
-        "        await stripe_client.v1.invoices.create(params={})\n"
+        "        await asyncio.to_thread(stripe_client.v1.invoices.create)\n"
     )
-    hits = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncWith):
-            ctx = " ".join(ast.unparse(i.context_expr) for i in node.items)
-            if "transaction()" in ctx:
-                for inner in ast.walk(node):
-                    if isinstance(inner, ast.Await) and any(
-                        m in ast.unparse(inner) for m in NETWORK_MARKERS
-                    ):
-                        hits.append(ast.unparse(inner))
-    assert hits, "detector failed to flag a network call inside a transaction"
+    direct = (
+        "async def f():\n"
+        "    async with database.transaction():\n"
+        "        await httpx_client.post(url)\n"
+    )
+    # The shape that produced 24 phantom findings: a DB write whose SQL merely
+    # NAMES a stripe column. Must stay ignored.
+    sql_only = (
+        "async def f():\n"
+        "    async with database.transaction():\n"
+        "        await db.execute('UPDATE m SET stripe_customer_id = :c', v)\n"
+    )
+    assert scan(wrapped), "missed a Stripe call handed to asyncio.to_thread"
+    assert scan(direct), "missed a direct httpx call"
+    assert not scan(sql_only), "false positive: flagged a plain DB write"
 
 
 def test_the_hoisted_catalog_sync_call_stays_hoisted() -> None:
