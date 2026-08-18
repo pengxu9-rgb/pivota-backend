@@ -60,6 +60,10 @@ from typing import Any, Iterable, Mapping, Optional
 # the gate closes. test_merchant_policy imports only stdlib, so no cycle.
 from services.source_quarantine import bare_domain
 from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
+from services.pdp_renderability import (
+    is_observed_seller_merchant_id,
+    is_seed_routed_lane,
+)
 
 # Worked example 2 — the test-merchant gate, 2026-07-27. It adds a NEW arm to
 # _derive_serving_decision (a real logic change), but the arm sits after the
@@ -87,7 +91,7 @@ from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 # Worked example 4 — the canonical-election gate, 2026-07-31. Bumps: it moves 121
 # measured prod rows from 'public' to 'shadow'. Ships as a pair with the
 # PIVOTA-Agent twin, backend first, same rule as every bump before it.
-POLICY_VERSION = "c1.v0.7"
+POLICY_VERSION = "c1.v0.8"
 
 # ---- Reason codes (authoritative vocabulary) -------------------------------
 #
@@ -731,7 +735,17 @@ def _derive_freshness(
 def _derive_verification_source(product: Optional[Mapping[str, Any]]) -> Optional[str]:
     if product is None:
         return None
-    if _get(product, "merchant_id") == "external_seed":
+    # ADR-009 (c1.v0.8): this labels HOW the row's facts were obtained. It tested
+    # the retired sentinel seller, which no catalog row carries since the A9-4
+    # re-key, so scraped supply fell through to the platform arms below and
+    # reported itself as a merchant sync. Ask the lane: a crawl is a scrape
+    # whatever seller it now sits under and whatever platform it mirrors.
+    if is_seed_routed_lane(
+        merchant_id=_get(product, "merchant_id"),
+        platform=_get(product, "platform"),
+        source_system=_get(product, "source_system"),
+        source_product_id=_get(product, "source_product_id"),
+    ):
         return "external_seed_scrape"
     platform = _get(product, "platform")
     if platform == "shopify":
@@ -794,13 +808,28 @@ def _derive_serving_decision(
     #     for its own content, so exempt from the identity-COVERAGE shadow gates
     #     (below) like a first-party merchant — but NOT from the index/quality gate.
     _merchant_id = str(_get(product, "merchant_id") or "") if product is not None else ""
-    _platform = str(_get(product, "platform") or "").lower() if product is not None else ""
+    # ADR-009 (c1.v0.8): the lane predicate adds the source_system and seed-id
+    # arms this hand-rolled trio lacked, so a mirrored row whose platform is its
+    # UPSTREAM's (the minted lane, platform 'shopify') is no longer missed.
+    #
+    # BE PRECISE ABOUT WHAT THIS GATES: is_external_seed_content has exactly one
+    # consumer, is_identity_coverage_exempt below. The index/quality gate never
+    # reads it. So widening does not gate more rows on quality — it strips the
+    # identity-COVERAGE exemption, i.e. public -> shadow. Measured on prod
+    # 2026-08-17: the new arms catch ZERO rows the old trio did not, so today's
+    # blast radius is 0; the version bump is for the DERIVATION change, which is
+    # what the twin has to agree with.
     is_external_seed_content = (
-        _platform == "external_seed"
-        or _merchant_id == "external_seed"
-        or _merchant_id.startswith("merch_obs_")
-    )
-    is_observed_seller = _merchant_id.startswith("merch_obs_")
+        is_seed_routed_lane(
+            merchant_id=_get(product, "merchant_id"),
+            platform=_get(product, "platform"),
+            source_system=_get(product, "source_system"),
+            source_product_id=_get(product, "source_product_id"),
+        )
+        if product is not None
+        else False
+    ) or is_observed_seller_merchant_id(_merchant_id)
+    is_observed_seller = is_observed_seller_merchant_id(_merchant_id)
     if product is not None:
         # c1.v0.5 (2026-07-29): a missing IPS row fails CLOSED for EVERY lane,
         # not only external-seed content. The first-party carve-out below this
