@@ -54,3 +54,8 @@ mvp_events.jsonl
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# GCP env ports (values + integration names) — never commit
+infra/gcp/env.*.yaml
+infra/gcp/secrets.*.list
+infra/gcp/*.local.*

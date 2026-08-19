@@ -1,0 +1,53 @@
+# Dump the Railway production Postgres into GCS from INSIDE GCP (us-west1 <-> Railway us-west is fast;
+# the laptop network is not). Then: infra/gcp/restore_to_cloudsql.sh staging gs://.../prod-<ts>.sql.gz
+#
+#   gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
+#     --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ)
+#
+# Requires secret `railway-prod-db-url` (Railway DATABASE_PUBLIC_URL) in the project, readable by the build SA.
+substitutions:
+  _BUCKET: pivota-staging-migration
+  _STAMP: manual
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/railway-prod-db-url/versions/latest
+      env: RAILWAY_DB_URL
+steps:
+  - name: postgres:17
+    id: dump
+    secretEnv: [RAILWAY_DB_URL]
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        echo "pg_dump $(pg_dump --version) -> /workspace/prod.sql.gz"
+        # -o pipefail is LOAD-BEARING: without it a pg_dump that dies mid-stream still leaves gzip
+        # exiting 0, the step passes, and a PARTIAL database gets imported over the cutover window.
+        # Append the sslmode parameter with the right separator; the URL may already carry a query.
+        case "$${RAILWAY_DB_URL}" in *\?*) SEP='&' ;; *) SEP='?' ;; esac
+        pg_dump "$${RAILWAY_DB_URL}$${SEP}sslmode=require" --no-owner --no-privileges --format=plain \
+          | gzip -1 > /workspace/prod.sql.gz
+        ls -la /workspace/prod.sql.gz
+
+        # Independent completeness checks: pg_dump writes this trailer LAST, so its presence proves
+        # the stream ran to the end. Then compare table counts against the live source.
+        gzip -cd /workspace/prod.sql.gz | tail -5 | grep -q 'PostgreSQL database dump complete' \
+          || { echo "FATAL: dump has no completion trailer - TRUNCATED"; exit 1; }
+        DUMPED=$(gzip -cd /workspace/prod.sql.gz | grep -c '^CREATE TABLE ')
+        LIVE=$(psql "$${RAILWAY_DB_URL}$${SEP}sslmode=require" -Atc \
+          "select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE'")
+        echo "tables: dumped=$${DUMPED} live=$${LIVE}"
+        [ "$${DUMPED}" = "$${LIVE}" ] || { echo "FATAL: table count mismatch"; exit 1; }
+        echo "$${DUMPED}" > /workspace/table_count.txt
+  - name: gcr.io/cloud-builders/gsutil
+    id: upload
+    args: ['cp', '/workspace/prod.sql.gz', 'gs://${_BUCKET}/prod-${_STAMP}.sql.gz']
+  - name: gcr.io/cloud-builders/gsutil
+    id: upload-manifest
+    args: ['cp', '/workspace/table_count.txt', 'gs://${_BUCKET}/prod-${_STAMP}.tables']
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+  diskSizeGb: 100
+timeout: 7200s

@@ -1,0 +1,19 @@
+# Explicit build-context exclusions. gcloud auto-generates one including .gitignore when this file
+# is absent; committing it means a .gitignore change can never silently ship secrets to Cloud Build.
+.git
+.github
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+node_modules
+tests
+docs
+infra/gcp/env.*.yaml
+infra/gcp/secrets.*.list
+infra/gcp/*.local.*
+.env
+.env.*
+external_seed
