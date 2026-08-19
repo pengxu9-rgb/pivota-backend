@@ -22,6 +22,7 @@ from db.orders import get_order, update_order, update_order_status, mark_order_p
 from db.merchant_onboarding import get_merchant_onboarding
 from utils.auth import get_current_employee
 from db.products import log_order_event
+from config.platform import is_deployed, is_production
 from config.settings import settings
 from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
@@ -919,7 +920,7 @@ async def handle_stripe_webhook(
         # be able to mutate live orders. `livemode` is part of the signed event.
         is_prod_env = (
             os.getenv("ENVIRONMENT", "").lower() == "production"
-            or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+            or is_production()
         )
         event_livemode = event.get("livemode")
         if is_prod_env and event_livemode is False:
@@ -2114,10 +2115,11 @@ async def _process_shopify_webhook_event(
     inline body — parameters are passed exactly, especially `got_canon` for the
     ADR-009 seller-mismatch guard and the idempotency/duplicate return.
     """
-    is_production = (
+    is_prod_runtime = (
         os.getenv("APP_ENV", "").lower() == "production"
         or os.getenv("ENVIRONMENT", "").lower() == "production"
-        or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+        # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "deployed"; it is False on Cloud Run.
+        or is_deployed()
     )
     try:
         # Persist event (append-only) with idempotency guard
@@ -2137,7 +2139,7 @@ async def _process_shopify_webhook_event(
         except Exception as e:
             # In production, fail so Shopify will retry and we don't lose the audit trail.
             logger.warning(f"PCS webhook event persistence failed merchant={merchant_id} topic={topic}: {e}")
-            if is_production:
+            if is_prod_runtime:
                 record_shopify_webhook(result="error", reason="persist_failed", topic=topic)
                 raise HTTPException(status_code=500, detail="Webhook event persistence unavailable")
 
@@ -2845,10 +2847,11 @@ async def handle_shopify_webhook(
 
         # Verify signature (strict in production; must use raw request body).
         instance_id = socket.gethostname()
-        is_production = (
+        is_prod_runtime = (
             os.getenv("APP_ENV", "").lower() == "production"
             or os.getenv("ENVIRONMENT", "").lower() == "production"
-            or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+            # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "deployed"; False on Cloud Run.
+            or is_deployed()
         )
         app_secret = getattr(settings, "shopify_client_secret", None)
         app_secret = app_secret.strip() if isinstance(app_secret, str) else ""
@@ -2889,7 +2892,7 @@ async def handle_shopify_webhook(
             "app_secret_len": app_secret_len,
             "secret_candidate_count": len(secret_candidates),
         }
-        if is_production:
+        if is_prod_runtime:
             if not x_shopify_shop_domain:
                 record_shopify_webhook(result="error", reason="missing_shop_domain", topic=topic)
                 logger.warning("Shopify webhook rejected: missing shop domain header %s", debug_meta)
@@ -2935,7 +2938,7 @@ async def handle_shopify_webhook(
                 verified_source = source
                 break
         debug_meta["verified_secret_source"] = verified_source
-        if is_production and not signature_verified:
+        if is_prod_runtime and not signature_verified:
             record_shopify_webhook(result="error", reason="invalid_signature", topic=topic)
             # This commonly indicates env drift across instances (different SHOPIFY_CLIENT_SECRET).
             meta = dict(debug_meta)

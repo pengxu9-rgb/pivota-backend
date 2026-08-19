@@ -9,6 +9,7 @@ from typing import Any
 
 import stripe
 
+from config.platform import is_production, raw_environment_label
 from config.settings import settings
 from db.database import IS_POSTGRES, database
 
@@ -493,7 +494,9 @@ async def _mark_file_env_gated_locked(file_row: Any) -> None:
     metadata.update(
         {
             "env_gate": True,
-            "railway_environment": os.getenv("RAILWAY_ENVIRONMENT") or "",
+            # Column/key name kept: it is persisted audit history that ops
+            # queries by name. The VALUE is still the platform's own label.
+            "railway_environment": raw_environment_label() or "",
             "settlement_transfer_allowed_on_staging": (
                 os.getenv("SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING") or ""
             ),
@@ -533,7 +536,7 @@ async def _mark_file_failed_locked(
 
 
 def _transfer_allowed_in_this_environment() -> bool:
-    if os.getenv("RAILWAY_ENVIRONMENT") == "production":
+    if is_production():
         return True
     return (
         os.getenv("SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING") or ""

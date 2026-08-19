@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 
+from config.platform import is_production
+
 # A real service secret (e.g. `openssl rand -hex 32` = 64 chars) is well above this;
 # it only rejects obviously-weak values in production. Dev fallbacks are exempt.
 _MIN_PROD_TOKEN_LEN = 16
@@ -20,7 +22,7 @@ _MIN_PROD_TOKEN_LEN = 16
 def _is_production() -> bool:
     return (
         os.getenv("ENVIRONMENT", "").strip().lower() == "production"
-        or os.getenv("RAILWAY_ENVIRONMENT", "").strip().lower() == "production"
+        or is_production()
     )
 
 

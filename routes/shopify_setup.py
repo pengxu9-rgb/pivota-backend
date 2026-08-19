@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Dict, Any
 import os
 import httpx
+from config.platform import is_deployed
 from config.settings import settings
 from db.merchant_onboarding import merchant_onboarding, get_merchant_onboarding
 from db.orders import orders
@@ -21,7 +22,8 @@ def _is_production() -> bool:
     return (
         os.getenv("APP_ENV", "").lower() == "production"
         or os.getenv("ENVIRONMENT", "").lower() == "production"
-        or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+        # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "deployed"; False on Cloud Run.
+        or is_deployed()
     )
 
 

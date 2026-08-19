@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
+from config.platform import is_production
 from config.settings import settings
 from db.database import IS_POSTGRES, database
 from db.merchant_onboarding import get_merchant_onboarding
@@ -297,7 +298,7 @@ async def handle_stripe_billing_webhook(
     # event. Mirrors the order/PSP webhook guard in webhook_routes.py.
     is_prod_env = (
         os.getenv("ENVIRONMENT", "").lower() == "production"
-        or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+        or is_production()
     )
     if is_prod_env and event.get("livemode") is False:
         logger.warning(

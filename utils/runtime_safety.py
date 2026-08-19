@@ -6,6 +6,8 @@ import os
 
 from fastapi import HTTPException
 
+from config.platform import is_deployed
+
 
 def env_flag(name: str) -> bool:
     return (os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"})
@@ -15,7 +17,10 @@ def is_production_runtime() -> bool:
     return (
         os.getenv("APP_ENV", "").strip().lower() == "production"
         or os.getenv("ENVIRONMENT", "").strip().lower() == "production"
-        or bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))
+        # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "Railway injected build metadata,
+        # so I am deployed" — it is False on Cloud Run, which would re-open every
+        # route this gate closes.
+        or is_deployed()
     )
 
 

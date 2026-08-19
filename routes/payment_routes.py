@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional
 from fastapi import APIRouter, HTTPException, Depends, status, Request, BackgroundTasks
 from pydantic import BaseModel
 
+from config.platform import is_production
 from orchestrator.payment_orchestrator import payment_orchestrator, OrchestrationResult
 from dashboard.core import dashboard_core, User
 from services.psp_payment_finalizer import finalize_payment_success
@@ -345,7 +346,7 @@ async def checkout_webhook(
             # dev/staging, log a warning and fall through (existing behaviour).
             is_prod = (
                 os.getenv("ENVIRONMENT", "").lower() == "production"
-                or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+                or is_production()
             )
             if is_prod:
                 logger.error(

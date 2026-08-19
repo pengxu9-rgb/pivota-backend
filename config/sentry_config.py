@@ -5,6 +5,8 @@ Optional - only initialized if SENTRY_DSN is set in environment
 import os
 import logging
 
+from config.platform import deployment_id, platform_env
+
 logger = logging.getLogger(__name__)
 
 def init_sentry():
@@ -26,7 +28,7 @@ def init_sentry():
         
         sentry_sdk.init(
             dsn=sentry_dsn,
-            environment=os.getenv("ENVIRONMENT", "production"),
+            environment=os.getenv("ENVIRONMENT") or platform_env(),
             
             # Integrations
             integrations=[
@@ -44,14 +46,14 @@ def init_sentry():
             send_default_pii=False,  # Don't send user data by default
             
             # Release tracking
-            release=os.getenv("RAILWAY_DEPLOYMENT_ID") or os.getenv("VERCEL_GIT_COMMIT_SHA"),
+            release=deployment_id() or os.getenv("VERCEL_GIT_COMMIT_SHA"),
             
             # Before send hook (filter sensitive data)
             before_send=filter_sensitive_data,
         )
         
         logger.info("✅ Sentry error tracking initialized")
-        logger.info(f"   Environment: {os.getenv('ENVIRONMENT', 'production')}")
+        logger.info(f"   Environment: {os.getenv('ENVIRONMENT') or platform_env()}")
         logger.info(f"   Traces sample rate: {os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0.1')}")
         return True
         

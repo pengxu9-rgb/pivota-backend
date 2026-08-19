@@ -381,6 +381,17 @@ except ImportError:
 # Utils
 from utils.auth import require_admin
 from utils.logger import logger
+from config.platform import (
+    commit_sha as platform_commit_sha,
+    deployment_id as platform_deployment_id,
+    git_branch as platform_git_branch,
+    is_production,
+    platform_metadata,
+    raw_environment_label,
+    require_platform_env,
+    service_id as platform_service_id,
+    service_name as platform_service_name,
+)
 from config.settings import settings
 from services.agent_governance import agent_governance, governance_runtime_contract
 
@@ -409,14 +420,12 @@ app = FastAPI(
 
 @lru_cache(maxsize=1)
 def _service_version_payload() -> dict:
-    commit_sha = (
-        os.getenv("RAILWAY_GIT_COMMIT_SHA")
-        or os.getenv("GIT_COMMIT_SHA")
-        or os.getenv("VERCEL_GIT_COMMIT_SHA")
-        or None
-    )
-    branch = os.getenv("RAILWAY_GIT_BRANCH") or os.getenv("GIT_BRANCH") or None
-    deployment_id = os.getenv("RAILWAY_DEPLOYMENT_ID") or None
+    # commit_sha()/git_branch() keep the same fallback chain and add the
+    # Cloud Run ones (PIVOTA_COMMIT_SHA / COMMIT_SHA / SOURCE_VERSION), which
+    # a deploy must inject because Cloud Run publishes no git metadata.
+    commit_sha = platform_commit_sha()
+    branch = platform_git_branch()
+    deployment_id = platform_deployment_id()
 
     if commit_sha is None:
         try:
@@ -441,7 +450,7 @@ def _service_version_payload() -> dict:
     commit = full_sha[:12] if full_sha else None
     build_id = (
         os.getenv("PIVOTA_BUILD_ID")
-        or os.getenv("RAILWAY_DEPLOYMENT_ID")
+        or platform_deployment_id()
         or os.getenv("VERCEL_GIT_COMMIT_SHA")
         or commit
         or f"local-{SERVICE_STARTED_AT}"
@@ -472,12 +481,16 @@ def _runtime_build_payload() -> dict:
             "commit_sha": version["full_sha"],
             "branch": version["branch"],
         },
+        # Key kept as "railway" because published health/build consumers read
+        # it by that name; the values now resolve on either platform. The
+        # "platform" block beside it is the platform-neutral successor.
         "railway": {
-            "environment": os.getenv("RAILWAY_ENVIRONMENT") or None,
+            "environment": raw_environment_label(),
             "deployment_id": version["deployment_id"],
-            "service_id": os.getenv("RAILWAY_SERVICE_ID") or None,
-            "service_name": os.getenv("RAILWAY_SERVICE_NAME") or None,
+            "service_id": platform_service_id(),
+            "service_name": platform_service_name(),
         },
+        "platform": platform_metadata(),
     }
 
 
@@ -1153,9 +1166,10 @@ async def get_version(request: Request):
     优先使用 Railway 环境变量，本地开发时回退到 git 命令
     Redeployed with Shopify/Stripe credentials
     """
-    # Railway 自动注入的环境变量
-    railway_commit = os.getenv("RAILWAY_GIT_COMMIT_SHA")
-    railway_branch = os.getenv("RAILWAY_GIT_BRANCH")
+    # Build metadata injected by the platform (Railway) or by the deploy
+    # (Cloud Run, which publishes none of its own).
+    railway_commit = platform_commit_sha()
+    railway_branch = platform_git_branch()
     # Computed once: all three return branches below (Railway, local-git,
     # unknown) published settings_contract, so gating only the Railway one
     # would just relocate the disclosure.
@@ -1280,7 +1294,7 @@ async def startup():
         # exceed the healthcheck retry window and cause deploy rollbacks.
         skip_heavy_env = os.getenv("SKIP_HEAVY_STARTUP_INIT")
         if skip_heavy_env is None:
-            skip_heavy = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower() == "production"
+            skip_heavy = is_production()
         else:
             skip_heavy = skip_heavy_env.lower() in {"1", "true", "yes"}
 
@@ -1811,6 +1825,17 @@ async def shutdown():
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
+    # FAIL AT BOOT, not per-request. Every prod/staging guard in this service
+    # resolves through config.platform; if the platform cannot tell us which
+    # environment this is (a Cloud Run revision deployed without PIVOTA_ENV),
+    # the shim answers "production" so the guards stay armed — but running on
+    # that guess is not acceptable, so refuse to come up at all. Local dev and
+    # the test suite (no K_SERVICE, no RAILWAY_*) resolve "development" and
+    # pass straight through.
+    resolved_env = require_platform_env()
+    logger.info("🌍 Platform: %s", platform_metadata())
+    logger.info("🌍 Resolved environment: %s", resolved_env)
+
     await startup_event()
     await startup()
     # Unattended DB repair. /health no longer reconnects as a side effect of

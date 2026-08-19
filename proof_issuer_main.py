@@ -7,13 +7,21 @@ pulling in the full pivota-backend monolith.
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI
+
+from config.platform import (
+    commit_sha,
+    deployment_id,
+    git_branch,
+    platform_metadata,
+    raw_environment_label,
+    service_id,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
@@ -43,13 +51,16 @@ async def __build() -> Dict[str, Any]:
         "service": "reviews-proof-issuer",
         "timestamp": time.time(),
         "git": {
-            "commit_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA") or "",
-            "branch": os.getenv("RAILWAY_GIT_BRANCH") or "",
+            "commit_sha": commit_sha() or "",
+            "branch": git_branch() or "",
         },
+        # Key kept as "railway" for the existing consumers of this probe; the
+        # values resolve on Cloud Run too.
         "railway": {
-            "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or "",
-            "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID") or "",
-            "service_id": os.getenv("RAILWAY_SERVICE_ID") or "",
+            "environment": raw_environment_label() or "",
+            "deployment_id": deployment_id() or "",
+            "service_id": service_id() or "",
         },
+        "platform": platform_metadata(),
     }
 

@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
+from config.platform import is_production
 from db.database import database
 from routes.agent_auth import AgentContext, get_agent_context
 from utils.logger import logger
@@ -57,8 +58,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _is_production_env() -> bool:
-    env = (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("RAILWAY_ENVIRONMENT_NAME") or "").strip().lower()
-    return env in {"production", "prod"}
+    env = (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or "").strip().lower()
+    if env:
+        return env in {"production", "prod"}
+    return is_production()
 
 
 PHOTO_SCHEMA_ENSURE_ON_REQUEST = _env_bool("PHOTO_SCHEMA_ENSURE_ON_REQUEST", default=not _is_production_env())
