@@ -5,11 +5,13 @@ API endpoints for payment processing and orchestration
 
 import hashlib
 import logging
+import os
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from fastapi import APIRouter, HTTPException, Depends, status, Request, BackgroundTasks
 from pydantic import BaseModel
 
+from config.platform import is_production
 from orchestrator.payment_orchestrator import payment_orchestrator, OrchestrationResult
 from dashboard.core import dashboard_core, User
 from services.psp_payment_finalizer import finalize_payment_success
@@ -17,6 +19,20 @@ from utils.auth import get_current_user
 
 logger = logging.getLogger("payment_routes")
 router = APIRouter(prefix="/api/payments", tags=["payments"])
+
+
+def _unsigned_webhook_is_fatal() -> bool:
+    """With no CHECKOUT_WEBHOOK_SECRET configured, production refuses the event.
+
+    Hoisted out of the route body so it is testable without driving a whole
+    webhook request — that inaccessibility is why this gate had no parity
+    coverage. Off production the caller logs and falls through, which is the
+    pre-existing behaviour.
+    """
+    return (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or is_production()
+    )
 
 # Request/Response Models
 class PaymentRequest(BaseModel):
@@ -343,10 +359,7 @@ async def checkout_webhook(
             # No webhook secret configured. In production this is a hard
             # failure — we refuse to silently accept unsigned webhooks. In
             # dev/staging, log a warning and fall through (existing behaviour).
-            is_prod = (
-                os.getenv("ENVIRONMENT", "").lower() == "production"
-                or os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
-            )
+            is_prod = _unsigned_webhook_is_fatal()
             if is_prod:
                 logger.error(
                     f"CHECKOUT_WEBHOOK_SECRET not configured in production — "

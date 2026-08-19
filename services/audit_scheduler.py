@@ -58,6 +58,8 @@ import logging
 import os
 from typing import Optional
 
+from config.platform import is_deployed, platform_env, service_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -203,11 +205,15 @@ def _queue_worker_enabled() -> bool:
     override = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
     if override:
         return override in ("1", "true", "yes", "on")
-    service = (os.getenv("RAILWAY_SERVICE_NAME") or "").lower()
-    env = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower()
+    service = (service_name() or "").lower()
     if "staging" in service or "preview" in service:
         return False
-    if env in ("staging", "preview", "development", "dev"):
+    # Off a managed platform we cannot prove anything, so stay ENABLED — the
+    # pre-shim code reached the same answer via an empty RAILWAY_ENVIRONMENT.
+    # On a managed host, only production drains the shared queue; the shim's
+    # fail-closed "production" therefore keeps the prod worker running, which
+    # is the direction this gate has always erred in.
+    if is_deployed() and platform_env() in ("staging", "development", "test"):
         return False
     return True
 
@@ -242,11 +248,11 @@ async def start_scheduler() -> None:
         if not worker_enabled:
             logger.warning(
                 "audit_scheduler: shared-queue worker ticks DISABLED on this "
-                "service (RAILWAY_SERVICE_NAME=%r RAILWAY_ENVIRONMENT=%r) — it "
+                "service (service_name=%r platform_env=%r) — it "
                 "will NOT drain prod audit/executor/verification queues. Set "
                 "AUDIT_WORKER_ENABLED=true to override.",
-                os.getenv("RAILWAY_SERVICE_NAME"),
-                os.getenv("RAILWAY_ENVIRONMENT"),
+                service_name(),
+                platform_env(),
             )
 
         from services.scheduler_job_runner import wrap_job

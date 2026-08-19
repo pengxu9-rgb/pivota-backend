@@ -73,8 +73,18 @@ implementation drifting from the first.
 - **Every protocol door is env-gated.** Production readiness is a config
   question: see `docs/agent-checkout/FLAG_MANIFEST.md` in PIVOTA-Agent for the
   authoritative per-environment snapshot.
-- **Production-like detection must include `RAILWAY_ENVIRONMENT`** — prod does
-  not set `NODE_ENV`, so `NODE_ENV`-only guards are inert there.
+- **Production-like detection goes through `config/platform.py`, never through
+  a raw env var.** Prod sets neither `NODE_ENV` nor `ENVIRONMENT`, so
+  `NODE_ENV`-only guards are inert there — and `RAILWAY_ENVIRONMENT`-only
+  guards become inert the moment a service moves to Cloud Run, where every
+  `RAILWAY_*` is unset. Both failures are silent: the guard evaluates to "not
+  production" and runs its dev branch against live traffic. Call
+  `is_production()` / `is_staging()` / `is_deployed()` instead. The shim
+  resolves `PIVOTA_ENV` → Railway deployment markers → Cloud Run, and FAILS
+  CLOSED to `production` on a managed host it cannot resolve; every FastAPI
+  entrypoint calls `require_platform_env()` so a revision deployed without
+  `PIVOTA_ENV` dies at boot rather than serving on that guess. New guards get
+  three-shape parity coverage in `tests/test_platform_guard_parity.py`.
 - **Naming:** "ACP" inside pivota-backend is the protocol-TIER label on the
   guarded charge lane (`GUARDED_PROTOCOLS = {acp, ucp, ap2}`); OpenAI-ACP the
   wire protocol lives only at the gateway door. "UCP" is the external Universal

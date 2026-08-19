@@ -19,6 +19,7 @@ from sqlalchemy import (
     create_engine,
 )
 
+from config.platform import is_deployed
 from config.settings import settings
 
 def _normalize_database_url(raw: str) -> str:
@@ -130,7 +131,7 @@ if IS_POSTGRES:
     # acceptable for read-only ops runs, NEVER set in a deployed environment
     # (prod connects over the internal network with no TLS need).
     if str(os.getenv("DB_SSL_NO_VERIFY", "")).strip().lower() in ("1", "true", "yes"):
-        if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_ID"):
+        if is_deployed():
             raise RuntimeError(
                 "DB_SSL_NO_VERIFY must never be set in a deployed environment — "
                 "it disables certificate verification for the whole pool. It is "

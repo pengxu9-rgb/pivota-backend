@@ -480,11 +480,25 @@ def test_a_tiny_store_cap_cannot_disable_the_ceiling(monkeypatch) -> None:
     assert 429 in codes, f"a tiny cap disabled enforcement entirely: {codes}"
 
 
-def test_enforcement_is_not_environment_gated(monkeypatch, backend) -> None:
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"RAILWAY_ENVIRONMENT_NAME": "production", "RAILWAY_ENVIRONMENT": "production"},
+        # Cloud Run: no RAILWAY_* exists at all. A limiter that had been gated
+        # on one would go inert here with nothing to notice it.
+        {"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "production"},
+        # And the unresolved revision, where the shim fails closed to prod.
+        {"K_SERVICE": "pivota-backend"},
+    ],
+    ids=["railway", "cloud_run", "cloud_run_unresolved"],
+)
+def test_enforcement_is_not_environment_gated(monkeypatch, backend, shape) -> None:
     """A mutant gating on RAILWAY_ENVIRONMENT_NAME shipped green: enforced in
     CI, dead in prod. Set the prod-looking env and assert it still enforces."""
-    monkeypatch.setenv("RAILWAY_ENVIRONMENT_NAME", "production")
-    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    for key in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME", "K_SERVICE", "PIVOTA_ENV"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in shape.items():
+        monkeypatch.setenv(key, value)
     app = _app(monkeypatch, ceiling=2)
     with TestClient(app) as c:
         codes = _codes(c, 6)

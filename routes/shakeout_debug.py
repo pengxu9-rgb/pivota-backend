@@ -9,8 +9,11 @@ the §A signup + §B webhook + §D-H pipeline shakeout work in
 Mounted under `/__shakeout/*` (double-underscore prefix marks internal/
 operational endpoints, mirroring /__scheduler_health and /__build).
 
-**Production safety.** Every endpoint refuses to run when
-`RAILWAY_ENVIRONMENT=production`. The shared-DB tenancy with prod means
+**Production safety.** Every endpoint refuses to run in production, as
+resolved by `config.platform.is_production()` (which fails CLOSED to
+production on a managed host that cannot name its environment, so these
+endpoints stay shut on a misconfigured deploy). The shared-DB tenancy with
+prod means
 DB writes from these endpoints would land in the same Postgres as prod
 traffic, but the shakeout merchant id pattern (`merch_shakeout_*`) is
 filterable. The endpoints additionally require a shared-secret header
@@ -31,6 +34,8 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
+from config.platform import is_production
+
 router = APIRouter(tags=["shakeout-debug"])
 
 
@@ -38,8 +43,7 @@ _SHAKEOUT_MERCHANT_PREFIX = "merch_shakeout_"
 
 
 def _require_non_prod() -> None:
-    env = (os.getenv("RAILWAY_ENVIRONMENT") or "").lower()
-    if env == "production":
+    if is_production():
         # Shakeout debug endpoints are disabled in production. The
         # `ALLOW_SHAKEOUT_ON_PROD` env-var bypass was used 2026-05-23
         # for a one-off §D-H E2E run against prod (PR #624) and
@@ -50,8 +54,7 @@ def _require_non_prod() -> None:
         raise HTTPException(
             status_code=403,
             detail=(
-                "shakeout debug endpoints are disabled in production "
-                "(RAILWAY_ENVIRONMENT=production)"
+                "shakeout debug endpoints are disabled in production"
             ),
         )
 
