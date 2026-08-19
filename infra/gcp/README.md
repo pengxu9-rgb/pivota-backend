@@ -75,6 +75,14 @@ still prod values in staging until test-mode keys are put in the overrides file 
 - `pivota-staging`: compute default SA → builder + `secretmanager.secretAccessor` + `storage.objectAdmin`
   (for the dump job); bucket `gs://pivota-staging-migration`; secret `railway-prod-db-url`
 
+### Why the Dockerfile is not at the repo root
+
+Railway auto-detects a root `Dockerfile` and switches the builder from Railpack to it for **every
+service that deploys from this repo** (`web`, `web-staging`, `pivota-acp`, `ucp-*`,
+`reviews-proof-issuer`, `invitation worker`, `relgraph-sync-routine`). On 2026-08-19 that failed the
+prod `web` healthcheck. Keep it at `infra/gcp/Dockerfile` and build with `-f`; `.dockerignore` stays
+at the repo root because that is the build context root.
+
 ## Known gaps before the Sep 8-12 prod cutover
 
 Tracked from the review of this PR; none is covered by these scripts yet.
