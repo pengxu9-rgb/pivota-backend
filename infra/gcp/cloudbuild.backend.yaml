@@ -1,0 +1,22 @@
+# Build + push the backend image to the shared Artifact Registry.
+#   gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
+#     --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+# (The COMMIT_SHA substitution is auto-populated by a Cloud Build GitHub trigger; pass it by hand for manual builds.)
+substitutions:
+  _REGION: us-west1
+  _REPO: pivota
+  _IMAGE: backend
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build',
+           '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}',
+           '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest',
+           '--build-arg', 'BUILDKIT_INLINE_CACHE=1',
+           '.']
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest'
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1200s
