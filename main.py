@@ -331,6 +331,7 @@ from routes.agent_recommendations import router as agent_recommendations_router
 from routes.fix_orders_table import router as fix_orders_table_router
 from routes.agent_metrics import router as agent_metrics_router
 from routes.agent_keys import router as agent_keys_router
+from routes.agent_identity_issuers import router as agent_identity_issuers_router, internal_router as agent_identity_issuers_internal_router
 from routes.agent_webhooks import router as agent_webhooks_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
@@ -1109,6 +1110,8 @@ app.include_router(agent_docs_router)  # Agent developer docs
 app.include_router(fix_orders_table_router)  # Fix orders table structure
 app.include_router(agent_metrics_router)  # Agent API metrics and monitoring
 app.include_router(agent_keys_router)  # Agent API key management
+app.include_router(agent_identity_issuers_router)  # Federated buyer identity: per-agent user-token issuers (portal self-serve)
+app.include_router(agent_identity_issuers_internal_router)  # Internal registry the gateway polls (/agent/internal/identity-issuers)
 app.include_router(agent_webhooks_router)  # Agent webhook management and deliveries
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs

@@ -69,8 +69,9 @@ def _jwks_sources() -> list[Tuple[str, str]]:
     return sources
 
 
-def _load_jwks(*, refresh: bool = False) -> Dict[str, Any]:
-    sources = _jwks_sources()
+def _load_jwks(*, refresh: bool = False, sources: Optional[list[Tuple[str, str]]] = None) -> Dict[str, Any]:
+    if sources is None:
+        sources = _jwks_sources()
     if not sources:
         raise AgentUserJwtError(
             "Missing JWKS configuration (set AGENT_USER_JWKS_URL or AGENT_USER_JWKS_JSON or AGENT_USER_JWKS_FILE)"
@@ -155,7 +156,8 @@ def _normalize_agent_user_ref(*, issuer: Optional[str], raw_ref: str) -> str:
 
 def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
     """
-    Verify an agent-user JWT and return a stable agent_user_ref.
+    Verify an agent-user JWT against the GLOBAL (env-configured) issuer and return a stable
+    agent_user_ref. For a per-agent (federated) issuer use `verify_agent_user_jwt_for_agent`.
 
     Required env (one of):
     - AGENT_USER_JWKS_URL
@@ -167,6 +169,68 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
     - AGENT_USER_JWT_AUDIENCE
     - AGENT_USER_JWT_ALGS (comma-separated, default RS256)
     """
+    return _verify_against(
+        token,
+        jwks_sources=None,
+        expected_issuers=_get_expected_issuers(),
+        expected_audience=_get_expected_audience(),
+        allowed_algs=_get_allowed_algs(),
+    )
+
+
+def _peek_unverified_issuer(token: str) -> Optional[str]:
+    """The `iss` claim WITHOUT verification — only ever used to SELECT a registered binding; the
+    signature is then checked against that binding's pinned JWKS and iss is re-checked there."""
+    try:
+        claims = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    except Exception:
+        return None
+    iss = claims.get("iss") if isinstance(claims, dict) else None
+    return iss if isinstance(iss, str) and iss.strip() else None
+
+
+async def verify_agent_user_jwt_for_agent(token: str, agent_id: Optional[str]) -> AgentUserIdentity:
+    """
+    Verify an agent-user JWT for a SPECIFIC calling agent.
+
+    Order: if the token's (unverified) `iss` is an ACTIVE issuer registered to `agent_id`
+    (db.agent_identity_issuers), verify against THAT binding — its JWKS, audience and alg
+    allowlist. Otherwise fall back to the global env issuer. A token from an issuer registered to
+    a DIFFERENT agent never matches here and is not accepted by the fallback either (unless ops
+    also configured it globally), which is the binding this exists to enforce.
+    """
+    token = (token or "").strip()
+    if not token:
+        raise AgentUserJwtError("Missing token")
+    if agent_id:
+        iss = _peek_unverified_issuer(token)
+        if iss:
+            from db.agent_identity_issuers import get_active_issuer  # late import: db layer
+
+            binding = await get_active_issuer(str(agent_id), iss)
+            if binding:
+                return _verify_against(
+                    token,
+                    jwks_sources=[("url", binding["jwks_uri"])],
+                    expected_issuers=[binding["issuer"]],
+                    expected_audience=binding["audience"],
+                    allowed_algs=list(binding.get("algs") or []) or ["RS256"],
+                    authorized_party=binding.get("authorized_party"),
+                    required_scopes=binding.get("required_scopes"),
+                )
+    return verify_agent_user_jwt(token)
+
+
+def _verify_against(
+    token: str,
+    *,
+    jwks_sources: Optional[list[Tuple[str, str]]],
+    expected_issuers: Optional[list[str]],
+    expected_audience: Optional[str],
+    allowed_algs: list[str],
+    authorized_party: Optional[str] = None,
+    required_scopes: Optional[list[str]] = None,
+) -> AgentUserIdentity:
     token = (token or "").strip()
     if not token:
         raise AgentUserJwtError("Missing token")
@@ -178,21 +242,18 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
 
     alg = (unverified_header.get("alg") or "").strip()
     kid = (unverified_header.get("kid") or "").strip() or None
-    allowed_algs = _get_allowed_algs()
     if not alg or alg not in allowed_algs:
         raise AgentUserJwtError("Unsupported JWT alg")
 
-    jwks = _load_jwks(refresh=False)
+    jwks = _load_jwks(refresh=False, sources=jwks_sources)
     candidates = list(_iter_jwk_candidates(jwks, kid=kid))
     if not candidates:
         # Retry once with refreshed JWKS to handle rotation.
-        jwks = _load_jwks(refresh=True)
+        jwks = _load_jwks(refresh=True, sources=jwks_sources)
         candidates = list(_iter_jwk_candidates(jwks, kid=kid))
     if not candidates:
         raise AgentUserJwtError("No matching JWKS key")
 
-    expected_issuers = _get_expected_issuers()
-    expected_audience = _get_expected_audience()
     single_issuer = expected_issuers[0] if expected_issuers and len(expected_issuers) == 1 else None
 
     last_err: Optional[Exception] = None
@@ -223,6 +284,22 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
         if expected_issuers:
             if not issuer or issuer not in expected_issuers:
                 last_err = AgentUserJwtError("Invalid issuer")
+                continue
+        if authorized_party:
+            azp = claims.get("azp") if isinstance(claims.get("azp"), str) else claims.get("client_id")
+            if azp != authorized_party:
+                last_err = AgentUserJwtError("Token authorized party not allowed")
+                continue
+        if required_scopes:
+            raw_scope = claims.get("scope")
+            if isinstance(raw_scope, str):
+                granted = set(raw_scope.split())
+            elif isinstance(claims.get("scp"), list):
+                granted = {str(x) for x in claims.get("scp")}
+            else:
+                granted = set()
+            if not all(sc in granted for sc in required_scopes):
+                last_err = AgentUserJwtError("Token missing a required scope")
                 continue
 
         subject = claims.get("sub")
