@@ -32,6 +32,9 @@ SERVICE_ACCOUNTS=(sa-backend sa-gateway sa-worker)
 
 log(){ printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
 have(){ "$@" >/dev/null 2>&1; }
+# IAM is eventually consistent: a freshly created service account can be rejected by the
+# policy API for ~10-30s ("does not exist"). Retry with backoff instead of failing the run.
+retry(){ local n=0; until "$@"; do n=$((n+1)); [ $n -ge 8 ] && return 1; sleep $((n*5)); done; }
 
 log "[$ENV] project=$PROJECT region=$REGION"
 "$GCLOUD" config set project "$PROJECT" >/dev/null
@@ -112,11 +115,13 @@ for sa in "${SERVICE_ACCOUNTS[@]}"; do
   EMAIL="$sa@$PROJECT.iam.gserviceaccount.com"
   have "$GCLOUD" iam service-accounts describe "$EMAIL" || "$GCLOUD" iam service-accounts create "$sa" --display-name="Cloud Run $sa"
   for role in roles/cloudsql.client roles/secretmanager.secretAccessor roles/logging.logWriter roles/monitoring.metricWriter roles/cloudtrace.agent; do
-    "$GCLOUD" projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$EMAIL" --role="$role" --condition=None >/dev/null
+    retry "$GCLOUD" projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$EMAIL" --role="$role" --condition=None >/dev/null 2>&1 \
+      || { echo "FAILED binding $role to $EMAIL" >&2; exit 1; }
   done
   # pull images from the shared registry
-  "$GCLOUD" artifacts repositories add-iam-policy-binding pivota --location="$REGION" --project="$SHARED" \
-    --member="serviceAccount:$EMAIL" --role=roles/artifactregistry.reader >/dev/null
+  retry "$GCLOUD" artifacts repositories add-iam-policy-binding pivota --location="$REGION" --project="$SHARED" \
+    --member="serviceAccount:$EMAIL" --role=roles/artifactregistry.reader >/dev/null 2>&1 \
+    || { echo "FAILED registry binding for $EMAIL" >&2; exit 1; }
 done
 # Cloud Run's own service agent must also read the shared registry
 "$GCLOUD" artifacts repositories add-iam-policy-binding pivota --location="$REGION" --project="$SHARED" \
