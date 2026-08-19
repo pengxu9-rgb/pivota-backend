@@ -175,7 +175,21 @@ async def test_orders_create_does_not_close_conversion(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_hmac_in_production_rejects_and_never_closes(monkeypatch):
+@pytest.mark.parametrize(
+    "deployed_shape",
+    [
+        {"RAILWAY_ENVIRONMENT": "production"},
+        {"RAILWAY_ENVIRONMENT": "staging"},
+        {"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "production"},
+        {"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "staging"},
+        {"K_SERVICE": "pivota-backend"},
+    ],
+    ids=["railway_prod", "railway_staging", "cloud_run_prod",
+         "cloud_run_staging", "cloud_run_unresolved"],
+)
+async def test_invalid_hmac_in_production_rejects_and_never_closes(
+    monkeypatch, deployed_shape
+):
     calls: List[Dict[str, Any]] = []
 
     async def close_spy(**kwargs: Any):
@@ -185,8 +199,19 @@ async def test_invalid_hmac_in_production_rejects_and_never_closes(monkeypatch):
     async def log_spy(**kwargs: Any):
         return None
 
-    # Force the production code path so HMAC is strictly enforced.
-    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "deadbeef")
+    # Force the deployed code path so HMAC is strictly enforced.
+    #
+    # This used to set RAILWAY_GIT_COMMIT_SHA, the legacy "am I deployed"
+    # idiom. That is build metadata about a commit, not proof of a deployment
+    # (a developer .env carries it), so config.platform no longer treats it as
+    # a platform marker. Parametrised over every DEPLOYED shape instead —
+    # including both STAGING ones, which is what pins is_deployed() rather than
+    # is_production() as the rule: staging has always enforced Shopify HMAC.
+    for _k in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME", "K_SERVICE",
+               "PIVOTA_ENV", "PIVOTA_PLATFORM", "ENVIRONMENT", "APP_ENV"):
+        monkeypatch.delenv(_k, raising=False)
+    for _k, _v in deployed_shape.items():
+        monkeypatch.setenv(_k, _v)
     stores = [{
         "platform": "shopify",
         "domain": "teststore.myshopify.com",

@@ -221,6 +221,230 @@ def test_shakeout_debug_is_allowed_locally():
     assert _require_non_prod() is None
 
 
+# ===========================================================================
+# THE WEBHOOK / SIGNATURE GATE FAMILY
+#
+# This file covered seven guards and imported none of the five webhook-facing
+# modules below. Two mutants proved the hole by surviving the FULL sweep:
+#
+#   M5  routes/webhook_routes.py  is_deployed() -> is_production()
+#   M7  routes/shopify_setup.py   is_deployed() -> is_production()
+#
+# M5's failure mode: on Railway staging, or any Cloud Run staging revision,
+# Shopify webhook HMAC verification degrades from ENFORCED to SKIPPED and the
+# persistence-failure hard-fail stops firing. Nothing errors, nothing warns,
+# and CI stays green.
+#
+# is_deployed() vs is_production() is therefore the assertion that matters, and
+# it can only be made by the STAGING side of each pair. A production-only test
+# passes identically under both — which is exactly how these mutants survived.
+# Every guard below is asserted in all three production shapes AND on staging.
+# ===========================================================================
+
+
+# --- Shopify webhook strictness: HMAC + persistence hard-fail (M5) ----------
+
+
+def test_shopify_webhook_strictness_is_on_in_every_production_shape(production_shape):
+    from routes.webhook_routes import _shopify_prod_runtime
+
+    assert _shopify_prod_runtime() is True
+
+
+def test_shopify_webhook_strictness_is_on_for_staging_too(staging_shape):
+    """THE M5 ASSERTION.
+
+    The pre-shim expression was ``bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))``,
+    true on Railway staging as well — so staging has ALWAYS enforced Shopify
+    HMAC. is_deployed() is the faithful translation; is_production() is not,
+    and swapping them leaves every staging deployment accepting unsigned
+    webhooks. This test is the only thing that can tell the two apart.
+    """
+    from routes.webhook_routes import _shopify_prod_runtime
+
+    assert _shopify_prod_runtime() is True
+
+
+def test_shopify_webhook_strictness_is_off_locally():
+    """The other half of the pair: without this, `return True` passes."""
+    from routes.webhook_routes import _shopify_prod_runtime
+
+    assert _shopify_prod_runtime() is False
+
+
+@pytest.mark.parametrize("var", ["APP_ENV", "ENVIRONMENT"])
+def test_shopify_webhook_strictness_honours_its_legacy_env_vars(monkeypatch, var):
+    from routes.webhook_routes import _shopify_prod_runtime
+
+    monkeypatch.setenv(var, "production")
+    assert _shopify_prod_runtime() is True
+
+
+# --- Stripe order/PSP webhook livemode gate --------------------------------
+
+
+def test_stripe_livemode_gate_is_active_in_every_production_shape(production_shape):
+    from routes.webhook_routes import _stripe_livemode_gate_active
+
+    assert _stripe_livemode_gate_active() is True
+
+
+def test_stripe_livemode_gate_is_inactive_on_staging(staging_shape):
+    """Deliberately NARROWER than the Shopify gate: staging must keep accepting
+    test-mode Stripe events. is_production(), not is_deployed()."""
+    from routes.webhook_routes import _stripe_livemode_gate_active
+
+    assert _stripe_livemode_gate_active() is False
+
+
+def test_stripe_livemode_gate_is_inactive_locally():
+    from routes.webhook_routes import _stripe_livemode_gate_active
+
+    assert _stripe_livemode_gate_active() is False
+
+
+def test_stripe_livemode_gate_honours_its_legacy_env_var(monkeypatch):
+    from routes.webhook_routes import _stripe_livemode_gate_active
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert _stripe_livemode_gate_active() is True
+
+
+# --- Stripe BILLING webhook livemode gate ----------------------------------
+
+
+def test_billing_livemode_gate_is_active_in_every_production_shape(production_shape):
+    from routes.billing_routes import _billing_livemode_gate_active
+
+    assert _billing_livemode_gate_active() is True
+
+
+def test_billing_livemode_gate_is_inactive_on_staging(staging_shape):
+    from routes.billing_routes import _billing_livemode_gate_active
+
+    assert _billing_livemode_gate_active() is False
+
+
+def test_billing_livemode_gate_is_inactive_locally():
+    from routes.billing_routes import _billing_livemode_gate_active
+
+    assert _billing_livemode_gate_active() is False
+
+
+def test_billing_livemode_gate_honours_its_legacy_env_var(monkeypatch):
+    from routes.billing_routes import _billing_livemode_gate_active
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert _billing_livemode_gate_active() is True
+
+
+# --- Checkout.com webhook: no secret configured => production refuses -------
+
+
+def test_unsigned_checkout_webhook_is_fatal_in_every_production_shape(production_shape):
+    from routes.payment_routes import _unsigned_webhook_is_fatal
+
+    assert _unsigned_webhook_is_fatal() is True
+
+
+def test_unsigned_checkout_webhook_is_tolerated_on_staging(staging_shape):
+    from routes.payment_routes import _unsigned_webhook_is_fatal
+
+    assert _unsigned_webhook_is_fatal() is False
+
+
+def test_unsigned_checkout_webhook_is_tolerated_locally():
+    from routes.payment_routes import _unsigned_webhook_is_fatal
+
+    assert _unsigned_webhook_is_fatal() is False
+
+
+def test_unsigned_checkout_webhook_honours_its_legacy_env_var(monkeypatch):
+    from routes.payment_routes import _unsigned_webhook_is_fatal
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert _unsigned_webhook_is_fatal() is True
+
+
+# --- Shopify setup endpoints: credential-overwrite surface (M7) ------------
+
+
+def test_shopify_setup_is_gated_in_every_production_shape(production_shape):
+    from routes.shopify_setup import _is_production, _shopify_setup_enabled
+
+    assert _is_production() is True
+    assert _shopify_setup_enabled() is False  # the opt-in is not set
+
+
+def test_shopify_setup_is_gated_on_staging_too(staging_shape):
+    """THE M7 ASSERTION — same shape, same reason, as M5.
+
+    These endpoints overwrite stored Shopify credentials. `bool(
+    RAILWAY_GIT_COMMIT_SHA)` closed them on staging as well; is_production()
+    would reopen them there.
+    """
+    from routes.shopify_setup import _is_production
+
+    assert _is_production() is True
+
+
+def test_shopify_setup_is_open_locally():
+    from routes.shopify_setup import _is_production
+
+    assert _is_production() is False
+
+
+def test_shopify_setup_opt_in_reopens_it(monkeypatch, production_shape):
+    """Pins that the gate is `_is_production() and not _shopify_setup_enabled()`
+    — a mutant dropping the opt-in would otherwise go unnoticed."""
+    from routes.shopify_setup import _is_production, _shopify_setup_enabled
+
+    monkeypatch.setenv("ENABLE_SHOPIFY_SETUP_ENDPOINTS", "true")
+    assert _is_production() is True
+    assert _shopify_setup_enabled() is True
+
+
+# --- Photo schema self-heal: never ensure-on-request in production ----------
+
+
+def test_photo_schema_ensure_is_off_in_every_production_shape(production_shape):
+    from routes.photos import _is_production_env
+
+    assert _is_production_env() is True
+
+
+def test_photo_schema_ensure_is_on_for_staging(staging_shape):
+    """Narrower than the webhook gates on purpose: this one is is_production(),
+    so staging keeps the self-healing DDL path."""
+    from routes.photos import _is_production_env
+
+    assert _is_production_env() is False
+
+
+def test_photo_schema_ensure_is_on_locally():
+    from routes.photos import _is_production_env
+
+    assert _is_production_env() is False
+
+
+@pytest.mark.parametrize("var", ["ENVIRONMENT", "APP_ENV"])
+def test_photo_schema_gate_honours_its_legacy_env_vars(monkeypatch, var):
+    from routes.photos import _is_production_env
+
+    monkeypatch.setenv(var, "production")
+    assert _is_production_env() is True
+
+
+def test_photo_schema_explicit_non_prod_env_var_beats_the_platform(monkeypatch):
+    """This module's precedence is deliberate and different: an explicit
+    ENVIRONMENT/APP_ENV wins outright, even on a production platform."""
+    from routes.photos import _is_production_env
+
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    assert _is_production_env() is False
+
+
 # ---------------------------------------------------------------------------
 # GUARD: production-only route gate (utils.runtime_safety)
 # ---------------------------------------------------------------------------

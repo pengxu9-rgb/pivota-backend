@@ -37,6 +37,23 @@ from utils.logger import logger
 
 
 router = APIRouter(tags=["billing"])
+
+
+def _billing_livemode_gate_active() -> bool:
+    """Production refuses test-mode Stripe BILLING events.
+
+    Hoisted out of the route body so tests/test_platform_guard_parity.py can
+    exercise it directly — an inline expression inside an async handler is
+    reachable only by driving a whole signed webhook, which is why this gate
+    had no parity coverage at all.
+
+    is_production(), not is_deployed(): staging must keep accepting test-mode
+    billing events.
+    """
+    return (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or is_production()
+    )
 stripe_client = stripe.StripeClient(api_key=settings.stripe_secret_key or "")
 
 _TABLE_COLUMN_CACHE: Dict[str, set[str]] = {}
@@ -296,10 +313,7 @@ async def handle_stripe_billing_webhook(
     # secret that happens to verify (or a test-clock / smoke-test harness) must
     # not be able to mutate live billing state. `livemode` is part of the signed
     # event. Mirrors the order/PSP webhook guard in webhook_routes.py.
-    is_prod_env = (
-        os.getenv("ENVIRONMENT", "").lower() == "production"
-        or is_production()
-    )
+    is_prod_env = _billing_livemode_gate_active()
     if is_prod_env and event.get("livemode") is False:
         logger.warning(
             "Ignoring test-mode Stripe billing webhook (livemode=false) in production: type=%s event_id=%s",

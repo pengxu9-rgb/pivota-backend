@@ -66,6 +66,51 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 adyen_webhook_security = HTTPBasic()
 
 
+# ---------------------------------------------------------------------------
+# The two environment gates this module hangs security on, hoisted out of the
+# route bodies so they can be tested directly.
+#
+# They were inline expressions inside 700-line async handlers, which meant the
+# only way to exercise them was to drive a whole webhook request — so nobody
+# did, and tests/test_platform_guard_parity.py never imported this module at
+# all. Two mutants proved the hole by surviving the FULL 10,794-test sweep:
+# swapping is_deployed() for is_production() in _shopify_prod_runtime() turns
+# Shopify HMAC verification from ENFORCED to SKIPPED on every staging
+# deployment, and stops the persistence-failure hard-fail from firing — CI
+# green throughout. is_deployed() vs is_production() IS the distinction, so it
+# is named and pinned on both sides.
+# ---------------------------------------------------------------------------
+
+
+def _stripe_livemode_gate_active() -> bool:
+    """Production refuses test-mode Stripe events.
+
+    is_production() — not is_deployed(): a staging deployment SHOULD accept
+    test-mode events, that is what staging is for.
+    """
+    return (
+        os.getenv("ENVIRONMENT", "").lower() == "production"
+        or is_production()
+    )
+
+
+def _shopify_prod_runtime() -> bool:
+    """Strict Shopify webhook handling: HMAC enforced, persistence failures fatal.
+
+    is_deployed() — not is_production(): the pre-shim expression was
+    ``bool(os.getenv("RAILWAY_GIT_COMMIT_SHA"))``, which was true on Railway
+    STAGING as well, so staging has always enforced signatures. Narrowing this
+    to is_production() would silently accept unsigned webhooks on every staging
+    revision.
+    """
+    return (
+        os.getenv("APP_ENV", "").lower() == "production"
+        or os.getenv("ENVIRONMENT", "").lower() == "production"
+        # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "deployed"; it is False on Cloud Run.
+        or is_deployed()
+    )
+
+
 async def _run_shopify_catalog_webhook_reconcile(
     *,
     merchant_id: str,
@@ -918,10 +963,7 @@ async def handle_stripe_webhook(
         # Livemode gate: in production, refuse test-mode events. A test-mode
         # endpoint secret (per-psp or platform) that happens to verify must not
         # be able to mutate live orders. `livemode` is part of the signed event.
-        is_prod_env = (
-            os.getenv("ENVIRONMENT", "").lower() == "production"
-            or is_production()
-        )
+        is_prod_env = _stripe_livemode_gate_active()
         event_livemode = event.get("livemode")
         if is_prod_env and event_livemode is False:
             logger.warning(
@@ -2115,12 +2157,7 @@ async def _process_shopify_webhook_event(
     inline body — parameters are passed exactly, especially `got_canon` for the
     ADR-009 seller-mismatch guard and the idempotency/duplicate return.
     """
-    is_prod_runtime = (
-        os.getenv("APP_ENV", "").lower() == "production"
-        or os.getenv("ENVIRONMENT", "").lower() == "production"
-        # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "deployed"; it is False on Cloud Run.
-        or is_deployed()
-    )
+    is_prod_runtime = _shopify_prod_runtime()
     try:
         # Persist event (append-only) with idempotency guard
         try:
@@ -2847,12 +2884,7 @@ async def handle_shopify_webhook(
 
         # Verify signature (strict in production; must use raw request body).
         instance_id = socket.gethostname()
-        is_prod_runtime = (
-            os.getenv("APP_ENV", "").lower() == "production"
-            or os.getenv("ENVIRONMENT", "").lower() == "production"
-            # `bool(RAILWAY_GIT_COMMIT_SHA)` meant "deployed"; False on Cloud Run.
-            or is_deployed()
-        )
+        is_prod_runtime = _shopify_prod_runtime()
         app_secret = getattr(settings, "shopify_client_secret", None)
         app_secret = app_secret.strip() if isinstance(app_secret, str) else ""
         store_secret = store_secret.strip() if isinstance(store_secret, str) else ""
