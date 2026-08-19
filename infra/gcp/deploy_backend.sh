@@ -23,6 +23,13 @@ REGION=us-west1
 SERVICE="${SERVICE:-web}"
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
+# `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
+# an existing service. A brand-new service has no previous revision to protect anyway.
+if "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  NO_TRAFFIC="--tag $CANDIDATE_TAG --no-traffic"; FIRST_DEPLOY=0
+else
+  NO_TRAFFIC=""; FIRST_DEPLOY=1; echo "note: $SERVICE does not exist yet - first revision takes traffic immediately"
+fi
 ENV_FILE="$HERE/env.$ENV.yaml"
 SECRETS_FILE="$HERE/secrets.$ENV.list"
 [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "missing $ENV_FILE / $SECRETS_FILE — run port_railway_env.py first" >&2; exit 1; }
@@ -60,7 +67,7 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
   --execution-environment gen2 \
   $PUBLIC_FLAG \
   --labels "env=$ENV,service=$SERVICE,managed-by=infra-gcp" \
-  --tag "$CANDIDATE_TAG" --no-traffic \
+  $NO_TRAFFIC \
   --quiet
 
 # Verify the candidate revision on its own tagged URL BEFORE it takes traffic: `gcloud run deploy`
@@ -68,6 +75,7 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # but cannot serve still does.
 CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --format="value(status.traffic.extract(\"url\").flatten())" | tr ';' '\n' | grep -F "$CANDIDATE_TAG" | head -1)
+[ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
 CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
 AUTH=()
 [ "$PUBLIC" = 1 ] || AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
@@ -76,6 +84,6 @@ CODE=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 "${AUTH[@]}" "$
 head -c 400 /tmp/pivota-health.$$; echo; rm -f /tmp/pivota-health.$$
 [ "$CODE" = 200 ] || { echo "candidate health check returned $CODE — NOT shifting traffic. Previous revision still serving." >&2; exit 1; }
 
-"$GCLOUD" run services update-traffic "$SERVICE" --project "$PROJECT" --region "$REGION" --to-latest --quiet
+[ "$FIRST_DEPLOY" = 1 ] || "$GCLOUD" run services update-traffic "$SERVICE" --project "$PROJECT" --region "$REGION" --to-latest --quiet
 URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')
 echo "deployed $SERVICE -> $URL (100% traffic)"

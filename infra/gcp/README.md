@@ -114,3 +114,42 @@ Tracked from the review of this PR; none is covered by these scripts yet.
     with no lifecycle rule, retention policy, or CMEK.
 12. **Cloud Build trigger** — images are built by hand with `COMMIT_SHA` passed in; provenance
     during cutover is manual.
+
+## Gateway (PIVOTA-Agent) on Cloud Run
+
+```bash
+# from a PIVOTA-Agent checkout
+gcloud builds submit --config ../pivota-backend-gcp/infra/gcp/cloudbuild.gateway.yaml \
+  --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+python3 ../pivota-backend-gcp/infra/gcp/port_railway_env.py \
+  --railway-service PIVOTA-Agent --railway-env production --env staging --prefix gateway --apply
+../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
+```
+
+The gateway reuses **its own repo's root Dockerfile**. That is safe there because PIVOTA-Agent's
+Railway services pin `builder=RAILPACK` explicitly, so the Dockerfile is inert on Railway - unlike
+pivota-backend, where adding a root Dockerfile hijacked the builder for 8 services.
+
+**`/healthz` is NOT reachable on Cloud Run.** Google's frontend intercepts it and returns its own
+404 before the request reaches the container; `/health` (the same handler) returns 200. Railway's
+configured healthcheckPath is `/healthz`, so any Cloud Run healthcheck, uptime check, or LB backend
+must use `/health`.
+
+**`--prefix` is mandatory when two services share a project.** It names the outputs
+`env.<env>.<prefix>.yaml` / `secrets.<env>.<prefix>.list`, prefixes Secret Manager entries
+`<prefix>-env-<NAME>`, **and** selects `env.<env>.<prefix>.overrides.yaml`. Without the prefix on the
+overrides file a port silently picks up another service's overrides and drops its own.
+
+**Staging cross-service URLs must be overridden.** The gateway's Railway env points every backend
+URL at production (`PIVOTA_API_BASE`, `PIVOTA_BACKEND_BASE_URL`, `PROMOTIONS_BACKEND_BASE_URL`,
+`DISCOVERY_PRODUCTS_SEARCH_BASE_URL`, `AURORA_BFF_RECO_CATALOG_SEARCH_BASE_URLS`,
+`NEXT_PUBLIC_API_URL`, `AGENT_AUTH_INTROSPECT_URL`, `PIVOTA_GATEWAY_URL`). A staging gateway left
+pointing at them would read production data and mint production-scoped tokens.
+
+### Open: staging service-to-service networking
+Both staging services are IAM-gated (no `allUsers`). Cloud Run→Cloud Run over `*.run.app` takes the
+public path, so with `--vpc-egress private-ranges-only` the gateway's calls to the backend will get
+401 until one of these is chosen:
+- **IAM + identity tokens** (correct, needs the gateway to mint an ID token per outbound call), or
+- **`--ingress internal` + `--vpc-egress all-traffic` + Cloud NAT** (no code change; NAT also gives
+  the stable egress IP that Antom/Adyen allowlisting will need).
