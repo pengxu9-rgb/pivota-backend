@@ -89,6 +89,26 @@ class WebhookService:
                 _WEBHOOK_EVENTS_SCHEMA_CHECKED = True
 
     @staticmethod
+    async def recheck_webhook_events_schema() -> bool:
+        """
+        Re-run the schema probe, clearing the "already checked" memo first.
+
+        On a FIRST boot against an empty database, main.startup_event() probes
+        `webhook_events` BEFORE main.startup() applies db/migrations/*.sql that
+        creates it. The probe used to latch _CHECKED=True, so audit
+        persistence/idempotency stayed off for the whole process lifetime even
+        though the table existed seconds later. main.startup() calls this once
+        after the migration phase. Returns True when persistence is available.
+        """
+        global _WEBHOOK_EVENTS_SCHEMA_READY
+        global _WEBHOOK_EVENTS_SCHEMA_CHECKED
+        if _WEBHOOK_EVENTS_SCHEMA_READY:
+            return True
+        _WEBHOOK_EVENTS_SCHEMA_CHECKED = False
+        await WebhookService.ensure_webhook_events_table()
+        return _WEBHOOK_EVENTS_SCHEMA_READY
+
+    @staticmethod
     async def verify_checkout_signature(
         payload: bytes,
         signature_header: str,

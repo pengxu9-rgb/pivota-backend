@@ -1,3 +1,19 @@
+-- DISABLED 2026-08-19 (renamed *.sql.disabled so main.startup()'s migration
+-- runner no longer executes it). Do NOT re-enable.
+--
+-- This file is MySQL dialect (inline `INDEX idx_x (col)` in CREATE TABLE,
+-- `ON UPDATE CURRENT_TIMESTAMP`). On Postgres the first statement fails with
+-- `syntax error at or near "ON"` / `"INDEX"`, the runner executes the whole
+-- file as ONE transaction, so nothing in it has ever been applied anywhere
+-- (Railway staging logs the same warning on every boot). Fixing the syntax
+-- would be WRONG: it defines `agent_metrics (agent_id PRIMARY KEY, ...)`,
+-- which conflicts with the `agent_metrics` shape created by
+-- 009_agent_observability.sql and used by services/agent_metrics_collector.py.
+-- The remaining tables (agent_api_logs, psp_attempts, mcp_query_logs,
+-- rate_limit_buckets, agent_sessions, audit_logs, error_logs,
+-- platform_analytics) are referenced by no code; webhook_events comes from
+-- 024_webhook_events.sql.
+--
 -- Production Database Schema Updates
 -- Run this after initial setup to add production-ready tables
 

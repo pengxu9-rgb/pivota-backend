@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 # Database
 from db.database import database, metadata, engine
+from db.startup_ddl import StartupDdlLock, startup_ddl_lock
 import db.auth_identity  # noqa: F401  (register canonical auth identity tables in metadata)
 import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in metadata)
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
@@ -658,25 +659,30 @@ async def startup_event():
         logger = logging.getLogger(__name__)
         logger.warning(f"⚠️ Startup DB connect skipped/failed (continuing degraded): {exc}")
         return
-    try:
-        # Create all tables defined in db.database (transactions, etc.)
-        metadata.create_all(engine)
-    except Exception as exc:
-        logger = logging.getLogger(__name__)
-        logger.warning(f"⚠️ Failed to run metadata.create_all: {exc}")
+    # All startup DDL below runs under a Postgres advisory lock so concurrent
+    # instances (Cloud Run min-instances>1, rolling revisions) and concurrent
+    # tasks serialize their CREATE ... IF NOT EXISTS against an EMPTY database.
+    # See db/startup_ddl.py. No-op cost on a warm DB: one lock round-trip.
+    async with startup_ddl_lock():
+        try:
+            # Create all tables defined in db.database (transactions, etc.)
+            metadata.create_all(engine)
+        except Exception as exc:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"⚠️ Failed to run metadata.create_all: {exc}")
 
-    # Ensure quote-first table exists (best-effort; does not raise).
-    try:
-        from db.quotes import ensure_quotes_table
+        # Ensure quote-first table exists (best-effort; does not raise).
+        try:
+            from db.quotes import ensure_quotes_table
 
-        await ensure_quotes_table()
-    except Exception as exc:
-        logger.warning(f"⚠️ Failed to ensure quotes table: {exc}")
+            await ensure_quotes_table()
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to ensure quotes table: {exc}")
 
-    # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
-    await WebhookService.ensure_webhook_events_table()
-    await ensure_agent_webhook_tables()
-    await ensure_merchant_webhook_tables()
+        # Ensure webhook audit/idempotency table exists (best-effort; does not raise)
+        await WebhookService.ensure_webhook_events_table()
+        await ensure_agent_webhook_tables()
+        await ensure_merchant_webhook_tables()
     await start_agent_webhook_retry_worker()
     await start_merchant_webhook_retry_worker()
 
@@ -1270,6 +1276,7 @@ async def startup():
     except Exception as e:
         logger.warning(f"⚠️ Sentry initialization skipped: {e}")
     
+    _startup_ddl_lock = StartupDdlLock()
     try:
         logger.info("📡 Connecting to database...")
         logger.info(f"   Database URL type: {type(database.url)}")
@@ -1278,6 +1285,12 @@ async def startup():
         if not getattr(database, "is_connected", False):
             await connect_database_with_timeout(15, db=database)
         logger.info("✅ Database connected successfully")
+
+        # Serialize this whole DDL phase (create_all, schema guard, SQL + inline
+        # migrations) across concurrent instances/tasks — see db/startup_ddl.py.
+        # Released explicitly after the migrations below and, as a safety net,
+        # in the outer finally (release() is idempotent).
+        await _startup_ddl_lock.acquire()
         
         # Ensure all tables exist (important for PostgreSQL)
         # Reuse db.database's sync engine: building one from database.url
@@ -1638,42 +1651,35 @@ async def startup():
         logger.info("   - Events: api_call_events, order_events")
         logger.info("   - Analytics: merchant_analytics")
         
-        # Run SQL migration files
+        # Run SQL migration files.
+        # Previously this opened a NEW engine per file and called
+        # conn.commit() on a legacy SQLAlchemy 1.4 Connection, which has no
+        # such method: every file raised AttributeError, and only files whose
+        # text began with a DDL keyword landed (1.4 legacy autocommit) while
+        # comment-led files were silently ROLLED BACK — the reason a fresh
+        # database had no webhook_events/users/employees. See db/sql_migrations.py.
+        # Runs inside the startup advisory lock acquired above.
         logger.info("🔄 Running SQL migration files...")
         try:
-            from sqlalchemy import text
-            import glob
-            
-            # Run all SQL migration files in order
-            migration_dir = os.path.join(os.path.dirname(__file__), "db", "migrations")
-            sql_files = sorted(glob.glob(os.path.join(migration_dir, "*.sql")))
-            
-            for sql_file in sql_files:
-                logger.info(f"   Running migration: {os.path.basename(sql_file)}")
-                with open(sql_file, 'r') as f:
-                    sql_content = f.read()
-                    # Execute the entire file as one transaction to preserve $$ blocks
-                    # PostgreSQL functions use $$ delimiters which shouldn't be split
-                    try:
-                        # Use raw connection for complex SQL with functions.
-                        # Reuse db.database's sync engine — database.url may
-                        # carry an async driver (sqlite+aiosqlite) that a fresh
-                        # create_engine here binds sync-side (MissingGreenlet).
-                        # AUTOCOMMIT isolation: each DDL statement commits implicitly.
-                        # Required because some migrations use CREATE INDEX CONCURRENTLY,
-                        # which Postgres forbids inside a transaction block. The previous
-                        # `engine.connect() + conn.commit()` pattern silently rolled back
-                        # fresh DDL (Connection has no .commit() in SA 1.4 legacy mode);
-                        # `engine.begin()` would commit but breaks the CONCURRENTLY paths.
-                        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                            conn.execute(text(sql_content))
-                    except Exception as e:
-                        logger.warning(f"   Migration {os.path.basename(sql_file)} error (may be already applied): {e}")
-                logger.info(f"   ✅ {os.path.basename(sql_file)} completed")
-            
+            from db.sql_migrations import run_sql_migrations
+
+            # `engine` is db.database's SYNC engine on purpose: database.url may
+            # carry an async driver (sqlite+aiosqlite) that a fresh create_engine
+            # here would bind sync-side (MissingGreenlet).
+            run_sql_migrations(engine)
             logger.info("✅ All SQL migrations completed")
         except Exception as migration_err:
             logger.warning(f"⚠️ SQL migration warning: {migration_err}")
+
+        # startup_event() probed webhook_events BEFORE the migration that
+        # creates it had run (first boot on an empty DB), which latched webhook
+        # audit persistence off for the process. Re-probe now that migrations
+        # are applied.
+        try:
+            if await WebhookService.recheck_webhook_events_schema():
+                logger.info("✅ webhook_events audit persistence enabled")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"webhook_events re-check skipped: {exc}")
         
         # Run inline migrations for merchant_onboarding table
         logger.info("🔄 Running inline database migrations...")
@@ -1781,6 +1787,7 @@ async def startup():
             
         except Exception as migration_err:
             logger.warning(f"⚠️ Migration warning (may be already applied): {migration_err}")
+
         
         # Re-run the light schema guard now that ALL tables exist. The first
         # pass (above) runs before the heavy init creates the remaining
@@ -1795,6 +1802,15 @@ async def startup():
             logger.info("✅ Schema guard: post-init required columns ensured")
         except Exception as schema_guard_err:
             logger.warning(f"Schema guard (post-init) warning: {schema_guard_err}")
+
+        # End of the startup DDL phase. The post-init schema guard above is
+        # part of it: db/schema_guard.py issues 24 CREATE INDEX IF NOT EXISTS
+        # statements through bare database.execute(), which is exactly as
+        # non-atomic across sessions as CREATE TABLE IF NOT EXISTS — and all
+        # of them share one try/except, so a racing instance would abort the
+        # rest of the guard and leave /health failing closed on a column it
+        # was supposed to ensure.
+        await _startup_ddl_lock.release()
 
         # Initialize services if available
         logger.info("🔌 Initializing optional services...")
@@ -1822,6 +1838,14 @@ async def startup():
         # Do not block deploy/healthchecks; keep the service up in degraded mode.
         logger.error("🟡 Continuing startup in degraded mode (some DB-backed endpoints may fail)")
         return
+    finally:
+        # Safety net: the fast-mode `return` and every error path above must
+        # drop the advisory lock so a sibling instance's boot is never blocked
+        # by this one. Idempotent if already released.
+        try:
+            await _startup_ddl_lock.release()
+        except Exception:  # noqa: BLE001
+            pass
 
 async def shutdown():
     """Cleanup on shutdown"""

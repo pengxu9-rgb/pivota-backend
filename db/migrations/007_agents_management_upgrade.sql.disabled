@@ -1,3 +1,22 @@
+-- DISABLED 2026-08-19 (renamed *.sql.disabled so main.startup()'s migration
+-- runner no longer executes it). Do NOT re-enable as-is.
+--
+-- On a clean database this file fails atomically at
+-- `CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)` because the
+-- `agents` table is created by SQLAlchemy metadata (db/agents.py) which has
+-- `is_active`, not `status`; the views below also reference a.name / a.email /
+-- a.last_active which that table does not have. The runner executes the whole
+-- file as ONE transaction, so none of it has ever been applied (Railway
+-- staging logs `column status does not exist` on every boot).
+--
+-- That atomic failure was load-bearing: Part 2 creates `agent_metrics` with a
+-- (window_start, window_end, window_type) shape that the application does NOT
+-- use. The live shape (timestamp, last_seen_at, collected_at, ...) comes from
+-- 009_agent_observability.sql, which runs AFTER this file; "fixing" the
+-- status index here would create the wrong agent_metrics first and make 009's
+-- CREATE TABLE IF NOT EXISTS a silent no-op, breaking
+-- services/agent_metrics_collector.py on every fresh database.
+--
 -- Migration 007: Agents Management Upgrade
 -- Extends agents table and adds agent_metrics for performance tracking
 

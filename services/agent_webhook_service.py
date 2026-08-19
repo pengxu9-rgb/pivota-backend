@@ -16,6 +16,7 @@ import httpx
 
 from config.settings import resolve_public_api_base_url
 from db.database import database
+from db.startup_ddl import execute_ddl
 
 
 logger = logging.getLogger(__name__)
@@ -231,86 +232,95 @@ def _next_retry_at(attempt_count: int) -> Optional[datetime]:
     return _utcnow() + timedelta(seconds=RETRY_DELAYS_SECONDS[retry_index])
 
 
+_AGENT_WEBHOOK_DDL_READY = False
+
+_AGENT_WEBHOOK_DDL_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS agent_webhook_configs (
+        id SERIAL PRIMARY KEY,
+        agent_id VARCHAR(255) NOT NULL UNIQUE,
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        destination_url TEXT,
+        subscribed_events JSON NOT NULL DEFAULT '[]',
+        signing_secret TEXT,
+        pending_signing_secret TEXT,
+        pending_secret_activates_at TIMESTAMP,
+        last_test_at TIMESTAMP,
+        last_test_status VARCHAR(32),
+        migration_source VARCHAR(128),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agent_webhook_deliveries (
+        id SERIAL PRIMARY KEY,
+        delivery_id VARCHAR(255) NOT NULL UNIQUE,
+        agent_id VARCHAR(255) NOT NULL,
+        event_id VARCHAR(255) NOT NULL,
+        event_type VARCHAR(255) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        http_status INTEGER,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        delivered_at TIMESTAMP,
+        next_retry_at TIMESTAMP,
+        request_id VARCHAR(255),
+        destination_url TEXT,
+        payload JSON NOT NULL DEFAULT '{}',
+        request_headers JSON NOT NULL DEFAULT '{}',
+        response_body TEXT,
+        last_error TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_agent_webhook_deliveries_agent_created
+    ON agent_webhook_deliveries(agent_id, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_agent_webhook_deliveries_retry
+    ON agent_webhook_deliveries(status, next_retry_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agent_webhook_managed_inbox_events (
+        id SERIAL PRIMARY KEY,
+        delivery_id VARCHAR(255) NOT NULL UNIQUE,
+        agent_id VARCHAR(255) NOT NULL,
+        event_id VARCHAR(255),
+        event_type VARCHAR(255),
+        signature_valid BOOLEAN NOT NULL DEFAULT FALSE,
+        received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        source_ip VARCHAR(255),
+        user_agent TEXT,
+        request_headers JSON NOT NULL DEFAULT '{}',
+        payload JSON NOT NULL DEFAULT '{}',
+        raw_body TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_agent_webhook_managed_inbox_agent_received
+    ON agent_webhook_managed_inbox_events(agent_id, received_at DESC)
+    """,
+)
+
+
 async def ensure_agent_webhook_tables() -> None:
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agent_webhook_configs (
-            id SERIAL PRIMARY KEY,
-            agent_id VARCHAR(255) NOT NULL UNIQUE,
-            enabled BOOLEAN NOT NULL DEFAULT FALSE,
-            destination_url TEXT,
-            subscribed_events JSON NOT NULL DEFAULT '[]',
-            signing_secret TEXT,
-            pending_signing_secret TEXT,
-            pending_secret_activates_at TIMESTAMP,
-            last_test_at TIMESTAMP,
-            last_test_status VARCHAR(32),
-            migration_source VARCHAR(128),
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agent_webhook_deliveries (
-            id SERIAL PRIMARY KEY,
-            delivery_id VARCHAR(255) NOT NULL UNIQUE,
-            agent_id VARCHAR(255) NOT NULL,
-            event_id VARCHAR(255) NOT NULL,
-            event_type VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL,
-            http_status INTEGER,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            latency_ms INTEGER,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            delivered_at TIMESTAMP,
-            next_retry_at TIMESTAMP,
-            request_id VARCHAR(255),
-            destination_url TEXT,
-            payload JSON NOT NULL DEFAULT '{}',
-            request_headers JSON NOT NULL DEFAULT '{}',
-            response_body TEXT,
-            last_error TEXT
-        )
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_agent_webhook_deliveries_agent_created
-        ON agent_webhook_deliveries(agent_id, created_at DESC)
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_agent_webhook_deliveries_retry
-        ON agent_webhook_deliveries(status, next_retry_at)
-        """
-    )
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agent_webhook_managed_inbox_events (
-            id SERIAL PRIMARY KEY,
-            delivery_id VARCHAR(255) NOT NULL UNIQUE,
-            agent_id VARCHAR(255) NOT NULL,
-            event_id VARCHAR(255),
-            event_type VARCHAR(255),
-            signature_valid BOOLEAN NOT NULL DEFAULT FALSE,
-            received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            source_ip VARCHAR(255),
-            user_agent TEXT,
-            request_headers JSON NOT NULL DEFAULT '{}',
-            payload JSON NOT NULL DEFAULT '{}',
-            raw_body TEXT
-        )
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_agent_webhook_managed_inbox_agent_received
-        ON agent_webhook_managed_inbox_events(agent_id, received_at DESC)
-        """
-    )
+    """
+    Idempotent, memoized per process. Each statement is ``IF NOT EXISTS`` but
+    that is not atomic across sessions: a concurrent instance/task that wins
+    the CREATE makes this one fail with a pg_catalog unique violation
+    (pg_type_typname_nsp_index). db.startup_ddl.execute_ddl classifies that
+    as "already exists" so a lost race is success, not a boot crash.
+    main.startup_event() additionally runs this under the startup advisory
+    lock; lazy callers (routes, retry workers) hit the memo after that.
+    """
+    global _AGENT_WEBHOOK_DDL_READY
+    if _AGENT_WEBHOOK_DDL_READY:
+        return
+    for stmt in _AGENT_WEBHOOK_DDL_STATEMENTS:
+        await execute_ddl(stmt, db=database)
+    _AGENT_WEBHOOK_DDL_READY = True
 
 
 async def _sync_legacy_agent_webhook_url(agent_id: str, destination_url: Optional[str]) -> None:
