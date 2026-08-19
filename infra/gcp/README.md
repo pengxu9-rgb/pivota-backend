@@ -74,3 +74,35 @@ still prod values in staging until test-mode keys are put in the overrides file 
 - `pivota-shared`: compute default SA → `roles/cloudbuild.builds.builder` + AR writer (Cloud Build runs as it)
 - `pivota-staging`: compute default SA → builder + `secretmanager.secretAccessor` + `storage.objectAdmin`
   (for the dump job); bucket `gs://pivota-staging-migration`; secret `railway-prod-db-url`
+
+## Known gaps before the Sep 8-12 prod cutover
+
+Tracked from the review of this PR; none is covered by these scripts yet.
+
+1. **Second database `pci_kb`** — `bootstrap_env.sh` creates only `pivota`. `PCI_KB_DATABASE_URL` /
+   `INGREDIENT_REFERENCE_DATABASE_URL` still point at Railway (`switchback.proxy.rlwy.net`, PG16,
+   24 MB, 23 tables) and are read by BOTH the backend and the gateway.
+2. **Cloud Scheduler** — nothing replaces the Railway crons (`relgraph-sync-routine`, the audit /
+   executor / invitation drainers). `deploy_backend.sh` sets `AUDIT_WORKER_ENABLED=false` on
+   staging, so today NOTHING drains those queues on GCP.
+3. **Gateway / proof-issuer / acp deploys** — `sa-gateway` and `sa-worker` exist but have no deploy
+   script. Staging services must be given the STAGING internal secrets, never Railway prod values.
+4. **LB / DNS / TLS** — no external load balancer, no `gateway.pivota.cc` (must exist before
+   partners copy URLs), no custom-domain mapping, no Cloud Armor. DNS is at Alibaba/HiChina and the
+   apex is a plain A record (no ALIAS), so the apex flips to the LB anycast IP.
+5. **Backup / restore drill** — PITR and 14 retained backups are configured but never exercised.
+6. **Rollback** — deploys now go out `--no-traffic` behind a candidate tag and only take traffic
+   after a health check; rollback is `gcloud run services update-traffic --to-revisions=<prev>=100`.
+   Document it in the cutover runbook.
+7. **Cloud SQL sizing** — prod is created with 20 GB SSD; IOPS scale with capacity and
+   `--storage-auto-increase` never raises the ceiling proactively. Use >= 100 GB for prod.
+8. **`--deny-maintenance-period`** is not set around Sep 8-12 or the late-Sep launch window.
+   ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real restart.
+9. **Egress IP** — `--vpc-egress private-ranges-only` means no stable outbound IP. Resolve before
+   any Antom/Adyen IP-allowlisting conversation (needs a NAT + `all-traffic`).
+10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
+    SHA during cutover week can produce a different image. Pin or add a lockfile.
+11. **Dump bucket** — prod data lands in `gs://pivota-staging-migration` (a staging-project bucket)
+    with no lifecycle rule, retention policy, or CMEK.
+12. **Cloud Build trigger** — images are built by hand with `COMMIT_SHA` passed in; provenance
+    during cutover is manual.

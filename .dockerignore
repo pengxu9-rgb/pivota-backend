@@ -16,3 +16,4 @@ docs
 external_seed
 infra/gcp/env.*.yaml
 infra/gcp/*.local.*
+infra/gcp/secrets.*.list

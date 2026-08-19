@@ -37,7 +37,10 @@ have(){ "$@" >/dev/null 2>&1; }
 retry(){ local n=0; until "$@"; do n=$((n+1)); [ $n -ge 8 ] && return 1; sleep $((n*5)); done; }
 
 log "[$ENV] project=$PROJECT region=$REGION"
-"$GCLOUD" config set project "$PROJECT" >/dev/null
+# Scope the project to THIS process only. `gcloud config set project` persists in ~/.config/gcloud
+# and would leave the operator's next hand-typed command pointed at whatever env ran last.
+export CLOUDSDK_CORE_PROJECT="$PROJECT"
+DRIFT=0
 PROJECT_NUMBER=$("$GCLOUD" projects describe "$PROJECT" --format='value(projectNumber)')
 
 # ---------------------------------------------------------------- shared: Artifact Registry
@@ -79,13 +82,20 @@ fi
 log "Secret Manager: db password + DATABASE_URL + redis auth"
 ensure_secret(){ # name, generator-command
   local name="$1"; shift
-  if ! have "$GCLOUD" secrets describe "$name"; then
-    "$GCLOUD" secrets create "$name" --replication-policy=automatic >/dev/null
-    "$@" | "$GCLOUD" secrets versions add "$name" --data-file=- >/dev/null
-    echo "  created $name"
-  else
-    echo "  exists  $name"
+  have "$GCLOUD" secrets describe "$name" || "$GCLOUD" secrets create "$name" --replication-policy=automatic >/dev/null
+  # Check VERSIONS, not just the secret: a previous run that failed mid-way can leave a secret with
+  # zero (or empty) versions, and "the secret exists" would then hide it forever.
+  if "$GCLOUD" secrets versions access latest --secret="$name" 2>/dev/null | grep -q .; then
+    echo "  exists  $name"; return 0
   fi
+  # Generate to a temp file FIRST and validate: the generator runs in its own shell without -e or
+  # pipefail, so `openssl ... | tr ...` can fail and still exit 0 with empty output, which would
+  # otherwise be written as a valid-looking empty secret (empty DB password, unusable DATABASE_URL).
+  local tmp; tmp=$(mktemp); chmod 600 "$tmp"
+  if ! "$@" > "$tmp" || ! [ -s "$tmp" ]; then rm -f "$tmp"; echo "FAILED to generate a value for $name" >&2; exit 1; fi
+  "$GCLOUD" secrets versions add "$name" --data-file="$tmp" >/dev/null
+  rm -f "$tmp"
+  echo "  created $name"
 }
 ensure_secret pivota-db-password sh -c 'openssl rand -base64 36 | tr -d "/+=\n"'
 DB_PASSWORD=$("$GCLOUD" secrets versions access latest --secret=pivota-db-password)
@@ -95,6 +105,14 @@ fi
 SQL_PRIVATE_IP=$("$GCLOUD" sql instances describe "$SQL_INSTANCE" --format='value(ipAddresses[0].ipAddress)')
 SQL_CONN=$("$GCLOUD" sql instances describe "$SQL_INSTANCE" --format='value(connectionName)')
 ensure_secret DATABASE_URL sh -c "printf 'postgresql://$DB_USER:$DB_PASSWORD@$SQL_PRIVATE_IP:5432/$DB_NAME?sslmode=require'"
+# ensure_secret never OVERWRITES an existing value, so a recreated instance (new private IP) would
+# leave this secret pointing at a dead address. Detect the drift loudly rather than silently serving it.
+if ! "$GCLOUD" secrets versions access latest --secret=DATABASE_URL | grep -qF "@$SQL_PRIVATE_IP:5432/"; then
+  echo "  !! DATABASE_URL does not point at $SQL_PRIVATE_IP - Cloud SQL was recreated." >&2
+  echo "     Add a new version deliberately, then redeploy every service:" >&2
+  echo "       $GCLOUD secrets versions add DATABASE_URL --data-file=- --project $PROJECT" >&2
+  DRIFT=1
+fi
 unset DB_PASSWORD
 
 # ---------------------------------------------------------------- Memorystore Redis
@@ -107,6 +125,10 @@ if ! have "$GCLOUD" redis instances describe "$REDIS_INSTANCE" --region="$REGION
 fi
 REDIS_HOST=$("$GCLOUD" redis instances describe "$REDIS_INSTANCE" --region="$REGION" --format='value(host)')
 REDIS_PORT=$("$GCLOUD" redis instances describe "$REDIS_INSTANCE" --region="$REGION" --format='value(port)')
+if have "$GCLOUD" secrets describe REDIS_URL && ! "$GCLOUD" secrets versions access latest --secret=REDIS_URL | grep -qF "@$REDIS_HOST:$REDIS_PORT/"; then
+  echo "  !! REDIS_URL does not point at $REDIS_HOST:$REDIS_PORT - Memorystore was recreated." >&2
+  DRIFT=1
+fi
 ensure_secret REDIS_URL sh -c "printf 'redis://:%s@$REDIS_HOST:$REDIS_PORT/0' \"\$($GCLOUD redis instances get-auth-string $REDIS_INSTANCE --region=$REGION --format='value(authString)')\""
 
 # ---------------------------------------------------------------- service accounts + IAM
@@ -128,6 +150,8 @@ done
   --member="serviceAccount:service-$PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com" --role=roles/artifactregistry.reader >/dev/null
 
 # ---------------------------------------------------------------- summary (no secrets)
+[ "$DRIFT" = 0 ] || echo "
+!! DRIFT DETECTED (see above) - secrets do not match the live resources. Fix before deploying." >&2
 log "Done: $ENV"
 cat <<SUMMARY
   project            $PROJECT ($PROJECT_NUMBER)

@@ -24,9 +24,27 @@ import argparse, json, os, re, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SECRET_NAME_RE = re.compile(r"(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|CREDENTIAL|API_KEY|APIKEY|_KEY$|_KEY_|DSN|SIGNING|WEBHOOK_SIGN|CLIENT_SECRET|AUTH_STRING|JWT)", re.I)
+# Name-side classifier. Errs toward SECRET: a config var wrongly kept in Secret Manager costs
+# nothing, while a credential wrongly written to env.<env>.yaml lands in a plaintext file and in
+# `gcloud run services describe` output. Additions over the first pass: PASSPHRASE/SALT/HMAC/
+# SIGNATURE/_PWD/AUTH/CERT/_PEM/_PFX/_P12/_SID/_PAT/_KEYS - the shapes the Antom/Adyen mTLS and
+# webhook-HMAC work will add.
+SECRET_NAME_RE = re.compile(
+    r"(SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|_PWD|PRIVATE|CREDENTIAL|API_KEY|APIKEY"
+    r"|_KEY$|_KEY_|_KEYS$|DSN|SIGNING|SIGNATURE|HMAC|SALT|WEBHOOK_SIGN|CLIENT_SECRET"
+    r"|AUTH_STRING|_AUTH$|^AUTH_|BASIC_AUTH|JWT|CERT|_PEM$|_PFX$|_P12$|_SID$|_PAT$"
+    # basic-auth usernames are half a credential and belong with their password half
+    r"|WEBHOOK_USER|_USERNAME$|_USER$)", re.I)
 LIVE_VALUE_RE = re.compile(r"(sk_live_|rk_live_|pk_live_|whsec_|live_|_prod|production)", re.I)
+# Value-side classifier. Anchored `user:pass@` only catches DSN-style URLs, so also match secret
+# material that carries no scheme (PEM blocks, provider-prefixed tokens) and credentials embedded
+# in a URL path or query - e.g. Feishu/Lark bot webhooks put the token in the path.
 CRED_URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://[^/@\s]+:[^/@\s]+@", re.I)
+CRED_VALUE_RE = re.compile(
+    r"(-----BEGIN [A-Z ]*PRIVATE KEY|-----BEGIN CERTIFICATE"
+    r"|sk_live_|sk_test_|rk_live_|whsec_|ghp_|github_pat_|xoxb-|xoxp-|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}"
+    r"|://[^\s]*/(?:hook|webhook|bot)/[A-Za-z0-9_-]{16,}"
+    r"|[?&](?:api_?key|token|secret|signature|sig)=[^&\s]{12,})", re.I)
 DROP_EXACT = {"PORT", "DATABASE_URL", "REDIS_URL", "DATABASE_PUBLIC_URL", "REDIS_PUBLIC_URL"}
 DROP_PREFIX = ("RAILWAY_", "NIXPACKS_", "RAILPACK_")
 
@@ -36,6 +54,12 @@ def railway_vars(service, env):
         sys.exit(f"railway variables failed: {out.stderr.strip()}")
     return json.loads(out.stdout)
 
+def classify(name, value):
+    """True if this var must go to Secret Manager rather than a plaintext env file."""
+    v = (value or "").strip()
+    return bool(SECRET_NAME_RE.search(name)) or bool(CRED_URL_RE.match(v)) or bool(CRED_VALUE_RE.search(v))
+
+
 def load_yaml_simple(p):
     """tiny 'KEY: value' / 'KEY: "value"' reader so we don't need PyYAML for overrides."""
     d = {}
@@ -44,7 +68,12 @@ def load_yaml_simple(p):
         line = line.rstrip()
         if not line or line.lstrip().startswith("#") or ":" not in line: continue
         k, v = line.split(":", 1); v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'": v = v[1:-1]
+        # Strip a trailing comment BEFORE unquoting, so `FLAG: "true"  # why` yields `true` and not
+        # `"true"`. Only an UNQUOTED comment is stripped - a `#` inside quotes is part of the value.
+        if not (len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'"):
+            v = re.sub(r"\s+#.*$", "", v).strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
         d[k.strip()] = v
     return d
 
@@ -70,23 +99,29 @@ def main():
         if not isinstance(v, str): v = json.dumps(v)
         if k in DROP_EXACT or k.startswith(DROP_PREFIX):
             dropped.append(k); continue
-        is_secret = bool(SECRET_NAME_RE.search(k)) or bool(CRED_URL_RE.match(v))
         src = "railway"
         if k in overrides:
             v = overrides.pop(k); src = "override"
+        # Classify AFTER the override is applied and on the stripped value: a plain Railway value
+        # replaced by a credentialed override must be classified on what we actually ship, and a
+        # leading space would otherwise defeat the anchored CRED_URL_RE match.
+        is_secret = classify(k, v)
         live = bool(LIVE_VALUE_RE.search(v)) or bool(LIVE_VALUE_RE.search(k))
         (secrets if is_secret else plain)[k] = v
         rows.append((k, "secret" if is_secret else "plain", src, "LIVE?" if live else ""))
     for k, v in overrides.items():  # overrides may add vars that Railway doesn't have
-        is_secret = bool(SECRET_NAME_RE.search(k)) or bool(CRED_URL_RE.match(v))
+        is_secret = classify(k, v)
         (secrets if is_secret else plain)[k] = v
         rows.append((k, "secret" if is_secret else "plain", "override(new)", ""))
 
     # plain env -> yaml
     out_yaml = HERE / f"env.{a.env}.yaml"
     out_yaml.write_text("".join(f"{k}: {yaml_quote(v)}\n" for k, v in sorted(plain.items())))
+    os.chmod(out_yaml, 0o600)
     # secrets list -> deploy mapping (names only; safe to commit? no — keep git-ignored, names reveal integrations)
-    (HERE / f"secrets.{a.env}.list").write_text("".join(f"{k}=env-{k}:latest\n" for k in sorted(secrets)))
+    secrets_list = HERE / f"secrets.{a.env}.list"
+    secrets_list.write_text("".join(f"{k}=env-{k}:latest\n" for k in sorted(secrets)))
+    os.chmod(secrets_list, 0o600)
 
     print(f"\n{'VAR':55} {'class':7} {'source':14} live-mode?")
     for r in rows: print(f"{r[0]:55} {r[1]:7} {r[2]:14} {r[3]}")
