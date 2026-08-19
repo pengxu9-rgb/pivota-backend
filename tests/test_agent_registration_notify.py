@@ -22,8 +22,9 @@ def test_notice_carries_identity_fields_and_no_secret():
     assert notice["event"] == "agent.registered"
     assert notice["agent_id"] == "agent_1" and notice["email"] == "m@minds.io" and notice["company"] == "Minds Inc"
     assert "Minds" in notice["text"] and "agent_1" in notice["text"]
-    assert "ak_live" not in str(notice)
-    assert "api_key" not in notice
+    # The payload is a CLOSED set of identity/attribution fields: nothing else — in particular no
+    # key-shaped value — can ride along, because the builder takes no such input.
+    assert set(notice) == {"text", "event", "agent_id", "agent_name", "email", "company", "client_ip", "key_sync_source"}
 
 
 @pytest.mark.asyncio
@@ -59,6 +60,7 @@ async def test_notify_posts_once_and_swallows_failures(monkeypatch):
     assert ok is True
     assert len(calls) == 1 and calls[0][0] == "https://hooks.example/abc"
     assert calls[0][1]["agent_id"] == "agent_2"
+    assert set(calls[0][1]) == {"text", "event", "agent_id", "agent_name", "email", "company", "client_ip", "key_sync_source"}
 
     class _Boom(_Client):
         async def post(self, url, json=None):

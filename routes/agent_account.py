@@ -84,6 +84,21 @@ def _normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
 
+_REGISTRATION_NOTIFY_TASKS: set = set()
+
+
+def _spawn_registration_notify(**kwargs) -> None:
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(notify_agent_registered(**kwargs))
+    _REGISTRATION_NOTIFY_TASKS.add(task)
+    task.add_done_callback(_REGISTRATION_NOTIFY_TASKS.discard)
+
+
 async def _sync_agent_auth_membership(
     *,
     email: str,
@@ -118,11 +133,26 @@ def _identity_id_from_membership(membership: Optional[dict], email: str) -> str:
     return f"legacy:{_normalize_email(email)}"
 
 
-async def _resolve_agent_key_table() -> Optional[str]:
+class KeyTableUnresolvedError(RuntimeError):
+    """The auth key-table probe failed (not "resolved to legacy"): registration must not guess."""
+
+
+async def _resolve_agent_key_table(*, for_write: bool = False) -> Optional[str]:
     """
-    Resolve which key table is used by auth lookup priority.
-    Priority follows db.agents._resolve_auth_key_table: api_keys > agent_api_keys > legacy.
+    Which key table the AUTH path reads — the ONE resolver (db.agents._resolve_auth_key_table), so
+    a registration writes to the same place authentication reads, including when ops pins
+    AGENT_AUTH_KEY_TABLE (api_keys / agent_api_keys / legacy_only) as a rollback lever.
+
+    `for_write=True` distinguishes "the probe errored" from "resolved to legacy": a write that
+    guessed plaintext-vs-hash on a transient probe failure would either persist a plaintext key
+    (the thing this module stopped doing) or mint an agent that cannot authenticate. Raise instead.
     """
+    from db.agents import _resolve_auth_key_table, _AGENT_AUTH_KEY_TABLE_MODE, IS_POSTGRES
+
+    if _AGENT_AUTH_KEY_TABLE_MODE == "legacy_only" or not IS_POSTGRES:
+        return None
+    if _AGENT_AUTH_KEY_TABLE_MODE in {"api_keys", "agent_api_keys"}:
+        return _AGENT_AUTH_KEY_TABLE_MODE
     try:
         row = await database.fetch_one(
             """
@@ -131,14 +161,17 @@ async def _resolve_agent_key_table() -> Optional[str]:
               to_regclass('public.agent_api_keys') AS agent_api_keys_table
             """
         )
-        row_dict = dict(row or {})
-        if row_dict.get("api_keys_table"):
-            return "api_keys"
-        if row_dict.get("agent_api_keys_table"):
-            return "agent_api_keys"
-    except Exception:
-        # Non-postgres or no visibility to regclass: keep legacy-only behavior.
+    except Exception as exc:
+        if for_write:
+            raise KeyTableUnresolvedError(f"auth key table probe failed: {type(exc).__name__}") from exc
         return None
+    row_dict = dict(row or {})
+    if row_dict.get("api_keys_table"):
+        return "api_keys"
+    if row_dict.get("agent_api_keys_table"):
+        return "agent_api_keys"
+    # Probe succeeded and found neither table: genuinely legacy.
+    await _resolve_auth_key_table()  # keep db.agents' cache warm/consistent with what we just observed
     return None
 
 
@@ -147,12 +180,16 @@ async def _sync_new_agent_api_key(
     agent_id: str,
     api_key: str,
     api_key_hash: str,
+    key_table: Optional[str] = None,
 ) -> str:
     """
     Ensure newly registered agent key is available on the active auth path.
     Returns one of: api_keys / agent_api_keys / legacy.
+    `key_table` is passed by register (resolved ONCE, before the agents row was written) so the
+    agents.api_key decision and the key-table insert cannot disagree.
     """
-    key_table = await _resolve_agent_key_table()
+    if key_table is None:
+        key_table = await _resolve_agent_key_table()
 
     if key_table == "api_keys":
         await database.execute(
@@ -395,6 +432,7 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         )
 
     agent_id: Optional[str] = None
+    created_user_id = None
     email = _normalize_email(data.email)
 
     try:
@@ -406,14 +444,19 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
-        
+
+        # Decide WHERE the key will live BEFORE any row is written, so a failed probe leaves nothing
+        # behind (a 503 with an orphaned users row would block the email from ever registering).
+        key_table = await _resolve_agent_key_table(for_write=True)
+
         # 2. Create user account
         password_hash = hash_password(data.password)
         
-        await database.execute(
+        created_user_row = await database.fetch_one(
             """
             INSERT INTO users (email, password_hash, full_name, role, active)
             VALUES (:email, :password_hash, :full_name, :role, :active)
+            RETURNING id
             """,
             {
                 "email": email,
@@ -423,7 +466,8 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 "active": True
             }
         )
-        
+        created_user_id = dict(created_user_row).get("id") if created_user_row else None
+
         # 3. Generate agent_id and API key
         agent_id = f"agent_{secrets.token_hex(8)}"
         api_key_raw = secrets.token_bytes(32)
@@ -433,7 +477,6 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         # The plaintext key is persisted ONLY when no hash key table exists (legacy deployments,
         # where agents.api_key is the auth lookup column). Everywhere else the column gets a
         # redacted per-agent marker and the key lives as a sha256 hash in the key table.
-        key_table = await _resolve_agent_key_table()
         stored_api_key = api_key if key_table is None else redacted_agent_api_key(agent_id)
 
         # 4. Create agent record - aligned with current agents table schema
@@ -477,12 +520,13 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
             agent_id=agent_id,
             api_key=api_key,
             api_key_hash=api_key_hash,
+            key_table=key_table,
         )
-        if key_table is not None and key_sync_source == "legacy":
-            # The key table vanished between the resolve and the insert; the agent would be
-            # unauthenticatable (redacted column + no hash row). Fail the registration rather
-            # than hand out a key that does not work.
-            raise RuntimeError("agent key table unavailable during registration")
+        if (key_table is None) != (key_sync_source == "legacy"):
+            # The two decisions must agree in BOTH directions: redacted column + no hash row is an
+            # agent that can never authenticate; plaintext column + a hash row is the plaintext the
+            # change exists to stop. Fail the registration rather than hand out a key in either state.
+            raise RuntimeError("agent key storage decision diverged during registration")
         await _sync_agent_auth_membership(
             email=email,
             agent_id=agent_id,
@@ -491,7 +535,9 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         )
 
         print(f"✅ Agent created: {agent_id} for {email} (key sync: {key_sync_source})")
-        await notify_agent_registered(
+        # Fire-and-forget: a slow or dead webhook must never delay or fail the registration, and a
+        # client disconnect mid-notify must never cancel the handler after the rows exist.
+        _spawn_registration_notify(
             agent_id=agent_id,
             agent_name=data.agent_name,
             email=email,
@@ -511,6 +557,10 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         
     except HTTPException:
         raise
+    except KeyTableUnresolvedError as e:
+        # Nothing was written yet (the probe runs before the users/agents inserts' key decision);
+        # tell the caller to retry rather than guess where the key should live.
+        raise HTTPException(status_code=503, detail=f"Registration temporarily unavailable: {e}")
     except Exception as e:
         # If any step failed after partial writes, clean up created rows.
         if agent_id:
@@ -523,14 +573,17 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
             except Exception:
                 pass
 
-        try:
-            await database.execute(
-                "DELETE FROM users WHERE email = :email AND role = 'agent'",
-                {"email": email}
-            )
-            print(f"🧹 Cleaned up user account after failure")
-        except:
-            pass
+        # Only the row THIS request created: two concurrent registrations for one email both pass
+        # the existence check, and the loser's cleanup must not delete the winner's user row.
+        if created_user_id:
+            try:
+                await database.execute(
+                    "DELETE FROM users WHERE id = :id AND role = 'agent'",
+                    {"id": created_user_id},
+                )
+                print("🧹 Cleaned up user account after failure")
+            except Exception:
+                pass
         
         import traceback
         print(f"❌ Agent registration error: {str(e)}")

@@ -469,10 +469,14 @@ async def get_recent_activity(
             # Try to resolve from x-api-key header
             api_key = request.headers.get("x-api-key") if request else None
             if api_key:
+                # A presented key that does not resolve is a 401, never "no filter" (the unfiltered
+                # query would hand every agent's activity to the caller).
                 try:
                     resolved_agent_id = await resolve_agent_id_by_api_key(api_key)
                 except Exception:
-                    pass
+                    resolved_agent_id = None
+                if not resolved_agent_id:
+                    raise HTTPException(status_code=401, detail="Invalid API key")
 
         if resolved_agent_id:
             agent_filter = "WHERE agent_id = :agent_id"
@@ -547,6 +551,8 @@ async def get_recent_activity(
             "offset": offset
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error getting recent activity: {e}")
         return {

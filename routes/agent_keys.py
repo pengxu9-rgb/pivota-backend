@@ -10,6 +10,7 @@ import hashlib
 from pydantic import BaseModel
 
 from db.database import database
+from db.agents import is_redacted_agent_api_key
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/agents", tags=["agent-keys"])
@@ -123,7 +124,9 @@ async def get_agent_api_keys(
                 """,
                 {"agent_or_email": agent_id}
             )
-            if legacy and legacy["api_key"]:
+            # A redacted marker is not a key: never display it and NEVER hash it into api_keys (that
+            # would mint `redacted:<agent_id>` — a public string — as a live credential).
+            if legacy and legacy["api_key"] and not is_redacted_agent_api_key(legacy["api_key"]):
                 legacy_dict = dict(legacy)
                 legacy_hash = legacy_dict.get("api_key_hash") or hashlib.sha256(legacy_dict["api_key"].encode("utf-8")).hexdigest()
                 try:

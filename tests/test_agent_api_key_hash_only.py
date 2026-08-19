@@ -40,19 +40,25 @@ def _register_body():
 class _FakeDb:
     """Records every execute(); answers fetch_one by query shape."""
 
-    def __init__(self, *, key_table: str | None):
+    def __init__(self, *, key_table: str | None, probe_error: bool = False):
         self.key_table = key_table
+        self.probe_error = probe_error
         self.executed: list[tuple[str, dict]] = []
 
     async def fetch_one(self, query, values=None):
         q = " ".join(str(query).split())
         if "to_regclass('public.api_keys')" in q:
+            if self.probe_error:
+                raise RuntimeError("connection reset during probe")
             return {
                 "api_keys_table": "api_keys" if self.key_table == "api_keys" else None,
                 "agent_api_keys_table": "agent_api_keys" if self.key_table == "agent_api_keys" else None,
             }
         if q.startswith("SELECT id FROM users"):
             return None  # not registered yet
+        if q.startswith("INSERT INTO users"):
+            self.executed.append((q, dict(values or {})))
+            return {"id": 77}
         return None
 
     async def execute(self, query, values=None):
@@ -61,8 +67,14 @@ class _FakeDb:
 
 
 def _install_fake_db(monkeypatch, module, fake):
+    import db.agents as agents_db
+
     monkeypatch.setattr(module.database, "fetch_one", fake.fetch_one)
     monkeypatch.setattr(module.database, "execute", fake.execute)
+    # The key-table resolver is Postgres-gated and env-gated; pin both so the probe runs.
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", True)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_CACHE", {"table": None, "expires_at": 0.0})
 
     async def _no_membership(**_kwargs):
         return None
@@ -131,6 +143,145 @@ def test_register_fails_closed_if_key_table_disappears_mid_flight(monkeypatch):
     assert any(q.startswith("DELETE FROM agents") for q, _ in fake.executed)
 
 
+def test_register_probe_error_is_503_and_writes_nothing(monkeypatch):
+    """A transient probe failure must not GUESS where the key lives (plaintext vs hash) — and must
+    leave no orphan users row that would block the email from ever registering."""
+    client, module = _account_client(monkeypatch)
+    fake = _FakeDb(key_table="api_keys", probe_error=True)
+    _install_fake_db(monkeypatch, module, fake)
+
+    resp = client.post("/agent/account/register", json=_register_body())
+
+    assert resp.status_code == 503, resp.text
+    assert fake.executed == []
+
+
+def test_register_honours_AGENT_AUTH_KEY_TABLE_rollback_lever(monkeypatch):
+    """legacy_only ⇒ the auth path reads agents.api_key ⇒ the plaintext must be written there, even
+    though the api_keys table physically exists."""
+    client, module = _account_client(monkeypatch)
+    import db.agents as agents_db
+
+    fake = _FakeDb(key_table="api_keys")
+    _install_fake_db(monkeypatch, module, fake)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "legacy_only")
+
+    resp = client.post("/agent/account/register", json=_register_body())
+
+    assert resp.status_code == 200, resp.text
+    api_key = resp.json()["api_key"]
+    agents_insert = [v for q, v in fake.executed if q.startswith("INSERT INTO agents")]
+    assert agents_insert[0]["api_key"] == api_key
+    assert not any(q.startswith("INSERT INTO api_keys") for q, _ in fake.executed)
+
+
+def test_register_cleanup_deletes_only_the_user_row_it_created(monkeypatch):
+    client, module = _account_client(monkeypatch)
+    fake = _FakeDb(key_table="api_keys")
+    _install_fake_db(monkeypatch, module, fake)
+
+    async def boom(**_kwargs):
+        raise RuntimeError("key table write failed")
+
+    monkeypatch.setattr(module, "_sync_new_agent_api_key", boom)
+    resp = client.post("/agent/account/register", json=_register_body())
+    assert resp.status_code == 500
+    deletes = [(q, v) for q, v in fake.executed if q.startswith("DELETE FROM users")]
+    assert len(deletes) == 1
+    assert "WHERE id = :id" in deletes[0][0] and deletes[0][1]["id"] == 77
+    assert "email" not in deletes[0][1]
+
+
+# ── 1b. the redaction marker is never a credential ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_redacted_marker_is_refused_as_a_presented_key_without_touching_the_db(monkeypatch):
+    import db.agents as agents_db
+
+    async def forbidden(*_a, **_k):
+        raise AssertionError("no DB lookup may run for a redacted marker")
+
+    monkeypatch.setattr(agents_db.database, "fetch_one", forbidden)
+    metrics = {}
+    assert await agents_db.get_agent_by_key("redacted:agent_abc", metrics) is None
+    assert metrics["auth_source"] == "redacted_marker_refused"
+    assert await agents_db.resolve_agent_id_by_api_key("redacted:agent_abc") is None
+
+
+def test_legacy_plaintext_lookups_exclude_the_marker_at_the_sql_level():
+    import db.agents as agents_db
+
+    assert "api_key NOT LIKE 'redacted:%'" in agents_db._LEGACY_API_KEY_LOOKUP_SQL
+    import inspect
+
+    src = inspect.getsource(agents_db.get_agent_by_key)
+    assert "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1" not in src
+    assert src.count("_LEGACY_API_KEY_LOOKUP_SQL") == 2
+
+
+def test_api_keys_legacy_branch_never_hashes_the_marker(monkeypatch):
+    """routes/agent_keys.py surfaces agents.api_key when no api_keys rows exist — and used to hash it
+    into api_keys. For a redacted row that would mint `redacted:<agent_id>` as a live credential."""
+    import routes.agent_keys as keys_module
+    from utils.auth import get_current_user
+
+    executed = []
+
+    async def fetch_all(query, values=None):
+        return []
+
+    async def fetch_one(query, values=None):
+        q = " ".join(str(query).split())
+        if "FROM agents" in q:
+            return {"agent_id": "agent_r", "agent_name": "R", "owner_email": "r@x.io", "api_key": "redacted:agent_r", "api_key_hash": None, "created_at": None}
+        return None
+
+    async def execute(query, values=None):
+        executed.append((" ".join(str(query).split()), dict(values or {})))
+
+    monkeypatch.setattr(keys_module.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(keys_module.database, "fetch_one", fetch_one)
+    monkeypatch.setattr(keys_module.database, "execute", execute)
+    app = FastAPI()
+    app.include_router(keys_module.router)
+    app.dependency_overrides[get_current_user] = lambda: {"agent_id": "agent_r", "role": "agent"}
+    resp = TestClient(app).get("/agents/agent_r/api-keys")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["keys"] == []
+    assert not any(q.startswith("INSERT INTO api_keys") for q, _ in executed)
+    assert "redacted" not in resp.text
+
+
+# ── 1c. metrics endpoints fail CLOSED on an unresolvable key ─────────────────
+
+def test_recent_activity_endpoints_401_on_an_unresolvable_key_instead_of_dumping_everyone(monkeypatch):
+    import db.agents as agents_db
+    import routes.agent_metrics as metrics
+    import routes.agent_metrics_v1 as metrics_v1
+
+    async def no_agent(_key):
+        return None
+
+    async def fetch_all(query, values=None):
+        raise AssertionError(f"the activity query must not run: {' '.join(str(query).split())[:80]}")
+
+    monkeypatch.setattr(agents_db, "get_agent_by_key", lambda k, metrics_out=None: _none())
+    monkeypatch.setattr(metrics.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(metrics_v1.database, "fetch_all", fetch_all)
+    app = FastAPI()
+    app.include_router(metrics.router)
+    app.include_router(metrics_v1.router)
+    client = TestClient(app)
+    r1 = client.get("/agent/metrics/recent", headers={"x-api-key": "ak_live_" + "9" * 64})
+    r2 = client.get("/agent/v1/metrics/recent", headers={"x-api-key": "ak_live_" + "9" * 64})
+    assert r1.status_code == 401, r1.text
+    assert r2.status_code == 401, r2.text
+
+
+async def _none():
+    return None
+
+
 # ── 2. login ──────────────────────────────────────────────────────────────────
 
 def _login_setup(monkeypatch, module, *, stored_api_key: str):
@@ -168,6 +319,10 @@ def _login_setup(monkeypatch, module, *, stored_api_key: str):
 
     monkeypatch.setattr(module.database, "fetch_one", fetch_one)
     monkeypatch.setattr(module.database, "execute", execute)
+    import db.agents as agents_db
+
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", True)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
 
     async def _no_membership(**_kwargs):
         return None

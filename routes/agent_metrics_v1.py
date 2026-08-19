@@ -2,10 +2,11 @@
 Agent Metrics aliases under /agent/v1/metrics for external agents and portals
 These mirror /agent/metrics endpoints and support x-api-key-based filtering.
 """
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from db.database import database
+from db.agents import resolve_agent_id_by_api_key
 
 router = APIRouter(prefix="/agent/v1/metrics", tags=["Agent Metrics V1"])
 
@@ -119,15 +120,14 @@ async def get_recent_activity_v1(
         if not resolved_agent_id and request:
             api_key = request.headers.get("x-api-key")
             if api_key:
+                # A presented key that does not resolve is a 401, never "no filter": the unfiltered
+                # query below would return every agent's activity to an unauthenticated caller.
                 try:
-                    row = await database.fetch_one(
-                        "SELECT agent_id FROM agents WHERE api_key = :k LIMIT 1",
-                        {"k": api_key}
-                    )
-                    if row:
-                        resolved_agent_id = row["agent_id"]
+                    resolved_agent_id = await resolve_agent_id_by_api_key(api_key)
                 except Exception:
-                    pass
+                    resolved_agent_id = None
+                if not resolved_agent_id:
+                    raise HTTPException(status_code=401, detail="Invalid API key")
 
         if resolved_agent_id:
             agent_filter = "WHERE agent_id = :agent_id"
@@ -159,6 +159,8 @@ async def get_recent_activity_v1(
         ]
 
         return {"status": "success", "activities": formatted, "count": len(formatted), "limit": limit, "offset": offset}
+    except HTTPException:
+        raise
     except Exception as e:
         return {"status": "success", "activities": [], "count": 0, "note": str(e)}
 
