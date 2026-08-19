@@ -36,3 +36,41 @@ REGIONAL (HA) + 2 GB standard_ha Redis, deletion protection on.
   (`config/platform.py`, PR #1771) fails closed and `require_platform_env()` kills boot without it.
 - `DATABASE_URL` / `REDIS_URL` mounted from Secret Manager.
 - min-instances ≥ 1 for anything holding a DB pool (cold start + pool repair = the wedge).
+
+## Runbook: backend `web` to Cloud Run (what actually ran on 2026-08-19)
+
+```bash
+export GCLOUD=~/google-cloud-sdk/bin/gcloud PATH=~/google-cloud-sdk/bin:$PATH
+
+# 1. build + push image (Cloud Build in pivota-shared; ~2 min)
+gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
+  --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+
+# 2. port Railway env -> env.<env>.yaml + Secret Manager env-* (run from a dir linked to the Railway project)
+#    write infra/gcp/env.<env>.overrides.yaml first (see env.overrides.example.yaml)
+python3 infra/gcp/port_railway_env.py --railway-service web --railway-env production --env staging --apply
+
+# 3. seed the database from prod (empty DB boot is broken: concurrent CREATE TABLE IF NOT EXISTS race)
+gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
+  --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ)
+infra/gcp/restore_to_cloudsql.sh staging gs://pivota-staging-migration/prod-<stamp>.sql.gz --wipe
+
+# 4. deploy
+infra/gcp/deploy_backend.sh staging $(git rev-parse HEAD)
+```
+
+### Staging secret policy
+`env.staging.overrides.yaml` (git-ignored, chmod 600) rotates every **internal** shared secret to a
+fresh random value (`JWT_SECRET_KEY`, `SHOP_GATEWAY_AGENT_API_KEY`, `*_INTERNAL_KEY`, `CHECKOUT_*`,
+`ADMIN_API_KEY`, `METRICS_BEARER_TOKEN`, …) so a token minted on the public staging URL is never
+valid in prod. **The staging gateway / proof-issuer / acp must be given the same staging values**
+(read them from Secret Manager `env-<NAME>` in pivota-staging — never copy from Railway prod).
+Data-bound secrets (`CONNECTOR_CREDENTIALS_KEY`, `REVIEWS_*_SIGNING_SECRET`) are kept so a restored
+prod dump stays readable. Third-party LIVE credentials (Stripe, SendGrid, Shopify, Adyen, AWS, …) are
+still prod values in staging until test-mode keys are put in the overrides file — side-effect flags
+(`REVIEWS_INVITATION_WORKER_ENABLED`, `AGENT_ACP_ALLOW_LIVE_CAPTURE`, `ALLOW_SHAKEOUT_ON_PROD`) are off.
+
+### One-time project plumbing that bootstrap_env.sh does NOT do (done by hand 2026-08-19)
+- `pivota-shared`: compute default SA → `roles/cloudbuild.builds.builder` + AR writer (Cloud Build runs as it)
+- `pivota-staging`: compute default SA → builder + `secretmanager.secretAccessor` + `storage.objectAdmin`
+  (for the dump job); bucket `gs://pivota-staging-migration`; secret `railway-prod-db-url`
