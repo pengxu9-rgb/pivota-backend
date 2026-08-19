@@ -22,12 +22,15 @@ SECRETS_FILE="$HERE/secrets.$ENV.list"
 # Secret Manager mappings: DATABASE_URL/REDIS_URL from bootstrap + every env-* secret
 SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,$(paste -sd, "$SECRETS_FILE")"
 
+# gcloud allows only ONE env-vars flag: merge the ported file with the platform vars into a temp file
+MERGED=$(mktemp); trap 'rm -f "$MERGED"' EXIT
+{ cat "$ENV_FILE"; printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\nPIVOTA_PLATFORM: "cloud_run"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"; } > "$MERGED"
+
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "sa-backend@$PROJECT.iam.gserviceaccount.com" \
   --network default --subnet default --vpc-egress private-ranges-only \
-  --env-vars-file "$ENV_FILE" \
-  --update-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=$SERVICE,PIVOTA_COMMIT_SHA=$TAG,PIVOTA_PLATFORM=cloud_run" \
+  --env-vars-file "$MERGED" \
   --set-secrets "$SECRETS" \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
   --min-instances "$MIN" --max-instances "$MAX" \
