@@ -503,6 +503,39 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
         return None
 
 
+# Redacted value written to agents.api_key for agents whose key lives only as a hash in a key
+# table. The column is NOT NULL UNIQUE and several legacy readers still select it, so it must
+# hold a per-agent, non-secret, recognisable string rather than NULL or the plaintext key.
+AGENT_API_KEY_REDACTED_PREFIX = "redacted:"
+
+
+def redacted_agent_api_key(agent_id: str) -> str:
+    return f"{AGENT_API_KEY_REDACTED_PREFIX}{agent_id}"
+
+
+def is_redacted_agent_api_key(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(AGENT_API_KEY_REDACTED_PREFIX)
+
+
+async def resolve_agent_id_by_api_key(api_key: str) -> Optional[str]:
+    """agent_id for an X-API-Key value, or None.
+
+    Routes that only need the caller's agent_id used to run
+    `SELECT agent_id FROM agents WHERE api_key = :key`, which matches the plaintext column
+    only. Keys are now persisted hash-only (agents.api_key holds a redacted marker), so every
+    resolver must go through get_agent_by_key: hash table first, legacy plaintext fallback
+    second, and the same auth cache.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        return None
+    agent = await get_agent_by_key(key)
+    if not agent:
+        return None
+    agent_id = agent.get("agent_id")
+    return str(agent_id) if agent_id else None
+
+
 async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
     """获取 Agent 信息（不含 API Key）"""
     try:

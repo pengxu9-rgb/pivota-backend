@@ -12,8 +12,10 @@ import secrets
 import hashlib
 import time
 
+from db.agents import is_redacted_agent_api_key, redacted_agent_api_key
 from db.auth_identity import upsert_membership
 from db.database import database
+from services.agent_registration_notify import notify_agent_registered
 from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
@@ -364,7 +366,10 @@ class AgentLoginResponse(BaseModel):
     success: bool
     token: str
     agent: AgentInfo
-    api_key: str
+    # Always None: the API key is shown once at registration / key creation and is persisted
+    # hash-only, so login has nothing to return. Kept in the model so older portal builds that
+    # read `api_key` see a missing key (and fall back to /api-keys), not a schema error.
+    api_key: Optional[str] = None
 
 # ============================================================================
 # Endpoints
@@ -424,7 +429,13 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         api_key_raw = secrets.token_bytes(32)
         api_key = f"ak_live_{api_key_raw.hex()}"
         api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-        
+
+        # The plaintext key is persisted ONLY when no hash key table exists (legacy deployments,
+        # where agents.api_key is the auth lookup column). Everywhere else the column gets a
+        # redacted per-agent marker and the key lives as a sha256 hash in the key table.
+        key_table = await _resolve_agent_key_table()
+        stored_api_key = api_key if key_table is None else redacted_agent_api_key(agent_id)
+
         # 4. Create agent record - aligned with current agents table schema
         await database.execute(
             """
@@ -456,7 +467,7 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 "agent_name": data.agent_name,
                 "owner_email": email,
                 "description": data.description or "",
-                "api_key": api_key,
+                "api_key": stored_api_key,
                 "api_key_hash": api_key_hash,
             }
         )
@@ -467,6 +478,11 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
             api_key=api_key,
             api_key_hash=api_key_hash,
         )
+        if key_table is not None and key_sync_source == "legacy":
+            # The key table vanished between the resolve and the insert; the agent would be
+            # unauthenticatable (redacted column + no hash row). Fail the registration rather
+            # than hand out a key that does not work.
+            raise RuntimeError("agent key table unavailable during registration")
         await _sync_agent_auth_membership(
             email=email,
             agent_id=agent_id,
@@ -475,7 +491,15 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         )
 
         print(f"✅ Agent created: {agent_id} for {email} (key sync: {key_sync_source})")
-        
+        await notify_agent_registered(
+            agent_id=agent_id,
+            agent_name=data.agent_name,
+            email=email,
+            company=data.company,
+            client_ip=client_ip,
+            key_sync_source=key_sync_source,
+        )
+
         return {
             "success": True,
             "message": "Agent account created successfully",
@@ -557,15 +581,18 @@ async def login_agent(data: AgentLoginRequest):
         # databases.Record → plain dict for safe .get() usage
         agent_dict = dict(agent)
 
-        if not agent_dict.get("api_key"):
-            raise HTTPException(status_code=403, detail="Agent API key is unavailable")
-
-        api_key_hash = hashlib.sha256(agent_dict["api_key"].encode("utf-8")).hexdigest()
-        await _ensure_agent_api_key_on_auth_path(
-            agent_id=agent_dict["agent_id"],
-            api_key=agent_dict["api_key"],
-            api_key_hash=api_key_hash,
-        )
+        # Legacy rows still carry the plaintext key in agents.api_key; make sure it is present on
+        # the hash auth path so the portal's /agent/v1 calls keep working. Rows written after the
+        # hash-only change hold a redacted marker and already have their hash row, so there is
+        # nothing to backfill — and nothing to return.
+        legacy_plaintext_key = agent_dict.get("api_key")
+        if legacy_plaintext_key and not is_redacted_agent_api_key(legacy_plaintext_key):
+            api_key_hash = hashlib.sha256(legacy_plaintext_key.encode("utf-8")).hexdigest()
+            await _ensure_agent_api_key_on_auth_path(
+                agent_id=agent_dict["agent_id"],
+                api_key=legacy_plaintext_key,
+                api_key_hash=api_key_hash,
+            )
 
         # 4. Update last login
         await database.execute(
@@ -625,7 +652,7 @@ async def login_agent(data: AgentLoginRequest):
                 "status": "active",
                 "agent_type": agent_dict.get("agent_type") or "basic",
             },
-            api_key=agent_dict["api_key"]
+            api_key=None,
         )
         
     except HTTPException:

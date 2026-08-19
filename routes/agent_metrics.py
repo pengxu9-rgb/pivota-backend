@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from db.database import database
+from db.agents import resolve_agent_id_by_api_key
 from utils.auth import require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
@@ -41,12 +42,7 @@ async def get_metrics_summary(
             except:
                 pass
         if not agent_id and x_api_key:
-            agent_row = await database.fetch_one(
-                "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
-                {"key": x_api_key}
-            )
-            if agent_row:
-                agent_id = agent_row["agent_id"]
+            agent_id = await resolve_agent_id_by_api_key(x_api_key)
         if not agent_id and not employee_context:
             raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
 
@@ -255,12 +251,7 @@ async def get_recent_activity(
             except:
                 pass
         if not agent_id and x_api_key:
-            agent_row = await database.fetch_one(
-                "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
-                {"key": x_api_key}
-            )
-            if agent_row:
-                agent_id = agent_row["agent_id"]
+            agent_id = await resolve_agent_id_by_api_key(x_api_key)
         if not agent_id:
             raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
         rows = await database.fetch_all(
@@ -368,12 +359,7 @@ async def get_metrics_timeline(
             except:
                 pass
         if not agent_id and x_api_key:
-            agent_row = await database.fetch_one(
-                "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
-                {"key": x_api_key}
-            )
-            if agent_row:
-                agent_id = agent_row["agent_id"]
+            agent_id = await resolve_agent_id_by_api_key(x_api_key)
         
         if not agent_id:
             raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
@@ -484,12 +470,7 @@ async def get_recent_activity(
             api_key = request.headers.get("x-api-key") if request else None
             if api_key:
                 try:
-                    row = await database.fetch_one(
-                        "SELECT agent_id FROM agents WHERE api_key = :k LIMIT 1",
-                        {"k": api_key}
-                    )
-                    if row:
-                        resolved_agent_id = row["agent_id"]
+                    resolved_agent_id = await resolve_agent_id_by_api_key(api_key)
                 except Exception:
                     pass
 
