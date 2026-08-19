@@ -22,6 +22,11 @@ os.environ.setdefault("DB_POOL_MAX_SIZE", "2")
 if os.getenv("DATABASE_PUBLIC_URL"):
     os.environ["DATABASE_URL"] = os.getenv("DATABASE_PUBLIC_URL", "")
 
+from config.platform import (  # noqa: E402
+    platform_metadata,
+    raw_environment_label,
+    service_name,
+)
 from db.database import IS_POSTGRES, database  # noqa: E402
 
 
@@ -312,10 +317,18 @@ async def _drive(args: argparse.Namespace) -> None:
         result = {
             "ok": True,
             "mode": "read_only",
+            # Key kept as "railway" so already-archived inventory JSON stays
+            # comparable, but the VALUES now resolve through config.platform.
+            # Read directly, these two were RAILWAY_SERVICE_NAME /
+            # RAILWAY_ENVIRONMENT_NAME — both null on Cloud Run, so every
+            # post-cutover audit artefact would have recorded "which host and
+            # environment produced this" as null and nobody would have noticed
+            # until they needed it.
             "railway": {
-                "service": os.getenv("RAILWAY_SERVICE_NAME"),
-                "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME"),
+                "service": service_name(),
+                "environment": raw_environment_label(),
             },
+            "platform": platform_metadata(),
             "match_terms": terms,
             "known_legacy_merchant_ids": sorted(known_ids),
             "candidate_count": len(merchants),

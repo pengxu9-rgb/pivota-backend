@@ -20,6 +20,7 @@ from config.platform import (
     git_branch,
     platform_metadata,
     raw_environment_label,
+    require_platform_env,
     service_id,
 )
 
@@ -28,6 +29,20 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from routes.reviews_proof_issuer import router as reviews_proof_issuer_router
+
+# FAIL AT BOOT, not per-request — the same assertion main.py makes in its
+# lifespan. This is a SECOND FastAPI service deployed from this repo, so it
+# gets the guarantee independently: config.platform fails CLOSED to
+# "production" when it cannot resolve the environment on a managed host, and a
+# service that came up on that guess is a service whose every prod/staging
+# guard was decided by a guess. On Cloud Run without PIVOTA_ENV this raises
+# instead. Local dev and tests (no K_SERVICE, no Railway deployment marker)
+# resolve to "development" and pass straight through.
+#
+# It runs at import time rather than in a lifespan hook deliberately: this
+# module has no lifespan, and a misconfigured revision should die before the
+# ASGI server binds a port and starts passing health checks.
+_RESOLVED_ENV = require_platform_env()
 
 app = FastAPI(
     title="Reviews Proof Issuer",

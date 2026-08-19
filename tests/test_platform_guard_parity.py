@@ -655,9 +655,11 @@ def _init_sentry_capturing(monkeypatch):
     import config.sentry_config as sentry_config
 
     captured: dict = {}
+    tags: dict = {}
 
     fake_sdk = types.ModuleType("sentry_sdk")
     fake_sdk.init = lambda **kwargs: captured.update(kwargs)  # type: ignore[attr-defined]
+    fake_sdk.set_tag = lambda k, v: tags.__setitem__(k, v)  # type: ignore[attr-defined]
 
     fake_fastapi = types.ModuleType("sentry_sdk.integrations.fastapi")
     fake_fastapi.FastApiIntegration = lambda *a, **k: object()  # type: ignore[attr-defined]
@@ -671,6 +673,7 @@ def _init_sentry_capturing(monkeypatch):
     monkeypatch.setenv("SENTRY_DSN", "https://public@example.invalid/1")
 
     assert sentry_config.init_sentry() is True
+    captured["_tags"] = tags
     return captured
 
 
@@ -691,19 +694,42 @@ def test_sentry_environment_is_staging_on_staging(monkeypatch, staging_shape):
     assert captured["environment"] == "staging"
 
 
-def test_sentry_release_resolves_on_cloud_run(monkeypatch):
+def test_sentry_release_is_the_commit_sha_on_cloud_run(monkeypatch):
+    """release MUST be a git sha, never K_REVISION.
+
+    deployment_id() resolves to K_REVISION on Cloud Run ("web-00042-abc").
+    Sentry cannot map that to a commit, so suspect-commits and regression
+    detection break after cutover — silently, since Sentry accepts any string
+    as a release. The revision is still published, as a TAG.
+    """
+    monkeypatch.setenv("K_SERVICE", "pivota-backend")
+    monkeypatch.setenv("K_REVISION", "pivota-backend-00042-abc")
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("PIVOTA_COMMIT_SHA", "c" * 40)
+    captured = _init_sentry_capturing(monkeypatch)
+    assert captured["release"] == "c" * 40
+    assert captured["_tags"]["deployment_id"] == "pivota-backend-00042-abc"
+    assert captured["_tags"]["platform"] == "cloud_run"
+
+
+def test_sentry_release_is_the_commit_sha_on_railway(monkeypatch):
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "dep-abc-123")
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "d" * 40)
+    captured = _init_sentry_capturing(monkeypatch)
+    assert captured["release"] == "d" * 40
+    assert captured["_tags"]["deployment_id"] == "dep-abc-123"
+    assert captured["_tags"]["platform"] == "railway"
+
+
+def test_sentry_release_falls_back_to_the_deployment_id(monkeypatch):
+    """A revision deployed without any commit sha still gets SOME release
+    rather than None — but the fallback must not be mistaken for the fix."""
     monkeypatch.setenv("K_SERVICE", "pivota-backend")
     monkeypatch.setenv("K_REVISION", "pivota-backend-00042-abc")
     monkeypatch.setenv("PIVOTA_ENV", "production")
     captured = _init_sentry_capturing(monkeypatch)
     assert captured["release"] == "pivota-backend-00042-abc"
-
-
-def test_sentry_release_is_unchanged_on_railway(monkeypatch):
-    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
-    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "dep-abc-123")
-    captured = _init_sentry_capturing(monkeypatch)
-    assert captured["release"] == "dep-abc-123"
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +812,64 @@ def test_app_refuses_to_boot_on_an_unresolved_managed_platform(monkeypatch):
     with pytest.raises(RuntimeError, match="PIVOTA_ENV"):
         with TestClient(app):
             pass
+
+
+def _import_in_a_clean_process(module: str, extra_env: dict):
+    """Import `module` in a fresh interpreter with a scrubbed environment."""
+    import os
+
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_"))
+        and k not in ("ENVIRONMENT", "APP_ENV")
+    }
+    env.update(
+        {
+            "DATABASE_URL": "postgresql://u:p@db.invalid:5432/pivota",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+def test_proof_issuer_refuses_to_boot_on_an_unresolved_managed_platform():
+    """The SECOND FastAPI service in this repo needs the assertion too.
+
+    main.py had the only require_platform_env() call site, via its lifespan.
+    proof_issuer_main.py is deployed separately from the same repo and had
+    none — so on Cloud Run without PIVOTA_ENV it came up happily with every
+    guard resolved by the fail-closed guess. It now asserts at import time,
+    before the ASGI server can bind a port and start passing health checks.
+    """
+    result = _import_in_a_clean_process("proof_issuer_main", {"K_SERVICE": "proof-issuer"})
+    assert result.returncode != 0, (
+        "the proof issuer booted on an unresolvable managed host: "
+        f"{result.stdout[-2000:]}"
+    )
+    assert "PIVOTA_ENV" in result.stderr
+
+
+def test_proof_issuer_boots_when_the_environment_is_declared():
+    """The mutant this kills: raising unconditionally, which would brick the
+    service on every platform including the one it runs on today."""
+    result = _import_in_a_clean_process(
+        "proof_issuer_main", {"K_SERVICE": "proof-issuer", "PIVOTA_ENV": "production"}
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_proof_issuer_boots_locally():
+    result = _import_in_a_clean_process("proof_issuer_main", {})
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 # ---------------------------------------------------------------------------

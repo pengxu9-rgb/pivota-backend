@@ -5,7 +5,7 @@ Optional - only initialized if SENTRY_DSN is set in environment
 import os
 import logging
 
-from config.platform import deployment_id, platform_env
+from config.platform import commit_sha, deployment_id, platform_env, platform_name
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +45,31 @@ def init_sentry():
             # Additional context
             send_default_pii=False,  # Don't send user data by default
             
-            # Release tracking
-            release=deployment_id() or os.getenv("VERCEL_GIT_COMMIT_SHA"),
+            # Release tracking.
+            #
+            # MUST be the commit sha, not the deployment id. On Railway
+            # RAILWAY_DEPLOYMENT_ID was an opaque uuid, so suspect-commits and
+            # regression detection never worked well; on Cloud Run
+            # deployment_id() resolves to K_REVISION ("web-00042-abc"), which
+            # Sentry cannot map to a commit at all. commit_sha() reads
+            # PIVOTA_COMMIT_SHA / RAILWAY_GIT_COMMIT_SHA / COMMIT_SHA /
+            # SOURCE_VERSION, so it is a real sha on both platforms — provided
+            # the Cloud Run deploy bakes PIVOTA_COMMIT_SHA in, which is already
+            # required for /version.
+            release=commit_sha() or deployment_id(),
             
             # Before send hook (filter sensitive data)
             before_send=filter_sensitive_data,
         )
+
+        # The rollout identity is still worth having — it is just a TAG, not
+        # the release. On Cloud Run this is the revision name, which is how ops
+        # correlates an error back to a specific rollout.
+        try:
+            sentry_sdk.set_tag("deployment_id", deployment_id() or "unknown")
+            sentry_sdk.set_tag("platform", platform_name())
+        except Exception:  # pragma: no cover - tagging must never break init
+            logger.debug("Sentry deployment tags could not be set", exc_info=True)
         
         logger.info("✅ Sentry error tracking initialized")
         logger.info(f"   Environment: {os.getenv('ENVIRONMENT') or platform_env()}")
