@@ -122,7 +122,19 @@ async def register_identity_issuer(
             detail={"error": "JWKS_UNREACHABLE", "field": exc.field, "message": str(exc)},
         )
 
-    row = await store.upsert_issuer(agent_id, reg, jwks_ok=True)
+    try:
+        row = await store.upsert_issuer(agent_id, reg, jwks_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        # The partial unique index is the real guard against two agents racing for one issuer
+        # (the find_active_owner check above is a pre-check, not a lock). Map the violation to the
+        # same 409 the pre-check answers, never a 500.
+        msg = str(exc).lower()
+        if "unique" in msg or "duplicate" in msg or "agent_identity_issuers_active_issuer_uidx" in msg:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "ISSUER_ALREADY_REGISTERED", "message": "This issuer is already registered to another agent. Contact support if you own it."},
+            )
+        raise
     return {"status": "success", "issuer": _public(row)}
 
 

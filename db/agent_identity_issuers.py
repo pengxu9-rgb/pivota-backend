@@ -16,9 +16,12 @@ Consumers:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import os
 import re
+import socket
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -33,6 +36,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_ALG_PATTERN = re.compile(r"^(?:RS|PS|ES)\d{3}$|^EdDSA$")
 DEFAULT_ALGS = ["RS256", "ES256"]
 JWKS_FETCH_TIMEOUT_SECONDS = 5.0
+JWKS_OPAQUE_FAILURE = "JWKS could not be fetched as a usable key set (https, 2xx, {keys:[…]} with an RSA/EC/OKP key)"
 ASYMMETRIC_KTYS = {"RSA", "EC", "OKP"}
 
 
@@ -42,6 +46,78 @@ class IssuerValidationError(ValueError):
     def __init__(self, field: str, message: str):
         super().__init__(message)
         self.field = field
+
+
+def _env_list(name: str) -> List[str]:
+    raw = (os.getenv(name) or "").strip()
+    return [p.strip() for p in raw.split(",") if p.strip()] if raw else []
+
+
+def reserved_issuers() -> set:
+    """Issuer strings NO agent may register: the platform's own identity issuers.
+
+    An agent registering one of these with its own JWKS would be claiming to mint tokens for an
+    issuer the platform already trusts elsewhere. Sources: the global agent-user issuer(s)
+    (AGENT_USER_JWT_ISSUERS / AGENT_USER_JWT_ISSUER), Pivota's own OAuth AS (MCP_OAUTH_AS_ISSUER),
+    and an ops-maintained list (AGENT_IDENTITY_RESERVED_ISSUERS) for gateway-side issuers this
+    service cannot see (IDENTITY_ISSUERS_JSON / MCP_OAUTH_ISSUERS_JSON live on the gateway).
+    Compared case-insensitively with trailing slashes stripped.
+    """
+    out = set()
+    for name in ("AGENT_USER_JWT_ISSUERS", "AGENT_USER_JWT_ISSUER", "AGENT_IDENTITY_RESERVED_ISSUERS"):
+        for v in _env_list(name):
+            out.add(_issuer_key(v))
+    own = (os.getenv("MCP_OAUTH_AS_ISSUER") or "").strip()
+    if own:
+        out.add(_issuer_key(own))
+    return out
+
+
+def _issuer_key(value: str) -> str:
+    return str(value or "").strip().rstrip("/").lower()
+
+
+def is_reserved_issuer(issuer: str) -> bool:
+    return _issuer_key(issuer) in reserved_issuers()
+
+
+def is_global_issuer(issuer: str) -> bool:
+    """True when the GLOBAL env verifier owns this issuer — it must be verified there, never via a binding."""
+    key = _issuer_key(issuer)
+    for name in ("AGENT_USER_JWT_ISSUERS", "AGENT_USER_JWT_ISSUER"):
+        if any(_issuer_key(v) == key for v in _env_list(name)):
+            return True
+    return False
+
+
+def _is_public_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    # `is_global` is the authoritative check (covers CGNAT 100.64/10, which is_private misses);
+    # the explicit flags are belt-and-braces for older Python semantics.
+    if not getattr(addr, "is_global", True):
+        return False
+    return not (
+        addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast
+        or addr.is_reserved or addr.is_unspecified or getattr(addr, "is_site_local", False)
+    )
+
+
+def host_resolves_public_only(host: str) -> bool:
+    """Every address the host resolves to must be globally routable (SSRF: no RFC1918/CGNAT/link-local)."""
+    try:
+        literal = ipaddress.ip_address(host)
+        return _is_public_ip(str(literal))
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except Exception:  # noqa: BLE001
+        return False
+    addrs = {info[4][0] for info in infos if info and info[4]}
+    return bool(addrs) and all(_is_public_ip(a) for a in addrs)
 
 
 _DDL_STATEMENTS = [
@@ -59,6 +135,9 @@ _DDL_STATEMENTS = [
         last_jwks_ok_at  TIMESTAMPTZ NULL,
         created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT agent_identity_issuers_status_check CHECK (status IN ('active', 'disabled')),
+        CONSTRAINT agent_identity_issuers_issuer_no_pipe CHECK (position('|' in issuer) = 0),
+        CONSTRAINT agent_identity_issuers_jwks_https CHECK (jwks_uri LIKE 'https://%'),
         CONSTRAINT agent_identity_issuers_agent_issuer_unique UNIQUE (agent_id, issuer)
     )
     """,
@@ -130,13 +209,20 @@ def normalize_registration(body: Dict[str, Any]) -> IssuerRegistration:
     if any(ch.isspace() for ch in issuer):
         raise IssuerValidationError("issuer", "issuer must not contain whitespace")
 
+    if is_reserved_issuer(issuer):
+        raise IssuerValidationError("issuer", "this issuer is reserved by the platform and cannot be registered")
+
     jwks_uri = _clean_str(body.get("jwks_uri"), "jwks_uri", required=True)
     parsed = urlparse(jwks_uri)
     if parsed.scheme != "https" or not parsed.netloc:
         raise IssuerValidationError("jwks_uri", "jwks_uri must be an https URL")
     host = (parsed.hostname or "").lower()
-    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local") or host.endswith(".internal"):
+    if parsed.username or parsed.password:
+        raise IssuerValidationError("jwks_uri", "jwks_uri must not carry credentials")
+    if host in {"localhost", "::1"} or host.endswith(".local") or host.endswith(".internal") or host.endswith(".localhost"):
         raise IssuerValidationError("jwks_uri", "jwks_uri must be publicly reachable")
+    if not host_resolves_public_only(host):
+        raise IssuerValidationError("jwks_uri", "jwks_uri must resolve to a public address")
 
     audience = _clean_str(body.get("audience"), "audience", required=True)
 
@@ -190,15 +276,18 @@ async def dereference_jwks(jwks_uri: str) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=JWKS_FETCH_TIMEOUT_SECONDS, follow_redirects=False) as client:
             resp = await client.get(jwks_uri, headers={"Accept": "application/json"})
     except Exception as exc:  # noqa: BLE001 — surfaced as a validation error, never a 500
-        raise IssuerValidationError("jwks_uri", f"JWKS could not be fetched: {type(exc).__name__}") from exc
+        logger.info("jwks dereference failed: %s", type(exc).__name__)
+        raise IssuerValidationError("jwks_uri", JWKS_OPAQUE_FAILURE) from exc
+    # ONE opaque message for every failure mode: status, JSON, shape. Distinct messages turned
+    # this endpoint into an internal-network oracle (status codes of whatever the URL reached).
     if resp.status_code < 200 or resp.status_code >= 300:
-        raise IssuerValidationError("jwks_uri", f"JWKS returned HTTP {resp.status_code}")
+        raise IssuerValidationError("jwks_uri", JWKS_OPAQUE_FAILURE)
     try:
         doc = resp.json()
     except Exception as exc:  # noqa: BLE001
-        raise IssuerValidationError("jwks_uri", "JWKS is not valid JSON") from exc
+        raise IssuerValidationError("jwks_uri", JWKS_OPAQUE_FAILURE) from exc
     if not _jwks_has_usable_key(doc):
-        raise IssuerValidationError("jwks_uri", "JWKS must be {keys:[…]} with at least one RSA/EC/OKP key")
+        raise IssuerValidationError("jwks_uri", JWKS_OPAQUE_FAILURE)
     return doc
 
 
