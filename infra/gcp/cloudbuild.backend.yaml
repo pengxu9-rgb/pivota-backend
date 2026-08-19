@@ -9,6 +9,10 @@ substitutions:
 steps:
   - name: gcr.io/cloud-builders/docker
     args: ['build',
+           # -f: the Dockerfile deliberately does NOT live at the repo root. Railway auto-detects a
+           # root Dockerfile and silently switches every service in this repo from Railpack to it
+           # (prod `web` healthcheck-failed on 2026-08-19 for exactly this reason).
+           '-f', 'infra/gcp/Dockerfile',
            '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}',
            '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest',
            '--build-arg', 'BUILDKIT_INLINE_CACHE=1',
