@@ -66,12 +66,34 @@ def test_platform_name_is_local_with_no_markers():
     assert P.is_deployed() is False
 
 
-def test_platform_name_is_railway_from_any_railway_var(monkeypatch):
-    # Not just RAILWAY_ENVIRONMENT: a worker service that only receives build
-    # metadata is still deployed.
-    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "abc123")
+def test_platform_name_is_railway_from_any_deployment_marker(monkeypatch):
+    # Not just RAILWAY_ENVIRONMENT: a worker service is identified by any of the
+    # variables Railway injects into a running container.
+    monkeypatch.setenv("RAILWAY_SERVICE_ID", "svc-abc123")
     assert P.platform_name() == "railway"
     assert P.is_deployed() is True
+
+
+def test_railway_build_metadata_alone_is_not_a_deployment(monkeypatch):
+    """RAILWAY_GIT_* describes a COMMIT, not the host executing this process.
+
+    It was originally treated as proof of deployment (the whole detection was a
+    `RAILWAY_` prefix scan). That scan also swallowed `RAILWAY_TOKEN`, the CLI
+    credential developers export to reach the prod DB through the proxy — which
+    resolved a laptop as production and armed the settlement transfer path. The
+    git vars are still read as VALUES by commit_sha() / git_branch(); they just
+    no longer decide which platform we are on. Every real Railway deployment
+    also carries RAILWAY_ENVIRONMENT and RAILWAY_SERVICE_ID, so nothing that is
+    genuinely deployed loses its identity here.
+    """
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "abc123")
+    monkeypatch.setenv("RAILWAY_GIT_BRANCH", "main")
+    assert P.platform_name() == "local"
+    assert P.is_deployed() is False
+    assert P.is_production() is False
+    # …but the value is still readable.
+    assert P.commit_sha() == "abc123"
+    assert P.git_branch() == "main"
 
 
 def test_platform_name_is_cloud_run_from_k_service(monkeypatch):

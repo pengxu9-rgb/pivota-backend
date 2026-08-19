@@ -54,6 +54,16 @@ _PLATFORM_KEYS = (
     "RAILWAY_DEPLOYMENT_ID",
     "RAILWAY_GIT_COMMIT_SHA",
     "RAILWAY_GIT_BRANCH",
+    # NOT platform markers — Railway CLI credentials and a routing target, all
+    # three routinely exported in a developer's shell profile because the
+    # documented ops workflow reaches the prod DB through the Railway proxy.
+    # Scrubbed so this suite is hermetic on a laptop as well as on CI: before
+    # the allowlist fix in config/platform.py, `RAILWAY_TOKEN=…` alone made 14
+    # of this branch's 125 new tests fail by resolving the machine as
+    # production. See test_a_railway_cli_token_alone_is_not_a_deployment.
+    "RAILWAY_TOKEN",
+    "RAILWAY_API_TOKEN",
+    "RAILWAY_PRIVATE_DOMAIN",
     "K_SERVICE",
     "K_REVISION",
     "K_CONFIGURATION",
@@ -122,6 +132,67 @@ def test_every_staging_shape_reads_as_staging(staging_shape):
     assert P.is_production() is False
     assert P.is_staging() is True
     assert P.is_deployed() is True
+
+
+# ---------------------------------------------------------------------------
+# A DEVELOPER'S SHELL IS NOT A DEPLOYMENT
+#
+# The regression these pin: `_on_railway()` used to scan the whole `RAILWAY_`
+# prefix, so the Railway CLI's own credentials counted as proof of deployment.
+# This repo's documented ops workflow is "reach the prod DB through the Railway
+# proxy", so `RAILWAY_TOKEN` genuinely lives in developer shell profiles. The
+# consequence was not cosmetic: settlement transfers have INVERTED polarity, so
+# a laptop with a token exported had the real merchant payout path ARMED.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["RAILWAY_TOKEN", "RAILWAY_API_TOKEN", "RAILWAY_PRIVATE_DOMAIN"],
+)
+def test_a_railway_cli_token_alone_is_not_a_deployment(monkeypatch, key):
+    monkeypatch.setenv(key, "deadbeefdeadbeefdeadbeefdeadbeef")
+
+    assert P.platform_name() == "local"
+    assert P.is_deployed() is False
+    assert P.platform_env() == "development"
+    assert P.is_production() is False
+
+    # The money path, stated explicitly rather than left implied.
+    from services.settlement_file_service import _transfer_allowed_in_this_environment
+
+    assert _transfer_allowed_in_this_environment() is False
+
+    # And local boot must not die: require_platform_env() raises only on a
+    # managed host it cannot resolve.
+    assert P.require_platform_env() == "development"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "RAILWAY_ENVIRONMENT",
+        "RAILWAY_ENVIRONMENT_NAME",
+        "RAILWAY_SERVICE_ID",
+        "RAILWAY_SERVICE_NAME",
+        "RAILWAY_PROJECT_ID",
+        "RAILWAY_DEPLOYMENT_ID",
+    ],
+)
+def test_every_railway_deployment_marker_still_proves_deployment(monkeypatch, key):
+    """The other side of the allowlist.
+
+    Without this, `_on_railway()` could be narrowed to `return False` — or the
+    allowlist emptied — and the test above would still pass while today's
+    Railway production silently became "local".
+    """
+    monkeypatch.setenv(key, "production" if "ENVIRONMENT" in key else "some-value")
+
+    assert P.platform_name() == "railway"
+    assert P.is_deployed() is True
+    # Either it resolves (the ENVIRONMENT keys) or it fails closed — never
+    # "development", which is what would disarm every guard.
+    assert P.platform_env() == "production"
 
 
 # ---------------------------------------------------------------------------

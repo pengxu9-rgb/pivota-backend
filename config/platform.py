@@ -26,7 +26,8 @@ CONTRACT
   accept an injected environment (``utils.startup_mode``) keep their signature.
 * Precedence:  explicit ``PIVOTA_*``  →  Railway  →  Cloud Run  →  local.
 * FAIL CLOSED: if we are demonstrably on a managed platform (``K_SERVICE`` set,
-  or any non-empty ``RAILWAY_*``) but the environment cannot be resolved to
+  or a Railway *deployment* marker set — see ``_RAILWAY_DEPLOYMENT_KEYS``, which
+  deliberately excludes the CLI's auth variables) but the environment cannot be resolved to
   production/staging, :func:`platform_env` returns ``"production"`` and logs
   loudly.  The safest wrong answer is "this is production": demo/fabrication/
   insecure paths stay OFF and prod-only money/queue paths stay ON.
@@ -104,8 +105,46 @@ _ENV_ALIASES: Dict[str, str] = {
     "ci": TEST,
 }
 
-# Any of these being non-empty proves we are on Railway.
-_RAILWAY_PREFIX = "RAILWAY_"
+# Any of these being non-empty proves Railway INJECTED them into a running
+# deployment — i.e. we are executing inside a Railway container.
+#
+# ⚠️ THIS IS AN ALLOWLIST, NOT A `RAILWAY_` PREFIX SCAN, AND THAT IS THE WHOLE
+# POINT. The first version of this module scanned the prefix, reasoning that a
+# new Railway variable should count immediately. It counted too much: the
+# Railway CLI's own credentials are named `RAILWAY_TOKEN` / `RAILWAY_API_TOKEN`,
+# and this team's documented ops workflow is "reach the prod DB through the
+# Railway proxy", so those are exported in developer shell profiles. With the
+# prefix scan, a laptop with a token exported resolved platform_name=railway,
+# fail-closed to platform_env=production, is_production()=True — which ARMED THE
+# REAL SETTLEMENT TRANSFER PATH (services.settlement_file_service has inverted
+# polarity: production ENABLES payouts) and made require_platform_env() kill
+# local boot. A developer's shell must never be able to answer "am I in
+# production".
+#
+# Excluded on purpose:
+#   RAILWAY_TOKEN, RAILWAY_API_TOKEN — CLI auth credentials, developer-exported.
+#   RAILWAY_PRIVATE_DOMAIN          — a routing TARGET, not a statement about
+#       the host we run on; it is routinely copied into local .env files and
+#       docker-compose to address a Railway-side service from outside.
+#   RAILWAY_GIT_* (COMMIT_SHA, BRANCH, AUTHOR, …) — build metadata about a
+#       commit, not proof that Railway is executing this process. They are
+#       copied into local .env files and CI matrices for /version parity, and
+#       `commit_sha()` / `git_branch()` below still read them as VALUES. Reading
+#       a value is not the same question as "which host am I on".
+#
+# The cost of the allowlist is that a brand-new Railway deployment variable must
+# be added here by hand. That is the correct trade: this list decides whether
+# money moves, and the risk of missing an addition (Railway always injects
+# RAILWAY_ENVIRONMENT and RAILWAY_SERVICE_ID on every deployment, both listed)
+# is far smaller than the risk of a shell export deciding it.
+_RAILWAY_DEPLOYMENT_KEYS = (
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_ENVIRONMENT_NAME",
+    "RAILWAY_SERVICE_ID",
+    "RAILWAY_SERVICE_NAME",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_DEPLOYMENT_ID",
+)
 # Cloud Run injects K_SERVICE / K_REVISION / K_CONFIGURATION on every revision.
 _CLOUD_RUN_KEYS = ("K_SERVICE", "K_REVISION", "K_CONFIGURATION")
 
@@ -138,16 +177,13 @@ def _first(env: Optional[Mapping[str, str]], *keys: str) -> Optional[str]:
 
 
 def _on_railway(env: Optional[Mapping[str, str]] = None) -> bool:
-    """True when ANY non-empty RAILWAY_* variable is present.
+    """True when Railway injected a DEPLOYMENT marker into this process.
 
-    Deliberately prefix-scanned rather than an explicit key list: Railway adds
-    variables over time, and for the "am I deployed" question a new one should
-    count immediately rather than after someone remembers to extend a tuple.
+    Explicit allowlist, not a ``RAILWAY_`` prefix scan — see the comment on
+    :data:`_RAILWAY_DEPLOYMENT_KEYS`. ``RAILWAY_TOKEN`` in a developer's shell
+    profile must resolve to ``local``, not to production.
     """
-    for key, value in _mapping(env).items():
-        if key.startswith(_RAILWAY_PREFIX) and (value or "").strip():
-            return True
-    return False
+    return any(_get(env, key) for key in _RAILWAY_DEPLOYMENT_KEYS)
 
 
 def _on_cloud_run(env: Optional[Mapping[str, str]] = None) -> bool:
