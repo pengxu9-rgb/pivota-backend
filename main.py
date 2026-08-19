@@ -418,6 +418,25 @@ app = FastAPI(
 )
 
 
+def _should_skip_heavy_startup_init() -> bool:
+    """Whether startup() should stop after the light schema guard.
+
+    startup() runs a large amount of best-effort schema/DDL work. A deployed
+    service must pass its healthcheck quickly; long-running DDL can exceed the
+    retry window and roll the deploy back. Production skips it by default.
+
+    Extracted from the body of startup() so it can be tested: inline, the
+    prod/non-prod decision was reachable only by running the whole startup
+    sequence, so nothing would have noticed it inverting. NOT the same rule as
+    utils.startup_mode.should_skip_heavy_startup (which skips on ANY deployed
+    host, staging included) — that difference is pre-existing and deliberate.
+    """
+    explicit = os.getenv("SKIP_HEAVY_STARTUP_INIT")
+    if explicit is None:
+        return is_production()
+    return explicit.lower() in {"1", "true", "yes"}
+
+
 @lru_cache(maxsize=1)
 def _service_version_payload() -> dict:
     # commit_sha()/git_branch() keep the same fallback chain and add the
@@ -1289,16 +1308,7 @@ async def startup():
         except Exception as schema_guard_err:
             logger.warning(f"Schema guard warning: {schema_guard_err}")
 
-        # This startup function contains a large amount of best-effort schema/DDL work.
-        # In Railway, the service healthcheck must pass quickly; long-running DDL can
-        # exceed the healthcheck retry window and cause deploy rollbacks.
-        skip_heavy_env = os.getenv("SKIP_HEAVY_STARTUP_INIT")
-        if skip_heavy_env is None:
-            skip_heavy = is_production()
-        else:
-            skip_heavy = skip_heavy_env.lower() in {"1", "true", "yes"}
-
-        if skip_heavy:
+        if _should_skip_heavy_startup_init():
             logger.warning(
                 "🟡 Skipping heavy startup DDL/migrations for fast healthcheck. "
                 "Set SKIP_HEAVY_STARTUP_INIT=false to run full startup init."
