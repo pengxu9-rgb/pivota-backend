@@ -6,13 +6,19 @@ set -euo pipefail
 ENV="${1:-}"; TAG="${2:-}"
 [ -n "$ENV" ] && [ -n "$TAG" ] || { echo "usage: $0 staging|prod <image-tag>" >&2; exit 2; }
 case "$ENV" in
-  # WORKERS: only the production service drains the shared async-run queues (audit/executor/
-  # invitation). A staging drainer would execute runs restored from the prod snapshot using the
-  # third-party credentials this service holds.
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; WORKERS=false; POOL_MIN=2; POOL_MAX=8 ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; WORKERS=true;  POOL_MIN=2; POOL_MAX=6 ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8 ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=6 ;;
   *) echo "bad env" >&2; exit 2 ;;
 esac
+
+# WORKERS must be forced OFF for the whole pre-cutover window. Between now and the DNS flip the GCP
+# prod stack runs against a COPY of production data with the REAL production third-party credentials
+# while Railway prod is still serving. Two live drainers on two copies of the same queue means
+# duplicate emails, duplicate settlement attempts, duplicate captures. Cutover flips this to true as
+# a deliberate step, AFTER Railway's workers are stopped.
+#   pre-cutover:  WORKERS=false infra/gcp/deploy_backend.sh prod <tag>   (default below)
+#   at cutover:   WORKERS=true  infra/gcp/deploy_backend.sh prod <tag>
+: "${WORKERS:=false}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
