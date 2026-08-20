@@ -37,6 +37,33 @@ def is_asyncpg_pool_gone_error(err: BaseException) -> bool:
     )
 
 
+class PoolCheckoutTimeout(TimeoutError):
+    """Waited too long for a free slot in the connection pool.
+
+    A DEDICATED type because the raw signal is untypeable: asyncpg raises a bare
+    `TimeoutError` whose `str()` is EMPTY, and every classifier in this module
+    matches on substrings — so pool saturation would sail past all of them and
+    surface as a 500 INTERNAL_SERVER_ERROR. That is loud in the wrong channel:
+    it pages as a code bug rather than DB capacity, and it hands agent/partner
+    clients a NON-RETRYABLE status for a state that is entirely retryable.
+
+    Subclasses TimeoutError so any caller already catching that (e.g. the
+    canonical route's `_bounded_db`) keeps working unchanged.
+    """
+
+
+def is_pool_checkout_timeout(err: BaseException) -> bool:
+    """True if `err` (or anything it wraps) is a pool-checkout timeout."""
+    seen: Set[int] = set()
+    cur: Optional[BaseException] = err
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, PoolCheckoutTimeout):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def is_asyncpg_busy_error(err: BaseException) -> bool:
     """
     asyncpg raises `InterfaceError: cannot perform operation: another operation is in progress`
@@ -47,6 +74,10 @@ def is_asyncpg_busy_error(err: BaseException) -> bool:
     cur: Optional[BaseException] = err
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
+        # Type check FIRST: a pool-checkout timeout carries an empty message,
+        # so no substring test can ever see it.
+        if isinstance(cur, PoolCheckoutTimeout):
+            return True
         cur_text = str(cur).lower()
         if _ASYNC_PG_BUSY_SUBSTR in cur_text:
             return True

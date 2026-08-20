@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime
+import asyncio
+import logging
 import os
 from typing import Any, Optional
 
@@ -106,12 +108,22 @@ else:
         pass
 
 # Initialize DB connection (databases library handles pooling)
+from utils.transient_errors import PoolCheckoutTimeout  # noqa: E402
+
+logger = logging.getLogger("db.database")
+
 database_kwargs = {}
 if IS_POSTGRES:
     database_kwargs = {
         "min_size": _env_int("DB_POOL_MIN_SIZE", 5, min_value=1, max_value=50),
         "max_size": _env_int("DB_POOL_MAX_SIZE", 20, min_value=1, max_value=100),
-        # `databases` passes this into asyncpg connect kwargs (connection timeout).
+        # ⚠️ THIS NAME LIES AND THE NAME IS LOAD-BEARING IN AN INCIDENT.
+        # `asyncpg.create_pool` has NO `timeout` parameter of its own; it
+        # forwards this into `connect()`, so it bounds CONNECTION
+        # ESTABLISHMENT, not waiting for a free pool slot. Checking it out is
+        # bounded by DB_POOL_CHECKOUT_TIMEOUT_SECONDS below. Renaming this one
+        # would silently change the connect budget, so it keeps its name and
+        # gets this comment instead.
         "timeout": _env_float("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", 5.0, min_value=0.1, max_value=60.0),
     }
     if database_kwargs["max_size"] < database_kwargs["min_size"]:
@@ -144,6 +156,116 @@ if IS_POSTGRES:
         database_kwargs["ssl"] = _ctx
     if _command_timeout > 0:
         database_kwargs["command_timeout"] = _command_timeout
+
+# ---------------------------------------------------------------------------
+# Bound the wait for a free pool slot.
+#
+# `databases` 0.7.0 checks a connection out with a bare
+# `await self._database._pool.acquire()` (backends/postgres.py,
+# `PostgresConnection.acquire`), and `asyncpg.Pool.acquire` defaults to
+# `timeout=None` — WAIT FOREVER. So a saturated pool does not degrade, it
+# stops: callers queue with no deadline and no error.
+#
+# That is not theoretical. 2026-08-20: one report query averaging 125s over
+# 1,374 calls filled the 20 slots, and every scheduler job then hung silently
+# until it burned its own deadline — 705 `maximum number of running instances`,
+# 66 `JobDeadlineExceeded`, and ZERO database errors, because nothing ever
+# failed; it just never returned. HTTP starved alongside them and the sitemap
+# cron took a 504. The slow query is fixed (#1779), but the NEXT slow query
+# does the same thing, which is why this is worth patching a pinned library for.
+#
+# asyncpg's own `acquire(timeout=)` is used rather than wrapping the call in
+# `asyncio.wait_for`: cancelling mid-acquire is exactly how a connection gets
+# left half-checked-out ("Connection is already acquired"), and the driver
+# handles its own timeout without that hazard.
+#
+# The two asserts are preserved verbatim. "DatabaseBackend is not running" in
+# particular is the signal `utils/database_readiness._pool_is_provably_dead`
+# reads to decide a pool is genuinely dead, so losing it would break recovery.
+DB_POOL_CHECKOUT_TIMEOUT_SECONDS = _env_float(
+    # 120s, not the 4s an HTTP request can afford, and that asymmetry is the point.
+    #
+    # Callers already bound THEMSELVES where they need to: the canonical route
+    # gives a query 4s (`CANONICAL_PRODUCTS_DB_TIMEOUT_SECONDS`) and the edge
+    # gives up sooner still. So this deadline is not there to make HTTP fail
+    # fast — HTTP fails fast on its own — it exists solely to stop an INFINITE
+    # wait. Scheduler jobs are the constraint in the other direction: their run
+    # deadlines are 600-14400s (`services/audit_scheduler._JOB_RUN_DEADLINES`),
+    # and a nightly sweep that would legitimately queue 90s for a slot and then
+    # run fine must not be converted into a failure. A tight global bound would
+    # invent a new failure class for batch work that previously merely ran late.
+    "DB_POOL_CHECKOUT_TIMEOUT_SECONDS", 120.0, min_value=0.5, max_value=600.0
+)
+
+
+def _install_bounded_pool_checkout() -> bool:
+    """Give `PostgresConnection.acquire` a deadline. Returns True if installed."""
+    from databases.backends.postgres import PostgresConnection
+
+    if getattr(PostgresConnection.acquire, "_pivota_bounded", False):
+        return True
+
+    # Refuse to patch an implementation we have not read. Overwriting blindly
+    # would silently reinstate 0.7.0 semantics over a newer `databases` — and
+    # the per-task connection map in 0.8+ is a stated future direction here, so
+    # that is a live risk, not a hypothetical one.
+    import inspect
+
+    original = inspect.getsource(PostgresConnection.acquire)
+    for expected in (
+        "Connection is already acquired",
+        "DatabaseBackend is not running",
+        "self._database._pool.acquire()",
+    ):
+        if expected not in original:
+            raise RuntimeError(
+                "db.database: refusing to bound pool checkout — "
+                f"databases.PostgresConnection.acquire no longer contains {expected!r}. "
+                "The library changed; re-read it and update this patch."
+            )
+
+    async def acquire(self) -> None:  # type: ignore[no-untyped-def]
+        # Explicit raises, not bare asserts: `python -O` strips asserts, and
+        # "DatabaseBackend is not running" is the signal
+        # `utils/database_readiness._pool_is_provably_dead` reads to tell a dead
+        # pool from a slow one. Same reasoning as that module's own guard.
+        if self._connection is not None:
+            raise AssertionError("Connection is already acquired")
+        if self._database._pool is None:
+            raise AssertionError("DatabaseBackend is not running")
+        try:
+            self._connection = await self._database._pool.acquire(
+                timeout=DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+            )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            pool = self._database._pool
+            # Attribution, which the bare TimeoutError cannot carry: an empty
+            # message in a 5xx tells an operator nothing about WHY.
+            logger.warning(
+                "database pool checkout timed out after %.1fs "
+                "(pool size=%s, free=%s) — the pool is saturated, not broken",
+                DB_POOL_CHECKOUT_TIMEOUT_SECONDS,
+                getattr(pool, "_maxsize", "?"),
+                getattr(getattr(pool, "_queue", None), "qsize", lambda: "?")(),
+            )
+            raise PoolCheckoutTimeout(
+                "timed out waiting %.1fs for a database connection"
+                % DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+            ) from exc
+
+    acquire._pivota_bounded = True  # type: ignore[attr-defined]
+    PostgresConnection.acquire = acquire  # type: ignore[assignment]
+    return True
+
+
+if IS_POSTGRES:
+    # Not best-effort. If this cannot install, every query is one slow statement
+    # away from an unbounded hang, and the 2026-08-20 evidence is that such a
+    # hang is silent — so failing at import is strictly better than discovering
+    # it during the next incident.
+    if not _install_bounded_pool_checkout():
+        raise RuntimeError("db.database: bounded pool checkout failed to install")
+
 
 database = Database(DATABASE_URL, **database_kwargs)
 # Lazy asyncpg pool for legacy helpers (Postgres only)
