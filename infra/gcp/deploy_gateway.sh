@@ -12,8 +12,8 @@ set -euo pipefail
 ENV="${1:-}"; TAG="${2:-}"
 [ -n "$ENV" ] && [ -n "$TAG" ] || { echo "usage: $0 staging|prod <image-tag>" >&2; exit 2; }
 case "$ENV" in
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; PG_POOL_MAX=5 ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; PG_POOL_MAX=3 ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; GW_POOL_MAIN=3; GW_POOL_AUX=2 ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; GW_POOL_MAIN=2; GW_POOL_AUX=1 ;;
   *) echo "bad env" >&2; exit 2 ;;
 esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -66,17 +66,20 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
 { :
   # requirePlatformEnv() throws at boot without this (src/server.js:52114).
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
-  # node-pg's Pool defaults to 10 connections PER PROCESS. At --max-instances 20 that is 200 on its
-  # own, and Cloud SQL max_connections is 200. Staging (MAX=4) can never reveal this.
+  # The gateway opens FOUR pools, not one, and reads these exact names:
+  #   DB_POOL_MAX                      src/db/index.js:132                 (default 5)
+  #   PCI_KB_DB_POOL_MAX               src/services/pciKbClient.js:46      (default 3)
+  #   INGREDIENT_REFERENCE_DB_POOL_MAX src/services/ingredientReferenceStore.js:82 (default 3)
+  #   INGREDIENT_SIGNAL_DB_POOL_MAX    src/services/ingredientSignalStore.js:93    (default 3)
+  # Defaults therefore sum to 14 connections PER INSTANCE, not 10. PG_POOL_MAX / PGPOOL_MAX /
+  # DB_POOL_MAX_SIZE - which an earlier version of this script set - are read by NOTHING in this
+  # repo, so that sizing was inert. Measure the variable names before trusting a budget.
   #
-  # BUDGET - re-derive this whenever a service is added, and note it is NOT currently satisfied:
-  #   web 20x6=120 + gateway 20x3=60 + worker 1x10=10            = 190
-  #   + proof-issuer 20x6=120 + acp 20x6=120 (both min=2 max=20) = 430 against max_connections=200
-  # proof-issuer opens no pool (it is a stateless signer - no DB), so its 120 is nominal. acp is a
-  # different repo and whether it honours DB_POOL_MAX_SIZE is UNMEASURED. Before cutover either
-  # measure acp's real pool behaviour and cap max-instances accordingly, or raise max_connections.
-  # Tracked as a cutover gap in README; do not treat 190/200 as still true.
-  printf 'PG_POOL_MAX: "%s"\nPGPOOL_MAX: "%s"\nDB_POOL_MAX_SIZE: "%s"\n' "$PG_POOL_MAX" "$PG_POOL_MAX" "$PG_POOL_MAX"
+  # BUDGET against max_connections=300 (raised from 200):
+  #   web 20x6=120 + gateway 20x5=100 + worker 1x10=10 = 230, leaving 70 for ops and superuser.
+  #   proof-issuer and acp mount no DATABASE_URL at all, so they contribute 0.
+  printf 'DB_POOL_MAX: "%s"\nPCI_KB_DB_POOL_MAX: "%s"\nINGREDIENT_REFERENCE_DB_POOL_MAX: "%s"\nINGREDIENT_SIGNAL_DB_POOL_MAX: "%s"\n' \
+    "$GW_POOL_MAIN" "$GW_POOL_AUX" "$GW_POOL_AUX" "$GW_POOL_AUX"
 } >> "$MERGED"
 
 # The candidate gate must be able to REACH the candidate. Every prod service is

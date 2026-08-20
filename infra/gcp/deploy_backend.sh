@@ -66,7 +66,17 @@ SECRETS_FILE="$HERE/secrets.$ENV$TAGPART.list"
 [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "missing $ENV_FILE / $SECRETS_FILE — run port_railway_env.py first" >&2; exit 1; }
 
 # Secret Manager mappings: DATABASE_URL/REDIS_URL from bootstrap + every env-* secret
-SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,$(paste -sd, "$SECRETS_FILE")"
+# Mounting the datastore DSNs is OPT-IN, not automatic. Handing a service a DATABASE_URL it never
+# had does not just add connections - it can change BEHAVIOUR. acp is the proof: on Railway it has no
+# DATABASE_URL and runs on its in-memory fallback, but the unconditional mount made the Cloud Run copy
+# log "ACP ready with database persistence" and open an asyncpg pool. Its `Database(DATABASE_URL)`
+# takes NO pool arguments, so it is asyncpg's default min=10/max=10 per instance and it honours
+# neither DB_POOL_MAX_SIZE nor DATABASE_POOL_SIZE - 10 x 20 instances = 200 connections on its own,
+# against a max_connections of 200, plus a silent persistence change in the payment path.
+: "${MOUNT_DB:=$([ "$SERVICE" = web ] || [ "$SERVICE" = worker ] && echo 1 || echo 0)}"
+DB_SECRETS=""
+[ "$MOUNT_DB" = 1 ] && DB_SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,"
+SECRETS="${DB_SECRETS}$(paste -sd, "$SECRETS_FILE")"
 
 # gcloud allows only ONE env-vars flag: merge the ported file with the platform vars into a temp file
 # Pass these UNCONDITIONALLY. Setting them only when non-empty means a RUN_COMMAND left exported
@@ -153,7 +163,7 @@ probe_health(){ # url -> echoes the status code
   --set-secrets "$SECRETS" \
   ${CMD_ARGS[@]+"${CMD_ARGS[@]}"} \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
-  --min-instances "$MIN" --max-instances "$MAX" \
+  --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \
   --ingress "$INGRESS" \
