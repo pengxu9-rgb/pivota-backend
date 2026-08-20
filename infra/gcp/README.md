@@ -63,7 +63,7 @@ infra/gcp/deploy_backend.sh staging $(git rev-parse HEAD)
 `env.staging.overrides.yaml` (git-ignored, chmod 600) rotates every **internal** shared secret to a
 fresh random value (`JWT_SECRET_KEY`, `SHOP_GATEWAY_AGENT_API_KEY`, `*_INTERNAL_KEY`, `CHECKOUT_*`,
 `ADMIN_API_KEY`, `METRICS_BEARER_TOKEN`, …) so a token minted on the public staging URL is never
-valid in prod. **The staging gateway / proof-issuer / acp must be given the same staging values**
+valid in prod. **The staging gateway / proof-issuer must be given the same staging values**
 (read them from Secret Manager `env-<NAME>` in pivota-staging — never copy from Railway prod).
 Data-bound secrets (`CONNECTOR_CREDENTIALS_KEY`, `REVIEWS_*_SIGNING_SECRET`) are kept so a restored
 prod dump stays readable. Third-party LIVE credentials (Stripe, SendGrid, Shopify, Adyen, AWS, …) are
@@ -121,7 +121,7 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    | `ucp-worker` | Pivota Infra | `pivota-acp` (`main`) | **running** on a Jul-10 image; Aug-20 redeploy failed | **retire — ADR-021** |
    | `ucp-web-production` | Pivota Infra | `pivota-acp` (`main`) | **never once booted** (99 deploys, 0 SUCCESS) | **retire — ADR-021** |
    | `ucp-platform-receiver` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS; 0 real requests | **retire — ADR-021** |
-   | `pivota-acp` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS | **retire — ADR-021** (see the warning below) |
+   | `pivota-acp` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS | **retire — ADR-021** (see below) |
    | `catalog-intelligence` | catalog-intelligence | own repo | service SUCCESS; 2 of its 3 sub-services FAILED | migrate — own Postgres + Redis |
    | `bulk-email-tool` | bulk-email-tool | `bulk-email-tool` | SUCCESS | **KEEP** (2026-08-20) — see below |
 
@@ -136,12 +136,20 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    **Ordering:** delete `ucp-web` with or before `ucp-worker` — `ucp-web` is the only thing that can
    write the queue, so removing the worker first would leave a writer with no drainer.
 
-   ⚠️ **`pivota-acp` is deployed to Cloud Run, which contradicts ADR-021.** That deployment was made
-   on 2026-08-20 without reference to the ADR. ADR-021 §1 moved ACP checkout in-process into
-   pivota-backend and §4 states `PLATFORM_ORDERS_ACP_URL` "stays unset forever". Resolve this before
-   cutover: either delete the Cloud Run `acp` service and its ported secrets, or supersede ADR-021
-   deliberately. Note the ported secrets include live `STRIPE_SECRET_KEY` and `ADYEN_API_KEY`, which
-   ADR-021 said to **rotate** as part of retirement — copying them to a new home is not rotation.
+   **`pivota-acp` was briefly deployed to Cloud Run on 2026-08-20 and has been REMOVED** the same
+   day, following ADR-021. Deleted: the Cloud Run `acp` service and its four `acp-env-*` secrets.
+   Nothing on GCP referenced it, and `acp.pivota.cc` is unaffected — it is a custom domain on
+   **PIVOTA-Agent**, which the load balancer routes to `pivota-bes-gateway`, never to that service.
+
+   Do not redeploy it. A future migration pass that enumerates Railway services will try to bring it
+   across again; ADR-021 §1 (ACP checkout runs in-process in pivota-backend —
+   `acp_checkout_session_service`, migration 191) and §4 (`PLATFORM_ORDERS_ACP_URL` "stays unset
+   forever") are the reasons not to.
+
+   **Still outstanding from ADR-021: key rotation.** The Stripe key on the Railway `pivota-acp`
+   service is `sk_test_`, so that one is not a live-money credential. The Adyen key is a real API key
+   whose environment cannot be told from its prefix. Deleting the GCP copies is not rotation — the
+   Railway originals remain until those services are deleted there.
 
 4. **DNS cutover mechanics** — the load balancer EXISTS with six ACTIVE certificates
    (`api`, `gateway`, `mcp`, `commerce.mcp`, `ucp`, `acp`). The **apex does NOT move**:
@@ -306,7 +314,7 @@ Verified 2026-08-19: the `worker` revision logs
 completed in 3m50s with `ok: true`.
 
 
-## proof-issuer and acp on Cloud Run
+## proof-issuer on Cloud Run
 
 Both are deployed with the SAME script as the backend — `deploy_backend.sh` is now parameterised
 rather than duplicated, so every safety fix (opt-in workers, candidate-verify before traffic, egress
@@ -319,11 +327,6 @@ SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
   RUN_COMMAND=python RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
   infra/gcp/deploy_backend.sh prod <backend-sha>
 
-# acp: its own repo (pengxu9-rgb/pivota-acp) and its own root Dockerfile.
-gcloud builds submit --config <acp cloudbuild> --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
-SERVICE=acp IMAGE_NAME=acp ENV_PREFIX=acp \
-  RUN_COMMAND=uvicorn RUN_ARGS="--app-dir,./pivota_infra,src.main:app,--host,0.0.0.0,--port,8080" \
-  infra/gcp/deploy_backend.sh prod <acp-sha>
 ```
 
 `PUBLIC=1` is required, not optional: these services are reachable only from the VPC (ingress), and
@@ -346,9 +349,7 @@ Three things worth knowing:
   is the app-level auth, exactly as on Railway. Verified: 200 from a VPC-attached job, 404 from the
   public internet.
 
-acp is deployed inert for the pre-cutover window — `ACP_ENABLE_REAL_CAPTURE=false` and
-`DISABLE_WEBHOOK_OUTBOX=true`, and its backend/webhook URLs point at the GCP backend rather than the
-live Railway one, so it cannot act on production orders while Railway is still serving.
+**`acp` is NOT deployed to GCP** — ADR-021 retires it; see the un-migrated services table above.
 
 
 ## Connection budget — how it was DERIVED (and how to actually measure it)
