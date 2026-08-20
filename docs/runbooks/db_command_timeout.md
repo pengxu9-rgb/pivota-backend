@@ -18,8 +18,8 @@ statement failure in prod is unrelated to it.
 ## What the knob does
 
 `db/database.py` reads `DB_COMMAND_TIMEOUT_SECONDS` and, when it is `> 0`,
-passes it to asyncpg as `command_timeout` — for the shared `databases.Database`
-pool and for the legacy `get_db_pool()` asyncpg pool. It is **per statement**,
+passes it to asyncpg as `command_timeout` for the shared `databases.Database`
+pool — the only pool this process owns. It is **per statement**,
 not per request and not per scheduler run.
 
 Before 2026-08-17 the env var was **absent** on `web`/production, so

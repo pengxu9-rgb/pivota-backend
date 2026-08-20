@@ -4,7 +4,7 @@ import datetime
 import asyncio
 import logging
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from databases import Database
 from sqlalchemy import (
@@ -268,31 +268,26 @@ if IS_POSTGRES:
 
 
 database = Database(DATABASE_URL, **database_kwargs)
-# Lazy asyncpg pool for legacy helpers (Postgres only)
-_asyncpg_pool: Any = None
-
-
-async def get_db_pool():
-    """
-    Backward-compatible helper for routes that still expect an asyncpg pool.
-    Lazily creates a shared pool using the configured DATABASE_URL.
-    """
-    if not IS_POSTGRES:
-        raise RuntimeError("asyncpg pool is only available when DATABASE_URL is PostgreSQL")
-
-    global _asyncpg_pool
-    if _asyncpg_pool is None:
-        # Lazy import to avoid hard-failing local dev when asyncpg wheels are broken/unavailable.
-        import asyncpg  # type: ignore
-
-        _pool_kwargs = {}
-        if database_kwargs.get("command_timeout"):
-            # Same opt-in statement ceiling as the primary `database` object —
-            # legacy-pool callers must not retain the infinite-hang behavior.
-            _pool_kwargs["command_timeout"] = database_kwargs["command_timeout"]
-        _asyncpg_pool = await asyncpg.create_pool(DATABASE_URL, **_pool_kwargs)
-    return _asyncpg_pool
-
+# THE SECOND POOL IS GONE (2026-08-20). `get_db_pool()` lazily built its own
+# `asyncpg.create_pool(DATABASE_URL)` for "routes that still expect an asyncpg
+# pool". By the end it had exactly ONE caller, and it carried two hazards the
+# primary pool no longer has:
+#   * asyncpg's create_pool defaults are min_size=max_size=10, so it opened TEN
+#     connections eagerly, entirely outside the DB_POOL_MAX_SIZE budget — the
+#     capacity everything else is sized against was quietly wrong;
+#   * its `pool.acquire()` took no deadline, i.e. the unbounded wait #1781
+#     removed from the primary pool was still live here.
+# Bounding it would have kept both a second pool and a second thing to remember.
+# Its one caller, POST /admin/cleanup/phase5-data, was deleted rather than
+# ported: measured against production, its FIRST statement was
+# `DELETE FROM agent_routing_history`, and that table does not exist there — nor
+# does `dual_sided_revenue`, which it also counted. `revenue_matching_logs` has
+# no `revenue_id` column and `agent_integration_logs` has no `event_data`
+# column, so three of its four DELETEs and two of its three COUNTs could not
+# run either. The endpoint could only ever have returned its blanket 500. No
+# repo referenced it. So there is now one pool, one budget, one deadline. Do
+# not reintroduce a private pool: add what you need to `database_kwargs`
+# instead.
 
 metadata = MetaData()
 
