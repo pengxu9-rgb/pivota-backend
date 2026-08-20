@@ -116,27 +116,25 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 3. **Remaining un-migrated services.** The gateway, proof-issuer and acp are deployed (see the
    sections above). Still Railway-only:
 
-   | service | Railway project | why it is still there |
-   |---|---|---|
-   | `ucp-worker` | Pivota Infra | no Cloud Run deploy yet; its prod deploy is currently **FAILED** on Railway — establish whether it is still needed before spending effort migrating it |
-   | `ucp-platform-receiver` | Pivota Infra | no Cloud Run deploy yet (prod deploy healthy) |
-   | `catalog-intelligence` | catalog-intelligence | separate repo + its own Postgres and Redis |
-   | `bulk-email-tool` | bulk-email-tool | **KEEP** (2026-08-20 decision) — see below |
+   | service | source repo | prod state | disposition |
+   |---|---|---|---|
+   | `ucp-worker` | `pivota-acp` | **FAILED** 2026-08-20 | **kill candidate** |
+   | `ucp-web-production` | `pivota-acp` | **FAILED since 2026-01-15** | **kill candidate** |
+   | `ucp-platform-receiver` | `pivota-acp` | SUCCESS | **kill candidate** |
+   | `catalog-intelligence` | own repo | SUCCESS | migrate — own Postgres + Redis |
+   | `bulk-email-tool` | own repo | SUCCESS | **KEEP** (2026-08-20) — see below |
 
-   **`bulk-email-tool` is the one that can be lost by accident.** It lives in its own Railway project,
-   appears in **no repo in this org**, and serves a live custom domain `bulk-email-tool.pivota.cc`
-   that is deliberately NOT in the load balancer's six-host list and has no cert-map entry. Nothing
-   in the cutover touches it, and nothing in the cutover would notice if it disappeared.
+   **The three `ucp-*` services are superseded, not merely un-migrated.** The UCP/ACP/MCP doors are
+   custom domains on the **PIVOTA-Agent** service — verified live: `acp.pivota.cc` answers
+   `{"service":"PIVOTA-Agent"}`, and `ucp.pivota.cc/.well-known/ucp` returns 200 from PIVOTA-Agent
+   while `ucp-worker` is dead. Two of the three cannot start at all: both exit on
+   `DATABASE_URL is required` / `from db.database import database`, and **neither has ever had a
+   `DATABASE_URL`** — `ucp-worker` carries only 7 UCP config vars. A queue-polling worker without
+   database access has never drained a queue. `ucp-web-production` has been failing since January.
 
-   Consequences, both intentional:
-   - It is **not** part of the Sep 8-12 DNS flip. Its CNAME stays pointed at Railway, which is
-     correct — it is independent of the six hosts that must move together.
-   - **Do not decommission the Railway account** on the assumption that everything moved. This
-     service, plus the three above, still run there. Decommissioning is a separate decision that
-     comes after each of these has either migrated or been explicitly killed.
+   Do not migrate these. Confirm nothing enqueues to them, then delete them — that is a decision to
+   take deliberately, not a cleanup to fold into the cutover.
 
-   Migrating it later means: its own image, its own Cloud Run service, and a **seventh** certificate
-   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 4. **DNS cutover mechanics** — the load balancer EXISTS with six ACTIVE certificates
    (`api`, `gateway`, `mcp`, `commerce.mcp`, `ucp`, `acp`). The **apex does NOT move**:
    `pivota.cc`/`www` are Vercel-served and have no cert-map entry, so pointing them at the LB fails
@@ -408,3 +406,35 @@ Verify after the cutover import rather than trusting this note:
 ```sql
 select column_name from information_schema.columns where table_name='checkout_sessions' order by 1;
 ```
+
+
+## Which services a repo redeploys — check this before merging
+
+Railway auto-deploys **every service whose source is a repo you push to**, not just the one you were
+thinking about. Merging a change to `pivota-acp` on 2026-08-20 redeployed four services and left two
+of them failed.
+
+| repo | services it redeploys |
+|---|---|
+| `pengxu9-rgb/pivota-acp` | `pivota-acp`, `ucp-platform-receiver`, `ucp-web-production`, `ucp-worker` |
+| `pengxu9-rgb/pivota-backend` | `web`, `reviews-proof-issuer`, `invitation worker` |
+| `pengxu9-rgb/PIVOTA-Agent` | `PIVOTA-Agent` (its own project) |
+
+Regenerate this table rather than trusting it — services get added:
+
+```bash
+railway api 'query { project(id: "<id>") { services { edges { node { name
+  serviceInstances { edges { node { source { repo } } } }
+  deployments(first:1) { edges { node { status createdAt } } } } } } } }'
+```
+
+Two incidents came from not doing this:
+
+- A root `Dockerfile` added to `pivota-backend` switched the builder from Railpack to Docker for
+  **all three** of its services; prod `web` built, then failed its health check.
+- A merge to `pivota-acp` redeployed `ucp-worker`, which had been running a July image and could not
+  start on current code. That service turned out to be vestigial, so the blast radius was luck
+  rather than diligence.
+
+**Before merging into any repo that Railway builds from, list its services and know what a redeploy
+will do to each.**
