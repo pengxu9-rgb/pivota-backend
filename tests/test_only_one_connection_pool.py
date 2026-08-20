@@ -35,17 +35,37 @@ from typing import List, Tuple
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# Every production tree, kept in step with the dialect gate's own sweep so a
-# pool cannot hide in `scripts/` — this repo runs ops scripts against the
-# production database, and `test_scan_covers_every_production_tree` fails if
-# that gate widens and this one does not.
-SCANNED_TREES = (
-    "db", "routes", "services", "jobs", "utils", "core", "middleware",
-    "scripts", "adapters", "orchestrator",
-)
+# Production trees are DISCOVERED, not listed. A hand-written list is how this
+# guard would rot silently: `readiness/` (34 modules, imported by six route
+# files, its own CI tree) and `config/` (imported by main.py) were both absent
+# from the first draft's list AND from the dialect gate's `_SWEPT_DIRS` that the
+# draft borrowed, so a pool created in either was invisible to a test whose name
+# claimed it covered every production tree.
+_NOT_PRODUCTION = {"tests", "node_modules", "migrations", "docs", "htmlcov"}
+
+
+def _production_trees() -> Tuple[str, ...]:
+    trees = []
+    for path in sorted(REPO_ROOT.iterdir()):
+        if not path.is_dir() or path.name.startswith(".") or path.name in _NOT_PRODUCTION:
+            continue
+        if any("__pycache__" not in f.parts for f in path.rglob("*.py")):
+            trees.append(path.name)
+    return tuple(trees)
+
+
+SCANNED_TREES = _production_trees()
+
+# main.py is not under any tree, and it is where routers are mounted.
 SCANNED_FILES = ("main.py",)
 
 # (module path, enclosing function) allowed to call asyncpg.create_pool.
+#
+# NOTE what this pins and what it does not: it counts lexical CALL SITES, not
+# pools. A second `create_pool(...)` added inside `_new_pool`, or a second call
+# OF `_new_pool()`, both pass. Those are visible in review of a file this test
+# already names; an unrelated route quietly growing its own pool is not, and
+# that is the case this exists to catch.
 ALLOWED = {("utils/database_readiness.py", "_new_pool")}
 
 # A second `databases.Database(...)` is the OTHER way to grow a pool: it builds
@@ -53,6 +73,12 @@ ALLOWED = {("utils/database_readiness.py", "_new_pool")}
 # does inherit the bounded checkout (that patch is installed on the asyncpg
 # class, not on one pool), so it is the lesser hazard — but it still defeats the
 # budget, so it is allowlisted by name rather than ignored.
+#
+# Both matchers are NAME-shaped, not type-shaped: they test whether the callee
+# source ends in `create_pool`/`Database`. So a thread pool's `.create_pool()`
+# or a legitimate `InMemoryDatabase(...)` will trip them, and an aliased import
+# (`from asyncpg import create_pool as _mk`) will slip past. They fail loud and
+# are allowlistable; they are not a defence against someone determined to evade.
 ALLOWED_DATABASE_CONSTRUCTION = {
     # The one shared instance every route and job uses.
     ("db/database.py", "<module>"),
@@ -151,16 +177,21 @@ def test_no_second_databases_instance() -> None:
 def test_scan_covers_every_production_tree() -> None:
     """Narrowing the scan is how this guard would be silenced without a diff.
 
-    The dialect gate sweeps the same population for a different reason; borrow
-    its list so one file stays the definition of "production Python".
+    `SCANNED_TREES` is discovered, so this cannot re-run the same walk and call
+    it a check. It asserts against two independent sources instead: the dialect
+    gate's own sweep list, and the trees that sweep omits but that production
+    imports anyway.
     """
     from tests.test_repo_sql_prepare_postgres import _SWEPT_DIRS, _SWEPT_FILES
 
-    missing_dirs = sorted(set(_SWEPT_DIRS) - set(SCANNED_TREES))
+    # `readiness` and `config` are the concrete gap: _SWEPT_DIRS omits both, and
+    # main.py / six route modules import them.
+    required = set(_SWEPT_DIRS) | {"readiness", "config", "realtime", "utils", "middleware"}
+    missing_dirs = sorted(required - set(SCANNED_TREES))
     missing_files = sorted(set(_SWEPT_FILES) - set(SCANNED_FILES))
     assert not missing_dirs and not missing_files, (
-        "this guard scans less than the dialect gate does, so a pool created in "
-        f"{missing_dirs + missing_files} would be invisible here"
+        "this guard no longer scans every tree production imports, so a pool "
+        f"created in {missing_dirs + missing_files} would be invisible here"
     )
 
 
