@@ -6,6 +6,10 @@ async def test_sync_new_agent_api_key_prefers_api_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_account as module
+    import db.agents as agents_db
+
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", True)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
 
     executed = []
 
@@ -38,6 +42,10 @@ async def test_sync_new_agent_api_key_uses_agent_api_keys_when_needed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_account as module
+    import db.agents as agents_db
+
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", True)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
 
     executed = []
 
@@ -73,6 +81,10 @@ async def test_sync_new_agent_api_key_falls_back_to_legacy_when_no_key_tables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import routes.agent_account as module
+    import db.agents as agents_db
+
+    monkeypatch.setattr(agents_db, "IS_POSTGRES", True)
+    monkeypatch.setattr(agents_db, "_AGENT_AUTH_KEY_TABLE_MODE", "auto")
 
     executed = []
 

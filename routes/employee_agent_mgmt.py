@@ -17,6 +17,15 @@ import json as json_module
 
 logger = logging.getLogger(__name__)
 
+def _mask_agent_api_key(value) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("redacted:"):
+        return None
+    return raw[:10] + "..." if len(raw) > 10 else None
+
+
 router = APIRouter(prefix="/employee", tags=["employee-agents"])
 
 # ============== Helpers ==============
@@ -285,7 +294,9 @@ async def get_agent_details(
                 "owner_email": owner_email,
                 "company": agent.get("company"),
                 "use_case": agent.get("use_case") or "General integration",
-                "api_key": agent.get("api_key"),
+                # Prefix only. The employee console never needs the secret, and rows written
+                # since the hash-only change carry a redacted marker here anyway.
+                "api_key": _mask_agent_api_key(agent.get("api_key")),
                 "status": agent.get("status") or "active",
                 "agent_type": agent.get("agent_type"),  # [Phase 6.2] Include agent_type
                 "created_at": agent.get("created_at"),

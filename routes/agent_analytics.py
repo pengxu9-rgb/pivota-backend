@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from db.database import database
+from db.agents import resolve_agent_id_by_api_key
 from utils.auth import decode_token
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-analytics"])
@@ -26,12 +27,7 @@ async def resolve_agent_id(
             pass
     
     if not agent_id and x_api_key:
-        agent_row = await database.fetch_one(
-            "SELECT agent_id FROM agents WHERE api_key = :key LIMIT 1",
-            {"key": x_api_key}
-        )
-        if agent_row:
-            agent_id = agent_row["agent_id"]
+        agent_id = await resolve_agent_id_by_api_key(x_api_key)
     
     if not agent_id:
         raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")

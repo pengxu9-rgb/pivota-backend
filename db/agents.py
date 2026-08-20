@@ -403,6 +403,32 @@ async def set_agent_public_key(agent_id: str, public_key: str) -> None:
     )
 
 
+# Redacted value written to agents.api_key for agents whose key lives only as a hash in a key
+# table. The column is NOT NULL UNIQUE and several legacy readers still select it, so it must
+# hold a per-agent, non-secret, recognisable string rather than NULL or the plaintext key.
+#
+# THE MARKER IS NEVER A CREDENTIAL. agent_id is public (registration response, metrics, employee
+# console), so `redacted:<agent_id>` is guessable; every lookup that compares a PRESENTED key
+# against agents.api_key (the legacy fallbacks below) must refuse it explicitly, and nothing may
+# ever hash it into a key table (routes/agent_keys.py legacy branch, the redaction script).
+AGENT_API_KEY_REDACTED_PREFIX = "redacted:"
+
+
+def redacted_agent_api_key(agent_id: str) -> str:
+    return f"{AGENT_API_KEY_REDACTED_PREFIX}{agent_id}"
+
+
+def is_redacted_agent_api_key(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(AGENT_API_KEY_REDACTED_PREFIX)
+
+
+# Legacy plaintext lookups exclude the marker at the SQL level too, so the guard does not depend
+# on every caller remembering the Python check.
+_LEGACY_API_KEY_LOOKUP_SQL = (
+    "SELECT * FROM agents WHERE api_key = :api_key AND api_key NOT LIKE 'redacted:%' LIMIT 1"
+)
+
+
 async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）
 
@@ -416,6 +442,13 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
         metrics.setdefault("auth_lookup_ms", 0)
         metrics.setdefault("auth_cache_hit", False)
         metrics.setdefault("auth_source", "none")
+
+    # The redaction marker stored in agents.api_key is never a key (see AGENT_API_KEY_REDACTED_PREFIX).
+    if is_redacted_agent_api_key(api_key):
+        if metrics is not None:
+            metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
+            metrics["auth_source"] = "redacted_marker_refused"
+        return None
 
     key_hash = _agent_auth_cache_key(api_key)
     cache_hit, cached_agent = _get_cached_agent_auth(key_hash)
@@ -440,7 +473,7 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
             should_try_legacy = True
         if not result and should_try_legacy:
             legacy = await database.fetch_one(
-                "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1",
+                _LEGACY_API_KEY_LOOKUP_SQL,
                 {"api_key": api_key},
             )
             if legacy:
@@ -478,7 +511,7 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
         if should_try_legacy:
             try:
                 legacy = await database.fetch_one(
-                    "SELECT * FROM agents WHERE api_key = :api_key LIMIT 1",
+                    _LEGACY_API_KEY_LOOKUP_SQL,
                     {"api_key": api_key},
                 )
                 if legacy:
@@ -501,6 +534,25 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
             metrics["auth_cache_hit"] = False
             metrics["auth_source"] = "error"
         return None
+
+
+async def resolve_agent_id_by_api_key(api_key: str) -> Optional[str]:
+    """agent_id for an X-API-Key value, or None.
+
+    Routes that only need the caller's agent_id used to run
+    `SELECT agent_id FROM agents WHERE api_key = :key`, which matches the plaintext column
+    only. Keys are now persisted hash-only (agents.api_key holds a redacted marker), so every
+    resolver must go through get_agent_by_key: hash table first, legacy plaintext fallback
+    second, and the same auth cache.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        return None
+    agent = await get_agent_by_key(key)
+    if not agent:
+        return None
+    agent_id = agent.get("agent_id")
+    return str(agent_id) if agent_id else None
 
 
 async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
