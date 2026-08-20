@@ -74,6 +74,9 @@ SECRETS_FILE="$HERE/secrets.$ENV$TAGPART.list"
 # neither DB_POOL_MAX_SIZE nor DATABASE_POOL_SIZE - 10 x 20 instances = 200 connections on its own,
 # against a max_connections of 200, plus a silent persistence change in the payment path.
 : "${MOUNT_DB:=$([ "$SERVICE" = web ] || [ "$SERVICE" = worker ] && echo 1 || echo 0)}"
+# Validate, like WORKERS/PAUSED elsewhere. MOUNT_DB=true - the spelling those flags use - would
+# otherwise evaluate false and deploy `web` with NO DATABASE_URL, which fails at runtime, not here.
+case "$MOUNT_DB" in 0|1) ;; *) echo "MOUNT_DB must be exactly 0 or 1 (got '$MOUNT_DB')" >&2; exit 2 ;; esac
 DB_SECRETS=""
 [ "$MOUNT_DB" = 1 ] && DB_SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,"
 SECRETS="${DB_SECRETS}$(paste -sd, "$SECRETS_FILE")"
@@ -105,7 +108,7 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
   printf 'SKIP_HEAVY_STARTUP_INIT: "true"\n'
   printf 'AUDIT_WORKER_ENABLED: "%s"\n' "$WORKERS"
   printf 'REVIEWS_INVITATION_WORKER_ENABLED: "%s"\n' "$WORKERS"
-  # Cloud SQL max_connections=200 (bootstrap_env.sh). db/database.py defaults to a 5..20 pool PER
+  # Cloud SQL max_connections=300 (bootstrap_env.sh). db/database.py defaults to a 5..20 pool PER
   # PROCESS, so MAX instances x 20 would be 400 on prod and exhaust the server. Size the pool from
   # the instance ceiling, leaving headroom for the other services and for ops sessions.
   printf 'DB_POOL_MIN_SIZE: "%s"\nDB_POOL_MAX_SIZE: "%s"\n' "$POOL_MIN" "$POOL_MAX"

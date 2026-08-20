@@ -74,7 +74,7 @@ if ! have "$GCLOUD" sql instances describe "$SQL_INSTANCE"; then
     --storage-type=SSD --storage-size=20 --storage-auto-increase \
     --backup-start-time=09:00 --enable-point-in-time-recovery --retained-backups-count=14 \
     --maintenance-window-day=SUN --maintenance-window-hour=10 \
-    --database-flags=max_connections=200 \
+    --database-flags=max_connections=300 \
     $DELETION_PROTECTION
 fi
 if ! "$GCLOUD" sql databases list --instance="$SQL_INSTANCE" --format='value(name)' | grep -qx "$DB_NAME"; then

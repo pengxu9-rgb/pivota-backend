@@ -109,9 +109,10 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 1. **Second database `pci_kb`** — `bootstrap_env.sh` creates only `pivota`. `PCI_KB_DATABASE_URL` /
    `INGREDIENT_REFERENCE_DATABASE_URL` still point at Railway (`switchback.proxy.rlwy.net`, PG16,
    24 MB, 23 tables) and are read by BOTH the backend and the gateway.
-2. **Cloud Scheduler** — nothing replaces the Railway crons (`relgraph-sync-routine`, the audit /
-   executor / invitation drainers). `deploy_backend.sh` sets `AUDIT_WORKER_ENABLED=false` on
-   staging, so today NOTHING drains those queues on GCP.
+2. **Scheduled work is deployed but inert** — `setup_scheduler.sh` creates the single-instance
+   `worker` plus the `relgraph-sync` and `reviews-invitation-send` Cloud Run Jobs and their two
+   Cloud Scheduler triggers. Everything is created PAUSED / workers-off; arming is the explicit
+   cutover step `WORKERS=true PAUSED=0 ...`, run only after Railway's workers stop.
 3. **Remaining un-migrated services** — `ucp-worker`, `ucp-platform-receiver`, and
    `catalog-intelligence` still run only on Railway. The gateway, proof-issuer and acp are deployed
    (see the sections above).
@@ -323,7 +324,7 @@ acp is deployed inert for the pre-cutover window — `ACP_ENABLE_REAL_CAPTURE=fa
 live Railway one, so it cannot act on production orders while Railway is still serving.
 
 
-## Connection budget — how it was actually measured
+## Connection budget — how it was DERIVED (and how to actually measure it)
 
 Do not trust a budget written in a comment. This one was wrong twice:
 
@@ -344,8 +345,45 @@ The lesson both times: **grep the application for the variable name before belie
 applied.** A pool setting the app does not read is indistinguishable from no setting at all, and it
 looks correct in `gcloud run services describe`.
 
-Re-measure with:
+**This is a derivation from configuration, not a measurement.** It reads env vars, which tells you
+what was *requested*, not what is *held*. The real measurement is against the running database:
+
+```sql
+select usename, application_name, count(*) from pg_stat_activity group by 1,2 order by 3 desc;
+```
+
+Run that under load before the cutover window. Two things the derivation cannot see:
+
+- **Rolling deploys double a service transiently.** `--no-traffic` then `--to-latest` means old and
+  new revisions coexist, and old instances linger for in-flight requests up to `--timeout 300`. At
+  web's ceiling that is up to 240 for web alone for ~5 minutes - more than the 70 headroom. Deploy
+  services one at a time during the cutover window, not concurrently.
+- **The gateway's 100 assumes its three KB DSNs point at `pivota-pg`.** They currently point at
+  Railway (see gap #1), so only `DB_POOL_MAX` (20x2=40) lands on Cloud SQL today. 100 is the
+  post-`pci_kb`-migration figure - conservative now, correct later.
+- The ingredient pools fall back to `DB_POOL_MAX` *before* their own default of 3, so raising
+  `DB_POOL_MAX` alone raises three pools, not one.
+
+Re-derive config with:
 ```bash
 gcloud run services describe <svc> --project pivota-prod --region us-west1 --format=json \
   | python3 -c "import sys,json;d=json.load(sys.stdin);c=d['spec']['template']['spec']['containers'][0];print({e['name']:e.get('value') for e in c.get('env',[]) if 'POOL' in e['name'] or e['name']=='DATABASE_URL'})"
+```
+
+
+## Known schema drift in the cutover database
+
+While `acp` briefly had a `DATABASE_URL` (revisions before `acp-00004`), its startup DDL ran against
+the shared `pivota` database and added a `metadata` column to `checkout_sessions`, which the
+backend's own `db/migrations/025_acp_sessions.sql` does not define.
+
+Assessed and left in place: the column is nullable, **nothing reads it**
+(`grep checkout_sessions.*metadata` across the backend returns only SQLAlchemy's unrelated
+`metadata.create_all`), and the backend's schema won the race - the live table still has its 2 FKs
+and 5 indexes. It also disappears on its own, because the prod database is re-imported from a fresh
+Railway dump at cutover.
+
+Verify after the cutover import rather than trusting this note:
+```sql
+select column_name from information_schema.columns where table_name='checkout_sessions' order by 1;
 ```

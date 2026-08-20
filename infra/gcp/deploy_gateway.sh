@@ -62,7 +62,11 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # against the SDK's own loader). Appending an override after the ported file therefore does NOTHING
 # whenever the ported file already defines that key - which silently made WORKERS, DB_POOL_* and even
 # PIVOTA_ENV inert. Strip the keys we are about to set before appending them.
-grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
+# Strip exactly the keys re-set below. DB_POOL_MIN_SIZE/DB_POOL_MAX_SIZE are kept in this list only
+# because a ported Railway env may still carry them (they are inert here); the four names that DO
+# matter must be stripped, or a ported value would win - gcloud takes the FIRST duplicate key - and
+# the printf below would be silently inert, reverting the gateway to 5+3+3+3 per instance.
+grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE|DB_POOL_MAX|PCI_KB_DB_POOL_MAX|INGREDIENT_REFERENCE_DB_POOL_MAX|INGREDIENT_SIGNAL_DB_POOL_MAX):' "$ENV_FILE" > "$MERGED"
 { :
   # requirePlatformEnv() throws at boot without this (src/server.js:52114).
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
@@ -133,7 +137,7 @@ probe_health(){ # url -> echoes the status code
   --env-vars-file "$MERGED" \
   --set-secrets "$SECRETS" \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
-  --min-instances "$MIN" --max-instances "$MAX" \
+  --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost --execution-environment gen2 \
   --ingress "$INGRESS" \
   $PUBLIC_FLAG \

@@ -88,14 +88,23 @@ mkjob(){ # name image sa command...
 echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 mkjob relgraph-sync "$GATEWAY_IMAGE" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
   --command npm --args "run,relgraph:sync-routine:cron"
 
 echo "== job: reviews-invitation-send (was a 60s bash loop)"
+# Run the one-shot processor DIRECTLY, not scripts/run_reviews_invitation_send_loop.sh.
+# That wrapper is `while true; do ...; sleep $SLEEP_SECONDS; done` and reads no RUN_ONCE (grep it) -
+# it never exits. As a Cloud Run Job on a * * * * * trigger it would run to the 3600s task timeout
+# while Scheduler starts another every minute, and Jobs allow concurrent executions. Each holds an
+# asyncpg pool (db/database.py defaults 5..20), so within ~4-14 minutes of un-pausing at cutover the
+# connection headroom is gone and every service starts throwing TooManyConnectionsError.
+# The wrapper's own loop body is exactly this script, so a per-minute Scheduler tick IS the loop.
+# DB_POOL_* are pinned because a Job inherits no pool sizing from the deploy scripts.
 mkjob reviews-invitation-send "$BACKEND_IMAGE" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=reviews-invitation-send,PIVOTA_COMMIT_SHA=$BACKEND_TAG,SLEEP_SECONDS=0,RUN_ONCE=true" \
-  --command /bin/bash --args "scripts/run_reviews_invitation_send_loop.sh"
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=reviews-invitation-send,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=4" \
+  --task-timeout 300s \
+  --command python --args "scripts/process_due_reviews_invitation_send_jobs.py"
 
 # ---------------------------------------------------------------- 3. Cloud Scheduler triggers
 PROJECT_NUMBER=$("$GCLOUD" projects describe "$PROJECT" --format='value(projectNumber)')
