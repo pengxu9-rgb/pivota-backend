@@ -8,6 +8,7 @@ from sqlalchemy import Column, DateTime, String, Table, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.database import database, metadata
+from db.startup_ddl import execute_ddl
 from utils.logger import logger
 
 
@@ -82,7 +83,9 @@ async def ensure_quotes_table() -> None:
             "CREATE INDEX IF NOT EXISTS idx_quotes_consumed_order_id ON quotes(consumed_order_id);",
         ]
         for stmt in statements:
-            await database.execute(stmt)
+            # A concurrent session may win the CREATE ... IF NOT EXISTS race;
+            # execute_ddl treats that as "already exists" (success).
+            await execute_ddl(stmt, db=database)
     except Exception as e:
         # Best-effort; if this fails, inserts will surface the error with context.
         logger.warning("ensure_quotes_table failed (best-effort)", extra={"error": str(e)})

@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import httpx
 
 from db.database import database
+from db.startup_ddl import execute_ddl
 
 
 logger = logging.getLogger(__name__)
@@ -174,59 +175,67 @@ def _next_retry_at(attempt_count: int) -> Optional[datetime]:
     return _utcnow() + timedelta(seconds=RETRY_DELAYS_SECONDS[retry_index])
 
 
+_MERCHANT_WEBHOOK_DDL_READY = False
+
+_MERCHANT_WEBHOOK_DDL_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS merchant_webhook_configs (
+        id SERIAL PRIMARY KEY,
+        merchant_id VARCHAR(255) NOT NULL UNIQUE,
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        destination_url TEXT,
+        subscribed_events JSON NOT NULL DEFAULT '[]',
+        signing_secret TEXT,
+        last_test_at TIMESTAMP,
+        last_test_status VARCHAR(32),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS merchant_webhook_deliveries (
+        id SERIAL PRIMARY KEY,
+        delivery_id VARCHAR(255) NOT NULL UNIQUE,
+        merchant_id VARCHAR(255) NOT NULL,
+        event_id VARCHAR(255) NOT NULL,
+        event_type VARCHAR(255) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        http_status INTEGER,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        delivered_at TIMESTAMP,
+        next_retry_at TIMESTAMP,
+        request_id VARCHAR(255),
+        destination_url TEXT,
+        payload JSON NOT NULL DEFAULT '{}',
+        request_headers JSON NOT NULL DEFAULT '{}',
+        response_body TEXT,
+        last_error TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_merchant_webhook_deliveries_merchant_created
+    ON merchant_webhook_deliveries(merchant_id, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_merchant_webhook_deliveries_retry
+    ON merchant_webhook_deliveries(status, next_retry_at)
+    """,
+)
+
+
 async def ensure_merchant_webhook_tables() -> None:
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS merchant_webhook_configs (
-            id SERIAL PRIMARY KEY,
-            merchant_id VARCHAR(255) NOT NULL UNIQUE,
-            enabled BOOLEAN NOT NULL DEFAULT FALSE,
-            destination_url TEXT,
-            subscribed_events JSON NOT NULL DEFAULT '[]',
-            signing_secret TEXT,
-            last_test_at TIMESTAMP,
-            last_test_status VARCHAR(32),
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    await database.execute(
-        """
-        CREATE TABLE IF NOT EXISTS merchant_webhook_deliveries (
-            id SERIAL PRIMARY KEY,
-            delivery_id VARCHAR(255) NOT NULL UNIQUE,
-            merchant_id VARCHAR(255) NOT NULL,
-            event_id VARCHAR(255) NOT NULL,
-            event_type VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL,
-            http_status INTEGER,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            latency_ms INTEGER,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            delivered_at TIMESTAMP,
-            next_retry_at TIMESTAMP,
-            request_id VARCHAR(255),
-            destination_url TEXT,
-            payload JSON NOT NULL DEFAULT '{}',
-            request_headers JSON NOT NULL DEFAULT '{}',
-            response_body TEXT,
-            last_error TEXT
-        )
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_merchant_webhook_deliveries_merchant_created
-        ON merchant_webhook_deliveries(merchant_id, created_at DESC)
-        """
-    )
-    await database.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_merchant_webhook_deliveries_retry
-        ON merchant_webhook_deliveries(status, next_retry_at)
-        """
-    )
+    """
+    Idempotent, memoized per process. See ensure_agent_webhook_tables() for
+    why a lost CREATE ... IF NOT EXISTS race must be treated as success.
+    """
+    global _MERCHANT_WEBHOOK_DDL_READY
+    if _MERCHANT_WEBHOOK_DDL_READY:
+        return
+    for stmt in _MERCHANT_WEBHOOK_DDL_STATEMENTS:
+        await execute_ddl(stmt, db=database)
+    _MERCHANT_WEBHOOK_DDL_READY = True
 
 
 async def _get_or_create_raw_config(merchant_id: str) -> Dict[str, Any]:
