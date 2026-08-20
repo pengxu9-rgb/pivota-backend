@@ -122,7 +122,9 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    | `ucp-web-production` | Pivota Infra | `pivota-acp` (`main`) | **never once booted** (99 deploys, 0 SUCCESS) | **retire — ADR-021** |
    | `ucp-platform-receiver` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS; 0 real requests | **retire — ADR-021** |
    | `pivota-acp` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS | **retire — ADR-021** (see below) |
-   | `catalog-intelligence` | catalog-intelligence | own repo | service SUCCESS; 2 of its 3 sub-services FAILED | migrate — own Postgres + Redis |
+   | `catalog-intelligence` (main) | catalog-intelligence | own repo | SUCCESS, `/health` 200 | **not a cutover blocker** — see below |
+   | `ingredient-harvester` | catalog-intelligence | own repo | **FAILED since 2026-05-29** | **kill candidate** — see below |
+   | `Worker service` | catalog-intelligence | own repo | **FAILED since 2026-05-29** | **kill candidate** — see below |
    | `bulk-email-tool` | bulk-email-tool | `bulk-email-tool` | SUCCESS | **KEEP** (2026-08-20) — see below |
 
    **ADR-021 (Accepted, 2026-08-01) already retired the four Infra services** and called for rotating
@@ -417,6 +419,38 @@ select column_name from information_schema.columns where table_name='checkout_se
 ```
 
 
+### `catalog-intelligence` — assessed 2026-08-20, not a cutover blocker
+
+No ADR constrains this project. The assessment below is why it is safe to leave on Railway through
+the Sep 8-12 cutover, and why two of its three services should be deleted rather than migrated.
+
+**The main service is not on the buyer or payment path.** `CATALOG_INTELLIGENCE_BASE_URL` is consumed
+only by `services/catalog_intelligence_client.py`, whose sole caller is `bd_cold_start_service` —
+reached from `agent_center_bd_routes`, `merchant_audit_routes` and `agent_readiness_score`, i.e. the
+business-development and merchant-audit surfaces. Nothing in the Minds/Antom lane touches it.
+
+**And the client cannot break a request.** Its docstring is explicit: *"Never raises. All errors
+logged at WARNING/ERROR."* It returns `None` when unconfigured, on any HTTP error, and on an empty
+response; callers fall back. Leaving the URL pointed at Railway after cutover degrades BD/audit
+enrichment gracefully — it does not fail anything.
+
+**`ingredient-harvester` and `Worker service` are dead with no consumers.** The harvester is a
+FastAPI + RQ service that batch-harvests `raw_ingredient_text` for beauty SKUs; the worker
+(`python -m app.worker`) drains its Redis queue. Both have been FAILED since 2026-05-29 and Railway
+no longer retains their logs. Two facts settle their disposition:
+
+- **They write to their own database** (`postgres-4hog`), **not** to `pci_kb` (`switchback`) — the KB
+  the gateway and backend actually read. The dead harvester is therefore NOT upstream of the
+  ingredient data served today.
+- **That database is empty.** Six tables; `imports`, `harvest_tasks`, `candidate_rows` and
+  `candidate_row_audit_findings` all hold **0 rows**.
+
+So the lane produces nothing and nothing consumes it. Delete rather than migrate — the same shape as
+the `ucp-*` services above: infrastructure that exists, fails, and has no downstream.
+
+⚠️ **Rotate `SERPER_API_KEY`.** It is set in plaintext on both failed services and was exposed in a
+terminal session on 2026-08-20. Rotate at serper.dev even if the services are deleted.
+
 ### `bulk-email-tool` — KEEP, and easy to lose
 
 It lives in its own Railway project (`bulk-email-tool`, repo `pengxu9-rgb/bulk-email-tool`) and
@@ -426,7 +460,7 @@ in the cutover would notice if it disappeared.
 
 - It is **not** part of the Sep 8-12 DNS flip. Its CNAME stays pointed at Railway, which is correct.
 - **Do not decommission the Railway account** on the assumption that everything moved. This service,
-  plus `catalog-intelligence`, still run there.
+  plus `catalog-intelligence` (see the assessment above), still run there.
 - Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 
