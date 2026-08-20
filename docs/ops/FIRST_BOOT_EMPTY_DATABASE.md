@@ -26,7 +26,7 @@ production database must run with:
 SKIP_HEAVY_STARTUP_INIT=false
 ```
 
-and can be set back afterwards — the `schema_migrations` ledger makes later
+and can be set back afterwards — the `startup_sql_migrations` ledger makes later
 boots cheap anyway. The advisory lock still protects `startup_event()`'s DDL
 in either mode.
 
@@ -112,7 +112,7 @@ after.
   single engine for the whole run, files containing `CONCURRENTLY` executed
   statement-by-statement on an AUTOCOMMIT connection (psycopg2 sends a
   multi-statement string as one implicit transaction, so AUTOCOMMIT alone is
-  not enough), and a `schema_migrations` ledger (`filename`, `checksum`,
+  not enough), and a `startup_sql_migrations` ledger (`filename`, `checksum`,
   `applied_at`) written in the same transaction as the file, so each file
   applies at most once per database and a failing file is retried next boot.
   Editing an already-applied file logs a checksum warning and does **not**
@@ -125,8 +125,8 @@ after.
     psycopg2 an empty parameter mapping, so every file containing a literal
     `%` failed with "dict is not a sequence" — 30+ files.
 
-Cost on a warm database: one advisory-lock round trip plus one
-`SELECT ... FROM schema_migrations`.
+Cost on a warm database: one advisory-lock round trip, one
+`CREATE TABLE IF NOT EXISTS` and one `SELECT ... FROM startup_sql_migrations`.
 
 ## What the first boot on staging will actually do
 
@@ -150,11 +150,54 @@ Before deploying this to an environment with a large catalog, either:
 * check which of those objects already exist (`\d+ catalog_products`,
   `select indexname from pg_indexes where tablename in ('catalog_products','catalog_skus','external_product_seeds')`)
   and pre-seed the ledger for the files that are already applied:
-  `INSERT INTO schema_migrations (filename, checksum) VALUES ('132_catalog_offer_suppression_writer_audit.sql', 'preseeded') ON CONFLICT DO NOTHING;`
+  `INSERT INTO startup_sql_migrations (filename, checksum) VALUES ('132_catalog_offer_suppression_writer_audit.sql', 'preseeded') ON CONFLICT DO NOTHING;`
 * or apply those files by hand first (they are safe to run outside a
   transaction) and then pre-seed.
 
 On an empty database none of this matters — the indexes build instantly.
+
+## The ledger is NOT called `schema_migrations`
+
+Production already has a `schema_migrations` table, and it belongs to a
+different system: 71 rows keyed `id` (`001_taxonomy.sql`,
+`004_look_replicator.sql`, …), columns `id` + `applied_at`, nothing in this
+repo reads or writes it.
+
+The first cut of this runner used that name. `CREATE TABLE IF NOT EXISTS`
+then no-op'd against the foreign table, and every ledger `INSERT` failed
+*inside the migration's own transaction* — so **all 219 files rolled back**,
+each logged as a routine "may be already applied" warning. Reproduced
+2026-08-20 against a copy of the production shape.
+
+Three things now stand between that and a repeat, because on a shared database
+the name alone is not enough:
+
+1. The ledger is `startup_sql_migrations`.
+2. The ledger row is written **after** the migration's transaction commits,
+   never inside it. A ledger that is unwritable for any reason — a view, a
+   missing unique constraint for `ON CONFLICT`, an extra `NOT NULL` column, no
+   `INSERT` grant — can then cost at most a re-run, never a rollback.
+3. If a relation of our name exists and the runner cannot read `filename,
+   checksum` out of it, it **refuses to run migrations at all** and logs an
+   error.
+
+Point 3 deserves its reasoning, because "apply everything anyway" sounds like
+the safer fallback and is not. Without the ledger the runner cannot tell what
+already ran, and re-running the tree against a populated database re-executes
+convergent writes. Measured over three boots in that mode:
+
+* `126_subscription_plans_allowance_rebase.sql` sets
+  `subscription_plans.monthly_credit_allowance` back to 4000/18000/75000 —
+  an allowance changed through the app is silently reverted at the next boot.
+* `139_*` and `146_*` re-tombstone / re-deactivate catalog rows an operator
+  may have revived.
+* `013_consolidate_routing.sql` appends a `routing_migration_log` row per boot.
+* `003`, `024` and `027` cannot be re-run at all (`CREATE TRIGGER` has no
+  `IF NOT EXISTS` in PG15), so from the second boot on they fail forever and
+  the summary reads permanently red — indistinguishable from a real outage.
+
+If you pre-seed, pre-seed `startup_sql_migrations`. Leave `schema_migrations`
+alone.
 
 ## Disabled migrations
 

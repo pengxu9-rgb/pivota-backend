@@ -31,11 +31,37 @@ not through ``text()`` or ``exec_driver_sql`` — both of those mangle static
 SQL that contains ``:name`` tokens or literal ``%``. Only the ledger INSERT
 is bound.
 
-Applied files are recorded in ``schema_migrations`` so each file runs at most
+Applied files are recorded in ``startup_sql_migrations`` so each file runs at most
 once per database *through this runner*, in the same transaction as the file
 itself: a file that fails leaves no ledger row and is retried on the next
 boot, exactly like the old best-effort behaviour. Migration content is
 unchanged.
+
+The ledger is deliberately NOT called ``schema_migrations``: production already
+has a table of that name, owned by something outside this repo — 71 rows keyed
+``id`` (``001_taxonomy.sql``, ``004_look_replicator.sql``, …) with no
+``filename``/``checksum`` columns. Using that name made ``CREATE TABLE IF NOT
+EXISTS`` a no-op against the foreign table and every ledger INSERT then failed
+inside the migration's own transaction, so **all 219 files rolled back**
+(reproduced 2026-08-20).
+
+Two independent guards came out of that, because the name alone is not enough
+on a database this repo shares with other systems:
+
+* The ledger row is recorded AFTER the migration's transaction commits, never
+  inside it (:func:`_record_applied`). A ledger that is unwritable for any
+  reason — a view, a missing unique constraint for ``ON CONFLICT``, an extra
+  NOT NULL column, no INSERT grant — can then only cost a re-run, never a
+  rollback.
+* :func:`_ledger_state` decides by READING the columns we use, not by
+  comparing information_schema shapes. If a relation of our name exists and we
+  cannot read it, the runner REFUSES to run rather than falling back to
+  "apply everything": re-running the tree against a populated database
+  re-executes convergent writes — ``126_subscription_plans_allowance_rebase``
+  resets ``subscription_plans.monthly_credit_allowance``, 139/146 re-tombstone
+  catalog rows, ``013`` appends a routing_migration_log row per boot — and
+  three files (003, 024, 027) are not re-runnable at all, because
+  ``CREATE TRIGGER`` has no ``IF NOT EXISTS`` in PG15.
 
 Note the ledger is not the only applier: ``routes/admin_run_migration_pending``
 executes a migration by number and writes no ledger row, so a file applied
@@ -53,7 +79,7 @@ import hashlib
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -62,7 +88,7 @@ from db.startup_ddl import is_already_exists_error
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIRNAME = os.path.join("db", "migrations")
-LEDGER_TABLE = "schema_migrations"
+LEDGER_TABLE = "startup_sql_migrations"
 
 _LEDGER_DDL = f"""
 CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} (
@@ -173,30 +199,67 @@ def _is_only_comments(statement: str) -> bool:
     return not stripped.strip()
 
 
-def _ensure_ledger(engine) -> bool:
+# Ledger states.
+#   OK      — the table is ours and readable; skip what it records.
+#   ABSENT  — no such relation and we could not create one (e.g. the SQLite dev
+#             default, whose DDL this table's definition does not support). Run
+#             every file, record nothing. This is the pre-#1775 behaviour.
+#   FOREIGN — a relation of our name exists but we cannot read our columns out
+#             of it, i.e. it belongs to something else. REFUSE to run.
+LEDGER_OK = "ok"
+LEDGER_ABSENT = "absent"
+LEDGER_FOREIGN = "foreign"
+
+
+def _relation_exists(engine) -> bool:
     try:
-        with engine.begin() as conn:
-            conn.execute(text(_LEDGER_DDL))
-        return True
-    except Exception as exc:  # noqa: BLE001
-        if is_already_exists_error(exc):
-            return True
-        logger.warning(
-            "SQL migrations: could not create %s ledger, running without it: %s",
-            LEDGER_TABLE,
-            exc,
-        )
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT to_regclass(:t)"), {"t": LEDGER_TABLE}).scalar() is not None
+    except Exception:  # noqa: BLE001 - non-Postgres, or we cannot tell
         return False
 
 
-def _applied(engine) -> Dict[str, str]:
+def _ledger_state(engine) -> Tuple[str, Dict[str, str]]:
+    """(state, already-applied) — see LEDGER_* above.
+
+    The check is a READ of the columns we actually use, not an
+    information_schema shape comparison: a table can have the right column
+    names and still be unusable (a view, no unique constraint for ON CONFLICT,
+    an extra NOT NULL column, or no INSERT grant). Reading is also the
+    capability that matters most — knowing what already ran is what keeps the
+    runner from re-executing files against a populated database.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(_LEDGER_DDL))
+    except Exception as exc:  # noqa: BLE001
+        if not is_already_exists_error(exc):
+            logger.info("SQL migrations: could not create %s (%s)", LEDGER_TABLE, exc)
+
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(f"SELECT filename, checksum FROM {LEDGER_TABLE}"))
-            return {r[0]: r[1] for r in rows}
+            return LEDGER_OK, {r[0]: r[1] for r in rows}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("SQL migrations: could not read %s: %s", LEDGER_TABLE, exc)
-        return {}
+        if _relation_exists(engine):
+            logger.error(
+                "SQL migrations: a table named %s exists but is not ours (%s). REFUSING to "
+                "run migrations: without the ledger this runner cannot tell which files have "
+                "already been applied, and re-running the tree against a populated database "
+                "re-executes convergent writes (126_subscription_plans_allowance_rebase resets "
+                "billing allowances; 139/146 re-tombstone catalog rows). Rename LEDGER_TABLE "
+                "or hand the other table over.",
+                LEDGER_TABLE,
+                exc,
+            )
+            return LEDGER_FOREIGN, {}
+        logger.warning(
+            "SQL migrations: no usable %s ledger (%s) — running every file and recording "
+            "nothing.",
+            LEDGER_TABLE,
+            exc,
+        )
+        return LEDGER_ABSENT, {}
 
 
 def _execute_raw(conn, sql: str) -> None:
@@ -229,8 +292,24 @@ def _ledger_insert():
 
 
 def _record_applied(engine, name: str, digest: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(_ledger_insert(), {"filename": name, "checksum": digest})
+    """Best-effort, and deliberately NOT part of the migration's transaction.
+
+    Coupling them is what turned a ledger defect into a total outage: every
+    INSERT failed inside the migration's own transaction, so every file rolled
+    back. Recorded separately, the worst a broken ledger write can do is make
+    the file run again next boot.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(_ledger_insert(), {"filename": name, "checksum": digest})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "SQL migrations: %s applied but could not be recorded in %s (%s) — it will "
+            "run again on the next boot.",
+            name,
+            LEDGER_TABLE,
+            exc,
+        )
 
 
 def run_sql_migrations(engine, *, base_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -246,8 +325,11 @@ def run_sql_migrations(engine, *, base_dir: Optional[str] = None) -> Dict[str, A
     if not files:
         return result
 
-    have_ledger = _ensure_ledger(engine)
-    applied = _applied(engine) if have_ledger else {}
+    state, applied = _ledger_state(engine)
+    if state == LEDGER_FOREIGN:
+        result["aborted"] = f"{LEDGER_TABLE} exists but is not ours"
+        return result
+    have_ledger = state == LEDGER_OK
 
     for path in files:
         name = os.path.basename(path)
@@ -276,15 +358,13 @@ def run_sql_migrations(engine, *, base_dir: Optional[str] = None) -> Dict[str, A
                 with autocommit_engine.connect() as conn:
                     for statement in split_statements(body):
                         _execute_raw(conn, statement)
-                if have_ledger:
-                    _record_applied(engine, name, digest)
             else:
                 # One transaction for the whole file: preserves $$ blocks and
                 # keeps a partially-failing file from landing half-applied.
                 with engine.begin() as conn:
                     _execute_raw(conn, body)
-                    if have_ledger:
-                        conn.execute(_ledger_insert(), {"filename": name, "checksum": digest})
+            if have_ledger:
+                _record_applied(engine, name, digest)
             result["applied"].append(name)
             logger.info("   ✅ %s applied", name)
         except Exception as exc:  # noqa: BLE001 - best-effort, as before
