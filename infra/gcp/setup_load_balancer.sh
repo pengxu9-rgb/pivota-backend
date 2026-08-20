@@ -39,11 +39,19 @@ for svc in web gateway; do
   have "$GCLOUD" compute network-endpoint-groups describe "$PREFIX-neg-$svc" --region "$REGION" \
     || "$GCLOUD" compute network-endpoint-groups create "$PREFIX-neg-$svc" \
          --region "$REGION" --network-endpoint-type=serverless --cloud-run-service="$svc"
-  have "$GCLOUD" compute backend-services describe "$PREFIX-be-$svc" --global \
-    || "$GCLOUD" compute backend-services create "$PREFIX-be-$svc" --global \
-         --load-balancing-scheme=EXTERNAL_MANAGED --protocol=HTTPS --enable-logging --logging-sample-rate=1.0
-  "$GCLOUD" compute backend-services add-backend "$PREFIX-be-$svc" --global \
-    --network-endpoint-group="$PREFIX-neg-$svc" --network-endpoint-group-region="$REGION" 2>/dev/null || true
+  # NO --protocol here. Passing one sets portName (e.g. `https`), and a backend service with a
+  # portName REFUSES a serverless NEG: "Port name is not supported for a backend service with
+  # Serverless network endpoint groups". portName cannot be cleared by `update` either - the service
+  # has to be recreated - so getting this right at creation matters.
+  have "$GCLOUD" compute backend-services describe "$PREFIX-bes-$svc" --global \
+    || "$GCLOUD" compute backend-services create "$PREFIX-bes-$svc" --global \
+         --load-balancing-scheme=EXTERNAL_MANAGED --enable-logging --logging-sample-rate=1.0
+  # Do NOT swallow errors here. This attach failing silently is what produced six hostnames serving
+  # "no healthy upstream" with a perfectly valid certificate - the LB looked built and was not.
+  if ! "$GCLOUD" compute backend-services describe "$PREFIX-bes-$svc" --global --format='value(backends[0].group)' | grep -q .; then
+    "$GCLOUD" compute backend-services add-backend "$PREFIX-bes-$svc" --global \
+      --network-endpoint-group="$PREFIX-neg-$svc" --network-endpoint-group-region="$REGION"
+  fi
 done
 
 say "certificates (DNS-authorized, so they issue BEFORE the cutover)"
@@ -68,16 +76,16 @@ done
 say "url map"
 if ! have "$GCLOUD" compute url-maps describe "$PREFIX-urlmap"; then
   # Default to the backend service; every known host is matched explicitly below.
-  "$GCLOUD" compute url-maps create "$PREFIX-urlmap" --default-service="$PREFIX-be-web"
+  "$GCLOUD" compute url-maps create "$PREFIX-urlmap" --default-service="$PREFIX-bes-web"
 fi
 for h in $HOSTS_GATEWAY; do
   slug=$(printf '%s' "$h" | tr '.' '-')
   have "$GCLOUD" compute url-maps describe "$PREFIX-urlmap" --format="value(hostRules)" \
     && "$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
-         --path-matcher-name="pm-$slug" --default-service="$PREFIX-be-gateway" --new-hosts="$h" 2>/dev/null || true
+         --path-matcher-name="pm-$slug" --default-service="$PREFIX-bes-gateway" --new-hosts="$h" 2>/dev/null || true
 done
 "$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
-  --path-matcher-name="pm-api" --default-service="$PREFIX-be-web" --new-hosts="$HOSTS_WEB" 2>/dev/null || true
+  --path-matcher-name="pm-api" --default-service="$PREFIX-bes-web" --new-hosts="$HOSTS_WEB" 2>/dev/null || true
 
 say "https proxy + forwarding rule"
 have "$GCLOUD" compute target-https-proxies describe "$PREFIX-https-proxy" --global \
