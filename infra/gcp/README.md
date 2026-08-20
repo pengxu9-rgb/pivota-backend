@@ -191,3 +191,59 @@ public proxy hostname with a publicly-trusted certificate.
 Verified end to end after the fix: `discovery_ready: true`, and
 `GET /agent/v1/products/search?q=vitamin+c+serum` returns 200 with real catalog rows —
 gateway → backend → Cloud SQL, entirely over the VPC.
+
+## Second database: `pci_kb`
+
+A second live Railway database (PG 16, ~24 MB, 23 tables — ingredient/PCI reference data) is read by
+**both** the backend (`PCI_KB_DATABASE_URL`) and the gateway (`PCI_KB_DATABASE_URL` +
+`INGREDIENT_REFERENCE_DATABASE_URL`). It now lives as a second database on the same Cloud SQL
+instance:
+
+```bash
+gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
+  --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ),\
+_SECRET=railway-pcikb-db-url,_NAME=pcikb,_SSLMODE=prefer
+DB=pci_kb infra/gcp/restore_to_cloudsql.sh staging gs://pivota-staging-migration/pcikb-<stamp>.sql.gz
+```
+
+Two things this surfaced:
+
+- **`_SSLMODE=prefer` is required for this source.** The `pci_kb` Railway TCP proxy does not
+  terminate TLS (`server does not support SSL, but SSL was required`), unlike the main DB's proxy.
+  The hop is therefore unencrypted; acceptable only because the content is public reference data
+  (ingredients, papers, KB snippets) with no credentials and no buyer PII. Do not reuse `prefer` for
+  the main database.
+- **The dump verifier was wrong, not the dump.** It counted `CREATE TABLE` across all schemas but
+  compared against `table_schema='public'` only, so any database with a second schema false-alarmed
+  (`dumped=23 live=19`). It now counts every non-system schema and fails only on a *shortfall* —
+  a dump legitimately carries more CREATE TABLE statements than the query counts.
+
+Secrets: `PCI_KB_DATABASE_URL` (asyncpg, `sslmode=require`) and `PCI_KB_DATABASE_URL_NOVERIFY`
+(node-pg, `sslmode=no-verify`) — see the sslmode section above for why they differ.
+
+## Scheduling: `infra/gcp/setup_scheduler.sh <env> <backend-tag> <gateway-tag>`
+
+Railway ran the periodic work three different ways; Cloud Run needs three different answers:
+
+| Railway | interval | Cloud Run |
+|---|---|---|
+| audit/executor drainer ticks, inside the `web` service | 5–10 s | **`worker` service**, min=max=1, ingress internal |
+| 8 APScheduler jobs inside `web` (daily … 15/30/60 min) | mixed | same `worker` process, gated by `AUDIT_WORKER_ENABLED` |
+| `relgraph-sync-routine` | cron `37 10 * * *` | Cloud Run **Job** + Cloud Scheduler |
+| `invitation worker` (`while true; sleep 60`) | 60 s | Cloud Run **Job** + Scheduler `* * * * *` |
+
+**The drainers cannot become Scheduler jobs** — Scheduler's minimum interval is one minute. And they
+must not stay on `web`: `services/audit_scheduler.py` has no cross-process lock (APScheduler's
+`max_instances=1` is per-process), so every autoscaled instance would drain the same queue. Pinning
+them to a single-instance service reproduces Railway's semantics exactly, which is what a cutover
+needs; splitting the 8 periodic jobs into individual Scheduler entries is a later refactor.
+
+**Staging is created inert on purpose**: both Scheduler triggers are PAUSED and the worker runs with
+`AUDIT_WORKER_ENABLED=false`, because staging holds a restored production snapshot and still carries
+production third-party credentials — draining that queue would execute production-derived rows
+against live Stripe/SendGrid/Shopify. Prod creates them enabled.
+
+Verified 2026-08-19: the `worker` revision logs
+`shared-queue worker ticks DISABLED on this service (service_name='worker' platform_env='staging')`
+— the platform shim resolving its own identity — and `gcloud run jobs execute relgraph-sync`
+completed in 3m50s with `ok: true`.

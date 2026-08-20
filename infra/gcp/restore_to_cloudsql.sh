@@ -6,7 +6,9 @@ set -euo pipefail
 ENV="${1:-}"; URI="${2:-}"; WIPE="${3:-}"
 [ -n "$ENV" ] && [ -n "$URI" ] || { echo "usage: $0 staging|prod gs://bucket/file.sql.gz [--wipe]" >&2; exit 2; }
 case "$ENV" in staging) PROJECT=pivota-staging ;; prod) PROJECT=pivota-prod ;; *) exit 2 ;; esac
-GCLOUD="${GCLOUD:-gcloud}"; INSTANCE=pivota-pg; DB=pivota; USER=pivota
+GCLOUD="${GCLOUD:-gcloud}"; INSTANCE=pivota-pg; USER=pivota
+# DB defaults to the main database; override for a second one (e.g. DB=pci_kb ... --wipe)
+DB="${DB:-pivota}"
 BUCKET="${URI#gs://}"; BUCKET="${BUCKET%%/*}"
 
 # the instance's own service account must be able to read the object
