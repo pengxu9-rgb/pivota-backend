@@ -83,6 +83,25 @@ service that deploys from this repo** (`web`, `web-staging`, `pivota-acp`, `ucp-
 prod `web` healthcheck. Keep it at `infra/gcp/Dockerfile` and build with `-f`; `.dockerignore` stays
 at the repo root because that is the build context root.
 
+## Production stack (created 2026-08-20)
+
+| resource | value |
+|---|---|
+| Cloud SQL | `pivota-prod:us-west1:pivota-pg` — POSTGRES_17, `db-custom-2-7680`, **REGIONAL** (HA), PITR on, deletion protection on, private IP `10.25.0.2` |
+| Memorystore | `pivota-redis` — `STANDARD_HA`, 2 GB, 1 replica, AUTH on, `10.25.7.196:6379` |
+| **Egress IP** | **`8.231.167.230`** — RESERVED (not ephemeral), via Cloud NAT `pivota-nat` on router `pivota-router` |
+| service accounts | `sa-backend`, `sa-gateway`, `sa-worker` @ `pivota-prod.iam.gserviceaccount.com` |
+| secrets | `pivota-db-password`, `DATABASE_URL`, `REDIS_URL` |
+
+**`8.231.167.230` is the address to give Antom and Adyen for IP allowlisting.** It is a reserved
+static address, so it survives NAT/router/instance changes. Staging's equivalent is
+`136.66.216.216` — do not hand that one to a partner.
+
+Note the prod path exercised a line staging never did: Memorystore's HA tier is spelled `standard`
+(the tier WITH a replica, reported back as `STANDARD_HA`). `standard_ha` is the API enum, and gcloud
+normalizes it to `standard-ha`, which is not a valid `--tier` choice — so the first prod run failed
+there while every staging run had passed.
+
 ## Known gaps before the Sep 8-12 prod cutover
 
 Tracked from the review of this PR; none is covered by these scripts yet.
@@ -106,11 +125,153 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `--storage-auto-increase` never raises the ceiling proactively. Use >= 100 GB for prod.
 8. **`--deny-maintenance-period`** is not set around Sep 8-12 or the late-Sep launch window.
    ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real restart.
-9. **Egress IP** — `--vpc-egress private-ranges-only` means no stable outbound IP. Resolve before
-   any Antom/Adyen IP-allowlisting conversation (needs a NAT + `all-traffic`).
+9. **Egress IP requires `all-traffic`.** `setup_egress_nat.sh` creates the reserved address, router
+   and NAT but does NOT switch the services' egress mode — and the deploy scripts default to
+   `private-ranges-only`, under which outbound traffic never traverses the VPC and therefore does not
+   leave via the NAT. The reserved IP is only the real source address once the services run with
+   `VPC_EGRESS=all-traffic`. Set that (and re-set it on every deploy) before giving any partner the
+   address, or the allowlist entry will not match.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
     SHA during cutover week can produce a different image. Pin or add a lockfile.
 11. **Dump bucket** — prod data lands in `gs://pivota-staging-migration` (a staging-project bucket)
     with no lifecycle rule, retention policy, or CMEK.
 12. **Cloud Build trigger** — images are built by hand with `COMMIT_SHA` passed in; provenance
     during cutover is manual.
+
+## Gateway (PIVOTA-Agent) on Cloud Run
+
+```bash
+# from a PIVOTA-Agent checkout
+gcloud builds submit --config ../pivota-backend-gcp/infra/gcp/cloudbuild.gateway.yaml \
+  --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+python3 ../pivota-backend-gcp/infra/gcp/port_railway_env.py \
+  --railway-service PIVOTA-Agent --railway-env production --env staging --prefix gateway --apply
+../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
+```
+
+The gateway reuses **its own repo's root Dockerfile**. That is safe there because PIVOTA-Agent's
+Railway services pin `builder=RAILPACK` explicitly, so the Dockerfile is inert on Railway - unlike
+pivota-backend, where adding a root Dockerfile hijacked the builder for 8 services.
+
+**`/healthz` is NOT reachable on Cloud Run.** Google's frontend intercepts it and returns its own
+404 before the request reaches the container; `/health` (the same handler) returns 200. Railway's
+configured healthcheckPath is `/healthz`, so any Cloud Run healthcheck, uptime check, or LB backend
+must use `/health`.
+
+**`--prefix` is mandatory when two services share a project.** It names the outputs
+`env.<env>.<prefix>.yaml` / `secrets.<env>.<prefix>.list`, prefixes Secret Manager entries
+`<prefix>-env-<NAME>`, **and** selects `env.<env>.<prefix>.overrides.yaml`. Without the prefix on the
+overrides file a port silently picks up another service's overrides and drops its own.
+
+**Staging cross-service URLs must be overridden.** The gateway's Railway env points every backend
+URL at production (`PIVOTA_API_BASE`, `PIVOTA_BACKEND_BASE_URL`, `PROMOTIONS_BACKEND_BASE_URL`,
+`DISCOVERY_PRODUCTS_SEARCH_BASE_URL`, `AURORA_BFF_RECO_CATALOG_SEARCH_BASE_URLS`,
+`NEXT_PUBLIC_API_URL`, `AGENT_AUTH_INTROSPECT_URL`, `PIVOTA_GATEWAY_URL`). A staging gateway left
+pointing at them would read production data and mint production-scoped tokens.
+
+### Open: staging service-to-service networking
+Both staging services are IAM-gated (no `allUsers`). Cloud Run→Cloud Run over `*.run.app` takes the
+public path, so with `--vpc-egress private-ranges-only` the gateway's calls to the backend will get
+401 until one of these is chosen:
+- **IAM + identity tokens** (correct, needs the gateway to mint an ID token per outbound call), or
+- **`--ingress internal` + `--vpc-egress all-traffic` + Cloud NAT** (no code change; NAT also gives
+  the stable egress IP that Antom/Adyen allowlisting will need).
+
+## Service-to-service networking (decided 2026-08-19)
+
+`infra/gcp/setup_egress_nat.sh <env>` creates a Cloud Router + Cloud NAT with a **reserved** static
+egress IP, then services are switched to:
+
+| service | ingress | egress |
+|---|---|---|
+| `web` (backend) | `internal` | `all-traffic` |
+| `gateway` | `all` (IAM-gated) | `all-traffic` |
+
+Cloud Run → Cloud Run over `*.run.app` takes the **public** path, so with `private-ranges-only`
+egress the caller arrives anonymous and an IAM-gated callee answers 401. Routing all egress through
+the VPC makes those calls arrive as internal, so `--ingress internal` becomes the perimeter and no
+identity-token code is needed. The backend is now unreachable from the internet (404 at the ingress,
+authenticated or not) while the gateway reaches it normally.
+
+**Staging egress IP: `136.66.216.216`** — reserved and stable, but staging-only. **Never give this
+to a partner.** The address for Antom/Adyen allowlisting is the PROD one, `8.231.167.230`.
+IP-allowlist. Run the script for `prod` to reserve the production one before partner onboarding.
+
+### `sslmode=require` does NOT mean the same thing in Python and Node
+
+Same DSN, different behaviour, and it only shows up against Cloud SQL:
+
+- **asyncpg (backend)** — `sslmode=require` encrypts but does **not** verify the server CA. Works
+  against Cloud SQL's per-instance CA out of the box.
+- **node-pg (gateway)** — maps `sslmode=require` to `rejectUnauthorized: true`, so it tries to verify
+  Cloud SQL's per-instance certificate and fails with `unable to verify the first certificate`. Every
+  DB-backed discovery provider reported `query_error` while the connection itself looked configured.
+
+Fix: the gateway gets `DATABASE_URL_NOVERIFY` (`?sslmode=no-verify`), which node-pg maps to
+`rejectUnauthorized: false` — encrypted, unverified, i.e. *exactly* what asyncpg was already doing,
+on a private VPC address. This was never visible on Railway, where the DB was reached through a
+public proxy hostname with a publicly-trusted certificate.
+
+Verified end to end after the fix: `discovery_ready: true`, and
+`GET /agent/v1/products/search?q=vitamin+c+serum` returns 200 with real catalog rows —
+gateway → backend → Cloud SQL, entirely over the VPC.
+
+## Second database: `pci_kb`
+
+A second live Railway database (PG 16, ~24 MB, 23 tables — ingredient/PCI reference data) is read by
+**both** the backend (`PCI_KB_DATABASE_URL`) and the gateway (`PCI_KB_DATABASE_URL` +
+`INGREDIENT_REFERENCE_DATABASE_URL`). It now lives as a second database on the same Cloud SQL
+instance:
+
+```bash
+gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
+  --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ),\
+_SECRET=railway-pcikb-db-url,_NAME=pcikb,_SSLMODE=prefer
+DB=pci_kb infra/gcp/restore_to_cloudsql.sh staging gs://pivota-staging-migration/pcikb-<stamp>.sql.gz
+```
+
+Two things this surfaced:
+
+- **`_SSLMODE=prefer` is required for this source.** The `pci_kb` Railway TCP proxy does not
+  terminate TLS (`server does not support SSL, but SSL was required`), unlike the main DB's proxy.
+  The hop is therefore unencrypted; acceptable only because the content is public reference data
+  (ingredients, papers, KB snippets) with no credentials and no buyer PII. Do not reuse `prefer` for
+  the main database.
+- **The dump verifier was wrong, not the dump.** It counted `CREATE TABLE` across all schemas but
+  compared against `table_schema='public'` only, so any database with a second schema false-alarmed
+  (`dumped=23 live=19`). It now counts every non-system schema and fails only on a *shortfall* —
+  a dump legitimately carries more CREATE TABLE statements than the query counts.
+
+Secrets: `PCI_KB_DATABASE_URL` (asyncpg, `sslmode=require`) and `PCI_KB_DATABASE_URL_NOVERIFY`
+(node-pg, `sslmode=no-verify`) — see the sslmode section above for why they differ.
+
+## Scheduling: `infra/gcp/setup_scheduler.sh <env> <backend-tag> <gateway-tag>`
+
+Railway ran the periodic work three different ways; Cloud Run needs three different answers:
+
+| Railway | interval | Cloud Run |
+|---|---|---|
+| audit/executor drainer ticks, inside the `web` service | 5–10 s | **`worker` service**, min=max=1, ingress internal |
+| 8 APScheduler jobs inside `web` (daily … 15/30/60 min) | mixed | same `worker` process, gated by `AUDIT_WORKER_ENABLED` |
+| `relgraph-sync-routine` | cron `37 10 * * *` | Cloud Run **Job** + Cloud Scheduler |
+| `invitation worker` (`while true; sleep 60`) | 60 s | Cloud Run **Job** + Scheduler `* * * * *` |
+
+**The drainers cannot become Scheduler jobs** — Scheduler's minimum interval is one minute. And they
+must not stay on `web`: `services/audit_scheduler.py` has no cross-process lock (APScheduler's
+`max_instances=1` is per-process), so every autoscaled instance would drain the same queue. Pinning
+them to a single-instance service reproduces Railway's semantics exactly, which is what a cutover
+needs; splitting the 8 periodic jobs into individual Scheduler entries is a later refactor.
+
+**Both environments are created inert on purpose**: both Scheduler triggers are PAUSED and the worker runs with
+`AUDIT_WORKER_ENABLED=false`, because staging holds a restored production snapshot and still carries
+production third-party credentials — draining that queue would execute production-derived rows
+against live Stripe/SendGrid/Shopify. **Prod is inert too**: until the DNS flip, GCP prod runs
+against a COPY of production data with the REAL production credentials while Railway still serves,
+so a second set of drainers would double-send and double-charge. Arming is an explicit, deliberate
+cutover step: `WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>`, run only AFTER
+Railway's workers are stopped.
+
+Verified 2026-08-19: the `worker` revision logs
+`shared-queue worker ticks DISABLED on this service (service_name='worker' platform_env='staging')`
+— the platform shim resolving its own identity — and `gcloud run jobs execute relgraph-sync`
+completed in 3m50s with `ok: true`.

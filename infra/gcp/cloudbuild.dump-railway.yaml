@@ -8,9 +8,16 @@
 substitutions:
   _BUCKET: pivota-staging-migration
   _STAMP: manual
+  _SECRET: railway-prod-db-url   # Secret Manager entry holding the SOURCE Railway DSN
+  _NAME: prod                    # object basename: gs://<bucket>/<name>-<stamp>.sql.gz
+  # `require` for the main DB. The pci_kb Railway TCP proxy does NOT terminate TLS, so it needs
+  # `prefer` (negotiate, fall back to plaintext). Only lower this for a source that refuses SSL, and
+  # only when the content justifies an unencrypted hop - pci_kb is public reference data
+  # (ingredients, papers, KB snippets), no credentials and no buyer PII.
+  _SSLMODE: require
 availableSecrets:
   secretManager:
-    - versionName: projects/$PROJECT_ID/secrets/railway-prod-db-url/versions/latest
+    - versionName: projects/$PROJECT_ID/secrets/${_SECRET}/versions/latest
       env: RAILWAY_DB_URL
 steps:
   - name: postgres:17
@@ -26,7 +33,8 @@ steps:
         # exiting 0, the step passes, and a PARTIAL database gets imported over the cutover window.
         # Append the sslmode parameter with the right separator; the URL may already carry a query.
         case "$${RAILWAY_DB_URL}" in *\?*) SEP='&' ;; *) SEP='?' ;; esac
-        pg_dump "$${RAILWAY_DB_URL}$${SEP}sslmode=require" --no-owner --no-privileges --format=plain \
+        echo "sslmode=${_SSLMODE}"
+        pg_dump "$${RAILWAY_DB_URL}$${SEP}sslmode=${_SSLMODE}" --no-owner --no-privileges --format=plain \
           | gzip -1 > /workspace/prod.sql.gz
         ls -la /workspace/prod.sql.gz
 
@@ -35,17 +43,23 @@ steps:
         gzip -cd /workspace/prod.sql.gz | tail -5 | grep -q 'PostgreSQL database dump complete' \
           || { echo "FATAL: dump has no completion trailer - TRUNCATED"; exit 1; }
         DUMPED=$(gzip -cd /workspace/prod.sql.gz | grep -c '^CREATE TABLE ')
-        LIVE=$(psql "$${RAILWAY_DB_URL}$${SEP}sslmode=require" -Atc \
-          "select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE'")
+        # Count EVERY non-system schema: pg_dump dumps them all, so restricting the live side to
+        # 'public' under-counts and false-alarms on any database that uses a second schema.
+        LIVE=$(psql "$${RAILWAY_DB_URL}$${SEP}sslmode=${_SSLMODE}" -Atc \
+          "select count(*) from information_schema.tables
+             where table_schema not in ('pg_catalog','information_schema')
+               and table_schema not like 'pg_toast%' and table_type='BASE TABLE'")
         echo "tables: dumped=$${DUMPED} live=$${LIVE}"
-        [ "$${DUMPED}" = "$${LIVE}" ] || { echo "FATAL: table count mismatch"; exit 1; }
+        # Fail only on a SHORTFALL. The dump legitimately carries more CREATE TABLE statements than
+        # this query counts (partitions, extension-owned tables); fewer means we lost something.
+        [ "$${DUMPED}" -ge "$${LIVE}" ] || { echo "FATAL: dump has FEWER tables than the source - truncated"; exit 1; }
         echo "$${DUMPED}" > /workspace/table_count.txt
   - name: gcr.io/cloud-builders/gsutil
     id: upload
-    args: ['cp', '/workspace/prod.sql.gz', 'gs://${_BUCKET}/prod-${_STAMP}.sql.gz']
+    args: ['cp', '/workspace/prod.sql.gz', 'gs://${_BUCKET}/${_NAME}-${_STAMP}.sql.gz']
   - name: gcr.io/cloud-builders/gsutil
     id: upload-manifest
-    args: ['cp', '/workspace/table_count.txt', 'gs://${_BUCKET}/prod-${_STAMP}.tables']
+    args: ['cp', '/workspace/table_count.txt', 'gs://${_BUCKET}/${_NAME}-${_STAMP}.tables']
 options:
   machineType: E2_HIGHCPU_8
   logging: CLOUD_LOGGING_ONLY

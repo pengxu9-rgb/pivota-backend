@@ -45,7 +45,11 @@ CRED_VALUE_RE = re.compile(
     r"|sk_live_|sk_test_|rk_live_|whsec_|ghp_|github_pat_|xoxb-|xoxp-|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}"
     r"|://[^\s]*/(?:hook|webhook|bot)/[A-Za-z0-9_-]{16,}"
     r"|[?&](?:api_?key|token|secret|signature|sig)=[^&\s]{12,})", re.I)
-DROP_EXACT = {"PORT", "DATABASE_URL", "REDIS_URL", "DATABASE_PUBLIC_URL", "REDIS_PUBLIC_URL"}
+# Every DSN must come from Cloud SQL/Memorystore, never from the Railway env: --set-secrets is
+# last-wins and the ported list is appended after the explicit mounts, so a ported DSN would
+# silently override the Cloud SQL one and keep the service reading from Railway after cutover.
+DROP_EXACT = {"PORT", "DATABASE_URL", "REDIS_URL", "DATABASE_PUBLIC_URL", "REDIS_PUBLIC_URL",
+              "PCI_KB_DATABASE_URL", "INGREDIENT_REFERENCE_DATABASE_URL"}
 DROP_PREFIX = ("RAILWAY_", "NIXPACKS_", "RAILPACK_")
 
 def railway_vars(service, env):
@@ -88,11 +92,21 @@ def main():
     ap.add_argument("--project")
     ap.add_argument("--apply", action="store_true", help="create/update Secret Manager secrets")
     ap.add_argument("--gcloud", default=os.environ.get("GCLOUD", "gcloud"))
+    # Distinguishes one service's port from another's inside the same GCP project: the gateway and
+    # the backend share a project but not an env set, and their Secret Manager entries must not collide.
+    ap.add_argument("--prefix", help="write env.<env>.<prefix>.yaml and prefix secrets as <PREFIX>-env-<NAME>")
     a = ap.parse_args()
     project = a.project or f"pivota-{a.env}"
 
     raw = railway_vars(a.railway_service, a.railway_env)
-    overrides = load_yaml_simple(HERE / f"env.{a.env}.overrides.yaml")
+    # The overrides filename must carry the same prefix as the outputs, or a prefixed port silently
+    # picks up ANOTHER service's overrides and drops its own (which is how a staging gateway nearly
+    # shipped pointing at the production backend).
+    ov_name = f"env.{a.env}.{a.prefix}.overrides.yaml" if a.prefix else f"env.{a.env}.overrides.yaml"
+    ov_path = HERE / ov_name
+    if not ov_path.exists():
+        print(f"WARNING: no {ov_name} - nothing will be overridden for this port", file=sys.stderr)
+    overrides = load_yaml_simple(ov_path)
     plain, secrets, dropped, rows = {}, {}, [], []
     for k in sorted(raw):
         v = raw[k]
@@ -115,25 +129,27 @@ def main():
         rows.append((k, "secret" if is_secret else "plain", "override(new)", ""))
 
     # plain env -> yaml
-    out_yaml = HERE / f"env.{a.env}.yaml"
+    tag = f".{a.prefix}" if a.prefix else ""
+    sec_prefix = f"{a.prefix}-" if a.prefix else ""
+    out_yaml = HERE / f"env.{a.env}{tag}.yaml"
     out_yaml.write_text("".join(f"{k}: {yaml_quote(v)}\n" for k, v in sorted(plain.items())))
     os.chmod(out_yaml, 0o600)
     # secrets list -> deploy mapping (names only; safe to commit? no — keep git-ignored, names reveal integrations)
-    secrets_list = HERE / f"secrets.{a.env}.list"
-    secrets_list.write_text("".join(f"{k}=env-{k}:latest\n" for k in sorted(secrets)))
+    secrets_list = HERE / f"secrets.{a.env}{tag}.list"
+    secrets_list.write_text("".join(f"{k}={sec_prefix}env-{k}:latest\n" for k in sorted(secrets)))
     os.chmod(secrets_list, 0o600)
 
     print(f"\n{'VAR':55} {'class':7} {'source':14} live-mode?")
     for r in rows: print(f"{r[0]:55} {r[1]:7} {r[2]:14} {r[3]}")
     print(f"\nplain={len(plain)} secrets={len(secrets)} dropped={len(dropped)} ({', '.join(dropped[:6])}{'...' if len(dropped)>6 else ''})")
-    print(f"wrote {out_yaml.name}, secrets.{a.env}.list (both git-ignored)")
+    print(f"wrote {out_yaml.name}, {secrets_list.name} (both git-ignored); overrides from {ov_name}")
     flagged = [r[0] for r in rows if r[3]]
     if a.env == "staging" and flagged:
         print(f"\n!! {len(flagged)} vars look LIVE-MODE and have no override for staging — review before deploying:\n   " + "\n   ".join(flagged))
 
     if a.apply:
         for k, v in sorted(secrets.items()):
-            name = f"env-{k}"
+            name = f"{sec_prefix}env-{k}"
             exists = subprocess.run([a.gcloud, "secrets", "describe", name, "--project", project], capture_output=True).returncode == 0
             if not exists:
                 subprocess.run([a.gcloud, "secrets", "create", name, "--replication-policy=automatic", "--project", project], check=True, capture_output=True)
