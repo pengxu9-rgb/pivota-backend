@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Global external HTTPS load balancer in front of the Cloud Run services.
+#   infra/gcp/setup_load_balancer.sh staging|prod
+#
+# WHY CERTIFICATE MANAGER RATHER THAN A CLASSIC MANAGED CERT:
+# A google-managed SSL certificate on a target proxy validates by HTTP, so it only goes ACTIVE once
+# the hostname ALREADY points at this load balancer. During a cutover that means: flip DNS -> serve
+# TLS errors -> wait for issuance. Certificate Manager validates via a DNS TXT record instead, so
+# every certificate can reach ACTIVE while traffic is still on Railway, and the cutover becomes a
+# pure DNS change with no TLS gap. That is the whole reason for the extra moving parts here.
+#
+# The TXT records this prints must be added at the DNS host (HiChina) BEFORE the certs can issue.
+# They are additive and independent of the A/CNAME records that carry live traffic.
+set -euo pipefail
+ENV="${1:-}"
+case "$ENV" in
+  staging) PROJECT=pivota-staging; PREFIX=pivota-staging ;;
+  prod)    PROJECT=pivota-prod;    PREFIX=pivota ;;
+  *) echo "usage: $0 staging|prod" >&2; exit 2 ;;
+esac
+GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1
+export CLOUDSDK_CORE_PROJECT="$PROJECT"
+have(){ "$@" >/dev/null 2>&1; }
+say(){ printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
+
+# host -> cloud run service
+HOSTS_WEB="api.pivota.cc"
+HOSTS_GATEWAY="gateway.pivota.cc mcp.pivota.cc commerce.mcp.pivota.cc ucp.pivota.cc acp.pivota.cc"
+ALL_HOSTS="$HOSTS_WEB $HOSTS_GATEWAY"
+
+say "static anycast IP"
+have "$GCLOUD" compute addresses describe "$PREFIX-lb-ip" --global \
+  || "$GCLOUD" compute addresses create "$PREFIX-lb-ip" --global --ip-version=IPV4 \
+       --description="Global HTTPS LB frontend for $ENV"
+LB_IP=$("$GCLOUD" compute addresses describe "$PREFIX-lb-ip" --global --format='value(address)')
+
+say "serverless NEGs + backend services"
+for svc in web gateway; do
+  have "$GCLOUD" compute network-endpoint-groups describe "$PREFIX-neg-$svc" --region "$REGION" \
+    || "$GCLOUD" compute network-endpoint-groups create "$PREFIX-neg-$svc" \
+         --region "$REGION" --network-endpoint-type=serverless --cloud-run-service="$svc"
+  have "$GCLOUD" compute backend-services describe "$PREFIX-be-$svc" --global \
+    || "$GCLOUD" compute backend-services create "$PREFIX-be-$svc" --global \
+         --load-balancing-scheme=EXTERNAL_MANAGED --protocol=HTTPS --enable-logging --logging-sample-rate=1.0
+  "$GCLOUD" compute backend-services add-backend "$PREFIX-be-$svc" --global \
+    --network-endpoint-group="$PREFIX-neg-$svc" --network-endpoint-group-region="$REGION" 2>/dev/null || true
+done
+
+say "certificates (DNS-authorized, so they issue BEFORE the cutover)"
+CERT_LIST=""
+for h in $ALL_HOSTS; do
+  slug=$(printf '%s' "$h" | tr '.' '-')
+  have "$GCLOUD" certificate-manager dns-authorizations describe "auth-$slug" \
+    || "$GCLOUD" certificate-manager dns-authorizations create "auth-$slug" --domain="$h"
+  have "$GCLOUD" certificate-manager certificates describe "cert-$slug" \
+    || "$GCLOUD" certificate-manager certificates create "cert-$slug" --domains="$h" --dns-authorizations="auth-$slug"
+  CERT_LIST="${CERT_LIST}${CERT_LIST:+,}cert-$slug"
+done
+have "$GCLOUD" certificate-manager maps describe "$PREFIX-certmap" \
+  || "$GCLOUD" certificate-manager maps create "$PREFIX-certmap"
+for h in $ALL_HOSTS; do
+  slug=$(printf '%s' "$h" | tr '.' '-')
+  have "$GCLOUD" certificate-manager maps entries describe "entry-$slug" --map="$PREFIX-certmap" \
+    || "$GCLOUD" certificate-manager maps entries create "entry-$slug" --map="$PREFIX-certmap" \
+         --hostname="$h" --certificates="cert-$slug"
+done
+
+say "url map"
+if ! have "$GCLOUD" compute url-maps describe "$PREFIX-urlmap"; then
+  # Default to the backend service; every known host is matched explicitly below.
+  "$GCLOUD" compute url-maps create "$PREFIX-urlmap" --default-service="$PREFIX-be-web"
+fi
+for h in $HOSTS_GATEWAY; do
+  slug=$(printf '%s' "$h" | tr '.' '-')
+  have "$GCLOUD" compute url-maps describe "$PREFIX-urlmap" --format="value(hostRules)" \
+    && "$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
+         --path-matcher-name="pm-$slug" --default-service="$PREFIX-be-gateway" --new-hosts="$h" 2>/dev/null || true
+done
+"$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
+  --path-matcher-name="pm-api" --default-service="$PREFIX-be-web" --new-hosts="$HOSTS_WEB" 2>/dev/null || true
+
+say "https proxy + forwarding rule"
+have "$GCLOUD" compute target-https-proxies describe "$PREFIX-https-proxy" --global \
+  || "$GCLOUD" compute target-https-proxies create "$PREFIX-https-proxy" --global \
+       --url-map="$PREFIX-urlmap" --certificate-map="$PREFIX-certmap"
+have "$GCLOUD" compute forwarding-rules describe "$PREFIX-https-fr" --global \
+  || "$GCLOUD" compute forwarding-rules create "$PREFIX-https-fr" --global \
+       --load-balancing-scheme=EXTERNAL_MANAGED --address="$PREFIX-lb-ip" --target-https-proxy="$PREFIX-https-proxy" --ports=443
+
+say "http -> https redirect"
+if ! have "$GCLOUD" compute url-maps describe "$PREFIX-redirect"; then
+  cat > /tmp/redirect-$$.yaml <<YAML
+name: $PREFIX-redirect
+defaultUrlRedirect:
+  redirectResponseCode: MOVED_PERMANENTLY_DEFAULT
+  httpsRedirect: true
+YAML
+  "$GCLOUD" compute url-maps import "$PREFIX-redirect" --source=/tmp/redirect-$$.yaml --global --quiet
+  rm -f /tmp/redirect-$$.yaml
+fi
+have "$GCLOUD" compute target-http-proxies describe "$PREFIX-http-proxy" --global \
+  || "$GCLOUD" compute target-http-proxies create "$PREFIX-http-proxy" --url-map="$PREFIX-redirect" --global
+have "$GCLOUD" compute forwarding-rules describe "$PREFIX-http-fr" --global \
+  || "$GCLOUD" compute forwarding-rules create "$PREFIX-http-fr" --global \
+       --load-balancing-scheme=EXTERNAL_MANAGED --address="$PREFIX-lb-ip" --target-http-proxy="$PREFIX-http-proxy" --ports=80
+
+say "DNS records required"
+echo "  LOAD BALANCER IP: $LB_IP"
+echo
+echo "  1) Certificate validation TXT records - add these NOW; certs issue without touching traffic:"
+for h in $ALL_HOSTS; do
+  slug=$(printf '%s' "$h" | tr '.' '-')
+  "$GCLOUD" certificate-manager dns-authorizations describe "auth-$slug" \
+    --format="value[separator='  '](dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)" | sed 's/^/     /'
+done
+echo
+echo "  2) AT CUTOVER, repoint each host from its Railway CNAME to this LB:"
+for h in $ALL_HOSTS; do echo "     $h  ->  A  $LB_IP"; done
