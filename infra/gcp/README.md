@@ -113,27 +113,35 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `worker` plus the `relgraph-sync` and `reviews-invitation-send` Cloud Run Jobs and their two
    Cloud Scheduler triggers. Everything is created PAUSED / workers-off; arming is the explicit
    cutover step `WORKERS=true PAUSED=0 ...`, run only after Railway's workers stop.
-3. **Remaining un-migrated services.** The gateway, proof-issuer and acp are deployed (see the
-   sections above). Still Railway-only:
+3. **Remaining un-migrated services.** The gateway and proof-issuer are deployed (see the sections
+   above). See also **`docs/adr/ADR-021`**, which already decided the disposition of four of these.
 
-   | service | source repo | prod state | disposition |
-   |---|---|---|---|
-   | `ucp-worker` | `pivota-acp` | **FAILED** 2026-08-20 | **kill candidate** |
-   | `ucp-web-production` | `pivota-acp` | **FAILED since 2026-01-15** | **kill candidate** |
-   | `ucp-platform-receiver` | `pivota-acp` | SUCCESS | **kill candidate** |
-   | `catalog-intelligence` | own repo | SUCCESS | migrate — own Postgres + Redis |
-   | `bulk-email-tool` | own repo | SUCCESS | **KEEP** (2026-08-20) — see below |
+   | service | Railway project | source repo (branch) | prod state | disposition |
+   |---|---|---|---|---|
+   | `ucp-worker` | Pivota Infra | `pivota-acp` (`main`) | **running** on a Jul-10 image; Aug-20 redeploy failed | **retire — ADR-021** |
+   | `ucp-web-production` | Pivota Infra | `pivota-acp` (`main`) | **never once booted** (99 deploys, 0 SUCCESS) | **retire — ADR-021** |
+   | `ucp-platform-receiver` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS; 0 real requests | **retire — ADR-021** |
+   | `pivota-acp` | Pivota Infra | `pivota-acp` (`main`) | SUCCESS | **retire — ADR-021** (see the warning below) |
+   | `catalog-intelligence` | catalog-intelligence | own repo | service SUCCESS; 2 of its 3 sub-services FAILED | migrate — own Postgres + Redis |
+   | `bulk-email-tool` | bulk-email-tool | `bulk-email-tool` | SUCCESS | **KEEP** (2026-08-20) — see below |
 
-   **The three `ucp-*` services are superseded, not merely un-migrated.** The UCP/ACP/MCP doors are
-   custom domains on the **PIVOTA-Agent** service — verified live: `acp.pivota.cc` answers
-   `{"service":"PIVOTA-Agent"}`, and `ucp.pivota.cc/.well-known/ucp` returns 200 from PIVOTA-Agent
-   while `ucp-worker` is dead. Two of the three cannot start at all: both exit on
-   `DATABASE_URL is required` / `from db.database import database`, and **neither has ever had a
-   `DATABASE_URL`** — `ucp-worker` carries only 7 UCP config vars. A queue-polling worker without
-   database access has never drained a queue. `ucp-web-production` has been failing since January.
+   **ADR-021 (Accepted, 2026-08-01) already retired the four Infra services** and called for rotating
+   the Stripe/Adyen keys they held. This is a closed decision, not an open question. Supporting
+   evidence gathered 2026-08-20: the UCP/ACP/MCP doors are custom domains on **PIVOTA-Agent** (none
+   of the four has a custom domain); the only writer to `ucp_order_webhook_deliveries` lives in
+   `ucp-web`, which has never booted; `ucp-worker` polls successfully every 30s and logs
+   `drained=0 total=0` because nothing enqueues — **not** because it lacks a database. ADR-021 is
+   explicit that outbound UCP webhook delivery deliberately has **no home** after retirement.
 
-   Do not migrate these. Confirm nothing enqueues to them, then delete them — that is a decision to
-   take deliberately, not a cleanup to fold into the cutover.
+   **Ordering:** delete `ucp-web` with or before `ucp-worker` — `ucp-web` is the only thing that can
+   write the queue, so removing the worker first would leave a writer with no drainer.
+
+   ⚠️ **`pivota-acp` is deployed to Cloud Run, which contradicts ADR-021.** That deployment was made
+   on 2026-08-20 without reference to the ADR. ADR-021 §1 moved ACP checkout in-process into
+   pivota-backend and §4 states `PLATFORM_ORDERS_ACP_URL` "stays unset forever". Resolve this before
+   cutover: either delete the Cloud Run `acp` service and its ported secrets, or supersede ADR-021
+   deliberately. Note the ported secrets include live `STRIPE_SECRET_KEY` and `ADYEN_API_KEY`, which
+   ADR-021 said to **rotate** as part of retirement — copying them to a new home is not rotation.
 
 4. **DNS cutover mechanics** — the load balancer EXISTS with six ACTIVE certificates
    (`api`, `gateway`, `mcp`, `commerce.mcp`, `ucp`, `acp`). The **apex does NOT move**:
@@ -408,6 +416,19 @@ select column_name from information_schema.columns where table_name='checkout_se
 ```
 
 
+### `bulk-email-tool` — KEEP, and easy to lose
+
+It lives in its own Railway project (`bulk-email-tool`, repo `pengxu9-rgb/bulk-email-tool`) and
+serves a live custom domain `bulk-email-tool.pivota.cc` that is deliberately **not** in the load
+balancer's six-host list and has no cert-map entry. Nothing in the cutover touches it, and nothing
+in the cutover would notice if it disappeared.
+
+- It is **not** part of the Sep 8-12 DNS flip. Its CNAME stays pointed at Railway, which is correct.
+- **Do not decommission the Railway account** on the assumption that everything moved. This service,
+  plus `catalog-intelligence`, still run there.
+- Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
+  plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
+
 ## Which services a repo redeploys — check this before merging
 
 Railway auto-deploys **every service whose source is a repo you push to**, not just the one you were
@@ -416,22 +437,32 @@ of them failed.
 
 | repo | services it redeploys |
 |---|---|
-| `pengxu9-rgb/pivota-acp` | `pivota-acp`, `ucp-platform-receiver`, `ucp-web-production`, `ucp-worker` |
-| `pengxu9-rgb/pivota-backend` | `web`, `reviews-proof-issuer`, `invitation worker` |
-| `pengxu9-rgb/PIVOTA-Agent` | `PIVOTA-Agent` (its own project) |
+| repo (branch) | project | services it redeploys |
+|---|---|---|
+| `pivota-acp` (`main`) | Pivota Infra | `pivota-acp`, `ucp-platform-receiver`, `ucp-web-production`, `ucp-worker` |
+| `pivota-backend` (`main`) | Pivota Infra | `web`, `reviews-proof-issuer`, `invitation worker` |
+| `pivota-backend` (`staging/reviews-center`) | staging/reviews | `pivota-backend`, `Cron/Job service`, `proof issuer` |
+| `pivota-backend` (`feature/ap2-safe`) | pivota-ap2-staging | `web` |
+| `PIVOTA-Agent` (`main`) | Pivota Agent | `PIVOTA-Agent` |
+
+**The branch matters.** `pivota-backend` has seven repo-connected service instances across four
+projects, not three — a push to `main` redeploys three of them, but the table above is the full
+picture. `web-staging` and `relgraph-sync-routine` have NO repo source: they are deployed by CLI
+`railway up`, so a push does not touch them.
 
 Regenerate this table rather than trusting it — services get added:
 
 ```bash
-railway api 'query { project(id: "<id>") { services { edges { node { name
-  serviceInstances { edges { node { source { repo } } } }
-  deployments(first:1) { edges { node { status createdAt } } } } } } } }'
+# deploymentTriggers is authoritative - serviceInstances.source.repo is NOT (a service can carry a
+# repo source with no trigger, and a push then does nothing). Run this per project, for all of them.
+railway api 'query { project(id: "<id>") { name
+  services { edges { node { name deploymentTriggers { edges { node { repository branch } } } } } } } }'
 ```
 
 Two incidents came from not doing this:
 
 - A root `Dockerfile` added to `pivota-backend` switched the builder from Railpack to Docker for
-  **all three** of its services; prod `web` built, then failed its health check.
+  **every service that builds from that repo**; prod `web` built, then failed its health check.
 - A merge to `pivota-acp` redeployed `ucp-worker`, which had been running a July image and could not
   start on current code. That service turned out to be vestigial, so the blast radius was luck
   rather than diligence.
