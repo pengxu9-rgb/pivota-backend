@@ -38,7 +38,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
 SERVICE="${SERVICE:-web}"
-IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$TAG"
+# Reusable for the other Python services that ship from this repo or their own image:
+#   IMAGE_NAME  which Artifact Registry image to run (backend | acp | ...)
+#   ENV_PREFIX  which ported env/secrets files to use (empty = the backend's)
+#   RUN_COMMAND/RUN_ARGS  override the image entrypoint (proof-issuer is the same backend image
+#               with a different ASGI app, so it needs no image of its own)
+: "${IMAGE_NAME:=backend}"
+: "${ENV_PREFIX:=}"
+IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/$IMAGE_NAME:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
 # an existing service. A brand-new service has no previous revision to protect anyway.
@@ -47,14 +54,21 @@ if "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$RE
 else
   NO_TRAFFIC=""; FIRST_DEPLOY=1; echo "note: $SERVICE does not exist yet - first revision takes traffic immediately"
 fi
-ENV_FILE="$HERE/env.$ENV.yaml"
-SECRETS_FILE="$HERE/secrets.$ENV.list"
+TAGPART="${ENV_PREFIX:+.$ENV_PREFIX}"
+ENV_FILE="$HERE/env.$ENV$TAGPART.yaml"
+SECRETS_FILE="$HERE/secrets.$ENV$TAGPART.list"
 [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "missing $ENV_FILE / $SECRETS_FILE — run port_railway_env.py first" >&2; exit 1; }
 
 # Secret Manager mappings: DATABASE_URL/REDIS_URL from bootstrap + every env-* secret
 SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,$(paste -sd, "$SECRETS_FILE")"
 
 # gcloud allows only ONE env-vars flag: merge the ported file with the platform vars into a temp file
+CMD_ARGS=()
+# Use the --flag=value form: RUN_ARGS legitimately starts with a dash (e.g. "-m,uvicorn,...") and
+# argparse would otherwise read it as the next FLAG and report "--args: expected one argument".
+[ -n "${RUN_COMMAND:-}" ] && CMD_ARGS+=("--command=$RUN_COMMAND")
+[ -n "${RUN_ARGS:-}" ]    && CMD_ARGS+=("--args=$RUN_ARGS")
+
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # NOTE: port_railway_env.py drops RAILWAY_*, but several gates in this codebase still read those
 # names directly and FAIL-SAFE TOWARD ON when they are absent (utils/startup_mode.py:14 heavy startup,
@@ -79,10 +93,11 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
 
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
-  --service-account "sa-backend@$PROJECT.iam.gserviceaccount.com" \
+  --service-account "${SERVICE_ACCOUNT:-sa-backend}@$PROJECT.iam.gserviceaccount.com" \
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   --env-vars-file "$MERGED" \
   --set-secrets "$SECRETS" \
+  ${CMD_ARGS[@]+"${CMD_ARGS[@]}"} \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
   --min-instances "$MIN" --max-instances "$MAX" \
   --no-cpu-throttling --cpu-boost \

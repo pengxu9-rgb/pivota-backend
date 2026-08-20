@@ -275,3 +275,42 @@ Verified 2026-08-19: the `worker` revision logs
 `shared-queue worker ticks DISABLED on this service (service_name='worker' platform_env='staging')`
 — the platform shim resolving its own identity — and `gcloud run jobs execute relgraph-sync`
 completed in 3m50s with `ok: true`.
+
+
+## proof-issuer and acp on Cloud Run
+
+Both are deployed with the SAME script as the backend — `deploy_backend.sh` is now parameterised
+rather than duplicated, so every safety fix (opt-in workers, candidate-verify before traffic, egress
+mode, duplicate-key stripping) applies to all of them:
+
+```bash
+# proof-issuer: the SAME backend image, a different ASGI app. It ships from this repo, is stateless
+# (no DB, no scheduler), so it needs no image and no gating of its own.
+SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
+  RUN_COMMAND=python RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
+  infra/gcp/deploy_backend.sh prod <backend-sha>
+
+# acp: its own repo (pengxu9-rgb/pivota-acp) and its own root Dockerfile.
+gcloud builds submit --config <acp cloudbuild> --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+SERVICE=acp IMAGE_NAME=acp ENV_PREFIX=acp \
+  RUN_COMMAND=uvicorn RUN_ARGS="--app-dir,./pivota_infra,src.main:app,--host,0.0.0.0,--port,8080" \
+  infra/gcp/deploy_backend.sh prod <acp-sha>
+```
+
+Two things worth knowing:
+
+- **The acp image's own CMD ends in `--reload`.** That is a uvicorn development flag: it spawns a
+  file-watcher process and reloads on change. It is harmless on Railway but wasteful and fragile on
+  Cloud Run, so the deploy overrides the command to drop it. `RUN_ARGS` must be passed as
+  `--args=VALUE` (the script does this) because the value legitimately starts with a dash and
+  argparse would otherwise read it as the next flag.
+- **Both are IAM-open but network-closed** — `--ingress internal-and-cloud-load-balancing` plus
+  `allUsers` invoker. That is deliberate: the backend calls them with shared-secret headers
+  (`REVIEWS_BUYER_PROOF_ISSUER_INTERNAL_KEY`, `ACP_SERVICE_TOKEN`), not identity tokens, so an
+  IAM-gated service would 403 every legitimate call. The VPC is the perimeter and the shared secret
+  is the app-level auth, exactly as on Railway. Verified: 200 from a VPC-attached job, 404 from the
+  public internet.
+
+acp is deployed inert for the pre-cutover window — `ACP_ENABLE_REAL_CAPTURE=false` and
+`DISABLE_WEBHOOK_OUTBOX=true`, and its backend/webhook URLs point at the GCP backend rather than the
+live Railway one, so it cannot act on production orders while Railway is still serving.
