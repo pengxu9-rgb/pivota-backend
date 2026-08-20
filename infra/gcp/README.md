@@ -113,9 +113,30 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `worker` plus the `relgraph-sync` and `reviews-invitation-send` Cloud Run Jobs and their two
    Cloud Scheduler triggers. Everything is created PAUSED / workers-off; arming is the explicit
    cutover step `WORKERS=true PAUSED=0 ...`, run only after Railway's workers stop.
-3. **Remaining un-migrated services** — `ucp-worker`, `ucp-platform-receiver`, and
-   `catalog-intelligence` still run only on Railway. The gateway, proof-issuer and acp are deployed
-   (see the sections above).
+3. **Remaining un-migrated services.** The gateway, proof-issuer and acp are deployed (see the
+   sections above). Still Railway-only:
+
+   | service | Railway project | why it is still there |
+   |---|---|---|
+   | `ucp-worker` | Pivota Infra | no Cloud Run deploy yet; its prod deploy is currently **FAILED** on Railway — establish whether it is still needed before spending effort migrating it |
+   | `ucp-platform-receiver` | Pivota Infra | no Cloud Run deploy yet (prod deploy healthy) |
+   | `catalog-intelligence` | catalog-intelligence | separate repo + its own Postgres and Redis |
+   | `bulk-email-tool` | bulk-email-tool | **KEEP** (2026-08-20 decision) — see below |
+
+   **`bulk-email-tool` is the one that can be lost by accident.** It lives in its own Railway project,
+   appears in **no repo in this org**, and serves a live custom domain `bulk-email-tool.pivota.cc`
+   that is deliberately NOT in the load balancer's six-host list and has no cert-map entry. Nothing
+   in the cutover touches it, and nothing in the cutover would notice if it disappeared.
+
+   Consequences, both intentional:
+   - It is **not** part of the Sep 8-12 DNS flip. Its CNAME stays pointed at Railway, which is
+     correct — it is independent of the six hosts that must move together.
+   - **Do not decommission the Railway account** on the assumption that everything moved. This
+     service, plus the three above, still run there. Decommissioning is a separate decision that
+     comes after each of these has either migrated or been explicitly killed.
+
+   Migrating it later means: its own image, its own Cloud Run service, and a **seventh** certificate
+   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 4. **DNS cutover mechanics** — the load balancer EXISTS with six ACTIVE certificates
    (`api`, `gateway`, `mcp`, `commerce.mcp`, `ucp`, `acp`). The **apex does NOT move**:
    `pivota.cc`/`www` are Vercel-served and have no cert-map entry, so pointing them at the LB fails
