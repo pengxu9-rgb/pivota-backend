@@ -88,7 +88,7 @@ logger = logging.getLogger("accounts_orders")
 
 ACCESS_COOKIE_NAME = "acc_access_token"
 REFRESH_COOKIE_NAME = "acc_refresh_token"
-DEFAULT_AURORA_BFF_BASE = "https://pivota-agent-production.up.railway.app"
+DEFAULT_AURORA_BFF_BASE = "https://gateway.pivota.cc"
 AURORA_BFF_BASE = str(os.getenv("AURORA_BFF_BASE", DEFAULT_AURORA_BFF_BASE) or DEFAULT_AURORA_BFF_BASE).strip().rstrip("/")
 try:
     _aurora_timeout_ms = int(float(str(os.getenv("AURORA_BFF_TIMEOUT_MS", "5000"))))
