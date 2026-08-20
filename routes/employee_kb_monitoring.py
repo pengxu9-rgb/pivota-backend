@@ -23,7 +23,7 @@ router = APIRouter(
 
 SCHEMA_VERSION = "2026-02-22.v1"
 POLL_INTERVAL_SEC = 30
-DEFAULT_BASE_URL = "https://pivota-agent-production.up.railway.app"
+DEFAULT_BASE_URL = "https://gateway.pivota.cc"
 DEFAULT_CACHE_TTL_SEC = 15
 DEFAULT_TIMEOUT_MS = 2500
 DEFAULT_HISTORY_SIZE = 120

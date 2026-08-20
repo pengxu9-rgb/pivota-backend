@@ -175,7 +175,9 @@ class Settings(BaseSettings):
     # making any HTTP call.
     pivota_agent_internal_url: str = os.getenv(
         "PIVOTA_AGENT_INTERNAL_URL",
-        "https://pivota-agent-production.up.railway.app",
+        # Pivota-owned name, not the PaaS hostname: this default outlives the
+        # Railway -> Cloud Run move, which is then a DNS change only.
+        "https://gateway.pivota.cc",
     )
     # Shared secret with PIVOTA-Agent's /internal/agent-center/llm-probe.
     # Three candidate env vars in priority order:
@@ -519,7 +521,7 @@ class Settings(BaseSettings):
     )
     outbound_warm_handoff_resolve_url: str = os.getenv(
         "OUTBOUND_WARM_HANDOFF_RESOLVE_URL",
-        "https://pivota-agent-production.up.railway.app/internal/ucp/warm-handoff/resolve",
+        "https://gateway.pivota.cc/internal/ucp/warm-handoff/resolve",
     )
     # Shared secret for the gateway's internal endpoint (X-Internal-Key). Unset = the
     # click lane never attempts a warm handoff (fail-closed even with the flag on).
@@ -728,7 +730,12 @@ class Settings(BaseSettings):
     google_oauth_client_secret: str = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
     google_oauth_redirect_uri: str = os.getenv(
         "GOOGLE_OAUTH_REDIRECT_URI",
-        "https://web-production-fedb.up.railway.app/api/gsc/oauth/callback",
+        # This exact string is ALSO registered in the Google Cloud console as an authorized
+        # redirect URI; Google rejects the flow on any mismatch. Production overrides it via env,
+        # so changing the default here is inert until BOTH the console entry and the env var move
+        # (see R4 in the migration audit) — do those together, registering the new URI alongside
+        # the old one before removing either.
+        "https://api.pivota.cc/api/gsc/oauth/callback",
     )
 
     # ADR-006: Pivota-owned GSC indexing. Distinct principal from the
