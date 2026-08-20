@@ -45,6 +45,8 @@ esac
 #   at cutover:   WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>
 : "${WORKERS:=false}"
 : "${PAUSED:=1}"
+case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
+case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
@@ -107,8 +109,17 @@ sched(){ # name schedule job-name
     --schedule="$cron" --time-zone=Etc/UTC --uri="$uri" --http-method=POST \
     --oauth-service-account-email="$RUN_INVOKER" \
     --attempt-deadline=1800s --quiet
-  [ "$PAUSED" = 1 ] && "$GCLOUD" scheduler jobs pause "$name" --location "$REGION" --quiet && echo "   (paused: $ENV)"
-  return 0
+  # FAIL CLOSED on anything that is not exactly 0. `[ "$PAUSED" = 1 ]` treated PAUSED=true, yes, on
+  # and "1 " as UNPAUSED - an operator typing PAUSED=true for safety would have armed
+  # reviews-invitation-send on a one-minute schedule against a copy of production.
+  case "$PAUSED" in
+    0) "$GCLOUD" scheduler jobs resume "$name" --location "$REGION" --quiet \
+         || { echo "FAILED to resume $name" >&2; exit 1; }
+       echo "   (RESUMED: $name)" ;;
+    *) "$GCLOUD" scheduler jobs pause "$name" --location "$REGION" --quiet \
+         || { echo "FAILED to pause $name - it may be LIVE" >&2; exit 1; }
+       echo "   (paused: $name)" ;;
+  esac
 }
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync

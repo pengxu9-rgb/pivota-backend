@@ -36,11 +36,30 @@ echo "import finished"
 
 # Reconcile against the manifest the dump job wrote. `gcloud sql import` reports success per
 # statement batch; a dump that was truncated before upload would still "succeed" here.
+# Actually reconcile. Printing a SQL string for a human to run is not verification, and at cutover
+# the final import is the one that has no second chance.
 MANIFEST="${URI%.sql.gz}.tables"
-if "$GCLOUD" storage cat "$MANIFEST" >/dev/null 2>&1; then
-  EXPECTED=$("$GCLOUD" storage cat "$MANIFEST" | tr -d '[:space:]')
-  echo "expected table count from dump manifest: $EXPECTED"
-  echo "verify with:  select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE';"
-else
-  echo "!! no .tables manifest beside the dump - table count NOT verified" >&2
+"$GCLOUD" storage cat "$MANIFEST" >/dev/null 2>&1 \
+  || { echo "FATAL: no .tables manifest beside the dump - cannot verify the import" >&2; exit 1; }
+EXPECTED=$("$GCLOUD" storage cat "$MANIFEST" | tr -d '[:space:]')
+COUNT_SQL="select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema') and table_schema not like 'pg_toast%' and table_type='BASE TABLE'"
+JOB="verify-import-$$"
+"$GCLOUD" run jobs create "$JOB" --region "$REGION" --project "$PROJECT" \
+  --image "$REGION-docker.pkg.dev/pivota-shared/pivota/backend:latest" \
+  --service-account "sa-worker@$PROJECT.iam.gserviceaccount.com" \
+  --network default --subnet default --vpc-egress all-traffic \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest" --max-retries 0 \
+  --command psql --args "^|^\$DATABASE_URL|-Atc|$COUNT_SQL" --quiet >/dev/null 2>&1 || true
+if "$GCLOUD" run jobs execute "$JOB" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1; then
+  ACTUAL=$("$GCLOUD" logging read "resource.labels.job_name=\"$JOB\"" --project "$PROJECT" --limit 20 \
+    --format='value(textPayload)' 2>/dev/null | grep -oE '^[0-9]+$' | head -1)
 fi
+"$GCLOUD" run jobs delete "$JOB" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
+if [ -z "${ACTUAL:-}" ]; then
+  echo "!! could not read the imported table count - VERIFY BY HAND before cutting over:" >&2
+  echo "   expected $EXPECTED tables; run: $COUNT_SQL" >&2
+  exit 1
+fi
+echo "tables: expected=$EXPECTED imported=$ACTUAL"
+[ "$ACTUAL" -ge "$EXPECTED" ] || { echo "FATAL: imported FEWER tables than the dump contained" >&2; exit 1; }
+echo "import verified"

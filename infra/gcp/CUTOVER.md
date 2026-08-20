@@ -50,6 +50,9 @@ before prod is meant to act. Both scripts now default to inert and require an ex
    ```bash
    WORKERS=true infra/gcp/deploy_backend.sh prod <sha>
    WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <backend-sha> <gateway-sha>
+   # PAUSED=0 now genuinely RESUMES the Scheduler jobs (it previously only ever paused, so this
+   # step silently left both triggers paused). Confirm afterwards:
+   #   gcloud scheduler jobs list --location us-west1 --project pivota-prod   # both ENABLED
    infra/gcp/deploy_gateway.sh prod <gateway-sha>
    ```
 5. **Point the gateway at the public names**: edit `env.prod.gateway.overrides.yaml` to
@@ -65,6 +68,18 @@ before prod is meant to act. Both scripts now default to inert and require an ex
    snapshot.
 
 ## Rollback
+
+**Re-pausing the Scheduler triggers is part of rollback and was previously missing.** Rolling back
+DNS while the GCP triggers keep firing means both stacks write to their own databases and the
+divergence grows silently. The full stop is:
+
+```bash
+PAUSED=1 infra/gcp/setup_scheduler.sh prod <backend-sha> <gateway-sha>   # re-pause both triggers
+# and set AUDIT_WORKER_ENABLED=false / REVIEWS_INVITATION_WORKER_ENABLED=false in
+# infra/gcp/env.prod.overrides.yaml, then redeploy - the deploy scripts strip and re-set these keys,
+# so the overrides file is the source of truth for them.
+```
+
 Railway stays warm for one week. Rollback is: flip DNS back, set `AUDIT_WORKER_ENABLED=true` on
 Railway `web`, restart the Railway workers, and set GCP `WORKERS=false`.
 

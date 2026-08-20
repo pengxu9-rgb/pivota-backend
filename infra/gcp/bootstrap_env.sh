@@ -132,7 +132,13 @@ if have "$GCLOUD" secrets describe REDIS_URL && ! "$GCLOUD" secrets versions acc
   echo "  !! REDIS_URL does not point at $REDIS_HOST:$REDIS_PORT - Memorystore was recreated." >&2
   DRIFT=1
 fi
-ensure_secret REDIS_URL sh -c "printf 'redis://:%s@$REDIS_HOST:$REDIS_PORT/0' \"\$($GCLOUD redis instances get-auth-string $REDIS_INSTANCE --region=$REGION --format='value(authString)')\""
+# Fetch and validate the auth string FIRST. Building the URL inside the generator defeats
+# ensure_secret's non-empty check: a failed get-auth-string still produces "redis://:@host:6379/0",
+# which is non-empty, looks valid, and would be stored forever (ensure_secret never overwrites).
+REDIS_AUTH=$("$GCLOUD" redis instances get-auth-string "$REDIS_INSTANCE" --region="$REGION" --format='value(authString)' 2>/dev/null || true)
+[ -n "$REDIS_AUTH" ] || { echo "FAILED to read the Memorystore auth string - refusing to store an auth-less REDIS_URL" >&2; exit 1; }
+ensure_secret REDIS_URL printf 'redis://:%s@%s:%s/0' "$REDIS_AUTH" "$REDIS_HOST" "$REDIS_PORT"
+unset REDIS_AUTH
 
 # ---------------------------------------------------------------- service accounts + IAM
 log "Service accounts + IAM"
@@ -149,8 +155,11 @@ for sa in "${SERVICE_ACCOUNTS[@]}"; do
     || { echo "FAILED registry binding for $EMAIL" >&2; exit 1; }
 done
 # Cloud Run's own service agent must also read the shared registry
-"$GCLOUD" artifacts repositories add-iam-policy-binding pivota --location="$REGION" --project="$SHARED" \
-  --member="serviceAccount:service-$PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com" --role=roles/artifactregistry.reader >/dev/null
+# On a project where Cloud Run has never been deployed this service agent does not exist yet, so the
+# binding fails and set -e would abort the run AFTER Cloud SQL and Memorystore were already created.
+retry "$GCLOUD" artifacts repositories add-iam-policy-binding pivota --location="$REGION" --project="$SHARED" \
+  --member="serviceAccount:service-$PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com" --role=roles/artifactregistry.reader >/dev/null 2>&1 \
+  || echo "  !! could not grant the Cloud Run service agent registry read - deploy once, then re-run this script" >&2
 
 # ---------------------------------------------------------------- summary (no secrets)
 [ "$DRIFT" = 0 ] || echo "

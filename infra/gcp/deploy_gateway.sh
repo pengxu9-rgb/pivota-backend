@@ -12,8 +12,8 @@ set -euo pipefail
 ENV="${1:-}"; TAG="${2:-}"
 [ -n "$ENV" ] && [ -n "$TAG" ] || { echo "usage: $0 staging|prod <image-tag>" >&2; exit 2; }
 case "$ENV" in
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; PG_POOL_MAX=5 ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; PG_POOL_MAX=3 ;;
   *) echo "bad env" >&2; exit 2 ;;
 esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -45,10 +45,19 @@ SECRETS_FILE="$HERE/secrets.$ENV.gateway.list"
 # asyncpg against Cloud SQL's private IP; the Python services use the plain sslmode=require DSNs.
 SECRETS="DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,INGREDIENT_REFERENCE_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,$(paste -sd, "$SECRETS_FILE")"
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
-{ cat "$ENV_FILE"
+# gcloud's --env-vars-file resolves a DUPLICATE KEY to the FIRST occurrence, not the last (verified
+# against the SDK's own loader). Appending an override after the ported file therefore does NOTHING
+# whenever the ported file already defines that key - which silently made WORKERS, DB_POOL_* and even
+# PIVOTA_ENV inert. Strip the keys we are about to set before appending them.
+grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
+{ :
   # requirePlatformEnv() throws at boot without this (src/server.js:52114).
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
-} > "$MERGED"
+  # node-pg's Pool defaults to 10 connections PER PROCESS. At --max-instances 20 that is 200 on its
+  # own, and Cloud SQL max_connections is 200 shared with web and worker. Staging (MAX=4) can never
+  # reveal this. Budget: gateway 20x3=60 + web 20x6=120 + worker 10 = 190, under 200.
+  printf 'PG_POOL_MAX: "%s"\nPGPOOL_MAX: "%s"\nDB_POOL_MAX_SIZE: "%s"\n' "$PG_POOL_MAX" "$PG_POOL_MAX" "$PG_POOL_MAX"
+} >> "$MERGED"
 
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \

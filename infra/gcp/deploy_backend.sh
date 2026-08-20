@@ -23,6 +23,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
+# `internal` and `internal-and-cloud-load-balancing` are DIFFERENT values: only the latter admits
+# requests from Google Cloud Load Balancing. Setting plain `internal` on a service behind the LB
+# makes every request through api.pivota.cc fail with a valid certificate and a correct-looking
+# url map - the same "looks built, is not" shape as the unattached backend service.
+: "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo internal)}"
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
@@ -50,7 +55,12 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # services/audit_scheduler.py:_queue_worker_enabled). On Cloud Run that would re-arm the empty-DB DDL
 # race on every autoscale event and run the queue drainers on every instance. Set the explicit
 # overrides those gates check first. Remove once config/platform.py (#1771) covers every reader.
-{ cat "$ENV_FILE"
+# gcloud's --env-vars-file resolves a DUPLICATE KEY to the FIRST occurrence, not the last (verified
+# against the SDK's own loader). Appending an override after the ported file therefore does NOTHING
+# whenever the ported file already defines that key - which silently made WORKERS, DB_POOL_* and even
+# PIVOTA_ENV inert. Strip the keys we are about to set before appending them.
+grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
+{ :
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\nPIVOTA_PLATFORM: "cloud_run"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
   printf 'SKIP_HEAVY_STARTUP_INIT: "true"\n'
   printf 'AUDIT_WORKER_ENABLED: "%s"\n' "$WORKERS"
@@ -59,7 +69,7 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
   # PROCESS, so MAX instances x 20 would be 400 on prod and exhaust the server. Size the pool from
   # the instance ceiling, leaving headroom for the other services and for ops sessions.
   printf 'DB_POOL_MIN_SIZE: "%s"\nDB_POOL_MAX_SIZE: "%s"\n' "$POOL_MIN" "$POOL_MAX"
-} > "$MERGED"
+} >> "$MERGED"
 
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
@@ -71,6 +81,7 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
   --min-instances "$MIN" --max-instances "$MAX" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \
+  --ingress "$INGRESS" \
   $PUBLIC_FLAG \
   --labels "env=$ENV,service=$SERVICE,managed-by=infra-gcp" \
   $NO_TRAFFIC \

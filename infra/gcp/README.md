@@ -125,8 +125,12 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `--storage-auto-increase` never raises the ceiling proactively. Use >= 100 GB for prod.
 8. **`--deny-maintenance-period`** is not set around Sep 8-12 or the late-Sep launch window.
    ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real restart.
-9. **Egress IP** — `--vpc-egress private-ranges-only` means no stable outbound IP. Resolve before
-   any Antom/Adyen IP-allowlisting conversation (needs a NAT + `all-traffic`).
+9. **Egress IP requires `all-traffic`.** `setup_egress_nat.sh` creates the reserved address, router
+   and NAT but does NOT switch the services' egress mode — and the deploy scripts default to
+   `private-ranges-only`, under which outbound traffic never traverses the VPC and therefore does not
+   leave via the NAT. The reserved IP is only the real source address once the services run with
+   `VPC_EGRESS=all-traffic`. Set that (and re-set it on every deploy) before giving any partner the
+   address, or the allowlist entry will not match.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
     SHA during cutover week can produce a different image. Pin or add a lockfile.
 11. **Dump bucket** — prod data lands in `gs://pivota-staging-migration` (a staging-project bucket)
@@ -189,7 +193,8 @@ the VPC makes those calls arrive as internal, so `--ingress internal` becomes th
 identity-token code is needed. The backend is now unreachable from the internet (404 at the ingress,
 authenticated or not) while the gateway reaches it normally.
 
-**Staging egress IP: `136.66.216.216`** — reserved, stable. This is the address Antom/Adyen should
+**Staging egress IP: `136.66.216.216`** — reserved and stable, but staging-only. **Never give this
+to a partner.** The address for Antom/Adyen allowlisting is the PROD one, `8.231.167.230`.
 IP-allowlist. Run the script for `prod` to reserve the production one before partner onboarding.
 
 ### `sslmode=require` does NOT mean the same thing in Python and Node
@@ -257,10 +262,14 @@ must not stay on `web`: `services/audit_scheduler.py` has no cross-process lock 
 them to a single-instance service reproduces Railway's semantics exactly, which is what a cutover
 needs; splitting the 8 periodic jobs into individual Scheduler entries is a later refactor.
 
-**Staging is created inert on purpose**: both Scheduler triggers are PAUSED and the worker runs with
+**Both environments are created inert on purpose**: both Scheduler triggers are PAUSED and the worker runs with
 `AUDIT_WORKER_ENABLED=false`, because staging holds a restored production snapshot and still carries
 production third-party credentials — draining that queue would execute production-derived rows
-against live Stripe/SendGrid/Shopify. Prod creates them enabled.
+against live Stripe/SendGrid/Shopify. **Prod is inert too**: until the DNS flip, GCP prod runs
+against a COPY of production data with the REAL production credentials while Railway still serves,
+so a second set of drainers would double-send and double-charge. Arming is an explicit, deliberate
+cutover step: `WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>`, run only AFTER
+Railway's workers are stopped.
 
 Verified 2026-08-19: the `worker` revision logs
 `shared-queue worker ticks DISABLED on this service (service_name='worker' platform_env='staging')`

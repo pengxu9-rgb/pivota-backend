@@ -45,7 +45,11 @@ CRED_VALUE_RE = re.compile(
     r"|sk_live_|sk_test_|rk_live_|whsec_|ghp_|github_pat_|xoxb-|xoxp-|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}"
     r"|://[^\s]*/(?:hook|webhook|bot)/[A-Za-z0-9_-]{16,}"
     r"|[?&](?:api_?key|token|secret|signature|sig)=[^&\s]{12,})", re.I)
-DROP_EXACT = {"PORT", "DATABASE_URL", "REDIS_URL", "DATABASE_PUBLIC_URL", "REDIS_PUBLIC_URL"}
+# Every DSN must come from Cloud SQL/Memorystore, never from the Railway env: --set-secrets is
+# last-wins and the ported list is appended after the explicit mounts, so a ported DSN would
+# silently override the Cloud SQL one and keep the service reading from Railway after cutover.
+DROP_EXACT = {"PORT", "DATABASE_URL", "REDIS_URL", "DATABASE_PUBLIC_URL", "REDIS_PUBLIC_URL",
+              "PCI_KB_DATABASE_URL", "INGREDIENT_REFERENCE_DATABASE_URL"}
 DROP_PREFIX = ("RAILWAY_", "NIXPACKS_", "RAILPACK_")
 
 def railway_vars(service, env):

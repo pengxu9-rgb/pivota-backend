@@ -24,6 +24,13 @@ have(){ "$@" >/dev/null 2>&1; }
 say(){ printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
 
 # host -> cloud run service
+# These are PRODUCTION hostnames. Running this for staging would mint certificates for them inside
+# pivota-staging and then print "repoint api.pivota.cc at <staging LB>" - pointing production DNS at
+# a stack holding a restored prod snapshot. Staging has no pivota.cc names of its own, so refuse.
+if [ "$ENV" != prod ]; then
+  echo "refusing: the hostname list in this script is production-only. Give staging its own names first." >&2
+  exit 2
+fi
 HOSTS_WEB="api.pivota.cc"
 HOSTS_GATEWAY="gateway.pivota.cc mcp.pivota.cc commerce.mcp.pivota.cc ucp.pivota.cc acp.pivota.cc"
 ALL_HOSTS="$HOSTS_WEB $HOSTS_GATEWAY"
@@ -45,7 +52,8 @@ for svc in web gateway; do
   # has to be recreated - so getting this right at creation matters.
   have "$GCLOUD" compute backend-services describe "$PREFIX-bes-$svc" --global \
     || "$GCLOUD" compute backend-services create "$PREFIX-bes-$svc" --global \
-         --load-balancing-scheme=EXTERNAL_MANAGED --enable-logging --logging-sample-rate=1.0
+         --load-balancing-scheme=EXTERNAL_MANAGED --enable-logging --logging-sample-rate=1.0 \
+         --timeout=300
   # Do NOT swallow errors here. This attach failing silently is what produced six hostnames serving
   # "no healthy upstream" with a perfectly valid certificate - the LB looked built and was not.
   if ! "$GCLOUD" compute backend-services describe "$PREFIX-bes-$svc" --global --format='value(backends[0].group)' | grep -q .; then
@@ -78,14 +86,23 @@ if ! have "$GCLOUD" compute url-maps describe "$PREFIX-urlmap"; then
   # Default to the backend service; every known host is matched explicitly below.
   "$GCLOUD" compute url-maps create "$PREFIX-urlmap" --default-service="$PREFIX-bes-web"
 fi
-for h in $HOSTS_GATEWAY; do
+# Do NOT swallow these. If add-path-matcher fails, the host falls through to the url map's DEFAULT
+# service - which is the BACKEND - so mcp/ucp/acp/gateway would quietly serve the wrong application
+# behind a valid certificate. Skip only when the host rule already exists; fail on anything else.
+add_host(){ # host, backend-service
+  local h="$1" be="$2" slug err
   slug=$(printf '%s' "$h" | tr '.' '-')
-  have "$GCLOUD" compute url-maps describe "$PREFIX-urlmap" --format="value(hostRules)" \
-    && "$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
-         --path-matcher-name="pm-$slug" --default-service="$PREFIX-bes-gateway" --new-hosts="$h" 2>/dev/null || true
-done
-"$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
-  --path-matcher-name="pm-api" --default-service="$PREFIX-bes-web" --new-hosts="$HOSTS_WEB" 2>/dev/null || true
+  if "$GCLOUD" compute url-maps describe "$PREFIX-urlmap" --format='value(hostRules.hosts.list())' | tr ';,' '\n\n' | grep -qx "$h"; then
+    echo "   host rule exists: $h"; return 0
+  fi
+  if ! err=$("$GCLOUD" compute url-maps add-path-matcher "$PREFIX-urlmap" \
+        --path-matcher-name="pm-$slug" --default-service="$be" --new-hosts="$h" 2>&1); then
+    echo "FAILED to route $h -> $be:" >&2; echo "$err" >&2; exit 1
+  fi
+  echo "   routed $h -> $be"
+}
+for h in $HOSTS_GATEWAY; do add_host "$h" "$PREFIX-bes-gateway"; done
+add_host "$HOSTS_WEB" "$PREFIX-bes-web"
 
 say "https proxy + forwarding rule"
 have "$GCLOUD" compute target-https-proxies describe "$PREFIX-https-proxy" --global \
