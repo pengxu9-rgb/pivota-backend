@@ -32,7 +32,7 @@ before prod is meant to act. Both scripts now default to inert and require an ex
 
 ## T-48h
 1. Drop DNS TTLs to 60s at HiChina for: `api`, `mcp`, `commerce.mcp`, `ucp`, `acp`, `gateway`,
-   and the six hosts below (the apex and `www` are NOT moving - see the apex section). HiChina serves the OLD ttl until it expires — a 60s TTL
+   (the apex and `www` are NOT moving - see the apex section). HiChina serves the OLD ttl until it expires — a 60s TTL
    set on the day does nothing.
 2. Re-run the acceptance corpus against GCP prod.
 3. Confirm the Google console has BOTH redirect URIs registered (see

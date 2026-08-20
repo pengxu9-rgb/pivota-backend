@@ -112,11 +112,14 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 2. **Cloud Scheduler** — nothing replaces the Railway crons (`relgraph-sync-routine`, the audit /
    executor / invitation drainers). `deploy_backend.sh` sets `AUDIT_WORKER_ENABLED=false` on
    staging, so today NOTHING drains those queues on GCP.
-3. **Gateway / proof-issuer / acp deploys** — `sa-gateway` and `sa-worker` exist but have no deploy
-   script. Staging services must be given the STAGING internal secrets, never Railway prod values.
-4. **LB / DNS / TLS** — no external load balancer, no `gateway.pivota.cc` (must exist before
-   partners copy URLs), no custom-domain mapping, no Cloud Armor. DNS is at Alibaba/HiChina and the
-   apex is a plain A record (no ALIAS), so the apex flips to the LB anycast IP.
+3. **Remaining un-migrated services** — `ucp-worker`, `ucp-platform-receiver`, and
+   `catalog-intelligence` still run only on Railway. The gateway, proof-issuer and acp are deployed
+   (see the sections above).
+4. **DNS cutover mechanics** — the load balancer EXISTS with six ACTIVE certificates
+   (`api`, `gateway`, `mcp`, `commerce.mcp`, `ucp`, `acp`). The **apex does NOT move**:
+   `pivota.cc`/`www` are Vercel-served and have no cert-map entry, so pointing them at the LB fails
+   TLS rather than 404ing. See CUTOVER.md. Still open: Cloud Armor, and TTLs dropped to 60s at
+   T-48h.
 5. **Backup / restore drill** — PITR and 14 retained backups are configured but never exercised.
 6. **Rollback** — deploys now go out `--no-traffic` behind a candidate tag and only take traffic
    after a health check; rollback is `gcloud run services update-traffic --to-revisions=<prev>=100`.
@@ -125,12 +128,10 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `--storage-auto-increase` never raises the ceiling proactively. Use >= 100 GB for prod.
 8. **`--deny-maintenance-period`** is not set around Sep 8-12 or the late-Sep launch window.
    ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real restart.
-9. **Egress IP requires `all-traffic`.** `setup_egress_nat.sh` creates the reserved address, router
-   and NAT but does NOT switch the services' egress mode — and the deploy scripts default to
-   `private-ranges-only`, under which outbound traffic never traverses the VPC and therefore does not
-   leave via the NAT. The reserved IP is only the real source address once the services run with
-   `VPC_EGRESS=all-traffic`. Set that (and re-set it on every deploy) before giving any partner the
-   address, or the allowlist entry will not match.
+9. **Cloud SQL connection budget** — with proof-issuer and acp added, the nominal ceiling exceeds
+   `max_connections=200`. proof-issuer opens no pool, and acp's real pool behaviour is unmeasured.
+   Measure before cutover, then cap max-instances or raise max_connections. (Egress is resolved:
+   the deploy scripts default to `all-traffic` and `8.231.167.230` is confirmed as the source IP.)
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
     SHA during cutover week can produce a different image. Pin or add a lockfile.
 11. **Dump bucket** — prod data lands in `gs://pivota-staging-migration` (a staging-project bucket)
@@ -297,7 +298,13 @@ SERVICE=acp IMAGE_NAME=acp ENV_PREFIX=acp \
   infra/gcp/deploy_backend.sh prod <acp-sha>
 ```
 
-Two things worth knowing:
+`PUBLIC=1` is required, not optional: these services are reachable only from the VPC (ingress), and
+`PUBLIC=0` would make every deploy REVOKE the `allUsers` invoker binding the model depends on, so the
+backend's shared-secret calls would start 403ing. `--proxy-headers` and `--timeout-keep-alive 75`
+mirror what the backend image's own CMD sets; without them uvicorn falls back to a 5s keep-alive,
+the classic source of intermittent 502s behind Cloud Run's frontend.
+
+Three things worth knowing:
 
 - **The acp image's own CMD ends in `--reload`.** That is a uvicorn development flag: it spawns a
   file-watcher process and reloads on change. It is harmless on Railway but wasteful and fragile on

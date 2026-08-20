@@ -45,6 +45,12 @@ SERVICE="${SERVICE:-web}"
 #               with a different ASGI app, so it needs no image of its own)
 : "${IMAGE_NAME:=backend}"
 : "${ENV_PREFIX:=}"
+# A prefix TYPO fails closed on the -f check below. A prefix OMISSION does not: it silently hands
+# another service the backend's entire env file and secret list. Require them to agree.
+case "$SERVICE" in
+  web) [ -z "$ENV_PREFIX" ] || { echo "SERVICE=web must not set ENV_PREFIX (got '$ENV_PREFIX')" >&2; exit 2; } ;;
+  *)   [ -n "$ENV_PREFIX" ] || { echo "SERVICE=$SERVICE requires ENV_PREFIX (else it deploys with the BACKEND's config)" >&2; exit 2; } ;;
+esac
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/$IMAGE_NAME:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
@@ -63,11 +69,15 @@ SECRETS_FILE="$HERE/secrets.$ENV$TAGPART.list"
 SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,$(paste -sd, "$SECRETS_FILE")"
 
 # gcloud allows only ONE env-vars flag: merge the ported file with the platform vars into a temp file
-CMD_ARGS=()
-# Use the --flag=value form: RUN_ARGS legitimately starts with a dash (e.g. "-m,uvicorn,...") and
-# argparse would otherwise read it as the next FLAG and report "--args: expected one argument".
-[ -n "${RUN_COMMAND:-}" ] && CMD_ARGS+=("--command=$RUN_COMMAND")
-[ -n "${RUN_ARGS:-}" ]    && CMD_ARGS+=("--args=$RUN_ARGS")
+# Pass these UNCONDITIONALLY. Setting them only when non-empty means a RUN_COMMAND left exported
+# from a previous service's deploy rides along into the next one - and because proof_issuer_main also
+# serves /health, the wrong application would PASS the candidate check and take 100% of traffic on
+# api.pivota.cc. An empty value is gcloud's documented reset, so this also clears a stale override.
+# --flag=value form: RUN_ARGS legitimately starts with a dash ("-m,uvicorn,...") and argparse would
+# otherwise read it as the next flag.
+[ -n "${RUN_ARGS:-}" ] && [ -z "${RUN_COMMAND:-}" ] && {
+  echo "RUN_ARGS without RUN_COMMAND produces an unbootable revision (the image has no ENTRYPOINT)." >&2; exit 2; }
+CMD_ARGS=("--command=${RUN_COMMAND:-}" "--args=${RUN_ARGS:-}")
 
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # NOTE: port_railway_env.py drops RAILWAY_*, but several gates in this codebase still read those
@@ -90,6 +100,50 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
   # the instance ceiling, leaving headroom for the other services and for ops sessions.
   printf 'DB_POOL_MIN_SIZE: "%s"\nDB_POOL_MAX_SIZE: "%s"\n' "$POOL_MIN" "$POOL_MAX"
 } >> "$MERGED"
+
+# The candidate gate must be able to REACH the candidate. Every prod service is
+# `internal-and-cloud-load-balancing`, so a curl from an operator's laptop gets Google's 404 before
+# the container is ever consulted - the gate would then exit 1 on every prod deploy and strand a
+# perfectly good revision at 0%. Measured 2026-08-20: web/gateway/proof-issuer/acp all 404 from
+# outside; `internal` 404s before IAM, `all` gets as far as a 403.
+#
+# So: try directly, and if the answer is an ingress/IAM rejection rather than the app, re-probe from
+# INSIDE the VPC with a one-shot Cloud Run job. Only a real 200 from the application passes.
+probe_health(){ # url -> echoes the status code
+  local url="$1" code
+  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null || echo 000)
+  case "$code" in
+    200) rm -f /tmp/pivota-health.$$; echo 200; return 0 ;;
+    403|404|000) : ;;                     # possibly ingress/IAM, not the app - fall through
+    *) rm -f /tmp/pivota-health.$$; echo "$code"; return 0 ;;
+  esac
+  rm -f /tmp/pivota-health.$$
+  echo "   direct probe got $code (ingress-blocked from here); re-probing from inside the VPC" >&2
+  # ^|^ delimiter: gcloud splits --args on COMMAS, and this probe is Python that contains commas
+  # (`,timeout=25`), which would otherwise be shredded into separate argv entries.
+  local job="verify-$$-$RANDOM"
+  "$GCLOUD" run jobs create "$job" --region "$REGION" --project "$PROJECT" \
+    --image "$REGION-docker.pkg.dev/pivota-shared/pivota/backend:latest" \
+    --service-account "sa-worker@$PROJECT.iam.gserviceaccount.com" \
+    --network default --subnet default --vpc-egress all-traffic \
+    --max-retries 0 --task-timeout 120s --command python \
+    --args="^|^-c|import urllib.request;print('PROBE_STATUS='+str(urllib.request.urlopen('$url',timeout=25).status))" \
+    --quiet >/dev/null 2>&1
+  local out="" i
+  if "$GCLOUD" run jobs execute "$job" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1; then
+    # Cloud Logging ingestion lags the job's exit by a few seconds. Reading immediately returns
+    # nothing and the probe reports 000 - which reads exactly like a failed health check and would
+    # strand a healthy revision. Poll instead of guessing a sleep.
+    for i in 1 2 3 4 5 6; do
+      out=$("$GCLOUD" logging read "resource.labels.job_name=\"$job\"" --project "$PROJECT" --limit 15 \
+        --format='value(textPayload)' 2>/dev/null | grep -oE 'PROBE_STATUS=[0-9]+' | head -1 | cut -d= -f2)
+      [ -n "$out" ] && break
+      sleep 5
+    done
+  fi
+  "$GCLOUD" run jobs delete "$job" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
+  echo "${out:-000}"
+}
 
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
@@ -121,8 +175,7 @@ AUTH=()
 [ "$PUBLIC" = 1 ] || AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
 AUTH_ARGS=(${AUTH[@]+"${AUTH[@]}"})
 echo "verifying candidate at $CAND_URL"
-CODE=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$CAND_URL/health" || echo 000)
-head -c 400 /tmp/pivota-health.$$; echo; rm -f /tmp/pivota-health.$$
+CODE=$(probe_health "$CAND_URL/health")
 [ "$CODE" = 200 ] || { echo "candidate health check returned $CODE — NOT shifting traffic. Previous revision still serving." >&2; exit 1; }
 
 [ "$FIRST_DEPLOY" = 1 ] || "$GCLOUD" run services update-traffic "$SERVICE" --project "$PROJECT" --region "$REGION" --to-latest --quiet
