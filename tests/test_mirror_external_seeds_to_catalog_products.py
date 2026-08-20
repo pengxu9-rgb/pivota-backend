@@ -52,7 +52,19 @@ def test_mirror_missing_treats_attached_existing_canonical_as_present() -> None:
     the unattached winner. Self-heal preserved: if every attached target row
     is gone, the group is mirrorable again.
 
-    THESE ASSERTIONS PIN THE PROPERTY, NOT THE SPELLING. They used to require
+    THIS IS STILL A SPELLING TEST, and saying otherwise would repeat the
+    mistake it exists to document. A substring assert cannot tell
+    `SELECT DISTINCT a.external_product_id` from an equivalent `GROUP BY`, and
+    renaming the alias `ae` would fail it for a correct change. It is kept only
+    as a cheap smoke check that the attachment logic was not deleted outright;
+    the BEHAVIOUR is owned by
+    tests/test_missing_mirror_count_equivalence_postgres.py, which executes both
+    chains on real Postgres and now also executes `candidates_attached_present`
+    against a group with two attached seeds — so dropping the DISTINCT fails a
+    real query rather than a string match. If you are rewriting this SQL and one
+    of these asserts blocks you, change the assert; trust the Postgres gate.
+
+    What this replaced, and why. They used to require
     the literal `a.external_product_id = c.external_product_id`, i.e. that the
     check be written as a CORRELATED subquery. That correlation was the
     2026-08-20 outage: `active_all` is a materialised CTE, materialised CTEs
@@ -65,9 +77,9 @@ def test_mirror_missing_treats_attached_existing_canonical_as_present() -> None:
 
     The BEHAVIOUR — that this set matches the cheap chain's, including the
     duplicate/mixed-attachment groups production does not currently contain —
-    is proven by tests/test_missing_mirror_count_equivalence_postgres.py, which
-    executes both chains on real Postgres. Verified 2026-08-20 that dropping the
-    anti-join condition fails 2 of its 8 tests."""
+    is proven by tests/test_missing_mirror_count_equivalence_postgres.py.
+    Verified 2026-08-20: dropping the anti-join condition fails 2 of its tests,
+    and dropping the DISTINCT fails the attached-present counter."""
     # the attachment join itself
     assert "cp_attached.product_key = a.attached_product_key" in COMMON_CTES
     # keyed on the GROUP (external_product_id), not the rn=1 winner

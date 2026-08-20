@@ -745,7 +745,18 @@ active_mirrorable AS (
 -- once per candidate. MEASURED on prod: 11,352 loops, 64,508,866 inner
 -- iterations, 72.7s of a 76s query. Hoisting the join out makes the estimate
 -- irrelevant — it runs once over 11,352 rows instead of 11,352 times.
-attached_epids AS (
+-- NOT MATERIALIZED, and that keyword is the whole point of the fix holding.
+--
+-- The report's totals query references this CTE TWICE (`missing` and
+-- `candidates_attached_present`), and Postgres materialises any CTE referenced
+-- more than once — which would hand `attached_epids` the SAME statistics-free
+-- misestimate that made `active_all` explode, one level down. MEASURED at prod
+-- row counts (11,352 seeds / 5,683 attached): materialised the totals query
+-- plans a Nested Loop Anti Join re-scanning this CTE 5,683 times (~16M
+-- tuplestore reads) at 0.49s; NOT MATERIALIZED plans a Merge Anti Join with
+-- loops=1 at 0.08s. Inlining also lets the planner use catalog_products'
+-- indexes, which a tuplestore has none of.
+attached_epids AS NOT MATERIALIZED (
   SELECT DISTINCT a.external_product_id
   FROM active_all a
   JOIN catalog_products cp_attached

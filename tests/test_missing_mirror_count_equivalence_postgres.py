@@ -106,6 +106,12 @@ _SEEDS = [
     #    group as present (the 39-COSRX-shadow regression).
     ("s-mixed-win", "epid-mixed", "US", "Mixed Winner", "active", None, "2026-08-05", "2026-07-01"),
     ("s-mixed-att", "epid-mixed", "GB", "Mixed Attached", "active", "prod::agent::slug-2", "2026-08-09", "2026-07-01"),
+    # SECOND live-attached seed in the SAME group. Without it no fixture can
+    # produce the fan-out that `attached_epids`' DISTINCT exists to prevent, and
+    # deleting that DISTINCT survives every test that actually executes SQL —
+    # it was caught only by a substring assertion. With this row the anti-join
+    # sees a group whose attached set has two members.
+    ("s-mixed-att2", "epid-mixed", "GB", "Mixed Attached 2", "active", "prod::agent::slug-3", "2026-08-08", "2026-07-01"),
     # -- an INACTIVE seed carries the attachment; the active_all status predicate
     #    means it must NOT count as present => MISSING. Pins that the cheap chain
     #    carried `lower(coalesce(status,''))='active'` onto its inlined NOT EXISTS.
@@ -433,4 +439,58 @@ def test_status_predicate_is_never_hand_written_in_the_module() -> None:
         "the active-status predicate is spelled by hand "
         f"{len(hand_written)} time(s) in the module; concatenate "
         "_active_status(alias) instead so the two chains cannot drift"
+    )
+
+
+def test_candidates_attached_present_counts_groups_not_seeds(engine) -> None:
+    """`candidates_attached_present` must count attached GROUPS, once each.
+
+    This is the only assertion that EXECUTES the counter, and it is what makes
+    `attached_epids`' DISTINCT load-bearing rather than decorative. Without the
+    DISTINCT the CTE yields one row per attached SEED, and joining it to
+    `candidates` multiplies the group — `epid-mixed` has two live-attached
+    seeds in the fixture precisely so that shows up as 4 instead of 3.
+
+    The `missing` set cannot catch this: it uses LEFT JOIN ... IS NULL, which is
+    duplicate-insensitive, so a lost DISTINCT is invisible there. Before this
+    test the only guard was a substring assertion in
+    tests/test_mirror_external_seeds_to_catalog_products.py — i.e. spelling.
+    """
+    from sqlalchemy import text
+
+    from scripts.mirror_external_seeds_to_catalog_products import COMMON_CTES
+
+    with engine.connect() as c:
+        attached_present = c.execute(
+            text(
+                COMMON_CTES
+                + """
+                SELECT count(*) FROM candidates c
+                  JOIN attached_epids ae
+                    ON ae.external_product_id = c.external_product_id
+                """
+            )
+        ).scalar_one()
+        # The same question asked without the CTE: how many candidate groups
+        # have at least one live-attached active seed?
+        expected = c.execute(
+            text(
+                COMMON_CTES
+                + """
+                SELECT count(*) FROM candidates c
+                 WHERE EXISTS (
+                   SELECT 1 FROM active_all a
+                   JOIN catalog_products x ON x.product_key = a.attached_product_key
+                   WHERE a.external_product_id = c.external_product_id)
+                """
+            )
+        ).scalar_one()
+
+    assert attached_present == expected, (
+        "attached_epids fanned out: the JOIN counted seeds, not groups — "
+        "DISTINCT is missing or the join key changed"
+    )
+    assert expected >= 3, (
+        "fixture regression: fewer attached candidate groups than seeded, so "
+        "this test can no longer detect fan-out"
     )
