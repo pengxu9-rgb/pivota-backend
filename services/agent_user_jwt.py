@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -69,8 +70,9 @@ def _jwks_sources() -> list[Tuple[str, str]]:
     return sources
 
 
-def _load_jwks(*, refresh: bool = False) -> Dict[str, Any]:
-    sources = _jwks_sources()
+def _load_jwks(*, refresh: bool = False, sources: Optional[list[Tuple[str, str]]] = None) -> Dict[str, Any]:
+    if sources is None:
+        sources = _jwks_sources()
     if not sources:
         raise AgentUserJwtError(
             "Missing JWKS configuration (set AGENT_USER_JWKS_URL or AGENT_USER_JWKS_JSON or AGENT_USER_JWKS_FILE)"
@@ -135,6 +137,8 @@ def _public_key_from_jwk(jwk_dict: Dict[str, Any]):
             return algorithms.RSAAlgorithm.from_jwk(jwk_json)
         if kty == "EC":
             return algorithms.ECAlgorithm.from_jwk(jwk_json)
+        if kty == "OKP" and hasattr(algorithms, "OKPAlgorithm"):
+            return algorithms.OKPAlgorithm.from_jwk(jwk_json)
     except Exception as e:
         raise AgentUserJwtError("Failed to parse JWK") from e
     raise AgentUserJwtError("Unsupported JWK kty")
@@ -155,7 +159,8 @@ def _normalize_agent_user_ref(*, issuer: Optional[str], raw_ref: str) -> str:
 
 def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
     """
-    Verify an agent-user JWT and return a stable agent_user_ref.
+    Verify an agent-user JWT against the GLOBAL (env-configured) issuer and return a stable
+    agent_user_ref. For a per-agent (federated) issuer use `verify_agent_user_jwt_for_agent`.
 
     Required env (one of):
     - AGENT_USER_JWKS_URL
@@ -167,6 +172,140 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
     - AGENT_USER_JWT_AUDIENCE
     - AGENT_USER_JWT_ALGS (comma-separated, default RS256)
     """
+    return _verify_against(
+        token,
+        jwks_sources=None,
+        expected_issuers=_get_expected_issuers(),
+        expected_audience=_get_expected_audience(),
+        allowed_algs=_get_allowed_algs(),
+    )
+
+
+def _peek_unverified_issuer(token: str) -> Optional[str]:
+    """The `iss` claim WITHOUT verification — only ever used to SELECT a registered binding; the
+    signature is then checked against that binding's pinned JWKS and iss is re-checked there."""
+    try:
+        claims = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    except Exception:
+        return None
+    iss = claims.get("iss") if isinstance(claims, dict) else None
+    return iss if isinstance(iss, str) and iss.strip() else None
+
+
+async def verify_agent_user_jwt_for_agent(token: str, agent_id: Optional[str]) -> AgentUserIdentity:
+    """
+    Verify an agent-user JWT for a SPECIFIC calling agent.
+
+    Order: if the token's (unverified) `iss` is an ACTIVE issuer registered to `agent_id`
+    (db.agent_identity_issuers), verify against THAT binding — its JWKS, audience and alg
+    allowlist. Otherwise fall back to the global env issuer. A token from an issuer registered to
+    a DIFFERENT agent never matches here and is not accepted by the fallback either (unless ops
+    also configured it globally), which is the binding this exists to enforce.
+    """
+    token = (token or "").strip()
+    if not token:
+        raise AgentUserJwtError("Missing token")
+    if agent_id:
+        iss = _peek_unverified_issuer(token)
+        # A GLOBAL issuer is verified by the global verifier, never by a binding — a binding for such
+        # an issuer cannot be registered (reserved), and this check holds even if one existed.
+        from db.agent_identity_issuers import get_active_issuer, is_global_issuer  # late import: db layer
+
+        if iss and not is_global_issuer(iss):
+            binding = await get_active_issuer(str(agent_id), iss)
+            if binding:
+                jwks_uri = binding["jwks_uri"]
+                # Async dereference: the URL is agent-supplied now, so it must never block the loop,
+                # and an unknown `kid` may force ONE refresh per URL per window, not one per request.
+                jwks = await _load_remote_jwks_async(jwks_uri)
+                try:
+                    kid = (jwt.get_unverified_header(token).get("kid") or "").strip() or None
+                except Exception as e:
+                    raise AgentUserJwtError("Invalid JWT header") from e
+                if not list(_iter_jwk_candidates(jwks, kid=kid)):
+                    # Unknown kid: ONE rate-capped async refresh, then verify against whatever we hold.
+                    jwks = await _load_remote_jwks_async(jwks_uri, refresh=True)
+                return _verify_against(
+                    token,
+                    jwks_sources=[("url", jwks_uri)],
+                    preloaded_jwks=jwks,
+                    refresh_jwks=lambda jwks=jwks: jwks,
+                    expected_issuers=[binding["issuer"]],
+                    expected_audience=binding["audience"],
+                    allowed_algs=[a for a in (binding.get("algs") or []) if _ALLOWED_ALG_RE.match(str(a))] or ["RS256"],
+                    authorized_party=binding.get("authorized_party"),
+                    required_scopes=binding.get("required_scopes"),
+                    require_claims=FEDERATED_REQUIRED_CLAIMS,
+                    max_age_seconds=_federated_max_age_seconds(),
+                )
+    return verify_agent_user_jwt(token)
+
+
+# ── federated JWKS loading (async, bounded) ───────────────────────────────────
+
+FEDERATED_REQUIRED_CLAIMS = ("iss", "sub", "aud", "exp", "iat")
+_ALLOWED_ALG_RE = re.compile(r"^(?:RS|PS|ES)\d{3}$|^EdDSA$")
+_JWKS_REFRESH_MIN_INTERVAL_SECONDS = 60.0
+_JWKS_LAST_REFRESH: Dict[str, float] = {}
+
+
+def _federated_max_age_seconds() -> float:
+    try:
+        return max(60.0, float(os.getenv("AGENT_FEDERATED_JWT_MAX_AGE_SECONDS") or "3600"))
+    except ValueError:
+        return 3600.0
+
+
+async def _load_remote_jwks_async(url: str, *, refresh: bool = False) -> Dict[str, Any]:
+    cache_key = f"url:{url}"
+    ttl_s = float(os.getenv("AGENT_USER_JWKS_TTL_SECONDS") or "600")
+    now = time.time()
+    if not refresh:
+        cached = _JWKS_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+    if refresh:
+        last = _JWKS_LAST_REFRESH.get(url, 0.0)
+        if now - last < _JWKS_REFRESH_MIN_INTERVAL_SECONDS:
+            cached = _JWKS_CACHE.get(cache_key)
+            if cached:
+                return cached[1]
+        _JWKS_LAST_REFRESH[url] = now
+    timeout_s = float(os.getenv("AGENT_USER_JWKS_HTTP_TIMEOUT_SECONDS") or "5")
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
+            resp = await client.get(url, headers={"Accept": "application/json"})
+    except Exception as e:
+        raise AgentUserJwtError(f"Failed to fetch JWKS: {type(e).__name__}") from e
+    if resp.status_code < 200 or resp.status_code >= 300:
+        raise AgentUserJwtError(f"Failed to fetch JWKS: HTTP {resp.status_code}")
+    try:
+        jwks = resp.json()
+    except Exception as e:
+        raise AgentUserJwtError("Invalid JWKS JSON") from e
+    if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+        raise AgentUserJwtError("Invalid JWKS format: expected {keys: []}")
+    _JWKS_CACHE[cache_key] = (now + ttl_s, jwks)
+    return jwks
+
+
+
+
+
+def _verify_against(
+    token: str,
+    *,
+    jwks_sources: Optional[list[Tuple[str, str]]],
+    expected_issuers: Optional[list[str]],
+    expected_audience: Optional[str],
+    allowed_algs: list[str],
+    authorized_party: Optional[str] = None,
+    required_scopes: Optional[list[str]] = None,
+    preloaded_jwks: Optional[Dict[str, Any]] = None,
+    refresh_jwks=None,
+    require_claims: Tuple[str, ...] = ("exp",),
+    max_age_seconds: Optional[float] = None,
+) -> AgentUserIdentity:
     token = (token or "").strip()
     if not token:
         raise AgentUserJwtError("Missing token")
@@ -178,21 +317,22 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
 
     alg = (unverified_header.get("alg") or "").strip()
     kid = (unverified_header.get("kid") or "").strip() or None
-    allowed_algs = _get_allowed_algs()
-    if not alg or alg not in allowed_algs:
+    if not alg or alg not in allowed_algs or not _ALLOWED_ALG_RE.match(alg):
         raise AgentUserJwtError("Unsupported JWT alg")
 
-    jwks = _load_jwks(refresh=False)
+    jwks = preloaded_jwks if preloaded_jwks is not None else _load_jwks(refresh=False, sources=jwks_sources)
     candidates = list(_iter_jwk_candidates(jwks, kid=kid))
     if not candidates:
-        # Retry once with refreshed JWKS to handle rotation.
-        jwks = _load_jwks(refresh=True)
+        # Retry once with refreshed JWKS to handle rotation. The federated path supplies an async,
+        # rate-capped refresher; the global path keeps its sync loader.
+        if refresh_jwks is not None:
+            jwks = refresh_jwks()
+        else:
+            jwks = _load_jwks(refresh=True, sources=jwks_sources)
         candidates = list(_iter_jwk_candidates(jwks, kid=kid))
     if not candidates:
         raise AgentUserJwtError("No matching JWKS key")
 
-    expected_issuers = _get_expected_issuers()
-    expected_audience = _get_expected_audience()
     single_issuer = expected_issuers[0] if expected_issuers and len(expected_issuers) == 1 else None
 
     last_err: Optional[Exception] = None
@@ -204,7 +344,7 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
                 key=key,
                 algorithms=[alg],
                 options={
-                    "require": ["exp"],
+                    "require": list(require_claims),
                     "verify_signature": True,
                     "verify_exp": True,
                     "verify_iat": True,
@@ -218,11 +358,32 @@ def verify_agent_user_jwt(token: str) -> AgentUserIdentity:
         except Exception as e:
             last_err = e
             continue
+        if max_age_seconds is not None:
+            iat = claims.get("iat")
+            if not isinstance(iat, (int, float)) or (time.time() - float(iat)) > max_age_seconds:
+                last_err = AgentUserJwtError("Token too old")
+                continue
 
         issuer = claims.get("iss")
         if expected_issuers:
             if not issuer or issuer not in expected_issuers:
                 last_err = AgentUserJwtError("Invalid issuer")
+                continue
+        if authorized_party:
+            azp = claims.get("azp") if isinstance(claims.get("azp"), str) else claims.get("client_id")
+            if azp != authorized_party:
+                last_err = AgentUserJwtError("Token authorized party not allowed")
+                continue
+        if required_scopes:
+            raw_scope = claims.get("scope")
+            if isinstance(raw_scope, str):
+                granted = set(raw_scope.split())
+            elif isinstance(claims.get("scp"), list):
+                granted = {str(x) for x in claims.get("scp")}
+            else:
+                granted = set()
+            if not all(sc in granted for sc in required_scopes):
+                last_err = AgentUserJwtError("Token missing a required scope")
                 continue
 
         subject = claims.get("sub")
