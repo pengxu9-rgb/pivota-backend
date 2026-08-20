@@ -32,6 +32,9 @@ import uuid
 import pytest
 
 from db.sql_migrations import (
+    LEDGER_ABSENT,
+    LEDGER_FOREIGN,
+    LEDGER_OK,
     LEDGER_TABLE,
     list_migration_files,
     needs_autocommit,
@@ -342,7 +345,7 @@ def test_migration_commits_without_the_ledger(fresh_pg_engine, tmp_path, monkeyp
 
     base = str(tmp_path)
     _write(base, "001_no_ledger.sql", "-- leading comment\nCREATE TABLE IF NOT EXISTS t_no_ledger (id int);\n")
-    monkeypatch.setattr(module, "_ensure_ledger", lambda engine: False)
+    monkeypatch.setattr(module, "_ledger_state", lambda engine: (LEDGER_ABSENT, {}))
 
     result = module.run_sql_migrations(fresh_pg_engine, base_dir=base)
     assert result["failed"] == [], result["failed"]
@@ -370,7 +373,7 @@ def test_concurrently_migration_commits_without_the_ledger(fresh_pg_engine, tmp_
         "-- concurrent\nCREATE TABLE IF NOT EXISTS t_cnl (v text);\n"
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_t_cnl ON t_cnl (v);\n",
     )
-    monkeypatch.setattr(module, "_ensure_ledger", lambda engine: False)
+    monkeypatch.setattr(module, "_ledger_state", lambda engine: (LEDGER_ABSENT, {}))
 
     result = module.run_sql_migrations(fresh_pg_engine, base_dir=base)
     assert result["failed"] == [], result["failed"]
@@ -392,3 +395,198 @@ def test_split_statements_drops_comment_only_trailers() -> None:
     parts = split_statements("CREATE TABLE a (id int);\n-- note\nCREATE TABLE b (id int);\n")
     assert len(parts) == 2, parts
     assert parts[1].lstrip().startswith("--")
+
+
+@requires_pg
+def test_foreign_schema_migrations_table_does_not_break_the_runner(fresh_pg_engine, tmp_path) -> None:
+    """Production already has a `schema_migrations` table owned by something
+    outside this repo: 71 rows keyed `id` (`001_taxonomy.sql`, …), no
+    `filename`/`checksum` columns.
+
+    When the ledger was called `schema_migrations`, CREATE TABLE IF NOT EXISTS
+    no-op'd against that table and every ledger INSERT then failed *inside the
+    migration's own transaction* — all 219 files rolled back, each logged as a
+    warning. Measured 2026-08-20 against a copy of the production shape."""
+    from sqlalchemy import text
+
+    with fresh_pg_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE schema_migrations (id text PRIMARY KEY, "
+            "applied_at timestamptz NOT NULL DEFAULT now())"
+        )
+        conn.exec_driver_sql("INSERT INTO schema_migrations (id) VALUES ('001_taxonomy.sql')")
+
+    base = str(tmp_path)
+    _write(base, "001_a.sql", "-- comment led\nCREATE TABLE IF NOT EXISTS t_foreign_ok (id int);\n")
+    result = run_sql_migrations(fresh_pg_engine, base_dir=base)
+
+    assert result["failed"] == [], result["failed"]
+    assert result["applied"] == ["001_a.sql"]
+    with fresh_pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT to_regclass('t_foreign_ok')")).scalar() == "t_foreign_ok"
+        # The other system's rows are untouched — by CONTENT, not just count, so
+        # an UPDATE or delete-plus-insert cannot pass.
+        assert [r[0] for r in conn.execute(text("SELECT id FROM schema_migrations ORDER BY id"))] == [
+            "001_taxonomy.sql"
+        ]
+        # And OUR ledger is genuinely in use. Without this the gate passes even
+        # when LEDGER_TABLE is reverted to `schema_migrations`: the shape check
+        # then degrades to no-ledger and applies the file anyway, so the test
+        # would be pinning nothing about the name.
+        assert [r[0] for r in conn.execute(text(f"SELECT filename FROM {LEDGER_TABLE}"))] == [
+            "001_a.sql"
+        ]
+
+    second = run_sql_migrations(fresh_pg_engine, base_dir=base)
+    assert second["applied"] == [] and second["skipped"] == ["001_a.sql"], (
+        "the ledger is not being used — the runner is in degraded mode"
+    )
+
+
+@requires_pg
+def test_foreign_table_under_our_name_makes_the_runner_refuse(fresh_pg_engine, tmp_path) -> None:
+    """If a relation of OUR name exists and we cannot read our columns from it,
+    it belongs to something else — and without a ledger this runner cannot tell
+    which files already ran.
+
+    Applying everything anyway is not a safe fallback on a populated database:
+    126_subscription_plans_allowance_rebase resets
+    subscription_plans.monthly_credit_allowance, 139/146 re-tombstone catalog
+    rows, 013 appends a routing_migration_log row per boot, and 003/024/027
+    cannot be re-run at all (CREATE TRIGGER has no IF NOT EXISTS). So refuse."""
+    from sqlalchemy import text
+
+    with fresh_pg_engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"CREATE TABLE {LEDGER_TABLE} (id text PRIMARY KEY, applied_at timestamptz DEFAULT now())"
+        )
+        conn.exec_driver_sql(f"INSERT INTO {LEDGER_TABLE} (id) VALUES ('someone_elses.sql')")
+
+    base = str(tmp_path)
+    _write(base, "001_b.sql", "-- comment led\nCREATE TABLE IF NOT EXISTS t_refused (id int);\n")
+    result = run_sql_migrations(fresh_pg_engine, base_dir=base)
+
+    assert result["applied"] == [] and result["failed"] == []
+    assert "aborted" in result, "the runner did not refuse — it fell through to applying files"
+    with fresh_pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT to_regclass('t_refused')")).scalar() is None
+        # The other system's rows are untouched.
+        assert [r[0] for r in conn.execute(text(f"SELECT id FROM {LEDGER_TABLE}"))] == [
+            "someone_elses.sql"
+        ]
+
+
+@requires_pg
+def test_ledger_state_classifies_ours_and_foreign(fresh_pg_engine) -> None:
+    import db.sql_migrations as module
+
+    state, applied = module._ledger_state(fresh_pg_engine)
+    assert state == LEDGER_OK and applied == {}
+
+    with fresh_pg_engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP TABLE {LEDGER_TABLE}")
+        conn.exec_driver_sql(f"CREATE TABLE {LEDGER_TABLE} (id text PRIMARY KEY)")
+    state, applied = module._ledger_state(fresh_pg_engine)
+    assert state == LEDGER_FOREIGN and applied == {}
+
+
+@requires_pg
+def test_an_unwritable_ledger_never_rolls_back_the_migration(fresh_pg_engine, tmp_path) -> None:
+    """The ledger row is written AFTER the body commits, on its own
+    transaction. Coupling them is what turned a ledger defect into a total
+    outage. These four shapes all pass a column-name check and still reject
+    our INSERT — none of them may cost us the migration."""
+    from sqlalchemy import text
+
+    shapes = {
+        "no unique constraint for ON CONFLICT":
+            f"CREATE TABLE {LEDGER_TABLE} (filename text, checksum text)",
+        "extra NOT NULL column with no default":
+            f"CREATE TABLE {LEDGER_TABLE} (filename text PRIMARY KEY, checksum text, tenant text NOT NULL)",
+        "a view":
+            f"CREATE VIEW {LEDGER_TABLE} AS SELECT 'x'::text AS filename, 'y'::text AS checksum",
+    }
+    for label, ddl in shapes.items():
+        with fresh_pg_engine.begin() as conn:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {LEDGER_TABLE}")
+            conn.exec_driver_sql(f"DROP VIEW IF EXISTS {LEDGER_TABLE}")
+            conn.exec_driver_sql("DROP TABLE IF EXISTS t_unwritable")
+            conn.exec_driver_sql(ddl)
+
+        base = str(tmp_path / label.replace(" ", "_"))
+        _write(base, "001_u.sql", "-- comment led\nCREATE TABLE IF NOT EXISTS t_unwritable (id int);\n")
+        result = run_sql_migrations(fresh_pg_engine, base_dir=base)
+
+        assert result["applied"] == ["001_u.sql"], f"{label}: {result}"
+        assert result["failed"] == [], f"{label}: {result['failed']}"
+        with fresh_pg_engine.connect() as conn:
+            assert conn.execute(text("SELECT to_regclass('t_unwritable')")).scalar() == "t_unwritable", (
+                f"{label}: an unwritable ledger rolled the migration back"
+            )
+
+
+def test_ledger_table_is_not_the_foreign_schema_migrations_name() -> None:
+    """`schema_migrations` belongs to another system that shares this database.
+    Pinning the name here so a future rename cannot silently reintroduce the
+    collision."""
+    assert LEDGER_TABLE != "schema_migrations"
+    assert LEDGER_TABLE == "startup_sql_migrations"
+
+
+@requires_pg
+def test_degraded_mode_re_executes_every_file_on_every_boot(fresh_pg_engine, tmp_path, monkeypatch) -> None:
+    """Pins what "running without a ledger" actually costs, because the runner
+    documents it as the safe fallback. Every file is re-executed, so any file
+    that is not re-runnable fails from the second boot onward — in the real
+    tree that is 003/024/027 (`CREATE TRIGGER` has no IF NOT EXISTS)."""
+    import db.sql_migrations as module
+
+    monkeypatch.setattr(module, "_ledger_state", lambda engine: (LEDGER_ABSENT, {}))
+
+    base = str(tmp_path)
+    _write(
+        base,
+        "001_once.sql",
+        "-- not re-runnable: ADD CONSTRAINT has no IF NOT EXISTS\n"
+        "CREATE TABLE IF NOT EXISTS t_once (id int);\n"
+        "ALTER TABLE t_once ADD CONSTRAINT t_once_id_key UNIQUE (id);\n",
+    )
+
+    first = module.run_sql_migrations(fresh_pg_engine, base_dir=base)
+    assert first["applied"] == ["001_once.sql"], first
+
+    second = module.run_sql_migrations(fresh_pg_engine, base_dir=base)
+    assert second["skipped"] == [], "a ledger-less run must not skip anything"
+    assert [n for n, _ in second["failed"]] == ["001_once.sql"], (
+        "degraded mode re-executes every file; this one is not re-runnable, so the "
+        "second boot must report it failed (and roll it back whole)"
+    )
+
+
+@requires_pg
+def test_a_correctly_shaped_ledger_elsewhere_does_not_rescue_a_foreign_one(
+    fresh_pg_engine, tmp_path
+) -> None:
+    """The state check reads the SAME unqualified name the writes use, so a
+    correctly-shaped decoy in another schema cannot make the foreign table in
+    ours look usable. (An information_schema shape comparison without a
+    `current_schema()` filter did exactly that.)"""
+    from sqlalchemy import text
+
+    with fresh_pg_engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"CREATE TABLE public.{LEDGER_TABLE} (id text PRIMARY KEY, applied_at timestamptz)"
+        )
+        conn.exec_driver_sql("CREATE SCHEMA archive")
+        conn.exec_driver_sql(
+            f"CREATE TABLE archive.{LEDGER_TABLE} "
+            "(filename text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz DEFAULT now())"
+        )
+
+    base = str(tmp_path)
+    _write(base, "001_schema.sql", "-- comment led\nCREATE TABLE IF NOT EXISTS t_other_schema (id int);\n")
+    result = run_sql_migrations(fresh_pg_engine, base_dir=base)
+
+    assert "aborted" in result, f"the decoy in `archive` made a foreign table look ours: {result}"
+    with fresh_pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT to_regclass('t_other_schema')")).scalar() is None
