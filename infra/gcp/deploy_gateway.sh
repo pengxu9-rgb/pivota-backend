@@ -17,6 +17,14 @@ case "$ENV" in
   *) echo "bad env" >&2; exit 2 ;;
 esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
+# internet does not traverse the VPC, so it never leaves via Cloud NAT and the reserved address is
+# NOT the source IP. `8.231.167.230` is published to Antom/Adyen for allowlisting, so a deploy that
+# reverted this would silently break their IP checks. Verified from inside the VPC: a Cloud Run job
+# on this egress mode reports EGRESS_IP=8.231.167.230.
+: "${VPC_EGRESS:=all-traffic}"
+# `internal` alone does NOT admit the load balancer - only internal-and-cloud-load-balancing does.
+: "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo internal)}"
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
@@ -62,12 +70,13 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "sa-gateway@$PROJECT.iam.gserviceaccount.com" \
-  --network default --subnet default --vpc-egress private-ranges-only \
+  --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   --env-vars-file "$MERGED" \
   --set-secrets "$SECRETS" \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
   --min-instances "$MIN" --max-instances "$MAX" \
   --no-cpu-throttling --cpu-boost --execution-environment gen2 \
+  --ingress "$INGRESS" \
   $PUBLIC_FLAG \
   --labels "env=$ENV,service=$SERVICE,managed-by=infra-gcp" \
   $NO_TRAFFIC \

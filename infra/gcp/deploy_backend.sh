@@ -22,6 +22,12 @@ esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
+# all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
+# internet does not traverse the VPC, so it never leaves via Cloud NAT and the reserved address is
+# NOT the source IP. `8.231.167.230` is published to Antom/Adyen for allowlisting, so a deploy that
+# reverted this would silently break their IP checks. Verified from inside the VPC: a Cloud Run job
+# on this egress mode reports EGRESS_IP=8.231.167.230.
+: "${VPC_EGRESS:=all-traffic}"
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 # `internal` and `internal-and-cloud-load-balancing` are DIFFERENT values: only the latter admits
 # requests from Google Cloud Load Balancing. Setting plain `internal` on a service behind the LB
@@ -74,7 +80,7 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "sa-backend@$PROJECT.iam.gserviceaccount.com" \
-  --network default --subnet default --vpc-egress private-ranges-only \
+  --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   --env-vars-file "$MERGED" \
   --set-secrets "$SECRETS" \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \

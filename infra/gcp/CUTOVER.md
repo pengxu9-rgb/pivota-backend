@@ -32,7 +32,7 @@ before prod is meant to act. Both scripts now default to inert and require an ex
 
 ## T-48h
 1. Drop DNS TTLs to 60s at HiChina for: `api`, `mcp`, `commerce.mcp`, `ucp`, `acp`, `gateway`,
-   and the apex + `www` if they are moving. HiChina serves the OLD ttl until it expires — a 60s TTL
+   and the six hosts below (the apex and `www` are NOT moving - see the apex section). HiChina serves the OLD ttl until it expires — a 60s TTL
    set on the day does nothing.
 2. Re-run the acceptance corpus against GCP prod.
 3. Confirm the Google console has BOTH redirect URIs registered (see
@@ -92,3 +92,19 @@ means losing those writes or hand-reconciling them. Decide to roll back early or
   partners hold. The whole point of the R1-R8 work was that these do not move.
 - **Prod egress IP `8.231.167.230`** — reserved, given to Antom/Adyen for allowlisting. Staging's
   `136.66.216.216` is a different address and must never be given to a partner.
+
+## The apex is OUT OF SCOPE — do not flip it
+
+`pivota.cc` and `www.pivota.cc` are served by **Vercel** (`server: Vercel`, A `216.198.79.1`), the
+same as `agent.pivota.cc`. They are the marketing/UI site, not the backend or the gateway, and they
+are deliberately **absent from the load balancer's host list** — so there is no certificate for them
+in the cert map.
+
+Pointing the apex at the LB would therefore not 404; it would **fail TLS**, because SNI would match
+no cert-map entry. That is a hard outage on the most visible hostname you own.
+
+Only these six move, and they move together:
+`api` · `gateway` · `mcp` · `commerce.mcp` · `ucp` · `acp` — all `.pivota.cc`.
+
+Also not moving: `agent.pivota.cc` (Vercel), `bulk-email-tool.pivota.cc` (a separate Railway project
+that appears in no repo — decide keep/kill on its own).
