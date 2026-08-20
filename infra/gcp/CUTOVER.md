@@ -108,3 +108,59 @@ Only these six move, and they move together:
 
 Also not moving: `agent.pivota.cc` (Vercel), `bulk-email-tool.pivota.cc` (a separate Railway project
 that appears in no repo — decide keep/kill on its own).
+
+
+## Rehearsal results — staging, 2026-08-20
+
+The whole sequence was executed against staging. Five things were wrong; all are fixed, and the
+timings below are real, not estimates.
+
+| step | measured |
+|---|---|
+| dump Railway prod → GCS | **7m28s** (3.9 GB → 418 MiB gz) |
+| import into a fresh Cloud SQL database | **~9m30s** |
+| arm workers + resume both triggers | **~1m** |
+| **total data path** | **~17 minutes** |
+
+### What the rehearsal found
+
+1. **`--wipe` is the wrong shape for a cutover, and was replaced by `--new-db`.** `DROP DATABASE`
+   fails while any session holds the database — and scaling Cloud Run to zero does **not** kill
+   running instances promptly. Three attempts failed with *"database is being accessed by other
+   users"*, even after draining services and terminating backends. Discovering that at 2am, with the
+   old data already dropped, is the worst possible position.
+   `--new-db` imports into `pivota_<stamp>` while the services keep serving the current database.
+   Nothing is dropped, nothing must be drained, and the switch is a `DATABASE_URL` secret update plus
+   a redeploy — **which is also the rollback, in reverse.**
+2. **Importing over a populated database fails** on the first `CREATE SCHEMA` (`schema
+   "agent_center" already exists`). At cutover the target already holds the earlier import, so a
+   plain re-import would have failed. `--new-db` sidesteps this entirely.
+3. **The import verification never ran.** It used `--command psql`, but this image installs `libpq5`
+   and no `postgresql-client`, so the job never started and the count came back empty. The script
+   *did* fail closed with an actionable message — the behaviour was right, the check was absent. Now
+   uses python+asyncpg and targets the database actually imported into. Verified: **365 tables,
+   14,124 catalog_products.**
+4. **`--new-db` named the database from the dump URI alone**, so re-running against the same dump
+   collided with the previous run's database. Now includes a timestamp.
+5. **`REGION` was undefined** in `restore_to_cloudsql.sh` — the drain step died on `unbound variable`
+   under `set -u`.
+
+### What the rehearsal confirmed works
+
+- **`PAUSED=0` genuinely resumes both triggers.** This was previously a silent no-op, and it is the
+  step the cutover depends on. Verified: `Job has been resumed`, both `ENABLED`.
+- **The invitation job now runs and EXITS.** Two executions under a live `* * * * *` trigger,
+  ~60s apart, each `succeeded=1` with a completion time. Before the fix each would have run to the
+  3600s timeout while another started every minute.
+- **Connections stay far inside budget with workers armed.** Measured on the live database, not
+  derived: **20 of 200** in use (10 idle app + 2 cloudsqlagent + 1 active).
+- **Zero send/charge log lines** for the whole armed window.
+
+### Sequence changes this produces
+
+- The final data sync uses **`--new-db`**, and the switch is a secret update plus a redeploy.
+- **Deploy services one at a time**, not concurrently: a rolling deploy transiently doubles a
+  service's connections.
+- Staging's email credentials are deliberately invalid sentinels (it holds a restored **production**
+  snapshot with real buyer addresses; a live SendGrid key plus one enabled worker sends real mail).
+  Stripe in staging is a genuine `sk_test_` key taken from Railway's own `web-staging` service.
