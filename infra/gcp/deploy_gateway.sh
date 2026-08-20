@@ -17,6 +17,19 @@ case "$ENV" in
   *) echo "bad env" >&2; exit 2 ;;
 esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
+# internet does not traverse the VPC, so it never leaves via Cloud NAT and the reserved address is
+# NOT the source IP. `8.231.167.230` is published to Antom/Adyen for allowlisting, so a deploy that
+# reverted this would silently break their IP checks. Verified from inside the VPC: a Cloud Run job
+# on this egress mode reports EGRESS_IP=8.231.167.230.
+: "${VPC_EGRESS:=all-traffic}"
+# `internal` alone does NOT admit the load balancer - only internal-and-cloud-load-balancing does,
+# so prod (which sits behind the LB) must use the latter.
+# Staging defaults to `all` deliberately: the live staging gateway is reachable on its run.app URL
+# today, and silently flipping a SERVICE-level setting mid-deploy would take it offline for anything
+# outside the VPC - including the operator running the deploy. Pass INGRESS=internal explicitly to
+# tighten it as a considered change rather than a side effect of shipping code.
+: "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo all)}"
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
@@ -54,20 +67,72 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
   # requirePlatformEnv() throws at boot without this (src/server.js:52114).
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
   # node-pg's Pool defaults to 10 connections PER PROCESS. At --max-instances 20 that is 200 on its
-  # own, and Cloud SQL max_connections is 200 shared with web and worker. Staging (MAX=4) can never
-  # reveal this. Budget: gateway 20x3=60 + web 20x6=120 + worker 10 = 190, under 200.
+  # own, and Cloud SQL max_connections is 200. Staging (MAX=4) can never reveal this.
+  #
+  # BUDGET - re-derive this whenever a service is added, and note it is NOT currently satisfied:
+  #   web 20x6=120 + gateway 20x3=60 + worker 1x10=10            = 190
+  #   + proof-issuer 20x6=120 + acp 20x6=120 (both min=2 max=20) = 430 against max_connections=200
+  # proof-issuer opens no pool (it is a stateless signer - no DB), so its 120 is nominal. acp is a
+  # different repo and whether it honours DB_POOL_MAX_SIZE is UNMEASURED. Before cutover either
+  # measure acp's real pool behaviour and cap max-instances accordingly, or raise max_connections.
+  # Tracked as a cutover gap in README; do not treat 190/200 as still true.
   printf 'PG_POOL_MAX: "%s"\nPGPOOL_MAX: "%s"\nDB_POOL_MAX_SIZE: "%s"\n' "$PG_POOL_MAX" "$PG_POOL_MAX" "$PG_POOL_MAX"
 } >> "$MERGED"
+
+# The candidate gate must be able to REACH the candidate. Every prod service is
+# `internal-and-cloud-load-balancing`, so a curl from an operator's laptop gets Google's 404 before
+# the container is ever consulted - the gate would then exit 1 on every prod deploy and strand a
+# perfectly good revision at 0%. Measured 2026-08-20: web/gateway/proof-issuer/acp all 404 from
+# outside; `internal` 404s before IAM, `all` gets as far as a 403.
+#
+# So: try directly, and if the answer is an ingress/IAM rejection rather than the app, re-probe from
+# INSIDE the VPC with a one-shot Cloud Run job. Only a real 200 from the application passes.
+probe_health(){ # url -> echoes the status code
+  local url="$1" code
+  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null || echo 000)
+  case "$code" in
+    200) rm -f /tmp/pivota-health.$$; echo 200; return 0 ;;
+    403|404|000) : ;;                     # possibly ingress/IAM, not the app - fall through
+    *) rm -f /tmp/pivota-health.$$; echo "$code"; return 0 ;;
+  esac
+  rm -f /tmp/pivota-health.$$
+  echo "   direct probe got $code (ingress-blocked from here); re-probing from inside the VPC" >&2
+  # ^|^ delimiter: gcloud splits --args on COMMAS, and this probe is Python that contains commas
+  # (`,timeout=25`), which would otherwise be shredded into separate argv entries.
+  local job="verify-$$-$RANDOM"
+  "$GCLOUD" run jobs create "$job" --region "$REGION" --project "$PROJECT" \
+    --image "$REGION-docker.pkg.dev/pivota-shared/pivota/backend:latest" \
+    --service-account "sa-worker@$PROJECT.iam.gserviceaccount.com" \
+    --network default --subnet default --vpc-egress all-traffic \
+    --max-retries 0 --task-timeout 120s --command python \
+    --args="^|^-c|import urllib.request;print('PROBE_STATUS='+str(urllib.request.urlopen('$url',timeout=25).status))" \
+    --quiet >/dev/null 2>&1
+  local out="" i
+  if "$GCLOUD" run jobs execute "$job" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1; then
+    # Cloud Logging ingestion lags the job's exit by a few seconds. Reading immediately returns
+    # nothing and the probe reports 000 - which reads exactly like a failed health check and would
+    # strand a healthy revision. Poll instead of guessing a sleep.
+    for i in 1 2 3 4 5 6; do
+      out=$("$GCLOUD" logging read "resource.labels.job_name=\"$job\"" --project "$PROJECT" --limit 15 \
+        --format='value(textPayload)' 2>/dev/null | grep -oE 'PROBE_STATUS=[0-9]+' | head -1 | cut -d= -f2)
+      [ -n "$out" ] && break
+      sleep 5
+    done
+  fi
+  "$GCLOUD" run jobs delete "$job" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
+  echo "${out:-000}"
+}
 
 "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
   --service-account "sa-gateway@$PROJECT.iam.gserviceaccount.com" \
-  --network default --subnet default --vpc-egress private-ranges-only \
+  --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   --env-vars-file "$MERGED" \
   --set-secrets "$SECRETS" \
   --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
   --min-instances "$MIN" --max-instances "$MAX" \
   --no-cpu-throttling --cpu-boost --execution-environment gen2 \
+  --ingress "$INGRESS" \
   $PUBLIC_FLAG \
   --labels "env=$ENV,service=$SERVICE,managed-by=infra-gcp" \
   $NO_TRAFFIC \
@@ -86,8 +151,7 @@ echo "verifying candidate at $CAND_URL"
 # /health, NOT /healthz: Cloud Run's frontend intercepts /healthz and returns its own 404 before the
 # request reaches the container (proved 2026-08-19: /health -> 200 application/json from the app,
 # /healthz -> 404 text/html from GFE). Railway's healthcheckPath is /healthz, so this differs by platform.
-CODE=$(curl -sS -o /tmp/pivota-gw-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$CAND_URL/health" || echo 000)
-head -c 400 /tmp/pivota-gw-health.$$; echo; rm -f /tmp/pivota-gw-health.$$
+CODE=$(probe_health "$CAND_URL/health")
 [ "$CODE" = 200 ] || { echo "candidate /health returned $CODE - NOT shifting traffic." >&2; exit 1; }
 
 [ "$FIRST_DEPLOY" = 1 ] || "$GCLOUD" run services update-traffic "$SERVICE" --project "$PROJECT" --region "$REGION" --to-latest --quiet
