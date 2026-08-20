@@ -736,6 +736,32 @@ active_mirrorable AS (
   SELECT *
   FROM active_all
 ),
+-- Pre-computed ONCE so the anti-join below is a hash join, not a per-row scan.
+--
+-- `active_all` is a MATERIALIZED CTE (Postgres materialises any CTE referenced
+-- more than once), and a materialised CTE carries NO STATISTICS. The planner
+-- therefore estimated it at 63 rows when it holds 11,352, chose a Nested Loop
+-- for the correlated `NOT EXISTS` in `missing`, and re-scanned the whole CTE
+-- once per candidate. MEASURED on prod: 11,352 loops, 64,508,866 inner
+-- iterations, 72.7s of a 76s query. Hoisting the join out makes the estimate
+-- irrelevant — it runs once over 11,352 rows instead of 11,352 times.
+-- NOT MATERIALIZED, and that keyword is the whole point of the fix holding.
+--
+-- The report's totals query references this CTE TWICE (`missing` and
+-- `candidates_attached_present`), and Postgres materialises any CTE referenced
+-- more than once — which would hand `attached_epids` the SAME statistics-free
+-- misestimate that made `active_all` explode, one level down. MEASURED at prod
+-- row counts (11,352 seeds / 5,683 attached): materialised the totals query
+-- plans a Nested Loop Anti Join re-scanning this CTE 5,683 times (~16M
+-- tuplestore reads) at 0.49s; NOT MATERIALIZED plans a Merge Anti Join with
+-- loops=1 at 0.08s. Inlining also lets the planner use catalog_products'
+-- indexes, which a tuplestore has none of.
+attached_epids AS NOT MATERIALIZED (
+  SELECT DISTINCT a.external_product_id
+  FROM active_all a
+  JOIN catalog_products cp_attached
+    ON cp_attached.product_key = a.attached_product_key
+),
 ranked AS (
   SELECT
     eps.*,
@@ -840,14 +866,10 @@ missing AS (
   LEFT JOIN catalog_products cp
     ON cp.platform = 'external_seed'
    AND cp.source_product_id = c.external_product_id
+  LEFT JOIN attached_epids ae
+    ON ae.external_product_id = c.external_product_id
   WHERE cp.product_key IS NULL
-    AND NOT EXISTS (
-      SELECT 1
-      FROM active_all a
-      JOIN catalog_products cp_attached
-        ON cp_attached.product_key = a.attached_product_key
-      WHERE a.external_product_id = c.external_product_id
-    )
+    AND ae.external_product_id IS NULL
 )
 """
 )
@@ -1025,11 +1047,9 @@ async def _build_report(*, sample_limit: int, limit: int, apply: bool) -> Dict[s
           (SELECT count(*) FROM candidates WHERE length(coalesce(mirrored_description, '')) >= 50) AS candidates_with_description_50,
           (SELECT count(*) FROM candidates WHERE nullif(btrim(coalesce(image_url, '')), '') IS NOT NULL AND length(coalesce(mirrored_description, '')) >= 50) AS candidates_visible_quality_ready,
           (SELECT count(*) FROM missing) AS missing_catalog_products,
-          (SELECT count(*) FROM candidates c WHERE EXISTS (
-             SELECT 1 FROM active_all a
-             JOIN catalog_products x ON x.product_key = a.attached_product_key
-             WHERE a.external_product_id = c.external_product_id
-          )) AS candidates_attached_present,
+          (SELECT count(*) FROM candidates c
+             JOIN attached_epids ae ON ae.external_product_id = c.external_product_id
+          ) AS candidates_attached_present,
           (SELECT count(*) FROM catalog_products) AS catalog_products_total,
           (SELECT count(*) FROM catalog_products WHERE pivota_signature_id IS NOT NULL) AS catalog_products_with_sig,
           (SELECT count(*) FROM catalog_products WHERE merchant_id = 'external_seed' AND platform = 'external_seed') AS catalog_products_external_seed,

@@ -50,10 +50,42 @@ def test_mirror_missing_treats_attached_existing_canonical_as_present() -> None:
     by external_product_id), not just the ranked rn=1 winner — mixed
     attached/unattached duplicate groups would otherwise mint the shadow via
     the unattached winner. Self-heal preserved: if every attached target row
-    is gone, the NOT EXISTS passes and the group is mirrorable again."""
+    is gone, the group is mirrorable again.
+
+    THIS IS STILL A SPELLING TEST, and saying otherwise would repeat the
+    mistake it exists to document. A substring assert cannot tell
+    `SELECT DISTINCT a.external_product_id` from an equivalent `GROUP BY`, and
+    renaming the alias `ae` would fail it for a correct change. It is kept only
+    as a cheap smoke check that the attachment logic was not deleted outright;
+    the BEHAVIOUR is owned by
+    tests/test_missing_mirror_count_equivalence_postgres.py, which executes both
+    chains on real Postgres and now also executes `candidates_attached_present`
+    against a group with two attached seeds — so dropping the DISTINCT fails a
+    real query rather than a string match. If you are rewriting this SQL and one
+    of these asserts blocks you, change the assert; trust the Postgres gate.
+
+    What this replaced, and why. They used to require
+    the literal `a.external_product_id = c.external_product_id`, i.e. that the
+    check be written as a CORRELATED subquery. That correlation was the
+    2026-08-20 outage: `active_all` is a materialised CTE, materialised CTEs
+    carry no statistics, the planner estimated 63 rows against 11,352, chose a
+    Nested Loop and re-scanned the CTE once per candidate — 64,508,866 inner
+    iterations, 72.7s per call, ~2,600 calls, which exhausted the 20-slot pool
+    and starved HTTP. The check is now a pre-computed `attached_epids` set and
+    an anti-join: same rows, 160x faster. A test that pins one implementation
+    of a property blocks the fix for a defect in that implementation.
+
+    The BEHAVIOUR — that this set matches the cheap chain's, including the
+    duplicate/mixed-attachment groups production does not currently contain —
+    is proven by tests/test_missing_mirror_count_equivalence_postgres.py.
+    Verified 2026-08-20: dropping the anti-join condition fails 2 of its tests,
+    and dropping the DISTINCT fails the attached-present counter."""
+    # the attachment join itself
     assert "cp_attached.product_key = a.attached_product_key" in COMMON_CTES
-    assert "NOT EXISTS" in COMMON_CTES
-    assert "a.external_product_id = c.external_product_id" in COMMON_CTES
+    # keyed on the GROUP (external_product_id), not the rn=1 winner
+    assert "SELECT DISTINCT a.external_product_id" in COMMON_CTES
+    # and candidates whose group is attached are excluded
+    assert "ae.external_product_id IS NULL" in COMMON_CTES
 
 
 def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
