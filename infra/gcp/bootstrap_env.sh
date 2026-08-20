@@ -16,7 +16,10 @@ set -euo pipefail
 ENV="${1:-}"
 case "$ENV" in
   staging) PROJECT=pivota-staging; SQL_TIER=db-custom-1-3840; SQL_HA=zonal;    REDIS_GB=1; REDIS_TIER=basic;       DELETION_PROTECTION=--no-deletion-protection ;;
-  prod)    PROJECT=pivota-prod;    SQL_TIER=db-custom-2-7680; SQL_HA=REGIONAL; REDIS_GB=2; REDIS_TIER=standard_ha; DELETION_PROTECTION=--deletion-protection ;;
+  # Memorystore's HA tier is spelled `standard` (it is the tier WITH a replica); `standard_ha` is the
+  # API enum, and gcloud normalizes it to `standard-ha`, which is not a valid --tier choice. Staging
+  # uses `basic`, so this line only ever executes on the prod path - it failed there first.
+  prod)    PROJECT=pivota-prod;    SQL_TIER=db-custom-2-7680; SQL_HA=REGIONAL; REDIS_GB=2; REDIS_TIER=standard;    DELETION_PROTECTION=--deletion-protection ;;
   *) echo "usage: $0 staging|prod" >&2; exit 2 ;;
 esac
 

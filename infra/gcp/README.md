@@ -83,6 +83,25 @@ service that deploys from this repo** (`web`, `web-staging`, `pivota-acp`, `ucp-
 prod `web` healthcheck. Keep it at `infra/gcp/Dockerfile` and build with `-f`; `.dockerignore` stays
 at the repo root because that is the build context root.
 
+## Production stack (created 2026-08-20)
+
+| resource | value |
+|---|---|
+| Cloud SQL | `pivota-prod:us-west1:pivota-pg` — POSTGRES_17, `db-custom-2-7680`, **REGIONAL** (HA), PITR on, deletion protection on, private IP `10.25.0.2` |
+| Memorystore | `pivota-redis` — `STANDARD_HA`, 2 GB, 1 replica, AUTH on, `10.25.7.196:6379` |
+| **Egress IP** | **`8.231.167.230`** — RESERVED (not ephemeral), via Cloud NAT `pivota-nat` on router `pivota-router` |
+| service accounts | `sa-backend`, `sa-gateway`, `sa-worker` @ `pivota-prod.iam.gserviceaccount.com` |
+| secrets | `pivota-db-password`, `DATABASE_URL`, `REDIS_URL` |
+
+**`8.231.167.230` is the address to give Antom and Adyen for IP allowlisting.** It is a reserved
+static address, so it survives NAT/router/instance changes. Staging's equivalent is
+`136.66.216.216` — do not hand that one to a partner.
+
+Note the prod path exercised a line staging never did: Memorystore's HA tier is spelled `standard`
+(the tier WITH a replica, reported back as `STANDARD_HA`). `standard_ha` is the API enum, and gcloud
+normalizes it to `standard-ha`, which is not a valid `--tier` choice — so the first prod run failed
+there while every staging run had passed.
+
 ## Known gaps before the Sep 8-12 prod cutover
 
 Tracked from the review of this PR; none is covered by these scripts yet.
