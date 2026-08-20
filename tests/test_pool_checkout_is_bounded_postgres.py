@@ -69,12 +69,15 @@ async def test_a_saturated_pool_times_out_instead_of_hanging(monkeypatch) -> Non
 
         # A second caller in its OWN context cannot inherit the held connection,
         # so it must queue for the pool — and now give up.
+        captured: list = []
+
         async def starved() -> str:
             t0 = time.monotonic()
             try:
                 await db.fetch_val("SELECT 1")
                 return "served"
-            except (asyncio.TimeoutError, TimeoutError):
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                captured.append(exc)
                 return f"timed_out_after_{time.monotonic() - t0:.1f}s"
 
         # A separate task: it gets its own copy of the context, so it cannot
@@ -84,6 +87,20 @@ async def test_a_saturated_pool_times_out_instead_of_hanging(monkeypatch) -> Non
         # It must have failed on the POOL's 0.5s deadline, well before the
         # holder released at 3s — otherwise it was simply served late.
         assert "timed_out_after_0" in result or "timed_out_after_1" in result, result
+
+        # The TYPE the patch really raises — asserted on the live exception, not
+        # on one built by hand. A hand-built PoolCheckoutTimeout proves only that
+        # the class exists; a mutant raising a bare TimeoutError from the patch
+        # survived exactly that weaker test. A bare TimeoutError has an empty
+        # message, matches no substring classifier, and reaches clients as a 500.
+        from utils.transient_errors import PoolCheckoutTimeout, is_asyncpg_busy_error
+
+        assert captured, "no exception captured"
+        assert isinstance(captured[0], PoolCheckoutTimeout), (
+            f"pool saturation raised {type(captured[0]).__name__}, which no "
+            "classifier recognises — it would surface as a 500, not a 503"
+        )
+        assert is_asyncpg_busy_error(captured[0]), "not routed to the 503 vocabulary"
 
         assert result.startswith("timed_out"), (
             f"expected a bounded failure, got {result!r} — an unbounded acquire "
@@ -97,8 +114,11 @@ async def test_a_saturated_pool_times_out_instead_of_hanging(monkeypatch) -> Non
 async def test_the_deadline_does_not_fire_on_a_healthy_pool() -> None:
     """The bound must be invisible when slots are available.
 
-    Without this the test above passes just as well with a 0-second deadline,
-    which would fail every query in production.
+    NOT a guard against too-small a deadline — a mutant setting the default to
+    0.1s leaves this GREEN (`test_the_production_default_is_a_real_bound` is
+    what catches that). What this kills is "acquire always raises": a patch that
+    turned every checkout into a timeout would pass the saturation test above
+    and fail here.
     """
     from databases import Database
 
@@ -120,6 +140,7 @@ def test_the_patch_preserves_the_asserts_recovery_depends_on() -> None:
     """
     import inspect
 
+    import db.database  # noqa: F401 — installs the patch; do NOT rely on test order
     from databases.backends.postgres import PostgresConnection
 
     src = inspect.getsource(PostgresConnection.acquire)
@@ -135,3 +156,70 @@ def test_the_production_default_is_a_real_bound() -> None:
     assert 1.0 <= dbmod.DB_POOL_CHECKOUT_TIMEOUT_SECONDS <= 120.0, (
         f"implausible checkout deadline: {dbmod.DB_POOL_CHECKOUT_TIMEOUT_SECONDS}"
     )
+
+
+def test_the_process_actually_installs_the_patch_on_import() -> None:
+    """Importing `db.database` with a Postgres URL must leave checkout bounded.
+
+    THE TEST THIS FILE WAS MISSING, and its absence was the sharpest finding in
+    review: replacing `if IS_POSTGRES:` with `if False:` left all four other
+    tests passing, because test 1 calls `_install_bounded_pool_checkout()`
+    itself. They proved the FUNCTION works and never that the PROCESS runs it —
+    on a change whose entire value is being installed.
+
+    A subprocess is required: this interpreter has already imported the module,
+    so any in-process check is satisfied by whoever imported it first.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import db.database;"
+        "from databases.backends.postgres import PostgresConnection as C;"
+        "import sys;"
+        "sys.exit(0 if getattr(C.acquire, '_pivota_bounded', False) else 3)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+        env={**os.environ, "DATABASE_URL": DATABASE_URL},
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        "importing db.database did not bound pool checkout "
+        f"(rc={proc.returncode}): {proc.stderr.decode()[-400:]}"
+    )
+
+
+def test_a_checkout_timeout_is_classified_retryable_not_a_server_error() -> None:
+    """Saturation must reach clients as 503 + Retry-After, never a 500.
+
+    asyncpg raises a BARE `TimeoutError` whose `str()` is empty, and every
+    classifier in utils.transient_errors matches on substrings — so before the
+    typed `PoolCheckoutTimeout` this sailed past all of them into
+    `_handle_unexpected_error` and surfaced as 500 INTERNAL_SERVER_ERROR. That
+    is loud in the WRONG channel: it pages as a code bug rather than DB
+    capacity, and it hands agent/partner clients a non-retryable status for an
+    entirely retryable state.
+    """
+    from utils.transient_errors import (
+        PoolCheckoutTimeout,
+        db_busy_http_exception,
+        is_asyncpg_busy_error,
+        is_pool_checkout_timeout,
+    )
+
+    err = PoolCheckoutTimeout("timed out waiting 120.0s for a database connection")
+
+    assert isinstance(err, TimeoutError), (
+        "must stay a TimeoutError subclass so callers already catching it "
+        "(the canonical route's _bounded_db) keep working"
+    )
+    assert is_pool_checkout_timeout(err)
+    assert is_asyncpg_busy_error(err), "not routed to the existing 503 vocabulary"
+    # and it survives being wrapped, which is how it reaches most handlers
+    wrapped = RuntimeError("query failed")
+    wrapped.__cause__ = err
+    assert is_asyncpg_busy_error(wrapped)
+    assert db_busy_http_exception().status_code == 503
