@@ -29,10 +29,22 @@ set -euo pipefail
 ENV="${1:-}"; BACKEND_TAG="${2:-}"; GATEWAY_TAG="${3:-}"
 [ -n "$ENV" ] && [ -n "$BACKEND_TAG" ] && [ -n "$GATEWAY_TAG" ] || { echo "usage: $0 staging|prod <backend-tag> <gateway-tag>" >&2; exit 2; }
 case "$ENV" in
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    WORKERS=false; PAUSED=1 ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; WORKERS=true;  PAUSED=0 ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production ;;
   *) exit 2 ;;
 esac
+
+# WORKERS/PAUSED are OPT-IN, exactly as in deploy_backend.sh, and for the same reason: until the DNS
+# flip, GCP prod runs against a COPY of production data with the REAL production credentials while
+# Railway prod is still serving. Deriving these from $ENV is what makes `setup_scheduler.sh prod`
+# quietly arm a second set of drainers over the same queue — duplicate emails, duplicate settlement
+# attempts, duplicate captures. It did exactly that on 2026-08-20 (caught in under a minute, no
+# executions fired) because deploy_backend.sh had been made opt-in and this script had not.
+#
+#   pre-cutover:  infra/gcp/setup_scheduler.sh prod <a> <b>                  (inert: default)
+#   at cutover:   WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>
+: "${WORKERS:=false}"
+: "${PAUSED:=1}"
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"

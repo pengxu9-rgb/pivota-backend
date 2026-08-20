@@ -14,13 +14,21 @@ deliberately inert:
 |---|---|---|
 | `AUDIT_WORKER_ENABLED` / `REVIEWS_INVITATION_WORKER_ENABLED` | `false` (via `env.prod.overrides.yaml`) | `true` |
 | `deploy_backend.sh prod` | `WORKERS` defaults to `false` | `WORKERS=true` explicitly |
-| Cloud Scheduler triggers | not created | created enabled |
+| Cloud Scheduler triggers | created PAUSED (`PAUSED` defaults to 1) | `PAUSED=0` |
 | gateway → backend URLs | the GCP prod `run.app` URLs | `api.pivota.cc` (which by then IS GCP) |
 | DNS | unchanged, pointing at Railway | flipped |
 
 Two live drainers over two copies of one queue means duplicate emails, duplicate settlement
 attempts, duplicate captures. That is the single worst thing that can go wrong here, and it is why
 workers are opt-in rather than opt-out.
+
+**This is not hypothetical.** On 2026-08-20 `setup_scheduler.sh prod` armed the prod worker and both
+Cloud Scheduler triggers — including `reviews-invitation-send` on `* * * * *` — because
+`deploy_backend.sh` had been converted to opt-in and this script had not. Caught in under a minute;
+no job execution fired and no send/charge occurred. The lesson is in the shape, not the outcome: any
+script that derives "should this act on the world" from `$ENV` will eventually be run against prod
+before prod is meant to act. Both scripts now default to inert and require an explicit
+`WORKERS=true PAUSED=0`.
 
 ## T-48h
 1. Drop DNS TTLs to 60s at HiChina for: `api`, `mcp`, `commerce.mcp`, `ucp`, `acp`, `gateway`,
@@ -41,7 +49,7 @@ workers are opt-in rather than opt-out.
 4. **Bring the GCP stack live:**
    ```bash
    WORKERS=true infra/gcp/deploy_backend.sh prod <sha>
-   WORKERS=true infra/gcp/setup_scheduler.sh prod <backend-sha> <gateway-sha>
+   WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <backend-sha> <gateway-sha>
    infra/gcp/deploy_gateway.sh prod <gateway-sha>
    ```
 5. **Point the gateway at the public names**: edit `env.prod.gateway.overrides.yaml` to

@@ -83,10 +83,13 @@ CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --reg
   --format="value(status.traffic.extract(\"url\").flatten())" | tr ';' '\n' | grep -F "$CANDIDATE_TAG" | head -1)
 [ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
 CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
+# macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under
+# `set -u` — which is exactly the public (PUBLIC=1) case. Use the ${arr[@]+"${arr[@]}"} guard.
 AUTH=()
 [ "$PUBLIC" = 1 ] || AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
+AUTH_ARGS=(${AUTH[@]+"${AUTH[@]}"})
 echo "verifying candidate at $CAND_URL"
-CODE=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 "${AUTH[@]}" "$CAND_URL/health" || echo 000)
+CODE=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$CAND_URL/health" || echo 000)
 head -c 400 /tmp/pivota-health.$$; echo; rm -f /tmp/pivota-health.$$
 [ "$CODE" = 200 ] || { echo "candidate health check returned $CODE — NOT shifting traffic. Previous revision still serving." >&2; exit 1; }
 

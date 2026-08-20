@@ -35,7 +35,15 @@ ENV_FILE="$HERE/env.$ENV.gateway.yaml"
 SECRETS_FILE="$HERE/secrets.$ENV.gateway.list"
 [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "missing $ENV_FILE / $SECRETS_FILE - run port_railway_env.py --prefix gateway first" >&2; exit 1; }
 
-SECRETS="$(paste -sd, "$SECRETS_FILE")"
+# The gateway talks to Postgres directly (internal_catalog / external_seeds discovery providers), so
+# it needs DATABASE_URL and the pci_kb DSN - neither of which the porter emits: it DROPS DATABASE_URL
+# by design, because the value must come from Cloud SQL rather than Railway. Mount them explicitly,
+# or /health reports db_backed_providers_ready=false with code "missing_database" and discovery runs
+# single-provider without ever erroring.
+#
+# The _NOVERIFY variants exist because node-pg validates the server certificate chain differently to
+# asyncpg against Cloud SQL's private IP; the Python services use the plain sslmode=require DSNs.
+SECRETS="DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,INGREDIENT_REFERENCE_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,$(paste -sd, "$SECRETS_FILE")"
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 { cat "$ENV_FILE"
   # requirePlatformEnv() throws at boot without this (src/server.js:52114).
@@ -60,13 +68,16 @@ CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --reg
   --format="value(status.traffic.extract(\"url\").flatten())" | tr ';' '\n' | grep -F "$CANDIDATE_TAG" | head -1)
 [ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
 CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
+# macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under
+# `set -u` — which is exactly the public (PUBLIC=1) case. Use the ${arr[@]+"${arr[@]}"} guard.
 AUTH=()
 [ "$PUBLIC" = 1 ] || AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
+AUTH_ARGS=(${AUTH[@]+"${AUTH[@]}"})
 echo "verifying candidate at $CAND_URL"
 # /health, NOT /healthz: Cloud Run's frontend intercepts /healthz and returns its own 404 before the
 # request reaches the container (proved 2026-08-19: /health -> 200 application/json from the app,
 # /healthz -> 404 text/html from GFE). Railway's healthcheckPath is /healthz, so this differs by platform.
-CODE=$(curl -sS -o /tmp/pivota-gw-health.$$ -w '%{http_code}' -m 30 "${AUTH[@]}" "$CAND_URL/health" || echo 000)
+CODE=$(curl -sS -o /tmp/pivota-gw-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$CAND_URL/health" || echo 000)
 head -c 400 /tmp/pivota-gw-health.$$; echo; rm -f /tmp/pivota-gw-health.$$
 [ "$CODE" = 200 ] || { echo "candidate /health returned $CODE - NOT shifting traffic." >&2; exit 1; }
 
