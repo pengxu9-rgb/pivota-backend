@@ -109,9 +109,10 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 1. **Second database `pci_kb`** — `bootstrap_env.sh` creates only `pivota`. `PCI_KB_DATABASE_URL` /
    `INGREDIENT_REFERENCE_DATABASE_URL` still point at Railway (`switchback.proxy.rlwy.net`, PG16,
    24 MB, 23 tables) and are read by BOTH the backend and the gateway.
-2. **Cloud Scheduler** — nothing replaces the Railway crons (`relgraph-sync-routine`, the audit /
-   executor / invitation drainers). `deploy_backend.sh` sets `AUDIT_WORKER_ENABLED=false` on
-   staging, so today NOTHING drains those queues on GCP.
+2. **Scheduled work is deployed but inert** — `setup_scheduler.sh` creates the single-instance
+   `worker` plus the `relgraph-sync` and `reviews-invitation-send` Cloud Run Jobs and their two
+   Cloud Scheduler triggers. Everything is created PAUSED / workers-off; arming is the explicit
+   cutover step `WORKERS=true PAUSED=0 ...`, run only after Railway's workers stop.
 3. **Remaining un-migrated services** — `ucp-worker`, `ucp-platform-receiver`, and
    `catalog-intelligence` still run only on Railway. The gateway, proof-issuer and acp are deployed
    (see the sections above).
@@ -128,10 +129,10 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `--storage-auto-increase` never raises the ceiling proactively. Use >= 100 GB for prod.
 8. **`--deny-maintenance-period`** is not set around Sep 8-12 or the late-Sep launch window.
    ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real restart.
-9. **Cloud SQL connection budget** — with proof-issuer and acp added, the nominal ceiling exceeds
-   `max_connections=200`. proof-issuer opens no pool, and acp's real pool behaviour is unmeasured.
-   Measure before cutover, then cap max-instances or raise max_connections. (Egress is resolved:
-   the deploy scripts default to `all-traffic` and `8.231.167.230` is confirmed as the source IP.)
+9. **Cloud SQL connection budget — RESOLVED, measured.** `max_connections` raised 200 → 300.
+   Measured worst case 230/300 (headroom 70): web 20x6, gateway 20x5, worker 1x10, and
+   proof-issuer + acp contribute **0** because they mount no `DATABASE_URL` at all. Re-derive this
+   from the live services (not from comments) whenever a service or a pool default changes.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
     SHA during cutover week can produce a different image. Pin or add a lockfile.
 11. **Dump bucket** — prod data lands in `gs://pivota-staging-migration` (a staging-project bucket)
@@ -321,3 +322,68 @@ Three things worth knowing:
 acp is deployed inert for the pre-cutover window — `ACP_ENABLE_REAL_CAPTURE=false` and
 `DISABLE_WEBHOOK_OUTBOX=true`, and its backend/webhook URLs point at the GCP backend rather than the
 live Railway one, so it cannot act on production orders while Railway is still serving.
+
+
+## Connection budget — how it was DERIVED (and how to actually measure it)
+
+Do not trust a budget written in a comment. This one was wrong twice:
+
+1. **acp was given a `DATABASE_URL` it never had on Railway.** The deploy script mounted the datastore
+   DSNs unconditionally, so the Cloud Run copy logged `ACP ready with database persistence` while
+   Railway logs `DATABASE_URL not set, using in-memory storage`. That is not just connections - it is
+   a silent persistence change in the payment path. acp's `Database(DATABASE_URL)` takes NO pool
+   arguments, so it would have been asyncpg's default 10 per instance and it reads neither
+   `DB_POOL_MAX_SIZE` nor `DATABASE_POOL_SIZE`. Mounting is now opt-in (`MOUNT_DB`), default on only
+   for `web` and `worker`.
+2. **The gateway's pool sizing was set with variable names nothing reads.** `PG_POOL_MAX` /
+   `PGPOOL_MAX` / `DB_POOL_MAX_SIZE` are not consulted anywhere in PIVOTA-Agent. It opens **four**
+   pools and reads `DB_POOL_MAX` (default 5), `PCI_KB_DB_POOL_MAX` (3),
+   `INGREDIENT_REFERENCE_DB_POOL_MAX` (3) and `INGREDIENT_SIGNAL_DB_POOL_MAX` (3) — 14 per instance
+   by default, not the 10 the old comment assumed.
+
+The lesson both times: **grep the application for the variable name before believing a limit is
+applied.** A pool setting the app does not read is indistinguishable from no setting at all, and it
+looks correct in `gcloud run services describe`.
+
+**This is a derivation from configuration, not a measurement.** It reads env vars, which tells you
+what was *requested*, not what is *held*. The real measurement is against the running database:
+
+```sql
+select usename, application_name, count(*) from pg_stat_activity group by 1,2 order by 3 desc;
+```
+
+Run that under load before the cutover window. Two things the derivation cannot see:
+
+- **Rolling deploys double a service transiently.** `--no-traffic` then `--to-latest` means old and
+  new revisions coexist, and old instances linger for in-flight requests up to `--timeout 300`. At
+  web's ceiling that is up to 240 for web alone for ~5 minutes - more than the 70 headroom. Deploy
+  services one at a time during the cutover window, not concurrently.
+- **The gateway's 100 assumes its three KB DSNs point at `pivota-pg`.** They currently point at
+  Railway (see gap #1), so only `DB_POOL_MAX` (20x2=40) lands on Cloud SQL today. 100 is the
+  post-`pci_kb`-migration figure - conservative now, correct later.
+- The ingredient pools fall back to `DB_POOL_MAX` *before* their own default of 3, so raising
+  `DB_POOL_MAX` alone raises three pools, not one.
+
+Re-derive config with:
+```bash
+gcloud run services describe <svc> --project pivota-prod --region us-west1 --format=json \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);c=d['spec']['template']['spec']['containers'][0];print({e['name']:e.get('value') for e in c.get('env',[]) if 'POOL' in e['name'] or e['name']=='DATABASE_URL'})"
+```
+
+
+## Known schema drift in the cutover database
+
+While `acp` briefly had a `DATABASE_URL` (revisions before `acp-00004`), its startup DDL ran against
+the shared `pivota` database and added a `metadata` column to `checkout_sessions`, which the
+backend's own `db/migrations/025_acp_sessions.sql` does not define.
+
+Assessed and left in place: the column is nullable, **nothing reads it**
+(`grep checkout_sessions.*metadata` across the backend returns only SQLAlchemy's unrelated
+`metadata.create_all`), and the backend's schema won the race - the live table still has its 2 FKs
+and 5 indexes. It also disappears on its own, because the prod database is re-imported from a fresh
+Railway dump at cutover.
+
+Verify after the cutover import rather than trusting this note:
+```sql
+select column_name from information_schema.columns where table_name='checkout_sessions' order by 1;
+```
