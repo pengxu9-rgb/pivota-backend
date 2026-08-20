@@ -52,6 +52,18 @@ DROP_EXACT = {"PORT", "DATABASE_URL", "REDIS_URL", "DATABASE_PUBLIC_URL", "REDIS
               "PCI_KB_DATABASE_URL", "INGREDIENT_REFERENCE_DATABASE_URL"}
 DROP_PREFIX = ("RAILWAY_", "NIXPACKS_", "RAILPACK_")
 
+# Config for lanes an ACCEPTED ADR deleted. The porter carries forward whatever Railway holds, which
+# is right for a migration and wrong for something already decided against - otherwise dead config
+# migrates into the new platform and the next person assumes the lane exists because the config does.
+#
+# ADR-022 deleted the merchant-promotions lane end-to-end. Verified before dropping:
+# PROMOTIONS_BACKEND_BASE_URL and PROMOTIONS_MODE have ZERO runtime references in either repo.
+# PROMOTIONS_ADMIN_KEY is deliberately NOT here - despite the name it is a live shared admin
+# credential referenced in 20 runtime files (e.g. routes/admin_outcomes.py:23 does
+# `ADMIN_API_KEY or PROMOTIONS_ADMIN_KEY`), so dropping it would break admin auth wherever
+# ADMIN_API_KEY is unset. Grep for references before adding a name here.
+DROP_SUPERSEDED = {"PROMOTIONS_BACKEND_BASE_URL", "PROMOTIONS_MODE"}
+
 def railway_vars(service, env):
     out = subprocess.run(["railway", "variables", "-s", service, "-e", env, "--json"], capture_output=True, text=True)
     if out.returncode != 0:
@@ -111,7 +123,7 @@ def main():
     for k in sorted(raw):
         v = raw[k]
         if not isinstance(v, str): v = json.dumps(v)
-        if k in DROP_EXACT or k.startswith(DROP_PREFIX):
+        if k in DROP_EXACT or k in DROP_SUPERSEDED or k.startswith(DROP_PREFIX):
             dropped.append(k); continue
         src = "railway"
         if k in overrides:
@@ -127,6 +139,14 @@ def main():
         is_secret = classify(k, v)
         (secrets if is_secret else plain)[k] = v
         rows.append((k, "secret" if is_secret else "plain", "override(new)", ""))
+
+    # Applied after the overrides too: an ADR-deleted lane must not be reintroducible by an
+    # operator's overrides file, which is exactly how PROMOTIONS_BACKEND_BASE_URL survived the first
+    # attempt at this drop.
+    for k in list(plain) + list(secrets):
+        if k in DROP_SUPERSEDED:
+            plain.pop(k, None); secrets.pop(k, None)
+            if k not in dropped: dropped.append(k)
 
     # plain env -> yaml
     tag = f".{a.prefix}" if a.prefix else ""
