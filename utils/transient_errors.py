@@ -8,6 +8,11 @@ from fastapi import HTTPException
 _ASYNC_PG_BUSY_SUBSTR = "another operation is in progress"
 _ASYNC_PG_POOL_CLOSING_SUBSTR = "pool is closing"
 _ASYNC_PG_POOL_CLOSED_SUBSTR = "pool is closed"
+# Postgres's exact wording for a `statement_timeout` cancel (QueryCanceledError,
+# SQLSTATE 57014). The FULL phrase, not "canceling statement": the same
+# QueryCanceledError with "due to user request" means an explicit client-side
+# cancel, which is not a capacity signal and must not turn into a 503.
+_PG_STATEMENT_TIMEOUT_SUBSTR = "canceling statement due to statement timeout"
 
 
 def _matches_in_cause_chain(err: BaseException, substrings: tuple) -> bool:
@@ -84,6 +89,13 @@ def is_asyncpg_busy_error(err: BaseException) -> bool:
         if _ASYNC_PG_POOL_CLOSING_SUBSTR in cur_text:
             return True
         if _ASYNC_PG_POOL_CLOSED_SUBSTR in cur_text:
+            return True
+        if _PG_STATEMENT_TIMEOUT_SUBSTR in cur_text:
+            # DB_STATEMENT_TIMEOUT_SECONDS cancelled the statement server-side.
+            # Retryable by design: the ceiling exists to shed load when slow
+            # statements would otherwise camp on pool slots (2026-08-21 wedge),
+            # so the honest answer to the shed caller is 503 + Retry-After,
+            # not a 500 that pages as a code bug.
             return True
         cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
     return False
