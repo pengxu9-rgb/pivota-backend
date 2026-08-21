@@ -1,6 +1,31 @@
 # P-T2.3 — Real in-chat ACP charge lane (Option A) — build plan
 
-**Status:** Proposed / kickoff (2026-07-09). Founder decision: **Option A — make `pivota-acp` charge for real** (wire its Stripe adapter + genuine SPT/delegated-payment), not reuse the hosted-checkout path and not integrate a third-party provider.
+> ## ⚠️ SUPERSEDED BY ADR-021 (2026-08-01). Historical record — do not build from this.
+>
+> This plan's architecture is **Option A: make the external `pivota-acp` service charge for real**.
+> ADR-021 chose the opposite: **ACP checkout executes IN-PROCESS in pivota-backend**
+> (`services/acp_checkout_session_service.py`, table `acp_checkout_sessions`, migration 191), and the
+> `pivota-acp` service is retired.
+>
+> Concretely, in this document:
+>
+> - **"Mount `platform_orders_acp` router (still `FEATURE_PLATFORM_ORDERS_ACP`-gated)"** is no longer
+>   true. That flag and `PLATFORM_ORDERS_ACP_{URL,TOKEN,WEBHOOK_SECRET}` **were removed with their
+>   last consumers** — see `config/settings.py:346`. No code reads them. ADR-021 decision 4 is that
+>   `PLATFORM_ORDERS_ACP_URL` "stays unset forever".
+> - **"`pivota-acp` service = session + capture executor"** describes a retired design. The service
+>   still runs on Railway but nothing routes to it: `acp.pivota.cc` is a custom domain on
+>   **PIVOTA-Agent**, and no GCP prod service references it.
+> - The `Dockerfile.ucp-*` inventory near the end refers to three services **deleted on 2026-08-20**.
+>
+> **Why this banner exists rather than a quiet edit:** the gated-router line above was read by a
+> later audit as evidence that the flag is operative and merely defaults false, and that inference
+> reached a partner-facing document before it was caught. A stale plan that still reads as current
+> is not harmless — it regenerates the error. The plan is kept for its investigation record (the
+> 2026-07-09 finding that `pivota-acp` simulated capture rather than charging is still accurate and
+> still worth reading); only its forward architecture is dead.
+
+**Status:** **SUPERSEDED (ADR-021).** Originally: Proposed / kickoff (2026-07-09). Founder decision: **Option A — make `pivota-acp` charge for real** (wire its Stripe adapter + genuine SPT/delegated-payment), not reuse the hosted-checkout path and not integrate a third-party provider.
 **Prereqs shipped:** P-T2.0 attribution parity (#1255), P-T2.1 capability resolver (#1256), P-T2.2 fail-closed kill-switch (#1257), P-T2.3a per-merchant canary allowlist (#1259).
 **Owner:** Commerce / Fulfillment. **Blast radius:** real money — treat every step as fail-closed + test-mode-first.
 
