@@ -14,22 +14,90 @@ falls back to a clearly-flagged cross-border offer rather than "nothing to buy".
 When real fulfillment reach (ships_to) lands, cross_border can be resolved
 further into shippable vs unavailable; the served field stays the same.
 
+CURRENCY IS NOT COMPARABLE (ADR-024 Phase 0, item 1). The buy pick used to be
+`min(pool, key=... float(price))` over a pool the cross-border fallback can fill
+with several currencies at once, so a 4500 JPY offer "beat" a 12 GBP one as raw
+floats. That is this repo's recurring cross-unit defect in its fourth layer
+(ingestion, read, presentation, and here — selection). The pick therefore now
+narrows to ONE currency before any price comparison: the serving market's
+expected currency when the pool holds it, else the largest single-currency group.
+Ordering INSIDE that group is unchanged (in-stock first, then lowest price), so a
+single-currency pool -- the overwhelmingly common all-USD/US case -- picks exactly
+what it picked before. We never convert and never rank across currencies.
+
 Pure functions (no DB/IO). Additive: annotation only sets `market_availability` /
 `is_buy_pick`; it never drops offers.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_SERVING_MARKET = "US"
 
 MARKET_DOMESTIC = "domestic"
 MARKET_CROSS_BORDER = "cross_border"
 
+# The currency an offer must be priced in to be a same-currency buy for a serving
+# market -- the regions ADR-024 measured real supply for, nothing speculative.
+# An UNMAPPED market has no expected currency (None) and falls through to the
+# largest-single-currency rule below; it must never quietly become USD, which is
+# the assumption every one of the four currency defects was built on.
+#
+# NOT reused from routes/employee_products.MARKET_EXPECTED_CURRENCY, the repo's
+# other such map, for two reasons: it lives in a route module (a service must not
+# import a route to answer this), and its membership is a different question --
+# it is the CSV-import validator's list, carrying non-ISO keys ("UK", "EU") and
+# missing HR/FI/SE/HK, the regions ADR-024 measured real non-USD supply in. The
+# two converge in ADR-024 Phase 1's services/region_pricing; fold this copy in
+# there rather than growing a third.
+EXPECTED_CURRENCY_BY_MARKET: Dict[str, str] = {
+    "US": "USD", "GB": "GBP", "JP": "JPY", "FR": "EUR", "HR": "EUR",
+    "FI": "EUR", "AU": "AUD", "SE": "SEK", "KR": "KRW", "HK": "HKD",
+    "SG": "SGD", "CA": "CAD",
+}
+
+# Partition key for an offer that declares no currency. Its own bucket, never
+# merged into USD: "no currency stated" is not evidence of dollars.
+NO_CURRENCY = "(none)"
+
 
 def _norm_market(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def expected_currency_for_market(serving_market: Any) -> Optional[str]:
+    """The pricing currency a domestic buy in `serving_market` should carry, or
+    None when we have not mapped that market. None is an honest "unknown", not
+    a licence to assume USD."""
+    return EXPECTED_CURRENCY_BY_MARKET.get(_norm_market(serving_market))
+
+
+def _currency_key(value: Any) -> str:
+    return str(value or "").strip().upper() or NO_CURRENCY
+
+
+def _same_currency_candidates(
+    pool: Sequence[Tuple[Any, str]], expected_currency: Optional[str]
+) -> List[Any]:
+    """Narrow a priced candidate pool to exactly ONE currency, before any price
+    comparison happens.
+
+    `pool` is [(candidate, currency_key)] in stable input order. Prefers the
+    serving market's expected currency; with none of those present, takes the
+    LARGEST single-currency group -- dict preserves first-seen order and max()
+    keeps the first maximum, so a tie resolves to the group whose first offer
+    appeared first in the input. The result is never mixed-currency, which is
+    the whole point: no min() ever spans two units.
+    """
+    groups: Dict[str, List[Any]] = {}
+    for candidate, currency_key in pool:
+        groups.setdefault(currency_key, []).append(candidate)
+    if not groups:
+        return []
+    if expected_currency and expected_currency in groups:
+        return groups[expected_currency]
+    return max(groups.values(), key=len)
 
 
 def offer_market_availability(
@@ -60,6 +128,10 @@ def annotate_offer_buyability(
     """Set `market_availability` (domestic|cross_border) per dict-offer and
     `is_buy_pick` on the offer to present as the buy: cheapest in-stock DOMESTIC
     offer, falling back to cheapest in-stock CROSS_BORDER when none is domestic.
+
+    "Cheapest" is only asked WITHIN one currency (see the module docstring): the
+    pool is narrowed to a single currency first, reading each offer's own
+    `currency` key.
     """
     sm = _norm_market(serving_market) or DEFAULT_SERVING_MARKET
     out: List[Dict[str, Any]] = []
@@ -72,9 +144,13 @@ def annotate_offer_buyability(
         return [o for o in out if o["market_availability"] == avail and o.get("price") is not None]
 
     pool = priced(MARKET_DOMESTIC) or priced(MARKET_CROSS_BORDER)
+    candidates = _same_currency_candidates(
+        [(o, _currency_key(o.get("currency"))) for o in pool],
+        expected_currency_for_market(sm),
+    )
     pick: Optional[Dict[str, Any]] = None
-    if pool:
-        pick = min(pool, key=lambda o: (not _in_stock(o.get("availability")), float(o["price"])))
+    if candidates:
+        pick = min(candidates, key=lambda o: (not _in_stock(o.get("availability")), float(o["price"])))
     for o in out:
         o["is_buy_pick"] = pick is not None and o is pick
     return out
@@ -94,11 +170,20 @@ def _node_price(node: Any) -> Optional[float]:
     return None
 
 
+def _node_currency(node: Any) -> Any:
+    """The node's own pricing currency (PivotPricing.currency), or None."""
+    pricing = getattr(node, "pricing", None)
+    return getattr(pricing, "currency", None) if pricing is not None else None
+
+
 def annotate_offer_nodes(nodes: List[Any], serving_market: str = DEFAULT_SERVING_MARKET) -> List[Any]:
     """Duck-typed variant for OfferNode (search path): sets .market_availability +
     .is_buy_pick in place against the request market. Reads .market/.availability/
     .pricing.* -- no model import, so this module stays dependency-free. Same rule
-    as the dict path (domestic preferred, cross-border fallback).
+    as the dict path (domestic preferred, cross-border fallback, and the same
+    single-currency narrowing before any price comparison -- shared, not
+    re-spelled). The node's currency lives on .pricing.currency, not beside
+    .market.
     """
     sm = _norm_market(serving_market) or DEFAULT_SERVING_MARKET
     nodes = nodes or []
@@ -112,9 +197,16 @@ def annotate_offer_nodes(nodes: List[Any], serving_market: str = DEFAULT_SERVING
         ]
 
     pool = priced(MARKET_DOMESTIC) or priced(MARKET_CROSS_BORDER)
+    candidates = _same_currency_candidates(
+        [(np, _currency_key(_node_currency(np[0]))) for np in pool],
+        expected_currency_for_market(sm),
+    )
     pick = None
-    if pool:
-        pick = min(pool, key=lambda np: (not _in_stock(getattr(np[0], "availability", None)), np[1]))[0]
+    if candidates:
+        pick = min(
+            candidates,
+            key=lambda np: (not _in_stock(getattr(np[0], "availability", None)), np[1]),
+        )[0]
     for n in nodes:
         n.is_buy_pick = pick is not None and n is pick
     return nodes
