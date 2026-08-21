@@ -4,6 +4,7 @@ import datetime
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from databases import Database
@@ -156,6 +157,32 @@ if IS_POSTGRES:
         database_kwargs["ssl"] = _ctx
     if _command_timeout > 0:
         database_kwargs["command_timeout"] = _command_timeout
+    # Optional SERVER-side per-statement ceiling (`statement_timeout`), sent
+    # once per connection via asyncpg `server_settings` — zero per-query round
+    # trips. This bounds how long any single statement can HOLD a pool slot,
+    # which `command_timeout` cannot do: that one is a client-side await bound,
+    # so with it alone a pathological plan still occupies a server backend and
+    # a pool slot for the full 600s. 2026-08-21: ~6 agent searches/min whose
+    # statements ran to the server's cancel point held all 20 slots for hours —
+    # health 503, schedulers starved, portal key requests dead (the 2026-08-20
+    # report-query wedge above was the same shape). Keep this BELOW
+    # DB_COMMAND_TIMEOUT_SECONDS where both are set, so the server cancel wins
+    # and the connection stays reusable; a client-side cancel poisons the
+    # connection ("another operation is in progress").
+    #
+    # Unset (the default) keeps current behavior — flipping prod is ONE env
+    # change, revertible without a deploy. Startup SQL migrations are NOT
+    # affected either way: they run on the synchronous SQLAlchemy engine
+    # (db/sql_migrations.py), not this pool. In-pool work that legitimately
+    # runs longer (nightly sweeps, admin backfills) wraps the long statement in
+    # `unbounded_statement_timeout()` below.
+    _statement_timeout = _env_float(
+        "DB_STATEMENT_TIMEOUT_SECONDS", 0.0, min_value=0.0, max_value=600.0
+    )
+    if _statement_timeout > 0:
+        database_kwargs["server_settings"] = {
+            "statement_timeout": str(int(_statement_timeout * 1000)),
+        }
 
 # ---------------------------------------------------------------------------
 # Bound the wait for a free pool slot.
@@ -268,6 +295,38 @@ if IS_POSTGRES:
 
 
 database = Database(DATABASE_URL, **database_kwargs)
+
+
+@asynccontextmanager
+async def unbounded_statement_timeout(db: Optional[Database] = None):
+    """Escape hatch from DB_STATEMENT_TIMEOUT_SECONDS for ONE long statement.
+
+    Opens a transaction and issues `SET LOCAL statement_timeout = 0`, so every
+    statement executed inside the `async with` block (same task = same pooled
+    connection under `databases` 0.7.0) runs without the server-side ceiling.
+    The override dies with the transaction. SET LOCAL rather than a plain SET
+    on principle: asyncpg's pool DOES reset session state on release (verified
+    — a session-level SET here still came back to the ceiling on the next
+    checkout), but that net exists only at release time; SET LOCAL also covers
+    the same connection being reused within one task before release, and does
+    not depend on pool internals staying that way.
+
+    Scope it to the individual long-running statement, not a whole job tick:
+    the block holds one pool slot for its full duration, and it makes the
+    wrapped work a single transaction (one failure rolls back all of it).
+
+    No-op when the configured database is SQLite, which has no
+    statement_timeout and no pool.
+    """
+    target = db if db is not None else database
+    if db is None and not IS_POSTGRES:
+        yield
+        return
+    async with target.transaction():
+        await target.execute("SET LOCAL statement_timeout = 0")
+        yield
+
+
 # THE SECOND POOL IS GONE (2026-08-20). `get_db_pool()` lazily built its own
 # `asyncpg.create_pool(DATABASE_URL)` for "routes that still expect an asyncpg
 # pool". By the end it had exactly ONE caller, and it carried two hazards the
