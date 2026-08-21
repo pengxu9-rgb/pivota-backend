@@ -30,10 +30,32 @@ script that derives "should this act on the world" from `$ENV` will eventually b
 before prod is meant to act. Both scripts now default to inert and require an explicit
 `WORKERS=true PAUSED=0`.
 
-## T-48h
-1. Drop DNS TTLs to 60s at HiChina for: `api`, `mcp`, `commerce.mcp`, `ucp`, `acp`, `gateway`,
-   (the apex and `www` are NOT moving - see the apex section). HiChina serves the OLD ttl until it expires — a 60s TTL
-   set on the day does nothing.
+## Date: **Saturday 2026-08-22, morning.** Set 2026-08-21, ahead of the Minds integration next week.
+
+Cutting over *before* partners integrate is the whole reason this migration was brought forward:
+the cost is driven by live partner data and frozen partner-copied identifiers, and neither exists
+yet. That window closes when Minds starts.
+
+## T-20min (NOT T-48h - measured, see below)
+1. Drop DNS TTLs to 60s at HiChina for: `api`, `mcp`, `commerce.mcp`, `ucp`, `acp`, `gateway`
+   (the apex and `www` are NOT moving - see the apex section).
+
+   🚨 **The old "T-48h" here was wrong, and wrong in the expensive direction - it would have
+   delayed the cutover by two days for no benefit.** It assumed a long TTL. Measured against the
+   authoritative nameservers (`dns3/dns4.hichina.com`) on 2026-08-21, **all six hosts already serve
+   a 600s TTL**:
+
+   ```bash
+   for h in api gateway mcp commerce.mcp ucp acp; do
+     dig +noall +answer @dns3.hichina.com "$h.pivota.cc" | head -1 | awk '{print $1, $2}'
+   done
+   # all six -> 600
+   ```
+
+   A resolver holding the old record therefore releases it within 10 minutes, so a 60s TTL is in
+   effect everywhere **~10-15 minutes** after the change. Verify against the authoritative server,
+   not a local resolver: a cached answer counts DOWN from 600 and will show smaller numbers that
+   mean nothing.
 2. Re-run the acceptance corpus against GCP prod.
 3. Confirm the Google console has BOTH redirect URIs registered (see
    `GOOGLE_OAUTH_REDIRECT_URI_registration.md`).
