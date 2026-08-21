@@ -13,6 +13,33 @@
 #    removes the public attack surface entirely.
 #  * A RESERVED (not ephemeral) NAT IP is the stable outbound address Antom/Adyen IP-allowlisting
 #    needs. Reserving it now means the address partners allowlist never changes.
+#
+# 🚨 DO NOT DELETE OR RECREATE `pivota-egress-ip` IN prod (8.231.167.230).
+# It is the OUTBOUND source address partners allowlist. Deleting the address resource, or deleting
+# and recreating the NAT that holds it, hands back the IP and you will not get it back - and a
+# partner allowlist entry is expensive to correct once integration has started. The reservation is
+# a convention enforced by this comment, not by an org policy.
+#
+# Two adjacent facts, both easy to get wrong in a partner-facing document:
+#  * DIRECTION. 8.231.167.230 is OUTBOUND ONLY - our source address when we call a partner. Traffic
+#    a partner sends TO US arrives at the global load balancer, `pivota-lb-ip` = 34.8.67.235. They
+#    are different addresses and an allowlist that conflates them is wrong in one direction.
+#  * STAGING IS A DIFFERENT IP: 136.66.216.216. Partner certification testing usually runs against
+#    staging before prod, so that address needs allowlisting too.
+#
+# WHEN TO HARDEN THIS. Nothing external depends on the address today (Antom is not integrated; the
+# live UCP door advertises `payment_handlers: {}`). The moment it lands in a real partner allowlist
+# that changes. Natural trigger: when ADR-023 (PR #2005) merges and Antom session work begins,
+# revisit whatever enforcement is available rather than relying on this comment.
+#
+# CRAWL EGRESS MUST NOT SHARE THIS IP. This script creates ONE router + ONE NAT covering
+# ALL_SUBNETWORKS_ALL_IP_RANGES, so every service shares 8.231.167.230. A scheduled re-crawl would
+# then share both IP reputation and the NAT port pool with the payment path - and NAT port
+# exhaustion is per-IP, so a burst crawl can starve payment egress even with clean reputation.
+# Measured 2026-08-21: ~50 requests across 37 Cloudflare-fronted merchant domains in ~1 minute trips
+# a cross-domain IP-level 429 lasting ~15 minutes. Before the first crawl job ships, give crawl its
+# own subnet + Router/NAT/reserved IP via `--nat-custom-subnet-ip-ranges`. The NEW address goes to
+# crawl; 8.231.167.230 stays on the payment path.
 set -euo pipefail
 ENV="${1:-}"
 case "$ENV" in staging) PROJECT=pivota-staging ;; prod) PROJECT=pivota-prod ;; *) echo "usage: $0 staging|prod" >&2; exit 2 ;; esac
