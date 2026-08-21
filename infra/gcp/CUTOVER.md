@@ -62,8 +62,27 @@ yet. That window closes when Minds starts.
 4. Announce the window to Minds and Antom.
 
 ## T-0, in order
+0. **Do not start before 04:00 PDT.** `relgraph-sync-routine` fires at **10:37 UTC = 03:37 PDT**
+   (the GCP twin is `37 10 * * *`). It completes and exits on its own, but starting earlier puts it
+   inside the write freeze.
+
 1. **Stop Railway's workers first.** `relgraph-sync-routine`, `invitation worker`, and
    `AUDIT_WORKER_ENABLED` on `web`. Nothing may drain the queue while the final dump is taken.
+
+   🚨 **`AUDIT_WORKER_ENABLED` must be SET to `false`, not unset.** It is not currently set on
+   Railway `web` at all, and the gate is **fail-safe toward ENABLED** — `services/audit_scheduler.py`
+   returns `True` when the var is empty and the service is not name-detected as staging:
+
+   ```python
+   override = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
+   if override: return override in ("1","true","yes","on")
+   ...
+   return True   # prod-named service, var unset -> WORKER IS ON
+   ```
+
+   So "turn off the audit worker" reads as done while the drainer is still running. Set it
+   explicitly and confirm `railway variables -s web --kv | grep AUDIT_WORKER_ENABLED` echoes
+   `false` before taking the dump.
 2. **Freeze writes** on Railway (maintenance flag) and note the time.
 3. **Final dump + import.** Same two commands used to build the stack, with a fresh stamp. The
    dump job self-verifies (completion trailer + table count) and the restore reconciles against the
@@ -131,15 +150,48 @@ yet. That window closes when Minds starts.
    #   gcloud scheduler jobs list --location us-west1 --project pivota-prod   # both ENABLED
    infra/gcp/deploy_gateway.sh prod <gateway-sha>
    ```
-6. **Point the gateway at the public names**: edit `env.prod.gateway.overrides.yaml` to
-   `api.pivota.cc`, re-port, redeploy.
+6. **Do NOT point the gateway's internal calls at `api.pivota.cc`.** This step used to say "point
+   the gateway at the public names". That is right for exactly one variable and wrong for five.
+
+   The gateway holds eight URLs into `web`, and they are already correctly split:
+
+   | variable | today | correct end state |
+   |---|---|---|
+   | `AGENT_AUTH_INTROSPECT_URL` | Cloud Run URL | **keep** — runs on every partner request |
+   | `PIVOTA_API_BASE` | Cloud Run URL | **keep** |
+   | `PIVOTA_BACKEND_BASE_URL` | Cloud Run URL | **keep** |
+   | `DISCOVERY_PRODUCTS_SEARCH_BASE_URL` | Cloud Run URL | **keep** |
+   | `AURORA_BFF_RECO_CATALOG_SEARCH_BASE_URLS` | Cloud Run URL | **keep** — reco is already ~7.65s |
+   | `NEXT_PUBLIC_API_URL` | Cloud Run URL | → `api.pivota.cc` (browsers see it) |
+   | `MCP_OAUTH_AUTHORIZATION_SERVERS` | already `api.pivota.cc` | already correct |
+   | `MCP_OAUTH_ISSUERS_JSON` | already `api.pivota.cc` | already correct |
+
+   Routing an internal call through the public name sends it gateway → Cloud NAT → public LB → back
+   into `web`: an extra hop, a second TLS termination, and NAT ports burned on
+   `8.231.167.230` — the same address and port pool the payment path uses. `AGENT_AUTH_INTROSPECT_URL`
+   is the worst of them, because it is on every partner request.
+
+   **Defer the one legitimate change to post-cutover.** Flipping `NEXT_PUBLIC_API_URL` *before* the
+   DNS flip would point it at Railway for the length of the window; doing it after costs nothing.
+   The MCP OAuth pair proves the split is already the intended shape.
 7. **Flip DNS** — all six Railway-backed CNAMEs together. They cross-reference each other
    (`commerce.mcp` is named inside documents served from `mcp`, `ucp` and `acp`), so a partial flip
    strands clients mid-discovery. The apex is a plain A record; HiChina has no ALIAS, so it points
    at the LB anycast IP directly.
 8. **Move `GOOGLE_OAUTH_REDIRECT_URI`** to `https://api.pivota.cc/...` (console entry must already
    exist).
-9. **Verify**: `/health` on every host, one real checkout end to end, one merchant Search Console
+9. **Pre-warm all six hosts before anyone looks at them.** First hit through the LB measured
+   **11.2s** cold against **0.20s** warm. At T+40 that reads as an outage. One `curl` per host
+   during the TTL wait is enough:
+
+   ```bash
+   for h in api gateway mcp commerce.mcp ucp acp; do
+     curl -s -o /dev/null -w "$h %{time_total}s\n" \
+       --resolve "$h.pivota.cc:443:34.8.67.235" "https://$h.pivota.cc/health"
+   done
+   ```
+
+10. **Verify**: `/health` on every host, one real checkout end to end, one merchant Search Console
    connect, catalog image URLs resolving, `__catalog_health` counts matching the pre-cutover
    snapshot.
 
