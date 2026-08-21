@@ -37,3 +37,33 @@ Concretely:
 ## Alternatives considered
 
 **Infra-executes (option b):** finish the per-service wiring — set `PLATFORM_ORDERS_ACP_URL`, route `ucp.pivota.cc` paths to the UCP services, move pivota-acp to europe-west4, monitor the credentialed box. Rejected: it institutionalizes a second policy surface, keeps four services plus a region straggler alive for zero current traffic, and the serving-policy history shows the drift cost gets paid repeatedly.
+
+## Correction (2026-08-21) — two factual premises in this ADR are false
+
+Recorded, not rewritten: the decision stands, but two of the facts cited for it do not, and this ADR
+is quoted as authority whenever someone deletes or revives a UCP service.
+
+Measured read-only against prod `Postgres-xMr6` on 2026-08-21, after the three `ucp-*` services were
+deleted:
+
+| claim in this ADR | measured |
+|---|---|
+| "`ucp_checkout_sessions` and `ucp_order_webhook_deliveries` held zero rows" | **56** and **22** rows |
+| "zero deliveries ever occurred" | **22 occurred**, 2026-01-14 → 2026-01-16, all `status='sent'`, `attempt_count=1`, `last_error` null, `sent_at` set |
+
+`ucp_checkout_sessions` spans 2026-01-14 → 2026-05-27 (28 `incomplete`, 26 `completed`,
+2 `requires_escalation`). The 22 deliveries went to `ucp-platform-receiver` (15),
+`ucp-web-production` (4) and three `*.trycloudflare.com` dev tunnels (3) — so **`ucp-platform-receiver`
+did serve real requests**, and something answered at the `ucp-web-production` host. Both facts
+contradict "never booted" and "0 real requests" as those phrases were used elsewhere.
+
+**What does not change:** every delivery completed, and no row is `pending`, `failed`, or otherwise
+retryable, so retiring the worker stranded nothing. Merchant ids are `merch_ucp_smoke`,
+`merch_ucp_smoke_local`, `merch_smoke_checkout`, `merch_acceptance`, and one hex id
+(`merch_efbc46b4619cfbdf`, 35 sessions) that does not resolve to a `merchants` row — `merchants.id`
+is an integer, so these are UCP-scoped identifiers, not customer accounts.
+
+**Why this matters going forward:** the retirement was justified partly by "nothing ever flowed
+through here." Something did, in January 2026. The justification that survives measurement is
+narrower — *the queue was fully drained before the drainer was removed*. Do not reuse the
+zero-rows premise on a queue nobody has counted.

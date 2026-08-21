@@ -130,17 +130,25 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    **ADR-021 (Accepted, 2026-08-01) already retired the four Infra services** and called for rotating
    the Stripe/Adyen keys they held. This is a closed decision, not an open question. Supporting
    evidence gathered 2026-08-20: the UCP/ACP/MCP doors are custom domains on **PIVOTA-Agent** (none
-   of the four has a custom domain); the only writer to `ucp_order_webhook_deliveries` lives in
-   `ucp-web`, which has never booted; `ucp-worker` polls successfully every 30s and logs
-   `drained=0 total=0` because nothing enqueues — **not** because it lacks a database; and
-   `ucp-platform-receiver` was SUCCESS but had served **0 real requests**. ADR-021 is explicit that
-   outbound UCP webhook delivery deliberately has **no home** after retirement.
+   of the four has a custom domain); `ucp-worker` polls every 30s and logs `drained=0 total=0`
+   because nothing enqueues — **not** because it lacks a database. ADR-021 is explicit that outbound
+   UCP webhook delivery deliberately has **no home** after retirement.
 
-   All three services are now deleted, so **none of the deploy-history figures above can be
-   re-checked** — Railway retains nothing for a deleted service. "99 deploys, 0 SUCCESS", "polls
-   every 30s", and "0 real requests" were recorded first-hand before deletion (the first two entered
-   the file in #1787, the last in the table row this PR replaced). Treat them as testimony, not as
-   queryable facts.
+   🚨 **Two claims previously repeated here are FALSE — see the Correction appended to ADR-021.**
+   Measured read-only against prod `Postgres-xMr6` on 2026-08-21: `ucp_checkout_sessions` holds
+   **56** rows and `ucp_order_webhook_deliveries` holds **22**, not zero. The 22 deliveries went to
+   `ucp-platform-receiver` (15), `ucp-web-production` (4) and three dev tunnels — so
+   `ucp-platform-receiver` **did** serve real requests, and something answered at the
+   `ucp-web-production` host in January 2026. Do not repeat "never booted" or "0 real requests".
+
+   The retirement is still correct, on a narrower and checkable basis: **all 22 deliveries are
+   `status='sent'`, `attempt_count=1`, `last_error` null — the queue was fully drained before the
+   drainer was removed**, and no row is pending, failed or retryable.
+
+   Everything else about deploy history — "99 deploys, 0 SUCCESS", "polls every 30s" — is now
+   **permanently unfalsifiable**: Railway retains nothing for a deleted service. Given that the two
+   claims above did not survive contact with the database, treat the rest as testimony rather than
+   fact, and measure before relying on any of it.
 
    **Ordering (recorded for accuracy): the stated order was NOT followed.** The rule was to delete
    `ucp-web` with or before `ucp-worker`, because `ucp-web` is the only writer to the queue and
@@ -148,13 +156,16 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    2026-08-20 was `ucp-worker`, `ucp-platform-receiver`, `ucp-web-production` (a first-hand operator
    observation — Railway retains no record of a deleted service, so this is not re-checkable).
 
-   It was inert, but **not** because nothing was running. `ucp-worker` *was* running its 2026-07-10
-   image, polling an empty queue — see the correction at the end of this file; a FAILED redeploy on
-   Railway does not remove the deployment already serving. The window was inert for one reason only:
-   the rule protects a live **writer** from losing its drainer, and the only writer is `ucp-web`,
-   which has never once booted (99 deploys, 0 SUCCESS). With no writer in existence, nothing could
-   enqueue during the seconds between the two deletions. Keep the rule for any future pair where the
-   **writer** actually runs.
+   It stranded nothing — but **not** for either reason first recorded here. `ucp-worker` *was*
+   running its 2026-07-10 image (a FAILED redeploy on Railway does not remove the deployment already
+   serving), and `ucp-web` is not a service that "never booted". What actually makes the
+   out-of-order deletion safe is measurable and was measured: **the queue was empty of work.** All
+   22 delivery rows are `status='sent'` with `attempt_count=1`, the newest from 2026-01-16, and
+   nothing has enqueued since. A drainer removed from a fully-drained queue strands nothing,
+   whatever order it goes in.
+
+   Keep the rule anyway. It is correct for any future pair where the writer is live and the queue is
+   not provably empty — which is the normal case, and was assumed rather than checked here.
 
    **`pivota-acp` was briefly deployed to Cloud Run on 2026-08-20 and has been REMOVED** the same
    day, following ADR-021. Deleted: the Cloud Run `acp` service and its four `acp-env-*` secrets.
@@ -166,14 +177,24 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `acp_checkout_session_service`, migration 191) and §4 (`PLATFORM_ORDERS_ACP_URL` "stays unset
    forever") are the reasons not to.
 
-   **Still outstanding from ADR-021: key rotation — now scoped to `pivota-acp` alone.** Every
-   variable on the three `ucp-*` services was inventoried (names + masked prefixes) immediately
-   before deletion, because **deleting a service destroys the record of what it held**. The dump
-   lives outside the repo at `~/dev/.pivota-gcp-env/retired_service_credentials_<date>.txt`. It
-   settles the scope:
+   **Still outstanding from ADR-021: key rotation — scoped, on the evidence available, to
+   `pivota-acp`.** The **production-environment** variables of the three `ucp-*` services were
+   inventoried (names + masked prefixes) immediately before deletion, because **deleting a service
+   destroys the record of what it held**. The dump lives outside the repo at
+   `~/dev/.pivota-gcp-env/retired_service_credentials_<date>.txt`.
 
-   - **None of the three held a PSP credential.** The Stripe/Adyen concern in ADR-021 is about
-     `pivota-acp`, which is still running.
+   ⚠️ **Two gaps in that evidence — do not read it as "settled".** `Pivota Infra` has a **staging**
+   environment as well, deleting a service removes it from *both*, and per-environment variable sets
+   differ materially here (`pivota-acp` carries 30 vars in production and 9 in staging; a real
+   `STRIPE_SECRET_KEY` sits on `web-staging`/staging today). The staging instances of the three
+   services were deleted **uninventoried**. The dump is also point-in-time — taken 2026-08-21, twenty
+   days after ADR-021 called for the rotation — so a credential removed in between is invisible to
+   it. Rotation is a question about what was *ever* exposed, which this dump cannot answer.
+
+   - **No PSP credential appears on the production instances of the three.** The Stripe/Adyen
+     concern in ADR-021 is about `pivota-acp`, which is still running. Rotate the Adyen key
+     regardless: it is a real key on a live service, its environment cannot be told from its prefix,
+     and the evidence above is not strong enough to close the item on its own.
    - `UCP_ORDER_WEBHOOK_SIGNING_PRIVATE_JWK` on `ucp-worker` was the literal placeholder
      `adsfas...#$%5`, confirming ADR-021's finding that outbound signatures could never have
      verified.
@@ -501,8 +522,13 @@ So the lane has **no consumer**, but it does have accumulated output. That still
 does **not** settle the *database*. Deleting `Postgres-4hoG` destroys ~8k harvested rows.
 
 ⚠️ **Rotate `SERPER_API_KEY`.** It was set in plaintext on both failed services (now deleted) and was
-exposed in a terminal session on 2026-08-20. Rotate at serper.dev — verified free to rotate: no
-surviving Railway service, no Cloud Run service, and no code path reads it.
+exposed in a terminal session on 2026-08-20. Rotate at serper.dev — verified free to rotate across
+all 40 Railway project x environment x service combinations, both GCP projects' Secret Manager, every
+Cloud Run service, and the repo: nothing reads it.
+
+🚨 **`SERPAPI_API_KEY` is a DIFFERENT vendor and must not be touched.** `env-SERPAPI_API_KEY` exists
+in both GCP projects and is live on Cloud Run `web` and `worker`. SerpAPI is not Serper.dev; rotating
+the wrong one breaks running services.
 
 ### `bulk-email-tool` — KEEP, and easy to lose
 
@@ -520,6 +546,11 @@ in the cutover would notice if it disappeared.
   course still serving from Railway — this bullet is about what remains *afterwards*. GCP `web` and
   `worker` both still carry `CATALOG_INTELLIGENCE_BASE_URL` pointed at Railway — deliberately, since
   that client never raises and degrades to `None`.
+- **Enumerate before assuming anything is disposable** — `railway list`, then `railway service list`
+  per project and per environment. Pivota Infra alone still hosts `web`, `reviews-proof-issuer`,
+  `invitation worker`, `relgraph-sync-routine`, `web-staging` and the Postgres/Redis instances, and
+  `PIVOTA-Agent` lives in its own project. Counting from this file rather than from Railway is how
+  services get deleted by surprise.
 - Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 
