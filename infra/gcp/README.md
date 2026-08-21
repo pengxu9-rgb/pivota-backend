@@ -167,6 +167,16 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    Keep the rule anyway. It is correct for any future pair where the writer is live and the queue is
    not provably empty — which is the normal case, and was assumed rather than checked here.
 
+   ⚠️ **Recorded hazard: that queue now has no drainer, and a running service holds the flag.**
+   `pivota-acp` is still up and carries `DISABLE_WEBHOOK_OUTBOX=true` plus
+   `PLATFORM_ORDERS_WEBHOOK_URL`. This repo contains **no** writer to `ucp_order_webhook_deliveries`
+   — the historical writer lives in the `pivota-acp` repo, which is why it could not be settled from
+   here. **Unresolved:** whether that flag governs `ucp_order_webhook_deliveries` or only the
+   separate `webhook_outbox` table from `db/migrations/026_acp_delegate_webhook.sql`. If it governs
+   the UCP table, flipping it to `false` starts filling a queue nothing drains, permanently. Confirm
+   in the `pivota-acp` repo before touching that variable, and do not treat `true` as a safe default
+   to flip during cutover.
+
    **`pivota-acp` was briefly deployed to Cloud Run on 2026-08-20 and has been REMOVED** the same
    day, following ADR-021. Deleted: the Cloud Run `acp` service and its four `acp-env-*` secrets.
    Nothing on GCP referenced it, and `acp.pivota.cc` is unaffected — it is a custom domain on
