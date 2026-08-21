@@ -19,10 +19,18 @@ from sqlalchemy import Boolean, String, and_, column, func, not_, select, table
 
 from db.catalog import catalog_products
 from services.index_pipeline_state_service import QUALITY_SCORE_THRESHOLD
+from services.offer_currency_policy import is_quarantined_row
 from services.pdp_renderability import compile_pg, pdp_renderable_expression
 from services.identity_join_sql import identity_listing_lateral_sql
-from services.priced_offer_sql import priced_offer_exists_sql
-from services.source_quarantine import CATALOG_PRODUCT_DOMAIN_SQL
+from services.priced_offer_sql import priced_offer_exists_sql, priced_offer_row_conjuncts
+from services.region_pricing import (
+    normalize_region,
+    pricing_currency_for_region_or_none,
+)
+from services.source_quarantine import (
+    CATALOG_PRODUCT_DOMAIN_SQL,
+    load_active_quarantines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +172,305 @@ _SERVING_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
     .where(_SERVING_NOT_RENDERABLE_WHERE)
     .limit(_SAMPLE_LIMIT)
 )
+
+# ── market/currency disagreement (ADR-024 Phase 0 item 2) ────────────────────
+#
+# Everything below this banner belongs to one check. It is the first check in
+# this module that cannot be a pair of SQL strings, for two reasons that are
+# both deliberate rather than incidental:
+#
+#   * the market -> expected-currency map lives in ONE place
+#     (services/region_pricing) and must not be re-spelled as a SQL VALUES
+#     list here — that is the split-brain services/priced_offer_sql exists to
+#     prevent, applied to a second table;
+#   * "is this offer's source quarantined" is answered by
+#     services/source_quarantine.quarantine_matches_source, a Python matcher
+#     with state/expiry/blank-value rules that a hand-written NOT EXISTS would
+#     restate rather than reuse.
+#
+# So the check carries a `runner` callable instead of `count_sql`/`sample_sql`,
+# and the SQL below is narrowing only: it decides WHICH offers are served and
+# groups them, and Python decides what each group MEANS.
+
+# The served-supply scope, at OFFER grain. Same two conjuncts
+# `priced_offer_exists_sql` asks — imported, not re-typed. ADR-024 measured its
+# non-USD supply against exactly this denominator ("14,981 servable offers
+# (unsuppressed, priced)"), so this check counts what that measurement counted.
+_SERVED_OFFER_WHERE = "\n              AND ".join(priced_offer_row_conjuncts(alias="co"))
+
+# Column aliases are chosen to match `services/offer_currency_policy`'s field
+# vocabulary (`source_domain`, `domain`, `merchant_id`, `platform`,
+# `source_system`, `source_ref`) so a row from this query can be handed to
+# `is_quarantined_row` unmodified. `platform` lives on catalog_products, not on
+# catalog_offers, and the merchant_platform match type needs it; LEFT JOIN so an
+# offer whose product row is missing still gets counted rather than vanishing.
+#
+# `upper(trim(coalesce(...)))` is the SERVING predicate's own normalisation
+# (services/region_pricing.region_currency_predicate), not a second one.
+_MARKET_CURRENCY_SERVED_CTE = f"""
+        WITH served_offers AS (
+            SELECT
+                co.offer_id                            AS offer_id,
+                co.merchant_id                         AS merchant_id,
+                co.source_system                       AS source_system,
+                co.source_ref                          AS source_ref,
+                co.source_domain                       AS source_domain,
+                cp.source_domain                       AS domain,
+                cp.platform                            AS platform,
+                upper(trim(coalesce(co.market, '')))   AS market_norm,
+                upper(trim(coalesce(co.currency, ''))) AS currency_norm
+            FROM catalog_offers co
+            LEFT JOIN catalog_products cp
+                   ON cp.product_key = co.product_key
+            WHERE {_SERVED_OFFER_WHERE}
+        )
+"""
+
+# One row per (market, currency) pair over the whole served corpus. Tiny — prod
+# 2026-08-21 carries 14 currency codes and a market column that is 'US' on
+# nearly every row — and it is the ONLY place the totals come from, so the
+# bucket counts below are exact rather than sampled.
+_MARKET_CURRENCY_PAIRS_SQL = (
+    _MARKET_CURRENCY_SERVED_CTE
+    + """
+        SELECT market_norm, currency_norm, count(*) AS n
+        FROM served_offers
+        GROUP BY market_norm, currency_norm
+"""
+)
+
+# Identity rows for the disagreeing pairs only, so the quarantine matcher runs
+# over the small set rather than the corpus. A ceiling far above the known
+# population (433 rows on prod) purely so a data explosion degrades into a
+# reported truncation instead of an unbounded fetch.
+_DISAGREEMENT_ROW_LIMIT = 10000
+
+_DISAGREEMENT_ROW_COLUMNS = (
+    "offer_id",
+    "merchant_id",
+    "source_system",
+    "source_ref",
+    "source_domain",
+    "domain",
+    "platform",
+    "market_norm",
+    "currency_norm",
+)
+
+
+def _market_currency_rows_sql(pair_count: int) -> str:
+    """Rows for `pair_count` disagreeing (market, currency) pairs.
+
+    The pair VALUES are BOUND, never interpolated: `currency_norm` is a string
+    read out of `catalog_offers`, i.e. writer-supplied data, and this module
+    interpolates only its own literals (see the `LIMIT`, an int constant).
+    """
+    if pair_count <= 0:
+        raise ValueError("no disagreeing pairs to query")
+    predicate = "\n               OR ".join(
+        f"(market_norm = :m{i} AND currency_norm = :c{i})" for i in range(pair_count)
+    )
+    return (
+        _MARKET_CURRENCY_SERVED_CTE
+        + f"""
+        SELECT {", ".join(_DISAGREEMENT_ROW_COLUMNS)}
+        FROM served_offers
+        WHERE {predicate}
+        ORDER BY offer_id
+        LIMIT {int(_DISAGREEMENT_ROW_LIMIT)}
+"""
+    )
+
+
+def classify_market_currency_pairs(pairs: Any) -> Dict[str, Any]:
+    """Bucket ``(market_norm, currency_norm, n)`` groups. Pure; no DB, no IO.
+
+    Split out of the runner so the DIALECT half (which offers are served, how
+    a currency normalises) can be executed against a real database in a test
+    while the POLICY half (what a market/currency pair means) is exercised on
+    real rows without one. The two halves failing together is the shape that
+    hides a defect: a scope bug and a classification bug both read as "0".
+
+    Returns the bucket counts plus the disagreeing pairs, spelled EXACTLY as
+    the database returned them so they can be bound straight back into the
+    row query.
+    """
+    served_offers = 0
+    blank_currency = 0
+    unmapped_market = 0
+    agreeing = 0
+    disagreeing = 0
+    unmapped_market_codes: List[str] = []
+    disagreeing_pairs: List[Any] = []
+
+    for row in pairs or []:
+        raw_market = row["market_norm"]
+        raw_currency = row["currency_norm"]
+        n = int(row["n"] or 0)
+        served_offers += n
+        currency = str(raw_currency or "").strip().upper()
+        if not currency:
+            # Owned by the price/currency gates, not by this check.
+            blank_currency += n
+            continue
+        # The SOFT accessor: an unmapped market is an honest "cannot compare",
+        # never a licence to assume USD.
+        expected = pricing_currency_for_region_or_none(normalize_region(raw_market))
+        if expected is None:
+            unmapped_market += n
+            label = normalize_region(raw_market) or "(blank)"
+            if label not in unmapped_market_codes:
+                unmapped_market_codes.append(label)
+            continue
+        if currency == expected:
+            agreeing += n
+            continue
+        disagreeing += n
+        disagreeing_pairs.append((raw_market, raw_currency))
+
+    return {
+        "served_offers": served_offers,
+        "agreeing": agreeing,
+        "blank_currency": blank_currency,
+        "unmapped_market": unmapped_market,
+        "unmapped_market_codes": sorted(unmapped_market_codes),
+        "disagreeing": disagreeing,
+        "disagreeing_pairs": disagreeing_pairs,
+    }
+
+
+async def _run_market_currency_disagreement(db: Any) -> Dict[str, Any]:
+    """ADR-024 Phase 0 item 2 — no served offer's currency may disagree with its
+    market's expected currency without a recorded reason.
+
+    WHAT IT WOULD HAVE CAUGHT. Both of the ADR's named market/currency defects
+    are in scope of exactly this count:
+
+      * **2026-07-28, Mintree.** Seven rows priced 847–3927.70 INR were
+        published as ``"USD"`` on the unauthenticated ACP feed — an Indian
+        store (``country=IN``, ``currency=INR``) whose offers claimed the US
+        market's currency. `services/offer_currency_policy`'s docstring is the
+        long version. Nothing counted the disagreement; a human found it.
+      * **The 433-EUR-as-US cohort, live today.** 433 EUR offers stamped
+        ``market='US'`` from one ``universal_product_sync`` merchant
+        (``merch_e68c20b0189746d0``, a bare UUID for a ``source_domain``) —
+        23% of all servable non-USD offers. ADR-024 names this as the residual
+        case its no-FX decision depends on being an INGESTION defect rather
+        than a ranking problem, which is only true while something counts it.
+
+    THIS CHECK IS `warn_only` AND MUST STAY THAT WAY UNTIL THAT COHORT IS
+    DISPOSED OF. It reports a real, currently-nonzero number; promoting it to
+    enforcing today would park the sweep permanently red on a known condition
+    under separate investigation, and a permanently-red check cannot signal a
+    NEW regression — this module's threshold convention says so at length above
+    ``_CHECKS``. Remediation of the 433 is a human decision (quarantine the
+    source, or reclassify the market), and the promotion happens in the same
+    change that resolves it, by deleting one `warn_only` key.
+
+    THE FOUR BUCKETS, and why each is a bucket rather than a silent skip:
+
+      * ``blank_currency`` — NOT this check's business. A missing currency is
+        owned by the price/currency gates (`priced_offer_sql`, the
+        `OFFER_PRICE_MISSING` trust gate); reading a blank as "disagrees with
+        USD" would double-count their defect as ours.
+      * ``unmapped_market`` — the market has no entry in
+        `services/region_pricing`. The SOFT accessor is used deliberately: an
+        unmapped market cannot be compared, and the honest answer is "unknown",
+        never "assume USD" — that assumption is the shared root of all four
+        currency defects ADR-024 lists. Counted, so an unmapped market growing
+        into a hiding place is visible.
+      * ``quarantined`` — the recorded reason. `catalog_source_quarantine` is
+        the EXISTING exemption store, with a real writer
+        (`scripts/audit_offer_currency.py`), a revoke path and expiry; matching
+        is delegated whole to `is_quarantined_row` /
+        `quarantine_matches_source`. No new exemption store, no local match
+        rule, no second normalisation.
+      * ``violations`` — a served offer that disagrees and has no recorded
+        reason. This is the number the threshold reads.
+
+    FAILURE IS NOT EMPTINESS, in this check's own direction. If the quarantine
+    resolve fails, the disagreeing rows are NOT swept into ``violations`` (they
+    might all be exempt) and NOT swept into ``quarantined`` (they might all be
+    live) — they land in ``unclassified_quarantine_unknown`` with
+    ``quarantine_lookup: "failed"``. Guessing either way would publish a number
+    the data does not support, which is the failure mode the whole quarantine
+    workstream exists to end.
+    """
+    pairs = await db.fetch_all(_MARKET_CURRENCY_PAIRS_SQL)
+    buckets = classify_market_currency_pairs(pairs)
+    disagreeing_pairs = buckets.pop("disagreeing_pairs")
+
+    detail: Dict[str, Any] = dict(buckets)
+    detail.update(
+        {
+            "quarantined": 0,
+            "unclassified_quarantine_unknown": 0,
+            "violations": 0,
+            "quarantine_lookup": "not_needed",
+            "sample": [],
+        }
+    )
+
+    if not disagreeing_pairs:
+        return {"count": 0, "sample_keys": [], "detail": detail}
+
+    values: Dict[str, Any] = {}
+    for i, (market_value, currency_value) in enumerate(disagreeing_pairs):
+        values[f"m{i}"] = market_value
+        values[f"c{i}"] = currency_value
+    fetched = await db.fetch_all(
+        _market_currency_rows_sql(len(disagreeing_pairs)), values
+    )
+    rows = [
+        {name: row[name] for name in _DISAGREEMENT_ROW_COLUMNS} for row in (fetched or [])
+    ]
+    detail["rows_examined"] = len(rows)
+    detail["truncated"] = len(rows) >= _DISAGREEMENT_ROW_LIMIT
+
+    quarantines: Any = None
+    try:
+        quarantines = await load_active_quarantines(db=db)
+        detail["quarantine_lookup"] = "ok"
+    except Exception:  # noqa: BLE001 — a failed resolve is reported, never guessed
+        logger.warning(
+            "catalog_invariants: market_currency quarantine resolve FAILED — "
+            "%d disagreeing rows reported UNCLASSIFIED, not as violations",
+            len(rows),
+            exc_info=True,
+        )
+        detail["quarantine_lookup"] = "failed"
+
+    quarantined = 0
+    unclassified = 0
+    violations: List[Dict[str, Any]] = []
+    for row in rows:
+        if detail["quarantine_lookup"] == "failed":
+            unclassified += 1
+            continue
+        if is_quarantined_row(row, quarantines or []):
+            quarantined += 1
+            continue
+        violations.append(row)
+
+    detail["quarantined"] = quarantined
+    detail["unclassified_quarantine_unknown"] = unclassified
+    detail["violations"] = len(violations)
+    detail["sample"] = [
+        {
+            "offer_id": row["offer_id"],
+            "merchant_id": row["merchant_id"],
+            "market": row["market_norm"],
+            "currency": row["currency_norm"],
+            "source_system": row["source_system"],
+        }
+        for row in violations[:_SAMPLE_LIMIT]
+    ]
+    return {
+        "count": len(violations),
+        "sample_keys": [row["offer_id"] for row in violations[:_SAMPLE_LIMIT]],
+        "detail": detail,
+    }
+
 
 # Each check: (name, threshold_env, default_threshold, description, count SQL,
 # sample SQL). Violation = count > threshold. Thresholds default to 0 except
@@ -963,6 +1270,35 @@ _CHECKS: List[Dict[str, Any]] = [
         "sample_sql": _SERVING_NOT_RENDERABLE_SAMPLE_SQL,
     },
     {
+        "name": "market_currency_disagreement",
+        "description": (
+            "a served offer is priced in a currency its market does not expect, "
+            "with no recorded reason — the ingestion defect ADR-024's no-FX "
+            "decision assumes is counted rather than absorbed by a ranker "
+            "(ADR-024 Phase 0 item 2)"
+        ),
+        "env": "CATALOG_INVARIANT_MARKET_CURRENCY_THRESHOLD",
+        # 0, and REPORTING-ONLY — the two are not in tension, they are the
+        # honest pair. The true count is not 0 today (the 433-EUR-as-US cohort
+        # below), so an enforcing check at 0 would ship permanently red; and a
+        # threshold raised to 433 would be a blessing of the exact rows the ADR
+        # says must not be trusted, plus 433 rows of head-room for the next
+        # Mintree. `warn_only` keeps the number honest AND visible while the
+        # cohort's disposition is a human decision, instead of choosing between
+        # a deaf alarm and a fake-green one.
+        #
+        # PROMOTION IS ONE DELETED KEY. Remove `warn_only` in the same change
+        # that disposes of the cohort (quarantine the source, or fix the
+        # market stamp); the threshold is already where it needs to be.
+        "default_threshold": 0,
+        "warn_only": True,
+        # No count_sql/sample_sql: the map and the quarantine matcher are
+        # Python and must not be restated in SQL. See the banner above _CHECKS.
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_market_currency_disagreement,
+    },
+    {
         "name": "orphan_trust_rows",
         "description": "trust rows whose catalog_products row no longer exists",
         "env": "CATALOG_INVARIANT_ORPHAN_THRESHOLD",
@@ -1029,28 +1365,58 @@ def _threshold(check: Dict[str, Any]) -> int:
 
 async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
     """Run every invariant; return counts, thresholds, and sample keys for
-    violated checks. Never raises for a single failing check — a check that
-    errors is reported as {"error": ...} so the rest still run."""
+    checks that are over threshold. Never raises for a single failing check — a
+    check that errors is reported as {"error": ...} so the rest still run.
+
+    TWO SEVERITIES, one code path. `over_threshold` is the measurement and is
+    computed identically for every check. `violated` is the VERDICT, and a
+    check marked `warn_only` never produces one: it reports its count, its
+    samples and its detail exactly as an enforcing check does, and is tallied
+    under `warned_count` instead of `violated_count`.
+
+    That distinction is deliberately not "a check that always passes". A
+    report-only check whose output were suppressed would be indistinguishable
+    from a healthy catalog — the same defect this module's threshold convention
+    warns about — so the only thing `warn_only` suppresses is the verdict.
+    """
     results: List[Dict[str, Any]] = []
     violated = 0
+    warned = 0
     for check in _CHECKS:
         entry: Dict[str, Any] = {
             "name": check["name"],
             "description": check["description"],
         }
         try:
-            row = await db.fetch_one(check["count_sql"])
-            count = int((row["c"] if row is not None else 0) or 0)
+            runner = check.get("runner")
+            samples: Any = None
+            if runner is not None:
+                outcome = await runner(db)
+                count = int(outcome["count"])
+                samples = list(outcome.get("sample_keys") or [])
+                entry["detail"] = outcome.get("detail")
+            else:
+                row = await db.fetch_one(check["count_sql"])
+                count = int((row["c"] if row is not None else 0) or 0)
             threshold = _threshold(check)
+            warn_only = bool(check.get("warn_only"))
+            over_threshold = count > threshold
             entry["count"] = count
             entry["threshold"] = threshold
-            entry["violated"] = count > threshold
-            if entry["violated"]:
-                violated += 1
-                samples = await db.fetch_all(check["sample_sql"])
-                entry["sample_keys"] = [r["subject_key"] for r in samples]
+            entry["warn_only"] = warn_only
+            entry["over_threshold"] = over_threshold
+            entry["violated"] = over_threshold and not warn_only
+            if over_threshold:
+                if samples is None:
+                    rows = await db.fetch_all(check["sample_sql"])
+                    samples = [r["subject_key"] for r in rows]
+                entry["sample_keys"] = samples
+                if warn_only:
+                    warned += 1
+                else:
+                    violated += 1
         except Exception as exc:  # noqa: BLE001 — one bad check must not sink the sweep
             logger.exception("catalog_invariants: check %s failed", check["name"])
             entry["error"] = str(exc)
         results.append(entry)
-    return {"violated_count": violated, "checks": results}
+    return {"violated_count": violated, "warned_count": warned, "checks": results}

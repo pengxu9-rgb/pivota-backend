@@ -21,7 +21,10 @@ class FakeDb:
 
     def _match(self, sql):
         for check in _CHECKS:
-            if check["count_sql"] == sql or check["sample_sql"] == sql:
+            # `.get`, not `[...]`: a check driven by a `runner` callable carries
+            # no count/sample SQL at all (market_currency_disagreement), and
+            # subscripting would KeyError here rather than falling through.
+            if check.get("count_sql") == sql or check.get("sample_sql") == sql:
                 return check["name"]
         raise AssertionError("unknown sql")
 
@@ -32,6 +35,12 @@ class FakeDb:
         return {"c": self._counts.get(name, 0)}
 
     async def fetch_all(self, sql, values=None):
+        # The runner-driven check issues its own SQL. An EMPTY served corpus is
+        # the honest answer for a fake with no offers in it — and it keeps that
+        # check out of every assertion below, which are all about the SQL-driven
+        # thresholding path.
+        if "served_offers" in sql:
+            return []
         name = self._match(sql)
         n = min(self._counts.get(name, 0), 5)
         return [{"subject_key": f"pk_{name}_{i}"} for i in range(n)]

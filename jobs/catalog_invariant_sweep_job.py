@@ -42,15 +42,34 @@ async def run_catalog_invariant_sweep_tick() -> None:
                     check.get("sample_keys"),
                     check.get("description"),
                 )
+            elif check.get("over_threshold"):
+                # A `warn_only` check over its threshold. WARNING, not ERROR:
+                # the number is real and must be seen, but the check is not a
+                # verdict yet (services/catalog_invariant_checks explains what
+                # `warn_only` does and does not suppress). The DETAIL is logged
+                # because for a reporting check the buckets ARE the finding —
+                # a bare count cannot distinguish "433 unexplained" from "433
+                # already quarantined".
+                logger.warning(
+                    "catalog_invariant REPORTING (warn_only): %s — count=%s "
+                    "(threshold=%s) samples=%s detail=%s :: %s",
+                    check.get("name"),
+                    check.get("count"),
+                    check.get("threshold"),
+                    check.get("sample_keys"),
+                    check.get("detail"),
+                    check.get("description"),
+                )
             elif check.get("error"):
                 logger.error(
                     "catalog_invariant check ERRORED: %s — %s",
                     check.get("name"), check.get("error"),
                 )
         logger.info(
-            "catalog_invariant_sweep: %d checks, %d violated",
+            "catalog_invariant_sweep: %d checks, %d violated, %d reporting",
             len(report.get("checks", [])),
             int(report.get("violated_count", 0)),
+            int(report.get("warned_count", 0)),
         )
     except Exception:
         logger.exception("catalog_invariant_sweep: tick failed")
