@@ -275,10 +275,13 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 
    **Two loose ends from the harvester deletion, neither of them a break:**
 
-   - `Postgres-4hoG` in the catalog-intelligence project is now **orphaned**: both of its consumers
-     are gone, but it is **not** empty — ~8k harvested rows across six tables (counts in the
-     catalog-intelligence assessment below). Keep or drop is a data decision, not a cutover one, and
-     dropping it is destructive.
+   - `Postgres-4hoG` in the catalog-intelligence project is **orphaned but not empty** — ~8k
+     harvested rows across six tables (counts in the catalog-intelligence assessment below).
+     **Resolved 2026-08-21: archived, instance kept.** `pg_dump -Fc` of all six tables lives at
+     `gs://pivota-prod-archives/postgres-4hog/postgres-4hog-archive-20260821.dump` (1.35 MiB), and
+     the Railway instance stays up — coherent with `Pivota-catalog-intelligence` remaining on
+     Railway. The archive is a SECOND copy, not the only one; a byte-level restore test has not been
+     run. Use `pg_dump` from `libpq` (18.4), not `postgresql@15` — a v15 client refuses a v17 server.
    - `Pivota-catalog-intelligence` still carries `INGREDIENT_HARVESTER_BASE_URL`, which now points at
      nothing. Behaviour is unchanged — the target had been FAILED since 2026-05-29, so the URL was
      already dead — but it should be removed on the next touch of that service.
@@ -292,10 +295,12 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 6. **Rollback** — deploys now go out `--no-traffic` behind a candidate tag and only take traffic
    after a health check; rollback is `gcloud run services update-traffic --to-revisions=<prev>=100`.
    Document it in the cutover runbook.
-7. **Cloud SQL sizing** — prod is created with 20 GB SSD; IOPS scale with capacity and
-   `--storage-auto-increase` never raises the ceiling proactively. Use >= 100 GB for prod.
-8. **`--deny-maintenance-period`** is not set around Sep 8-12 or the late-Sep launch window.
-   ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real restart.
+7. **Cloud SQL sizing — DONE 2026-08-21.** Raised 20 GB → **100 GB** (online, non-disruptive;
+   disk cannot be reduced afterwards). `storageAutoResize` remains on. IOPS scale with capacity,
+   and `--storage-auto-increase` only reacts to pressure rather than provisioning for it.
+8. **`--deny-maintenance-period` — DONE 2026-08-21.** Set **2026-08-22 → 2026-10-05**, covering the
+   cutover and the late-Sep launch. ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real
+   restart, so this is not cosmetic.
 9. **Cloud SQL connection budget — RESOLVED, measured.** `max_connections` raised 200 → 300.
    Measured worst case 230/300 (headroom 70): web 20x6, gateway 20x5, worker 1x10, and
    proof-issuer + acp contribute **0** because they mount no `DATABASE_URL` at all. Re-derive this
