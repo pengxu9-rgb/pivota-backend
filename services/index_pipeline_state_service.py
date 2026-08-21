@@ -23,6 +23,7 @@ from services.agent_decision_gates import (
     evaluate_agent_decision_gates,
 )
 from services.priced_offer_sql import priced_offer_exists_sql
+from services.region_pricing import has_offer_priced_for_region_sql
 
 logger = logging.getLogger(__name__)
 
@@ -551,10 +552,14 @@ _HAS_OFFER_SNAPSHOT_COLUMN = """
 # fields cannot span lines, and both query bodies (Postgres and the SQLite test
 # path) must interpolate the SAME fragment or they drift apart silently.
 _HAS_PRICE_EXISTS = priced_offer_exists_sql("cp.product_key")
-_HAS_US_OFFER_EXISTS = priced_offer_exists_sql(
-    "cp.product_key",
-    extra_predicate="upper(trim(coalesce(co.currency, ''))) = 'USD'",
-)
+# The US case of the region predicate (services/region_pricing, ADR-024 Phase 1).
+# Byte-identical to the hand-spelled currency conjunct it replaces — asserted in
+# tests/test_region_pricing.py — so this is a rename of the source of truth, not a
+# change of verdict. THE STORED SEMANTICS ARE UNCHANGED: index_pipeline_state
+# still bakes a US answer into serving_eligible at build time, and un-baking it
+# is Phase 2a, consumer by consumer. New code that wants another region calls
+# has_offer_priced_for_region_sql directly rather than reading this bit.
+_HAS_US_OFFER_EXISTS = has_offer_priced_for_region_sql("cp.product_key", "US")
 
 _ELIGIBILITY_COLUMNS = f"""
     cp.content_key,
