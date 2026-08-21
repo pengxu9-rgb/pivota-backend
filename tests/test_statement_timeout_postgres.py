@@ -92,6 +92,19 @@ def test_env_knob_reaches_the_pool_as_milliseconds() -> None:
     assert proc.returncode == 0, proc.stderr.decode()[-400:]
 
 
+def test_sub_second_values_floor_to_one_second_not_silently_off() -> None:
+    """DB_STATEMENT_TIMEOUT_SECONDS=0.0005 would otherwise become
+    statement_timeout='0' — which Postgres reads as NO ceiling while the
+    operator believes one is on. The floor turns that into '1000'."""
+    proc = _import_probe(
+        {"DB_STATEMENT_TIMEOUT_SECONDS": "0.0005"},
+        "import db.database as m; import sys;"
+        "v = (m.database_kwargs.get('server_settings') or {}).get('statement_timeout');"
+        "sys.exit(0 if v == '1000' else 3)",
+    )
+    assert proc.returncode == 0, proc.stderr.decode()[-400:]
+
+
 @pytest.mark.asyncio
 async def test_server_cancels_the_statement_and_the_connection_stays_usable() -> None:
     """The whole point: the SERVER frees the slot, and — unlike a client-side

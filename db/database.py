@@ -171,17 +171,26 @@ if IS_POSTGRES:
     # connection ("another operation is in progress").
     #
     # Unset (the default) keeps current behavior — flipping prod is ONE env
-    # change, revertible without a deploy. Startup SQL migrations are NOT
-    # affected either way: they run on the synchronous SQLAlchemy engine
-    # (db/sql_migrations.py), not this pool. In-pool work that legitimately
+    # change, revertible without a deploy. The LEDGERED startup migrations are
+    # not affected: db/sql_migrations.py runs on the synchronous SQLAlchemy
+    # engine (CONCURRENTLY files via AUTOCOMMIT), not this pool. Route-time and
+    # startup DDL that DOES go through this pool (the IF NOT EXISTS ensure_*
+    # sites, schema_guard) is covered by the ceiling — deliberate: in steady
+    # state those are no-ops, and one queued >30s behind a deploy-time lock is
+    # exactly a statement camping on a slot. In-pool work that legitimately
     # runs longer (nightly sweeps, admin backfills) wraps the long statement in
-    # `unbounded_statement_timeout()` below.
+    # `unbounded_statement_timeout()` below — and note ops scripts importing
+    # this module under a prod env inherit the ceiling too.
     _statement_timeout = _env_float(
         "DB_STATEMENT_TIMEOUT_SECONDS", 0.0, min_value=0.0, max_value=600.0
     )
     if _statement_timeout > 0:
+        # Floor 1s: sub-second values are misconfigurations with silent, nasty
+        # shapes — 0.0005 rounds to statement_timeout='0', which Postgres reads
+        # as NO ceiling while the operator believes one is on, and anything
+        # under ~1s starts cancelling healthy fast-path queries.
         database_kwargs["server_settings"] = {
-            "statement_timeout": str(int(_statement_timeout * 1000)),
+            "statement_timeout": str(int(max(_statement_timeout, 1.0) * 1000)),
         }
 
 # ---------------------------------------------------------------------------
@@ -304,22 +313,36 @@ async def unbounded_statement_timeout(db: Optional[Database] = None):
     Opens a transaction and issues `SET LOCAL statement_timeout = 0`, so every
     statement executed inside the `async with` block (same task = same pooled
     connection under `databases` 0.7.0) runs without the server-side ceiling.
-    The override dies with the transaction. SET LOCAL rather than a plain SET
-    on principle: asyncpg's pool DOES reset session state on release (verified
-    — a session-level SET here still came back to the ceiling on the next
-    checkout), but that net exists only at release time; SET LOCAL also covers
-    the same connection being reused within one task before release, and does
-    not depend on pool internals staying that way.
+    SET LOCAL rather than a plain SET on principle: asyncpg's pool DOES reset
+    session state on release (verified — a session-level SET here still came
+    back to the ceiling on the next checkout), but that net exists only at
+    release time; SET LOCAL also covers the same connection being reused
+    within one task before release, and does not depend on pool internals
+    staying that way.
+
+    Two scope caveats, both load-bearing:
+
+    * CALL THIS OUTSIDE ANY TRANSACTION. Under `databases` 0.7.0 a nested
+      `transaction()` is an asyncpg SAVEPOINT, and `SET LOCAL` inside a
+      savepoint survives its RELEASE — the lifted ceiling would persist to
+      the end of the CALLER's outer transaction, not this block.
+    * "Unbounded" lifts only the SERVER ceiling. Where the pool also runs
+      with DB_COMMAND_TIMEOUT_SECONDS (prod: 600), work past that bound gets
+      a CLIENT-side cancel mid-transaction — a poisoned connection and a
+      rollback attempt on it. This hatch does not extend that budget.
 
     Scope it to the individual long-running statement, not a whole job tick:
     the block holds one pool slot for its full duration, and it makes the
     wrapped work a single transaction (one failure rolls back all of it).
 
-    No-op when the configured database is SQLite, which has no
-    statement_timeout and no pool.
+    No-op when the TARGET database is not Postgres (judged from its URL, not
+    from the module-level default), which has no statement_timeout.
     """
     target = db if db is not None else database
-    if db is None and not IS_POSTGRES:
+    target_url = str(getattr(target, "url", "")).lower()
+    if not (
+        target_url.startswith("postgresql://") or target_url.startswith("postgres://")
+    ):
         yield
         return
     async with target.transaction():
