@@ -167,15 +167,38 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    Keep the rule anyway. It is correct for any future pair where the writer is live and the queue is
    not provably empty — which is the normal case, and was assumed rather than checked here.
 
-   ⚠️ **Recorded hazard: that queue now has no drainer, and a running service holds the flag.**
-   `pivota-acp` is still up and carries `DISABLE_WEBHOOK_OUTBOX=true` plus
-   `PLATFORM_ORDERS_WEBHOOK_URL`. This repo contains **no** writer to `ucp_order_webhook_deliveries`
-   — the historical writer lives in the `pivota-acp` repo, which is why it could not be settled from
-   here. **Unresolved:** whether that flag governs `ucp_order_webhook_deliveries` or only the
-   separate `webhook_outbox` table from `db/migrations/026_acp_delegate_webhook.sql`. If it governs
-   the UCP table, flipping it to `false` starts filling a queue nothing drains, permanently. Confirm
-   in the `pivota-acp` repo before touching that variable, and do not treat `true` as a safe default
-   to flip during cutover.
+   ✅ **RESOLVED — the drainerless-queue hazard recorded here does not exist.** Settled by reading
+   the `pivota-acp` repo (the previous note could not be closed from this repo alone):
+
+   - `DISABLE_WEBHOOK_OUTBOX` is defined once, in `pivota_infra_main/src/acp/outbox_queue.py`, and
+     every statement in that module targets **`webhook_outbox`**. It has no relationship to
+     `ucp_order_webhook_deliveries`. Flipping it cannot fill the UCP queue.
+   - The UCP table's only writer is `pivota_infra_main/routes/ucp_business_proxy_routes.py`, mounted
+     **only** by `ucp_web.py` → `Dockerfile.ucp-web` → the deleted `ucp-web-production`. Its only
+     drainer was `scripts/ucp_order_webhook_worker.py` → `Dockerfile.ucp-worker` → the deleted
+     `ucp-worker`. **Writer and drainer were deleted together**, so the queue is inert.
+   - `pivota-acp` runs a *different* application tree — `pivota_infra/src.main:app`, not
+     `pivota_infra_main/` — which never references the UCP table.
+
+   🚨 **But the analogous hazard is real on `webhook_outbox`, and that one is live.** Measured on
+   prod 2026-08-21: **3 rows `pending` since 2026-07-10**, `attempts = 0/3`, never attempted, with
+   **no `merchant_id` and no `webhook_url`**. `pivota-acp` runs with `DISABLE_WEBHOOK_OUTBOX=true`,
+   so its dispatcher never starts.
+
+   **Flipping that flag to `false` will not drain them — it cannot.** The dispatcher's
+   attempt-counter UPDATE is written as `INTERVAL ':backoff minutes'`, with the placeholder **inside
+   a quoted SQL literal**, so SQLAlchemy never binds it and Postgres rejects the statement:
+
+   ```
+   ERROR:  invalid input syntax for type interval: ":backoff minutes"
+   ```
+
+   That UPDATE runs *before* the send attempt and is caught by the per-row handler, so each row
+   fails, `attempts` never increments, `status` stays `pending`, and the next poll retries the same
+   rows forever. The outbox is dead twice over: disabled by env, and broken if enabled. Fix the
+   interval binding in the `pivota-acp` repo before ever setting the flag to `false`; the 3 stranded
+   rows carry no merchant or destination, so they are almost certainly July test residue rather than
+   lost customer events.
 
    **`pivota-acp` was briefly deployed to Cloud Run on 2026-08-20 and has been REMOVED** the same
    day, following ADR-021. Deleted: the Cloud Run `acp` service and its four `acp-env-*` secrets.
