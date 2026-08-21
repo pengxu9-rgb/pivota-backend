@@ -1,6 +1,6 @@
 # ADR-024: Region is a request dimension, not a global constant
 
-**Status:** Proposed (2026-08-21, revised same day after two-agent review)
+**Status:** Accepted (2026-08-21; Phase 0 + Phase 1 merged same day — #1798, #1799, #2071, #1803; open questions resolved by the decision owner, below)
 **Decision owner:** peng
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-012 (catalog convergence),
 ADR-018 (connection layer and priced serving lane), ADR-021 (PIVOTA-Agent is the protocol gateway)
@@ -293,16 +293,33 @@ row growth.
 12. [ ] Centralize the offer-selection rule (N regional offers → which to show)
         in one module, the way `priced_offer_sql` centralizes "is it priced".
 
-## Open questions
+## Resolved questions (decision owner, 2026-08-21)
 
-- **Pricing region vs fulfilment reachability** is *answered for Phase 1*
-  (currency-of-region; fulfilment unmodeled) but remains open for Phase 2b: a UK
-  store shipping to the US is a US-buyable offer priced in GBP, and
-  `merchant_region_support` is where that distinction becomes data.
-- **Where does `buyer_region` come from?** Prefer an explicit partner-supplied
-  field; never infer from currency; reconcile the existing signals
-  (`request.market`, `profileSummary.region`, language inference) to it.
-- **Thin-region fallback** — refuse (honest, empty) vs show foreign-priced with
-  an explicit "priced in GBP" marker (likely better, a product call). This
-  decision *gates* the FX-ranking question per commitment 5; decide it before
-  Phase 2b.
+- **Pricing region vs fulfilment reachability — DECIDED: pricing region.**
+  `has_offer_priced_for_region` gates on the region's expected pricing currency,
+  exactly as Phase 1 shipped it. Fulfilment reachability stays unmodeled until
+  `merchant_region_support` (Phase 2b) makes it data; it may then become a
+  second, additive gate — never a retroactive redefinition of this one.
+
+- **Thin-region fallback — DECIDED: none.** A region with no priced offers gets
+  an honest empty answer, not foreign-priced filler with a marker. "We have
+  nothing buyable in your region" is a true statement; a GBP price shown to a
+  JP buyer as fallback is a soft version of the comparison this ADR forbids,
+  and it would make mixed-currency pools the normal thin-region case.
+
+- **FX-ranking — DECIDED: not built; its trigger was declined above.** With
+  pricing-region gating and no fallback, every served pool is single-currency
+  by construction, so ranking never needs a rate. The residual case — a
+  foreign-currency row inside a region's pool — is mislabeled supply (see the
+  433-EUR-as-US anomaly), an ingestion defect for the Phase 0 invariant, not a
+  ranking problem to absorb. TRIPWIRE instead of a ranker: count
+  `unknown`-classified rows actually served, per region; materially nonzero
+  means clean data, not convert it. If a partner ever asks for cross-region
+  price comparison, that is EXPLICIT comparison with the rate and its
+  timestamp disclosed — its own ADR, its own trigger, never a latent ranker
+  capability. Commitment 5's no-FX-to-buyers rule is thereby unconditional.
+
+- **Where `buyer_region` comes from** (still open, low stakes): prefer the
+  explicit partner-supplied field; never infer from currency; reconcile
+  `request.market` / `profileSummary.region` / language inference to it as
+  those surfaces are touched.
