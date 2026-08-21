@@ -131,3 +131,24 @@ def test_map_keys_and_values_are_canonical_codes():
     for region, currency in REGION_PRICING_CURRENCY.items():
         assert len(region) == 2 and region.isalpha() and region.isupper()
         assert len(currency) == 3 and currency.isalpha() and currency.isupper()
+
+
+class TestPricingCurrencyForRegionOrNone:
+    """The SOFT accessor (added by the ADR-024 map fold-in) normalizes for
+    itself. offer_buyability happens to pre-normalize before calling, so
+    without these rows a mutant that drops the accessor's own
+    normalize_region call survives every existing test -- any OTHER caller
+    passing raw input would then silently get None for a mapped region."""
+
+    def test_normalizes_case_and_whitespace_itself(self):
+        from services.region_pricing import pricing_currency_for_region_or_none
+        assert pricing_currency_for_region_or_none(" gb ") == "GBP"
+        assert pricing_currency_for_region_or_none("jp") == "JPY"
+
+    def test_unmapped_and_garbage_yield_none_never_usd(self):
+        from services.region_pricing import pricing_currency_for_region_or_none
+        # Mutant killed: defaulting the .get() to 'USD' -- the exact assumption
+        # every one of the four currency defects was built on.
+        assert pricing_currency_for_region_or_none("DE") is None
+        assert pricing_currency_for_region_or_none("") is None
+        assert pricing_currency_for_region_or_none("usa") is None

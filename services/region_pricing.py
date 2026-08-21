@@ -96,6 +96,19 @@ def pricing_currency_for_region(region: str) -> str:
         ) from None
 
 
+def pricing_currency_for_region_or_none(region: str) -> Optional[str]:
+    """Soft variant of ``pricing_currency_for_region``: None for an unmapped
+    region instead of raising.
+
+    For callers whose unmapped-region behavior is a POLICY of their own --
+    ``services/offer_buyability`` falls back to its largest-single-currency rule
+    -- rather than a caller error. None is an honest "unknown", never a licence
+    to assume USD; the hard variant stays the right choice anywhere the region
+    reaches SQL.
+    """
+    return REGION_PRICING_CURRENCY.get(normalize_region(region) or "")
+
+
 def region_currency_predicate(region: str, *, alias: str = "co") -> str:
     """The bare currency conjunct for one ``catalog_offers`` alias.
 

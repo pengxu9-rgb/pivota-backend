@@ -32,6 +32,7 @@ Pure functions (no DB/IO). Additive: annotation only sets `market_availability` 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from services.region_pricing import pricing_currency_for_region_or_none
 
 DEFAULT_SERVING_MARKET = "US"
 
@@ -44,18 +45,14 @@ MARKET_CROSS_BORDER = "cross_border"
 # largest-single-currency rule below; it must never quietly become USD, which is
 # the assumption every one of the four currency defects was built on.
 #
-# NOT reused from routes/employee_products.MARKET_EXPECTED_CURRENCY, the repo's
-# other such map, for two reasons: it lives in a route module (a service must not
-# import a route to answer this), and its membership is a different question --
-# it is the CSV-import validator's list, carrying non-ISO keys ("UK", "EU") and
-# missing HR/FI/SE/HK, the regions ADR-024 measured real non-USD supply in. The
-# two converge in ADR-024 Phase 1's services/region_pricing; fold this copy in
-# there rather than growing a third.
-EXPECTED_CURRENCY_BY_MARKET: Dict[str, str] = {
-    "US": "USD", "GB": "GBP", "JP": "JPY", "FR": "EUR", "HR": "EUR",
-    "FI": "EUR", "AU": "AUD", "SE": "SEK", "KR": "KRW", "HK": "HKD",
-    "SG": "SGD", "CA": "CAD",
-}
+# The region->currency map itself lives in services/region_pricing (ADR-024
+# Phase 1); this module holds only the SOFT lookup policy: an unmapped serving
+# market yields None -- an honest "unknown" that routes to the
+# largest-single-currency rule below -- never a silent USD, which is the
+# assumption every one of the four currency defects was built on.
+# (routes/employee_products.MARKET_EXPECTED_CURRENCY remains separate on
+# purpose: it is the CSV-import validator's list, a different question, with
+# non-ISO keys.)
 
 # Partition key for an offer that declares no currency. Its own bucket, never
 # merged into USD: "no currency stated" is not evidence of dollars.
@@ -70,7 +67,7 @@ def expected_currency_for_market(serving_market: Any) -> Optional[str]:
     """The pricing currency a domestic buy in `serving_market` should carry, or
     None when we have not mapped that market. None is an honest "unknown", not
     a licence to assume USD."""
-    return EXPECTED_CURRENCY_BY_MARKET.get(_norm_market(serving_market))
+    return pricing_currency_for_region_or_none(_norm_market(serving_market))
 
 
 def _currency_key(value: Any) -> str:
