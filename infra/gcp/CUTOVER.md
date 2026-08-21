@@ -68,7 +68,35 @@ yet. That window closes when Minds starts.
 3. **Final dump + import.** Same two commands used to build the stack, with a fresh stamp. The
    dump job self-verifies (completion trailer + table count) and the restore reconciles against the
    `.tables` manifest.
-4. **Bring the GCP stack live:**
+4. **Regenerate the env files FIRST — every command in the next step needs them.**
+
+   🚨 **Found by the 2026-08-21 rehearsal: step 5 as written fails on its first command.**
+   `deploy_backend.sh`, `setup_scheduler.sh` and `deploy_gateway.sh` all read
+   `infra/gcp/env.<env>.yaml` and `infra/gcp/secrets.<env>.list`. Both are **generated**, both are
+   **git-ignored** (`.gitignore` lines 59-60), and neither exists in a fresh checkout. The observed
+   failure is immediate and clear, but it costs a context-switch at exactly the wrong moment:
+
+   ```
+   missing infra/gcp/env.staging.yaml / infra/gcp/secrets.staging.list - run port_railway_env.py first
+   ```
+
+   The overrides they are generated from live **outside the repo**, in `~/dev/.pivota-gcp-env/`,
+   because a worktree removal destroyed them twice. Copy them in before generating:
+
+   ```bash
+   cp ~/dev/.pivota-gcp-env/env.prod.overrides.yaml          infra/gcp/
+   cp ~/dev/.pivota-gcp-env/env.prod.gateway.overrides.yaml  infra/gcp/
+   python3 infra/gcp/port_railway_env.py --railway-service web --railway-env production \
+     --env prod --apply
+   python3 infra/gcp/port_railway_env.py --railway-service PIVOTA-Agent --railway-env production \
+     --env prod --prefix gateway --apply
+   ```
+
+   `--apply` writes Secret Manager versions, so whoever runs the cutover needs
+   `roles/secretmanager.secretVersionAdder` on `pivota-prod`. **Confirm that before the window**, not
+   during it.
+
+5. **Bring the GCP stack live:**
    ```bash
    WORKERS=true infra/gcp/deploy_backend.sh prod <sha>
    WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <backend-sha> <gateway-sha>
@@ -77,17 +105,52 @@ yet. That window closes when Minds starts.
    #   gcloud scheduler jobs list --location us-west1 --project pivota-prod   # both ENABLED
    infra/gcp/deploy_gateway.sh prod <gateway-sha>
    ```
-5. **Point the gateway at the public names**: edit `env.prod.gateway.overrides.yaml` to
+6. **Point the gateway at the public names**: edit `env.prod.gateway.overrides.yaml` to
    `api.pivota.cc`, re-port, redeploy.
-6. **Flip DNS** — all six Railway-backed CNAMEs together. They cross-reference each other
+7. **Flip DNS** — all six Railway-backed CNAMEs together. They cross-reference each other
    (`commerce.mcp` is named inside documents served from `mcp`, `ucp` and `acp`), so a partial flip
    strands clients mid-discovery. The apex is a plain A record; HiChina has no ALIAS, so it points
    at the LB anycast IP directly.
-7. **Move `GOOGLE_OAUTH_REDIRECT_URI`** to `https://api.pivota.cc/...` (console entry must already
+8. **Move `GOOGLE_OAUTH_REDIRECT_URI`** to `https://api.pivota.cc/...` (console entry must already
    exist).
-8. **Verify**: `/health` on every host, one real checkout end to end, one merchant Search Console
+9. **Verify**: `/health` on every host, one real checkout end to end, one merchant Search Console
    connect, catalog image URLs resolving, `__catalog_health` counts matching the pre-cutover
    snapshot.
+
+## Rehearsal log — 2026-08-21 (night before)
+
+Ran against staging on the code that ships tomorrow. Timings are consistent with the 2026-08-20 run,
+so treat them as the plan, not a best case.
+
+| step | measured | notes |
+|---|---|---|
+| Dump Railway prod → GCS | **7m26s** | 418.89 MiB, `.tables` manifest = 367 |
+| Import into a fresh Cloud SQL db | **10m08s** | `--new-db`; the live database was untouched throughout |
+| Verification gate | **367/367 tables, 14,124 `catalog_products`** | matches the previous rehearsal exactly |
+
+**What it caught:** T-0 step 4 above did not exist. Every command in the "bring the stack live" step
+needs generated env files that no fresh checkout has. That is now step 4.
+
+**Operational traps, all self-inflicted and all worth avoiding tomorrow:**
+
+- **Do not pipe these scripts to `tail`/`head`.** The pipeline's exit status is the *last*
+  command's, so a script that fails reports `0`. It hid two real failures during the rehearsal.
+  Redirect to a file and check `$?`, or `set -o pipefail` in the calling shell.
+- **macOS has no `timeout(1)`.** `timeout 540 ...` fails with `command not found` and — piped —
+  looks like success.
+- **The import takes ~10 minutes.** Do not run it under any wrapper with a shorter timeout; the
+  verification gate runs *after* the import and is the part that gets cut off.
+- **Staging secrets are named `env-<NAME>`, not `<NAME>`.** Reading the unprefixed name returns
+  empty, which reads as "unreadable" rather than "wrong name".
+
+**Checked before arming, and worth repeating:** staging runs a restored *production* snapshot with
+real buyer addresses. `env-SENDGRID_API_KEY` and `env-SMTP2GO_API_KEY` are still the
+`DISABLED-IN-STAGING-not-a-real-key` placeholders and `env-STRIPE_SECRET_KEY` is `sk_test_`. Verify
+that again before any future rehearsal arms workers.
+
+**Not exercised tonight:** the `DATABASE_URL` secret switch and the arming step, both of which need
+`secretmanager.secretVersionAdder`. Staging was returned to exactly its prior state — 3 databases,
+both schedulers `PAUSED`, `AUDIT_WORKER_ENABLED=false`.
 
 ## Rollback
 
