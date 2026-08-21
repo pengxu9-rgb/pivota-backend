@@ -1,6 +1,6 @@
 # ADR-024: Region is a request dimension, not a global constant
 
-**Status:** Accepted (2026-08-21; Phase 0 + Phase 1 merged same day — #1798, #1799, #2071, #1803; open questions resolved by the decision owner, below)
+**Status:** Accepted (2026-08-21; Phase 0 + Phase 1 merged same day — #1798, #1799, #2071, #1803, then #1807 invariant + #2078 tripwire; open questions resolved and the Phase 2 entry gate RUN, below)
 **Decision owner:** peng
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-012 (catalog convergence),
 ADR-018 (connection layer and priced serving lane), ADR-021 (PIVOTA-Agent is the protocol gateway)
@@ -266,13 +266,44 @@ row growth.
        `AGENT_PDP_SERVING_MARKET`'s env default.
 
 **Phase 2 entry gate — falsify cheaply before spending**
-8. [ ] Three read-only probes: (a) *supply* — count content_keys passing every
+8. [x] Three read-only probes — RUN 2026-08-21, results below: (a) *supply* — count content_keys passing every
        region-neutral gate that hold a GBP (then JPY) offer; if ≈0, the unlock is
        illusory; (b) *transact* — run 5 survivors through search → PDP →
        `create_checkout`; the seed-cohort refusal predicts failure, which would
        reframe Phase 2 from "unlock supply" to "acquire buyable siblings";
        (c) *demand* — Minds request share by shopper region from gateway edge
        logs; if non-US < 1%, defer Phase 2 cheaply.
+
+**Entry-gate results (measured on prod, 2026-08-21):**
+
+- **(a) Supply — real.** The blocked cohort is 418 keys (down from 963 on
+  2026-08-14; USD-sibling capture has been landing since). By currency:
+  GBP 323, JPY 52, EUR 19, SGD 14, HKD 5, KRW 4, AUD 1 — all quality-passed by
+  construction.
+- **(b) Transact — fails 5/5, as predicted.** The live UCP door requires OAuth
+  non-interactively unavailable, so the refusal predicate itself was evaluated
+  against prod rows (`is_real_variant` + the mirror-title rule in
+  catalog_variant_promoter — deterministic). Five candidates across five
+  merchants: four carry a single variant whose title mirrors the product title
+  (the mirror-script synthetic), one is a literal `AUTO-…` placeholder. Every
+  one would be refused `no_real_variant_identity`. **Phase 2b is therefore
+  "acquire buyable siblings" — prices AND variant identity — not "unlock
+  existing supply."** Displayable ≠ buyable stands.
+- **(c) Demand — zero.** The gateway edge-log window held exactly two
+  requests, both from the probe session itself. Per this gate's own rule,
+  Phase 2b acquisition DEFERS until partner traffic exists or a partner
+  declares non-US regions. Correctness work (Phase 0/1, the invariant, the
+  tripwire) is merged, so deferral costs nothing.
+
+**The 433-EUR-as-US cohort is dispositioned: a real merchant, not garbage.**
+"Tsingtao Bear" — an active, indexable, internal Wix merchant
+(`universal_product_sync`) genuinely pricing in EUR; the UUID-as-source_domain
+is its Wix site id and `market='US'` is migration 149's default. 14 products,
+433 offer rows, none serving-eligible. Remediation: fix the WRITER
+(universal_product_sync stops stamping the US default; derive market from
+store settings or leave NULL) and leave the rows until `market` becomes
+load-bearing — quarantine would be wrong, the currency is honest. The #1807
+invariant counts the cohort visibly in the meantime.
 
 **Phase 2a — un-bake the stored verdict (behavior change, per consumer)**
 9. [ ] Name the disposition for each stored-bit consumer before moving the US
