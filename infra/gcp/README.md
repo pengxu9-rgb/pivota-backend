@@ -187,14 +187,25 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    on prod 2026-08-21: **3 `order_create` rows `pending` since 2026-07-10**, `attempts = 0/3`, never
    attempted. `pivota-acp` runs `DISABLE_WEBHOOK_OUTBOX=true`, so its dispatcher never starts.
 
-   **Do not flip that flag to `false` to "drain" them.** The live dispatcher is
-   `pivota_infra/src/acp/outbox_queue.py`, and two independent defects sit behind the flag:
+   ✅ **Both defects below are FIXED** in `pivota-acp` PR #34 (`e8f18a8`). Kept as the record of
+   what was wrong, and because the operator precondition still stands: **set `OPENAI_WEBHOOK_URL`
+   and `MERCHANT_WEBHOOK_SECRET` before flipping the flag**, or the dispatcher correctly refuses to
+   run and the in-process queue fills toward its cap.
 
-   1. It calls `r.get(...)` on a `databases` `Record`. Under the pinned `databases>=0.8.0,<0.9.0`
-      a `Record` is a `Sequence` with **no `.get`** (verified: `hasattr(Record, "get") is False`).
-      The first pending row raises `AttributeError`; the `except` handler calls `r.get` again and
-      raises too; `dispatch_loop` is `try/finally` with no `except`, so **the asyncio task dies
-      permanently** until the next deploy.
+   The live dispatcher is `pivota_infra/src/acp/outbox_queue.py`. Two independent defects sat behind
+   the flag:
+
+   1. It called `r.get(...)` on a `databases` `Record`. Under the pinned `databases>=0.8.0,<0.9.0`
+      a `Record` is a `Sequence`, not a `Mapping` — but **`.get` is not simply absent**, which is
+      how this was first recorded here and it was wrong. `Record.__getattr__` returns
+      `self._mapping.get(name)`, so on an *instance* `r.get` resolves to a column-lookup miss —
+      `None` — and **calling** it raises `TypeError: 'NoneType' object is not callable`.
+      (`hasattr(Record, "get")` is `False` on the **class** and `True` on an **instance**; checking
+      the class and generalising is the mistake.) The first pending row raised; the `except` handler
+      called `r.get` again and raised too; `dispatch_loop` was `try/finally` with no `except`, so
+      **the asyncio task died permanently** until the next deploy.
+
+      **Grep production logs for `TypeError`, not `AttributeError`.**
    2. Even repaired, `pivota_infra/src/acp/outbox.py:23` returns early when `OPENAI_WEBHOOK_URL` or
       `MERCHANT_WEBHOOK_SECRET` is unset — **both are unset on `pivota-acp`** — after which the
       dispatcher's success branch marks the row `sent`. Fixing only (1) converts a visible stall
