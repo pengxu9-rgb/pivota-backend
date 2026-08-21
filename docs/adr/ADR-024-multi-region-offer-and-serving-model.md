@@ -1,117 +1,160 @@
 # ADR-024: Region is a request dimension, not a global constant
 
-**Status:** Proposed (2026-08-21)
+**Status:** Proposed (2026-08-21, revised same day after two-agent review)
 **Decision owner:** peng
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-012 (catalog convergence),
 ADR-018 (connection layer and priced serving lane), ADR-021 (PIVOTA-Agent is the protocol gateway)
-**Numbering note:** ADR-023 is claimed by the open UCP hosted-payment-escalation ADR in PIVOTA-Agent.
+**Numbering note:** ADR-023 is claimed by the open UCP hosted-payment-escalation ADR in PIVOTA-Agent (#2005).
 
 ## Context
 
-Today the commerce index serves exactly one region. `serving_eligible` is a single
-boolean per `content_key`, and the region question is asked once, in one place, as
-`has_us_offer`:
+Today the commerce index serves one region, and region enters the system through
+**two mechanisms, not one** — a first draft of this ADR claimed one predicate was
+the whole region model, and review falsified that:
+
+**Mechanism 1 — a stored, build-time verdict.** The US test is one predicate:
 
 ```python
 # services/index_pipeline_state_service.py:554
 _HAS_US_OFFER_EXISTS = priced_offer_exists_sql(
-    "cp.product_key", extra_predicate="upper(trim(coalesce(co.currency,''))) = 'USD'")
+    "cp.product_key", extra_predicate="upper(trim(coalesce(co.currency, ''))) = 'USD'")
 ```
 
-That predicate is the whole of our region model. Everything downstream inherits it:
-`agent_decision_gates.BLOCKER_NO_US_OFFER`, the merchant-facing copy in
-`serving_status_service` ("Add US pricing…"), and by omission the decision layer,
-which has never needed to ask what region a buyer is in because there has only
-ever been one answer.
+But it does not run at request time. It runs inside `_classify_product` during the
+index-pipeline recompute, where `evaluate_agent_decision_gates` turns a missing US
+offer into `blocker_code = "no_us_offer"`, and `serving_eligible` requires
+`blocker_code == "none"`. **The region verdict is baked into the stored
+`serving_eligible` boolean at build time, where no request — and therefore no
+buyer region — exists.** The core predicates (quality ≥ 71.4, image, description,
+identity, price > 0) are region-neutral; region enters only through that
+flag-gated blocker conjunct, and the flag is live on prod — the 963 keys blocked
+`no_us_offer` prove it. Every consumer of the stored bit inherits the verdict:
+sitemap candidates (`canonical_sitemap_candidates.eligibility_predicate`),
+`pipeline_stage` public/shadow assignment, IndexNow, catalog health
+(`foreign_market` classification), and the merchant-facing copy in
+`serving_status_service` ("Add US pricing…").
 
-As we integrate Minds and other agentic partners, that assumption stops holding.
-A single agent integration serves buyers in many regions from one endpoint. The
-question the index must answer changes from *"does this product have a US offer?"*
-to **"does this product have an offer buyable in the region this request is for?"**
+**Mechanism 2 — request-time cross-border tagging.** `services/offer_buyability.py`
+already tags every served offer `domestic`/`cross_border` against a request market
+and selects an `is_buy_pick`, driven from `pivot_query_service.py:2283`
+(`annotate_offer_nodes(item.offers, request.market)`) and from
+`routes/agent_pdp_v1.py` via the env knob `AGENT_PDP_SERVING_MARKET` (default US).
+So the decision layer has *already* asked what region a request is for — the
+plumbing exists on one lane and is defaulted-US on the rest.
 
-### What we already have (measured on prod, 2026-08-21)
+As we integrate Minds and other agentic partners, whose buyers span many regions
+behind one endpoint, the question becomes: **"does this product have an offer
+buyable in the region this request is for?"** — asked per request, answered
+consistently by both mechanisms.
 
-The schema is further along than the gate is. `catalog_offers` already carries
-`market` and `currency` per offer row, and identity/offer separation is already
-the decided architecture — one `content_key`, N offers, US-buyability arriving as
-an *attached sibling offer* rather than a rewrite of the honest foreign one.
+### What `market` actually means (and does not)
 
-Of 14,981 servable offers (unsuppressed, priced):
+`catalog_offers` carries `market` and `currency` per offer, but they are not
+symmetric in trustworthiness:
 
-| | Offers | Merchants |
-|---|---:|---:|
-| USD | 13,138 | — |
-| **Non-USD** | **1,843 (12.3%)** | **48** |
+- `market` is `NOT NULL DEFAULT 'US'` (migration 149: "refine to real per-offer
+  geo when modeled"). The serving code explicitly refuses to trust it —
+  `has_us_offer` is "Derived from CURRENCY, not catalog_offers.market: … it is
+  'US' for every row and carries no signal" (index_pipeline_state_service.py:600).
+- Where `market` *is* non-US, it was stamped by
+  `scripts/backfill_offer_market_currency.py` from the storefront's `/meta.json` —
+  **the same source that stamped `currency`**, so any measured market~currency
+  correlation is true by construction, and `market` there means "store's home",
+  not "buyable by". `services/storefront_currency.py` is explicit: market and
+  currency are "different axes (destination served vs store base currency) — a
+  KR/HK exporter legitimately prices in USD."
+- `currency` IS written truthfully by every writer (0 of 18,279 live priced
+  offers null), and is exactly how the INR/ZAR/GBP mispricings were detected.
 
-GBP 780 · EUR 608 · JPY 333 · AUD 26 · SEK 25 · KRW 23 · HKD 22 · SGD 14 · CAD 12.
-Every one of those codes is already inside the decision layer's 14-currency
-allowlist. `market` and `currency` track each other almost perfectly.
+Therefore: **Phase 1 gates on currency, not on `market`.** The predicate is named
+what it is — `has_offer_priced_for_region` — and fulfilment reachability is
+explicitly out of scope until modeled. When Phase 2 writers begin stamping
+`market` as *destination* (Shopify Markets capture), that semantics change is
+declared, and old store-home values are not mixed with new destination values.
 
-Two distinct populations, and the difference matters for acquisition:
+### The supply, measured (prod, 2026-08-21)
 
-- **283 single-currency merchants hold 1,184 non-USD offers (64%)** — genuinely
-  regional storefronts (`dearbarber.co.uk`, `arencia.jp`, `roundlab.co.kr`),
-  nearly all arriving via `external_product_seeds_mirror_v1`, i.e. crawled.
-- **19 multi-currency merchants hold 659 (36%)** — every one is exactly two
-  currencies, always `X,USD`. That is the Shopify-Markets pattern: one store
-  already presenting a home currency alongside USD.
+Of 14,981 servable offers (unsuppressed, priced): **1,843 non-USD (12.3%), held
+by 48 merchants** — 29 single-currency regional storefronts plus 19
+multi-currency merchants. (The catalog's full merchant population is ~302; most
+single-currency merchants are USD-only.)
 
-Separately, 963 `content_key`s are blocked `no_us_offer`, **all of them
-`priced_but_not_usd`** and all quality-scored ≥ 71.4. This is high-quality supply
-withheld purely by the region gate — the largest single unlock left in the index.
-A prod probe found **573/963 recoverable** because the merchant already sets a
-genuine US price via Shopify Markets; we simply never captured it.
+GBP 780 · EUR 608 · JPY 333 · AUD 26 · SEK 25 · KRW 23 · HKD 22 · SGD 14 · CAD 12
+— every code already inside the decision layer's 14-currency allowlist.
+
+Two acquisition populations:
+- **Regional storefronts (1,184 offers, 64%)** — `dearbarber.co.uk`, `arencia.jp`,
+  `roundlab.co.kr`; nearly all crawled (`external_product_seeds_mirror_v1`).
+- **Multi-currency merchants (659 offers, 36%)** — every one exactly two
+  currencies, always `X,USD`: the Shopify-Markets pattern.
+
+Separately, 963 content_keys are blocked `no_us_offer`, all `priced_but_not_usd`,
+all quality ≥ 71.4, with 573 already carrying genuine merchant-set USD prices via
+Shopify Markets (probe proven in `scripts/capture_us_market_offers.py`). Under
+this ADR those keys become **displayable** supply for their own regions —
+*displayable, not yet buyable*: the cohort is dominated by crawled seeds that
+`create_checkout` refuses today (`no_real_variant_identity`), so the transact leg
+is a separate, explicitly unproven claim.
 
 ### The recurring failure mode this ADR must not feed
 
-Currency has produced the same defect three times, in three layers:
+Currency has produced the same defect **four** times, in four layers:
 
-1. **Ingestion (2026-07-28):** Mintree INR prices published as `"USD"` — rupee
-   amounts served as dollars on the unauthenticated ACP feed.
-2. **Read (PR #2065, this week):** `extractCatalogCandidatePrice` discarded a
-   row's declared currency for scalar price seeds and stamped USD. Measured
-   against a $40 ceiling, 1,172 offers would have read falsely *conforming* and
-   671 falsely *over* — including all 333 JPY rows, making the entire
-   Japanese-priced catalog invisible to any budget-constrained search.
+1. **Ingestion (2026-07-28):** Mintree INR prices published as `"USD"` on the
+   unauthenticated ACP feed (`services/offer_currency_policy.py` docstring).
+2. **Read (PR #2065):** `extractCatalogCandidatePrice` discarded a row's declared
+   currency for scalar seeds and stamped USD. Against a $40 ceiling, 1,172 offers
+   read falsely *conforming* and 671 falsely *over* — including all 333 JPY rows.
 3. **Presentation (same PR):** price positions sorted by currency code
-   alphabetically, labelling EUR 200 the "lowest" of `[EUR 200, GBP 5, USD 50]`.
+   alphabetically, labelling EUR 200 the "lowest" of [EUR 200, GBP 5, USD 50].
+4. **Selection (live today, unfixed):** `offer_buyability`'s buy-pick is
+   `min(pool, key=… float(price))` over a cross-border fallback pool that mixes
+   currencies — 4500 (JPY) loses to 12 (GBP) as floats, on the pivot/UCP lane.
 
-Each was a *comparison or a label asserted across units we cannot compare*. Any
-multi-region design that introduces conversion introduces a fourth instance. That
-history is the strongest constraint on this decision.
+Each is a comparison or label asserted across units we cannot compare. Any design
+that introduces conversion introduces a fifth. This history is the strongest
+constraint on the decision.
 
 ## Decision
 
-**Region becomes an explicit request dimension carried end to end, and the index
-stores one honest offer per (product, region) rather than one privileged offer.**
+**Region becomes an explicit request dimension carried end to end; the index
+stores one honest offer per (product, region-pricing); the stored eligibility
+verdict is un-baked from any single region on a named, per-consumer schedule —
+not silently.**
 
-Four commitments:
+Five commitments:
 
-1. **The index stores regional offers as siblings.** One `content_key` → N
-   `catalog_offers`, each keyed by its own `(market, currency)`, each honestly
-   attributed to the source that produced it. We never rewrite a foreign offer
-   into USD. This generalizes the already-decided sibling-offer design from
-   "US" to "N regions".
+1. **Sibling offers, never rewrites.** One `content_key` → N `catalog_offers`,
+   each keyed by its own pricing currency (and, once destination semantics are
+   declared, market), each honestly attributed. We never rewrite a foreign offer
+   into USD. This generalizes the already-decided sibling-US-offer design.
 
-2. **The serving gate is parameterized, not duplicated.** `serving_eligible`
-   stays region-neutral (quality, image, description, identity, price > 0 — all
-   of it already is). The region test stays exactly where it is today, as one
-   `extra_predicate` on `priced_offer_exists_sql`, with the region supplied
-   rather than hardcoded.
+2. **One region predicate, parameterized, gating on currency.**
+   `has_offer_priced_for_region(region)` replaces `_HAS_US_OFFER_EXISTS`, built on
+   `priced_offer_exists_sql`'s existing `extra_predicate` seam, mapping region →
+   expected pricing currency. Fulfilment reachability is a second, weaker gate we
+   do not yet model and do not pretend to.
 
-3. **The decision layer receives a buyer region and derives its price ceiling
-   currency from it.** No component infers currency from a hardcoded default.
+3. **The stored verdict un-bakes consumer by consumer.** `serving_eligible`'s
+   region conjunct cannot simply "take a parameter" — it is stored. Each consumer
+   of the stored bit gets a named disposition (see Phase 2a) before the US
+   conjunct moves out of the stored formula. Until then the stored bit keeps
+   today's US semantics and is treated as `serving_eligible_us` in all new code.
 
-4. **No FX conversion reaches a buyer.** Cross-currency comparison remains
-   refused, exactly as `classifyRecoCandidateAgainstPriceCeiling` refuses it
-   today. If we later want cross-currency *ranking*, it ships as a separately
-   gated capability that may reorder results but may never produce a displayed
-   number or a stated verdict.
+4. **The decision layer receives `buyer_region` and derives ceiling currency from
+   it.** No component infers region from currency, or currency from language.
+   Existing region signals (`request.market` on the pivot lane,
+   `profileSummary.region`, `derivePhotoModulesMarket`'s language inference) are
+   reconciled to the request's `buyer_region`, not left to fight it.
 
-The single most important structural point: **the core serving predicate is
-already region-neutral, and the region question is already isolated into one
-`EXISTS` over a table that already carries `market` and `currency`.** This is a
-parameterization and an acquisition problem, not a re-architecture.
+5. **No FX conversion reaches a buyer — ever.** Cross-currency comparison remains
+   refused exactly as `classifyRecoCandidateAgainstPriceCeiling` refuses it. If
+   cross-currency *ranking* is ever wanted, it ships separately gated, may
+   reorder, and may never produce a displayed number or a stated verdict. This
+   decision is explicitly coupled to the thin-region fallback question (see Open
+   questions): if the fallback is "show foreign-priced offers with a marker",
+   mixed-currency pools become the *normal* thin-region case and ranking-only FX
+   moves into scope at that moment — not before.
 
 ## Options Considered
 
@@ -121,161 +164,145 @@ parameterization and an acquisition problem, not a re-architecture.
 |-----------|------------|
 | Complexity | Low to build, High to operate |
 | Cost | N× infra, N× index |
-| Scalability | Poor — linear in regions |
 | Fit for partners | **Wrong shape** |
 
-**Pros:** No code change; the US-only assumption stays true within each deployment.
-**Cons:** Fatal for the actual requirement. One Minds integration serves buyers in
-many regions through one endpoint; we cannot ask a partner to pick a different
-base URL per shopper. Also duplicates the catalog and splits identity.
+One Minds integration serves buyers in many regions through one endpoint; we
+cannot ask a partner to pick a base URL per shopper. Splits identity. Rejected.
 
 ### Option B: Region as a request dimension, offers as siblings *(recommended)*
 
 | Dimension | Assessment |
 |-----------|------------|
-| Complexity | Medium — threading + one acquisition producer |
+| Complexity | Medium — threading + un-baking the stored verdict + one acquisition producer |
 | Cost | Row growth in `catalog_offers`; no new store |
 | Scalability | Good — new region is data, not schema |
-| Team familiarity | High — extends the existing sibling-offer design |
+| Team familiarity | High — extends the sibling-offer design |
 
-**Pros:** Schema already supports it (`market`, `currency` per offer). The region
-gate is one predicate. Adding a region becomes an acquisition task, not a
-migration. Keeps every price honestly attributed to the merchant who set it.
-**Cons:** Region must be threaded through recall, gating, caching and prompting —
-and *every cache key* becomes a correctness hazard until it includes region.
+**Pros:** schema already carries per-offer currency; the predicate seam exists;
+adding a region becomes acquisition. **Cons:** region must be threaded through
+recall, gating, caching, prompting, and *every cache key on the path* — and the
+stored-verdict un-baking is a real, consumer-by-consumer migration, not a
+parameter change. The first draft of this ADR underestimated that; review
+corrected it.
 
 ### Option C: Normalize everything to USD at ingestion with stored FX
 
-| Dimension | Assessment |
-|-----------|------------|
-| Complexity | Medium |
-| Cost | Rate source + staleness policy |
-| Scalability | Good |
-| Risk | **Unacceptable** |
-
-**Pros:** Every downstream comparison "just works"; one currency everywhere;
-no threading.
-**Cons:** It is the Mintree incident as an architecture. A converted price is not
-a price the merchant will honour, and a buyer shown "$44" for a £35 item has been
-quoted a number no checkout will match. It also destroys the information needed to
-render the real price, and rate staleness turns every stored price into a slowly
-rotting claim. Rejected on the strength of three separate live defects of exactly
-this shape.
+**Rejected — for display and verdicts, absolutely.** It is the Mintree incident
+as an architecture, and the repo has now shipped that defect four times in four
+layers. A converted price is not a price any merchant will honour at checkout.
+The narrow carve-out (ranking-only FX, never displayed, never a verdict) is
+defined in commitment 5 and is *not* Option C.
 
 ### Option D: Per-region precomputed eligibility table
 
-`content_key_region_eligibility(content_key, region, eligible, blocker_code)`.
-
-| Dimension | Assessment |
-|-----------|------------|
-| Complexity | Medium-High |
-| Cost | Row count × regions; a new pipeline to keep fresh |
-| Scalability | Good for read, costly to maintain |
-
-**Pros:** Per-region blocker reasons for merchant-facing copy ("no offer for JP")
-come for free; read path is a single indexed lookup.
-**Cons:** Premature. The region test is a cheap `EXISTS` over an already-indexed
-table; precomputing it adds a second source of truth that can go stale against
-`catalog_offers` — the exact split-brain `priced_offer_sql` exists to prevent.
-**Revisit if** the runtime `EXISTS` shows up in query plans, not before.
-
-## Trade-off Analysis
-
-**B vs C is the load-bearing choice**, and it is not primarily a performance
-trade-off — it is a question of what we are willing to assert. C buys uniformity
-by manufacturing a number no merchant agreed to. This codebase has already shipped
-that mistake three times and paid for it three times. B keeps every price
-attributable to the merchant that set it, and pays for that with threading work
-and cache-key discipline. That is the right price to pay.
-
-**B vs D is a timing choice, not a philosophy choice.** D is where B goes if the
-runtime predicate becomes a bottleneck. Building D first would create a derived
-eligibility store before we know its access pattern, and the repo's own history
-(`priced_offer_sql`'s docstring) is explicit about what happens when two
-components answer the same question from different sources.
-
-**The honest cost of B** is that region silently becomes part of the identity of
-every cached artifact. `reco_recall_pool_cache` is keyed on
-`(cache_key, step_family, lang, catalog_surface, planner_mode)` — **not region.**
-Ship B without adding that dimension and a pool recalled for a JP buyer will be
-served to a US buyer. This is not hypothetical: a price-ceiling cache-key
-dimension had to be added for exactly this reason, and the cache version bumped to
-orphan the old rows.
+**Deferred, with a sharper justification than the first draft.** The existing
+system is already D-shaped *for one region* — a precomputed per-content_key
+eligibility row with a blocker code, consumed by merchant copy, health, and
+scripts. That is precisely why the un-baking in Phase 2a must be explicit: those
+consumers exist. But building the N-region version of that table before the read
+paths exist would create a second source of truth against `catalog_offers` — the
+split-brain `priced_offer_sql`'s docstring records happening once already.
+**Revisit when** the runtime region `EXISTS` shows up in query plans, or when a
+consumer genuinely needs per-region blocker copy (merchant portal showing "no
+offer for JP" is the likely first).
 
 ## Consequences
 
-**Easier**
-- Adding a region becomes data acquisition, not a migration.
-- The 963 `no_us_offer` keys stop being blocked supply and become *supply for
-  another region*, immediately serveable to a buyer in that region.
-- Merchant-facing status copy can finally be specific: "no offer for JP" rather
-  than a US-shaped message shown to a Japanese merchant.
-- Honest per-region pricing is a partner-facing feature, not an internal detail.
+**Easier:** adding a region becomes acquisition; the 963 blocked keys become
+displayable regional supply; merchant status copy can be region-specific; honest
+regional pricing becomes a partner-facing feature.
 
-**Harder**
-- Every cache key, every prompt, and every telemetry dimension acquires a region.
-  Omitting it anywhere is a cross-region data leak that CI will not catch.
-- `resolveConcernFrameworkBudgetCeiling` hardcodes `currency: 'USD'`; prose budget
-  parsing ("under $40") assumes the symbol. Both need the request's currency.
-- More offers per product means the "which offer do we show" question gets a real
-  answer for the first time — a selection rule, not `offers[0]`.
-- Merchant region support becomes state we must acquire and keep fresh.
+**Harder:** every cache key, prompt, and telemetry dimension acquires a region —
+omission is a silent cross-region leak CI will not catch; the stored-verdict
+migration touches sitemap/IndexNow/health/merchant-copy; offer selection needs a
+real rule (the current one is defect #4 above); merchant region support becomes
+state to acquire and keep fresh.
 
-**Revisit when**
-- Runtime region `EXISTS` appears in slow-query plans → build Option D.
-- A partner genuinely needs cross-currency ranking → design it as ranking-only,
-  never display.
-- Region count exceeds ~10 → revisit row growth in `catalog_offers`.
+**Revisit when:** region `EXISTS` in slow plans → Option D; a partner needs
+cross-currency ranking → ranking-only FX per commitment 5; region count > ~10 →
+row growth.
 
 ## Action Items
 
-**Phase 1 — make region explicit (no behavior change)**
-1. [ ] Thread `buyer_region` (ISO-3166-1 alpha-2) through the gateway request
-       contract into recall, defaulting to `US` when absent so today's behavior
-       is byte-identical.
-2. [ ] Parameterize `_HAS_US_OFFER_EXISTS` → `has_offer_for_region(region)`,
-       keeping `priced_offer_exists_sql`'s existing `extra_predicate` seam. Rename
-       the blocker `no_us_offer` → `no_regional_offer` with the region in the
-       detail, preserving the old code as an alias until consumers migrate.
-3. [ ] **Add `region` to `reco_recall_pool_cache`'s key and bump the cache
-       version** — before any multi-region traffic exists, not after.
-4. [ ] Derive the price-ceiling currency from `buyer_region`; remove the
-       hardcoded `'USD'` in `resolveConcernFrameworkBudgetCeiling`.
+**Phase 0 — live defects and guards (before any region work)**
+1. [ ] Fix `offer_buyability`'s cross-currency buy-pick: partition the pool by
+       currency, prefer the serving market's expected currency, never `min()`
+       across currencies; a pool with no same-currency priced offer picks by
+       stock + stable order and is marked, not ranked. (Defect #4; live on the
+       pivot/UCP lane today.)
+2. [ ] Add the market/currency invariant check: no served offer's `currency` may
+       disagree with its `market`'s expected currency without a recorded reason.
+       Quarantine or reclassify today's anomaly — **433 EUR offers stamped
+       `market='US'`** from one `universal_product_sync` merchant with a bare
+       UUID as `source_domain` (23% of all servable non-USD offers) — *before*
+       any predicate or Phase 2 acquisition math trusts these rows.
+3. [ ] `formatPriceLabel` renders `$` for 10 of the 14 known currencies (already
+       filed); the budget gate's unmarked foreign-currency admit (already filed).
 
-**Phase 2 — acquire regional offers**
-5. [ ] Introduce `merchant_region_support` (which markets a store actually prices
-       and ships to), sourced from Shopify `/localization` availability, merchant
-       declaration, and observation.
-6. [ ] Generalize the proven Shopify Markets capture (multipart POST to
-       `/localization` with `_method=put` + `country_code`, verify via
-       `/cart.js`, read `/products/<handle>.js`) from US-only to per-region,
-       writing sibling offers. Start with the measured 573/963 recoverable keys.
-7. [ ] Define the offer-selection rule for a product with N regional offers, and
-       put it in one module the way `priced_offer_sql` centralizes "is it priced".
+**Phase 1 — make region explicit, zero behavior change**
+4. [ ] Thread `buyer_region` (ISO-3166-1 alpha-2) through the gateway request
+       contract into recall, defaulting to `US` — **with a `region_source:
+       explicit|defaulted` telemetry dimension per partner, and a per-partner
+       `region_required` flag** so the silent default is a measured transition,
+       not a permanent wrong-region path. (The pivot lane's optional `market`
+       field that partners never send is evidence the silent default is the
+       steady state unless instrumented.)
+5. [ ] Introduce `has_offer_priced_for_region(region)` beside (not replacing)
+       `_HAS_US_OFFER_EXISTS`, on the `extra_predicate` seam, with the region →
+       currency map in one module. The stored bit keeps US semantics; new code
+       reads the parameterized form.
+6. [ ] **Audit every cache key on the recall/serving path for a region
+       dimension** — `reco_recall_pool_cache` (add region to the key hash, bump
+       `RECO_RECALL_POOL_CACHE_VERSION`; the price-ceiling dimension was added
+       exactly this way), the gateway's in-process Maps in routes.js, and any
+       backend caches not already market-keyed (the external-seed search cache
+       and outbound-link cache already are).
+7. [ ] Derive the price-ceiling currency from `buyer_region`; sweep the USD/US
+       assumption inventory, not just two sites: `resolveConcernFrameworkBudgetCeiling`
+       ('USD' hardcoded), prose budget parsing ($-symbol), `priceDeltaUsd`
+       tradeoff copy in auroraStructuredMapper.js, the `normalizePriceObject` /
+       chatCardFactory USD fallback stamps, `derivePhotoModulesMarket`'s
+       language→market inference, the ACP feed's `currency or "USD"`, and
+       `AGENT_PDP_SERVING_MARKET`'s env default.
 
-**Phase 3 — presentation and truthfulness**
-8. [ ] Fix `formatPriceLabel`: it renders `$` for 10 of the 14 known currencies
-       (already filed).
-9. [ ] Decide the budget-gate behavior for a foreign-currency row — admit with an
-       honest marker rather than silently (already filed).
-10. [ ] Add an invariant check: no served offer's `currency` may disagree with its
-        `market`'s expected currency without an explicit, recorded reason. This is
-        the check that would have caught Mintree, and it would flag today's
-        anomaly: merchant `merch_e68c20b0189746d0` carries **433 EUR offers
-        stamped `market='US'`** via `universal_product_sync`, with a bare UUID
-        where `source_domain` should be a hostname — 23% of all servable non-USD
-        offers, and it looks like an ingestion defect rather than a real store.
+**Phase 2 entry gate — falsify cheaply before spending**
+8. [ ] Three read-only probes: (a) *supply* — count content_keys passing every
+       region-neutral gate that hold a GBP (then JPY) offer; if ≈0, the unlock is
+       illusory; (b) *transact* — run 5 survivors through search → PDP →
+       `create_checkout`; the seed-cohort refusal predicts failure, which would
+       reframe Phase 2 from "unlock supply" to "acquire buyable siblings";
+       (c) *demand* — Minds request share by shopper region from gateway edge
+       logs; if non-US < 1%, defer Phase 2 cheaply.
+
+**Phase 2a — un-bake the stored verdict (behavior change, per consumer)**
+9. [ ] Name the disposition for each stored-bit consumer before moving the US
+       conjunct: sitemap candidates (stay US? go region-neutral?), IndexNow,
+       `pipeline_stage`, catalog health's `foreign_market` class, merchant
+       status copy (becomes per-region), `capture_us_market_offers.py`.
+       Rename the blocker `no_us_offer` → `no_regional_offer` with region in the
+       detail, alias preserved until consumers migrate.
+
+**Phase 2b — acquire regional offers**
+10. [ ] `merchant_region_support` (which markets a store prices/ships to), from
+        Shopify `/localization` availability + declaration + observation.
+11. [ ] Generalize the proven Markets capture (multipart `/localization` POST
+        with `_method=put` + `country_code`, verify `/cart.js`, read
+        `/products/<handle>.js`) from US-only to per-region, writing sibling
+        offers with declared destination semantics. Start with the 573 proven
+        keys.
+12. [ ] Centralize the offer-selection rule (N regional offers → which to show)
+        in one module, the way `priced_offer_sql` centralizes "is it priced".
 
 ## Open questions
 
-- **Region vs market vs shipping destination.** `market` today conflates "where
-  the store is" with "who can buy". A UK store shipping to the US is a US-buyable
-  offer with a GBP price. Does `buyer_region` gate on *pricing* region or on
-  *fulfilment* reachability? This ADR assumes pricing region; fulfilment
-  reachability is a second, weaker gate we do not yet model.
-- **Does the buyer's region come from the partner, the shopper, or both?** Minds
-  knows its shopper's locale; we should prefer an explicit request field over
-  inference, and never infer region from currency (that re-derives what we store).
-- **What is the fallback when a region has no offer?** Refusing is honest but
-  yields empty answers in thin regions; showing a foreign-priced offer with an
-  explicit "priced in GBP" marker is likely better, and is a product decision.
+- **Pricing region vs fulfilment reachability** is *answered for Phase 1*
+  (currency-of-region; fulfilment unmodeled) but remains open for Phase 2b: a UK
+  store shipping to the US is a US-buyable offer priced in GBP, and
+  `merchant_region_support` is where that distinction becomes data.
+- **Where does `buyer_region` come from?** Prefer an explicit partner-supplied
+  field; never infer from currency; reconcile the existing signals
+  (`request.market`, `profileSummary.region`, language inference) to it.
+- **Thin-region fallback** — refuse (honest, empty) vs show foreign-priced with
+  an explicit "priced in GBP" marker (likely better, a product call). This
+  decision *gates* the FX-ranking question per commitment 5; decide it before
+  Phase 2b.
