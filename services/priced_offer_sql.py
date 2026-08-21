@@ -43,6 +43,8 @@ know this price", and every gate here must read it as "not buyable".
 
 from __future__ import annotations
 
+from typing import Tuple
+
 # The price expression itself, exposed separately so a caller that needs it in a
 # SELECT list (rather than an EXISTS) cannot re-spell it by hand.
 PRICED_OFFER_PRICE_EXPR = "coalesce({alias}.merchant_effective_price, {alias}.list_price)"
@@ -51,6 +53,27 @@ PRICED_OFFER_PRICE_EXPR = "coalesce({alias}.merchant_effective_price, {alias}.li
 def priced_offer_price_expr(*, alias: str = "co") -> str:
     """The buyable-price expression for one ``catalog_offers`` row."""
     return PRICED_OFFER_PRICE_EXPR.format(alias=alias)
+
+
+def priced_offer_row_conjuncts(*, alias: str = "co") -> Tuple[str, str]:
+    """The two per-ROW conjuncts that make a ``catalog_offers`` row served supply.
+
+    ``priced_offer_exists_sql`` below is these two conjuncts plus the
+    correlated ``product_key`` join, and it is built from this function so the
+    two spellings cannot diverge. Exposed separately because not every consumer
+    asks the question at PRODUCT grain: ADR-024's market/currency invariant
+    (``services/catalog_invariant_checks``) asks it at OFFER grain — "which
+    served offers disagree with their market" — and an EXISTS cannot answer
+    that. The whole reason this module exists is that the same rule got spelled
+    twice and drifted; a second grain must not become a second spelling.
+
+    Returned as separate conjuncts rather than one joined string so each caller
+    supplies its own indentation and no whitespace is baked in here.
+    """
+    return (
+        f"{alias}.suppressed_at IS NULL",
+        f"{priced_offer_price_expr(alias=alias)} > 0",
+    )
 
 
 def priced_offer_exists_sql(
@@ -74,13 +97,16 @@ def priced_offer_exists_sql(
     offer". The trust policy's tri-state gate depends on that distinction.
     """
     extra = f"\n          AND {extra_predicate}" if extra_predicate else ""
+    row = "".join(
+        f"\n          AND {conjunct}"
+        for conjunct in priced_offer_row_conjuncts(alias=alias)
+    )
     return (
         "EXISTS (\n"
         "        SELECT 1\n"
         f"        FROM catalog_offers {alias}\n"
-        f"        WHERE {alias}.product_key = {product_key_expr}\n"
-        f"          AND {alias}.suppressed_at IS NULL\n"
-        f"          AND {priced_offer_price_expr(alias=alias)} > 0"
+        f"        WHERE {alias}.product_key = {product_key_expr}"
+        f"{row}"
         f"{extra}\n"
         "    )"
     )
