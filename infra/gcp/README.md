@@ -132,17 +132,29 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    evidence gathered 2026-08-20: the UCP/ACP/MCP doors are custom domains on **PIVOTA-Agent** (none
    of the four has a custom domain); the only writer to `ucp_order_webhook_deliveries` lives in
    `ucp-web`, which has never booted; `ucp-worker` polls successfully every 30s and logs
-   `drained=0 total=0` because nothing enqueues — **not** because it lacks a database. ADR-021 is
-   explicit that outbound UCP webhook delivery deliberately has **no home** after retirement.
+   `drained=0 total=0` because nothing enqueues — **not** because it lacks a database; and
+   `ucp-platform-receiver` was SUCCESS but had served **0 real requests**. ADR-021 is explicit that
+   outbound UCP webhook delivery deliberately has **no home** after retirement.
+
+   All three services are now deleted, so **none of the deploy-history figures above can be
+   re-checked** — Railway retains nothing for a deleted service. "99 deploys, 0 SUCCESS", "polls
+   every 30s", and "0 real requests" were recorded first-hand before deletion (the first two entered
+   the file in #1787, the last in the table row this PR replaced). Treat them as testimony, not as
+   queryable facts.
 
    **Ordering (recorded for accuracy): the stated order was NOT followed.** The rule was to delete
    `ucp-web` with or before `ucp-worker`, because `ucp-web` is the only writer to the queue and
    removing the drainer first leaves a writer with no drainer. The actual deletion order on
-   2026-08-20 was `ucp-worker`, `ucp-platform-receiver`, `ucp-web-production`. It was inert: the rule
-   assumes both services are *running*, and neither was — `ucp-web` has never once booted (99
-   deploys, 0 SUCCESS) and `ucp-worker`'s last prod deploy had FAILED, so during the seconds-long
-   window there was no process in existence to enqueue anything. Keep the rule for any future pair
-   where both sides actually run.
+   2026-08-20 was `ucp-worker`, `ucp-platform-receiver`, `ucp-web-production` (a first-hand operator
+   observation — Railway retains no record of a deleted service, so this is not re-checkable).
+
+   It was inert, but **not** because nothing was running. `ucp-worker` *was* running its 2026-07-10
+   image, polling an empty queue — see the correction at the end of this file; a FAILED redeploy on
+   Railway does not remove the deployment already serving. The window was inert for one reason only:
+   the rule protects a live **writer** from losing its drainer, and the only writer is `ucp-web`,
+   which has never once booted (99 deploys, 0 SUCCESS). With no writer in existence, nothing could
+   enqueue during the seconds between the two deletions. Keep the rule for any future pair where the
+   **writer** actually runs.
 
    **`pivota-acp` was briefly deployed to Cloud Run on 2026-08-20 and has been REMOVED** the same
    day, following ADR-021. Deleted: the Cloud Run `acp` service and its four `acp-env-*` secrets.
@@ -182,8 +194,9 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    **Two loose ends from the harvester deletion, neither of them a break:**
 
    - `Postgres-4hoG` in the catalog-intelligence project is now **orphaned**: both of its consumers
-     are gone. It still holds the harvested `raw_ingredient_text`. Keep or drop is a data decision,
-     not a cutover one.
+     are gone, but it is **not** empty — ~8k harvested rows across six tables (counts in the
+     catalog-intelligence assessment below). Keep or drop is a data decision, not a cutover one, and
+     dropping it is destructive.
    - `Pivota-catalog-intelligence` still carries `INGREDIENT_HARVESTER_BASE_URL`, which now points at
      nothing. Behaviour is unchanged — the target had been FAILED since 2026-05-29, so the URL was
      already dead — but it should be removed on the next touch of that service.
@@ -477,14 +490,19 @@ no longer retains their logs. Two facts settle their disposition:
 - **They write to their own database** (`postgres-4hog`), **not** to `pci_kb` (`switchback`) — the KB
   the gateway and backend actually read. The dead harvester is therefore NOT upstream of the
   ingredient data served today.
-- **That database is empty.** Six tables; `imports`, `harvest_tasks`, `candidate_rows` and
-  `candidate_row_audit_findings` all hold **0 rows**.
+- **That database is NOT empty — the earlier "0 rows" claim in this file was wrong and is
+  retracted.** Re-measured directly on 2026-08-20, all six tables: `candidate_rows` **4,616**,
+  `task_rows` **3,135**, `candidate_row_audit_findings` **234**, `candidate_row_corrections` **179**,
+  `harvest_tasks` **53**, `imports` **41**. Do not repeat the earlier mistake of asserting emptiness
+  without counting every table — the original claim named only four of the six.
 
-So the lane produces nothing and nothing consumes it. Delete rather than migrate — the same shape as
-the `ucp-*` services above: infrastructure that exists, fails, and has no downstream.
+So the lane has **no consumer**, but it does have accumulated output. That still settles the
+*migration* question the same way — delete the two failed services rather than move them — but it
+does **not** settle the *database*. Deleting `Postgres-4hoG` destroys ~8k harvested rows.
 
-⚠️ **Rotate `SERPER_API_KEY`.** It is set in plaintext on both failed services and was exposed in a
-terminal session on 2026-08-20. Rotate at serper.dev even if the services are deleted.
+⚠️ **Rotate `SERPER_API_KEY`.** It was set in plaintext on both failed services (now deleted) and was
+exposed in a terminal session on 2026-08-20. Rotate at serper.dev — verified free to rotate: no
+surviving Railway service, no Cloud Run service, and no code path reads it.
 
 ### `bulk-email-tool` — KEEP, and easy to lose
 
@@ -495,10 +513,13 @@ in the cutover would notice if it disappeared.
 
 - It is **not** part of the Sep 8-12 DNS flip. Its CNAME stays pointed at Railway, which is correct.
 - **Do not decommission the Railway account** on the assumption that everything moved. After the
-  2026-08-20 deletions, **three** services still run there on purpose: this one,
-  `Pivota-catalog-intelligence`, and `pivota-acp`. GCP `web` and `worker` both still carry
-  `CATALOG_INTELLIGENCE_BASE_URL` pointed at Railway — deliberately, since that client never raises
-  and degrades to `None`.
+  2026-08-20 deletions, **two** services are deliberately staying on Railway *through and after the
+  cutover*: this one and `Pivota-catalog-intelligence` (the `catalog-intelligence` row in the table
+  above). `pivota-acp` also still runs there, but its disposition is **retire — ADR-021**, so it is
+  unfinished business rather than a decision. Before the flip, everything else in Pivota Infra is of
+  course still serving from Railway — this bullet is about what remains *afterwards*. GCP `web` and
+  `worker` both still carry `CATALOG_INTELLIGENCE_BASE_URL` pointed at Railway — deliberately, since
+  that client never raises and degrades to `None`.
 - Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 
@@ -508,11 +529,9 @@ Railway auto-deploys **every service whose source is a repo you push to**, not j
 thinking about. Merging a change to `pivota-acp` on 2026-08-20 redeployed four services and left two
 of them failed.
 
-| repo | services it redeploys |
-|---|---|
 | repo (branch) | project | services it redeploys |
 |---|---|---|
-| `pivota-acp` (`main`) | Pivota Infra | `pivota-acp`, `ucp-platform-receiver`, `ucp-web-production`, `ucp-worker` |
+| `pivota-acp` (`main`) | Pivota Infra | `pivota-acp` only (the three `ucp-*` services were deleted 2026-08-20) |
 | `pivota-backend` (`main`) | Pivota Infra | `web`, `reviews-proof-issuer`, `invitation worker` |
 | `pivota-backend` (`staging/reviews-center`) | staging/reviews | `pivota-backend`, `Cron/Job service`, `proof issuer` |
 | `pivota-backend` (`feature/ap2-safe`) | pivota-ap2-staging | `web` |
