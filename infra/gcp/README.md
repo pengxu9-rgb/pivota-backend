@@ -238,6 +238,45 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    `acp_checkout_session_service`, migration 191) and §4 (`PLATFORM_ORDERS_ACP_URL` "stays unset
    forever") are the reasons not to.
 
+   ### What is actually on the `pivota-acp` box — measured 2026-08-21 against `origin/main` @ `087daf4`
+
+   Two separate questions, which kept getting merged into one and answered wrongly:
+
+   **Is the Adyen key armed? No — and the reason is structural, not a flag.** No live code path can
+   reach Adyen with it:
+
+   - `ADYEN_API_KEY` is read into a module constant at `pivota_infra/src/config.py:11` and used by
+     nothing that makes a call.
+   - The only Adyen reference in the live tree is `pay_with_adyen()` in
+     `pivota_infra/src/main.py:130` — a **mock** under a literal `# Mock PSP connectors` header:
+     `await asyncio.sleep(1)` then `random.choice([True, False])`.
+   - The **real** Adyen connectors, including `https://checkout-live.adyen.com/v71`, live at
+     repo-root `psp/connectors.py:126` and `psp/production_connectors.py:127` — *outside* the served
+     tree. Verified empirically by importing the app: `psp` and `orchestrator` are **never loaded**,
+     and `routes/payment_routes.py` is **not mounted**. The app mounts exactly one router
+     (`acp_router`, 7 routes; 16 total).
+   - ACP real-capture is additionally gated: `_real_capture.py:25` defaults
+     `ACP_ENABLE_REAL_CAPTURE` false, and that flow "only calls the pivota-backend Agent API" — the
+     merchant is charged via its own PSP inside the backend, never via this service's connectors.
+
+   ⚠️ **Do not verify this from `~/dev/pivota-acp-revert`.** That checkout sits on an Apr-21 branch,
+   four months stale — it predates ADR-021 and PRs #34/#35 entirely. Fetch `origin/main`.
+
+   **Should the service still be running? That is the open item, and this is the argument for no.**
+   `/pay` is **unauthenticated** (no `Depends`, and the only middleware is `RequestIdMiddleware`),
+   **publicly advertised** in the live `openapi.json`, and returns a **random** success/failure:
+
+   ```
+   payment paths advertised publicly: ['/pay', '/agentic_commerce/delegate_payment']
+   ```
+
+   It moves no money — it is a mock — but anyone can POST it and receive
+   `{"psp":"adyen","status":"success"}`. A retired service that fabricates payment success on an
+   open endpoint is a reporting hazard, not a money hazard, and it is the strongest single reason to
+   decommission rather than keep deferring. Nothing routes to the box (`acp.pivota.cc` is a custom
+   domain on **PIVOTA-Agent**; zero references from any GCP prod service), so removing it costs
+   nothing.
+
    **Still outstanding from ADR-021: key rotation — scoped, on the evidence available, to
    `pivota-acp`.** The **production-environment** variables of the three `ucp-*` services were
    inventoried (names + masked prefixes) immediately before deletion, because **deleting a service
