@@ -96,6 +96,32 @@ yet. That window closes when Minds starts.
    `roles/secretmanager.secretVersionAdder` on `pivota-prod`. **Confirm that before the window**, not
    during it.
 
+   **Then confirm an image exists for the SHA you are about to deploy.** Step 5 takes `<sha>` and
+   `gcloud run deploy` resolves it against Artifact Registry. A **docs-only merge advances `main`
+   without building an image**, so the natural `$(git rev-parse HEAD)` is very often a SHA that has
+   no image — which is exactly what happened during the 2026-08-21 rehearsal:
+
+   ```
+   ERROR: (gcloud.run.deploy) Revision 'worker-00009-nhh' is not ready and cannot serve traffic.
+   Image '...pivota/backend:145934832d41d79c348485fca9cb7aaf548817d2' not found.
+   ```
+
+   Check before you start, and pick a SHA that resolves:
+
+   ```bash
+   SHA=$(git rev-parse HEAD)
+   gcloud artifacts docker images describe \
+     "us-west1-docker.pkg.dev/pivota-shared/pivota/backend:$SHA" >/dev/null 2>&1 \
+     && echo "backend image OK" || echo "NO IMAGE for $SHA - build it, or deploy a tag that exists"
+   gcloud artifacts docker tags list us-west1-docker.pkg.dev/pivota-shared/pivota/backend \
+     --format='value(tag)'   # the tags that DO exist
+   ```
+
+   Reassuring, and verified during the rehearsal: a missing image is **not** an outage. The new
+   revision fails to become ready and **takes no traffic** — the previous revision keeps serving, and
+   `status.traffic` still names it. But it stops the cutover *after* the database switch, which is
+   the worst place to stop, so treat this as a pre-flight and not a runtime surprise.
+
 5. **Bring the GCP stack live:**
    ```bash
    WORKERS=true infra/gcp/deploy_backend.sh prod <sha>
@@ -148,9 +174,20 @@ real buyer addresses. `env-SENDGRID_API_KEY` and `env-SMTP2GO_API_KEY` are still
 `DISABLED-IN-STAGING-not-a-real-key` placeholders and `env-STRIPE_SECRET_KEY` is `sk_test_`. Verify
 that again before any future rehearsal arms workers.
 
-**Not exercised tonight:** the `DATABASE_URL` secret switch and the arming step, both of which need
-`secretmanager.secretVersionAdder`. Staging was returned to exactly its prior state — 3 databases,
-both schedulers `PAUSED`, `AUDIT_WORKER_ENABLED=false`.
+**Arming WAS exercised, on a second pass with founder authorization.** `port_railway_env.py --apply`
+ran clean (**53 secrets**, 1m13s) and — importantly — the staging overrides held: `env-SENDGRID_API_KEY`
+and `env-SMTP2GO_API_KEY` were still the `DISABLED-IN-STAGING` placeholders afterwards, so re-porting
+does **not** reintroduce live mail credentials. `WORKERS=true PAUSED=0` then took 1m23s and genuinely
+**RESUMED** both Scheduler jobs. The invitation job ran once a minute and **exited each time**
+(`succeededCount=1` across four executions) rather than running to its timeout, and no send or charge
+line appeared in the logs while armed.
+
+**On the permission:** `roles/secretmanager.secretVersionAdder` was never the obstacle — the account
+running the cutover (`peng@woopay.tech`) holds `roles/owner` on both projects. The earlier block was a
+local tooling sandbox, not a GCP grant.
+
+Staging was returned to exactly its prior state — 3 databases, both schedulers `PAUSED`,
+`AUDIT_WORKER_ENABLED=false`, service `ready=True`.
 
 ## Rollback
 
