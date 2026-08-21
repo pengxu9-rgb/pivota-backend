@@ -43,7 +43,7 @@ currency code, and it comes out of this fixed map — never out of caller input.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 from services.priced_offer_sql import priced_offer_exists_sql
 
