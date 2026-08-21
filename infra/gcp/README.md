@@ -167,15 +167,55 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    Keep the rule anyway. It is correct for any future pair where the writer is live and the queue is
    not provably empty — which is the normal case, and was assumed rather than checked here.
 
-   ⚠️ **Recorded hazard: that queue now has no drainer, and a running service holds the flag.**
-   `pivota-acp` is still up and carries `DISABLE_WEBHOOK_OUTBOX=true` plus
-   `PLATFORM_ORDERS_WEBHOOK_URL`. This repo contains **no** writer to `ucp_order_webhook_deliveries`
-   — the historical writer lives in the `pivota-acp` repo, which is why it could not be settled from
-   here. **Unresolved:** whether that flag governs `ucp_order_webhook_deliveries` or only the
-   separate `webhook_outbox` table from `db/migrations/026_acp_delegate_webhook.sql`. If it governs
-   the UCP table, flipping it to `false` starts filling a queue nothing drains, permanently. Confirm
-   in the `pivota-acp` repo before touching that variable, and do not treat `true` as a safe default
-   to flip during cutover.
+   ✅ **RESOLVED — the drainerless-queue hazard recorded here does not exist.** Settled by reading
+   the `pivota-acp` repo (the previous note could not be closed from this repo alone):
+
+   - `DISABLE_WEBHOOK_OUTBOX` is read in **two** places, and only one of them executes in
+     production: `pivota_infra/src/main.py:105`, the live startup hook. (The other,
+     `pivota_infra_main/src/acp/outbox_queue.py:15`, is in an unreferenced tree.) Both concern
+     **`webhook_outbox`**; neither references `ucp_order_webhook_deliveries`. Flipping the flag
+     cannot fill the UCP queue.
+   - The UCP table's only *enqueuer* is `pivota_infra_main/routes/ucp_business_proxy_routes.py`,
+     mounted **only** by `ucp_web.py` → `Dockerfile.ucp-web` → the deleted `ucp-web-production`. Its
+     only drainer was `scripts/ucp_order_webhook_worker.py` → `Dockerfile.ucp-worker` → the deleted
+     `ucp-worker`. **Enqueuer and drainer were deleted together**, so the queue is inert.
+   - `pivota-acp` builds the root `Dockerfile` and runs `--app-dir ./pivota_infra src.main:app`. The
+     `pivota_infra_main/` tree **is** in the image (`PYTHONPATH` includes it) but is never mounted,
+     and it never references the UCP table.
+
+   🚨 **The analogous hazard on `webhook_outbox` is real, and worse than a stalled queue.** Measured
+   on prod 2026-08-21: **3 `order_create` rows `pending` since 2026-07-10**, `attempts = 0/3`, never
+   attempted. `pivota-acp` runs `DISABLE_WEBHOOK_OUTBOX=true`, so its dispatcher never starts.
+
+   **Do not flip that flag to `false` to "drain" them.** The live dispatcher is
+   `pivota_infra/src/acp/outbox_queue.py`, and two independent defects sit behind the flag:
+
+   1. It calls `r.get(...)` on a `databases` `Record`. Under the pinned `databases>=0.8.0,<0.9.0`
+      a `Record` is a `Sequence` with **no `.get`** (verified: `hasattr(Record, "get") is False`).
+      The first pending row raises `AttributeError`; the `except` handler calls `r.get` again and
+      raises too; `dispatch_loop` is `try/finally` with no `except`, so **the asyncio task dies
+      permanently** until the next deploy.
+   2. Even repaired, `pivota_infra/src/acp/outbox.py:23` returns early when `OPENAI_WEBHOOK_URL` or
+      `MERCHANT_WEBHOOK_SECRET` is unset — **both are unset on `pivota-acp`** — after which the
+      dispatcher's success branch marks the row `sent`. Fixing only (1) converts a visible stall
+      into **rows marked delivered that were never sent**.
+
+   ⚠️ **Do not describe those 3 rows as test residue.** They have no `merchant_id` and no
+   `webhook_url`, but the only enqueuer (`pivota_infra/src/acp/router.py:458`, the order-creation
+   path) never writes those columns — so a real undelivered order event is indistinguishable from
+   test traffic by that signature. Treat them as possibly real.
+
+   The `INTERVAL ':backoff minutes'` defect is real but lives in the **unreferenced**
+   `pivota_infra_main/` copy (fixed in `pivota-acp` PR #33). Its runtime error is **not** the
+   message a naive test suggests: SQLAlchemy *does* bind the placeholder — into the literal — so
+   asyncpg receives `INTERVAL '$2 minutes'` and Postgres fails at Parse with:
+
+   ```
+   ERROR:  could not determine data type of parameter $2
+   ```
+
+   Grep logs for that string, not for `invalid input syntax for type interval`, which only appears
+   if the raw `:backoff` text reaches the server — which on this path it never does.
 
    **`pivota-acp` was briefly deployed to Cloud Run on 2026-08-20 and has been REMOVED** the same
    day, following ADR-021. Deleted: the Cloud Run `acp` service and its four `acp-env-*` secrets.
