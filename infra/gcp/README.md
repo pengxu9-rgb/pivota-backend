@@ -709,6 +709,44 @@ in the cutover would notice if it disappeared.
 - Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 
+## Secret access is per-service for the gateway, project-wide for the rest
+
+`sa-gateway` holds `secretmanager.secretAccessor` on **each of its 39 secrets individually**, not at
+the project level. `sa-backend` and `sa-worker` still hold it project-wide.
+
+That asymmetry is deliberate. The gateway is the internet-facing service and carries the anonymous
+`/v1` surface, so it is the one where an SSRF or RCE turns into credential theft — and it needed
+none of the 29 credential-bearing secrets it could previously read (Adyen API key and all three
+webhook secrets, Stripe, AWS, `JWT_SECRET_KEY`, the MCP OAuth private key, Shopify, SendGrid, both
+database DSNs). `sa-backend` and `sa-worker` each need 57 of the 97 mounted secrets, so per-secret
+grants there buy much less isolation while adding a foot-gun: a newly added secret without a
+matching grant fails at **instance start**, not at deploy time, so the revision deploys and then
+will not serve.
+
+**If you add a secret to `secrets.prod.gateway.list`, grant it too:**
+
+```bash
+gcloud secrets add-iam-policy-binding <SECRET> \
+  --member="serviceAccount:sa-gateway@pivota-prod.iam.gserviceaccount.com" \
+  --role=roles/secretmanager.secretAccessor --project=pivota-prod
+```
+
+Verify a narrowing by forcing a **new revision** and watching it become Ready — secrets resolve at
+instance start, so an existing healthy revision proves nothing about a grant you just changed.
+
+**Data Access audit logs are ON for Secret Manager** (`DATA_READ` + `DATA_WRITE`), so every secret
+read is attributable:
+
+```bash
+gcloud logging read 'protoPayload.serviceName="secretmanager.googleapis.com"
+  AND protoPayload.methodName:"AccessSecretVersion"' --project=pivota-prod --freshness=1h \
+  --format="value(timestamp,protoPayload.authenticationInfo.principalEmail,protoPayload.resourceName)"
+```
+
+Editing the audit config means editing the project IAM policy, and `set-iam-policy` replaces the
+whole document — assert the existing bindings are unchanged before writing, or you will silently
+drop them.
+
 ## Which services a repo redeploys — check this before merging
 
 Railway auto-deploys **every service whose source is a repo you push to**, not just the one you were

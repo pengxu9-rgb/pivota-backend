@@ -149,7 +149,38 @@ Postgres (+ its public proxy) · this bucket (5 dumps) · `gs://pivota-prod-migr
 **Fix:** move prod dumps to the prod project, `public_access_prevention: enforced`, a 7–14 day
 lifecycle rule, consider CMEK.
 
-### 2.5 Project-wide secret access, and secret reads are not audited
+### 2.5 Project-wide secret access, and secret reads are not audited — PARTLY FIXED 2026-08-22
+
+**Fixed:** Data Access audit logs are now ON for Secret Manager (`DATA_READ` + `DATA_WRITE`), and
+`sa-gateway` — the internet-facing service with the anonymous `/v1` surface in §1.3 — has been
+narrowed from **project-wide to its 39 specific secrets**.
+
+It could previously read all 105, including `env-ADYEN_API_KEY` and all three Adyen webhook
+secrets, Stripe, `env-AWS_SECRET_ACCESS_KEY`, `env-JWT_SECRET_KEY`,
+`env-MCP_OAUTH_AS_PRIVATE_KEY_PEM`, `env-SHOPIFY_CLIENT_SECRET`, `env-SENDGRID_API_KEY` and both
+database DSNs — 29 credential-bearing secrets it has no use for. It now cannot.
+
+Sequenced so a mistake could not break production: all 39 per-secret grants applied and verified
+**39/39 present** *before* the project-level grant was removed, then a **fresh gateway revision was
+forced** — secrets resolve at instance start, so a new revision is the only real test that the
+grant set is complete. Result: `gateway-00017-zoh` Ready, all five gateway-served hosts 200, zero
+errors, and `sa-gateway` confirmed to have no access to `env-ADYEN_API_KEY`.
+
+The audit config was applied by editing the IAM policy JSON directly and asserting the 25 existing
+bindings were byte-identical before writing — `set-iam-policy` replaces the whole document, so a
+careless edit silently drops bindings. Verified working by performing a read and finding it in the
+log within seconds.
+
+**Still open, deliberately:** `sa-backend` and `sa-worker` keep project-level access. They each
+need 57 of the 97 mounted secrets, so per-secret grants buy far less isolation there while adding a
+real foot-gun — every newly added secret would need a matching grant or the next deploy fails at
+instance start. Also open: the default compute SA still holds project-level `secretAccessor`, and
+`roles/owner` is still a single human with no break-glass second principal.
+
+*(One audit finding here was already stale: both scheduler jobs were reported as running under the
+default compute SA. They run as `sa-worker` — verified before acting on it.)*
+
+#### Original finding
 
 `roles/secretmanager.secretAccessor` is granted at **project** level to `sa-backend`, `sa-gateway`,
 `sa-worker` and the default compute SA. **No per-secret IAM on any of the 105 secrets.**
