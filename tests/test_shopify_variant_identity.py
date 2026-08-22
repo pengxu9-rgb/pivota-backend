@@ -709,3 +709,44 @@ def test_an_attached_shopify_seed_prefers_catalog_identity_over_storefront_evide
 
     assert identity["platform"] == "shopify"
     assert identity["cart_variant_id"] == "99999999999999", "catalog identity wins here"
+
+
+def test_resolve_cart_permalink_refuses_a_non_shopify_storefront() -> None:
+    """The single cart decision, tested directly.
+
+    The platform gate only bites when the platform is NOT Shopify and a numeric id IS present
+    — a wix/woo seed carrying a numeric catalog variant id. Without it, `/cart/<id>:1` would be
+    built for a storefront that has no such route, turning a working PDP referral into a 404.
+    The offers.resolve fixtures cannot reach this combination, so it is pinned here.
+    """
+    from routes.agent_shop_gateway import resolve_cart_permalink
+
+    assert resolve_cart_permalink(
+        destination_url="https://brand.com/products/x", shop_domain="brand.com",
+        platform="wix", cart_variant_id="41234567890123",
+    ) is None
+    assert resolve_cart_permalink(
+        destination_url="https://brand.com/products/x", shop_domain="brand.com",
+        platform="shopify", cart_variant_id="41234567890123",
+    ) == "https://brand.com/cart/41234567890123:1"
+
+
+def test_resolve_cart_permalink_never_fabricates_from_a_non_numeric_id() -> None:
+    from routes.agent_shop_gateway import resolve_cart_permalink
+
+    for bad in ("SKU-1", "∅", "", None, "cv_abc123"):
+        assert resolve_cart_permalink(
+            destination_url="https://brand.com/products/x", shop_domain="brand.com",
+            platform="shopify", cart_variant_id=bad,
+        ) is None, bad
+
+
+def test_a_myshopify_host_is_shopify_even_without_a_platform_label() -> None:
+    """The host check is the second half of the gate — a seed with no platform label but a
+    *.myshopify.com destination is unambiguously Shopify."""
+    from routes.agent_shop_gateway import resolve_cart_permalink
+
+    assert resolve_cart_permalink(
+        destination_url="https://shop.myshopify.com/products/x", shop_domain=None,
+        platform=None, cart_variant_id="41234567890123",
+    ) == "https://shop.myshopify.com/cart/41234567890123:1"

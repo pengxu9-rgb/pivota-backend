@@ -1384,3 +1384,78 @@ def test_the_cart_id_reaching_the_builder_is_the_evidenced_one_not_the_sku(
         "attribution and the cart are different channels — if they are equal here the "
         "fixture no longer exercises the divergence this test exists for"
     )
+
+
+def _seed_row_for_exec_spec(*, evidence: bool):
+    snapshot = {"variants": [{"variant_id": "SKU-1", "title": "30ml",
+                              "price_amount": 19.0, "price_currency": "USD",
+                              "availability": "in_stock"}]}
+    if evidence:
+        snapshot["storefront_platform"] = "shopify"
+        snapshot["storefront_platform_source"] = "products_js_v1"
+        snapshot["variants"][0]["shopify_variant_id"] = "41234567890123"
+    return {
+        "id": "eps_spec", "external_product_id": "ext_spec", "market": "US", "tool": "*",
+        "destination_url": "https://brand.com/products/serum",
+        "canonical_url": "https://brand.com/products/serum",
+        "domain": "brand.com", "title": "Serum", "price_amount": 19.0,
+        "price_currency": "USD", "availability": "in_stock", "utm_template": None,
+        "seed_data": {"brand": "Brand", "snapshot": snapshot}, "status": "active",
+    }
+
+
+@pytest.mark.parametrize("evidence,expected", [(True, True), (False, False)])
+def test_cart_prefilled_tells_the_agent_what_the_link_actually_does(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, evidence: bool, expected: bool
+) -> None:
+    """EXECUTION SPEC v0. `affiliate_url` resolves either to a pre-filled cart or a bare PDP,
+    and the agent could not tell which — the decision lived inside the redirect builder,
+    was stamped into the signed token as `join_mode`, and was never returned.
+
+    The flag must track what the LINK does, so both are asserted from the same request: a
+    claim that can drift from the URL it describes is worse than no claim.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [_seed_row_for_exec_spec(evidence=evidence)]
+        return []
+
+    real_builder = gateway._make_external_redirect_url
+    built: dict = {}
+
+    async def recording_builder(**kwargs):
+        url = await real_builder(**kwargs)
+        # decode the signed token to see the destination the buyer would actually reach
+        import base64
+        import json as _json
+        from urllib.parse import parse_qs, urlparse
+
+        tok = parse_qs(urlparse(url).query)["token"][0].split(".")[0]
+        payload = _json.loads(base64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))
+        built["dest"] = payload["dest"]
+        return url
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", recording_builder)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+
+    assert offers[0]["cart_prefilled"] is expected
+    # and the flag agrees with the link it describes
+    assert built, "the real builder was never reached"
+    assert ("/cart/" in built["dest"]) is expected, built["dest"]
