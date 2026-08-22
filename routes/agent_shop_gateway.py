@@ -68,11 +68,16 @@ from services.outbound_links_service import (
     apply_utm,
     append_referral_click_param,
     append_shopify_cart_click_attribute,
+    extract_shopify_numeric_variant_id,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
     normalize_shop_host,
     shopify_cart_base_url,
+)
+from services.shopify_variant_identity import (
+    sole_stamped_variant_id,
+    storefront_is_shopify,
 )
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
@@ -4157,6 +4162,7 @@ async def _handle_offers_resolve(
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
+                    cart_variant_id=redirect_identity.get("cart_variant_id"),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
@@ -6954,11 +6960,47 @@ def _external_seed_redirect_identity(
     seller_ref = str(row.get("seller_ref") or seed_data.get("seller_ref") or "").strip() or None
     seed_kind = str(row.get("seed_kind") or seed_data.get("seed_kind") or "").strip() or None
 
+    # STOREFRONT EVIDENCE (services/shopify_variant_identity). The `platform` parsed above
+    # is the INTAKE LANE — "external_seed" for the whole crawl cohort — but the consumer of
+    # this field, _make_external_redirect_url's is_shopify gate, needs the STOREFRONT's
+    # platform, and for that cohort the two diverge on essentially every row (measured:
+    # 81/81 reachable PDPs are Shopify on custom domains). A successful `/products/x.js`
+    # parse is definitive proof of Shopify-ness, and the backfill stamps that proof into
+    # seed_data.snapshot. Two hard rules keep this from becoming the round-3 regression:
+    #
+    #   * OVERRIDE ONLY THE LANE LABEL. A real attached platform ("wix", "woocommerce")
+    #     is writer-verified identity; snapshot evidence never outranks it. Only None or
+    #     the lane token itself is eligible.
+    #   * NEVER GUESS A VARIANT. The stamped id is used only when the product has exactly
+    #     one (sole_stamped_variant_id), and only when the id we already carry cannot make
+    #     a permalink anyway (a numeric attached_variant_id always wins). The cart and the
+    #     attribution ctx then name the SAME variant — the id that will actually be in the
+    #     buyer's cart — rather than a synthetic "{epid}-default" the storefront never saw.
+    #
+    # Price, currency, availability and every other serving read are untouched on purpose:
+    # this function feeds the REDIRECT, and widening it past identity is exactly what made
+    # the previous attempt serve a frozen snapshot price as live.
+    # ROUND-4 CORRECTION: `variant_id` is deliberately NOT overridden any more. The first
+    # version replaced a SKU-shaped id with the stamped numeric one so cart and attribution
+    # would "name the same variant" — but the attribution layer cross-fills BOTH ways
+    # (commerce_attribution_service: `product_id = fallback or variant_id` and vice versa),
+    # so the numeric id leaked UP A GRAIN into surface_click_events.canonical_product_id,
+    # and an attached SKU that joins catalog aliases (canonical_variant_id ~ sku_key) was
+    # silently replaced by a value that joins nothing. Attribution therefore keeps its
+    # pre-change values byte for byte, and the recovered id travels on `cart_variant_id`,
+    # a channel only the cart-permalink construction reads — never the token ctx.
+    cart_variant_id: Optional[str] = None
+    if platform in (None, "external_seed") and storefront_is_shopify(seed_data):
+        platform = "shopify"
+        if not extract_shopify_numeric_variant_id(variant_id):
+            cart_variant_id = sole_stamped_variant_id(seed_data)
+
     return {
         "merchant_id": merchant_id,
         "platform": platform,
         "product_id": canonical_product_id,
         "variant_id": variant_id,
+        "cart_variant_id": cart_variant_id,
         "shop_domain": shop_domain,
         "seller_ref": seller_ref,
         "seed_kind": seed_kind,
@@ -6976,6 +7018,12 @@ async def _make_external_redirect_url(
     merchant_id: Optional[str] = None,
     product_id: Optional[str] = None,
     variant_id: Optional[str] = None,
+    # CART-ONLY channel for a backfill-recovered numeric Shopify variant id. Read by the
+    # permalink construction below and by NOTHING else — in particular it is never stamped
+    # into the token ctx, because commerce_attribution_service cross-fills product<->variant
+    # ids both ways and a numeric variant id must not leak up a grain into
+    # canonical_product_id (round-4 review of #1813).
+    cart_variant_id: Optional[str] = None,
     shop_domain: Optional[str] = None,
     platform: Optional[str] = None,
     quantity: int = 1,
@@ -7006,7 +7054,7 @@ async def _make_external_redirect_url(
     if is_shopify:
         cart_base = shopify_cart_base_url(
             shop_domain=shop_domain or destination_url,
-            variant_id=variant_id,
+            variant_id=cart_variant_id or variant_id,
             quantity=quantity,
         )
     join_mode = "cart_permalink" if cart_base else "referral_only"
@@ -7240,6 +7288,7 @@ async def _build_prefetched_external_seed_wrappers(
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
+                    cart_variant_id=redirect_identity.get("cart_variant_id"),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
@@ -9562,6 +9611,7 @@ async def _handle_find_products_multi_inner(
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
+                    cart_variant_id=redirect_identity.get("cart_variant_id"),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
