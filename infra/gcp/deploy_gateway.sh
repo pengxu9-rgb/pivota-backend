@@ -161,5 +161,40 @@ echo "verifying candidate at $CAND_URL"
 CODE=$(probe_health "$CAND_URL/health")
 [ "$CODE" = 200 ] || { echo "candidate /health returned $CODE - NOT shifting traffic." >&2; exit 1; }
 
+# Retire stale candidate tags, and say what was retired.
+#
+# WHY THIS IS NOT COSMETIC. A tagged revision is never garbage-collected, and every service
+# here sets min-instances >= 1, so each old candidate keeps instances RUNNING forever. Cloud Run
+# resolves `--set-secrets ...:latest` at INSTANCE START, not per request, so those immortal
+# instances stay pinned to whatever secret VERSION was latest when they booted.
+#
+# That is not hypothetical. After the 2026-08-22 cutover, `gateway-00010-mar` (booted 08-20, so
+# holding DATABASE_URL_NOVERIFY v1) kept running its in-process pdp_identity_auto_resolve timer
+# every 30 minutes against the RETIRED `pivota` database - including 400 rows written AFTER the
+# secret had been repointed to the cutover snapshot. Repointing a secret fixes the revision that
+# takes traffic; it does nothing to the ones still pinned behind a tag.
+#
+# Only tags on revisions serving 0% are removed; the live revision keeps its own tag. Parsed from
+# JSON rather than `--format=filter("percent:0")` - that filter currently matches the 100%-traffic
+# entry as well (gcloud warns its operator semantics are changing), which would untag the LIVE
+# revision. Cleanup failure is reported but never fails the deploy: the promotion already
+# succeeded, and leaving a stale tag is worse-but-not-broken.
+sweep_stale_tags() {
+  local stale
+  stale=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --format=json 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+print(",".join(t["tag"] for t in d.get("status",{}).get("traffic",[])
+                if t.get("tag") and not t.get("percent")))' 2>/dev/null) || return 0
+  [ -n "$stale" ] || { echo "no stale candidate tags"; return 0; }
+  echo "retiring stale candidate tags: $stale"
+  "$GCLOUD" run services update-traffic "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --remove-tags="$stale" --quiet >/dev/null 2>&1 \
+    || echo "WARNING: could not remove stale tags ($stale) - remove them by hand, they keep instances alive on old secret versions" >&2
+}
+
 [ "$FIRST_DEPLOY" = 1 ] || "$GCLOUD" run services update-traffic "$SERVICE" --project "$PROJECT" --region "$REGION" --to-latest --quiet
+sweep_stale_tags
 echo "deployed $SERVICE -> $("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)') (100% traffic)"

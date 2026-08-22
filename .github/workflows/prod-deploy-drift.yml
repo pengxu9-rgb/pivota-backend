@@ -1,0 +1,83 @@
+# Does production actually run what `main` says it runs?
+#
+# Before the 2026-08-22 cutover, a merge to main auto-deployed to Railway prod, so "merged"
+# and "shipped" were the same event. They are not any more. Railway is now the ROLLBACK, and
+# GCP Cloud Run - which serves every user - only moves when somebody runs
+# infra/gcp/deploy_backend.sh by hand. Nothing else reports the gap.
+#
+# It has already bitten once: #1812 (a seed refresh that could never correct a stale price)
+# merged 78 minutes after the flip, deployed itself to the rollback, and left production on
+# the previous commit. Nobody was told, and the Railway host still answered /__build with a
+# newer, confidently-green commit than production.
+#
+# This job exists to make that silence impossible. It does not deploy - deploying to a
+# payments platform on merge is a bigger decision than this file should make - it only says
+# out loud when live != main.
+name: prod deploy drift
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compare live production against this commit
+        run: |
+          set -uo pipefail
+          MAIN_SHA="$(git rev-parse HEAD)"
+          echo "main:      $MAIN_SHA"
+
+          # api.pivota.cc resolves to the GCP load balancer. If DNS ever moves back, this
+          # reads whatever is actually serving users - which is the question being asked.
+          LIVE_JSON="$(curl -fsS --max-time 25 https://api.pivota.cc/health || true)"
+          if [ -z "$LIVE_JSON" ]; then
+            echo "::error::could not reach https://api.pivota.cc/health - production health is unknown"
+            exit 1
+          fi
+
+          LIVE_SHA="$(printf '%s' "$LIVE_JSON" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("version") or {}).get("full_sha",""))')"
+          echo "live prod: ${LIVE_SHA:-<absent>}"
+
+          if [ -z "$LIVE_SHA" ]; then
+            echo "::error::/health returned no version.full_sha - cannot verify what production runs"
+            exit 1
+          fi
+
+          if [ "$LIVE_SHA" = "$MAIN_SHA" ]; then
+            echo "production is running main"
+            exit 0
+          fi
+
+          # Distinguish "not deployed yet" from "deployed something else entirely".
+          if git merge-base --is-ancestor "$LIVE_SHA" HEAD 2>/dev/null; then
+            BEHIND="$(git rev-list --count "$LIVE_SHA..HEAD" 2>/dev/null || echo '?')"
+            echo "::error::production is $BEHIND commit(s) BEHIND main and will stay there until someone deploys."
+            echo "commits not in production:"
+            git log --oneline "$LIVE_SHA..HEAD" | sed 's/^/  /'
+          else
+            echo "::error::production runs $LIVE_SHA, which is NOT an ancestor of main - the two have diverged."
+          fi
+
+          cat <<'EOF'
+          To ship main to production:
+            gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
+              --substitutions=COMMIT_SHA=<sha> .
+            infra/gcp/deploy_backend.sh prod <sha>
+            SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
+              RUN_COMMAND=python RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
+              infra/gcp/deploy_backend.sh prod <sha>
+            WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <sha> <gateway-sha>
+          EOF
+          exit 1
