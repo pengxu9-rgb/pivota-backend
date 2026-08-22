@@ -76,6 +76,25 @@ CONSECUTIVE_BLOCK_ABORT = int(os.getenv("VARIANT_BACKFILL_ABORT_AFTER_BLOCKS", "
 BLOCK_OUTCOMES = frozenset({"rate_limited", "http_403", "http_503", "not_json"})
 
 
+# Hoisted so its guards are assertable without a database. Review found that EVERY
+# write-path guard survived mutation — including one whose reversion (writing to
+# '{variants}' instead of '{snapshot,variants}') silently re-opened a blocker while the
+# suite stayed green. A statement no test can see is a statement no test protects.
+STAMP_UPDATE_SQL = """
+                    UPDATE external_product_seeds
+                    SET seed_data = jsonb_set(
+                            seed_data,
+                            '{snapshot,variants}',
+                            CAST(:variants AS jsonb),
+                            true
+                        )
+                    WHERE id = :id
+                      AND jsonb_typeof(seed_data) = 'object'
+                      AND updated_at IS NOT DISTINCT FROM :updated_at
+                    RETURNING id
+"""
+
+
 class Pacer:
     """One global spigot plus a per-domain floor."""
 
@@ -116,9 +135,20 @@ async def select_candidates(limit: int, domain: Optional[str]) -> List[Dict[str,
     clauses = [
         "status = 'active'",
         "jsonb_typeof(seed_data) = 'object'",
-        "COALESCE(canonical_url, destination_url) ~ '/products/'",
-        # Something to stamp ONTO. Stamp-only by design — see the module docstring.
-        "jsonb_array_length(COALESCE(seed_data->'snapshot'->'variants', '[]'::jsonb)) > 0",
+        # NULLIF, not COALESCE alone: `canonical_url = ''` is not NULL, so COALESCE kept
+        # the empty string and the regex dropped the row even when destination_url was
+        # perfectly good. The Python at the fetch site uses `or`, which DOES fall through
+        # — the two halves disagreed and the fallback was unreachable.
+        "COALESCE(NULLIF(canonical_url, ''), destination_url) ~ '/products/'",
+        # THE TYPE GUARD MUST COME BEFORE THE ARRAY FUNCTIONS. `jsonb_array_length` and
+        # `jsonb_array_elements` RAISE on a non-array, and `jsonb_typeof(seed_data) =
+        # 'object'` constrains only the TOP level — so one row whose snapshot.variants is
+        # an object or a scalar aborted the entire query with "cannot get array length of
+        # a non-array", and the script produced a traceback instead of a cohort. Postgres
+        # does not guarantee clause order, so this is a guard on the value's type, not a
+        # bet on short-circuiting.
+        "jsonb_typeof(seed_data->'snapshot'->'variants') = 'array'",
+        "jsonb_array_length(seed_data->'snapshot'->'variants') > 0",
         # A content-locked snapshot is REFUSED, not bypassed. trg_enforce_seed_data_lock
         # (migration 081) logs a violation when a write changes a top-level seed_data key
         # named in content_lock, and this write changes `snapshot`. The trigger is
@@ -243,9 +273,17 @@ async def run(limit: int, domain: Optional[str], apply: bool) -> Dict[str, Any]:
             if seed_data is None:
                 outcomes["unreadable_seed_data"] += 1
                 continue
+            raw_variants = (seed_data.get("snapshot") or {}).get("variants")
             variants = snapshot_variants(seed_data)
             if not variants:
                 outcomes["no_snapshot_variants"] += 1
+                continue
+            if not isinstance(raw_variants, list) or len(raw_variants) != len(variants):
+                # `snapshot_variants` filters non-dict elements, and the filtered list
+                # becomes the ENTIRE new array via jsonb_set — so a scalar sitting in the
+                # array would be silently deleted by a write that claims only to stamp an
+                # id. Same class as the document-destruction blocker, one level down.
+                outcomes["malformed_variant_element"] += 1
                 continue
             if already_covered(seed_data):
                 outcomes["already_covered"] += 1
@@ -298,26 +336,24 @@ async def run(limit: int, domain: Optional[str], apply: bool) -> Dict[str, Any]:
                 # an extraction event, and `stale_snapshot` (7d) falls back to updated_at, so
                 # bumping it would clear a runtime BLOCKER on evidence we did not collect.
                 # scripts/backfill_crawl_seed_variants.py holds the same line.
-                result = await database.execute(
-                    """
-                    UPDATE external_product_seeds
-                    SET seed_data = jsonb_set(
-                            seed_data,
-                            '{snapshot,variants}',
-                            CAST(:variants AS jsonb),
-                            true
-                        )
-                    WHERE id = :id
-                      AND jsonb_typeof(seed_data) = 'object'
-                      AND updated_at IS NOT DISTINCT FROM :updated_at
-                    """,
+                # RETURNING id, NOT bare execute(). `databases` 0.7.0 implements
+                # execute() as `connection.fetchval(...)`, which returns None for a
+                # non-RETURNING UPDATE regardless of rows affected — so `if not result`
+                # fired on EVERY write. --apply reported `stamped: 0` and counted every
+                # successful write as a conflict while the writes actually landed, which
+                # reads as total failure to the operator and makes a real conflict
+                # indistinguishable from a success. The prior-art script this comment
+                # cites avoids it by reading the command tag off a raw asyncpg
+                # connection; RETURNING is the equivalent through this driver.
+                written_id = await database.fetch_val(
+                    STAMP_UPDATE_SQL,
                     {
                         "id": row["id"],
                         "variants": json.dumps(new_variants, ensure_ascii=False, default=str),
                         "updated_at": row.get("updated_at"),
                     },
                 )
-                if not result:
+                if written_id is None:
                     # Someone else wrote the row between our read and our write. Their data
                     # is newer; counted, never forced.
                     conflicts += 1

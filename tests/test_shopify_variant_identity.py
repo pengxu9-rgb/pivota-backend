@@ -361,3 +361,121 @@ def test_a_transport_error_is_an_outcome_not_an_exception() -> None:
     payload, outcome = _asyncio.run(fetch_product_js(_Client(), "https://b.com/products/h.js"))
     assert payload is None
     assert outcome == "error:TimeoutError"
+
+
+# ---------------------------------------------------------------- the loop closes
+# Review found the backfill was inert TWICE over: it wrote to `snapshot.variants` while the
+# cart lane read top-level only, and it wrote `shopify_variant_id` while that lane accepted
+# only variant_id|variantId|sku|sku_id|id. Data landed ahead of a consumer that could never
+# see it. These pin the consumer half, end to end.
+
+def test_the_cart_lane_reads_snapshot_variants_when_there_is_no_top_level_array() -> None:
+    """The crawl cohort authors variants ONLY under snapshot. Reading top-level alone meant
+    the lane that builds the cart permalink saw nothing for exactly the cohort it serves."""
+    from routes.agent_shop_gateway import _seed_variants
+
+    seed = {"snapshot": {"variants": [{"title": "30ml", "shopify_variant_id": "41234567890123"}]}}
+    assert _seed_variants(seed) == [{"title": "30ml", "shopify_variant_id": "41234567890123"}]
+
+
+def test_a_top_level_array_still_wins_when_present() -> None:
+    """Precedence is unchanged for seeds that do have one — this is a fallback, not a swap."""
+    from routes.agent_shop_gateway import _seed_variants
+
+    seed = {
+        "variants": [{"title": "top"}],
+        "snapshot": {"variants": [{"title": "snap"}]},
+    }
+    assert _seed_variants(seed) == [{"title": "top"}]
+
+
+def test_the_numeric_id_is_preferred_over_a_sku_shaped_one() -> None:
+    """A SKU resolves fine for identity and then yields NO cart URL, because
+    `shopify_cart_base_url` refuses to fabricate. That silent dead end is why the permalink
+    was unbuildable for most of the cohort."""
+    from routes.agent_shop_gateway import _seed_offer_variant_id
+
+    assert _seed_offer_variant_id(
+        {"variant_id": "TO-001", "shopify_variant_id": "41234567890123"}
+    ) == "41234567890123"
+    # and the existing keys remain the fallback for non-Shopify destinations
+    assert _seed_offer_variant_id({"variant_id": "TO-001"}) == "TO-001"
+
+
+def test_a_backfilled_seed_yields_a_real_cart_url_end_to_end() -> None:
+    """The whole point, asserted in one line: seed_data as the backfill leaves it, through
+    the lane's own two helpers, into a cart permalink. If any link in that chain regresses
+    this fails, which is what the previous version of this work lacked entirely."""
+    from routes.agent_shop_gateway import _seed_offer_variant_id, _seed_variants
+    from services.outbound_links_service import shopify_cart_base_url
+
+    live = parse_product_js({"variants": [_live("41234567890123", "30ml")]})
+    stamped, report = stamp_variant_ids([{"title": "30ml", "variant_id": "TO-001"}], live)
+    assert report["stamped"] == 1
+
+    seed_data = {"snapshot": {"variants": stamped}}
+    variant = _seed_variants(seed_data)[0]
+    cart = shopify_cart_base_url(
+        shop_domain="genabelle.com",
+        variant_id=_seed_offer_variant_id(variant),
+        quantity=1,
+    )
+
+    assert cart == "https://genabelle.com/cart/41234567890123:1"
+
+
+def test_without_the_backfill_the_same_seed_yields_no_cart_url() -> None:
+    """The control. Establishes that the test above passes because of the recovered id and
+    not for some incidental reason — a SKU-only variant must produce None, not a URL."""
+    from routes.agent_shop_gateway import _seed_offer_variant_id, _seed_variants
+    from services.outbound_links_service import shopify_cart_base_url
+
+    seed_data = {"snapshot": {"variants": [{"title": "30ml", "variant_id": "TO-001"}]}}
+    variant = _seed_variants(seed_data)[0]
+
+    assert shopify_cart_base_url(
+        shop_domain="genabelle.com",
+        variant_id=_seed_offer_variant_id(variant),
+        quantity=1,
+    ) is None
+
+
+def test_the_update_statement_keeps_every_guard_that_closed_a_blocker() -> None:
+    """Each clause here closed a specific, demonstrated blocker. Review found that all of
+    them survived mutation — including reverting the path to '{variants}', which silently
+    re-opens the shadowing bug while the suite stays green. A statement no test can see is
+    a statement no test protects.
+    """
+    from scripts.backfill_shopify_variant_ids import STAMP_UPDATE_SQL
+
+    sql = " ".join(STAMP_UPDATE_SQL.split())
+
+    # writes into snapshot, NOT top-level, or it shadows the array serving prefers
+    assert "'{snapshot,variants}'" in sql
+    assert "'{variants}'" not in sql
+    # a merge, not a whole-document replace
+    assert "jsonb_set(" in sql and "SET seed_data = jsonb_set" in sql
+    # optimistic concurrency against the refresh job, which rewrites this same key
+    assert "updated_at IS NOT DISTINCT FROM :updated_at" in sql
+    # never merge into a double-encoded string
+    assert "jsonb_typeof(seed_data) = 'object'" in sql
+    # RETURNING, because databases.execute() is fetchval and yields None either way
+    assert "RETURNING id" in sql
+    # updated_at is NOT bumped: a .js fetch is not an extraction event
+    assert "updated_at = NOW()" not in sql and "SET updated_at" not in sql
+
+
+def test_selection_guards_the_array_type_before_calling_array_functions() -> None:
+    """`jsonb_array_length` RAISES on a non-array, and Postgres does not guarantee clause
+    order — so one malformed row aborted the whole query and the script produced a
+    traceback instead of a cohort."""
+    import inspect
+
+    from scripts.backfill_shopify_variant_ids import select_candidates
+
+    src = inspect.getsource(select_candidates)
+    assert "jsonb_typeof(seed_data->'snapshot'->'variants') = 'array'" in src
+    # an empty canonical_url must fall through to destination_url, as the Python does
+    assert "NULLIF(canonical_url, '')" in src
+    # a content-locked snapshot is refused, not bypassed
+    assert "content_lock" in src

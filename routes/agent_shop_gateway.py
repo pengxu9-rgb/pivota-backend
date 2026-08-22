@@ -3197,9 +3197,27 @@ def _extract_price_currency_from_variant(
 
 
 def _seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Top-level first, then snapshot.
+
+    The snapshot fallback is not cosmetic: the crawl cohort authors its variants at
+    `seed_data["snapshot"]["variants"]` (scripts/onboard_external_brand_from_crawl.py,
+    scripts/backfill_crawl_seed_variants.py) and MOST of those seeds have no top-level
+    array at all. Reading top-level only meant this lane — the one that builds the cart
+    permalink — saw no variants for exactly the cohort the permalink exists to serve.
+    Every sibling reader already falls back this way
+    (beauty_external_ranking._normalize_seed_variants, agent_api._seed_variants,
+    employee_products._seed_variants); this one was the outlier.
+    """
     raw = seed_data.get("variants")
     if isinstance(raw, list):
-        return [it for it in raw if isinstance(it, dict)]
+        variants = [it for it in raw if isinstance(it, dict)]
+        if variants:
+            return variants
+    snapshot = seed_data.get("snapshot")
+    if isinstance(snapshot, dict):
+        snapshot_raw = snapshot.get("variants")
+        if isinstance(snapshot_raw, list):
+            return [it for it in snapshot_raw if isinstance(it, dict)]
     return []
 
 
@@ -3228,8 +3246,23 @@ def _seed_display_name(row: Dict[str, Any], seed_data: Dict[str, Any]) -> str:
 
 
 def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
+    """`shopify_variant_id` LEADS, because it is the only one of these that is guaranteed
+    to be a numeric Shopify variant id.
+
+    `shopify_cart_base_url` refuses to fabricate, so it accepts a bare numeric id or a
+    `gid://shopify/ProductVariant/<n>` and returns None for anything else — and the other
+    keys here are routinely a SKU string (`TO-001`) or a synthetic
+    `"{external_product_id}-default"` from the crawl onboarder. Those resolve happily for
+    identity purposes and then yield no cart URL at all, which is why the pre-filled cart
+    was unbuildable for most of the cohort. Recovered by
+    scripts/backfill_shopify_variant_ids.py into snapshot.variants.
+
+    It leads rather than replaces: the existing keys remain the identity fallback for
+    non-Shopify destinations, where a cart permalink was never on the table.
+    """
     raw = (
-        v.get("variant_id")
+        v.get("shopify_variant_id")
+        or v.get("variant_id")
         or v.get("variantId")
         or v.get("sku")
         or v.get("sku_id")
