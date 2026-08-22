@@ -331,6 +331,26 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    TLS rather than 404ing. See CUTOVER.md. Still open: Cloud Armor, and TTLs dropped to 60s at
    T-48h.
 5. **Backup / restore drill** — PITR and 14 retained backups are configured but never exercised.
+
+   **Monitoring — DONE 2026-08-22, `infra/gcp/setup_monitoring.sh prod`.** The post-cutover audit
+   found prod serving live payment traffic with **0 alert policies, 0 notification channels, 0
+   uptime checks**. Now: an email channel, 6 uptime checks (one per public host, from 3 regions,
+   with TLS validation), and 5 alert policies — host down, TLS expiring inside 14 days, LB 5xx,
+   Cloud Run job task failures, Cloud SQL backends over 240/300. Re-run the script to change a
+   threshold; it replaces policies by `displayName` so the values live in git.
+
+   Two things worth knowing about that script. It talks to the **Monitoring REST API rather than
+   `gcloud alpha monitoring`**: when the alpha component is not installed those commands print an
+   install prompt and **exit 0**, so `... | wc -l` reads "0 policies" when the truth is "the command
+   never ran" — which is how this baseline was nearly mis-measured. And the alert filters were
+   verified against live series, not just accepted by the API: an alert whose filter matches no
+   metric is indistinguishable from a healthy one. `response_code_class` and `result` were both
+   confirmed to be real labels carrying real values (`200/300/400` and `succeeded`) — the 5xx and
+   `failed` filters return nothing today because nothing is failing, which is the point.
+
+   **Still open on this axis:** no Cloud Armor (so no WAF or rate limiting at the edge), and the
+   app-level limiter covers only `/agent/*` of 1,011 published paths. See
+   `docs/security/POST_CUTOVER_AUDIT_2026-08-22.md` §2.2.
 6. **Rollback** — deploys now go out `--no-traffic` behind a candidate tag and only take traffic
    after a health check; rollback is `gcloud run services update-traffic --to-revisions=<prev>=100`.
    Document it in the cutover runbook.
