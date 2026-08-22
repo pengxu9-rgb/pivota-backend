@@ -17,6 +17,7 @@ import io
 import json
 import hashlib
 import logging
+import math
 import re
 from urllib.parse import urlparse
 from urllib.parse import parse_qsl, urlencode, urlunparse
@@ -4442,67 +4443,109 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     # PRICE AND AVAILABILITY ARE FACTS WITH A SHELF LIFE, NOT CURATED COPY.
     #
     # This block used to be `price_amount = COALESCE(price_amount, :price_amount)`
-    # in the SQL — i.e. "write the fresh price only if the stored one is NULL".
-    # Since a seed almost always HAS a price, that made the refresh structurally
-    # incapable of correcting a stale one: it re-fetched the live page, wrote the
-    # new price into seed_data["snapshot"], and then discarded it for the column
-    # every consumer actually reads. Measured 2026-08-21 over 81 live K-beauty
-    # PDPs: 12.3% price drift and 11.1% listed-in-stock-but-live-out-of-stock,
-    # none of which any number of refresh runs could have fixed.
+    # in the SQL — "write the fresh value only if the stored one is NULL". Since a
+    # seed almost always HAS a price, the refresh re-fetched the live page, wrote
+    # the new price into seed_data["snapshot"], and then discarded it for the column
+    # every consumer reads. Measured 2026-08-21 over 81 live K-beauty PDPs: 12.3%
+    # price drift, 11.1% listed-in-stock-but-live-out-of-stock, none of it fixable
+    # by any number of refresh runs.
     #
-    # Resolved HERE rather than in SQL on purpose. The decision is then visible to
-    # the caller (see `price_refresh` in the return value, which the freshness
-    # sweep counts), and it is reachable by a unit test — the SQL variant was not,
-    # because the test harness stubs the statement executor and never evaluates
-    # COALESCE.
+    # 🚨 WHAT THE FIRST VERSION OF THIS FIX GOT WRONG, because the shape of the
+    # correction is dictated by it. It gated on `snap_price_currency is None` and on
+    # `snap_availability is None`, having read `_extract_from_html`. Neither is ever
+    # None by the time it arrives here — the CALLER post-processes both:
+    #   * services/external_offers_service.resolve_external_offer FABRICATES a
+    #     currency when extraction found none: `"JPY" if market=="JP" else "USD"`.
+    #     `_detect_currency_from_text` has no `₩`/KRW case, so a Korean page priced
+    #     ₩24,000 arrives as 24000.0 **USD**. The old COALESCE kept the stored KRW;
+    #     a naive fix writes the fabricated USD and reports it as a correction.
+    #   * availability is stored as `extracted.get("availability") or "unknown"`, so
+    #     "no observation" arrives as the literal string "unknown" — and
+    #     services/beauty_external_ranking maps anything outside
+    #     {out_of_stock, outofstock, sold_out} to inventory 999, i.e. IN STOCK. So
+    #     writing "unknown" over a known out_of_stock serves it as purchasable: the
+    #     exact defect this change exists to remove.
+    # Read the producer, not just the extractor.
     #
-    # title/image_url keep their curated-first precedence (an employee-written
-    # title should survive a crawl); only the perishable facts are refreshed.
+    # Resolved in Python rather than SQL so the decision is visible to callers (the
+    # `price_refresh` / `availability_refresh` reports the sweep counts) and
+    # reachable by a test. The statement below is asserted COALESCE-free for these
+    # columns in tests/test_external_seed_refresh_price.py — the harness stubs the
+    # executor, so without that assertion a re-COALESCE mutant stays green.
     def _as_price(value: Any) -> Optional[float]:
         if value is None:
             return None
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             return None
+        # NaN survives float() and then defeats every comparison below: `nan != prev`
+        # is True but `abs(nan - prev) >= 0.005` is False, so it would be written to a
+        # DOUBLE PRECISION column and reported "unchanged". Treat it as no reading.
+        return parsed if math.isfinite(parsed) else None
 
     prev_amount = _as_price(row.get("price_amount"))
-    prev_currency = (str(row.get("price_currency") or "").strip() or None)
+    prev_currency = (str(row.get("price_currency") or "").strip().upper() or None)
     fresh_amount = _as_price(snap_price_amount)
     fresh_currency = (str(snap_price_currency or "").strip().upper() or None)
 
-    # AMOUNT AND CURRENCY MOVE TOGETHER. `_extract_from_html` resolves them from
-    # independent sources (services/external_offers_service.py — JSON-LD price vs
-    # a separate currency field), so a fetch can yield an amount with no currency.
-    # Taking the amount alone would pair a NEW number with the STALE currency and
-    # silently redenominate the offer. When the pair is incomplete we keep both
-    # old values and say so, rather than half-applying.
-    if fresh_amount is not None and fresh_currency:
+    # A SCRAPED REFRESH MAY CORRECT AN AMOUNT. IT MAY NOT REDENOMINATE AN OFFER.
+    #
+    # Because the currency reaching us may be a market-derived default rather than an
+    # observation (see above), a disagreement between stored and fresh currency is not
+    # evidence the merchant changed currency — it is more likely evidence we failed to
+    # read one. Refusing the whole pair is the only safe reading, and it is reported
+    # rather than swallowed so the rate is measurable. A genuine merchant currency
+    # change therefore needs a human, which is the right cost: the alternative is
+    # silently restating a ₩24,000 product as $24,000.
+    if fresh_amount is None:
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "unavailable"
+    elif fresh_currency is None:
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_incomplete_pair"
+    elif prev_currency is not None and fresh_currency != prev_currency:
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_currency_mismatch"
+    else:
         next_amount, next_currency = fresh_amount, fresh_currency
-        if prev_amount is None or prev_currency is None:
-            price_status = "applied"
-        elif abs(fresh_amount - prev_amount) >= 0.005 or fresh_currency != prev_currency:
+        if prev_amount is None:
+            # First fill is not drift. Counting it as such would inflate the staleness
+            # rate the sweep reports, which is the number this whole lane is judged on.
+            price_status = "filled"
+        elif abs(fresh_amount - prev_amount) >= 0.005:
             price_status = "applied"
         else:
+            # Currency case-normalization ('usd' -> 'USD') lands here on purpose: the
+            # WRITE is desirable, but it is not a price change and must not be counted.
             price_status = "unchanged"
-    else:
-        next_amount, next_currency = prev_amount, prev_currency
-        price_status = (
-            "skipped_incomplete_pair"
-            if (fresh_amount is not None) != bool(fresh_currency)
-            else "unavailable"
-        )
 
-    # Availability is its own perishable fact and moves independently of price —
-    # a page can keep its price and go out of stock. Reported separately so the
-    # sweep can state the stock-flip rate (11.1% of the same live sample) rather
-    # than folding it into the price number.
+    # KNOWN BEHAVIOUR CHANGE, stated rather than discovered later. The PATCH route
+    # above lets an employee set price_amount/price_currency/availability directly.
+    # Under the old COALESCE those edits were permanent, because the refresh could
+    # never overwrite a non-NULL value — a side effect of the bug, not a designed
+    # override. They are now superseded by the next successful refresh. That is the
+    # intended direction for a perishable fact (a hand-typed price goes stale like any
+    # other), but there is no real override mechanism to fall back on: unlike the
+    # description, which has _set_manual_seed_description_override, price has none, and
+    # external_offer_snapshots.override_price_amount is applied only in to_public().
+    # Follow-up: give price a first-class override flag the refresh honours.
+    # Availability: "unknown" is the producer's way of saying it saw nothing, so it is
+    # NOT an observation and must never overwrite a known state (see the block above).
+    _NO_AVAILABILITY_OBSERVATION = {"", "unknown"}
     prev_availability = (str(row.get("availability") or "").strip() or None)
-    fresh_availability = (str(snap_availability or "").strip() or None)
+    _fresh_availability_raw = str(snap_availability or "").strip()
+    fresh_availability = (
+        _fresh_availability_raw
+        if _fresh_availability_raw.lower() not in _NO_AVAILABILITY_OBSERVATION
+        else None
+    )
     next_availability = fresh_availability or prev_availability
     if fresh_availability is None:
         availability_status = "unavailable"
-    elif prev_availability is None or fresh_availability != prev_availability:
+    elif prev_availability is None:
+        availability_status = "filled"
+    elif fresh_availability != prev_availability:
         availability_status = "applied"
     else:
         availability_status = "unchanged"
@@ -4513,13 +4556,6 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "previous": prev_availability,
         "availability": next_availability,
     }
-
-    # Curated copy: existing wins. Resolved here too, so this statement has NO
-    # semantics hidden in SQL — every value written below is decided in Python and
-    # is therefore visible to a test. `is not None` (not `or`) preserves the exact
-    # COALESCE semantics this replaced: a stored empty string is a stored value.
-    next_title = row.get("title") if row.get("title") is not None else snap_title
-    next_image_url = row.get("image_url") if row.get("image_url") is not None else snap_image_url
 
     price_refresh = {
         "status": price_status,
@@ -4535,8 +4571,8 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         UPDATE external_product_seeds
         SET canonical_url = :canonical_url,
             domain = :domain,
-            title = :title,
-            image_url = :image_url,
+            title = COALESCE(title, :title),
+            image_url = COALESCE(image_url, :image_url),
             price_amount = :price_amount,
             price_currency = :price_currency,
             availability = :availability,
@@ -4548,8 +4584,8 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "id": seed_id,
             "canonical_url": canonical_url,
             "domain": domain,
-            "title": next_title,
-            "image_url": next_image_url,
+            "title": snap_title,
+            "image_url": snap_image_url,
             "price_amount": next_amount,
             "price_currency": next_currency,
             "availability": next_availability,

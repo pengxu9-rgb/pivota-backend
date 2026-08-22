@@ -454,3 +454,88 @@ async def test_build_merchant_commerce_readiness_list_distinguishes_red_yellow_g
     assert rows["merch_red"]["status"] == "red"
     assert rows["merch_red"]["merchant_valid"] is False
     assert "missing_store_domain" in rows["merch_red"]["invalid_reasons"]
+
+
+# ---------------------------------------------------------------------------------------
+# Drift aggregation. The PR that added these counters argues they are the whole
+# justification for scheduling the sweep — "N re-crawled" says nothing about whether the
+# index was WRONG — so the counters themselves need pinning, or the number the decision
+# rests on is unverified.
+# ---------------------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_refresh_batch_counts_each_drift_outcome_separately(monkeypatch):
+    from services import external_referral_readiness as module
+
+    outcomes = {
+        "s_applied": "applied",
+        "s_filled": "filled",
+        "s_unchanged": "unchanged",
+        "s_unavailable": "unavailable",
+        "s_incomplete": "skipped_incomplete_pair",
+        "s_mismatch": "skipped_currency_mismatch",
+    }
+
+    async def fake_candidates(*, limit: int):
+        return list(outcomes)
+
+    async def fake_refresh(seed_id: str):
+        return {
+            "status": "success",
+            "seed_id": seed_id,
+            "price_refresh": {"status": outcomes[seed_id]},
+            # Only the 'applied' seed also flips stock, so the two counters cannot be
+            # accidentally reading each other.
+            "availability_refresh": {"status": "applied" if seed_id == "s_applied" else "unchanged"},
+        }
+
+    monkeypatch.setattr(module, "get_external_referral_refresh_candidate_seed_ids", fake_candidates)
+    summary = await module.run_external_referral_refresh_batch(refresh_seed_by_id=fake_refresh, limit=50)
+
+    assert summary["refreshed"] == 6
+    assert summary["price_changed"] == 1, "only 'applied' is drift"
+    assert summary["price_filled"] == 1
+    assert summary["price_unchanged"] == 1
+    assert summary["price_unavailable"] == 1
+    assert summary["price_skipped_incomplete_pair"] == 1
+    assert summary["price_skipped_currency_mismatch"] == 1
+    assert summary["availability_changed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_batch_survives_a_malformed_drift_report(monkeypatch):
+    """A truthy non-dict `price_refresh` used to raise INSIDE the try, landing the same
+    seed in BOTH `refreshed` and `failed` — a worse outcome than an uncounted report."""
+    from services import external_referral_readiness as module
+
+    async def fake_candidates(*, limit: int):
+        return ["s_bad"]
+
+    async def fake_refresh(seed_id: str):
+        return {"status": "success", "seed_id": seed_id, "price_refresh": "not-a-dict"}
+
+    monkeypatch.setattr(module, "get_external_referral_refresh_candidate_seed_ids", fake_candidates)
+    summary = await module.run_external_referral_refresh_batch(refresh_seed_by_id=fake_refresh, limit=5)
+
+    assert summary["refreshed"] == 1
+    assert summary["failed"] == 0, "a seed must never be counted as both refreshed and failed"
+    assert summary["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_refresh_batch_tolerates_a_result_with_no_drift_report(monkeypatch):
+    """Back-compat: a caller that predates the drift reports must still aggregate."""
+    from services import external_referral_readiness as module
+
+    async def fake_candidates(*, limit: int):
+        return ["s_old"]
+
+    async def fake_refresh(seed_id: str):
+        return {"status": "success", "seed_id": seed_id}
+
+    monkeypatch.setattr(module, "get_external_referral_refresh_candidate_seed_ids", fake_candidates)
+    summary = await module.run_external_referral_refresh_batch(refresh_seed_by_id=fake_refresh, limit=5)
+
+    assert summary["refreshed"] == 1
+    assert summary["price_changed"] == 0
+    assert summary["availability_changed"] == 0
