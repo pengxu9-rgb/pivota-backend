@@ -10,14 +10,32 @@
 # a GitHub-signed OIDC token that is minted per job, expires in minutes, and is bound by an
 # attribute condition to ONE repository. There is no long-lived secret to leak.
 #
-# WHAT IT CAN DO, deliberately narrowly: build the backend image in pivota-shared, and roll
-# Cloud Run `web` in pivota-prod forward onto it. It cannot read prod secret VALUES, cannot touch
-# Cloud SQL, and cannot rewrite the service's environment - see CONFIG=preserve in
-# deploy_backend.sh for why a code deploy must not be able to change 188 env vars.
+# WHAT IT CAN DO: build the backend image in pivota-shared, and roll Cloud Run `web` in
+# pivota-prod forward onto it.
+#
+# WHAT IT CAN ALSO DO, AND SHOULD NOT - stated plainly, because the first version of this header
+# claimed the opposite and was wrong on all three counts. This identity holds `run.admin` on
+# pivota-prod and `iam.serviceAccountUser` on `sa-backend`, which carries PROJECT-WIDE
+# `secretmanager.secretAccessor` and `cloudsql.client`. Deploying a revision or a job that RUNS AS
+# sa-backend therefore reaches every production secret - live payment keys, signing keys,
+# DATABASE_URL - and Cloud SQL over the default VPC. `CONFIG=preserve` in deploy_backend.sh is a
+# convention inside one shell script, not an IAM control; `run.admin` can rewrite the environment
+# regardless of what that script chooses to send.
+#
+# Closing it properly means replacing sa-backend's project-level secretAccessor with per-secret
+# grants for only what `web` mounts, and conditioning run.admin on the `web` service. That is a
+# change to how the service itself is configured, so it is tracked separately rather than done
+# quietly here. Until then, treat a compromised Actions run on this repo as equivalent to
+# disclosure of every prod secret, and rotate on that basis.
 set -euo pipefail
 
 REPO="${1:-pengxu9-rgb/pivota-backend}"
-[[ "$REPO" == */* ]] || { echo "repo must be owner/name (got '$REPO')" >&2; exit 2; }
+# Validate the SHAPE, not just the slash. This string is interpolated into a CEL expression below,
+# inside single quotes. `*/*` alone admits an argument like  a/b' || true || '  which closes the
+# quote and appends a tautology, turning the provider's only security boundary into one that
+# accepts an OIDC token from ANY repository on GitHub.
+[[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+  || { echo "repo must be owner/name using [A-Za-z0-9._-] (got '$REPO')" >&2; exit 2; }
 
 SHARED=pivota-shared
 PROD=pivota-prod
@@ -62,7 +80,17 @@ fi
 # exactly this reason, but it will happily accept a condition that is too loose. Pin the full
 # owner/name; `assertion.repository_owner` alone would admit every repo under the account,
 # including a fork someone pushes to.
-CONDITION="assertion.repository == '$REPO'"
+# Pin the BRANCH here, not only in the workflow. `workflow_dispatch` runs the workflow file, and
+# the tooling it checks out, from the ref it was dispatched FROM - so an in-workflow branch check
+# is a control the attacker edits in the same commit that attacks it. Anyone with push access can
+# dispatch a branch whose deploy step has been rewritten. IAM is the layer they cannot reach.
+#
+# STILL OPEN, deliberately: this matches the repository by NAME. GitHub releases a username when an
+# account is renamed or deleted, so whoever claims `${REPO%%/*}` afterwards can mint accepted
+# tokens. Pinning `assertion.repository_id` (immutable, numeric) closes that, but reading it needs
+# an authenticated API call this bootstrap script should not depend on. Worth doing by hand:
+#   gh api repos/'"$REPO"' --jq .id
+CONDITION="assertion.repository == '$REPO' && assertion.ref == 'refs/heads/main'"
 MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref"
 
 if "$GCLOUD" iam workload-identity-pools providers describe "$PROVIDER" \
@@ -160,15 +188,30 @@ done
 # actAs on every future service account in prod, including ones created for something else.
 #   sa-backend - what `web` runs as
 #   sa-worker  - what the in-VPC probe job runs as
+#
+# sa-worker is NOT optional, and it is not obvious why: deploy_backend.sh verifies an
+# internal-ingress candidate by creating a one-shot Cloud Run JOB inside the VPC that runs as
+# sa-worker (deploy_backend.sh, probe_health). A security review recommended dropping this grant
+# on the grounds that the workflow "only deploys web" - it would have broken the candidate health
+# gate on every production deploy. Read probe_health before removing it.
+MISSING=""
 for target in "sa-backend@$PROD.iam.gserviceaccount.com" "sa-worker@$PROD.iam.gserviceaccount.com"; do
   if "$GCLOUD" iam service-accounts describe "$target" --project="$PROD" >/dev/null 2>&1; then
     "$GCLOUD" iam service-accounts add-iam-policy-binding "$target" --project="$PROD" \
       --role="roles/iam.serviceAccountUser" --member="serviceAccount:$SA" --quiet >/dev/null
     echo "   roles/iam.serviceAccountUser on $target"
   else
-    echo "   WARNING: $target does not exist - deploys running as it will fail" >&2
+    MISSING="$MISSING $target"
   fi
 done
+# Exit non-zero rather than warn. A warning on stderr followed by "done." and exit 0 is how the
+# Cloud Build grant went missing in the first place: the operator reads the exit code, not the
+# scrollback, and the gap surfaces in the first deploy as a PERMISSION_DENIED naming an account by
+# numeric id. Run bootstrap_env.sh first if these do not exist yet.
+[ -z "$MISSING" ] || {
+  echo "these service accounts do not exist in $PROD:$MISSING" >&2
+  echo "deploys that run as them will fail. Run infra/gcp/bootstrap_env.sh first." >&2
+  exit 1; }
 
 cat <<EOF
 
