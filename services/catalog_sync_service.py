@@ -74,6 +74,7 @@ from services.catalog_row_trust_upserter import (
     upsert_catalog_row_trust_many,
 )
 from services.strong_identifier import (
+
     MPN_CAPTURED_AS_BARCODE,
     NO_STRONG_IDENTIFIER,
     StrongIdentifier,
@@ -82,6 +83,20 @@ from services.strong_identifier import (
 
 
 logger = logging.getLogger(__name__)
+
+# ADR-024: the value written to catalog_offers.market when we do NOT know the
+# store's country. Spelled as a constant so the write site, its provenance key
+# and the tests all name the same thing, and so a future real-market derivation
+# has one place to replace.
+MARKET_UNKNOWN_DEFAULT = "US"
+
+# Marker written into catalog_offers.offer_payload alongside the above. Its
+# PRESENCE means "market is the column default, not an observation".
+#
+# Note on the constants: inlining either literal at the write site is an
+# EQUIVALENT mutant (same bytes written) -- they buy one place to change when a
+# real market derivation lands, not behavior, so no test pins their use.
+MARKET_PROVENANCE_PLATFORM_DEFAULT = "platform_default_unknown"
 
 
 # Bounds concurrent in-flight live-ingest fashion enrichment LLM calls so a
@@ -1441,12 +1456,28 @@ async def ingest_standard_products(
                     "readiness_tier": readiness_tier,
                     "offer_mode": offer_mode,
                     "channel": "default",
-                    # Internal merchant storefront = first-party, US-market by
-                    # default (mig 149). offer_type/why_buy_direct stay unset
-                    # here -- brand_direct is only assigned to verified brand
-                    # merchants (see mig 149 backfill / offer_classification).
+                    # Internal merchant storefront = first-party.
+                    # offer_type/why_buy_direct stay unset here -- brand_direct is
+                    # only assigned to verified brand merchants (see mig 149
+                    # backfill / offer_classification).
                     "is_first_party": True,
-                    "market": "US",
+                    # `market` here is NOT a claim about geography. The column is
+                    # NOT NULL DEFAULT 'US' (mig 149, "refine to real per-offer geo
+                    # when modeled") and we hold no country for these stores:
+                    # merchant_stores carries store_id/platform/domain/api_key and
+                    # no locale, and nothing in this sync path fetches one from the
+                    # platform. So this writes the column's own default and RECORDS
+                    # that it did, in offer_payload below.
+                    #
+                    # Why that matters (ADR-024): a defaulted 'US' is
+                    # indistinguishable from a known 'US', which is exactly why
+                    # index_pipeline_state derives US-buyability from CURRENCY and
+                    # says market "carries no signal". Measured 2026-07-29 on the
+                    # Wix pilot merch_e68c20b0189746d0 ("Tsingtao Bear"): 433
+                    # EUR-priced offers stamped market='US' by this line -- honest
+                    # currency, fabricated market. The currency below istruly from the
+                    # platform payload; the market is not, and now says so.
+                    "market": MARKET_UNKNOWN_DEFAULT,
                     "availability": availability,
                     "inventory_quantity": inventory_quantity,
                     "currency": product.currency,
@@ -1464,6 +1495,12 @@ async def ingest_standard_products(
                         "product_id": str(product.product_id or product.id),
                         "variant_id": source_variant_id,
                         "sku": variant.sku or product.sku,
+                        # Provenance for `market` above. Deriving a real market
+                        # needs a per-platform store-locale fetch we do not do
+                        # yet; until then this key is what lets a reader tell a
+                        # DEFAULTED market from a known one. ADR-024 Phase 2a/2b
+                        # consumers should treat its presence as "market unknown".
+                        "market_provenance": MARKET_PROVENANCE_PLATFORM_DEFAULT,
                     },
                 }
                 if audit is not None:
