@@ -113,15 +113,37 @@ for role in roles/cloudbuild.builds.editor roles/artifactregistry.writer \
   echo "   $role"
 done
 
-# `gcloud builds submit` runs the build AS the Cloud Build service agent, so the caller must be
-# allowed to act as it. Without this the submit fails with a serviceAccountUser error that names
-# an account the operator never chose and did not know was involved.
-CB_SA="$SHARED_NUM@cloudbuild.gserviceaccount.com"
-if "$GCLOUD" iam service-accounts describe "$CB_SA" --project="$SHARED" >/dev/null 2>&1; then
+# `gcloud builds submit` runs the build AS a service account, and the caller must be allowed to
+# act as it. Which account that is has CHANGED: builds used to default to the legacy Cloud Build
+# agent <num>@cloudbuild.gserviceaccount.com, and now default to the project's Compute Engine
+# default service account. On this project the legacy agent does not exist at all.
+#
+# The first version of this script assumed the legacy name and wrapped the grant in
+# `if describe >/dev/null 2>&1`. The account was absent, so the guard SILENTLY SKIPPED the only
+# binding that mattered, the script exited 0 twice, and the gap surfaced as a PERMISSION_DENIED
+# naming a service account by NUMERIC ID - in the first real deploy, which is the worst place to
+# learn it. A probe that cannot fail reports success for a job it never did.
+#
+# So: try both, grant on every one that exists, and fail loudly if none do.
+CB_GRANTED=0
+for CB_SA in "$SHARED_NUM@cloudbuild.gserviceaccount.com" "$SHARED_NUM-compute@developer.gserviceaccount.com"; do
+  "$GCLOUD" iam service-accounts describe "$CB_SA" --project="$SHARED" >/dev/null 2>&1 || continue
   "$GCLOUD" iam service-accounts add-iam-policy-binding "$CB_SA" --project="$SHARED" \
     --role="roles/iam.serviceAccountUser" --member="serviceAccount:$SA" --quiet >/dev/null
   echo "   roles/iam.serviceAccountUser on $CB_SA"
-fi
+  CB_GRANTED=$((CB_GRANTED + 1))
+done
+# NOTE ON SCOPE: the compute default service account usually carries project Editor, so actAs on
+# it is a broad grant within pivota-shared. It is also exactly the account a human operator's
+# `gcloud builds submit` already runs as, so this puts CI at parity with the operator rather than
+# above them. Narrowing it means giving Cloud Build a dedicated, least-privileged build service
+# account and passing --service-account - worth doing, but a change to how everyone builds, not
+# something this script should decide on its own.
+[ "$CB_GRANTED" -gt 0 ] || {
+  echo "no Cloud Build service account found in $SHARED - 'gcloud builds submit' will fail with" >&2
+  echo "PERMISSION_DENIED naming an account by numeric id. Resolve it with:" >&2
+  echo "  gcloud iam service-accounts list --project=$SHARED --format='table(email,uniqueId)'" >&2
+  exit 1; }
 
 # pivota-prod: deploy revisions, shift traffic, and run the in-VPC health probe job.
 # roles/run.admin covers services AND jobs - deploy_backend.sh verifies an internal-ingress
