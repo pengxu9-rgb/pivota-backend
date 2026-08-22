@@ -192,6 +192,17 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # the substitution-rate instrument.
     # (HEAD needs no handling here: the route is GET-only, so HEAD is a side-effect-free 405
     # at the framework layer — no warm attempt, no cart, no click log.)
+    #
+    # CONTRACT NOTE — this lane can falsify an answer we ALREADY SENT. `offers.resolve`
+    # returns `cart_prefilled` on external offers (routes/agent_shop_gateway.py), computed
+    # at RESOLVE time from the same resolve_cart_permalink that chose `dest`. A `false`
+    # there is a positive claim to the agent — "this link lands on a product page, the buyer
+    # picks the variant" — and eligibility below fires on exactly that cold population, so a
+    # warm upgrade makes that already-sent `false` wrong with no way to correct it. `true` is
+    # unaffected (this lane only ever BUILDS a cart). Widening the allowlist also invalidates
+    # `false` answers on tokens minted before the widening and still inside their TTL. See
+    # docs/runbooks/outbound_warm_handoff_rollout.md before widening or before changing the
+    # eligibility rules.
     warm_redirect_url: Optional[str] = None
     if settings.outbound_warm_handoff_enabled:
         # The WHOLE lane is throw-guarded: an unexpected error anywhere in eligibility,

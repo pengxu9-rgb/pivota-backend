@@ -4219,6 +4219,44 @@ async def _handle_offers_resolve(
                         #
                         # Computed by the SAME resolve_cart_permalink the redirect itself
                         # uses, so the answer cannot drift from what the link does.
+                        #
+                        # SCOPE — this is RESOLVE-TIME truth, and one lane can change it at
+                        # CLICK time. The public redirect (`GET /r`, routes/outbound_links.py)
+                        # has a warm-handoff lane that, for an eligible destination, calls the
+                        # gateway's internal resolve and 302s the shopper to a PRE-BUILT cart
+                        # on the brand's own storefront instead of to `dest`
+                        # (services/outbound_warm_handoff.py :: evaluate_warm_eligibility).
+                        # Nothing in that lane looks at what we said here.
+                        #
+                        # The exposure is ONE-SIDED, and it is the `false` side:
+                        #   - `true`  -> dest is already a cart permalink; a warm handoff only
+                        #                ever BUILDS a cart, so the claim cannot be falsified.
+                        #   - `false` -> we told the agent "this lands on a product page, the
+                        #                buyer picks the variant themselves". If the lane fires,
+                        #                the buyer lands in a prefilled cart and the answer we
+                        #                already sent is wrong. An explicit `false` is itself a
+                        #                positive claim to a buyer (PIVOTA-Agent #2082 made the
+                        #                gateway field a TRI-STATE for exactly this reason:
+                        #                only an explicit backend `false` licenses saying it),
+                        #                so a falsifiable `false` is the same defect one layer
+                        #                down.
+                        #
+                        # NOT hypothetical: OUTBOUND_WARM_HANDOFF_ENABLED is `true` on the
+                        # serving prod revision with a live internal key and
+                        # OUTBOUND_WARM_HANDOFF_BRANDS set to six brand domains (verified
+                        # 2026-08-22 against Cloud Run `web`, us-west1). The code DEFAULT in
+                        # config/settings.py is false, which is what makes this easy to
+                        # misread — read the deployed env, not the default. This field simply
+                        # had not shipped yet when that canary was turned on.
+                        #
+                        # Warm eligibility is decidable HERE (it is a function of the dest
+                        # host, the flag, the allowlist/rollout pct, and the token — the only
+                        # click-time-only input, the user-agent, can only ever REMOVE
+                        # eligibility), so a resolve-time check would be a sound conservative
+                        # over-approximation. Before changing this, read
+                        # docs/runbooks/outbound_warm_handoff_rollout.md — the constraint and
+                        # the preferred fix are recorded there. Do NOT "fix" it by making the
+                        # warm lane skip these offers without reading that doc first.
                         "cart_prefilled": bool(
                             resolve_cart_permalink(
                                 # The SAME value the builder above was called with
