@@ -24,6 +24,10 @@ esac
 # a deliberate step, AFTER Railway's workers are stopped.
 #   pre-cutover:  WORKERS=false infra/gcp/deploy_backend.sh prod <tag>   (default below)
 #   at cutover:   WORKERS=true  infra/gcp/deploy_backend.sh prod <tag>
+# Captured before the default below, because after `: "${WORKERS:=false}"` there is no way left to
+# tell "caller asked for false" from "caller said nothing". The CONFIG=preserve check needs that.
+_WORKERS_EXPLICIT="${WORKERS+1}"
+_MOUNT_DB_EXPLICIT="${MOUNT_DB+1}"
 : "${WORKERS:=false}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # CONFIG=apply    rewrite the service's env + secrets from env.<env>.yaml / secrets.<env>.list.
@@ -41,6 +45,22 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # reviewed, human operation.
 : "${CONFIG:=apply}"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
+# WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
+# vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
+# constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
+# --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live prod today so
+# nothing drifts - but an operator who widened --max-instances by hand during an incident will
+# have it pulled back silently by the next CI deploy.
+#
+# WORKERS and MOUNT_DB only take effect through the env/secret files, so under `preserve` they are
+# read and then ignored. Refuse rather than ignore: the cutover runbook's headline command is
+# `WORKERS=true infra/gcp/deploy_backend.sh prod <tag>`, and running that with CONFIG=preserve
+# would report a clean, promoted, health-checked deploy while leaving the drainers exactly as they
+# were - a successful-looking deploy that did not do the one thing it was run for.
+if [ "$CONFIG" = preserve ]; then
+  [ -z "$_WORKERS_EXPLICIT" ] || { echo "WORKERS has no effect under CONFIG=preserve (it is applied via the env file). Use CONFIG=apply." >&2; exit 2; }
+  [ -z "$_MOUNT_DB_EXPLICIT" ] || { echo "MOUNT_DB has no effect under CONFIG=preserve (it is applied via --set-secrets). Use CONFIG=apply." >&2; exit 2; }
+fi
 # PROMOTE=0 stops after the candidate revision passes its health check, leaving it at 0% traffic.
 # The previous revision keeps serving. This is how the deploy path itself can be exercised - build,
 # auth, revision, in-VPC probe - without putting anything in front of users.
@@ -179,7 +199,13 @@ fi
 # INSIDE the VPC with a one-shot Cloud Run job. Only a real 200 from the application passes.
 probe_health(){ # url -> echoes the status code
   local url="$1" code
-  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null || echo 000)
+  # curl emits the -w template even when the transfer FAILS - "000", no trailing newline - and
+  # only then exits non-zero. The old `|| echo 000` therefore appended a second one and produced
+  # "000000", which matches no arm of the case below except the catch-all, so the function returned
+  # early and the in-VPC re-probe underneath - the entire reason this function exists - was dead
+  # code for every timeout and connection reset. Only a real HTTP status ever reached it.
+  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null) || true
+  code="${code:-000}"
   case "$code" in
     200) rm -f /tmp/pivota-health.$$; echo 200; return 0 ;;
     403|404|000) : ;;                     # possibly ingress/IAM, not the app - fall through
@@ -233,7 +259,11 @@ probe_health(){ # url -> echoes the status code
 # reports success as soon as the container passes its startup probe, which a revision that boots
 # but cannot serve still does.
 CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
-  --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1)
+  --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1 || true)
+# ^ `|| true` is load-bearing. Under `set -o pipefail` a grep that matches nothing makes the whole
+# pipeline exit 1, `VAR=$(...)` adopts that status, and `set -e` kills the script - silently, right
+# after a successful `run deploy`. That is exactly the FIRST_DEPLOY case the next two lines were
+# written to handle, so they could never run.
 [ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
 CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
 # macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under
