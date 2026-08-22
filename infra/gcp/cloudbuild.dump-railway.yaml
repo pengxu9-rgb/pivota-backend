@@ -1,12 +1,26 @@
 # Dump the Railway production Postgres into GCS from INSIDE GCP (us-west1 <-> Railway us-west is fast;
 # the laptop network is not). Then: infra/gcp/restore_to_cloudsql.sh staging gs://.../prod-<ts>.sql.gz
 #
-#   gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
-#     --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ)
+#   gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-prod \
+#     --substitutions=_BUCKET=pivota-prod-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ)
 #
 # Requires secret `railway-prod-db-url` (Railway DATABASE_PUBLIC_URL) in the project, readable by the build SA.
+#
+# RUN THIS IN pivota-prod, NOT pivota-staging. The dump is PRODUCTION data and belongs in a
+# production bucket; running the job in the prod project means the prod compute SA (already
+# storage.objectAdmin + secretmanager.secretAccessor there) writes to its own bucket, with no
+# cross-project grant at all. `railway-prod-db-url` exists in both projects, so nothing else moves.
+#
+# Do NOT instead grant the staging build SA access to the prod bucket: `gsutil cp` needs
+# storage.objects.LIST, so the only grant that works is one that also lets staging READ every
+# production dump - which is the exposure this change exists to remove. Verified the hard way:
+# objectCreator alone fails with "does not have storage.objects.list access".
 substitutions:
-  _BUCKET: pivota-staging-migration
+  # PRODUCTION DATA GOES IN A PRODUCTION BUCKET. This defaulted to the STAGING project's bucket,
+  # so every prod dump - including the cutover snapshot, full of real buyer PII - landed where
+  # `projectViewer:pivota-staging` could read it. That grant is structural: it survives the next
+  # person added to staging. Moved 2026-08-22; see infra/gcp/README.md item 11.
+  _BUCKET: pivota-prod-migration
   _STAMP: manual
   _SECRET: railway-prod-db-url   # Secret Manager entry holding the SOURCE Railway DSN
   _NAME: prod                    # object basename: gs://<bucket>/<name>-<stamp>.sql.gz

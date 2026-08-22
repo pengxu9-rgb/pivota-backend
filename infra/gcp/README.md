@@ -51,9 +51,9 @@ gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota
 python3 infra/gcp/port_railway_env.py --railway-service web --railway-env production --env staging --apply
 
 # 3. seed the database from prod (empty DB boot is broken: concurrent CREATE TABLE IF NOT EXISTS race)
-gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
-  --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ)
-infra/gcp/restore_to_cloudsql.sh staging gs://pivota-staging-migration/prod-<stamp>.sql.gz --wipe
+gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-prod \
+  --substitutions=_BUCKET=pivota-prod-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ)
+infra/gcp/restore_to_cloudsql.sh staging gs://pivota-prod-migration/prod-<stamp>.sql.gz --wipe
 
 # 4. deploy
 infra/gcp/deploy_backend.sh staging $(git rev-parse HEAD)
@@ -73,7 +73,8 @@ still prod values in staging until test-mode keys are put in the overrides file 
 ### One-time project plumbing that bootstrap_env.sh does NOT do (done by hand 2026-08-19)
 - `pivota-shared`: compute default SA → `roles/cloudbuild.builds.builder` + AR writer (Cloud Build runs as it)
 - `pivota-staging`: compute default SA → builder + `secretmanager.secretAccessor` + `storage.objectAdmin`
-  (for the dump job); bucket `gs://pivota-staging-migration`; secret `railway-prod-db-url`
+  (for the dump job); bucket `gs://pivota-prod-migration` (prod dumps never live in a
+  staging-project bucket — see item 11); secret `railway-prod-db-url`
 
 ### Why the Dockerfile is not at the repo root
 
@@ -366,8 +367,37 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    from the live services (not from comments) whenever a service or a pool default changes.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
     SHA during cutover week can produce a different image. Pin or add a lockfile.
-11. **Dump bucket** — prod data lands in `gs://pivota-staging-migration` (a staging-project bucket)
-    with no lifecycle rule, retention policy, or CMEK.
+11. **Dump bucket — FIXED 2026-08-22.** Prod dumps used to land in `gs://pivota-staging-migration`,
+    a **staging-project** bucket where `projectViewer:pivota-staging` held `legacyObjectReader` —
+    so any principal with Viewer on staging could read full production data, including the cutover
+    snapshot and its buyer PII. Contained at the time (one human plus service accounts), but the
+    grant is *structural*: it survives the next person added to staging.
+
+    All 9 objects were copied to `gs://pivota-prod-migration`, verified byte-for-byte by size,
+    then deleted from the staging bucket. The staging Cloud SQL service account was granted
+    `objectViewer` on the prod bucket first, so restoring a prod snapshot INTO staging still works
+    — a narrow, service-account-scoped grant instead of a blanket project-viewer one.
+
+    Hardening applied to all three data buckets: `public_access_prevention: enforced` (was
+    `inherited`), and a **30-day** lifecycle on both migration buckets. Thirty rather than the
+    7–14 first proposed: it covers the Railway warm period and the late-September launch window,
+    after which Cloud SQL PITR plus 14 retained backups are the real recovery path.
+    `pivota-prod-archives` keeps no expiry — it holds the deliberate `Postgres-4hoG` archive.
+
+    The defaults now point at the prod bucket in `cloudbuild.dump-railway.yaml`,
+    `restore_to_cloudsql.sh` and this file. Without that, the next dump would have recreated the
+    problem — the cleanup would have been a one-time gesture.
+
+    **The dump job now runs in `pivota-prod`, not `pivota-staging`.** Changing only the bucket
+    would have shipped broken: the staging build SA has `storage.objectAdmin` on the *staging*
+    project, so writing to a prod bucket fails. That was caught by actually running the job, not
+    by reading the IAM policy — the first attempt died with
+    `does not have storage.objects.list access`. Note the shape of that error: `gsutil cp` needs
+    **list**, so the only cross-project grant that works is one that also lets staging **read every
+    production dump** — precisely the exposure being removed. Running the job in the prod project
+    avoids the grant entirely; the prod compute SA is already `objectAdmin` + `secretAccessor`
+    there, and `railway-prod-db-url` exists in both projects. Verified end to end: 8m4s, dump and
+    `.tables` manifest both landed in `gs://pivota-prod-migration`.
 12. **Cloud Build trigger** — images are built by hand with `COMMIT_SHA` passed in; provenance
     during cutover is manual.
 
@@ -457,10 +487,10 @@ A second live Railway database (PG 16, ~24 MB, 23 tables — ingredient/PCI refe
 instance:
 
 ```bash
-gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-staging \
-  --substitutions=_BUCKET=pivota-staging-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ),\
+gcloud builds submit --no-source --config infra/gcp/cloudbuild.dump-railway.yaml --project pivota-prod \
+  --substitutions=_BUCKET=pivota-prod-migration,_STAMP=$(date -u +%Y%m%dT%H%MZ),\
 _SECRET=railway-pcikb-db-url,_NAME=pcikb,_SSLMODE=prefer
-DB=pci_kb infra/gcp/restore_to_cloudsql.sh staging gs://pivota-staging-migration/pcikb-<stamp>.sql.gz
+DB=pci_kb infra/gcp/restore_to_cloudsql.sh staging gs://pivota-prod-migration/pcikb-<stamp>.sql.gz
 ```
 
 Two things this surfaced:
