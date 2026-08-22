@@ -16,10 +16,10 @@ from typing import Any, Dict, List
 import pytest
 
 from services.shopify_variant_identity import (
-    apply_variant_ids,
     match_variants,
     parse_product_js,
     product_js_url,
+    stamp_variant_ids,
 )
 
 
@@ -129,6 +129,39 @@ def test_two_seed_variants_claiming_one_live_variant_are_BOTH_dropped() -> None:
     assert reason == "no_confident_match"
 
 
+def test_a_label_matching_TWO_live_variants_refuses_instead_of_taking_the_first() -> None:
+    """Reaches the `len(hits) == 1` guard, which nothing else did.
+
+    Review found this: the existing "both dropped" test produced ZERO hits, not two, so it
+    exercised the "nothing intersects" path and a mutant relaxing the guard to `>= 1` —
+    i.e. take the first hit, i.e. GUESS — survived the whole suite. A seed that knows only
+    its size, against a storefront that sells that size in two colours, is exactly the shape
+    where guessing puts the wrong item in the cart.
+    """
+    live = parse_product_js({"variants": [
+        _live("11", "Small / Red", options=["Small", "Red"]),
+        _live("22", "Small / Blue", options=["Small", "Blue"]),
+    ]})
+    mapping, reason = match_variants([{"title": "Small"}], live)
+
+    assert mapping == {}
+    assert reason == "no_confident_match"
+
+
+def test_two_seed_variants_resolving_to_the_SAME_live_variant_drop_both() -> None:
+    """Reaches the double-claim filter, which nothing else did.
+
+    Each seed variant matches exactly one live variant — so the per-seed guard is satisfied
+    — but they match the SAME one. Without the claim count, both would be stamped with one
+    id and two different products would share a cart URL.
+    """
+    live = parse_product_js({"variants": [_live("11", "Shade"), _live("22", "Deep")]})
+    mapping, reason = match_variants([{"title": "Shade"}, {"title": "Shade"}], live)
+
+    assert mapping == {}
+    assert reason == "no_confident_match"
+
+
 def test_an_unlabelled_seed_variant_is_refused_not_positionally_guessed() -> None:
     """Position is not identity. A storefront is free to reorder its variants, so falling
     back to index would be a coin flip dressed up as a match."""
@@ -149,6 +182,20 @@ def test_a_partial_match_keeps_what_is_certain_and_says_so() -> None:
     assert reason == "partial_label_match"
 
 
+def test_an_empty_seed_list_never_returns_a_mapping_for_index_zero() -> None:
+    """`len(seed_variants) <= 1` matched the EMPTY list too and returned `{0: id}` — a
+    mapping into a list with no index 0. It was harmless only because the one caller routed
+    empties elsewhere before reaching it, which is the kind of safety that disappears the
+    first time a second caller appears. Asserted on `match_variants` directly, since that is
+    where the trap lives.
+    """
+    live = parse_product_js({"variants": [_live("11", "30ml")]})
+    mapping, reason = match_variants([], live)
+
+    assert mapping == {}
+    assert reason == "seed_has_no_variants"
+
+
 def test_no_live_variants_is_distinguishable_from_no_match() -> None:
     """Different causes need different fixes: an unreachable/blocked page is a crawl
     problem, an unmatched label is a matching problem."""
@@ -166,28 +213,12 @@ def test_a_duplicated_live_id_cannot_be_claimed_twice() -> None:
 
 # ---------------------------------------------------------------- applying to seed_data
 
-def test_a_seed_with_no_variants_gets_them_created() -> None:
-    """The majority case — 72% of serving rows carry no variant at all — and pure gain,
-    because there is no curated content to overwrite."""
-    live = parse_product_js({"variants": [
-        _live("11", "30ml", price=2240, available=True),
-        _live("22", "50ml", price=3200, available=False),
-    ]})
-    out, report = apply_variant_ids({"title": "Serum"}, live)
-
-    assert report["action"] == "created"
-    assert [v["shopify_variant_id"] for v in out["variants"]] == ["11", "22"]
-    assert out["variants"][0]["availability"] == "in_stock"
-    assert out["variants"][1]["availability"] == "out_of_stock"
-    assert out["variants"][0]["price_amount"] == pytest.approx(22.40)
-
-
 def test_apply_never_mutates_its_argument() -> None:
     """The caller diffs before/after to decide whether to write at all; in-place mutation
     would make every row look changed."""
     seed = {"variants": [{"title": "30ml"}]}
     live = parse_product_js({"variants": [_live("11", "30ml")]})
-    apply_variant_ids(seed, live)
+    stamp_variant_ids(seed.get('variants', []), live)
 
     assert seed == {"variants": [{"title": "30ml"}]}
 
@@ -198,10 +229,10 @@ def test_the_existing_variant_id_field_is_left_alone() -> None:
     mean, so the numeric id lands on its own key."""
     seed = {"variants": [{"title": "30ml", "variant_id": "TO-001", "sku": "TO-001"}]}
     live = parse_product_js({"variants": [_live("11", "30ml")]})
-    out, _ = apply_variant_ids(seed, live)
+    out, _ = stamp_variant_ids(seed.get('variants', []), live)
 
-    assert out["variants"][0]["variant_id"] == "TO-001"
-    assert out["variants"][0]["shopify_variant_id"] == "11"
+    assert out[0]["variant_id"] == "TO-001"
+    assert out[0]["shopify_variant_id"] == "11"
 
 
 def test_an_existing_shopify_variant_id_is_never_overwritten() -> None:
@@ -209,9 +240,9 @@ def test_an_existing_shopify_variant_id_is_never_overwritten() -> None:
     evidence than that."""
     seed = {"variants": [{"title": "30ml", "shopify_variant_id": "999"}]}
     live = parse_product_js({"variants": [_live("11", "30ml")]})
-    out, report = apply_variant_ids(seed, live)
+    out, report = stamp_variant_ids(seed.get('variants', []), live)
 
-    assert out["variants"][0]["shopify_variant_id"] == "999"
+    assert out[0]["shopify_variant_id"] == "999"
     assert report["stamped"] == 0
     assert report["action"] == "unchanged"
 
@@ -219,9 +250,9 @@ def test_an_existing_shopify_variant_id_is_never_overwritten() -> None:
 def test_an_ambiguous_seed_is_left_completely_untouched() -> None:
     seed = {"variants": [{"title": "Shade"}, {"title": "Shade"}]}
     live = parse_product_js({"variants": [_live("11", "Shade 01"), _live("22", "Shade 02")]})
-    out, report = apply_variant_ids(seed, live)
+    out, report = stamp_variant_ids(seed.get('variants', []), live)
 
-    assert out == seed
+    assert out == seed["variants"]
     assert report["stamped"] == 0
     assert report["reason"] == "no_confident_match"
 
@@ -233,8 +264,8 @@ def test_the_recovered_id_is_one_the_cart_builder_will_accept() -> None:
     from services.outbound_links_service import shopify_cart_base_url
 
     live = parse_product_js({"variants": [_live("41234567890123", "30ml")]})
-    out, _ = apply_variant_ids({}, live)
-    recovered = out["variants"][0]["shopify_variant_id"]
+    out, _ = stamp_variant_ids([{"title": "30ml"}], live)
+    recovered = out[0]["shopify_variant_id"]
 
     assert shopify_cart_base_url(shop_domain="genabelle.com", variant_id=recovered, quantity=1) == (
         "https://genabelle.com/cart/41234567890123:1"
@@ -245,28 +276,39 @@ def test_the_recovered_id_is_one_the_cart_builder_will_accept() -> None:
 # Selection and outcome classification. Cheap to pin, and the classification is what makes
 # a run's report actionable: "blocked" and "the handle is dead" need different responses.
 
-def test_already_covered_requires_EVERY_variant_to_have_an_id() -> None:
-    """A partially-covered row must stay a candidate — otherwise the first successful match
-    on a multi-variant product permanently excludes its siblings from ever being filled."""
-    from scripts.backfill_shopify_variant_ids import already_covered
+def test_already_covered_reads_SNAPSHOT_variants_not_top_level() -> None:
+    """The crawl cohort keeps its variants under `snapshot`, while the serving readers
+    prefer TOP-LEVEL. Reading the wrong one made a seed with real variants look empty — and
+    the earlier version then created a fabricated top-level array that SHADOWED them.
+
+    A partially-covered row must also stay a candidate, or the first match on a multi-variant
+    product permanently excludes its siblings.
+    """
+    from scripts.backfill_shopify_variant_ids import already_covered, snapshot_variants
 
     assert already_covered({}) is False
-    assert already_covered({"variants": []}) is False
-    assert already_covered({"variants": [{"shopify_variant_id": "1"}]}) is True
-    assert already_covered({"variants": [{"shopify_variant_id": "1"}, {}]}) is False
-    assert already_covered({"variants": [{"shopify_variant_id": "  "}]}) is False
+    assert already_covered({"snapshot": {"variants": []}}) is False
+    assert already_covered({"snapshot": {"variants": [{"shopify_variant_id": "1"}]}}) is True
+    assert already_covered({"snapshot": {"variants": [{"shopify_variant_id": "1"}, {}]}}) is False
+    assert already_covered({"snapshot": {"variants": [{"shopify_variant_id": "  "}]}}) is False
+    # top-level is NOT where this script looks or writes
+    assert already_covered({"variants": [{"shopify_variant_id": "1"}]}) is False
+    assert snapshot_variants({"variants": [{"a": 1}]}) == []
 
 
 def test_seed_data_is_read_whether_the_driver_hands_back_dict_or_text() -> None:
-    """JSONB comes back as a dict on asyncpg and as a string on some paths; a str that
-    fails to parse must degrade to {} rather than crash a 200-row sweep on one bad row."""
+    """JSONB comes back as a dict on asyncpg and as a string on some paths. An unparseable
+    one must be SKIPPED, never coerced to an empty document and written back."""
     from scripts.backfill_shopify_variant_ids import _seed_data_of
 
     assert _seed_data_of({"seed_data": {"a": 1}}) == {"a": 1}
     assert _seed_data_of({"seed_data": '{"a": 1}'}) == {"a": 1}
-    assert _seed_data_of({"seed_data": "not json"}) == {}
-    assert _seed_data_of({"seed_data": None}) == {}
-    assert _seed_data_of({}) == {}
+    # None means UNREADABLE -> skip. Returning {} here was a document-destroying bug: the
+    # caller stamped onto the empty dict and wrote it as the WHOLE seed_data.
+    assert _seed_data_of({"seed_data": "not json"}) is None
+    assert _seed_data_of({"seed_data": '["a list"]'}) is None
+    assert _seed_data_of({"seed_data": None}) is None
+    assert _seed_data_of({}) is None
 
 
 @pytest.mark.parametrize(

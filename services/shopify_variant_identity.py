@@ -22,8 +22,21 @@ matching rule. The I/O half (selection, pacing, writes) is
 is where a wrong answer silently sends a buyer to the wrong size, and it should be provable
 without a database or a network.
 
-WHAT IT WRITES, AND WHERE. A NEW key, `shopify_variant_id`, on each seed variant. It does
-NOT touch the existing `variant_id`, which is read by at least five services
+WHAT IT WRITES, AND WHERE. A NEW key, `shopify_variant_id`, on each EXISTING seed variant.
+
+It stamps only; it never CREATES a variant array. An earlier version did, and that was wrong
+in a way worth recording: the crawl cohort keeps its variants at
+`seed_data["snapshot"]["variants"]` (scripts/onboard_external_brand_from_crawl.py,
+scripts/backfill_crawl_seed_variants.py), while the serving readers
+(`beauty_external_ranking._normalize_seed_variants`, `agent_api._seed_variants`,
+`agent_sdk_fixed`) take TOP-LEVEL `variants` first and fall back to snapshot. So creating a
+top-level array made a seed that already had good variants serve a poorer fabricated one —
+no currency, no `variant_id`, "Default Title" as the display name — while the audit path
+kept reading snapshot, and the same seed answered differently depending on who asked.
+Authoring a variant array is a separate job with its own currency and readiness obligations;
+see scripts/backfill_crawl_seed_variants.py, which already does it properly.
+
+It does NOT touch the existing `variant_id`, which is read by services
 (`catalog_variant_promoter`, `payment_offer_evidence_service`, `attached_seed_runtime_evidence`,
 `pci_kb_scope_review`) that match it against catalog SKU identity. Overwriting a SKU-shaped
 value with a Shopify numeric id would change what those matches mean — the same
@@ -215,13 +228,18 @@ def match_variants(
     if not live:
         return {}, "no_live_variants"
 
-    if len(seed_variants) <= 1 and len(live) == 1:
-        return {0: live[0]["shopify_variant_id"]}, "sole_variant"
-
     if not seed_variants:
-        # No seed variants to attach to, but several live ones: the caller decides whether
-        # to CREATE entries. Not this function's call — it only maps.
+        # Checked BEFORE the sole-variant rule: `<= 1` matched the empty list too and
+        # returned a mapping for index 0 of it, which was safe only because the one caller
+        # happened to route empties elsewhere. Ordering the guard first removes the trap.
         return {}, "seed_has_no_variants"
+
+    if len(seed_variants) == 1 and len(live) == 1:
+        # Accepted on counts, without label agreement: when the storefront has exactly one
+        # purchasable variant, it is the only cart URL this product can have, so a stale
+        # seed label ("50ml" against a product now sold only as "30ml") does not make the
+        # id wrong. Any ambiguity needs two candidates, and there are not two.
+        return {0: live[0]["shopify_variant_id"]}, "sole_variant"
 
     live_labels = [set(_candidate_labels(item)) for item in live]
     proposed: Dict[int, int] = {}
@@ -255,37 +273,26 @@ def match_variants(
     return resolved, "partial_label_match" if ambiguous else "label_match"
 
 
-def apply_variant_ids(
-    seed_data: Dict[str, Any],
+def stamp_variant_ids(
+    seed_variants: List[Dict[str, Any]],
     live_variants: List[Dict[str, Any]],
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Return (new_seed_data, report). Pure — never mutates its argument.
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Return (new_variants, report). Pure — never mutates its argument.
 
-    Two behaviours, both additive:
-      * seed already has variants -> stamp `shopify_variant_id` on the ones that matched.
-      * seed has NO variants at all -> create entries from the storefront. This is the
-        majority case (72% of serving rows carry no variant), and it is pure gain: there is
-        no curated content to overwrite.
+    Operates on a LIST, not on `seed_data`, so this module never has to know which of the
+    two places a cohort keeps its variants. The caller owns that, and gets it wrong less
+    often when the choice is explicit at the call site.
 
-    An existing `shopify_variant_id` is never overwritten — a value already there was
-    either verified or hand-set, and a later crawl is not better evidence than that.
+    Stamps only. A seed with no variants is returned untouched: authoring an array is a
+    different job with currency and readiness obligations this function cannot meet (see the
+    module docstring).
+
+    An existing `shopify_variant_id` is never overwritten — a value already there was either
+    verified or hand-set, and a later crawl is not better evidence than that.
     """
-    data = dict(seed_data or {})
-    existing = [dict(v) for v in (data.get("variants") or []) if isinstance(v, dict)]
-
-    if not existing and live_variants:
-        created = [
-            {
-                "shopify_variant_id": item["shopify_variant_id"],
-                "title": item.get("title"),
-                **({"sku": item["sku"]} if item.get("sku") else {}),
-                **({"price_amount": item["price_amount"]} if item.get("price_amount") is not None else {}),
-                "availability": "in_stock" if item.get("available") else "out_of_stock",
-            }
-            for item in live_variants[:MAX_VARIANTS]
-        ]
-        data["variants"] = created
-        return data, {"action": "created", "reason": "seed_had_no_variants", "stamped": len(created)}
+    existing = [dict(v) for v in (seed_variants or []) if isinstance(v, dict)]
+    if not existing:
+        return existing, {"action": "skipped", "reason": "seed_has_no_variants", "stamped": 0}
 
     mapping, reason = match_variants(existing, live_variants)
     stamped = 0
@@ -294,9 +301,7 @@ def apply_variant_ids(
             continue
         existing[index]["shopify_variant_id"] = numeric
         stamped += 1
-    if stamped:
-        data["variants"] = existing
-    return data, {
+    return existing, {
         "action": "stamped" if stamped else "unchanged",
         "reason": reason,
         "stamped": stamped,

@@ -57,9 +57,9 @@ if str(ROOT) not in sys.path:
 
 from db.database import database  # noqa: E402
 from services.shopify_variant_identity import (  # noqa: E402
-    apply_variant_ids,
     parse_product_js,
     product_js_url,
+    stamp_variant_ids,
 )
 
 # Matches services/external_offers_service.DEFAULT_UA: a probe that identifies itself the
@@ -71,7 +71,9 @@ PER_DOMAIN_MIN_GAP_S = float(os.getenv("VARIANT_BACKFILL_DOMAIN_GAP_S", "3.0"))
 REQUEST_TIMEOUT_S = float(os.getenv("VARIANT_BACKFILL_TIMEOUT_S", "20"))
 # Stop the run rather than spend an hour throttled. A sustained 429 streak means the IP is
 # blocked, and every further request deepens it while collecting nothing.
-CONSECUTIVE_429_ABORT = int(os.getenv("VARIANT_BACKFILL_ABORT_AFTER_429", "8"))
+CONSECUTIVE_BLOCK_ABORT = int(os.getenv("VARIANT_BACKFILL_ABORT_AFTER_BLOCKS", "8"))
+# Every shape a bot block actually takes, not just the one observed on 2026-08-21.
+BLOCK_OUTCOMES = frozenset({"rate_limited", "http_403", "http_503", "not_json"})
 
 
 class Pacer:
@@ -96,26 +98,53 @@ class Pacer:
 
 
 async def select_candidates(limit: int, domain: Optional[str]) -> List[Dict[str, Any]]:
-    """Active seeds that could gain a numeric variant id.
+    """Seeds that could gain a numeric variant id.
 
-    Ordered oldest-touched first so a partial run makes progress on the stalest rows rather
-    than re-walking the same head every time.
+    EVERY eligibility condition is in SQL, before the LIMIT. An earlier version filtered
+    "is it a Shopify product URL" and "is it already covered" in Python AFTERWARDS, so a run
+    selected the oldest N rows, discarded most of them, and the next run re-selected the
+    identical unproductive prefix — burning the 1 req/s budget forever without reaching row
+    N+1. That is the trap scripts/run_seed_content_audit.py documents.
+
+    `jsonb_typeof(seed_data) = 'object'` guards the double-encoded-string shape: asyncpg
+    returns JSONB as a dict OR a JSON string depending on codec, and a row that arrives as a
+    string must never be merged into. Same guard as scripts/backfill_crawl_seed_variants.py.
+
+    Ordered by id, not updated_at: this script deliberately does not bump `updated_at`, so
+    ordering by it would re-walk the same head every run.
     """
     clauses = [
         "status = 'active'",
-        "COALESCE(canonical_url, destination_url) IS NOT NULL",
-        "COALESCE(canonical_url, destination_url) <> ''",
+        "jsonb_typeof(seed_data) = 'object'",
+        "COALESCE(canonical_url, destination_url) ~ '/products/'",
+        # Something to stamp ONTO. Stamp-only by design — see the module docstring.
+        "jsonb_array_length(COALESCE(seed_data->'snapshot'->'variants', '[]'::jsonb)) > 0",
+        # A content-locked snapshot is REFUSED, not bypassed. trg_enforce_seed_data_lock
+        # (migration 081) logs a violation when a write changes a top-level seed_data key
+        # named in content_lock, and this write changes `snapshot`. The trigger is
+        # RAISE NOTICE today and documented to become RAISE EXCEPTION "once bypass volume
+        # = 0" — so bypassing would both inflate the number gating that flip and hard-fail
+        # afterwards. An id we cannot stamp is a row we skip.
+        "NOT (COALESCE(content_lock, '{}'::jsonb) ? 'snapshot')",
+        # At least one variant still missing the id.
+        """EXISTS (
+             SELECT 1 FROM jsonb_array_elements(seed_data->'snapshot'->'variants') v
+             WHERE COALESCE(v->>'shopify_variant_id', '') = ''
+           )""",
     ]
     values: Dict[str, Any] = {"limit": max(1, int(limit))}
     if domain:
-        clauses.append("domain = :domain")
+        # Suffix match, not equality: a stored `www.brand.com` against `--domain brand.com`
+        # reported `candidates: 0` and exited 0, which reads as "nothing to do".
+        clauses.append("(domain = :domain OR domain LIKE :domain_suffix)")
         values["domain"] = domain
+        values["domain_suffix"] = f"%.{domain}"
     rows = await database.fetch_all(
         f"""
-        SELECT id, domain, canonical_url, destination_url, seed_data
+        SELECT id, domain, canonical_url, destination_url, seed_data, updated_at
         FROM external_product_seeds
         WHERE {' AND '.join(clauses)}
-        ORDER BY updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY id
         LIMIT :limit
         """,
         values,
@@ -123,27 +152,48 @@ async def select_candidates(limit: int, domain: Optional[str]) -> List[Dict[str,
     return [dict(r) for r in rows or []]
 
 
-def _seed_data_of(row: Dict[str, Any]) -> Dict[str, Any]:
+def _seed_data_of(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """None means UNREADABLE, and an unreadable row must be skipped, never written.
+
+    Returning {} here was a document-destroying bug: the caller would then stamp onto an
+    empty dict and write it as the WHOLE seed_data, erasing title, description, images,
+    manual_overrides and snapshot. The SQL `jsonb_typeof` guard makes this near-unreachable;
+    this is the second lock on the same door.
+    """
     raw = row.get("seed_data")
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str) and raw.strip():
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
+            return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
-            return {}
-    return {}
+            return None
+    return None
+
+
+def snapshot_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The crawl cohort keeps its variants HERE, not at the top level.
+
+    Top-level `variants` is what the serving readers prefer
+    (`beauty_external_ranking._normalize_seed_variants`, `agent_api._seed_variants`), so
+    writing there would shadow the real array with whatever this script produced. Stamping
+    in place inside snapshot leaves that precedence exactly as it was.
+    """
+    snapshot = seed_data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return []
+    variants = snapshot.get("variants")
+    if not isinstance(variants, list):
+        return []
+    return [v for v in variants if isinstance(v, dict)]
 
 
 def already_covered(seed_data: Dict[str, Any]) -> bool:
-    variants = seed_data.get("variants")
-    if not isinstance(variants, list) or not variants:
+    variants = snapshot_variants(seed_data)
+    if not variants:
         return False
-    return all(
-        isinstance(v, dict) and str(v.get("shopify_variant_id") or "").strip()
-        for v in variants
-    )
+    return all(str(v.get("shopify_variant_id") or "").strip() for v in variants)
 
 
 async def fetch_product_js(client: httpx.AsyncClient, url: str) -> tuple[Optional[Any], str]:
@@ -183,12 +233,20 @@ async def run(limit: int, domain: Optional[str], apply: bool) -> Dict[str, Any]:
     per_domain_failures: Counter = Counter()
     stamped_total = 0
     changed_rows = 0
-    consecutive_429 = 0
+    conflicts = 0
+    consecutive_blocks = 0
     aborted = False
 
     async with httpx.AsyncClient() as client:
         for row in rows:
             seed_data = _seed_data_of(row)
+            if seed_data is None:
+                outcomes["unreadable_seed_data"] += 1
+                continue
+            variants = snapshot_variants(seed_data)
+            if not variants:
+                outcomes["no_snapshot_variants"] += 1
+                continue
             if already_covered(seed_data):
                 outcomes["already_covered"] += 1
                 continue
@@ -204,20 +262,24 @@ async def run(limit: int, domain: Optional[str], apply: bool) -> Dict[str, Any]:
             payload, outcome = await fetch_product_js(client, js_url)
             outcomes[outcome] += 1
 
-            if outcome == "rate_limited":
-                consecutive_429 += 1
+            # THE BREAKER COUNTS BLOCKS, NOT ONLY LITERAL 429s. A Cloudflare bot block is
+            # just as often a 403, or a 200 serving challenge HTML (-> not_json). Counting
+            # only 429 meant a domain 403ing every row reset the streak forever and the run
+            # ground on, blocked, calling the result coverage.
+            if outcome in BLOCK_OUTCOMES:
+                consecutive_blocks += 1
                 per_domain_failures[host] += 1
-                if consecutive_429 >= CONSECUTIVE_429_ABORT:
+                if consecutive_blocks >= CONSECUTIVE_BLOCK_ABORT:
                     aborted = True
                     break
                 continue
-            consecutive_429 = 0
+            consecutive_blocks = 0
             if outcome != "ok":
                 per_domain_failures[host] += 1
                 continue
 
             live = parse_product_js(payload)
-            new_seed_data, report = apply_variant_ids(seed_data, live)
+            new_variants, report = stamp_variant_ids(variants, live)
             reasons[report["reason"]] += 1
             if report["stamped"] <= 0:
                 continue
@@ -225,14 +287,42 @@ async def run(limit: int, domain: Optional[str], apply: bool) -> Dict[str, Any]:
             stamped_total += report["stamped"]
             changed_rows += 1
             if apply:
-                await database.execute(
+                # A JSONB MERGE ON ONE KEY, not a whole-document replace, and guarded on the
+                # updated_at we read. The refresh job (routes/employee_products.
+                # _refresh_external_seed_by_id) rewrites this same `snapshot.variants` key,
+                # and this loop runs for minutes at 1 req/s — a stale whole-document write
+                # would silently revert it. Same shape as
+                # scripts/backfill_agent_seed_variants.sql.
+                #
+                # `updated_at` is deliberately NOT bumped: a variants-only .js fetch is not
+                # an extraction event, and `stale_snapshot` (7d) falls back to updated_at, so
+                # bumping it would clear a runtime BLOCKER on evidence we did not collect.
+                # scripts/backfill_crawl_seed_variants.py holds the same line.
+                result = await database.execute(
                     """
                     UPDATE external_product_seeds
-                    SET seed_data = CAST(:seed_data AS JSONB), updated_at = NOW()
+                    SET seed_data = jsonb_set(
+                            seed_data,
+                            '{snapshot,variants}',
+                            CAST(:variants AS jsonb),
+                            true
+                        )
                     WHERE id = :id
+                      AND jsonb_typeof(seed_data) = 'object'
+                      AND updated_at IS NOT DISTINCT FROM :updated_at
                     """,
-                    {"id": row["id"], "seed_data": json.dumps(new_seed_data, ensure_ascii=False)},
+                    {
+                        "id": row["id"],
+                        "variants": json.dumps(new_variants, ensure_ascii=False, default=str),
+                        "updated_at": row.get("updated_at"),
+                    },
                 )
+                if not result:
+                    # Someone else wrote the row between our read and our write. Their data
+                    # is newer; counted, never forced.
+                    conflicts += 1
+                    changed_rows -= 1
+                    stamped_total -= report["stamped"]
 
     return {
         "mode": "apply" if apply else "dry_run",
@@ -240,6 +330,7 @@ async def run(limit: int, domain: Optional[str], apply: bool) -> Dict[str, Any]:
         "candidates": len(rows),
         "rows_with_new_ids": changed_rows,
         "variant_ids_stamped": stamped_total,
+        "write_conflicts": conflicts,
         "fetch_outcomes": dict(outcomes),
         "match_reasons": dict(reasons),
         "worst_domains": dict(per_domain_failures.most_common(10)),
