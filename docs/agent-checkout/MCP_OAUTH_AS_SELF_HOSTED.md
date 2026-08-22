@@ -62,10 +62,30 @@ Generate the key once:
 
 ```
 MCP_OAUTH_ENABLED=1
-MCP_OAUTH_RESOURCE=https://pivota-agent-production.up.railway.app/mcp
+MCP_OAUTH_RESOURCE=https://commerce.mcp.pivota.cc/mcp
 MCP_OAUTH_AUTHORIZATION_SERVERS=https://api.pivota.cc
 MCP_OAUTH_ISSUERS_JSON=[{"iss":"https://api.pivota.cc","jwksUri":"https://api.pivota.cc/.well-known/jwks.json","algs":["RS256"]}]
 ```
+
+⚠️ **`MCP_OAUTH_RESOURCE` must be byte-identical to an entry in
+`MCP_OAUTH_AS_ALLOWED_RESOURCES` above.** It is the RFC 8707 resource indicator the
+client echoes back at `/oauth/authorize`, and the allowlist is compared exactly —
+a mismatch is not a warning, it fails **every** authorize with `invalid_target`.
+
+This block previously published a `*.up.railway.app` host here while the allowlist
+five lines up said `commerce.mcp.pivota.cc`. The two never agreed, so a partner
+configuring from this document could not complete a single authorization. Live
+production has always used the `commerce.mcp.pivota.cc` value; only the document
+was wrong. Verified against the running gateway on 2026-08-22:
+
+```
+MCP_OAUTH_RESOURCE = https://commerce.mcp.pivota.cc/mcp
+```
+
+Do not substitute the Cloud Run URL or any `*.run.app`/`*.up.railway.app` host.
+The public hostname is the contract with the client and is stable across
+infrastructure moves — that is the whole point of it. When the platform moved
+from Railway to GCP on 2026-08-22, this value did not change and must not.
 
 (The backend's own `agent_user_jwt` verifier, if used, is similarly pointed at the AS via
 `AGENT_USER_JWT_ISSUERS` + `AGENT_USER_JWKS_URL`.)
