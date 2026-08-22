@@ -549,7 +549,6 @@ def test_a_numeric_SKU_can_never_be_used_as_a_cart_variant_id() -> None:
         offer_variant_id="80072940",  # an all-digit SKU, not a Shopify variant id
     )
 
-    assert identity["platform_from_evidence"] is True
     assert identity["cart_variant_id"] == "41234567890123", "the STAMPED id, not the SKU"
     assert identity["variant_id"] == "80072940", "attribution still sees the SKU"
 
@@ -582,7 +581,6 @@ def test_a_declined_prefill_is_not_rescued_by_a_numeric_sku() -> None:
             merchant_id=identity["merchant_id"], product_id=identity["product_id"],
             variant_id=identity["variant_id"],
             cart_variant_id=identity["cart_variant_id"],
-            platform_from_evidence=identity["platform_from_evidence"],
             shop_domain=identity["shop_domain"], platform=identity["platform"],
             seller_ref=identity["seller_ref"], seed_kind=identity["seed_kind"],
         )
@@ -593,20 +591,54 @@ def test_a_declined_prefill_is_not_rescued_by_a_numeric_sku() -> None:
     assert "80072940" not in dest, "a SKU must never reach a cart URL"
 
 
-def test_the_connected_merchant_lane_keeps_its_variant_id_fallback() -> None:
-    """`platform_from_evidence` defaults False, so a writer-verified platform — where
-    variant_id IS a real Shopify variant id — is unaffected by the round-5 tightening."""
+def test_a_caller_that_cannot_justify_an_id_gets_no_cart_at_all() -> None:
+    """There is no fallback. `variant_id` alone — the attribution value — must never reach the
+    permalink, however Shopify-shaped it looks. A caller that can justify its id passes
+    `cart_variant_id` explicitly; one that cannot gets referral_only."""
     import asyncio
 
     from routes.agent_shop_gateway import _make_external_redirect_url
 
-    redirect_url = asyncio.run(
+    without = asyncio.run(
         _make_external_redirect_url(
             market="US", tool="*", destination_url="https://shop.example/products/x",
             utm_template=None, ctx={"source": "connected_catalog"},
             allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
-            variant_id="41234567890123", shop_domain="shop.example", platform="shopify",
+            variant_id="41234567890123", cart_variant_id=None,
+            shop_domain="shop.example", platform="shopify",
         )
     )
+    assert "/cart/" not in _dest_of(without), "variant_id alone must not build a cart"
 
-    assert "/cart/41234567890123:1" in _dest_of(redirect_url)
+    # the connected lane justifies its id by provenance and passes it deliberately
+    with_claim = asyncio.run(
+        _make_external_redirect_url(
+            market="US", tool="*", destination_url="https://shop.example/products/x",
+            utm_template=None, ctx={"source": "connected_catalog"},
+            allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
+            variant_id="41234567890123", cart_variant_id="41234567890123",
+            shop_domain="shop.example", platform="shopify",
+        )
+    )
+    assert "/cart/41234567890123:1" in _dest_of(with_claim)
+
+
+def test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain() -> None:
+    """The door round 5 left open: platform is writer-verified (no evidence flip), so the old
+    conditional fallback still fired and built a cart from the SKU chain. The attached variant
+    id is catalog identity and may be used; a SKU may not."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    sku_only = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1"),
+        seed_data={}, offer_variant_id="80072940",
+    )
+    assert sku_only["platform"] == "shopify"
+    assert sku_only["cart_variant_id"] is None, "a SKU is not a Shopify variant id"
+
+    attached = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1",
+                       attached_variant_id="41234567890123"),
+        seed_data={}, offer_variant_id="80072940",
+    )
+    assert attached["cart_variant_id"] == "41234567890123"

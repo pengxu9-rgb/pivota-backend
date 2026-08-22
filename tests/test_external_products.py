@@ -360,6 +360,7 @@ async def test_shop_gateway_make_external_redirect_url_without_allowlist_gate(
         utm_template=None,
         ctx={"seedId": "seed_1"},
         allowed_domains=["example.com"],
+        cart_variant_id=None,
     )
 
     assert isinstance(redirect, str)

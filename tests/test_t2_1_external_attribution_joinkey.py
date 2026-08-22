@@ -78,6 +78,7 @@ async def test_shopify_seed_builds_cart_permalink_with_matching_ctx():
         shop_domain="teststore.com",
         platform="shopify",
         quantity=1,
+        cart_variant_id="46123456789",
     )
     assert redirect_url is not None
     payload = _decode_redirect(redirect_url)
@@ -117,6 +118,7 @@ async def test_non_shopify_seed_falls_back_to_referral_only():
         variant_id="46123456789",  # numeric, but platform is NOT shopify -> no cart permalink
         shop_domain="teststore.com",
         platform="woocommerce",
+        cart_variant_id="46123456789",
     )
     assert redirect_url is not None
     payload = _decode_redirect(redirect_url)
@@ -147,6 +149,7 @@ async def test_shopify_platform_but_non_numeric_variant_does_not_fabricate():
         variant_id="SKU-ABC",
         shop_domain="teststore.com",
         platform="shopify",
+        cart_variant_id="SKU-ABC",
     )
     payload = _decode_redirect(redirect_url)
     assert payload["ctx"]["join_mode"] == "referral_only"
@@ -168,6 +171,7 @@ async def test_disallowed_domain_returns_none_even_for_shopify():
         variant_id="46123456789",
         shop_domain="teststore.com",
         platform="shopify",
+        cart_variant_id="46123456789",
     )
     assert redirect_url is None
 
@@ -189,6 +193,7 @@ async def test_ctx_click_id_is_used_by_materialize_not_a_fresh_id():
         variant_id="46123456789",
         shop_domain="teststore.com",
         platform="shopify",
+        cart_variant_id="46123456789",
     )
     ctx = _decode_redirect(redirect_url)["ctx"]
 

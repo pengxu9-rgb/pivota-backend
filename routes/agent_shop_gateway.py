@@ -4163,7 +4163,6 @@ async def _handle_offers_resolve(
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
-                    platform_from_evidence=bool(redirect_identity.get("platform_from_evidence")),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
@@ -5564,6 +5563,11 @@ async def _attach_connected_product_redirects(
                     merchant_id=merchant_id,
                     product_id=str(p.get("product_id") or p.get("id") or "").strip() or None,
                     variant_id=variant_id,
+                    # Provenance, not shape: this id comes from the merchant's OWN connected
+                    # catalog sync (p["variants"][].variant_id), so for a shopify-platform
+                    # store it is the Shopify-issued variant id. Passed explicitly because the
+                    # builder has no fallback — a caller that cannot justify its id passes None.
+                    cart_variant_id=variant_id,
                     shop_domain=shop_domain,
                     platform=platform or None,
                 )
@@ -6990,11 +6994,24 @@ def _external_seed_redirect_identity(
     # silently replaced by a value that joins nothing. Attribution therefore keeps its
     # pre-change values byte for byte, and the recovered id travels on `cart_variant_id`,
     # a channel only the cart-permalink construction reads — never the token ctx.
+    # THE CART VARIANT ID IS CHOSEN BY PROVENANCE, NEVER BY SHAPE, AND NEVER BY FALLBACK.
+    #
+    # `variant_id` above is an ATTRIBUTION value: `_seed_offer_variant_id` resolves it from
+    # variant_id | variantId | sku | sku_id | id, so it is routinely a SKU string or a
+    # synthetic "{epid}-default". Being all-digits does not make such a value a Shopify
+    # variant id — that was the round-5 P0, where a numeric SKU built a cart for a product
+    # Shopify never had under that id, on multi-variant products where the stamped-id guard
+    # had deliberately declined.
+    #
+    # Round 5 fixed only the evidence-derived branch and left the `or` fallback standing for
+    # the rest, which left the identical bug reachable through an ATTACHED shopify product
+    # (platform writer-verified, so no evidence flip, and variant_id still from the SKU
+    # chain). A conditional fallback is still a fallback. So there is none: this value is set
+    # from a source whose provenance justifies it, or it stays None and the redirect degrades
+    # to referral_only — which is the correct, honest outcome when we cannot name the variant.
     cart_variant_id: Optional[str] = None
-    platform_from_evidence = False
     if platform in (None, "external_seed") and storefront_is_shopify(seed_data):
         platform = "shopify"
-        platform_from_evidence = True
         # ROUND-5 CORRECTION. This used to run only `if not extract_shopify_numeric_variant_id(
         # variant_id)`, on the reasoning that a numeric id already in hand needs no second
         # channel. That reasoning was wrong: `variant_id` here comes from
@@ -7007,7 +7024,14 @@ def _external_seed_redirect_identity(
         #
         # When the platform label is EVIDENCE-DERIVED, the stamped id is the only value we
         # have any evidence for, so it is used unconditionally or the permalink is declined.
+        # Stamped from the storefront's own /products/x.js — the only Shopify-issued id we
+        # have for a crawl seed. None when the product has more than one variant.
         cart_variant_id = sole_stamped_variant_id(seed_data)
+    elif platform == "shopify":
+        # Writer-verified Shopify attachment. `attached_variant_id` is catalog identity
+        # (catalog_skus.source_variant_id), which for platform='shopify' IS the Shopify
+        # variant id. The offer/SKU chain is deliberately NOT consulted here.
+        cart_variant_id = extract_shopify_numeric_variant_id(attached_variant_id)
 
     return {
         "merchant_id": merchant_id,
@@ -7015,10 +7039,6 @@ def _external_seed_redirect_identity(
         "product_id": canonical_product_id,
         "variant_id": variant_id,
         "cart_variant_id": cart_variant_id,
-        # Tells the builder it may NOT fall back to `variant_id` for the permalink. False for
-        # writer-verified platforms (the connected-merchant lane), where variant_id IS a real
-        # Shopify variant id and the fallback is correct.
-        "platform_from_evidence": platform_from_evidence,
         "shop_domain": shop_domain,
         "seller_ref": seller_ref,
         "seed_kind": seed_kind,
@@ -7041,11 +7061,18 @@ async def _make_external_redirect_url(
     # into the token ctx, because commerce_attribution_service cross-fills product<->variant
     # ids both ways and a numeric variant id must not leak up a grain into
     # canonical_product_id (round-4 review of #1813).
-    cart_variant_id: Optional[str] = None,
-    # When True, `cart_variant_id` is AUTHORITATIVE and the permalink must not fall back to
-    # `variant_id` — see the round-5 note in _external_seed_redirect_identity. Defaults False
-    # so the connected-merchant caller, whose variant_id is writer-verified, is unaffected.
-    platform_from_evidence: bool = False,
+    # THE ONLY INPUT TO THE CART PERMALINK, and REQUIRED — no default, deliberately.
+    #
+    # Must be a value the CALLER can justify as a Shopify-issued variant id. There is no
+    # fallback to `variant_id`, which is an attribution value and routinely a SKU or a
+    # synthetic "{epid}-default"; treating one as a variant id built carts for products
+    # Shopify never had under that id.
+    #
+    # No default, because a defaulted one makes OMISSION silent: a new caller (or a deleted
+    # line) would simply stop producing permalinks with nothing failing. Requiring it turns
+    # that into a TypeError the suite catches, and forces every call site to say either "here
+    # is an id I can justify" or an explicit None — which correctly degrades to referral_only.
+    cart_variant_id: Optional[str],
     shop_domain: Optional[str] = None,
     platform: Optional[str] = None,
     quantity: int = 1,
@@ -7076,7 +7103,7 @@ async def _make_external_redirect_url(
     if is_shopify:
         cart_base = shopify_cart_base_url(
             shop_domain=shop_domain or destination_url,
-            variant_id=cart_variant_id if platform_from_evidence else (cart_variant_id or variant_id),
+            variant_id=cart_variant_id,
             quantity=quantity,
         )
     join_mode = "cart_permalink" if cart_base else "referral_only"
@@ -7311,7 +7338,6 @@ async def _build_prefetched_external_seed_wrappers(
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
-                    platform_from_evidence=bool(redirect_identity.get("platform_from_evidence")),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
@@ -9635,7 +9661,6 @@ async def _handle_find_products_multi_inner(
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
-                    platform_from_evidence=bool(redirect_identity.get("platform_from_evidence")),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
