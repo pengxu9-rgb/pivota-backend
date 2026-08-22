@@ -1431,12 +1431,57 @@ async def run_external_referral_refresh_batch(
     degraded = 0
     failed = 0
     errors: List[Dict[str, Any]] = []
+    # Drift accounting. "refreshed" only says we re-fetched; it says nothing about
+    # whether anything was WRONG, which is the number that justifies running this
+    # on a schedule at all. `price_changed` is the measured staleness rate of the
+    # index, per run. `price_skipped_incomplete_pair` is the honest residue: a
+    # fetch that produced an amount without a currency, deliberately not applied
+    # (see the pairing note in routes/employee_products._refresh_external_seed_by_id)
+    # — if it grows, the extractor needs work, not the writer.
+    price_changed = 0
+    price_filled = 0
+    price_unchanged = 0
+    price_unavailable = 0
+    price_skipped_incomplete_pair = 0
+    # A scraped currency that disagrees with the stored one is refused rather than
+    # applied (see routes/employee_products._refresh_external_seed_by_id). This counter
+    # is the visible cost of that refusal: if it is non-trivial, the currency EXTRACTOR
+    # needs work — `_detect_currency_from_text` has no KRW case and the caller defaults
+    # by market — not the writer.
+    price_skipped_currency_mismatch = 0
+    # A fetch that produced a non-positive amount. Distinct from `unavailable` (no
+    # reading at all) because it means the extractor read something and got a broken
+    # offer shape — a different problem with a different fix.
+    price_skipped_non_positive = 0
+    availability_changed = 0
     for seed_id in candidate_seed_ids:
         try:
             result = await refresh_seed_by_id(seed_id)
             status = str(result.get("status") or "success")
             if status == "success":
                 refreshed += 1
+                # isinstance, not truthiness: a truthy non-dict here used to raise
+                # INSIDE the try and land the same seed in BOTH `refreshed` and
+                # `failed`, which is a worse outcome than an uncounted drift report.
+                price = result.get("price_refresh")
+                price_status = str(price.get("status") or "") if isinstance(price, dict) else ""
+                if price_status == "applied":
+                    price_changed += 1
+                elif price_status == "filled":
+                    price_filled += 1
+                elif price_status == "unchanged":
+                    price_unchanged += 1
+                elif price_status == "skipped_incomplete_pair":
+                    price_skipped_incomplete_pair += 1
+                elif price_status == "skipped_currency_mismatch":
+                    price_skipped_currency_mismatch += 1
+                elif price_status == "skipped_non_positive":
+                    price_skipped_non_positive += 1
+                elif price_status == "unavailable":
+                    price_unavailable += 1
+                availability = result.get("availability_refresh")
+                if isinstance(availability, dict) and availability.get("status") == "applied":
+                    availability_changed += 1
             elif status == "degraded":
                 degraded += 1
             else:
@@ -1452,5 +1497,13 @@ async def run_external_referral_refresh_batch(
         "refreshed": refreshed,
         "degraded": degraded,
         "failed": failed,
+        "price_changed": price_changed,
+        "price_unchanged": price_unchanged,
+        "price_unavailable": price_unavailable,
+        "price_filled": price_filled,
+        "price_skipped_incomplete_pair": price_skipped_incomplete_pair,
+        "price_skipped_currency_mismatch": price_skipped_currency_mismatch,
+        "price_skipped_non_positive": price_skipped_non_positive,
+        "availability_changed": availability_changed,
         "errors": errors[:20],
     }
