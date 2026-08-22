@@ -762,6 +762,22 @@ async def test_ingest_standard_products_shopify_offer_guard_filters_invalid_batc
     assert len(offer_writes) == 1
     assert offer_writes[0]["source_domain"] == "guard-shop.myshopify.com"
     assert offer_writes[0]["offer_payload"]["variant_id"] == "v_valid"
+    # ADR-024: `market` is the column default, and the row now SAYS so. The
+    # value is unchanged (this is a provenance change, not a behavior change);
+    # what is new is that a reader can tell a defaulted market from a known one.
+    # Mutant killed: dropping the provenance key, or writing a market that is
+    # not the declared default constant.
+    assert offer_writes[0]["market"] == module.MARKET_UNKNOWN_DEFAULT == "US"
+    assert (
+        offer_writes[0]["offer_payload"]["market_provenance"]
+        == module.MARKET_PROVENANCE_PLATFORM_DEFAULT
+        == "platform_default_unknown"
+    )
+    # The CURRENCY is a real observation from the platform payload and must not
+    # be tarred with the same brush -- it carries no provenance marker, because
+    # it needs none. (The 2026-07-29 Wix pilot's 433 rows were honest EUR under
+    # a fabricated US market; only the market half was ever the defect.)
+    assert "currency_provenance" not in offer_writes[0]["offer_payload"]
     assert len(audit_rows) == 1
     assert audit_rows[0]["writer_name"] == "shopify_products_sync"
     assert audit_rows[0]["batch_id"] == "batch_guard"
@@ -856,6 +872,22 @@ async def test_ingest_standard_products_wix_offer_guard_filters_invalid_batch(
     assert len(offer_writes) == 1
     assert offer_writes[0]["source_domain"] == "guard-shop.wixsite.com"
     assert offer_writes[0]["offer_payload"]["variant_id"] == "v_valid"
+    # ADR-024: `market` is the column default, and the row now SAYS so. The
+    # value is unchanged (this is a provenance change, not a behavior change);
+    # what is new is that a reader can tell a defaulted market from a known one.
+    # Mutant killed: dropping the provenance key, or writing a market that is
+    # not the declared default constant.
+    assert offer_writes[0]["market"] == module.MARKET_UNKNOWN_DEFAULT == "US"
+    assert (
+        offer_writes[0]["offer_payload"]["market_provenance"]
+        == module.MARKET_PROVENANCE_PLATFORM_DEFAULT
+        == "platform_default_unknown"
+    )
+    # The CURRENCY is a real observation from the platform payload and must not
+    # be tarred with the same brush -- it carries no provenance marker, because
+    # it needs none. (The 2026-07-29 Wix pilot's 433 rows were honest EUR under
+    # a fabricated US market; only the market half was ever the defect.)
+    assert "currency_provenance" not in offer_writes[0]["offer_payload"]
     assert len(audit_rows) == 1
     assert audit_rows[0]["writer_name"] == wix_source_system
     assert audit_rows[0]["batch_id"] == "batch_guard"
