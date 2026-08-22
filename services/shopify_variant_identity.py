@@ -16,11 +16,17 @@ storefront for `/products/<handle>.js`, which is a public, unauthenticated endpo
 returns every variant with its numeric id. A live probe on 2026-08-21 recovered numeric ids
 for **81 of 81** reachable Shopify PDPs.
 
-WHAT THIS MODULE IS. The pure, testable half: URL derivation, `.js` parsing, and the
-matching rule. The I/O half (selection, pacing, writes) is
-`scripts/backfill_shopify_variant_ids.py`. Splitting them is deliberate — the matching rule
-is where a wrong answer silently sends a buyer to the wrong size, and it should be provable
-without a database or a network.
+WHAT THIS MODULE IS, AND WHAT IT IS NOT. The pure decision logic: URL derivation, `.js`
+parsing, and the matching rule. It touches no database, no network and no serving path.
+
+There is deliberately NO CONSUMER YET. Three review rounds on the original PR each found a
+P0 in the previous round's fix, and the last one showed why: a recovered id still cannot
+build a cart permalink, because `_make_external_redirect_url` gates that on `is_shopify`
+while crawl seeds carry `platform = "external_seed"` on custom domains. The blocker is at
+the CONSUMER end, so the ops script and the serving-side change were cut rather than shipped
+against a path that could not use them. Whoever picks this up should start from
+`_make_external_redirect_url`, prove a cart URL end to end for one domain, and only then
+wire a backfill to feed it.
 
 WHAT IT WRITES, AND WHERE. A NEW key, `shopify_variant_id`, on each EXISTING seed variant.
 
