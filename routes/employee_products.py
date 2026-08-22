@@ -4439,16 +4439,107 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             if isinstance(variant, dict):
                 variant.pop("description", None)
 
+    # PRICE AND AVAILABILITY ARE FACTS WITH A SHELF LIFE, NOT CURATED COPY.
+    #
+    # This block used to be `price_amount = COALESCE(price_amount, :price_amount)`
+    # in the SQL — i.e. "write the fresh price only if the stored one is NULL".
+    # Since a seed almost always HAS a price, that made the refresh structurally
+    # incapable of correcting a stale one: it re-fetched the live page, wrote the
+    # new price into seed_data["snapshot"], and then discarded it for the column
+    # every consumer actually reads. Measured 2026-08-21 over 81 live K-beauty
+    # PDPs: 12.3% price drift and 11.1% listed-in-stock-but-live-out-of-stock,
+    # none of which any number of refresh runs could have fixed.
+    #
+    # Resolved HERE rather than in SQL on purpose. The decision is then visible to
+    # the caller (see `price_refresh` in the return value, which the freshness
+    # sweep counts), and it is reachable by a unit test — the SQL variant was not,
+    # because the test harness stubs the statement executor and never evaluates
+    # COALESCE.
+    #
+    # title/image_url keep their curated-first precedence (an employee-written
+    # title should survive a crawl); only the perishable facts are refreshed.
+    def _as_price(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    prev_amount = _as_price(row.get("price_amount"))
+    prev_currency = (str(row.get("price_currency") or "").strip() or None)
+    fresh_amount = _as_price(snap_price_amount)
+    fresh_currency = (str(snap_price_currency or "").strip().upper() or None)
+
+    # AMOUNT AND CURRENCY MOVE TOGETHER. `_extract_from_html` resolves them from
+    # independent sources (services/external_offers_service.py — JSON-LD price vs
+    # a separate currency field), so a fetch can yield an amount with no currency.
+    # Taking the amount alone would pair a NEW number with the STALE currency and
+    # silently redenominate the offer. When the pair is incomplete we keep both
+    # old values and say so, rather than half-applying.
+    if fresh_amount is not None and fresh_currency:
+        next_amount, next_currency = fresh_amount, fresh_currency
+        if prev_amount is None or prev_currency is None:
+            price_status = "applied"
+        elif abs(fresh_amount - prev_amount) >= 0.005 or fresh_currency != prev_currency:
+            price_status = "applied"
+        else:
+            price_status = "unchanged"
+    else:
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = (
+            "skipped_incomplete_pair"
+            if (fresh_amount is not None) != bool(fresh_currency)
+            else "unavailable"
+        )
+
+    # Availability is its own perishable fact and moves independently of price —
+    # a page can keep its price and go out of stock. Reported separately so the
+    # sweep can state the stock-flip rate (11.1% of the same live sample) rather
+    # than folding it into the price number.
+    prev_availability = (str(row.get("availability") or "").strip() or None)
+    fresh_availability = (str(snap_availability or "").strip() or None)
+    next_availability = fresh_availability or prev_availability
+    if fresh_availability is None:
+        availability_status = "unavailable"
+    elif prev_availability is None or fresh_availability != prev_availability:
+        availability_status = "applied"
+    else:
+        availability_status = "unchanged"
+
+    availability_refresh = {
+        "status": availability_status,
+        "changed": availability_status == "applied",
+        "previous": prev_availability,
+        "availability": next_availability,
+    }
+
+    # Curated copy: existing wins. Resolved here too, so this statement has NO
+    # semantics hidden in SQL — every value written below is decided in Python and
+    # is therefore visible to a test. `is not None` (not `or`) preserves the exact
+    # COALESCE semantics this replaced: a stored empty string is a stored value.
+    next_title = row.get("title") if row.get("title") is not None else snap_title
+    next_image_url = row.get("image_url") if row.get("image_url") is not None else snap_image_url
+
+    price_refresh = {
+        "status": price_status,
+        "changed": price_status == "applied",
+        "previous_amount": prev_amount,
+        "previous_currency": prev_currency,
+        "amount": next_amount,
+        "currency": next_currency,
+    }
+
     await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
         SET canonical_url = :canonical_url,
             domain = :domain,
-            title = COALESCE(title, :title),
-            image_url = COALESCE(image_url, :image_url),
-            price_amount = COALESCE(price_amount, :price_amount),
-            price_currency = COALESCE(price_currency, :price_currency),
-            availability = COALESCE(availability, :availability),
+            title = :title,
+            image_url = :image_url,
+            price_amount = :price_amount,
+            price_currency = :price_currency,
+            availability = :availability,
             seed_data = :seed_data,
             updated_at = NOW()
         WHERE id = :id
@@ -4457,11 +4548,11 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "id": seed_id,
             "canonical_url": canonical_url,
             "domain": domain,
-            "title": snap_title,
-            "image_url": snap_image_url,
-            "price_amount": snap_price_amount,
-            "price_currency": snap_price_currency,
-            "availability": snap_availability,
+            "title": next_title,
+            "image_url": next_image_url,
+            "price_amount": next_amount,
+            "price_currency": next_currency,
+            "availability": next_availability,
             "seed_data": _seed_data_payload(seed_data),
         },
     )
@@ -4474,6 +4565,11 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "canonical_url": canonical_url,
         "domain": domain,
         "seed_data": seed_data,
+        # Drift report. The batch runner sums these so "we re-crawled N seeds" can
+        # be stated as "N re-crawled, M prices actually moved" — the difference is
+        # the whole point of the refresh existing.
+        "price_refresh": price_refresh,
+        "availability_refresh": availability_refresh,
         "attached_product_key": row.get("attached_product_key"),
         "attached_variant_id": row.get("attached_variant_id"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,
