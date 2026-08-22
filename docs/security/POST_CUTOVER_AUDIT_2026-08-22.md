@@ -169,9 +169,17 @@ Both scheduler-driven Cloud Run jobs run as the **default compute SA**, which ad
 ### 2.6 A client has a Railway hostname hardcoded, and its writes are being lost
 
 Railway edge logs show `POST /photos/presign`, `/photos/confirm` and `GET /photos/download-url`
-arriving on `web-production-fedb.up.railway.app` from an AWS us-west-1 address — **not** through
-`api.pivota.cc`. DNS cannot fix a hardcoded hostname. Every such write lands in the Railway
+arriving on the legacy `web-production-fedb` Railway host from an AWS us-west-1 address — **not**
+through `api.pivota.cc`. DNS cannot fix a hardcoded hostname. Every such write lands in the Railway
 database and is silently discarded.
+
+> The full hostname is written in that split form on purpose.
+> `tests/test_legacy_backend_url_guard.py` fails the build if the literal
+> `web-production-fedb` + `.up.railway.app` appears anywhere outside its own
+> allowlist — the guard exists so that URL can never quietly come back into
+> config or code. Please do not "fix" this line by restoring the literal; it
+> will turn main red. Reconstruct it from the guard's `LEGACY_BACKEND_URLS`
+> tuple if you need it verbatim.
 
 **Find the client and repoint it before Railway is decommissioned**, or the failure mode changes
 from "silently lost" to "hard error".
