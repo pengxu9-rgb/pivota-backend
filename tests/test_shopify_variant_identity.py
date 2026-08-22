@@ -275,3 +275,187 @@ def test_the_recovered_id_is_one_the_cart_builder_will_accept() -> None:
     assert shopify_cart_base_url(shop_domain="genabelle.com", variant_id=recovered, quantity=1) == (
         "https://genabelle.com/cart/41234567890123:1"
     )
+
+
+# ---------------------------------------------------------------- the consumer slice
+# Round 3 established the recovered id was inert: _make_external_redirect_url gates the
+# cart permalink on platform == "shopify", and a crawl seed's platform is the INTAKE LANE
+# ("external_seed"), not the storefront's software. These pin the evidence-gated bridge —
+# and, unlike the reverted attempt, the bridge touches ONLY the redirect identity: no
+# serving read (price/currency/availability) is in its blast radius by construction.
+
+def _crawl_row(**overrides):
+    row = {
+        "id": "eps_1",
+        "attached_product_key": "prod::external_seed::external_seed::ext_abc123",
+        "attached_variant_id": None,
+        "domain": "genabelle.com",
+        "destination_url": "https://genabelle.com/products/melacare-jelly-touch-dual-pad",
+        "seller_ref": "seller:genabelle.com",
+        "seed_kind": "self",
+    }
+    row.update(overrides)
+    return row
+
+
+def _evidence_seed(*ids, platform_key: bool = True):
+    snapshot = {"variants": [{"title": f"v{i}", "shopify_variant_id": vid} for i, vid in enumerate(ids)]}
+    if platform_key:
+        snapshot["storefront_platform"] = "shopify"
+        snapshot["storefront_platform_source"] = "products_js_v1"
+    return {"snapshot": snapshot}
+
+
+def test_without_evidence_the_identity_is_byte_identical_to_before() -> None:
+    """The no-regression control: a seed the backfill never touched must flow exactly as it
+    does on main — lane label kept, no variant invented."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(row=_crawl_row(), seed_data={"snapshot": {}})
+
+    assert identity["platform"] == "external_seed"
+    assert identity["variant_id"] is None
+
+
+def test_evidence_flips_the_lane_label_and_supplies_the_sole_numeric_id() -> None:
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=_evidence_seed("41234567890123")
+    )
+
+    assert identity["platform"] == "shopify"
+    assert identity["variant_id"] == "41234567890123"
+
+
+def test_stamped_ids_alone_are_evidence_even_without_the_platform_key() -> None:
+    """Stamped ids can only come from a successful .js parse, so they prove Shopify-ness
+    by themselves — rows stamped before the producer learned to write the platform key
+    must not be stranded."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=_evidence_seed("41234567890123", platform_key=False)
+    )
+
+    assert identity["platform"] == "shopify"
+    assert identity["variant_id"] == "41234567890123"
+
+
+def test_two_stamped_ids_flip_the_platform_but_refuse_to_pick_a_variant() -> None:
+    """Product-grain redirect, buyer has not chosen: prefilling either of two variants is
+    the wrong-size hazard. The permalink is declined (non-numeric variant -> referral_only)
+    while the platform evidence still stands."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=_evidence_seed("111", "222")
+    )
+
+    assert identity["platform"] == "shopify"
+    assert identity["variant_id"] is None
+
+
+def test_a_real_attached_platform_is_never_overridden_by_snapshot_evidence() -> None:
+    """A writer-verified platform is identity; crawl evidence never outranks it."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::wix::w123"),
+        seed_data=_evidence_seed("41234567890123"),
+    )
+
+    assert identity["platform"] == "wix"
+
+
+def test_a_numeric_attached_variant_id_always_wins_over_the_stamped_one() -> None:
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_variant_id="40000000000001"),
+        seed_data=_evidence_seed("41234567890123"),
+    )
+
+    assert identity["variant_id"] == "40000000000001"
+
+
+def _dest_of(redirect_url: str) -> str:
+    """Decode the /r?token= payload and return the destination the buyer would land on."""
+    import base64
+    import json as _json
+    from urllib.parse import parse_qs, urlparse
+
+    token = parse_qs(urlparse(redirect_url).query)["token"][0]
+    payload_b64 = token.split(".")[0]
+    padded = payload_b64 + "=" * ((4 - len(payload_b64) % 4) % 4)
+    return _json.loads(base64.urlsafe_b64decode(padded))["dest"]
+
+
+def test_end_to_end_an_evidence_stamped_seed_redirects_into_a_prefilled_cart() -> None:
+    """The whole chain, through the REAL redirect builder: identity -> is_shopify gate ->
+    cart permalink -> signed token, decoded to the URL the buyer actually lands on."""
+    import asyncio
+
+    from routes.agent_shop_gateway import (
+        _external_seed_redirect_identity,
+        _make_external_redirect_url,
+    )
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=_evidence_seed("41234567890123")
+    )
+    redirect_url = asyncio.run(
+        _make_external_redirect_url(
+            market="US",
+            tool="*",
+            destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
+            utm_template=None,
+            ctx={"seedId": "eps_1"},
+            allowed_domains=["genabelle.com"],
+            merchant_id=identity["merchant_id"],
+            product_id=identity["product_id"],
+            variant_id=identity["variant_id"],
+            shop_domain=identity["shop_domain"],
+            platform=identity["platform"],
+            seller_ref=identity["seller_ref"],
+            seed_kind=identity["seed_kind"],
+        )
+    )
+
+    dest = _dest_of(redirect_url)
+    assert dest.startswith("https://genabelle.com/cart/41234567890123:1"), dest
+    assert "attributes%5Bpivota_click_id%5D=" in dest or "attributes[pivota_click_id]=" in dest
+
+
+def test_end_to_end_control_the_same_seed_without_evidence_stays_referral_only() -> None:
+    """Proves the previous test passes BECAUSE of the evidence, not incidentally — and
+    that untouched rows keep today's behaviour exactly."""
+    import asyncio
+
+    from routes.agent_shop_gateway import (
+        _external_seed_redirect_identity,
+        _make_external_redirect_url,
+    )
+
+    identity = _external_seed_redirect_identity(row=_crawl_row(), seed_data={"snapshot": {}})
+    redirect_url = asyncio.run(
+        _make_external_redirect_url(
+            market="US",
+            tool="*",
+            destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
+            utm_template=None,
+            ctx={"seedId": "eps_1"},
+            allowed_domains=["genabelle.com"],
+            merchant_id=identity["merchant_id"],
+            product_id=identity["product_id"],
+            variant_id=identity["variant_id"],
+            shop_domain=identity["shop_domain"],
+            platform=identity["platform"],
+            seller_ref=identity["seller_ref"],
+            seed_kind=identity["seed_kind"],
+        )
+    )
+
+    dest = _dest_of(redirect_url)
+    assert "/cart/" not in dest, dest
+    assert dest.startswith("https://genabelle.com/products/melacare-jelly-touch-dual-pad")

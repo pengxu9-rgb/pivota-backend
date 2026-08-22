@@ -68,11 +68,16 @@ from services.outbound_links_service import (
     apply_utm,
     append_referral_click_param,
     append_shopify_cart_click_attribute,
+    extract_shopify_numeric_variant_id,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     make_redirect_token,
     normalize_shop_host,
     shopify_cart_base_url,
+)
+from services.shopify_variant_identity import (
+    sole_stamped_variant_id,
+    storefront_is_shopify,
 )
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
@@ -6953,6 +6958,31 @@ def _external_seed_redirect_identity(
     # rows) threads through as None and closure stamps seller_ref_missing.
     seller_ref = str(row.get("seller_ref") or seed_data.get("seller_ref") or "").strip() or None
     seed_kind = str(row.get("seed_kind") or seed_data.get("seed_kind") or "").strip() or None
+
+    # STOREFRONT EVIDENCE (services/shopify_variant_identity). The `platform` parsed above
+    # is the INTAKE LANE — "external_seed" for the whole crawl cohort — but the consumer of
+    # this field, _make_external_redirect_url's is_shopify gate, needs the STOREFRONT's
+    # platform, and for that cohort the two diverge on essentially every row (measured:
+    # 81/81 reachable PDPs are Shopify on custom domains). A successful `/products/x.js`
+    # parse is definitive proof of Shopify-ness, and the backfill stamps that proof into
+    # seed_data.snapshot. Two hard rules keep this from becoming the round-3 regression:
+    #
+    #   * OVERRIDE ONLY THE LANE LABEL. A real attached platform ("wix", "woocommerce")
+    #     is writer-verified identity; snapshot evidence never outranks it. Only None or
+    #     the lane token itself is eligible.
+    #   * NEVER GUESS A VARIANT. The stamped id is used only when the product has exactly
+    #     one (sole_stamped_variant_id), and only when the id we already carry cannot make
+    #     a permalink anyway (a numeric attached_variant_id always wins). The cart and the
+    #     attribution ctx then name the SAME variant — the id that will actually be in the
+    #     buyer's cart — rather than a synthetic "{epid}-default" the storefront never saw.
+    #
+    # Price, currency, availability and every other serving read are untouched on purpose:
+    # this function feeds the REDIRECT, and widening it past identity is exactly what made
+    # the previous attempt serve a frozen snapshot price as live.
+    if platform in (None, "external_seed") and storefront_is_shopify(seed_data):
+        platform = "shopify"
+        if not extract_shopify_numeric_variant_id(variant_id):
+            variant_id = sole_stamped_variant_id(seed_data) or variant_id
 
     return {
         "merchant_id": merchant_id,

@@ -312,3 +312,74 @@ def stamp_variant_ids(
         "reason": reason,
         "stamped": stamped,
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Consumer-side helpers: what the redirect lane reads.
+#
+# THE EVIDENCE CONTRACT. `platform` on a crawl seed records the INTAKE LANE
+# ("external_seed"), not the software the storefront runs — and the cart-permalink gate in
+# routes/agent_shop_gateway._make_external_redirect_url compares against exactly that label,
+# so the whole crawl cohort (measured: 81/81 reachable PDPs are Shopify on custom domains)
+# is refused a permalink it could serve. The missing fact is storefront platform, and a
+# successful `/products/<handle>.js` parse IS definitive proof of it: only Shopify serves
+# that endpoint in that shape. The producer therefore stamps, at parse-success time:
+#
+#     seed_data["snapshot"]["storefront_platform"]        = "shopify"
+#     seed_data["snapshot"]["storefront_platform_source"] = "products_js_v1"
+#
+# and per matched variant, `shopify_variant_id` (see stamp_variant_ids). These helpers are
+# the ONLY sanctioned readers. They are deliberately evidence-only: no CDN-host heuristics,
+# no market defaults — the two shortcuts that manufactured this file's history of retracted
+# claims.
+# ---------------------------------------------------------------------------------------------
+
+def storefront_is_shopify(seed_data: Any) -> bool:
+    """True only on explicit stored evidence, never on inference.
+
+    Two forms count, both producible solely by a successful `.js` parse: the stamped
+    `storefront_platform` key, or any variant carrying a `shopify_variant_id` (stamped ids
+    imply the parse succeeded even if the platform key predates the producer writing it).
+    """
+    if not isinstance(seed_data, dict):
+        return False
+    snapshot = seed_data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return False
+    if str(snapshot.get("storefront_platform") or "").strip().lower() == "shopify":
+        return True
+    variants = snapshot.get("variants")
+    if isinstance(variants, list):
+        return any(
+            isinstance(v, dict) and str(v.get("shopify_variant_id") or "").strip()
+            for v in variants
+        )
+    return False
+
+
+def sole_stamped_variant_id(seed_data: Any) -> Optional[str]:
+    """The stamped numeric id, but ONLY when the product has exactly one.
+
+    The redirect is built at PRODUCT grain — the buyer has not chosen a variant yet — so
+    prefilling a cart is only safe when there is nothing to choose. One distinct stamped id
+    means the storefront sells one purchasable variant: prefill it. Zero means no evidence.
+    Two or more means picking any of them is the wrong-size-in-the-cart hazard this module
+    exists to refuse, so the permalink is declined and the redirect stays referral_only.
+    """
+    if not isinstance(seed_data, dict):
+        return None
+    snapshot = seed_data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    variants = snapshot.get("variants")
+    if not isinstance(variants, list):
+        return None
+    ids = {
+        str(v.get("shopify_variant_id")).strip()
+        for v in variants
+        if isinstance(v, dict) and str(v.get("shopify_variant_id") or "").strip()
+    }
+    if len(ids) != 1:
+        return None
+    sole = next(iter(ids))
+    return sole if _numeric_id(sole) else None
