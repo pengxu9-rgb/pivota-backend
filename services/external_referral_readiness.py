@@ -1449,6 +1449,10 @@ async def run_external_referral_refresh_batch(
     # needs work — `_detect_currency_from_text` has no KRW case and the caller defaults
     # by market — not the writer.
     price_skipped_currency_mismatch = 0
+    # A fetch that produced a non-positive amount. Distinct from `unavailable` (no
+    # reading at all) because it means the extractor read something and got a broken
+    # offer shape — a different problem with a different fix.
+    price_skipped_non_positive = 0
     availability_changed = 0
     for seed_id in candidate_seed_ids:
         try:
@@ -1471,6 +1475,8 @@ async def run_external_referral_refresh_batch(
                     price_skipped_incomplete_pair += 1
                 elif price_status == "skipped_currency_mismatch":
                     price_skipped_currency_mismatch += 1
+                elif price_status == "skipped_non_positive":
+                    price_skipped_non_positive += 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
                 availability = result.get("availability_refresh")
@@ -1497,6 +1503,7 @@ async def run_external_referral_refresh_batch(
         "price_filled": price_filled,
         "price_skipped_incomplete_pair": price_skipped_incomplete_pair,
         "price_skipped_currency_mismatch": price_skipped_currency_mismatch,
+        "price_skipped_non_positive": price_skipped_non_positive,
         "availability_changed": availability_changed,
         "errors": errors[:20],
     }

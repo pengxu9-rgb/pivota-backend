@@ -4501,6 +4501,19 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     if fresh_amount is None:
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "unavailable"
+    elif fresh_amount <= 0:
+        # `price: 0` IS A DOCUMENTED BROKEN-OFFER SHAPE IN THIS CATALOG, not a free
+        # product. `_parse_price` strips every non-digit, so an unrenderable or
+        # sold-out PDP that emits `product:price:amount = 0` (or a currency glyph with
+        # no number) arrives here as a clean 0.0 — and "$0 / EUR price for US users"
+        # is recorded a few hundred lines up as an OBSERVED production symptom, not a
+        # hypothetical. The old COALESCE preserved the stored price in this cell, so
+        # writing it would be a regression introduced by the very change meant to make
+        # prices trustworthy — and it lands hardest on the out-of-stock cohort this
+        # work targets. Negative is unreachable (the minus sign is stripped upstream)
+        # but is covered by the same comparison rather than left to be discovered.
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_non_positive"
     elif fresh_currency is None:
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_incomplete_pair"

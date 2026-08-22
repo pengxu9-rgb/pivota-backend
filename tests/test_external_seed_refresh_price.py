@@ -181,11 +181,14 @@ def test_a_scraped_currency_may_not_redenominate_a_stored_offer(
     failed to READ a currency than that the merchant changed one, so the whole pair
     is refused and the refusal is counted.
     """
+    # The fresh AMOUNT differs from the stored one on purpose. With both equal, a mutant
+    # that half-applied (`next_amount = fresh_amount` while keeping `prev_currency`) —
+    # exactly the failure this guard exists to prevent — would survive undetected.
     row = _seed_row(price_amount=24000.0, price_currency="KRW")
-    result = _run_refresh(monkeypatch, row, _snapshot(price_amount=24000.0, price_currency="USD"))
+    result = _run_refresh(monkeypatch, row, _snapshot(price_amount=22000.0, price_currency="USD"))
 
     assert row["price_currency"] == "KRW", "a scraper must never silently redenominate"
-    assert row["price_amount"] == pytest.approx(24000.0)
+    assert row["price_amount"] == pytest.approx(24000.0), "the amount must not move without its currency"
 
     price = result["price_refresh"]
     assert price["status"] == "skipped_currency_mismatch"
@@ -309,4 +312,37 @@ def test_refresh_does_not_report_a_stock_flip_when_nothing_moved(
     result = _run_refresh(monkeypatch, row, _snapshot(availability="in_stock"))
 
     assert result["availability_refresh"]["status"] == "unchanged"
+    assert result["availability_refresh"]["changed"] is False
+
+
+def test_a_zero_price_is_refused_rather_than_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`price: 0` is a documented broken-offer shape here, not a free product.
+
+    `_parse_price` strips every non-digit, so an unrenderable or sold-out PDP emitting
+    `product:price:amount = 0` arrives as a clean 0.0. The old COALESCE preserved the
+    stored price in this cell — writing it would be a regression introduced by the
+    change meant to make prices trustworthy, and it lands hardest on the out-of-stock
+    cohort this work targets.
+    """
+    row = _seed_row()
+    result = _run_refresh(monkeypatch, row, _snapshot(price_amount=0.0))
+
+    assert row["price_amount"] == pytest.approx(28.0)
+    assert result["price_refresh"]["status"] == "skipped_non_positive"
+    assert result["price_refresh"]["changed"] is False
+
+
+def test_a_first_availability_fill_is_not_counted_as_a_stock_flip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the price-side `filled` split: learning a stock state for the first
+    time is not the same event as a product going out of stock, and only the latter
+    belongs in `availability_changed`."""
+    row = _seed_row(availability=None)
+    result = _run_refresh(monkeypatch, row, _snapshot(availability="in_stock"))
+
+    assert row["availability"] == "in_stock"
+    assert result["availability_refresh"]["status"] == "filled"
     assert result["availability_refresh"]["changed"] is False
