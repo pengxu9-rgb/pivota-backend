@@ -171,11 +171,25 @@ async def connect_wix_store_employee(
 @router.post("/merchant/onboarding/setup-psp")
 async def setup_merchant_psp(
     request: ConnectPSPRequest,
-    current_user: Optional[dict] = Depends(lambda: None)  # No auth required for merchant onboarding
+    current_user: dict = Depends(get_current_user)
 ):
-    """Setup PSP for a merchant (Employee action or Merchant self-service during onboarding)"""
-    # If user is authenticated, check permissions
-    if current_user and current_user.get("role") not in ["employee", "admin", "merchant"]:
+    """Setup PSP for a merchant (Employee action or Merchant self-service during onboarding).
+
+    AUTHENTICATION IS REQUIRED, and the guard below is now reachable.
+
+    This route previously declared its dependency as a no-op callable returning
+    None, with a comment saying no auth was required for onboarding. That made
+    `current_user` None on every request, so the role check was dead code - while
+    the handler writes `merchant_psps` rows (api_key, secret_key, account_id,
+    provider) for a **caller-supplied** merchant_id. It was reachable
+    unauthenticated from the public internet.
+
+    Every other route in this file already depended on get_current_user; this one
+    was the outlier, and it had no callers anywhere in the repo. Merchant
+    self-service is still supported - `merchant` remains in the allowed roles -
+    it just has to be a merchant who is signed in.
+    """
+    if current_user.get("role") not in ["employee", "admin", "merchant"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

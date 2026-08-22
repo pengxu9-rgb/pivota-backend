@@ -1,37 +1,38 @@
 """
-Quick setup endpoint to create database indexes
-Now requires admin authentication for security
+Quick setup endpoints that create database indexes and tables.
+
+BOTH ROUTES EXECUTE DDL AND BOTH REQUIRE ADMIN AUTHENTICATION.
+
+The previous version claimed in this very docstring that it "now requires admin
+authentication", and did not. `create_all_indexes` declared its user parameter
+with no dependency attached, so FastAPI bound it as an ordinary request-BODY
+field: the caller supplied it, any truthy value satisfied the check, and
+`require_admin` was imported twice and never called. `create_usage_logs_table`
+had no parameters and no check at all. Both were reachable unauthenticated from
+the public internet and ran DDL against production.
+
+The guard is now a real dependency, so it resolves before the handler and cannot
+be satisfied by request content. The optional env-var setup key is gone too: a
+route that already demands an authenticated admin does not need a second, weaker
+credential, and it was unset in production regardless.
+
+NOTE: neither route has a caller anywhere in this repo. Schema changes belong in
+db/migrations/, which is how every other index here is created. These are kept
+only because removing a mounted route is a product decision; if nothing calls
+them by the next cleanup pass, delete the module.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
 from utils.auth import require_admin
 import time
-import os
 
 router = APIRouter(prefix="/setup", tags=["setup"])
 
-# Allow without auth only in development or with special env var
-SETUP_KEY = os.getenv("SETUP_KEY", None)
 
 @router.post("/create-all-indexes")
-async def create_all_indexes(setup_key: str = None, current_user: dict = None):
-    """Create all database indexes to improve performance"""
-    
-    # Check authentication: either setup key or admin user
-    if SETUP_KEY:
-        if setup_key != SETUP_KEY:
-            # Try admin auth as fallback
-            try:
-                from utils.auth import require_admin
-                if not current_user:
-                    raise HTTPException(status_code=401, detail="Setup key invalid or admin authentication required")
-            except:
-                raise HTTPException(status_code=401, detail="Setup key invalid")
-    else:
-        # No setup key configured, require admin auth
-        if not current_user:
-            raise HTTPException(status_code=401, detail="Admin authentication required")
-    
+async def create_all_indexes(current_admin: dict = Depends(require_admin)):
+    """Create all database indexes to improve performance. Admin only."""
+
     indexes_created = []
     errors = []
     
@@ -76,8 +77,8 @@ async def create_all_indexes(setup_key: str = None, current_user: dict = None):
     }
 
 @router.post("/create-usage-logs-table")
-async def create_usage_logs_table():
-    """Create agent_usage_logs table if it doesn't exist"""
+async def create_usage_logs_table(current_admin: dict = Depends(require_admin)):
+    """Create agent_usage_logs table if it doesn't exist. Admin only."""
     try:
         await database.execute("""
             CREATE TABLE IF NOT EXISTS agent_usage_logs (
