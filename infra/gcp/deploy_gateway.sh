@@ -146,7 +146,7 @@ probe_health(){ # url -> echoes the status code
   --quiet
 
 CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
-  --format="value(status.traffic.extract(\"url\").flatten())" | tr ';' '\n' | grep -F "$CANDIDATE_TAG" | head -1)
+  --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1)
 [ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
 CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
 # macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under
