@@ -80,6 +80,7 @@ async def test_token_ctx_carries_seller_ref_alongside_anchor():
         platform=None,
         seller_ref="merch_obs_cafecafecafecafe",  # the SELLER (conversion subject)
         seed_kind="cross",
+        cart_variant_id=None,  # this test is about the token ctx, not the permalink
     )
     assert redirect_url is not None
     ctx = _decode_redirect(redirect_url)["ctx"]
@@ -105,6 +106,7 @@ async def test_token_ctx_omits_seller_keys_for_legacy_seed():
         platform=None,
         seller_ref=None,
         seed_kind=None,
+        cart_variant_id=None,
     )
     assert redirect_url is not None
     ctx = _decode_redirect(redirect_url)["ctx"]

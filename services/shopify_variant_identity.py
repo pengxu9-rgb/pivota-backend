@@ -19,14 +19,15 @@ for **81 of 81** reachable Shopify PDPs.
 WHAT THIS MODULE IS, AND WHAT IT IS NOT. The pure decision logic: URL derivation, `.js`
 parsing, and the matching rule. It touches no database, no network and no serving path.
 
-There is deliberately NO CONSUMER YET. Three review rounds on the original PR each found a
-P0 in the previous round's fix, and the last one showed why: a recovered id still cannot
-build a cart permalink, because `_make_external_redirect_url` gates that on `is_shopify`
-while crawl seeds carry `platform = "external_seed"` on custom domains. The blocker is at
-the CONSUMER end, so the ops script and the serving-side change were cut rather than shipped
-against a path that could not use them. Whoever picks this up should start from
-`_make_external_redirect_url`, prove a cart URL end to end for one domain, and only then
-wire a backfill to feed it.
+THE CONSUMER SHIPPED IN #1813 and lives at the bottom of this file: `storefront_is_shopify`
+and `sole_stamped_variant_id`, read by `routes/agent_shop_gateway._external_seed_redirect_identity`
+to flip a crawl seed's intake-lane label to a real `platform="shopify"` and prefill a cart
+permalink. The producer that writes that evidence is `scripts/backfill_shopify_variant_ids.py`.
+
+(An earlier revision of this paragraph said there was "deliberately no consumer yet" and that
+the serving change had been "cut". That was true for about a day and then shipped, and the
+note outlived it — the same stale-doc failure this codebase has been bitten by before. If you
+are reading a claim like that here again, check it against the code before believing it.)
 
 WHAT IT WRITES, AND WHERE. A NEW key, `shopify_variant_id`, on each EXISTING seed variant.
 

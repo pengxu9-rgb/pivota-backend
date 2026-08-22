@@ -8,10 +8,10 @@ right answer is "no answer".
 Fixtures are shaped from real `/products/<handle>.js` bodies observed on 2026-08-21 while
 probing the K-beauty cohort (numeric ids, `price` in minor units, `options` array).
 
-SCOPE. This module is the decision logic only. The ops script that walks the cohort, and the
-serving-side change that would let a recovered id reach a cart permalink, were both cut from
-this PR after review — see the PR description. Nothing here touches a database, the network,
-or a serving path.
+SCOPE. The decision logic, plus the consumer-side rules that shipped in #1813 — the tests at
+the bottom drive the real `_external_seed_redirect_identity` and `_make_external_redirect_url`.
+Nothing here touches a database or the network. The producer's SQL is covered separately, and
+against a real Postgres, by tests/test_backfill_shopify_variant_ids_postgres.py.
 """
 
 from __future__ import annotations
@@ -376,7 +376,16 @@ def test_a_real_attached_platform_is_never_overridden_by_snapshot_evidence() -> 
     assert identity["platform"] == "wix"
 
 
-def test_a_numeric_attached_variant_id_always_wins_over_the_stamped_one() -> None:
+def test_the_stamped_id_wins_the_cart_even_when_another_numeric_id_is_present() -> None:
+    """CORRECTED IN ROUND 5. This test previously asserted the opposite — "a numeric id in
+    hand needs no second channel" — and that invariant was wrong.
+
+    Being all-digits is not evidence of being a SHOPIFY variant id. `attached_variant_id`
+    and the `_seed_offer_variant_id` chain both routinely carry numeric SKUs, and treating
+    those as permalink-ready built carts from numbers Shopify never issued. When the platform
+    label is evidence-derived, the stamped id is the only value with evidence behind it, so
+    it owns the cart. `variant_id` is untouched and still owns attribution.
+    """
     from routes.agent_shop_gateway import _external_seed_redirect_identity
 
     identity = _external_seed_redirect_identity(
@@ -384,8 +393,8 @@ def test_a_numeric_attached_variant_id_always_wins_over_the_stamped_one() -> Non
         seed_data=_evidence_seed("41234567890123"),
     )
 
-    assert identity["variant_id"] == "40000000000001"
-    assert identity["cart_variant_id"] is None, "a numeric id in hand needs no second channel"
+    assert identity["variant_id"] == "40000000000001", "attribution unchanged"
+    assert identity["cart_variant_id"] == "41234567890123", "the cart uses the EVIDENCED id"
 
 
 def _dest_of(redirect_url: str) -> str:
@@ -522,3 +531,181 @@ def test_junk_stamped_values_are_not_evidence() -> None:
     junk = {"snapshot": {"variants": [{"shopify_variant_id": True}]}}
     assert storefront_is_shopify(junk) is False
     assert sole_stamped_variant_id(junk) is None
+
+
+def test_a_numeric_SKU_can_never_be_used_as_a_cart_variant_id() -> None:
+    """ROUND-5 P0. `variant_id` here comes from `_seed_offer_variant_id`
+    (variant_id | variantId | sku | sku_id | id), and a plain NUMERIC SKU satisfies
+    `extract_shopify_numeric_variant_id` by design — so the old guard skipped its branch and
+    the builder's `cart_variant_id or variant_id` fallback prefilled a cart from a number
+    Shopify never issued as a variant id. On a multi-variant product it did so even though
+    `sole_stamped_variant_id` had deliberately declined.
+    """
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(),
+        seed_data=_evidence_seed("41234567890123"),
+        offer_variant_id="80072940",  # an all-digit SKU, not a Shopify variant id
+    )
+
+    assert identity["cart_variant_id"] == "41234567890123", "the STAMPED id, not the SKU"
+    assert identity["variant_id"] == "80072940", "attribution still sees the SKU"
+
+
+def test_a_declined_prefill_is_not_rescued_by_a_numeric_sku() -> None:
+    """The multi-variant case, which is the dangerous one: the guard declines, and the
+    permalink must decline with it rather than fall back to whatever digits are lying around."""
+    import asyncio
+
+    from routes.agent_shop_gateway import (
+        _external_seed_redirect_identity,
+        _make_external_redirect_url,
+    )
+
+    seed = {"snapshot": {"storefront_platform": "shopify", "variants": [
+        {"title": "30ml", "shopify_variant_id": "41234567890123"},
+        {"title": "50ml"},
+        {"title": "100ml"},
+    ]}}
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=seed, offer_variant_id="80072940"
+    )
+    assert identity["cart_variant_id"] is None, "3 variants, 1 stamped -> decline"
+
+    redirect_url = asyncio.run(
+        _make_external_redirect_url(
+            market="US", tool="*",
+            destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
+            utm_template=None, ctx={"seedId": "eps_1"}, allowed_domains=["genabelle.com"],
+            merchant_id=identity["merchant_id"], product_id=identity["product_id"],
+            variant_id=identity["variant_id"],
+            cart_variant_id=identity["cart_variant_id"],
+            shop_domain=identity["shop_domain"], platform=identity["platform"],
+            seller_ref=identity["seller_ref"], seed_kind=identity["seed_kind"],
+        )
+    )
+
+    dest = _dest_of(redirect_url)
+    assert "/cart/" not in dest, dest
+    assert "80072940" not in dest, "a SKU must never reach a cart URL"
+
+
+def test_a_caller_that_cannot_justify_an_id_gets_no_cart_at_all() -> None:
+    """There is no fallback. `variant_id` alone — the attribution value — must never reach the
+    permalink, however Shopify-shaped it looks. A caller that can justify its id passes
+    `cart_variant_id` explicitly; one that cannot gets referral_only."""
+    import asyncio
+
+    from routes.agent_shop_gateway import _make_external_redirect_url
+
+    without = asyncio.run(
+        _make_external_redirect_url(
+            market="US", tool="*", destination_url="https://shop.example/products/x",
+            utm_template=None, ctx={"source": "connected_catalog"},
+            allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
+            variant_id="41234567890123", cart_variant_id=None,
+            shop_domain="shop.example", platform="shopify",
+        )
+    )
+    assert "/cart/" not in _dest_of(without), "variant_id alone must not build a cart"
+
+    # the connected lane justifies its id by provenance and passes it deliberately
+    with_claim = asyncio.run(
+        _make_external_redirect_url(
+            market="US", tool="*", destination_url="https://shop.example/products/x",
+            utm_template=None, ctx={"source": "connected_catalog"},
+            allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
+            variant_id="41234567890123", cart_variant_id="41234567890123",
+            shop_domain="shop.example", platform="shopify",
+        )
+    )
+    assert "/cart/41234567890123:1" in _dest_of(with_claim)
+
+
+def test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain() -> None:
+    """The door round 5 left open: platform is writer-verified (no evidence flip), so the old
+    conditional fallback still fired and built a cart from the SKU chain. The attached variant
+    id is catalog identity and may be used; a SKU may not."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    sku_only = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1"),
+        seed_data={}, offer_variant_id="80072940",
+    )
+    assert sku_only["platform"] == "shopify"
+    assert sku_only["cart_variant_id"] is None, "a SKU is not a Shopify variant id"
+
+    attached = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1",
+                       attached_variant_id="41234567890123"),
+        seed_data={}, offer_variant_id="80072940",
+    )
+    assert attached["cart_variant_id"] == "41234567890123"
+
+
+def test_the_attached_branch_requires_the_platform_to_be_shopify() -> None:
+    """Round-6 F5: the platform gate on the attached branch was untested. A wix-attached seed
+    on a .myshopify.com host would otherwise offer a cart id for a non-Shopify storefront."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    wix = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::wix::p1",
+                       attached_variant_id="41234567890123"),
+        seed_data={},
+    )
+    assert wix["platform"] == "wix"
+    assert wix["cart_variant_id"] is None
+
+
+def test_the_production_default_attached_variant_id_is_not_a_cart_id() -> None:
+    """Round-6 F5: `attach_external_seed` defaults attached_variant_id to the sentinel "∅",
+    so this is the value most attached seeds actually carry. It must not reach a cart."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1",
+                       attached_variant_id="∅"),
+        seed_data={},
+    )
+    assert identity["cart_variant_id"] is None
+
+
+def test_storefront_evidence_outranks_an_operator_typed_attached_id() -> None:
+    """Round-6 F5: nothing pinned which wins when BOTH exist. Evidence is the stronger
+    provenance — it came from the storefront itself, not from a text field — so a seed whose
+    lane label is still `external_seed` takes the stamped id even though an attached variant
+    id is present."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_variant_id="99999999999999"),
+        seed_data=_evidence_seed("41234567890123"),
+    )
+    assert identity["cart_variant_id"] == "41234567890123"
+
+
+def test_an_attached_shopify_seed_prefers_catalog_identity_over_storefront_evidence() -> None:
+    """Pins a DELIBERATE choice that nothing previously constrained.
+
+    When a seed is BOTH attached-Shopify (platform writer-verified) and carries storefront
+    evidence, two ids compete: `attached_variant_id` (catalog identity, but operator-typed
+    and unenforced — see the provenance note in _external_seed_redirect_identity) and the
+    stamped id (proven by the storefront's own /products/x.js).
+
+    Current behaviour: the attached id wins, because a writer-verified platform means a human
+    or a sync deliberately linked this seed to a catalog row, and overriding that with a crawl
+    artefact would make the attachment meaningless. The counter-argument is real — storefront
+    evidence has the stronger provenance — so this is pinned rather than left to chance, and
+    it is the assertion to change if that trade is ever revisited.
+    """
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1",
+                       attached_variant_id="99999999999999"),
+        seed_data=_evidence_seed("41234567890123"),
+    )
+
+    assert identity["platform"] == "shopify"
+    assert identity["cart_variant_id"] == "99999999999999", "catalog identity wins here"
