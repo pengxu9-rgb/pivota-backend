@@ -8,10 +8,10 @@ right answer is "no answer".
 Fixtures are shaped from real `/products/<handle>.js` bodies observed on 2026-08-21 while
 probing the K-beauty cohort (numeric ids, `price` in minor units, `options` array).
 
-SCOPE. This module is the decision logic only. The ops script that walks the cohort, and the
-serving-side change that would let a recovered id reach a cart permalink, were both cut from
-this PR after review — see the PR description. Nothing here touches a database, the network,
-or a serving path.
+SCOPE. The decision logic, plus the consumer-side rules that shipped in #1813 — the tests at
+the bottom drive the real `_external_seed_redirect_identity` and `_make_external_redirect_url`.
+Nothing here touches a database or the network. The producer's SQL is covered separately, and
+against a real Postgres, by tests/test_backfill_shopify_variant_ids_postgres.py.
 """
 
 from __future__ import annotations
@@ -376,7 +376,16 @@ def test_a_real_attached_platform_is_never_overridden_by_snapshot_evidence() -> 
     assert identity["platform"] == "wix"
 
 
-def test_a_numeric_attached_variant_id_always_wins_over_the_stamped_one() -> None:
+def test_the_stamped_id_wins_the_cart_even_when_another_numeric_id_is_present() -> None:
+    """CORRECTED IN ROUND 5. This test previously asserted the opposite — "a numeric id in
+    hand needs no second channel" — and that invariant was wrong.
+
+    Being all-digits is not evidence of being a SHOPIFY variant id. `attached_variant_id`
+    and the `_seed_offer_variant_id` chain both routinely carry numeric SKUs, and treating
+    those as permalink-ready built carts from numbers Shopify never issued. When the platform
+    label is evidence-derived, the stamped id is the only value with evidence behind it, so
+    it owns the cart. `variant_id` is untouched and still owns attribution.
+    """
     from routes.agent_shop_gateway import _external_seed_redirect_identity
 
     identity = _external_seed_redirect_identity(
@@ -384,8 +393,8 @@ def test_a_numeric_attached_variant_id_always_wins_over_the_stamped_one() -> Non
         seed_data=_evidence_seed("41234567890123"),
     )
 
-    assert identity["variant_id"] == "40000000000001"
-    assert identity["cart_variant_id"] is None, "a numeric id in hand needs no second channel"
+    assert identity["variant_id"] == "40000000000001", "attribution unchanged"
+    assert identity["cart_variant_id"] == "41234567890123", "the cart uses the EVIDENCED id"
 
 
 def _dest_of(redirect_url: str) -> str:
@@ -522,3 +531,82 @@ def test_junk_stamped_values_are_not_evidence() -> None:
     junk = {"snapshot": {"variants": [{"shopify_variant_id": True}]}}
     assert storefront_is_shopify(junk) is False
     assert sole_stamped_variant_id(junk) is None
+
+
+def test_a_numeric_SKU_can_never_be_used_as_a_cart_variant_id() -> None:
+    """ROUND-5 P0. `variant_id` here comes from `_seed_offer_variant_id`
+    (variant_id | variantId | sku | sku_id | id), and a plain NUMERIC SKU satisfies
+    `extract_shopify_numeric_variant_id` by design — so the old guard skipped its branch and
+    the builder's `cart_variant_id or variant_id` fallback prefilled a cart from a number
+    Shopify never issued as a variant id. On a multi-variant product it did so even though
+    `sole_stamped_variant_id` had deliberately declined.
+    """
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(),
+        seed_data=_evidence_seed("41234567890123"),
+        offer_variant_id="80072940",  # an all-digit SKU, not a Shopify variant id
+    )
+
+    assert identity["platform_from_evidence"] is True
+    assert identity["cart_variant_id"] == "41234567890123", "the STAMPED id, not the SKU"
+    assert identity["variant_id"] == "80072940", "attribution still sees the SKU"
+
+
+def test_a_declined_prefill_is_not_rescued_by_a_numeric_sku() -> None:
+    """The multi-variant case, which is the dangerous one: the guard declines, and the
+    permalink must decline with it rather than fall back to whatever digits are lying around."""
+    import asyncio
+
+    from routes.agent_shop_gateway import (
+        _external_seed_redirect_identity,
+        _make_external_redirect_url,
+    )
+
+    seed = {"snapshot": {"storefront_platform": "shopify", "variants": [
+        {"title": "30ml", "shopify_variant_id": "41234567890123"},
+        {"title": "50ml"},
+        {"title": "100ml"},
+    ]}}
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=seed, offer_variant_id="80072940"
+    )
+    assert identity["cart_variant_id"] is None, "3 variants, 1 stamped -> decline"
+
+    redirect_url = asyncio.run(
+        _make_external_redirect_url(
+            market="US", tool="*",
+            destination_url="https://genabelle.com/products/melacare-jelly-touch-dual-pad",
+            utm_template=None, ctx={"seedId": "eps_1"}, allowed_domains=["genabelle.com"],
+            merchant_id=identity["merchant_id"], product_id=identity["product_id"],
+            variant_id=identity["variant_id"],
+            cart_variant_id=identity["cart_variant_id"],
+            platform_from_evidence=identity["platform_from_evidence"],
+            shop_domain=identity["shop_domain"], platform=identity["platform"],
+            seller_ref=identity["seller_ref"], seed_kind=identity["seed_kind"],
+        )
+    )
+
+    dest = _dest_of(redirect_url)
+    assert "/cart/" not in dest, dest
+    assert "80072940" not in dest, "a SKU must never reach a cart URL"
+
+
+def test_the_connected_merchant_lane_keeps_its_variant_id_fallback() -> None:
+    """`platform_from_evidence` defaults False, so a writer-verified platform — where
+    variant_id IS a real Shopify variant id — is unaffected by the round-5 tightening."""
+    import asyncio
+
+    from routes.agent_shop_gateway import _make_external_redirect_url
+
+    redirect_url = asyncio.run(
+        _make_external_redirect_url(
+            market="US", tool="*", destination_url="https://shop.example/products/x",
+            utm_template=None, ctx={"source": "connected_catalog"},
+            allowed_domains=["shop.example"], merchant_id="merch_1", product_id="p1",
+            variant_id="41234567890123", shop_domain="shop.example", platform="shopify",
+        )
+    )
+
+    assert "/cart/41234567890123:1" in _dest_of(redirect_url)

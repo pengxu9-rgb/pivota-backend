@@ -89,8 +89,23 @@ PER_DOMAIN_MIN_GAP_S = float(os.getenv("VARIANT_BACKFILL_DOMAIN_GAP_S", "3.0"))
 REQUEST_TIMEOUT_S = float(os.getenv("VARIANT_BACKFILL_TIMEOUT_S", "20"))
 CONSECUTIVE_BLOCK_ABORT = int(os.getenv("VARIANT_BACKFILL_ABORT_AFTER_BLOCKS", "8"))
 # Every shape a bot block actually takes, not only the 429 observed on 2026-08-21. A
-# Cloudflare block is commonly 403, or 200 + a challenge page (which lands as not_json).
-BLOCK_OUTCOMES = frozenset({"rate_limited", "http_403", "http_503", "not_json"})
+# Cloudflare block is commonly 403, or 200 + a challenge page.
+#
+# `not_json` is NOT here, and that is a correction: it was, and it conflates a Cloudflare
+# challenge with a THEMED SOFT-404 — a dead product handle rendering the shop's 404 page with
+# status 200. Those are the same bytes to us but opposite facts, and treating a brand's dead
+# handles as a block aborted the entire sweep on one brand's rot. A challenge page is
+# indistinguishable here, so it is counted as a per-domain signal (`most_blocked_domains`)
+# rather than allowed to stop the run.
+#
+# `error:*` IS here, via the prefix check below: an IP-level block usually presents as 403s
+# INTERLEAVED with connection resets, and treating a reset as "not a block" reset the counter
+# on every other request — 40 requests into a live block without aborting, measured.
+BLOCK_OUTCOMES = frozenset({"rate_limited", "http_403", "http_503", "http_502", "http_520", "http_521"})
+
+
+def _is_block(outcome: str) -> bool:
+    return outcome in BLOCK_OUTCOMES or outcome.startswith("error:")
 
 STOREFRONT_PLATFORM = "shopify"
 STOREFRONT_PLATFORM_SOURCE = "products_js_v1"
@@ -125,12 +140,20 @@ SELECT_CANDIDATES_SQL = f"""
       -- partially-covered row eligible, and retires it once every variant is stamped.
       AND EXISTS (
             SELECT 1 FROM jsonb_array_elements({_SNAPSHOT_VARIANTS_SAFE}) AS v
-            WHERE COALESCE(v->>'shopify_variant_id', '') = ''
+            -- NUMERIC, not merely non-empty. A live writer lands unvalidated variant keys
+            -- here (recover_seed_data_from_catalog_extract -> seed_data_writer), and junk like
+            -- `true` would otherwise mark the row covered and retire it from the backfill
+            -- permanently — unrepairable, and useless to the consumer, which requires numeric.
+            WHERE COALESCE(v->>'shopify_variant_id', '') !~ '^[0-9]+$'
           )
       {{domain_clause}}
-    -- ORDER BY id, not updated_at: this script deliberately does not bump updated_at, so
-    -- ordering by it would re-walk the same head every run. Every eligibility condition is
-    -- in SQL, BEFORE the LIMIT, so a run cannot spend its budget discarding rows in Python.
+      {{cursor_clause}}
+    -- ORDER BY id + a CURSOR, because eligibility alone is not progress. A row that can never
+    -- be stamped — a dead handle (6.7% of a live sample), or any `no_confident_match` — stays
+    -- eligible forever and sorts to the front, so a plain `ORDER BY id LIMIT n` re-fetched the
+    -- identical unproductive prefix on every run and never reached row n+1. Measured: four
+    -- consecutive runs, same three dead rows, zero stamped. `--after` pages past them; the run
+    -- reports `next_cursor` so a sweep can be resumed rather than restarted.
     ORDER BY id
     LIMIT :limit
 """
@@ -185,8 +208,14 @@ class Pacer:
         self._last_by_domain[domain] = stamp
 
 
-async def select_candidates(limit: int, domain: Optional[str]) -> List[Dict[str, Any]]:
+async def select_candidates(
+    limit: int, domain: Optional[str], after: Optional[str] = None
+) -> List[Dict[str, Any]]:
     values: Dict[str, Any] = {"limit": max(1, int(limit))}
+    cursor_clause = ""
+    if after:
+        cursor_clause = "AND id > :after"
+        values["after"] = after
     domain_clause = ""
     if domain:
         # Suffix match with a leading dot OR exact, so `--domain brand.com` covers
@@ -198,7 +227,8 @@ async def select_candidates(limit: int, domain: Optional[str]) -> List[Dict[str,
         values["domain_exact"] = domain
         values["domain_suffix"] = f"%.{safe}"
     rows = await database.fetch_all(
-        SELECT_CANDIDATES_SQL.format(domain_clause=domain_clause), values
+        SELECT_CANDIDATES_SQL.format(domain_clause=domain_clause, cursor_clause=cursor_clause),
+        values,
     )
     return [dict(r) for r in rows or []]
 
@@ -267,8 +297,10 @@ async def fetch_product_js(client: Any, url: str) -> Tuple[Optional[Any], str]:
         return None, "unparseable"
 
 
-async def run(limit: int, domain: Optional[str], apply: bool, client: Any) -> Dict[str, Any]:
-    rows = await select_candidates(limit=limit, domain=domain)
+async def run(
+    limit: int, domain: Optional[str], apply: bool, client: Any, after: Optional[str] = None
+) -> Dict[str, Any]:
+    rows = await select_candidates(limit=limit, domain=domain, after=after)
     pacer = Pacer()
     outcomes: Counter = Counter()
     reasons: Counter = Counter()
@@ -299,11 +331,18 @@ async def run(limit: int, domain: Optional[str], apply: bool, client: Any) -> Di
             continue
 
         host = urlparse(js_url).hostname or (row.get("domain") or "unknown")
+        if domain and not (host == domain or host.endswith(f".{domain}")):
+            # `--domain` filters the domain COLUMN, but the fetch host comes from
+            # canonical_url and the two can disagree. The rollout plan ("one --domain at
+            # --limit 5") and the shared-NAT blast-radius argument both assume --domain
+            # bounds which hosts are contacted, so it has to bound them here too.
+            outcomes["host_outside_domain_filter"] += 1
+            continue
         await pacer.wait(host)
         payload, outcome = await fetch_product_js(client, js_url)
         outcomes[outcome] += 1
 
-        if outcome in BLOCK_OUTCOMES:
+        if _is_block(outcome):
             consecutive_blocks += 1
             per_domain_blocks[host] += 1
             if consecutive_blocks >= CONSECUTIVE_BLOCK_ABORT:
@@ -343,6 +382,10 @@ async def run(limit: int, domain: Optional[str], apply: bool, client: Any) -> Di
     return {
         "mode": "apply" if apply else "dry_run",
         "aborted_on_block": aborted,
+        # Resume point. Feed back as --after so the next run starts past everything this one
+        # already walked, stampable or not. Without it the sweep re-fetches its own permanent
+        # failures forever and never reaches the rest of the cohort.
+        "next_cursor": (rows[-1]["id"] if rows and not aborted else None),
         "candidates": len(rows),
         "rows_with_new_ids": changed_rows,
         "variant_ids_stamped": stamped_total,
@@ -360,6 +403,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--domain", type=str, default=None, help="one storefront (suffix match)")
     parser.add_argument("--apply", action="store_true", help="write; omit for a dry run")
+    parser.add_argument("--after", type=str, default=None,
+                        help="resume past this seed id (use next_cursor from a prior run)")
     args = parser.parse_args()
 
     async def _main() -> Dict[str, Any]:
@@ -367,7 +412,8 @@ def main() -> int:
         try:
             async with httpx.AsyncClient() as client:
                 return await run(
-                    limit=args.limit, domain=args.domain, apply=args.apply, client=client
+                    limit=args.limit, domain=args.domain, apply=args.apply,
+                    client=client, after=args.after,
                 )
         finally:
             await database.disconnect()

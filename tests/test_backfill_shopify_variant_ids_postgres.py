@@ -107,10 +107,12 @@ def _snapshot(*variants: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
     return {"snapshot": {"variants": list(variants), **extra}}
 
 
-async def _select(limit: int = 50, domain: Optional[str] = None) -> List[Dict[str, Any]]:
+async def _select(
+    limit: int = 50, domain: Optional[str] = None, after: Optional[str] = None
+) -> List[Dict[str, Any]]:
     from scripts.backfill_shopify_variant_ids import select_candidates
 
-    return await select_candidates(limit=limit, domain=domain)
+    return await select_candidates(limit=limit, domain=domain, after=after)
 
 
 # ---------------------------------------------------------------------------- selection
@@ -473,3 +475,139 @@ async def test_a_sustained_block_aborts_instead_of_deepening_it(_db) -> None:
 
     assert summary["aborted_on_block"] is True
     assert _Client.calls == CONSECUTIVE_BLOCK_ABORT, "must stop AT the threshold, not after"
+
+
+# ------------------------------------------------------- round-5 review: the sweep must progress
+
+async def test_a_sweep_pages_past_rows_it_can_never_stamp(_db) -> None:
+    """THE WEDGE. A dead handle or an unmatchable label stays ELIGIBLE forever and sorts
+    first, so `ORDER BY id LIMIT n` re-fetched the identical unproductive prefix on every run
+    and never reached row n+1. Measured before the fix: four consecutive runs, same three dead
+    rows, zero stamped. The cursor is what turns eligibility into progress."""
+    for i in range(5):
+        await _insert(_db, f"s{i}", _snapshot({"title": "30ml"}),
+                      url=f"https://brand.com/products/p{i}")
+
+    first = await _select(limit=2)
+    assert [r["id"] for r in first] == ["s0", "s1"]
+
+    second = await _select(limit=2, after=first[-1]["id"])
+    assert [r["id"] for r in second] == ["s2", "s3"], "the run must move on, not re-walk"
+
+
+async def test_the_run_reports_a_resume_point(_db) -> None:
+    from scripts.backfill_shopify_variant_ids import run
+
+    for i in range(3):
+        await _insert(_db, f"s{i}", _snapshot({"title": "30ml"}),
+                      url=f"https://brand.com/products/p{i}")
+
+    class _Dead:
+        status_code = 404
+        headers = {"content-type": "text/html"}
+
+    class _Client:
+        async def get(self, url, **kwargs):
+            return _Dead()
+
+    summary = await run(limit=2, domain=None, apply=False, client=_Client())
+
+    assert summary["next_cursor"] == "s1", "a run of pure failures must still advance"
+    assert summary["fetch_outcomes"]["dead_handle"] == 2
+
+
+async def test_junk_in_shopify_variant_id_does_not_retire_a_row(_db) -> None:
+    """A live writer lands unvalidated variant keys here. Junk marked the row covered and
+    retired it from the backfill permanently — unrepairable, and useless to the consumer,
+    which requires a numeric id."""
+    await _insert(_db, "junk", _snapshot({"title": "a", "shopify_variant_id": True}))
+    await _insert(_db, "obj", _snapshot({"title": "a", "shopify_variant_id": {"a": 1}}))
+    await _insert(_db, "real", _snapshot({"title": "a", "shopify_variant_id": "41234567890123"}))
+
+    assert sorted(r["id"] for r in await _select()) == ["junk", "obj"]
+
+
+async def test_a_brands_dead_handles_do_not_abort_the_whole_sweep(_db) -> None:
+    """`not_json` conflated a Cloudflare challenge with a THEMED SOFT-404 — the same bytes,
+    opposite facts. Wired to the global abort, one brand's rot bricked the backfill: every
+    later run selected the same rows, aborted, exited 1, stamped nothing."""
+    from scripts.backfill_shopify_variant_ids import CONSECUTIVE_BLOCK_ABORT, run
+    import scripts.backfill_shopify_variant_ids as mod
+
+    for i in range(CONSECUTIVE_BLOCK_ABORT + 2):
+        await _insert(_db, f"s{i:02d}", _snapshot({"title": "30ml"}),
+                      url=f"https://brand.com/products/p{i}")
+
+    class _SoftFourOhFour:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+
+    class _Client:
+        async def get(self, url, **kwargs):
+            return _SoftFourOhFour()
+
+    prev = (mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S)
+    mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = 0.0, 0.0
+    try:
+        summary = await run(limit=50, domain=None, apply=False, client=_Client())
+    finally:
+        mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = prev
+
+    assert summary["aborted_on_block"] is False, "soft-404s are the seed's rot, not our block"
+    assert summary["fetch_outcomes"]["not_json"] == CONSECUTIVE_BLOCK_ABORT + 2
+
+
+async def test_403s_interleaved_with_connection_resets_still_abort(_db) -> None:
+    """What an IP-level block actually looks like. Treating a reset as "not a block" reset the
+    counter on every other request — 40 requests into a live block without aborting."""
+    from scripts.backfill_shopify_variant_ids import CONSECUTIVE_BLOCK_ABORT, run
+    import scripts.backfill_shopify_variant_ids as mod
+
+    for i in range(40):
+        await _insert(_db, f"s{i:02d}", _snapshot({"title": "30ml"}),
+                      url=f"https://brand.com/products/p{i}")
+
+    class _Forbidden:
+        status_code = 403
+        headers = {"content-type": "text/html"}
+
+    class _Client:
+        n = 0
+
+        async def get(self, url, **kwargs):
+            _Client.n += 1
+            if _Client.n % 2 == 0:
+                raise ConnectionResetError("peer reset")
+            return _Forbidden()
+
+    prev = (mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S)
+    mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = 0.0, 0.0
+    try:
+        summary = await run(limit=50, domain=None, apply=False, client=_Client())
+    finally:
+        mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = prev
+
+    assert summary["aborted_on_block"] is True
+    assert _Client.n == CONSECUTIVE_BLOCK_ABORT
+
+
+async def test_domain_bounds_the_hosts_actually_contacted(_db) -> None:
+    """`--domain` filtered the domain COLUMN while the fetch host came from canonical_url.
+    The rollout plan and the shared-NAT blast-radius argument both assume it bounds which
+    hosts are contacted."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert(_db, "mismatch", _snapshot({"title": "a"}), domain="brand.com",
+                  url="https://other-store.example/products/x")
+
+    class _Client:
+        calls: List[str] = []
+
+        async def get(self, url, **kwargs):
+            _Client.calls.append(url)
+            raise AssertionError("must not be fetched")
+
+    summary = await run(limit=5, domain="brand.com", apply=False, client=_Client())
+
+    assert _Client.calls == []
+    assert summary["fetch_outcomes"]["host_outside_domain_filter"] == 1

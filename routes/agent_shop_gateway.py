@@ -4163,6 +4163,7 @@ async def _handle_offers_resolve(
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
+                    platform_from_evidence=bool(redirect_identity.get("platform_from_evidence")),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
@@ -6990,10 +6991,23 @@ def _external_seed_redirect_identity(
     # pre-change values byte for byte, and the recovered id travels on `cart_variant_id`,
     # a channel only the cart-permalink construction reads — never the token ctx.
     cart_variant_id: Optional[str] = None
+    platform_from_evidence = False
     if platform in (None, "external_seed") and storefront_is_shopify(seed_data):
         platform = "shopify"
-        if not extract_shopify_numeric_variant_id(variant_id):
-            cart_variant_id = sole_stamped_variant_id(seed_data)
+        platform_from_evidence = True
+        # ROUND-5 CORRECTION. This used to run only `if not extract_shopify_numeric_variant_id(
+        # variant_id)`, on the reasoning that a numeric id already in hand needs no second
+        # channel. That reasoning was wrong: `variant_id` here comes from
+        # `_seed_offer_variant_id` (variant_id | variantId | sku | sku_id | id), and a plain
+        # NUMERIC SKU satisfies extract_shopify_numeric_variant_id by design. So a seed whose
+        # sku was e.g. "80072940" skipped this branch, and the builder's `cart_variant_id or
+        # variant_id` fallback then prefilled a cart from a number Shopify never issued as a
+        # variant id — INCLUDING on multi-variant products where sole_stamped_variant_id had
+        # deliberately declined. Demonstrated end to end before this fix.
+        #
+        # When the platform label is EVIDENCE-DERIVED, the stamped id is the only value we
+        # have any evidence for, so it is used unconditionally or the permalink is declined.
+        cart_variant_id = sole_stamped_variant_id(seed_data)
 
     return {
         "merchant_id": merchant_id,
@@ -7001,6 +7015,10 @@ def _external_seed_redirect_identity(
         "product_id": canonical_product_id,
         "variant_id": variant_id,
         "cart_variant_id": cart_variant_id,
+        # Tells the builder it may NOT fall back to `variant_id` for the permalink. False for
+        # writer-verified platforms (the connected-merchant lane), where variant_id IS a real
+        # Shopify variant id and the fallback is correct.
+        "platform_from_evidence": platform_from_evidence,
         "shop_domain": shop_domain,
         "seller_ref": seller_ref,
         "seed_kind": seed_kind,
@@ -7024,6 +7042,10 @@ async def _make_external_redirect_url(
     # ids both ways and a numeric variant id must not leak up a grain into
     # canonical_product_id (round-4 review of #1813).
     cart_variant_id: Optional[str] = None,
+    # When True, `cart_variant_id` is AUTHORITATIVE and the permalink must not fall back to
+    # `variant_id` — see the round-5 note in _external_seed_redirect_identity. Defaults False
+    # so the connected-merchant caller, whose variant_id is writer-verified, is unaffected.
+    platform_from_evidence: bool = False,
     shop_domain: Optional[str] = None,
     platform: Optional[str] = None,
     quantity: int = 1,
@@ -7054,7 +7076,7 @@ async def _make_external_redirect_url(
     if is_shopify:
         cart_base = shopify_cart_base_url(
             shop_domain=shop_domain or destination_url,
-            variant_id=cart_variant_id or variant_id,
+            variant_id=cart_variant_id if platform_from_evidence else (cart_variant_id or variant_id),
             quantity=quantity,
         )
     join_mode = "cart_permalink" if cart_base else "referral_only"
@@ -7289,6 +7311,7 @@ async def _build_prefetched_external_seed_wrappers(
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
+                    platform_from_evidence=bool(redirect_identity.get("platform_from_evidence")),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
@@ -9612,6 +9635,7 @@ async def _handle_find_products_multi_inner(
                     product_id=redirect_identity["product_id"],
                     variant_id=redirect_identity["variant_id"],
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
+                    platform_from_evidence=bool(redirect_identity.get("platform_from_evidence")),
                     shop_domain=redirect_identity["shop_domain"],
                     platform=redirect_identity["platform"],
                     seller_ref=redirect_identity["seller_ref"],
