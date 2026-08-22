@@ -31,7 +31,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # Full history, deliberately. Every question this job asks - is the live SHA an
+          # ancestor of main, how many commits behind is it, is the gap docs-only - can only
+          # be answered if the live commit exists in this checkout. Under a shallow clone it
+          # never does, so the job fell through to its "cannot classify" branch on EVERY run
+          # and reported a divergence that had not happened. That also made the docs-only
+          # exemption below unreachable, which is the exact crying-wolf this job must avoid.
+          # blob:none keeps it cheap: the diffs here are --name-only, which needs trees, not
+          # file contents.
+          fetch-depth: 0
+          filter: blob:none
 
       - name: Compare live production against this commit
         run: |
@@ -81,7 +90,9 @@ jobs:
             echo "runtime-affecting files not in production:"
             printf '%s\n' "$RUNTIME_CHANGED" | sed 's/^/  /'
           else
-            echo "note: $LIVE_SHA is not in this checkout - cannot classify the gap, treating as runtime drift"
+            echo "::warning::$LIVE_SHA is not in this repository at all. With full history that"
+            echo "means production runs a build from a commit that was force-pushed away, or from"
+            echo "another repo. Treating as runtime drift."
           fi
 
           # Distinguish "not deployed yet" from "deployed something else entirely".
