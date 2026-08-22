@@ -24,7 +24,9 @@ from services.shopify_variant_identity import (
     match_variants,
     parse_product_js,
     product_js_url,
+    sole_stamped_variant_id,
     stamp_variant_ids,
+    storefront_is_shopify,
 )
 
 
@@ -318,6 +320,10 @@ def test_without_evidence_the_identity_is_byte_identical_to_before() -> None:
 
 
 def test_evidence_flips_the_lane_label_and_supplies_the_sole_numeric_id() -> None:
+    """The recovered id rides `cart_variant_id` — a channel only the permalink reads —
+    while `variant_id` (which feeds the attribution ctx) stays exactly what it was. Round 4
+    found the attribution layer cross-fills product<->variant ids BOTH ways, so a numeric
+    id on the old channel leaked up a grain into canonical_product_id."""
     from routes.agent_shop_gateway import _external_seed_redirect_identity
 
     identity = _external_seed_redirect_identity(
@@ -325,7 +331,8 @@ def test_evidence_flips_the_lane_label_and_supplies_the_sole_numeric_id() -> Non
     )
 
     assert identity["platform"] == "shopify"
-    assert identity["variant_id"] == "41234567890123"
+    assert identity["cart_variant_id"] == "41234567890123"
+    assert identity["variant_id"] is None, "attribution must stay byte-identical to pre-change"
 
 
 def test_stamped_ids_alone_are_evidence_even_without_the_platform_key() -> None:
@@ -339,7 +346,7 @@ def test_stamped_ids_alone_are_evidence_even_without_the_platform_key() -> None:
     )
 
     assert identity["platform"] == "shopify"
-    assert identity["variant_id"] == "41234567890123"
+    assert identity["cart_variant_id"] == "41234567890123"
 
 
 def test_two_stamped_ids_flip_the_platform_but_refuse_to_pick_a_variant() -> None:
@@ -353,6 +360,7 @@ def test_two_stamped_ids_flip_the_platform_but_refuse_to_pick_a_variant() -> Non
     )
 
     assert identity["platform"] == "shopify"
+    assert identity["cart_variant_id"] is None
     assert identity["variant_id"] is None
 
 
@@ -377,6 +385,7 @@ def test_a_numeric_attached_variant_id_always_wins_over_the_stamped_one() -> Non
     )
 
     assert identity["variant_id"] == "40000000000001"
+    assert identity["cart_variant_id"] is None, "a numeric id in hand needs no second channel"
 
 
 def _dest_of(redirect_url: str) -> str:
@@ -415,6 +424,7 @@ def test_end_to_end_an_evidence_stamped_seed_redirects_into_a_prefilled_cart() -
             merchant_id=identity["merchant_id"],
             product_id=identity["product_id"],
             variant_id=identity["variant_id"],
+            cart_variant_id=identity["cart_variant_id"],
             shop_domain=identity["shop_domain"],
             platform=identity["platform"],
             seller_ref=identity["seller_ref"],
@@ -424,6 +434,13 @@ def test_end_to_end_an_evidence_stamped_seed_redirects_into_a_prefilled_cart() -
 
     dest = _dest_of(redirect_url)
     assert dest.startswith("https://genabelle.com/cart/41234567890123:1"), dest
+    # THE ATTRIBUTION BOUNDARY: the numeric id must never enter the signed token ctx, where
+    # commerce_attribution_service would cross-fill it into canonical_product_id.
+    import base64 as _b64, json as _j
+    from urllib.parse import parse_qs as _pq, urlparse as _up
+    tok = _pq(_up(redirect_url).query)["token"][0].split(".")[0]
+    ctx = _j.loads(_b64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))["ctx"]
+    assert "41234567890123" not in _j.dumps({k: v for k, v in ctx.items() if k != "dest"}), ctx
     assert "attributes%5Bpivota_click_id%5D=" in dest or "attributes[pivota_click_id]=" in dest
 
 
@@ -449,6 +466,7 @@ def test_end_to_end_control_the_same_seed_without_evidence_stays_referral_only()
             merchant_id=identity["merchant_id"],
             product_id=identity["product_id"],
             variant_id=identity["variant_id"],
+            cart_variant_id=identity["cart_variant_id"],
             shop_domain=identity["shop_domain"],
             platform=identity["platform"],
             seller_ref=identity["seller_ref"],
@@ -459,3 +477,48 @@ def test_end_to_end_control_the_same_seed_without_evidence_stays_referral_only()
     dest = _dest_of(redirect_url)
     assert "/cart/" not in dest, dest
     assert dest.startswith("https://genabelle.com/products/melacare-jelly-touch-dual-pad")
+
+
+def test_a_sku_shaped_offer_variant_id_is_preserved_for_attribution() -> None:
+    """Round-4 F2: the funnel joins canonical_variant_id against catalog sku aliases, so a
+    SKU-shaped id that joined before must keep joining. The cart gets the numeric id on its
+    own channel; attribution keeps the SKU."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(), seed_data=_evidence_seed("41234567890123"), offer_variant_id="TO-001"
+    )
+
+    assert identity["variant_id"] == "TO-001"
+    assert identity["cart_variant_id"] == "41234567890123"
+
+
+def test_a_partial_stamp_on_a_multi_variant_product_declines_the_cart() -> None:
+    """Round-4 F3: one recovered id is not one purchasable variant. match_variants supports
+    a partial stamp, so a 3-variant product with 1 stamped id must NOT prefill — that is an
+    arbitrary variant of a product the buyer has not chosen from."""
+    seed = {"snapshot": {"variants": [
+        {"title": "30ml", "shopify_variant_id": "11"},
+        {"title": "50ml"},
+        {"title": "100ml"},
+    ]}}
+
+    assert sole_stamped_variant_id(seed) is None
+    assert storefront_is_shopify(seed) is True, "the evidence still stands; only the prefill declines"
+
+
+def test_the_platform_key_alone_is_evidence() -> None:
+    """Round-4 F5: the PRIMARY documented evidence key had zero coverage — every fixture
+    also carried stamped ids, so deleting the whole storefront_platform branch survived."""
+    assert storefront_is_shopify({"snapshot": {"storefront_platform": "shopify", "variants": []}}) is True
+    assert storefront_is_shopify({"snapshot": {"storefront_platform": " SHOPIFY "}}) is True
+    assert storefront_is_shopify({"snapshot": {"storefront_platform": "woocommerce"}}) is False
+
+
+def test_junk_stamped_values_are_not_evidence() -> None:
+    """Round-4 F4: scripts/recover_seed_data_from_catalog_extract lands arbitrary variant
+    keys from an external extract service, unvalidated. Non-numeric junk must neither prove
+    Shopify-ness nor prefill a cart."""
+    junk = {"snapshot": {"variants": [{"shopify_variant_id": True}]}}
+    assert storefront_is_shopify(junk) is False
+    assert sole_stamped_variant_id(junk) is None

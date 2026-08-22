@@ -350,21 +350,29 @@ def storefront_is_shopify(seed_data: Any) -> bool:
         return True
     variants = snapshot.get("variants")
     if isinstance(variants, list):
+        # NUMERIC stamped ids only. Round 4 found a live writer that lands arbitrary,
+        # unvalidated variant keys in snapshot (scripts/recover_seed_data_from_catalog_extract
+        # -> seed_data_writer, straight from an external extract service), so a junk
+        # `shopify_variant_id: True` must not count as proof — false evidence here turns a
+        # working PDP referral into a dead cart link on a non-Shopify storefront.
         return any(
-            isinstance(v, dict) and str(v.get("shopify_variant_id") or "").strip()
+            isinstance(v, dict) and _numeric_id(v.get("shopify_variant_id"))
             for v in variants
         )
     return False
 
 
 def sole_stamped_variant_id(seed_data: Any) -> Optional[str]:
-    """The stamped numeric id, but ONLY when the product has exactly one.
+    """The stamped numeric id, but ONLY when the product itself has exactly one variant.
 
-    The redirect is built at PRODUCT grain — the buyer has not chosen a variant yet — so
-    prefilling a cart is only safe when there is nothing to choose. One distinct stamped id
-    means the storefront sells one purchasable variant: prefill it. Zero means no evidence.
-    Two or more means picking any of them is the wrong-size-in-the-cart hazard this module
-    exists to refuse, so the permalink is declined and the redirect stays referral_only.
+    The redirect is built at PRODUCT grain — the buyer has not chosen a variant — so
+    prefilling a cart is only safe when there is nothing to choose. Round 4 caught the first
+    version conflating two different facts: it required one distinct stamped ID, but
+    `match_variants` deliberately supports a PARTIAL stamp (`partial_label_match`), so a
+    three-variant product with one recovered id read as "sole" and would have prefilled an
+    arbitrary variant of a multi-variant product — the exact wrong-size hazard this module
+    exists to refuse. The unit is therefore the VARIANT ENTRY, not the recovered id: exactly
+    one entry in the snapshot, and that entry stamped numeric. Anything else declines.
     """
     if not isinstance(seed_data, dict):
         return None
@@ -374,12 +382,8 @@ def sole_stamped_variant_id(seed_data: Any) -> Optional[str]:
     variants = snapshot.get("variants")
     if not isinstance(variants, list):
         return None
-    ids = {
-        str(v.get("shopify_variant_id")).strip()
-        for v in variants
-        if isinstance(v, dict) and str(v.get("shopify_variant_id") or "").strip()
-    }
-    if len(ids) != 1:
+    entries = [v for v in variants if isinstance(v, dict)]
+    if len(entries) != 1:
         return None
-    sole = next(iter(ids))
+    sole = str(entries[0].get("shopify_variant_id") or "").strip()
     return sole if _numeric_id(sole) else None
