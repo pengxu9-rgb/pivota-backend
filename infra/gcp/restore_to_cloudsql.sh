@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Import a plain-SQL gzip dump from GCS into the env's Cloud SQL `pivota` database.
-#   infra/gcp/restore_to_cloudsql.sh staging gs://pivota-staging-migration/prod-<stamp>.sql.gz [--wipe]
+#   infra/gcp/restore_to_cloudsql.sh staging gs://pivota-prod-migration/prod-<stamp>.sql.gz [--wipe]
+#   (dumps live in the PROD bucket even when restoring INTO staging - the staging Cloud SQL service
+#    account is granted objectViewer on it. Prod data must not sit in a staging-project bucket.)
 # --wipe drops and recreates the `pivota` database first (staging rehearsals only; refuses on prod).
 #
 # CUTOVER PATH: --new-db, not --wipe.
