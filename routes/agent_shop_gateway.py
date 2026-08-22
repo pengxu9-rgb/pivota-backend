@@ -4208,6 +4208,29 @@ async def _handle_offers_resolve(
                         "in_stock": bool(in_stock),
                         "purchase_route": "affiliate_outbound",
                         "affiliate_url": redirect_url,
+                        # EXECUTION SPEC v0, one field: what does following `affiliate_url`
+                        # actually DO? It resolves either to a PRE-FILLED CART on the
+                        # merchant's own storefront or to a bare product page, and until now
+                        # an agent could not tell which — the decision was computed inside
+                        # _make_external_redirect_url, stamped into the signed token as
+                        # `join_mode`, and never returned. An agent planning a card-rail
+                        # handoff needs it: a prefilled cart is a materially different
+                        # completion path from "land on a PDP and find the variant yourself".
+                        #
+                        # Computed by the SAME resolve_cart_permalink the redirect itself
+                        # uses, so the answer cannot drift from what the link does.
+                        "cart_prefilled": bool(
+                            resolve_cart_permalink(
+                                # The SAME value the builder above was called with
+                                # (`canonical_url or destination_url`), not the raw column —
+                                # _seed_domain_from_url reads the host off it, so a different
+                                # input here could disagree with the link it describes.
+                                destination_url=str(canonical_url or destination_url),
+                                shop_domain=redirect_identity.get("shop_domain"),
+                                platform=redirect_identity.get("platform"),
+                                cart_variant_id=redirect_identity.get("cart_variant_id"),
+                            )
+                        ),
                         "internal_checkout_items": None,
                         "confidence": confidence,
                         "source": {
@@ -7056,6 +7079,41 @@ def _external_seed_redirect_identity(
     }
 
 
+def resolve_cart_permalink(
+    *,
+    destination_url: str,
+    shop_domain: Optional[str],
+    platform: Optional[str],
+    cart_variant_id: Optional[str],
+    quantity: int = 1,
+) -> Optional[str]:
+    """The single decision: can this handoff land in a PRE-FILLED cart, or only on the PDP?
+
+    Extracted so there is exactly ONE implementation. `_make_external_redirect_url` uses it to
+    choose the redirect's destination, and `offers.resolve` uses it to tell the agent which of
+    the two its `affiliate_url` will do — a fact that was previously computed here, stamped
+    into the signed token as `join_mode`, and never returned, so an agent holding the link had
+    no way to know whether following it would produce a cart. Two call sites re-deriving that
+    from parts is exactly the twin-implementation drift this codebase keeps paying for.
+
+    Returns the cart base URL, or None for an honest referral. Never fabricates: the variant id
+    must already be one a caller could justify (see the provenance note in
+    _external_seed_redirect_identity), and shopify_cart_base_url refuses anything non-numeric.
+    """
+    candidate_host = normalize_shop_host(shop_domain) or _seed_domain_from_url(destination_url)
+    is_shopify = (
+        str(platform or "").strip().lower() == "shopify"
+        or candidate_host.endswith(".myshopify.com")
+    )
+    if not is_shopify:
+        return None
+    return shopify_cart_base_url(
+        shop_domain=shop_domain or destination_url,
+        variant_id=cart_variant_id,
+        quantity=quantity,
+    )
+
+
 async def _make_external_redirect_url(
     *,
     market: str,
@@ -7105,18 +7163,13 @@ async def _make_external_redirect_url(
     #     (order-side join, closable by T2-2) with zero merchant setup.
     #   referral_only  -> otherwise: keep the product URL and append the id as a plain query
     #     param for click-side attribution only. Honest degradation (no order-side join).
-    candidate_host = normalize_shop_host(shop_domain) or _seed_domain_from_url(destination_url)
-    is_shopify = (
-        str(platform or "").strip().lower() == "shopify"
-        or candidate_host.endswith(".myshopify.com")
+    cart_base = resolve_cart_permalink(
+        destination_url=destination_url,
+        shop_domain=shop_domain,
+        platform=platform,
+        cart_variant_id=cart_variant_id,
+        quantity=quantity,
     )
-    cart_base = None
-    if is_shopify:
-        cart_base = shopify_cart_base_url(
-            shop_domain=shop_domain or destination_url,
-            variant_id=cart_variant_id,
-            quantity=quantity,
-        )
     join_mode = "cart_permalink" if cart_base else "referral_only"
 
     dest_with_utm = apply_utm(
