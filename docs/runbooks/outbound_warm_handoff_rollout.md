@@ -47,10 +47,13 @@ Why `false` specifically matters: the paired gateway PR (PIVOTA-Agent #2082) mad
 claim to a buyer about where they will land, and only an explicit backend `false` licenses
 saying it. A `false` that click-time behaviour contradicts is that same defect one layer down.
 
-**Status:** `cart_prefilled` (#1822) is merged to `main` but was **not** on the serving
-revision as of 2026-08-22 (prod was one commit behind, at `b5490615`). So this does not
-require a flag flip to become live — **it goes live at the next deploy**, for any external
-offer whose destination host is one of the six allowlisted brands.
+**Status: FIXED in code** (see "Preferred fix", now implemented). `cart_prefilled` no
+longer emits a `false` the warm lane could contradict — it emits `null` there instead.
+
+The window this closed: `cart_prefilled` (#1822) was merged to `main` but **not** on the
+serving revision as of 2026-08-22 (prod was one commit behind, at `b5490615`), while the warm
+canary was already on. It would have needed no flag flip to go wrong — only the next deploy,
+for any external offer whose destination host is one of the six allowlisted brands.
 
 *Unquantified here:* how many external-seed offers on those six domains resolve to
 `cart_prefilled: false`. Answering it needs SQL over the seed corpus by domain (prod
@@ -76,9 +79,11 @@ Before flipping `OUTBOUND_WARM_HANDOFF_ENABLED`, adding domains to
 
 - [ ] Confirm whether the deployed revision serves `cart_prefilled` at all
       (`/health` → `commit_sha`; the field ships in #1822 / `3ea67508`).
-- [ ] If it does, resolve the conflict in Constraint 1 **first** — either the flag accounts
-      for warm eligibility, or the upgrade is suppressed for offers that reported `false`
-      (see below). Shipping both as they stand means knowingly serving a false negative.
+- [x] Resolve the conflict in Constraint 1 — **done**: `_cart_prefilled_claim` consults
+      `could_upgrade_at_click_time` and answers `null` where `false` is not provable. If you
+      are widening the allowlist, no extra step is needed; the claim follows the config.
+      **But** re-read Constraint 2 — the fix is evaluated at mint time, so it does not cover
+      tokens already in flight.
 - [ ] Account for the ~7-day tail of Constraint 2 in the canary window.
 - [ ] Watch the `handoff` / `warm_reason` pair on click-event ctx — that is the
       substitution-rate instrument, and it is also what tells you how many `false` answers
@@ -91,7 +96,23 @@ Two candidates:
 **(a) `cart_prefilled` accounts for warm-handoff eligibility.**
 **(b) The warm upgrade is suppressed for offers that already reported `false`.**
 
-**Preferred: (a), in the form "downgrade the falsifiable `false` to `null`".**
+**Chosen: (a), in the form "downgrade the falsifiable `false` to `null`" — IMPLEMENTED.**
+
+Where it lives:
+- `services/outbound_warm_handoff.py::could_upgrade_at_click_time` — the resolve-time
+  over-approximation. Calls the SAME `evaluate_warm_eligibility` the click path calls (via a
+  new `assume_human` flag that waives only the user-agent knockout), so the two cannot drift.
+- `routes/agent_shop_gateway.py::_cart_prefilled_claim` — the tri-state. `True` if the link
+  is a cart permalink, `None` if a click could still upgrade it, `False` only when neither.
+- The warm lane's own behaviour is **unchanged** — the buyer still gets the better landing.
+
+Tests: `tests/test_offers_resolve.py` (field-level, plus an end-to-end one that follows the
+minted link through `GET /r` and asserts the buyer really does reach a cart) and
+`tests/test_outbound_warm_handoff_click.py` (the soundness matrix). Ten mutants were run
+against them, including "no guard", "blanket null", and a fabricated token; all were killed.
+Note the fabricated-token mutant initially SURVIVED an outcome-only assertion — token
+mismatch is a coin flip at a 50% rollout — so parity is asserted by token identity, not by
+the resulting boolean.
 
 Rationale:
 
@@ -123,5 +144,6 @@ carries `false`, and if that host is added within the token's 7-day TTL the stal
 still falsifiable. (a) shrinks the window to that tail; only (b)'s stamped-claim machinery
 closes it entirely. Constraint 2's checklist item is the mitigation.
 
-**Not implemented — this document records the constraint and the decision. Confirm with the
-owner before changing handoff behaviour or the field's value.**
+**Implemented 2026-08-22.** The remaining open item is the Constraint 2 tail: closing it
+needs the stamped-claim machinery from (b), which has not been built and should not be
+without a decision that the tail is worth it.

@@ -179,11 +179,15 @@ def evaluate_warm_eligibility(
     user_agent: Optional[str],
     token: str,
     settings: Any,
+    assume_human: bool = False,
 ) -> Tuple[bool, str]:
     """Local, no-network eligibility for a warm-handoff attempt. Returns (eligible, reason).
 
     Ordering is deliberate: cheap knockouts first, then the canary allowlist / pct rollout.
     The caller has already handled flag-off, expired tokens, and HEAD requests.
+
+    ``assume_human`` skips the user-agent knockout for callers that do not have one — see
+    ``could_upgrade_at_click_time``. The click path never passes it (default False).
     """
     if not str(settings.outbound_warm_handoff_internal_key or "").strip():
         return False, "no_internal_key"
@@ -192,7 +196,7 @@ def evaluate_warm_eligibility(
         return False, "no_dest_host"
     if is_affiliate_destination(dest):
         return False, "affiliate"
-    if is_bot_user_agent(user_agent):
+    if not assume_human and is_bot_user_agent(user_agent):
         return False, "bot"
     brands = settings.outbound_warm_handoff_brands
     if brands:
@@ -202,6 +206,48 @@ def evaluate_warm_eligibility(
     if rollout_bucket(token, settings.outbound_warm_handoff_rollout_pct):
         return True, "rollout"
     return False, "control"
+
+
+def could_upgrade_at_click_time(*, dest: str, token: str, settings: Any) -> bool:
+    """Can a click on this ALREADY-MINTED redirect still be upgraded to a prefilled cart?
+
+    Answered at RESOLVE time, before the link has been handed to anyone, so `offers.resolve`
+    can avoid making a `cart_prefilled: false` claim this lane would later contradict (an
+    answer already sent to an agent cannot be corrected). See
+    docs/runbooks/outbound_warm_handoff_rollout.md.
+
+    A SOUND OVER-APPROXIMATION, deliberately: `False` here guarantees the click path also
+    says ineligible, while `True` only means "possibly". Every input to
+    `evaluate_warm_eligibility` is available at mint time — dest host, flag, internal key,
+    brand allowlist, rollout pct, and the token itself (`rollout_bucket` is a stable hash of
+    it, which is exactly why prefetch and click land in the same bucket) — except the
+    user-agent, and that one can only ever REMOVE eligibility (a bot gets the cold redirect).
+    So assuming a human cannot lose a case; it can only over-report.
+
+    Deliberately calls the SAME evaluate_warm_eligibility the click path calls rather than
+    re-deriving the rules: a second implementation of an eligibility predicate is exactly the
+    twin-implementation drift resolve_cart_permalink was extracted to avoid, and here a drift
+    would silently restore the false claim this exists to prevent.
+
+    NOT a promise the upgrade will happen: even an eligible click can fall back to the cold
+    redirect (gateway timeout, non-200, off-brand continue_url, bot UA). That is precisely
+    why the caller answers "unknown" rather than flipping the claim to `true`.
+
+    Env is read at CLICK time, so this is only sound for the config as of THIS call: widening
+    the allowlist retroactively falsifies `false` answers on tokens still inside their TTL
+    (Constraint 2 in the runbook).
+    """
+    # The click lane checks the flag in the route, before eligibility is ever consulted.
+    if not getattr(settings, "outbound_warm_handoff_enabled", False):
+        return False
+    eligible, _reason = evaluate_warm_eligibility(
+        dest=dest,
+        user_agent=None,
+        token=token,
+        settings=settings,
+        assume_human=True,
+    )
+    return eligible
 
 
 def _validate_continue_url(continue_url: str, brand_host: str) -> bool:

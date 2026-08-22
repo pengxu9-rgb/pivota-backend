@@ -198,11 +198,17 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # at RESOLVE time from the same resolve_cart_permalink that chose `dest`. A `false`
     # there is a positive claim to the agent — "this link lands on a product page, the buyer
     # picks the variant" — and eligibility below fires on exactly that cold population, so a
-    # warm upgrade makes that already-sent `false` wrong with no way to correct it. `true` is
-    # unaffected (this lane only ever BUILDS a cart). Widening the allowlist also invalidates
-    # `false` answers on tokens minted before the widening and still inside their TTL. See
-    # docs/runbooks/outbound_warm_handoff_rollout.md before widening or before changing the
-    # eligibility rules.
+    # warm upgrade would make that already-sent `false` wrong with no way to correct it.
+    # (`true` is unaffected: this lane only ever BUILDS a cart.)
+    #
+    # Handled on the CLAIM side, not here: _cart_prefilled_claim asks
+    # could_upgrade_at_click_time and answers `null` rather than a `false` this lane could
+    # contradict. The upgrade itself is deliberately unsuppressed — the buyer gets the better
+    # landing either way. So the rules below are now load-bearing for an agent-facing
+    # contract as well as for the redirect: CHANGING THEM CHANGES WHAT WE PROMISE. Widening
+    # the brand allowlist still invalidates `false` answers on tokens minted before the
+    # widening and still inside their 7-day TTL — that tail is not closed. See
+    # docs/runbooks/outbound_warm_handoff_rollout.md.
     warm_redirect_url: Optional[str] = None
     if settings.outbound_warm_handoff_enabled:
         # The WHOLE lane is throw-guarded: an unexpected error anywhere in eligibility,

@@ -305,3 +305,95 @@ async def test_resolve_warm_handoff_passes_variant_hint_and_attribution(monkeypa
     assert seen["json"]["variant_id"] == "51895645012184"
     assert seen["json"]["attribution"] == {"pivota_click_id": "clk_1"}
     assert seen["headers"]["X-Internal-Key"] == "test-key"
+
+
+# ---------------------------------------------------------------------------
+# could_upgrade_at_click_time — the resolve-time over-approximation that keeps
+# `offers.resolve` from claiming `cart_prefilled: false` on an offer this lane would
+# later upgrade. See docs/runbooks/outbound_warm_handoff_rollout.md.
+# ---------------------------------------------------------------------------
+
+_ELIGIBILITY_MATRIX = [
+    # (label, dest, brands_raw, pct, enabled, key)
+    ("allowlisted brand", BRAND_DEST, "cosrx.com", 0, True, "k"),
+    ("brand off the allowlist", BRAND_DEST, "someone-else.com", 0, True, "k"),
+    ("no allowlist, full rollout", BRAND_DEST, "", 100, True, "k"),
+    ("no allowlist, no rollout", BRAND_DEST, "", 0, True, "k"),
+    ("no allowlist, half rollout", BRAND_DEST, "", 50, True, "k"),
+    ("affiliate destination", "https://track.linksynergy.com/x?u=1", "", 100, True, "k"),
+    ("hostless destination", "not-a-url", "", 100, True, "k"),
+    ("lane disabled", BRAND_DEST, "cosrx.com", 100, False, "k"),
+    ("no internal key", BRAND_DEST, "cosrx.com", 100, True, None),
+]
+
+
+@pytest.mark.parametrize("label,dest,brands,pct,enabled,key", _ELIGIBILITY_MATRIX)
+def test_could_upgrade_at_click_time_never_under_reports(
+    monkeypatch, label, dest, brands, pct, enabled, key
+):
+    """SOUNDNESS: a resolve-time `False` must guarantee the click also refuses.
+
+    That direction is the one the caller relies on — it is what licenses emitting an explicit
+    `cart_prefilled: false`. Over-reporting (True where the click would refuse) is allowed and
+    costs only a `null`; under-reporting reinstates the false claim.
+    """
+    monkeypatch.setattr(settings, "outbound_warm_handoff_enabled", enabled)
+    monkeypatch.setattr(settings, "outbound_warm_handoff_internal_key", key)
+    monkeypatch.setattr(settings, "outbound_warm_handoff_brands_raw", brands)
+    monkeypatch.setattr(settings, "outbound_warm_handoff_rollout_pct", pct)
+    token = _mint_token(dest)
+
+    resolve_says = warm.could_upgrade_at_click_time(dest=dest, token=token, settings=settings)
+    click_says, reason = warm.evaluate_warm_eligibility(
+        dest=dest, user_agent=HUMAN_UA, token=token, settings=settings
+    )
+    if not enabled:
+        assert resolve_says is False, label
+        return
+    assert resolve_says == click_says, f"{label}: resolve={resolve_says} click={click_says} ({reason})"
+
+
+def test_could_upgrade_at_click_time_over_reports_for_a_bot_and_that_is_correct(monkeypatch):
+    """The user-agent is the ONLY click-time-only input, and it can only REMOVE eligibility.
+
+    We do not know at resolve time who will click, so we assume a human. A bot then gets the
+    cold redirect while we said "unknown" — an over-report, which is the safe direction. The
+    reverse (claiming `false` and serving a cart) is the defect.
+    """
+    token = _mint_token()
+    assert warm.could_upgrade_at_click_time(dest=BRAND_DEST, token=token, settings=settings) is True
+    bot_eligible, reason = warm.evaluate_warm_eligibility(
+        dest=BRAND_DEST, user_agent="Mozilla/5.0 (compatible; GPTBot/1.0)", token=token, settings=settings
+    )
+    assert (bot_eligible, reason) == (False, "bot")
+
+
+def test_assume_human_skips_only_the_user_agent_knockout(monkeypatch):
+    """`assume_human` must not become a skeleton key that waves through every other rule."""
+    token = _mint_token()
+    # It does waive the UA knockout...
+    assert warm.evaluate_warm_eligibility(
+        dest=BRAND_DEST, user_agent="curl/8.4.0", token=token, settings=settings, assume_human=True
+    ) == (True, "allowlisted")
+    # ...and nothing else. Affiliate hosts and non-allowlisted brands still refuse.
+    assert warm.evaluate_warm_eligibility(
+        dest="https://track.linksynergy.com/x?u=1", user_agent=None, token=token,
+        settings=settings, assume_human=True
+    ) == (False, "affiliate")
+    monkeypatch.setattr(settings, "outbound_warm_handoff_brands_raw", "someone-else.com")
+    assert warm.evaluate_warm_eligibility(
+        dest=BRAND_DEST, user_agent=None, token=token, settings=settings, assume_human=True
+    ) == (False, "not_allowlisted")
+    monkeypatch.setattr(settings, "outbound_warm_handoff_internal_key", "")
+    assert warm.evaluate_warm_eligibility(
+        dest=BRAND_DEST, user_agent=None, token=token, settings=settings, assume_human=True
+    ) == (False, "no_internal_key")
+
+
+def test_the_click_path_still_knocks_out_bots_by_default(monkeypatch):
+    """The new parameter must default OFF — the click lane passes no `assume_human`."""
+    token = _mint_token()
+    assert warm.evaluate_warm_eligibility(
+        dest=BRAND_DEST, user_agent="Mozilla/5.0 (compatible; ClaudeBot/1.0)",
+        token=token, settings=settings
+    ) == (False, "bot")
