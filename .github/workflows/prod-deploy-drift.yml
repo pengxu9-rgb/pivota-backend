@@ -60,6 +60,30 @@ jobs:
             exit 0
           fi
 
+          # Not every commit needs a deploy. Docs, runbooks, the infra scripts and this workflow
+          # never enter the container image, so a gap made only of those is not a production
+          # problem - and failing on it would train everyone to ignore this job. That matters:
+          # an alarm that cries wolf is worse than no alarm, because it launders a real one.
+          #
+          # Anything NOT in this list is treated as runtime-affecting, so the default is to
+          # alarm. A new top-level directory is a deploy until someone says otherwise.
+          if git cat-file -e "$LIVE_SHA" 2>/dev/null; then
+            RUNTIME_CHANGED="$(git diff --name-only "$LIVE_SHA..HEAD" \
+              | grep -vE '^(docs/|infra/|\.github/|scripts/|tests/|README|CHANGELOG)' \
+              | grep -vE '\.md$' || true)"
+            if [ -z "$RUNTIME_CHANGED" ]; then
+              echo "production is $(git rev-list --count "$LIVE_SHA..HEAD") commit(s) behind main,"
+              echo "but none of them touch code the container runs:"
+              git diff --name-only "$LIVE_SHA..HEAD" | sed 's/^/  /'
+              echo "no deploy needed."
+              exit 0
+            fi
+            echo "runtime-affecting files not in production:"
+            printf '%s\n' "$RUNTIME_CHANGED" | sed 's/^/  /'
+          else
+            echo "note: $LIVE_SHA is not in this checkout - cannot classify the gap, treating as runtime drift"
+          fi
+
           # Distinguish "not deployed yet" from "deployed something else entirely".
           if git merge-base --is-ancestor "$LIVE_SHA" HEAD 2>/dev/null; then
             BEHIND="$(git rev-list --count "$LIVE_SHA..HEAD" 2>/dev/null || echo '?')"
