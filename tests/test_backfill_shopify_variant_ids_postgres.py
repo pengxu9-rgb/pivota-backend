@@ -611,3 +611,72 @@ async def test_domain_bounds_the_hosts_actually_contacted(_db) -> None:
 
     assert _Client.calls == []
     assert summary["fetch_outcomes"]["host_outside_domain_filter"] == 1
+
+
+async def test_a_block_alternating_403_with_a_challenge_page_still_aborts(_db) -> None:
+    """Round-6: reclassifying `not_json` out of BLOCK_OUTCOMES re-opened the hole the
+    `error:*` rule had just closed — an ambiguous challenge page RESET the streak, so a
+    403/challenge alternating block ran 22 requests deep without aborting. `not_json` is now
+    neutral: it neither aborts nor resets."""
+    from scripts.backfill_shopify_variant_ids import CONSECUTIVE_BLOCK_ABORT, run
+    import scripts.backfill_shopify_variant_ids as mod
+
+    for i in range(40):
+        await _insert(_db, f"s{i:02d}", _snapshot({"title": "30ml"}),
+                      url=f"https://brand.com/products/p{i}", domain="brand.com")
+
+    class _Forbidden:
+        status_code = 403
+        headers = {"content-type": "text/html"}
+
+    class _Challenge:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+
+    class _Client:
+        n = 0
+
+        async def get(self, url, **kwargs):
+            _Client.n += 1
+            return _Challenge() if _Client.n % 2 == 0 else _Forbidden()
+
+    prev = (mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S)
+    mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = 0.0, 0.0
+    try:
+        summary = await run(limit=50, domain=None, apply=False, client=_Client())
+    finally:
+        mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = prev
+
+    assert summary["aborted_on_block"] is True
+    assert _Client.n < 20, f"must not run {_Client.n} requests into a live block"
+    # and the ambiguous outcome is visible per-domain, as the comment claims
+    assert summary["most_blocked_domains"].get("brand.com", 0) > 0
+
+
+async def test_an_aborted_run_reports_no_resume_point(_db) -> None:
+    """Round-6 F5: without `and not aborted`, a resumed sweep permanently skips every row
+    fetched after the abort — they were never actually examined."""
+    from scripts.backfill_shopify_variant_ids import CONSECUTIVE_BLOCK_ABORT, run
+    import scripts.backfill_shopify_variant_ids as mod
+
+    for i in range(CONSECUTIVE_BLOCK_ABORT + 5):
+        await _insert(_db, f"s{i:02d}", _snapshot({"title": "30ml"}),
+                      url=f"https://brand.com/products/p{i}")
+
+    class _Forbidden:
+        status_code = 403
+        headers = {"content-type": "text/html"}
+
+    class _Client:
+        async def get(self, url, **kwargs):
+            return _Forbidden()
+
+    prev = (mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S)
+    mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = 0.0, 0.0
+    try:
+        summary = await run(limit=50, domain=None, apply=False, client=_Client())
+    finally:
+        mod.GLOBAL_MIN_INTERVAL_S, mod.PER_DOMAIN_MIN_GAP_S = prev
+
+    assert summary["aborted_on_block"] is True
+    assert summary["next_cursor"] is None, "an aborted run must not advance the cursor"

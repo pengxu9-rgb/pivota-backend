@@ -6977,10 +6977,13 @@ def _external_seed_redirect_identity(
     #     is writer-verified identity; snapshot evidence never outranks it. Only None or
     #     the lane token itself is eligible.
     #   * NEVER GUESS A VARIANT. The stamped id is used only when the product has exactly
-    #     one (sole_stamped_variant_id), and only when the id we already carry cannot make
-    #     a permalink anyway (a numeric attached_variant_id always wins). The cart and the
-    #     attribution ctx then name the SAME variant — the id that will actually be in the
-    #     buyer's cart — rather than a synthetic "{epid}-default" the storefront never saw.
+    #     one variant (sole_stamped_variant_id); otherwise the permalink is declined.
+    #
+    # (Two claims that stood here have been retracted by later rounds and are stated here so
+    # nobody re-derives them from a stale comment: "a numeric attached_variant_id always
+    # wins" — false, being all-digits is not evidence of being a SHOPIFY id, see :7007; and
+    # "the cart and the attribution ctx then name the SAME variant" — false, they are
+    # deliberately separate channels, see :6988.)
     #
     # Price, currency, availability and every other serving read are untouched on purpose:
     # this function feeds the REDIRECT, and widening it past identity is exactly what made
@@ -7028,9 +7031,17 @@ def _external_seed_redirect_identity(
         # have for a crawl seed. None when the product has more than one variant.
         cart_variant_id = sole_stamped_variant_id(seed_data)
     elif platform == "shopify":
-        # Writer-verified Shopify attachment. `attached_variant_id` is catalog identity
-        # (catalog_skus.source_variant_id), which for platform='shopify' IS the Shopify
-        # variant id. The offer/SKU chain is deliberately NOT consulted here.
+        # Writer-verified Shopify attachment. `attached_variant_id` is INTENDED to be catalog
+        # identity (catalog_skus.source_variant_id), which for platform='shopify' is the
+        # Shopify variant id — but that is a convention, not an enforced one: the attach
+        # endpoints (routes/employee_products attach_external_seed, the CSV column) store
+        # whatever string an operator posts, with no catalog lookup, and
+        # attached_seed_runtime_evidence matches the same column against the SEED's own
+        # variant_id/sku. So this is the one branch here whose input is operator-typed.
+        # extract_shopify_numeric_variant_id bounds the damage to all-digit values, and the
+        # branch is strictly narrower than the pre-round-5 behaviour it replaced — but if a
+        # wrong-cart report ever traces back here, this is why. The offer/SKU chain is
+        # deliberately NOT consulted.
         cart_variant_id = extract_shopify_numeric_variant_id(attached_variant_id)
 
     return {

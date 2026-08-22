@@ -1296,3 +1296,91 @@ def test_offers_resolve_ungrouped_product_is_honest_absent_never_pc(
     # Belt-and-braces: nor anywhere else in the response body.
     pc_strings_body = [s for s in _iter_strings(body) if s.startswith("pc:")]
     assert pc_strings_body == [], f"pc: ref leaked outside mapping: {pc_strings_body}"
+
+
+def test_the_cart_id_reaching_the_builder_is_the_evidenced_one_not_the_sku(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """THE WIRE BETWEEN IDENTITY AND BUILDER, which nothing covered.
+
+    `_external_seed_redirect_identity` is tested, and `_make_external_redirect_url` is
+    tested, but every seed call site reaches the builder through a monkeypatched AsyncMock
+    that discards its kwargs — so the argument connecting them was unverified at three of
+    four production call sites. Round-6 review demonstrated the consequence: reinstating the
+    round-5 P0 verbatim (`cart_variant_id=redirect_identity.get("variant_id")`) left the
+    whole suite GREEN.
+
+    This records the real call. The seed below is the dangerous shape: storefront evidence
+    present, and an all-digit SKU on the seed variant — the combination that used to build a
+    cart for a product Shopify never had under that id.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [
+                {
+                    "id": "eps_wire",
+                    "external_product_id": "ext_wire",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://brand.com/products/serum",
+                    "canonical_url": "https://brand.com/products/serum",
+                    "domain": "brand.com",
+                    "title": "Serum",
+                    "price_amount": 19.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "seed_data": {
+                        "brand": "Brand",
+                        "snapshot": {
+                            "storefront_platform": "shopify",
+                            "storefront_platform_source": "products_js_v1",
+                            "variants": [
+                                {
+                                    # all-digit SKU: passes extract_shopify_numeric_variant_id
+                                    # by shape, but is NOT a Shopify-issued variant id
+                                    "variant_id": "80072940",
+                                    "shopify_variant_id": "41234567890123",
+                                    "title": "30ml",
+                                    "price_amount": 19.0,
+                                    "price_currency": "USD",
+                                    "availability": "in_stock",
+                                }
+                            ],
+                        },
+                    },
+                    "status": "active",
+                }
+            ]
+        return []
+
+    seen: dict = {}
+
+    async def recording_builder(**kwargs):
+        seen.update(kwargs)
+        return "https://example.com/r?token=test"
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", recording_builder)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "80072940"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+
+    assert seen, "the redirect builder was never reached — this test would prove nothing"
+    assert "cart_variant_id" in seen, "the required argument must actually be threaded"
+    assert seen["cart_variant_id"] == "41234567890123", (
+        "the cart must use the STAMPED id; passing variant_id here is the round-5 P0"
+    )
+    assert seen.get("variant_id") != seen["cart_variant_id"], (
+        "attribution and the cart are different channels — if they are equal here the "
+        "fixture no longer exercises the divergence this test exists for"
+    )

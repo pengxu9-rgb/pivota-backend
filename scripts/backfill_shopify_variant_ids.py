@@ -91,12 +91,15 @@ CONSECUTIVE_BLOCK_ABORT = int(os.getenv("VARIANT_BACKFILL_ABORT_AFTER_BLOCKS", "
 # Every shape a bot block actually takes, not only the 429 observed on 2026-08-21. A
 # Cloudflare block is commonly 403, or 200 + a challenge page.
 #
-# `not_json` is NOT here, and that is a correction: it was, and it conflates a Cloudflare
-# challenge with a THEMED SOFT-404 — a dead product handle rendering the shop's 404 page with
-# status 200. Those are the same bytes to us but opposite facts, and treating a brand's dead
-# handles as a block aborted the entire sweep on one brand's rot. A challenge page is
-# indistinguishable here, so it is counted as a per-domain signal (`most_blocked_domains`)
-# rather than allowed to stop the run.
+# `not_json` is NEITHER a block nor a clean outcome, and it is handled as a third thing.
+# It conflates a Cloudflare challenge page with a THEMED SOFT-404 — a dead product handle
+# rendering the shop's 404 page with status 200. Same bytes to us, opposite facts. Treating
+# it as a BLOCK aborted the whole sweep on one brand's rot; treating it as CLEAN reset the
+# consecutive-block counter and re-opened the exact hole the `error:*` rule closed (measured
+# round 6: a 403/challenge alternating stream ran 22 requests into a live IP block without
+# aborting). So it is NEUTRAL — it neither aborts nor resets — and it is counted into
+# `most_blocked_domains`, which an earlier version of this comment claimed and the code did
+# not do.
 #
 # `error:*` IS here, via the prefix check below: an IP-level block usually presents as 403s
 # INTERLEAVED with connection resets, and treating a reset as "not a block" reset the counter
@@ -119,7 +122,7 @@ STOREFRONT_PLATFORM_SOURCE = "products_js_v1"
 # query put the array function FIRST. A single malformed row then aborted the whole run with
 # "cannot get array length of a non-array". A CASE wrap is evaluated as one expression, so
 # the guard cannot be separated from the thing it guards. This is the pattern the repo
-# already uses at routes/agent_shop_gateway.py:4027.
+# already uses at routes/agent_shop_gateway.py:3998-4003.
 _SNAPSHOT_VARIANTS_SAFE = (
     "CASE WHEN jsonb_typeof(seed_data->'snapshot'->'variants') = 'array' "
     "THEN seed_data->'snapshot'->'variants' ELSE '[]'::jsonb END"
@@ -348,6 +351,13 @@ async def run(
             if consecutive_blocks >= CONSECUTIVE_BLOCK_ABORT:
                 aborted = True
                 break
+            continue
+        if outcome == "not_json":
+            # Ambiguous: a challenge page and a themed soft-404 are indistinguishable here.
+            # Recorded per-domain so a brand that only ever answers this is visible, but it
+            # must not RESET the streak — a block that alternates 403 with a challenge page
+            # would otherwise never reach the threshold.
+            per_domain_blocks[host] += 1
             continue
         consecutive_blocks = 0
         if outcome != "ok":

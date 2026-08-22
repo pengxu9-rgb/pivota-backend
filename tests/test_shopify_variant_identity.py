@@ -642,3 +642,70 @@ def test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain() -> N
         seed_data={}, offer_variant_id="80072940",
     )
     assert attached["cart_variant_id"] == "41234567890123"
+
+
+def test_the_attached_branch_requires_the_platform_to_be_shopify() -> None:
+    """Round-6 F5: the platform gate on the attached branch was untested. A wix-attached seed
+    on a .myshopify.com host would otherwise offer a cart id for a non-Shopify storefront."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    wix = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::wix::p1",
+                       attached_variant_id="41234567890123"),
+        seed_data={},
+    )
+    assert wix["platform"] == "wix"
+    assert wix["cart_variant_id"] is None
+
+
+def test_the_production_default_attached_variant_id_is_not_a_cart_id() -> None:
+    """Round-6 F5: `attach_external_seed` defaults attached_variant_id to the sentinel "∅",
+    so this is the value most attached seeds actually carry. It must not reach a cart."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1",
+                       attached_variant_id="∅"),
+        seed_data={},
+    )
+    assert identity["cart_variant_id"] is None
+
+
+def test_storefront_evidence_outranks_an_operator_typed_attached_id() -> None:
+    """Round-6 F5: nothing pinned which wins when BOTH exist. Evidence is the stronger
+    provenance — it came from the storefront itself, not from a text field — so a seed whose
+    lane label is still `external_seed` takes the stamped id even though an attached variant
+    id is present."""
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_variant_id="99999999999999"),
+        seed_data=_evidence_seed("41234567890123"),
+    )
+    assert identity["cart_variant_id"] == "41234567890123"
+
+
+def test_an_attached_shopify_seed_prefers_catalog_identity_over_storefront_evidence() -> None:
+    """Pins a DELIBERATE choice that nothing previously constrained.
+
+    When a seed is BOTH attached-Shopify (platform writer-verified) and carries storefront
+    evidence, two ids compete: `attached_variant_id` (catalog identity, but operator-typed
+    and unenforced — see the provenance note in _external_seed_redirect_identity) and the
+    stamped id (proven by the storefront's own /products/x.js).
+
+    Current behaviour: the attached id wins, because a writer-verified platform means a human
+    or a sync deliberately linked this seed to a catalog row, and overriding that with a crawl
+    artefact would make the attachment meaningless. The counter-argument is real — storefront
+    evidence has the stronger provenance — so this is pinned rather than left to chance, and
+    it is the assertion to change if that trade is ever revisited.
+    """
+    from routes.agent_shop_gateway import _external_seed_redirect_identity
+
+    identity = _external_seed_redirect_identity(
+        row=_crawl_row(attached_product_key="prod::merch_1::shopify::p1",
+                       attached_variant_id="99999999999999"),
+        seed_data=_evidence_seed("41234567890123"),
+    )
+
+    assert identity["platform"] == "shopify"
+    assert identity["cart_variant_id"] == "99999999999999", "catalog identity wins here"
