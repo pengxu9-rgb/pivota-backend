@@ -92,6 +92,9 @@ handlers are real and idempotent:
 Do not run crawler traffic through the payment worker's shared egress/IP
 allowlist.  `antom_ucp` payment traffic needs an isolated, stable payment egress
 path; public crawling must use a separately rate-limited worker and egress.
+`docs/commerce-index-crawl-lane.md` defines the required dedicated GCP subnet,
+NAT, activation gates, and source-policy boundary. Provisioning that subnet does
+not authorize crawler traffic by itself.
 
 The first real target bridge is Gateway's
 `scripts/drain-commerce-index-relgraph.js`: it resolves changed canonical
