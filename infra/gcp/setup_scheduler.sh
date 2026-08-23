@@ -45,8 +45,16 @@ esac
 #   at cutover:   WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>
 : "${WORKERS:=false}"
 : "${PAUSED:=1}"
+: "${RELGRAPH_PUBLICATION_WORKER:=false}"
+: "${SEARCH_INDEX_PUBLICATION_WORKER:=false}"
+: "${CHECKOUT_VALIDATION_WORKER:=false}"
+: "${INSIGHT_REFRESH_WORKER:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
+case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
+case "$SEARCH_INDEX_PUBLICATION_WORKER" in true|false) ;; *) echo "SEARCH_INDEX_PUBLICATION_WORKER must be exactly true or false (got '$SEARCH_INDEX_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
+case "$CHECKOUT_VALIDATION_WORKER" in true|false) ;; *) echo "CHECKOUT_VALIDATION_WORKER must be exactly true or false (got '$CHECKOUT_VALIDATION_WORKER')" >&2; exit 2 ;; esac
+case "$INSIGHT_REFRESH_WORKER" in true|false) ;; *) echo "INSIGHT_REFRESH_WORKER must be exactly true or false (got '$INSIGHT_REFRESH_WORKER')" >&2; exit 2 ;; esac
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
@@ -91,6 +99,42 @@ mkjob relgraph-sync "$GATEWAY_IMAGE" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
   --command npm --args "run,relgraph:sync-routine:cron"
 
+echo "== job: commerce-index-relgraph (v2 targeted graph publication)"
+# This worker is independently opt-in. It is safe to create while inert, but it
+# must not consume queue rows until migration 194 is applied, v2 fact emission is
+# enabled, and the affected-product bridge has passed a canary. The script itself
+# refuses to claim work without COMMERCE_INDEX_RELGRAPH_APPLY=true.
+mkjob commerce-index-relgraph "$GATEWAY_IMAGE" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-relgraph,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,COMMERCE_INDEX_RELGRAPH_APPLY=$RELGRAPH_PUBLICATION_WORKER,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1" \
+  --task-timeout 1800s \
+  --command node --args "scripts/drain-commerce-index-relgraph.js,--worker-id,cloud-run-relgraph"
+
+echo "== job: commerce-index-search-index (v2 targeted OpenSearch publication)"
+# Requires CATALOG_SERVING_INDEX_BASE_URL and CATALOG_SERVING_INDEX_API_KEY to
+# be provisioned on the job before SEARCH_INDEX_PUBLICATION_WORKER is enabled.
+# The worker refuses to claim jobs if either the explicit apply gate or index
+# configuration is absent, so an incomplete setup cannot drain the queue.
+mkjob commerce-index-search-index "$GATEWAY_IMAGE" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,CATALOG_SERVING_INDEX_API_KEY=CATALOG_SERVING_INDEX_API_KEY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-search-index,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,COMMERCE_INDEX_SEARCH_PUBLICATION_APPLY=$SEARCH_INDEX_PUBLICATION_WORKER,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1" \
+  --task-timeout 900s \
+  --command node --args "scripts/drain-commerce-index-search-index.js,--worker-id,cloud-run-search-index"
+
+echo "== job: commerce-index-checkout-validation (v2 quote-first marker)"
+mkjob commerce-index-checkout-validation "$BACKEND_IMAGE" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-checkout-validation,PIVOTA_COMMIT_SHA=$BACKEND_TAG,COMMERCE_INDEX_CHECKOUT_VALIDATION_ENABLED=$CHECKOUT_VALIDATION_WORKER,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+  --task-timeout 300s \
+  --command python --args "scripts/drain_commerce_index_checkout_validation_jobs.py"
+
+echo "== job: commerce-index-insight-refresh (v2 reviewed insights requests)"
+mkjob commerce-index-insight-refresh "$BACKEND_IMAGE" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-insight-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,COMMERCE_INDEX_INSIGHT_REFRESH_ENABLED=$INSIGHT_REFRESH_WORKER,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+  --task-timeout 300s \
+  --command python --args "scripts/drain_commerce_index_insight_refresh_jobs.py"
+
 echo "== job: reviews-invitation-send (was a 60s bash loop)"
 # Run the one-shot processor DIRECTLY, not scripts/run_reviews_invitation_send_loop.sh.
 # That wrapper is `while true; do ...; sleep $SLEEP_SECONDS; done` and reads no RUN_ONCE (grep it) -
@@ -133,6 +177,27 @@ sched(){ # name schedule job-name
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
+sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
+sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
+sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
+sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-refresh
+# A global scheduler resume must never activate this new writer by accident.
+if [ "$RELGRAPH_PUBLICATION_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-relgraph-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-relgraph-cron; RELGRAPH_PUBLICATION_WORKER=false)"
+fi
+if [ "$SEARCH_INDEX_PUBLICATION_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-search-index-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-search-index-cron; SEARCH_INDEX_PUBLICATION_WORKER=false)"
+fi
+if [ "$CHECKOUT_VALIDATION_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-checkout-validation-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-checkout-validation-cron; CHECKOUT_VALIDATION_WORKER=false)"
+fi
+if [ "$INSIGHT_REFRESH_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-insight-refresh-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-insight-refresh-cron; INSIGHT_REFRESH_WORKER=false)"
+fi
 
 echo
 echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=$WORKERS)"

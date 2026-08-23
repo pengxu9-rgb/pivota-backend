@@ -261,6 +261,103 @@ async def test_upsert_field_fact_uses_logical_key_and_prunes_run_duplicates(
 
 
 @pytest.mark.asyncio
+async def test_upsert_field_fact_emits_v2_delta_only_when_feature_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+
+    async def fake_fetch_one(_query):
+        return None
+
+    async def fake_execute(_query, _values=None):
+        return None
+
+    async def fake_upsert_by_pk(*_args, **_kwargs):
+        return None
+
+    async def fake_delta(**kwargs):
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "record_field_change_and_publications", fake_delta)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_1")
+
+    await module._upsert_field_fact(
+        entity_type="offer",
+        entity_id="offer_1",
+        field_family="pricing",
+        field_key="merchant_effective_price",
+        source_system="shopify_products_sync",
+        source_ref="sync_1",
+        value={"amount": "12.00", "currency": "USD"},
+        merchant_id="merchant_1",
+        commerce_index_source_id="ci_source_merchant_1_shopify",
+        commerce_index_source_kind="merchant_api",
+    )
+
+    assert len(emitted) == 1
+    assert emitted[0]["merchant_id"] == "merchant_1"
+    assert emitted[0]["observation"].source_kind == "merchant_api"
+    assert emitted[0]["source_id"] == "ci_source_merchant_1_shopify"
+
+
+@pytest.mark.asyncio
+async def test_upsert_field_fact_withholds_v2_delta_without_active_source_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def should_not_emit(**_kwargs):
+        raise AssertionError("v2 publication requires an active source contract")
+
+    async def fake_upsert_by_pk(*_args, **_kwargs):
+        return None
+
+    async def fake_execute(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(module, "record_field_change_and_publications", should_not_emit)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_1")
+
+    await module._upsert_field_fact(
+        entity_type="offer",
+        entity_id="offer_1",
+        field_family="pricing",
+        field_key="merchant_effective_price",
+        source_system="universal_product_sync",
+        source_ref="sync_1",
+        value={"amount": "12.00", "currency": "USD"},
+        merchant_id="merchant_1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_v2_ingest_does_not_mutate_catalog_without_active_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_source(**_kwargs):
+        return None
+
+    monkeypatch.setattr(module, "resolve_active_catalog_source", no_source)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_1")
+
+    result = await module.ingest_standard_products(
+        merchant_id="merchant_1",
+        platform="shopify",
+        product_payloads=[{"id": "p_1", "title": "Blocked product"}],
+        source_system="universal_product_sync",
+    )
+
+    assert result["commerce_index_v2_withheld"] is True
+    assert result["products_ingested"] == 0
+
+
+@pytest.mark.asyncio
 async def test_append_snapshot_keeps_latest_offer_source_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -129,6 +129,53 @@ def test_connect_psp_forces_stripe_payment_intent_mode(monkeypatch) -> None:
     assert insert_values["provider_config"] == '{"mode": "payment_intent", "public_key": "pk_live_replacement_key"}'
 
 
+def test_connect_antom_stores_inactive_configuration_until_execution_is_enabled(monkeypatch) -> None:
+    client, module = _build_client()
+    executed = []
+
+    async def fake_get_merchant_id_from_user(_current_user):
+        return "merch_test_connect"
+
+    async def fake_fetch_all(_query, _values=None):
+        return []
+
+    async def fake_execute(query, values=None):
+        executed.append((" ".join(query.split()), dict(values or {})))
+
+    @asynccontextmanager
+    async def fake_transaction():
+        yield
+
+    monkeypatch.setattr(module, "get_merchant_id_from_user", fake_get_merchant_id_from_user)
+    monkeypatch.setattr(module.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module.database, "transaction", lambda: fake_transaction())
+
+    response = client.post(
+        "/merchant/integrations/psp/connect",
+        json={
+            "provider": "antom",
+            "api_key": "antom_api_key_123",
+            "merchant_id": "antom_merchant_123",
+            "client_id": "antom_client_123",
+            "environment": "sandbox",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"]["status"] == "inactive"
+    assert "pending signed-contract enablement" in payload["message"]
+    insert_values = next(values for query, values in executed if query.startswith("INSERT INTO merchant_psps"))
+    assert insert_values["status"] == "inactive"
+    assert insert_values["account_id"] == "antom_merchant_123"
+    assert json.loads(insert_values["provider_config"]) == {
+        "merchant_id": "antom_merchant_123",
+        "client_id": "antom_client_123",
+        "environment": "test",
+    }
+
+
 def test_connect_psp_preserves_existing_stripe_webhook_fields(monkeypatch) -> None:
     client, module = _build_client()
     executed = []
