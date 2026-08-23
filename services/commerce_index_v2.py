@@ -37,6 +37,24 @@ def commerce_index_v2_enabled() -> bool:
     }
 
 
+def commerce_index_v2_enabled_for_merchant(merchant_id: Optional[str]) -> bool:
+    """Return true only for an explicitly allowlisted merchant.
+
+    A global feature flag is not a canary.  Requiring the second, scoped gate
+    prevents a staging or production rollout for one merchant from enqueueing
+    work for every existing catalog connector.
+    """
+    if not commerce_index_v2_enabled():
+        return False
+    normalized_merchant_id = str(merchant_id or "").strip()
+    allowed = {
+        item.strip()
+        for item in str(os.getenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST") or "").split(",")
+        if item.strip()
+    }
+    return bool(normalized_merchant_id and allowed and normalized_merchant_id in allowed)
+
+
 def source_kind_for_system(source_system: str) -> str:
     """Conservative source-class mapping for the existing catalog adapters."""
     source = str(source_system or "").strip().lower()

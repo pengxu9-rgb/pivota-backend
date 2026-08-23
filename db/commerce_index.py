@@ -30,7 +30,7 @@ commerce_index_field_changes = Table(
     "commerce_index_field_changes",
     metadata,
     Column("change_id", String(255), primary_key=True),
-    Column("source_id", String(255), nullable=True, index=True),
+    Column("source_id", String(255), nullable=False, index=True),
     Column("merchant_id", String(64), nullable=False, index=True),
     Column("entity_type", String(32), nullable=False),
     Column("entity_id", String(255), nullable=False),
@@ -103,4 +103,16 @@ commerce_index_checkout_validation_requests = Table(
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_commerce_index_checkout_validation", "merchant_id", "status", "created_at"),
+)
+
+
+# The Gateway search worker uses this small, source-ref-to-document mapping to
+# rebuild an old sellable-item group after a product's identity group changes.
+commerce_index_search_memberships = Table(
+    "commerce_index_search_memberships",
+    metadata,
+    Column("source_ref", String(255), primary_key=True),
+    Column("document_id", String(255), nullable=False, index=True),
+    Column("updated_at", DateTime, server_default=func.now(), nullable=False),
+    Index("idx_commerce_index_search_memberships_document", "document_id"),
 )

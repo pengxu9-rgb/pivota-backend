@@ -71,3 +71,42 @@ async def test_source_metadata_rejects_credentials() -> None:
             provider="shopify",
             source_metadata={"api_key": "do-not-store"},
         )
+
+
+@pytest.mark.asyncio
+async def test_source_metadata_rejects_credentials_nested_in_lists() -> None:
+    with pytest.raises(ValueError, match="must not contain credentials"):
+        await module.register_commerce_index_source(
+            merchant_id="merchant_123",
+            provider="shopify",
+            source_metadata={"connections": [{"api_key": "do-not-store"}]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_active_catalog_source_requires_active_consent(monkeypatch) -> None:
+    async def fake_fetch_one(_query):
+        return {
+            "source_id": "ci_source_shopify",
+            "merchant_id": "merchant_123",
+            "provider": "shopify",
+            "integration_layer": "catalog",
+            "status": "active",
+            "consent_ref": "shopify-oauth:abc",
+        }
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    source = await module.resolve_active_catalog_source(merchant_id="merchant_123", provider="shopify")
+
+    assert source is not None
+    assert source["source_id"] == "ci_source_shopify"
+    assert source["field_source_kind"] == "merchant_api"
+
+
+@pytest.mark.asyncio
+async def test_payment_provider_cannot_resolve_as_catalog_source(monkeypatch) -> None:
+    async def should_not_query(_query):
+        raise AssertionError("payment source must not be queried as a catalog authority")
+
+    monkeypatch.setattr(module.database, "fetch_one", should_not_query)
+    assert await module.resolve_active_catalog_source(merchant_id="merchant_123", provider="antom") is None

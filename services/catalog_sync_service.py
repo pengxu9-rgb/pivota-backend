@@ -76,9 +76,9 @@ from services.catalog_row_trust_upserter import (
 from services.commerce_index_delta_service import record_field_change_and_publications
 from services.commerce_index_v2 import (
     FieldObservation,
-    commerce_index_v2_enabled,
-    source_kind_for_system,
+    commerce_index_v2_enabled_for_merchant,
 )
+from services.commerce_index_source_service import resolve_active_catalog_source
 from services.strong_identifier import (
 
     MPN_CAPTURED_AS_BARCODE,
@@ -861,9 +861,19 @@ async def _upsert_field_fact(
     confidence: Optional[Decimal] = None,
     review_state: str = "observed",
     merchant_id: Optional[str] = None,
+    commerce_index_source_id: Optional[str] = None,
+    commerce_index_source_kind: Optional[str] = None,
 ) -> None:
     fact_id = _stable_key("fact", entity_type, entity_id, field_family, field_key, source_system)
-    v2_enabled = bool(merchant_id and commerce_index_v2_enabled())
+    # Source identity and merchant scoping are mandatory for v2 publication.
+    # Legacy canonical fact ingestion remains unchanged when the v2 canary is
+    # disabled or the merchant has not granted source consent.
+    v2_enabled = bool(
+        merchant_id
+        and commerce_index_source_id
+        and commerce_index_source_kind
+        and commerce_index_v2_enabled_for_merchant(merchant_id)
+    )
     # Migration-safe: legacy sync behavior remains a single fact upsert until
     # the Commerce Index v2 tables are deployed and the feature is enabled.
     previous = await _fetch_one_by_pk(catalog_field_facts, "fact_id", fact_id) if v2_enabled else None
@@ -904,13 +914,14 @@ async def _upsert_field_fact(
                 field_key=field_key,
                 value=value,
                 source_system=source_system,
-                source_kind=source_kind_for_system(source_system),
+                source_kind=str(commerce_index_source_kind),
                 source_ref=source_ref,
                 observed_at=observed_at or _utcnow(),
                 fresh_until=fresh_until,
                 confidence=float(confidence) if confidence is not None else 0.0,
             ),
             previous_value=previous.get("value_json") if previous else None,
+            source_id=str(commerce_index_source_id),
         )
 
 
@@ -996,7 +1007,29 @@ async def ingest_standard_products(
         "beauty_content_assets_upserted": 0,
         "beauty_compatibility_rules_upserted": 0,
         "brand_conflicts_flagged": 0,
+        "commerce_index_v2_withheld": False,
     }
+    commerce_index_source: Optional[Dict[str, Any]] = None
+    if commerce_index_v2_enabled_for_merchant(merchant_id):
+        # `platform`, not the generic writer label, establishes the source
+        # contract. This keeps portal universal sync as merchant API data and
+        # prevents a free-form `source_system` from granting authority.
+        commerce_index_source = await resolve_active_catalog_source(
+            merchant_id=merchant_id,
+            provider=platform,
+        )
+        if commerce_index_source is None:
+            # For an allowlisted v2 merchant, do not let an unconsented or
+            # unsupported source mutate canonical price/stock before the
+            # authority gate runs. Legacy merchants remain on the unchanged
+            # pre-v2 path because they never enter this branch.
+            logger.warning(
+                "Commerce Index v2 catalog intake withheld: no active consented source merchant=%s provider=%s",
+                merchant_id,
+                platform,
+            )
+            stats["commerce_index_v2_withheld"] = True
+            return stats
     # ADR-008 prevent-at-intake (convergence P1.4): guard once per distinct
     # brand per ingest run — a merchant's catalog is usually one brand, so
     # this is ~1 extra lookup per sync, not per product.
@@ -1391,6 +1424,8 @@ async def ingest_standard_products(
                 fresh_until=_utcnow() + timedelta(hours=24),
                 confidence=Decimal("1.0"),
                 merchant_id=merchant_id,
+                commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
             )
             if brand:
                 await _upsert_field_fact(
@@ -1404,6 +1439,8 @@ async def ingest_standard_products(
                     fresh_until=_utcnow() + timedelta(days=7),
                     confidence=Decimal("1.0"),
                     merchant_id=merchant_id,
+                    commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                    commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
 
             variants = _iter_variants(product)
@@ -1598,6 +1635,8 @@ async def ingest_standard_products(
                     fresh_until=_utcnow() + timedelta(hours=1),
                     confidence=Decimal("1.0"),
                     merchant_id=merchant_id,
+                    commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                    commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
                 await _upsert_field_fact(
                     entity_type="offer",
@@ -1610,6 +1649,8 @@ async def ingest_standard_products(
                     fresh_until=_utcnow() + timedelta(minutes=15),
                     confidence=Decimal("1.0"),
                     merchant_id=merchant_id,
+                    commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                    commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
 
                 if _beauty_is_candidate(product):
@@ -1645,6 +1686,8 @@ async def ingest_standard_products(
                         fresh_until=_utcnow() + timedelta(days=30),
                         confidence=Decimal("0.8"),
                         merchant_id=merchant_id,
+                        commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                        commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                     )
 
                     how_to_use_text, steps = _extract_how_to_use(metadata)
@@ -1676,6 +1719,8 @@ async def ingest_standard_products(
                             fresh_until=_utcnow() + timedelta(days=30),
                             confidence=Decimal("0.8"),
                             merchant_id=merchant_id,
+                            commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                            commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                         )
 
                     beauty_shade_rows.extend(

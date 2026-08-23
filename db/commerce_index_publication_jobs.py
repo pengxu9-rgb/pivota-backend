@@ -74,7 +74,10 @@ async def complete_publication_job(
             -- Keep this boolean separate from :status. PostgreSQL otherwise
             -- sees the same bind as varchar (the status column) and text (the
             -- string comparison), which makes the prepared statement invalid.
-            published_at = CASE WHEN :completed THEN :now ELSE NULL END,
+            published_at = CASE
+                WHEN :completed THEN CAST(:now AS timestamp)
+                ELSE NULL::timestamp
+            END,
             claimed_by = NULL,
             claimed_at = NULL,
             lease_until = NULL,

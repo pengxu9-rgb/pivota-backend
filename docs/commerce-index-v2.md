@@ -51,9 +51,13 @@ changes do, while price and stock trigger checkout validation instead.
 
 Existing Shopify/Wix/Commerce adapters now pass through this lane from
 `services/catalog_sync_service._upsert_field_fact`.  It is controlled by
-`COMMERCE_INDEX_V2_ENABLED`, which defaults to off: apply migration 194 first,
-deploy the code, then enable it only for the worker that has been configured to
-drain the target handlers.
+two gates: `COMMERCE_INDEX_V2_ENABLED=true` and an explicit
+`COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST=merchant_a,merchant_b`. This defaults to
+off even when the global flag is set, making a canary genuinely merchant-scoped.
+Apply migration 194 first, register an active consented catalog source, deploy
+the code, and then allowlist only the staged merchant. An allowlisted merchant
+without an active source contract is withheld before canonical catalog writes;
+the legacy, non-allowlisted path is unchanged.
 
 ## Source registration
 
@@ -67,6 +71,10 @@ An `active` source requires a merchant `consent_ref`.  `antom_catalog` may be
 registered as `pending` but cannot become active until its contracted catalogue
 feed adapter exists.  `antom` normalizes to `antom_ucp`, so payment onboarding
 cannot accidentally activate a product-feed authority.
+
+All v2 changes require a non-null `source_id` that references an active source
+contract. Authority is derived from that contract and the connector platform,
+not from a free-form writer label such as `universal_product_sync`.
 
 ## GCP release gates
 
@@ -99,6 +107,11 @@ Serving document builder and OpenSearch bulk publisher. It is paused by default
 through `SEARCH_INDEX_PUBLICATION_WORKER=false`; enable only after
 `CATALOG_SERVING_INDEX_BASE_URL` and the managed
 `CATALOG_SERVING_INDEX_API_KEY` secret are configured on the Cloud Run Job.
+Migration 195 adds a source-ref-to-document membership pointer used to repair
+the old group after identity resolution moves a product. The worker writes the
+new documents first, deletes only obsolete old document IDs, then replaces the
+membership pointers; a deletion or mapping failure leaves the publication job
+pending for retry.
 
 `product_insights` is intentionally a review-request lane: its worker writes
 `commerce_index_insight_refresh_requests(status=pending_review)` and never

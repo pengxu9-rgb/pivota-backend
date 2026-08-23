@@ -22,7 +22,7 @@ CREATE INDEX IF NOT EXISTS idx_commerce_index_sources_provider
 
 CREATE TABLE IF NOT EXISTS commerce_index_field_changes (
     change_id VARCHAR(255) PRIMARY KEY,
-    source_id VARCHAR(255),
+    source_id VARCHAR(255) NOT NULL REFERENCES commerce_index_sources(source_id),
     merchant_id VARCHAR(64) NOT NULL,
     entity_type VARCHAR(32) NOT NULL,
     entity_id VARCHAR(255) NOT NULL,

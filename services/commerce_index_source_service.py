@@ -12,6 +12,8 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional
 
+from sqlalchemy import select
+
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db.commerce_index import commerce_index_sources
@@ -70,16 +72,55 @@ def _default_refresh_policy(definition: Any) -> Dict[str, Any]:
     }
 
 
-def _validate_metadata(value: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def _validate_metadata(value: Any) -> Any:
     """Allow connector references, never credentials, in the fact-layer DB."""
-    result = dict(value or {})
-    for key, nested in result.items():
-        normalized = str(key).strip().lower()
-        if normalized in _SENSITIVE_CONFIG_TOKENS or any(token in normalized for token in _SENSITIVE_CONFIG_TOKENS):
-            raise ValueError("Commerce Index source metadata must not contain credentials")
-        if isinstance(nested, Mapping):
-            _validate_metadata(nested)
-    return result
+    if isinstance(value, Mapping):
+        result = dict(value)
+        for key, nested in result.items():
+            normalized = str(key).strip().lower()
+            if normalized in _SENSITIVE_CONFIG_TOKENS or any(token in normalized for token in _SENSITIVE_CONFIG_TOKENS):
+                raise ValueError("Commerce Index source metadata must not contain credentials")
+            result[key] = _validate_metadata(nested)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_validate_metadata(item) for item in value]
+    return value
+
+
+def source_kind_for_definition(definition: Any) -> str:
+    """Map a registered connector contract to the field-authority taxonomy."""
+    if definition.integration_layer == "catalog" and definition.source_kind == "storefront":
+        return "merchant_api"
+    if definition.integration_layer == "catalog" and definition.source_kind == "catalog_feed":
+        return "contracted_feed"
+    return "public_crawl"
+
+
+async def resolve_active_catalog_source(*, merchant_id: str, provider: str) -> Optional[Dict[str, Any]]:
+    """Resolve the consented source allowed to emit v2 catalog publications."""
+    definition = get_commerce_source(provider)
+    normalized_merchant_id = str(merchant_id or "").strip()
+    if (
+        definition is None
+        or not normalized_merchant_id
+        or definition.integration_layer != "catalog"
+        or not definition.capabilities.catalog_pull
+    ):
+        return None
+    row = await database.fetch_one(
+        select(commerce_index_sources)
+        .where(commerce_index_sources.c.merchant_id == normalized_merchant_id)
+        .where(commerce_index_sources.c.provider == definition.provider)
+        .where(commerce_index_sources.c.integration_layer == definition.integration_layer)
+        .where(commerce_index_sources.c.status == "active")
+        .where(commerce_index_sources.c.consent_ref.isnot(None))
+        .limit(1)
+    )
+    if not row:
+        return None
+    source = dict(row)
+    source["field_source_kind"] = source_kind_for_definition(definition)
+    return source
 
 
 async def register_commerce_index_source(
@@ -128,7 +169,7 @@ async def register_commerce_index_source(
         "consent_ref": normalized_consent_ref,
         "capabilities_json": _capabilities_payload(definition.capabilities),
         "refresh_policy_json": _default_refresh_policy(definition),
-        "source_config_json": _validate_metadata(source_metadata),
+        "source_config_json": _validate_metadata(dict(source_metadata or {})),
         "updated_at": now,
     }
     insert_stmt = pg_insert(commerce_index_sources).values(created_at=now, **values)

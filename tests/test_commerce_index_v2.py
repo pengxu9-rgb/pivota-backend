@@ -1,6 +1,12 @@
 from datetime import datetime, timezone
 
-from services.commerce_index_v2 import FieldObservation, commerce_index_v2_enabled, plan_field_change, source_kind_for_system
+from services.commerce_index_v2 import (
+    FieldObservation,
+    commerce_index_v2_enabled,
+    commerce_index_v2_enabled_for_merchant,
+    plan_field_change,
+    source_kind_for_system,
+)
 
 
 def _observation(*, family: str, source_kind: str = "merchant_api", value=None) -> FieldObservation:
@@ -73,3 +79,7 @@ def test_unknown_source_is_conservative_and_feature_gate_is_opt_in(monkeypatch) 
 
     monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
     assert commerce_index_v2_enabled() is True
+    assert commerce_index_v2_enabled_for_merchant("merchant_123") is False
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_123, merchant_456")
+    assert commerce_index_v2_enabled_for_merchant("merchant_123") is True
+    assert commerce_index_v2_enabled_for_merchant("merchant_999") is False
