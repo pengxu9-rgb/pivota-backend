@@ -44,6 +44,29 @@ Before a source-pull or public crawler schedule may be resumed, require all of:
 5. Metrics for request outcome, 429/403 rate, robots denial, freshness lag, and
    per-domain request count.
 
+### Dry-run manifest review gate
+
+The Gateway utility `scripts/validate-commerce-index-crawl-manifest.js` accepts
+only a local JSON manifest passed with `--manifest`. It never makes a network
+request, writes a database row, or permits live execution. It rejects a manifest
+unless all of the following are supplied:
+
+- `dry_run: true`, an ISO market, and the declared `PivotaCommerceIndexBot/…`
+  user agent;
+- an explicit source ID plus either merchant `consent_ref` or a public-crawl
+  policy reference;
+- fresh per-host robots evidence, no older than 24 hours, pointing at that
+  host's HTTPS `/robots.txt` URL;
+- product-only HTTPS targets without embedded credentials, with a bounded
+  per-domain request count, concurrency of exactly one, a delay of at least one
+  second, and no more than one retry.
+
+This is an operator/review control, not the final authorization boundary. A
+future crawl executor must independently resolve the source ID against the
+active `commerce_index_sources` registry and fetch/evaluate robots.txt itself
+immediately before a request. A caller-provided manifest can never grant that
+authorization.
+
 ## Publication relationship
 
 After a consented catalogue sync changes a product, publication workers may
