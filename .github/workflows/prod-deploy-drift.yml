@@ -25,6 +25,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # How long production may lag main before this job goes red. Long enough that a normal
+  # merge-then-deploy never trips it; short enough that a forgotten deploy is caught the same
+  # morning. Only applies when production is BEHIND main, never when it has diverged.
+  GRACE_MINUTES: '120' 
+
 jobs:
   drift:
     runs-on: ubuntu-latest
@@ -95,8 +101,44 @@ jobs:
             echo "another repo. Treating as runtime drift."
           fi
 
-          # Distinguish "not deployed yet" from "deployed something else entirely".
+          # A merge that landed seconds ago is a PENDING DEPLOY, not drift. Deploys here are
+          # deliberately manual, so every merge of runtime code is guaranteed to make this job red
+          # instantly - before any human could possibly have deployed it. Measured over one day:
+          # all 13 scheduled runs passed and the only failure was the push-triggered one. That is
+          # not an alarm, it is a notification on every merge, and it trains people to ignore the
+          # job - which then launders the real drift it exists to catch.
+          #
+          # So: alarm only once the gap has PERSISTED past a window long enough to deploy in.
+          #
+          # Measure when the code LANDED ON MAIN, not when it was written. Commit timestamps are
+          # wrong for this: a branch developed over two hours and then merged has commits that look
+          # two hours stale the instant they arrive, so a commit-time window would fire on exactly
+          # the merges it is meant to forgive. Walking --first-parent gives the merge that put the
+          # change on main, whose committer date IS the moment production fell behind.
+          #
+          # Anchored to files whose CONTENT still differs, not to files a commit happened to touch.
+          # main carries commits whose content is already deployed (a branch squash-merged and then
+          # merged again re-introduces them); those must not count as undeployed code.
+          #
+          # The window applies ONLY to "behind". A DIVERGED production means someone deployed
+          # something that is not on main, which is never a pending deploy and is never delayed.
           if git merge-base --is-ancestor "$LIVE_SHA" HEAD 2>/dev/null; then
+            RT_LIST="$(mktemp)"; printf '%s\n' "$RUNTIME_CHANGED" > "$RT_LIST"
+            LANDED=""
+            for c in $(git rev-list --reverse --first-parent "$LIVE_SHA..HEAD"); do
+              if git diff --name-only "$c^" "$c" 2>/dev/null | grep -qFxf "$RT_LIST"; then
+                LANDED="$(git show -s --format=%ct "$c")"; break
+              fi
+            done
+            rm -f "$RT_LIST"
+            if [ -n "$LANDED" ]; then
+              AGE_MIN=$(( ( $(date -u +%s) - LANDED ) / 60 ))
+              if [ "$AGE_MIN" -lt "$GRACE_MINUTES" ]; then
+                echo "::notice::undeployed runtime code landed on main ${AGE_MIN}m ago, inside the ${GRACE_MINUTES}m deploy window - not alarming yet. The hourly run will."
+                exit 0
+              fi
+              echo "this gap has been on main for ${AGE_MIN} minutes (window is ${GRACE_MINUTES})."
+            fi
             BEHIND="$(git rev-list --count "$LIVE_SHA..HEAD" 2>/dev/null || echo '?')"
             echo "::error::production is $BEHIND commit(s) BEHIND main and will stay there until someone deploys."
             echo "commits not in production:"
