@@ -1,13 +1,10 @@
-"""
-Employee Products (MVP)
+"""Employee-facing product, offer, and legacy-seed operations.
 
-Purpose:
-- Provide an employee-facing products list/search and product detail view backed by products_cache.
-- Designed to degrade gracefully while metrics/supply signals are sparse in early stages.
-
-NOTE (v0):
-- This is not the final 10M-scale read model. It is a bridge that enables the
-  employee portal UX while the `employee_products_index` rollups are built.
+The original ``/search`` and triplet-detail endpoints are intentionally kept
+for support of the cache-backed merchant-sync tools.  They are *not* the
+canonical product read model: employee product discovery now uses the
+content-key catalogue endpoints below, whose offers come from
+``catalog_offers``.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -5738,6 +5735,227 @@ async def search_products(
         "items": cards,
         "next": {"after_id": next_after_id},
         **({"debug_errors": debug_errors[:10]} if debug_errors else {}),
+    }
+
+
+def _catalog_number(value: Any) -> Optional[float]:
+    """Serialize Decimal/Numeric values without leaking driver-specific types."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/canonical")
+async def list_canonical_products(
+    q: Optional[str] = Query(default=None, description="Search content key, sig, brand, or title"),
+    merchant_id: Optional[str] = Query(default=None, description="Find content clusters containing this merchant"),
+    limit: int = Query(default=50, ge=1, le=100),
+    after_content_key: Optional[str] = Query(default=None, description="Keyset cursor returned by this endpoint"),
+    current_user: dict = Depends(get_current_employee),
+):
+    """List the canonical employee product catalogue at the content-key grain.
+
+    A content key is the identity/aggregation grain.  The selected canonical
+    ``sig_*`` remains a public-PDP URL identifier, while merchant buyability is
+    read exclusively from unsuppressed ``catalog_offers``.  External seeds are
+    deliberately absent: they are an audit/legacy compatibility data source,
+    not offers of record.
+    """
+    normalized_q = (q or "").strip()
+    normalized_merchant_id = (merchant_id or "").strip()
+    cursor = (after_content_key or "").strip()
+    values: Dict[str, Any] = {
+        "q": normalized_q or None,
+        "q_like": f"%{normalized_q}%" if normalized_q else None,
+        "merchant_id": normalized_merchant_id or None,
+        "after_content_key": cursor or None,
+        "limit": limit + 1,
+    }
+
+    rows = await database.fetch_all(
+        """
+        WITH matching_keys AS (
+          SELECT DISTINCT cp.content_key
+          FROM catalog_products cp
+          WHERE cp.content_key IS NOT NULL
+            AND cp.suppressed_at IS NULL
+            -- Bind every optional string explicitly.  asyncpg cannot infer a
+            -- type for a NULL-only named bind in the first page request.
+            AND (CAST(:merchant_id AS text) IS NULL OR cp.merchant_id = CAST(:merchant_id AS text))
+            AND (
+              CAST(:q AS text) IS NULL
+              OR cp.content_key = CAST(:q AS text)
+              OR cp.pivota_signature_id = CAST(:q AS text)
+              OR cp.title ILIKE CAST(:q_like AS text)
+              OR cp.brand ILIKE CAST(:q_like AS text)
+            )
+            AND (CAST(:after_content_key AS text) IS NULL
+                 OR cp.content_key > CAST(:after_content_key AS text))
+        ),
+        cluster_products AS (
+          SELECT cp.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY cp.content_key
+                   ORDER BY
+                     (cp.pivota_signature_id IS NOT NULL) DESC,
+                     cp.content_changed_at DESC NULLS LAST,
+                     cp.product_key ASC
+                 ) AS representative_rank
+          FROM catalog_products cp
+          JOIN matching_keys mk ON mk.content_key = cp.content_key
+          WHERE cp.suppressed_at IS NULL
+        ),
+        offer_stats AS (
+          SELECT
+            cp.content_key,
+            COUNT(DISTINCT cp.product_key)::int AS product_count,
+            COUNT(DISTINCT cp.merchant_id)::int AS merchant_count,
+            COUNT(DISTINCT o.offer_id)::int AS offer_count,
+            COUNT(DISTINCT o.merchant_id)::int AS offer_merchant_count,
+            MIN(COALESCE(o.merchant_effective_price, o.estimated_best_price, o.list_price)) AS lowest_price,
+            MIN(o.currency) FILTER (WHERE o.currency IS NOT NULL) AS currency
+          FROM cluster_products cp
+          LEFT JOIN catalog_offers o
+            ON o.product_key = cp.product_key
+           AND o.suppressed_at IS NULL
+          GROUP BY cp.content_key
+        )
+        SELECT
+          cp.content_key,
+          cp.product_key AS representative_product_key,
+          cp.title,
+          cp.brand,
+          cp.image_url,
+          cp.pivota_signature_id AS representative_sig_id,
+          cp.pivota_canonical_url,
+          COALESCE(cce.canonical_sig_id, cp.pivota_signature_id) AS canonical_sig_id,
+          COALESCE(ips.serving_eligible, FALSE) AS serving_eligible,
+          ips.index_eligible,
+          ips.blocker_code,
+          os.product_count,
+          os.merchant_count,
+          os.offer_count,
+          os.offer_merchant_count,
+          os.lowest_price,
+          os.currency
+        FROM cluster_products cp
+        JOIN offer_stats os ON os.content_key = cp.content_key
+        LEFT JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
+        LEFT JOIN content_canonical_election cce ON cce.content_key = cp.content_key
+        WHERE cp.representative_rank = 1
+        ORDER BY cp.content_key ASC
+        LIMIT :limit
+        """,
+        values,
+    )
+
+    has_more = len(rows or []) > limit
+    page_rows = [dict(row) for row in (rows or [])[:limit]]
+    items = [
+        {
+            **row,
+            "serving_eligible": bool(row.get("serving_eligible")),
+            "index_eligible": bool(row.get("index_eligible")),
+            "lowest_price": _catalog_number(row.get("lowest_price")),
+        }
+        for row in page_rows
+    ]
+    return {
+        "status": "success",
+        "items": items,
+        "next": {"after_content_key": items[-1]["content_key"] if has_more and items else None},
+    }
+
+
+@router.get("/canonical/{content_key}")
+async def get_canonical_product(
+    content_key: str,
+    current_user: dict = Depends(get_current_employee),
+):
+    """Return one content-key cluster and its merchant offers of record."""
+    ck = (content_key or "").strip()
+    if not ck.startswith("ck_"):
+        raise HTTPException(status_code=400, detail="INVALID_CONTENT_KEY")
+
+    products = await database.fetch_all(
+        """
+        SELECT
+          cp.product_key, cp.merchant_id, cp.platform, cp.source_product_id,
+          cp.title, cp.brand, cp.image_url, cp.pivota_signature_id,
+          cp.pivota_canonical_url, cp.pdp_scope, cp.sync_status,
+          cp.content_changed_at,
+          COALESCE(cm.merchant_name, cp.merchant_id) AS merchant_name
+        FROM catalog_products cp
+        LEFT JOIN catalog_merchants cm ON cm.merchant_id = cp.merchant_id
+        WHERE cp.content_key = :content_key
+          AND cp.suppressed_at IS NULL
+        ORDER BY (cp.pivota_signature_id IS NOT NULL) DESC,
+                 cp.content_changed_at DESC NULLS LAST,
+                 cp.product_key ASC
+        """,
+        {"content_key": ck},
+    )
+    if not products:
+        raise HTTPException(status_code=404, detail="CANONICAL_PRODUCT_NOT_FOUND")
+
+    offers = await database.fetch_all(
+        """
+        SELECT
+          o.offer_id, o.product_key, o.merchant_id,
+          COALESCE(cm.merchant_name, o.merchant_id) AS merchant_name,
+          o.market, o.channel, o.offer_mode, o.offer_type, o.is_first_party,
+          o.availability, o.currency, o.list_price,
+          o.merchant_effective_price, o.estimated_best_price,
+          o.price_confidence, o.source_domain, o.updated_at
+        FROM catalog_offers o
+        JOIN catalog_products cp ON cp.product_key = o.product_key
+        LEFT JOIN catalog_merchants cm ON cm.merchant_id = o.merchant_id
+        WHERE cp.content_key = :content_key
+          AND cp.suppressed_at IS NULL
+          AND o.suppressed_at IS NULL
+        ORDER BY
+          COALESCE(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC NULLS LAST,
+          o.merchant_id ASC,
+          o.offer_id ASC
+        """,
+        {"content_key": ck},
+    )
+    state = await database.fetch_one(
+        """
+        SELECT serving_eligible, index_eligible, blocker_code, blocker_detail
+        FROM index_pipeline_state
+        WHERE content_key = :content_key
+        """,
+        {"content_key": ck},
+    )
+    election = await database.fetch_one(
+        "SELECT canonical_sig_id FROM content_canonical_election WHERE content_key = :content_key",
+        {"content_key": ck},
+    )
+
+    product_items = [dict(row) for row in products]
+    offer_items = []
+    for row in offers or []:
+        item = dict(row)
+        for field in ("list_price", "merchant_effective_price", "estimated_best_price", "price_confidence"):
+            item[field] = _catalog_number(item.get(field))
+        item["is_first_party"] = bool(item.get("is_first_party"))
+        offer_items.append(item)
+    representative = product_items[0]
+    canonical_sig_id = (dict(election).get("canonical_sig_id") if election else None) or representative.get("pivota_signature_id")
+
+    return {
+        "status": "success",
+        "content_key": ck,
+        "canonical_sig_id": canonical_sig_id,
+        "canonical_url": representative.get("pivota_canonical_url"),
+        "serving": dict(state) if state else {"serving_eligible": False, "index_eligible": False},
+        "representative": representative,
+        "products": product_items,
+        "offers": offer_items,
     }
 
 
