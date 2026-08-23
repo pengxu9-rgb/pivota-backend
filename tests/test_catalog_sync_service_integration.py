@@ -315,6 +315,54 @@ async def test_emit_product_projection_facts_covers_content_taxonomy_and_media(
 
 
 @pytest.mark.asyncio
+async def test_emit_product_projection_facts_emits_tombstones_when_fields_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+
+    async def fake_upsert_field_fact(**kwargs):
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    product = module.StandardProduct(
+        id="product_1",
+        product_id="product_1",
+        platform="shopify",
+        merchant_id="merchant_1",
+        title="Barrier Cream",
+        description=None,
+        product_type=None,
+        tags=[],
+        price=24.0,
+        image_url=None,
+        images=[],
+    )
+
+    await module._emit_product_projection_facts(
+        product=product,
+        product_key="prod::merchant_1::shopify::product_1",
+        description=None,
+        category_path=None,
+        category_label_source=None,
+        category_confidence=None,
+        normalized_category=None,
+        source_system="shopify_products_sync",
+        source_ref="sync_2",
+        merchant_id="merchant_1",
+        commerce_index_source={
+            "source_id": "ci_source_merchant_1_shopify",
+            "field_source_kind": "merchant_api",
+        },
+    )
+
+    assert [(row["field_family"], row["field_key"], row["value"]) for row in emitted] == [
+        ("content", "description", None),
+        ("taxonomy", "classification", None),
+        ("media", "images", None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_upsert_field_fact_emits_v2_delta_only_when_feature_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

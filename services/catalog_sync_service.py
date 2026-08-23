@@ -970,15 +970,19 @@ async def _emit_product_projection_facts(
         "commerce_index_source_id": (commerce_index_source or {}).get("source_id"),
         "commerce_index_source_kind": (commerce_index_source or {}).get("field_source_kind"),
     }
-    if description:
-        await _upsert_field_fact(
-            **common,
-            field_family="content",
-            field_key="description",
-            value=description,
-            fresh_until=_utcnow() + timedelta(days=7),
-            confidence=Decimal("1.0"),
-        )
+    # Every authoritative full catalog observation must carry a value for each
+    # projected field, including an explicit ``None`` when the merchant removed
+    # it.  The nullable fact is a deletion tombstone: it replaces the previous
+    # source fact and emits a v2 delta so downstream search, graph and insight
+    # projections cannot retain stale content.
+    await _upsert_field_fact(
+        **common,
+        field_family="content",
+        field_key="description",
+        value=str(description or "").strip() or None,
+        fresh_until=_utcnow() + timedelta(days=7),
+        confidence=Decimal("1.0"),
+    )
 
     taxonomy = {
         "product_type": str(product.product_type or "").strip() or None,
@@ -988,26 +992,28 @@ async def _emit_product_projection_facts(
         "category_confidence": category_confidence,
         "tags": _dedupe_nonempty_strings(list(product.tags or [])),
     }
-    if any(value not in (None, "", []) for value in taxonomy.values()):
-        await _upsert_field_fact(
-            **common,
-            field_family="taxonomy",
-            field_key="classification",
-            value=taxonomy,
-            fresh_until=_utcnow() + timedelta(days=7),
-            confidence=Decimal("1.0"),
-        )
+    await _upsert_field_fact(
+        **common,
+        field_family="taxonomy",
+        field_key="classification",
+        value=(
+            taxonomy
+            if any(value not in (None, "", []) for value in taxonomy.values())
+            else None
+        ),
+        fresh_until=_utcnow() + timedelta(days=7),
+        confidence=Decimal("1.0"),
+    )
 
     images = _dedupe_nonempty_strings([product.image_url, *(product.images or [])])
-    if images:
-        await _upsert_field_fact(
-            **common,
-            field_family="media",
-            field_key="images",
-            value={"primary": images[0], "items": images},
-            fresh_until=_utcnow() + timedelta(days=7),
-            confidence=Decimal("1.0"),
-        )
+    await _upsert_field_fact(
+        **common,
+        field_family="media",
+        field_key="images",
+        value={"primary": images[0], "items": images} if images else None,
+        fresh_until=_utcnow() + timedelta(days=7),
+        confidence=Decimal("1.0"),
+    )
 
 
 async def _resolve_merchant_name(merchant_id: str) -> Optional[str]:
