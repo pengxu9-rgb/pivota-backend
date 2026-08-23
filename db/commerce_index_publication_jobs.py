@@ -71,7 +71,10 @@ async def complete_publication_job(
         UPDATE commerce_index_publication_jobs
         SET status = :status,
             error_message = :error_message,
-            published_at = CASE WHEN :status = 'completed' THEN :now ELSE NULL END,
+            -- Keep this boolean separate from :status. PostgreSQL otherwise
+            -- sees the same bind as varchar (the status column) and text (the
+            -- string comparison), which makes the prepared statement invalid.
+            published_at = CASE WHEN :completed THEN :now ELSE NULL END,
             claimed_by = NULL,
             claimed_at = NULL,
             lease_until = NULL,
@@ -85,6 +88,7 @@ async def complete_publication_job(
             "job_id": str(job_id or "").strip(),
             "worker_id": str(worker_id or "").strip(),
             "status": "pending" if failed else "completed",
+            "completed": not failed,
             "error_message": str(error_message or "").strip()[:1000] or None,
             "now": _utcnow(),
         },
