@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from db.database import database
 
 
-SUPPORTED_CANONICAL_PSPS = {"stripe", "adyen", "checkout"}
+SUPPORTED_CANONICAL_PSPS = {"stripe", "adyen", "checkout", "antom"}
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -66,6 +66,8 @@ def default_capabilities_for_provider(provider: str) -> List[str]:
         return ["payments", "refunds"]
     if provider_norm == "paypal":
         return ["payments", "refunds", "payouts"]
+    if provider_norm == "antom":
+        return ["payments", "refunds"]
     return ["payments"]
 
 
@@ -95,6 +97,11 @@ def normalize_psp_environment(provider: str, api_key: Optional[str], environment
             derived_env = "live"
         elif key.startswith("test_"):
             derived_env = "test"
+    elif provider_norm == "antom":
+        # Antom credentials do not have a stable public prefix.  Environment is
+        # therefore an explicit merchant configuration value.
+        if env == "sandbox":
+            return "test"
 
     # Secret-key prefixes are a stronger signal than any persisted environment
     # flag. This prevents rows marked "live" from still routing through test
@@ -194,6 +201,25 @@ def normalize_provider_config(
             normalized["environment"] = env_value
         return normalized
 
+    if provider_norm == "antom":
+        merchant_id = str(
+            config.get("merchant_id")
+            or config.get("merchantId")
+            or account_value
+            or ""
+        ).strip()
+        client_id = str(config.get("client_id") or config.get("clientId") or "").strip()
+        webhook_url = str(config.get("webhook_url") or config.get("webhookUrl") or "").strip()
+        normalized = {
+            "merchant_id": merchant_id or None,
+            "client_id": client_id or None,
+        }
+        if webhook_url:
+            normalized["webhook_url"] = webhook_url
+        if env_value != "unknown":
+            normalized["environment"] = env_value
+        return normalized
+
     return config
 
 
@@ -245,6 +271,13 @@ def build_provider_summary(
         return {
             "processing_channel_id": config.get("processing_channel_id"),
             "public_key_present": bool(config.get("public_key")),
+            "environment": env_value,
+        }
+    if provider_norm == "antom":
+        return {
+            "merchant_id": config.get("merchant_id"),
+            "client_id_present": bool(config.get("client_id")),
+            "webhook_url": config.get("webhook_url"),
             "environment": env_value,
         }
     return {
@@ -403,6 +436,16 @@ def build_runtime_adapter_kwargs(
             "environment": env_value,
         }
 
+    if provider_norm == "antom":
+        # This is intentionally configuration-only until the merchant's Antom
+        # product/API contract supplies the signed payment endpoint and key
+        # material through the managed secret path.
+        return {
+            "merchant_id": config.get("merchant_id") or account_id,
+            "client_id": config.get("client_id"),
+            "environment": env_value,
+        }
+
     if provider_norm == "paypal":
         return {
             "client_secret": secret_key,
@@ -485,6 +528,16 @@ def evaluate_psp_readiness(
         if not summary.get("public_key_present"):
             add_blocker("Checkout.com public key is missing")
 
+    elif provider_norm == "antom":
+        if not summary.get("merchant_id"):
+            add_blocker("Antom merchant ID is missing")
+        if not summary.get("client_id_present"):
+            add_blocker("Antom client ID is missing")
+        # Signed payment execution and webhook verification are deliberately
+        # gated on a provider-specific onboarding contract, not inferred from a
+        # generic PSP row.
+        add_blocker("Antom payment execution is not enabled for this merchant")
+
     if validation_value == "unknown":
         add_blocker("Processor validation has not been run")
     elif validation_value == "invalid":
@@ -519,7 +572,7 @@ def infer_runtime_provider(
     payment_reference: Optional[str] = None,
     fallback_provider: Optional[str] = None,
 ) -> Optional[str]:
-    supported_runtime_providers = SUPPORTED_CANONICAL_PSPS | {"paypal"}
+    supported_runtime_providers = (SUPPORTED_CANONICAL_PSPS - {"antom"}) | {"paypal"}
 
     provider_value = str(psp_used or "").strip().lower()
     if provider_value in supported_runtime_providers:

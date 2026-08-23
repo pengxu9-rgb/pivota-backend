@@ -73,6 +73,12 @@ from services.catalog_row_trust_upserter import (
     upsert_catalog_row_trust,
     upsert_catalog_row_trust_many,
 )
+from services.commerce_index_delta_service import record_field_change_and_publications
+from services.commerce_index_v2 import (
+    FieldObservation,
+    commerce_index_v2_enabled,
+    source_kind_for_system,
+)
 from services.strong_identifier import (
 
     MPN_CAPTURED_AS_BARCODE,
@@ -854,8 +860,13 @@ async def _upsert_field_fact(
     fresh_until: Optional[datetime] = None,
     confidence: Optional[Decimal] = None,
     review_state: str = "observed",
+    merchant_id: Optional[str] = None,
 ) -> None:
     fact_id = _stable_key("fact", entity_type, entity_id, field_family, field_key, source_system)
+    v2_enabled = bool(merchant_id and commerce_index_v2_enabled())
+    # Migration-safe: legacy sync behavior remains a single fact upsert until
+    # the Commerce Index v2 tables are deployed and the feature is enabled.
+    previous = await _fetch_one_by_pk(catalog_field_facts, "fact_id", fact_id) if v2_enabled else None
     await database.execute(
         catalog_field_facts.delete()
         .where(catalog_field_facts.c.entity_type == entity_type)
@@ -883,6 +894,24 @@ async def _upsert_field_fact(
             "review_state": review_state,
         },
     )
+    if v2_enabled:
+        await record_field_change_and_publications(
+            merchant_id=merchant_id,
+            observation=FieldObservation(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                field_family=field_family,
+                field_key=field_key,
+                value=value,
+                source_system=source_system,
+                source_kind=source_kind_for_system(source_system),
+                source_ref=source_ref,
+                observed_at=observed_at or _utcnow(),
+                fresh_until=fresh_until,
+                confidence=float(confidence) if confidence is not None else 0.0,
+            ),
+            previous_value=previous.get("value_json") if previous else None,
+        )
 
 
 async def _resolve_merchant_name(merchant_id: str) -> Optional[str]:
@@ -1361,6 +1390,7 @@ async def ingest_standard_products(
                 value=product.title,
                 fresh_until=_utcnow() + timedelta(hours=24),
                 confidence=Decimal("1.0"),
+                merchant_id=merchant_id,
             )
             if brand:
                 await _upsert_field_fact(
@@ -1373,6 +1403,7 @@ async def ingest_standard_products(
                     value=brand,
                     fresh_until=_utcnow() + timedelta(days=7),
                     confidence=Decimal("1.0"),
+                    merchant_id=merchant_id,
                 )
 
             variants = _iter_variants(product)
@@ -1566,6 +1597,7 @@ async def ingest_standard_products(
                     },
                     fresh_until=_utcnow() + timedelta(hours=1),
                     confidence=Decimal("1.0"),
+                    merchant_id=merchant_id,
                 )
                 await _upsert_field_fact(
                     entity_type="offer",
@@ -1577,6 +1609,7 @@ async def ingest_standard_products(
                     value={"availability": availability, "inventory_quantity": inventory_quantity},
                     fresh_until=_utcnow() + timedelta(minutes=15),
                     confidence=Decimal("1.0"),
+                    merchant_id=merchant_id,
                 )
 
                 if _beauty_is_candidate(product):
@@ -1611,6 +1644,7 @@ async def ingest_standard_products(
                         value=list(product.ingredient_ids or []),
                         fresh_until=_utcnow() + timedelta(days=30),
                         confidence=Decimal("0.8"),
+                        merchant_id=merchant_id,
                     )
 
                     how_to_use_text, steps = _extract_how_to_use(metadata)
@@ -1641,6 +1675,7 @@ async def ingest_standard_products(
                             value={"text": how_to_use_text, "steps": steps},
                             fresh_until=_utcnow() + timedelta(days=30),
                             confidence=Decimal("0.8"),
+                            merchant_id=merchant_id,
                         )
 
                     beauty_shade_rows.extend(

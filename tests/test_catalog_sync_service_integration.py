@@ -261,6 +261,46 @@ async def test_upsert_field_fact_uses_logical_key_and_prunes_run_duplicates(
 
 
 @pytest.mark.asyncio
+async def test_upsert_field_fact_emits_v2_delta_only_when_feature_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+
+    async def fake_fetch_one(_query):
+        return None
+
+    async def fake_execute(_query, _values=None):
+        return None
+
+    async def fake_upsert_by_pk(*_args, **_kwargs):
+        return None
+
+    async def fake_delta(**kwargs):
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "record_field_change_and_publications", fake_delta)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+
+    await module._upsert_field_fact(
+        entity_type="offer",
+        entity_id="offer_1",
+        field_family="pricing",
+        field_key="merchant_effective_price",
+        source_system="shopify_products_sync",
+        source_ref="sync_1",
+        value={"amount": "12.00", "currency": "USD"},
+        merchant_id="merchant_1",
+    )
+
+    assert len(emitted) == 1
+    assert emitted[0]["merchant_id"] == "merchant_1"
+    assert emitted[0]["observation"].source_kind == "merchant_api"
+
+
+@pytest.mark.asyncio
 async def test_append_snapshot_keeps_latest_offer_source_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

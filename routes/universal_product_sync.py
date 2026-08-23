@@ -16,6 +16,7 @@ from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
 from db.products import delete_missing_products_from_cache
 from services.catalog_sync_service import ingest_standard_products
+from services.commerce_source_registry import catalog_sync_blocker
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.wix_connection import (
     WixConnectionValidationError,
@@ -65,6 +66,21 @@ async def universal_product_sync(
 
     if current_user.get("merchant_id") != request.merchant_id and current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="cannot sync products for another merchant")
+
+    # A PSP connection is not evidence of permission to read a merchant catalogue.
+    # Reject it before store lookup so payment-only sources cannot return a silent
+    # zero-product "success" from this catalogue endpoint.
+    requested_platform = str(request.platform or "").strip().lower() or None
+    requested_platform_blocker = catalog_sync_blocker(requested_platform) if requested_platform else None
+    if requested_platform_blocker:
+        return UniversalSyncResponse(
+            status="unsupported",
+            message=requested_platform_blocker,
+            merchant_id=request.merchant_id,
+            platform=requested_platform or "unknown",
+            products_synced=0,
+            sync_time=datetime.now().isoformat(),
+        )
     
     try:
         logger.info(f"🔄 Universal sync request: merchant_id={request.merchant_id}")
@@ -121,6 +137,17 @@ async def universal_product_sync(
         
         platform = store_info["platform"]
         logger.info(f"Found {platform} store for merchant {request.merchant_id}")
+
+        platform_blocker = catalog_sync_blocker(platform)
+        if platform_blocker:
+            return UniversalSyncResponse(
+                status="unsupported",
+                message=platform_blocker,
+                merchant_id=request.merchant_id,
+                platform=platform,
+                products_synced=0,
+                sync_time=datetime.now().isoformat(),
+            )
 
         if platform == "shopify":
             refreshed_token, _ = await resolve_shopify_admin_access_token(
