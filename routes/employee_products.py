@@ -5782,15 +5782,18 @@ async def list_canonical_products(
           FROM catalog_products cp
           WHERE cp.content_key IS NOT NULL
             AND cp.suppressed_at IS NULL
-            AND (:merchant_id IS NULL OR cp.merchant_id = :merchant_id)
+            -- Bind every optional string explicitly.  asyncpg cannot infer a
+            -- type for a NULL-only named bind in the first page request.
+            AND (CAST(:merchant_id AS text) IS NULL OR cp.merchant_id = CAST(:merchant_id AS text))
             AND (
-              :q IS NULL
-              OR cp.content_key = :q
-              OR cp.pivota_signature_id = :q
-              OR cp.title ILIKE :q_like
-              OR cp.brand ILIKE :q_like
+              CAST(:q AS text) IS NULL
+              OR cp.content_key = CAST(:q AS text)
+              OR cp.pivota_signature_id = CAST(:q AS text)
+              OR cp.title ILIKE CAST(:q_like AS text)
+              OR cp.brand ILIKE CAST(:q_like AS text)
             )
-            AND (:after_content_key IS NULL OR cp.content_key > :after_content_key)
+            AND (CAST(:after_content_key AS text) IS NULL
+                 OR cp.content_key > CAST(:after_content_key AS text))
         ),
         cluster_products AS (
           SELECT cp.*,
