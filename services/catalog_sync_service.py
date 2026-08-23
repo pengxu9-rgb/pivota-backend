@@ -925,6 +925,91 @@ async def _upsert_field_fact(
         )
 
 
+def _dedupe_nonempty_strings(values: List[Any]) -> List[str]:
+    """Preserve source order while producing a stable media-fact payload."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+async def _emit_product_projection_facts(
+    *,
+    product: StandardProduct,
+    product_key: str,
+    description: Optional[str],
+    category_path: Optional[str],
+    category_label_source: Optional[str],
+    category_confidence: Optional[float],
+    normalized_category: Optional[str],
+    source_system: str,
+    source_ref: Optional[str],
+    merchant_id: str,
+    commerce_index_source: Optional[Dict[str, Any]],
+) -> None:
+    """Emit the non-commercial product facts that drive incremental projections.
+
+    Price and stock retain their offer-level cadence below.  Content, taxonomy,
+    and media used to mutate the serving projection without a v2 field fact,
+    leaving search, relation graph, and Insights stale after a normal merchant
+    sync.  These facts intentionally carry only merchant catalogue data.  Review
+    aggregates belong to a separately-authorized ``reviews_pull`` source and
+    must not be inferred from arbitrary storefront metadata here.
+    """
+    common = {
+        "entity_type": "product",
+        "entity_id": product_key,
+        "source_system": source_system,
+        "source_ref": source_ref,
+        "merchant_id": merchant_id,
+        "commerce_index_source_id": (commerce_index_source or {}).get("source_id"),
+        "commerce_index_source_kind": (commerce_index_source or {}).get("field_source_kind"),
+    }
+    if description:
+        await _upsert_field_fact(
+            **common,
+            field_family="content",
+            field_key="description",
+            value=description,
+            fresh_until=_utcnow() + timedelta(days=7),
+            confidence=Decimal("1.0"),
+        )
+
+    taxonomy = {
+        "product_type": str(product.product_type or "").strip() or None,
+        "category": normalized_category,
+        "category_path": category_path,
+        "category_label_source": category_label_source,
+        "category_confidence": category_confidence,
+        "tags": _dedupe_nonempty_strings(list(product.tags or [])),
+    }
+    if any(value not in (None, "", []) for value in taxonomy.values()):
+        await _upsert_field_fact(
+            **common,
+            field_family="taxonomy",
+            field_key="classification",
+            value=taxonomy,
+            fresh_until=_utcnow() + timedelta(days=7),
+            confidence=Decimal("1.0"),
+        )
+
+    images = _dedupe_nonempty_strings([product.image_url, *(product.images or [])])
+    if images:
+        await _upsert_field_fact(
+            **common,
+            field_family="media",
+            field_key="images",
+            value={"primary": images[0], "items": images},
+            fresh_until=_utcnow() + timedelta(days=7),
+            confidence=Decimal("1.0"),
+        )
+
+
 async def _resolve_merchant_name(merchant_id: str) -> Optional[str]:
     candidate_keys = [
         key
@@ -1442,6 +1527,20 @@ async def ingest_standard_products(
                     commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
                     commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
+
+            await _emit_product_projection_facts(
+                product=product,
+                product_key=product_key,
+                description=_description_for_ingest,
+                category_path=_cat_path,
+                category_label_source=_cat_source,
+                category_confidence=_cat_confidence,
+                normalized_category=_normalized_category,
+                source_system=source_system,
+                source_ref=source_ref,
+                merchant_id=merchant_id,
+                commerce_index_source=commerce_index_source,
+            )
 
             variants = _iter_variants(product)
             beauty_usage_rows: List[Dict[str, Any]] = []
