@@ -15,8 +15,9 @@ GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
 SHARED=pivota-shared
 CRAWL_SA="sa-store-audit-commerce-crawl@$PROJECT.iam.gserviceaccount.com"
-SELECTOR_SA="sa-store-audit-commerce-selector@$PROJECT.iam.gserviceaccount.com"
-SCHEDULER_SA="sa-store-audit-commerce-scheduler@$PROJECT.iam.gserviceaccount.com"
+# GCP service-account IDs have a strict 30-character limit.
+SELECTOR_SA="sa-store-audit-commerce-sel@$PROJECT.iam.gserviceaccount.com"
+SCHEDULER_SA="sa-store-audit-commerce-sched@$PROJECT.iam.gserviceaccount.com"
 BACKEND_SA="sa-backend@$PROJECT.iam.gserviceaccount.com"
 SECRET=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY
 have(){ "$@" >/dev/null 2>&1; }
@@ -47,8 +48,8 @@ grant_registry(){
 }
 
 ensure_sa sa-store-audit-commerce-crawl "$CRAWL_SA" "Store Audit anonymous commerce browser"
-ensure_sa sa-store-audit-commerce-selector "$SELECTOR_SA" "Store Audit commerce route selector"
-ensure_sa sa-store-audit-commerce-scheduler "$SCHEDULER_SA" "Store Audit commerce Scheduler invoker"
+ensure_sa sa-store-audit-commerce-sel "$SELECTOR_SA" "Store Audit commerce route selector"
+ensure_sa sa-store-audit-commerce-sched "$SCHEDULER_SA" "Store Audit commerce Scheduler invoker"
 for account in "$CRAWL_SA" "$SELECTOR_SA"; do
   grant_project "$account" roles/logging.logWriter
   grant_project "$account" roles/monitoring.metricWriter

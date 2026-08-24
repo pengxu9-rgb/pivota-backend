@@ -102,8 +102,8 @@ UCP_CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
 UCP_SELECTOR_SA="sa-store-audit-ucp-selector@$PROJECT.iam.gserviceaccount.com"
 UCP_SCHEDULER_SA="sa-store-audit-ucp-scheduler@$PROJECT.iam.gserviceaccount.com"
 COMMERCE_CRAWL_SA="sa-store-audit-commerce-crawl@$PROJECT.iam.gserviceaccount.com"
-COMMERCE_SELECTOR_SA="sa-store-audit-commerce-selector@$PROJECT.iam.gserviceaccount.com"
-COMMERCE_SCHEDULER_SA="sa-store-audit-commerce-scheduler@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_SELECTOR_SA="sa-store-audit-commerce-sel@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_SCHEDULER_SA="sa-store-audit-commerce-sched@$PROJECT.iam.gserviceaccount.com"
 have(){ "$@" >/dev/null 2>&1; }
 require_service_account(){
   have "$GCLOUD" iam service-accounts describe "$1" \
