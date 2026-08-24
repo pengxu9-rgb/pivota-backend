@@ -68,14 +68,19 @@ fi
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ]; then
   [ "$CONFIG" = apply ] || { echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED requires CONFIG=apply so the dedicated secret is mounted." >&2; exit 2; }
 fi
-if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
-  [ "$CONFIG" = apply ] || { echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED requires CONFIG=apply so the dedicated secret is mounted." >&2; exit 2; }
-fi
 # PROMOTE=0 stops after the candidate revision passes its health check, leaving it at 0% traffic.
 # The previous revision keeps serving. This is how the deploy path itself can be exercised - build,
 # auth, revision, in-VPC probe - without putting anything in front of users.
 : "${PROMOTE:=1}"
 case "$PROMOTE" in 0|1) ;; *) echo "PROMOTE must be exactly 0 or 1 (got '$PROMOTE')" >&2; exit 2 ;; esac
+# The GCP cutover deliberately leaves env.prod.yaml and secrets.prod.list out
+# of source control.  A receipt-contract candidate can therefore preserve the
+# running configuration and make only the two reviewed, incremental changes
+# below.  Never use this escape hatch to promote traffic: a promotion still
+# requires a reviewed CONFIG=apply deployment or an explicit traffic action.
+if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && [ "$CONFIG" = preserve ]; then
+  [ "$PROMOTE" = 0 ] || { echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED with CONFIG=preserve is candidate-only; set PROMOTE=0." >&2; exit 2; }
+fi
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
 # all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
@@ -185,7 +190,16 @@ if [ "$CONFIG" = preserve ]; then
   #
   # --update-env-vars MERGES one key. --set-env-vars / --env-vars-file REPLACE the whole set, and
   # would wipe the other 187.
-  CONFIG_ARGS=(--update-env-vars "PIVOTA_COMMIT_SHA=$TAG")
+  PRESERVE_ENV_UPDATES="PIVOTA_COMMIT_SHA=$TAG"
+  if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
+    # --update-* merges only these two keys.  It must not replace the active
+    # service's configuration, which is now the production source of truth.
+    PRESERVE_ENV_UPDATES="$PRESERVE_ENV_UPDATES,STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true"
+    CONFIG_ARGS=(--update-env-vars "$PRESERVE_ENV_UPDATES" \
+                 --update-secrets "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest")
+  else
+    CONFIG_ARGS=(--update-env-vars "$PRESERVE_ENV_UPDATES")
+  fi
 else
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # NOTE: port_railway_env.py drops RAILWAY_*, but several gates in this codebase still read those

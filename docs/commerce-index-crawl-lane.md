@@ -245,9 +245,11 @@ validated public IP; Chrome cannot independently re-resolve that HTTPS target.
 Provisioning is split into explicit, initially inert steps:
 
 ```bash
-# Deploy only the backend receipt contract.
-CONFIG=apply STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true \
-  infra/gcp/deploy_backend.sh staging <backend-tag>
+# On the GCP-cutover production service, preserve the live configuration and
+# create a 0%-traffic candidate that adds only the receipt flag and its
+# dedicated secret mount. This command cannot promote traffic.
+CONFIG=preserve PROMOTE=0 STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true \
+  infra/gcp/deploy_backend.sh prod <backend-tag>
 
 # The secret must already exist with a non-empty value; this script never
 # creates or displays it.
