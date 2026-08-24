@@ -220,6 +220,63 @@ the dedicated Secret Manager key. Enable only after the staging receipt/egress
 gate. The selector also refuses to queue when the backend receipt flag or
 dedicated receipt key is absent.
 
+## Store Audit commerce browser attachment (default off)
+
+The merchant checkout-route audit is separate from UCP and runs once per
+merchant. Product-level cartability is evidence from that route audit, not a
+reason to repeat a browser flow for every SKU. The browser may add one item to
+cart and reveal a checkout route; it never enters buyer data, address data,
+payment data, or submits an order.
+
+It has a distinct Secret Manager key and three dedicated service accounts:
+
+```text
+STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY
+sa-store-audit-commerce-crawl
+sa-store-audit-commerce-selector
+sa-store-audit-commerce-scheduler
+```
+
+The browser image is built separately from the gateway, receives only that
+dedicated key, and runs on `pivota-crawl`. Its worker resolves each merchant
+host once, rejects private or mixed DNS answers, then opens the socket to the
+validated public IP; Chrome cannot independently re-resolve that HTTPS target.
+
+Provisioning is split into explicit, initially inert steps:
+
+```bash
+# Deploy only the backend receipt contract.
+CONFIG=apply STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true \
+  infra/gcp/deploy_backend.sh staging <backend-tag>
+
+# The secret must already exist with a non-empty value; this script never
+# creates or displays it.
+infra/gcp/setup_store_audit_commerce_identity.sh staging
+
+# Create the selector and browser jobs with paused Scheduler triggers.
+STORE_AUDIT_COMMERCE_REPROBE_WORKER=true PAUSED=1 \
+STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL=https://<staging-web-run-app> \
+  infra/gcp/setup_scheduler.sh staging <backend-tag> <gateway-tag>
+```
+
+Only after a reviewed merchant source contract and a ten-product read-only
+reconciliation should the triggers be armed. `PAUSED=0` is rejected for this
+lane so it cannot resume unrelated schedulers. The same `ARMED` value is
+injected into both Jobs: a manual Cloud Run Job execution returns without
+enqueueing, claiming, launching a browser, or contacting a merchant while it
+is false.
+
+```bash
+STORE_AUDIT_COMMERCE_REPROBE_WORKER=true \
+STORE_AUDIT_COMMERCE_REPROBE_ARMED=true PAUSED=1 \
+STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL=https://<staging-web-run-app> \
+  infra/gcp/setup_scheduler.sh staging <backend-tag> <gateway-tag>
+```
+
+When the worker flag is false, rerunning the scheduler script pauses any
+existing commerce triggers; it never deletes evidence or enables any other
+job.
+
 ## Activation gates
 
 Before a source-pull or public crawler schedule may be resumed, require all of:

@@ -51,6 +51,8 @@ esac
 : "${INSIGHT_REFRESH_WORKER:=false}"
 : "${STORE_AUDIT_UCP_REPROBE_WORKER:=false}"
 : "${STORE_AUDIT_UCP_REPROBE_ARMED:=false}"
+: "${STORE_AUDIT_COMMERCE_REPROBE_WORKER:=false}"
+: "${STORE_AUDIT_COMMERCE_REPROBE_ARMED:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -59,11 +61,20 @@ case "$CHECKOUT_VALIDATION_WORKER" in true|false) ;; *) echo "CHECKOUT_VALIDATIO
 case "$INSIGHT_REFRESH_WORKER" in true|false) ;; *) echo "INSIGHT_REFRESH_WORKER must be exactly true or false (got '$INSIGHT_REFRESH_WORKER')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_UCP_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_UCP_REPROBE_WORKER must be exactly true or false (got '$STORE_AUDIT_UCP_REPROBE_WORKER')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_UCP_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_UCP_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_UCP_REPROBE_ARMED')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_WORKER must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_WORKER')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
 if [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_UCP_REPROBE_WORKER" != true ]; then
   echo "STORE_AUDIT_UCP_REPROBE_ARMED=true requires STORE_AUDIT_UCP_REPROBE_WORKER=true" >&2; exit 2
 fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" != true ]; then
+  echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED=true requires STORE_AUDIT_COMMERCE_REPROBE_WORKER=true" >&2; exit 2
+fi
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ] && [ "$PAUSED" = 0 ]; then
   echo "refusing PAUSED=0 with Store Audit UCP enabled: it resumes unrelated schedulers; use PAUSED=1 STORE_AUDIT_UCP_REPROBE_ARMED=true to arm only UCP" >&2
+  exit 2
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ] && [ "$PAUSED" = 0 ]; then
+  echo "refusing PAUSED=0 with Store Audit commerce enabled: use PAUSED=1 STORE_AUDIT_COMMERCE_REPROBE_ARMED=true to arm only commerce" >&2
   exit 2
 fi
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
@@ -75,18 +86,28 @@ if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
     || { echo "STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL must be a bare HTTPS origin (no path, query, userinfo, or port)" >&2; exit 2; }
   STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL%/}"
 fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  : "${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL:?set an https backend base URL before enabling Store Audit commerce jobs}"
+  [[ "$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
+    || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must be a bare HTTPS origin (no path, query, userinfo, or port)" >&2; exit 2; }
+  STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL%/}"
+fi
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
 GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
+BROWSER_AUDIT_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/store-audit-browser:$GATEWAY_TAG"
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
 UCP_CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
 UCP_SELECTOR_SA="sa-store-audit-ucp-selector@$PROJECT.iam.gserviceaccount.com"
 UCP_SCHEDULER_SA="sa-store-audit-ucp-scheduler@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_CRAWL_SA="sa-store-audit-commerce-crawl@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_SELECTOR_SA="sa-store-audit-commerce-selector@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_SCHEDULER_SA="sa-store-audit-commerce-scheduler@$PROJECT.iam.gserviceaccount.com"
 have(){ "$@" >/dev/null 2>&1; }
 require_service_account(){
   have "$GCLOUD" iam service-accounts describe "$1" \
-    || { echo "missing $1; run infra/gcp/setup_store_audit_ucp_identity.sh $ENV first" >&2; exit 1; }
+    || { echo "missing $1; provision the matching Store Audit identity script for $ENV first" >&2; exit 1; }
 }
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   WEB_UCP_SPEC="$("$GCLOUD" run services describe web --region "$REGION" --format=json)"
@@ -123,6 +144,35 @@ print("true" if flag and secret else "false")
   require_service_account "$UCP_CRAWL_SA"
   require_service_account "$UCP_SELECTOR_SA"
   require_service_account "$UCP_SCHEDULER_SA"
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  WEB_COMMERCE_SPEC="$("$GCLOUD" run services describe web --region "$REGION" --format=json)"
+  EXPECTED_COMMERCE_BACKEND_BASE_URL="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
+  [ "$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" = "$EXPECTED_COMMERCE_BACKEND_BASE_URL" ] \
+    || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_COMMERCE_BACKEND_BASE_URL)" >&2; exit 2; }
+  WEB_COMMERCE_ACTIVE_REVISION="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c '
+import json,sys
+o=json.load(sys.stdin)
+active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if not t.get("tag") and t.get("percent") == 100]
+print(active[0] if len(active) == 1 else "")
+')"
+  [ -n "$WEB_COMMERCE_ACTIVE_REVISION" ] \
+    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit commerce Jobs are created" >&2; exit 2; }
+  WEB_COMMERCE_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_COMMERCE_ACTIVE_REVISION" --region "$REGION" --format=json)"
+  WEB_COMMERCE_RECEIPT_READY="$(printf '%s' "$WEB_COMMERCE_ACTIVE_SPEC" | python3 -c '
+import json,sys
+o=json.load(sys.stdin)
+env=o.get("spec",{}).get("containers",[{}])[0].get("env",[])
+by_name={e.get("name"):e for e in env}
+flag=by_name.get("STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED",{}).get("value") == "true"
+secret=by_name.get("STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY",{}).get("valueFrom",{}).get("secretKeyRef",{}).get("name") == "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY"
+print("true" if flag and secret else "false")
+')"
+  [ "$WEB_COMMERCE_RECEIPT_READY" = true ] \
+    || { echo "web must mount STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY and set STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true before Store Audit commerce Jobs are created" >&2; exit 2; }
+  require_service_account "$COMMERCE_CRAWL_SA"
+  require_service_account "$COMMERCE_SELECTOR_SA"
+  require_service_account "$COMMERCE_SCHEDULER_SA"
 fi
 
 # ---------------------------------------------------------------- 1. the single-instance worker
@@ -162,6 +212,14 @@ mkcrawljob(){ # name image service-account command... -- the only crawl egress w
   "$GCLOUD" run jobs "$verb" "$name" --region "$REGION" --image "$image" --service-account "$service_account" \
     --network default --subnet pivota-crawl --vpc-egress all-traffic \
     --max-retries 1 --task-timeout 300s --cpu 1 --memory 1Gi \
+    --labels "env=$ENV,managed-by=infra-gcp,lane=store-audit-crawl" --quiet "$@"
+}
+mkbrowserauditjob(){ # Browser is intentionally isolated to the crawl subnet.
+  local name="$1" image="$2" service_account="$3"; shift 3
+  local verb=create; have "$GCLOUD" run jobs describe "$name" --region "$REGION" && verb=update
+  "$GCLOUD" run jobs "$verb" "$name" --region "$REGION" --image "$image" --service-account "$service_account" \
+    --network default --subnet pivota-crawl --vpc-egress all-traffic \
+    --max-retries 1 --task-timeout 300s --cpu 2 --memory 2Gi \
     --labels "env=$ENV,managed-by=infra-gcp,lane=store-audit-crawl" --quiet "$@"
 }
 echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
@@ -246,6 +304,30 @@ else
   echo "== Store Audit UCP Jobs not created (STORE_AUDIT_UCP_REPROBE_WORKER=false)"
 fi
 
+# Commerce checkout audit is merchant-scoped, so the selector emits at most
+# one active probe per merchant. The browser job may add one item to cart and
+# reveal checkout routing only; its backend receipt contract rejects address,
+# payment, and order-submission data.
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  COMMERCE_CLAIM_URL="$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL/internal/store-audit/commerce-probes/claims"
+  COMMERCE_RECEIPT_URL="$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL/internal/store-audit/commerce-probes/receipts"
+  echo "== job: store-audit-commerce-reprobe-enqueue (merchant checkout selector)"
+  mkjob store-audit-commerce-reprobe-enqueue "$BACKEND_IMAGE" "$COMMERCE_SELECTOR_SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL:latest,STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=store-audit-commerce-reprobe-enqueue,PIVOTA_COMMIT_SHA=$BACKEND_TAG,STORE_AUDIT_COMMERCE_REPROBE_SCHEDULER_ENABLED=true,STORE_AUDIT_COMMERCE_REPROBE_ARMED=$STORE_AUDIT_COMMERCE_REPROBE_ARMED,STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 300s \
+    --command python --args "scripts/run_scheduled_commerce_checkout_reprobes.py"
+  echo "== job: store-audit-commerce-probe (anonymous browser crawl egress)"
+  mkbrowserauditjob store-audit-commerce-probe "$BROWSER_AUDIT_IMAGE" "$COMMERCE_CRAWL_SA" \
+    --set-secrets "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=store-audit-commerce-probe,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,STORE_AUDIT_COMMERCE_REPROBE_ARMED=$STORE_AUDIT_COMMERCE_REPROBE_ARMED,STORE_AUDIT_COMMERCE_PROBE_CLAIM_URL=$COMMERCE_CLAIM_URL,STORE_AUDIT_COMMERCE_PROBE_RECEIPT_URL=$COMMERCE_RECEIPT_URL,STORE_AUDIT_COMMERCE_PROBE_ID_TOKEN_AUDIENCE=$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" \
+    --command node --args "scripts/run_store_audit_commerce_worker.js"
+  "$GCLOUD" run services add-iam-policy-binding web --region "$REGION" \
+    --member="serviceAccount:$COMMERCE_CRAWL_SA" --role=roles/run.invoker --quiet
+else
+  echo "== Store Audit commerce Jobs not created (STORE_AUDIT_COMMERCE_REPROBE_WORKER=false)"
+fi
+
 # ---------------------------------------------------------------- 3. Cloud Scheduler triggers
 PROJECT_NUMBER=$("$GCLOUD" projects describe "$PROJECT" --format='value(projectNumber)')
 RUN_INVOKER="$SA"
@@ -294,6 +376,23 @@ else
     if have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
       "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet
       echo "   (paused: $trigger; STORE_AUDIT_UCP_REPROBE_WORKER=false)"
+    fi
+  done
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  for job in store-audit-commerce-reprobe-enqueue store-audit-commerce-probe; do
+    "$GCLOUD" run jobs add-iam-policy-binding "$job" --region "$REGION" \
+      --member="serviceAccount:$COMMERCE_SCHEDULER_SA" --role=roles/run.invoker --quiet
+  done
+  COMMERCE_PAUSED=1
+  [ "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" = true ] && COMMERCE_PAUSED=0
+  sched store-audit-commerce-reprobe-enqueue-cron "45 3 * * *" store-audit-commerce-reprobe-enqueue "$COMMERCE_SCHEDULER_SA" "$COMMERCE_PAUSED"
+  sched store-audit-commerce-probe-cron "*/5 * * * *" store-audit-commerce-probe "$COMMERCE_SCHEDULER_SA" "$COMMERCE_PAUSED"
+else
+  for trigger in store-audit-commerce-reprobe-enqueue-cron store-audit-commerce-probe-cron; do
+    if have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
+      "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet
+      echo "   (paused: $trigger; STORE_AUDIT_COMMERCE_REPROBE_WORKER=false)"
     fi
   done
 fi
