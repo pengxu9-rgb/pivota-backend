@@ -261,7 +261,10 @@ STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL=https://<staging-web-run-app> \
 
 Only after a reviewed merchant source contract and a ten-product read-only
 reconciliation should the triggers be armed. `PAUSED=0` is rejected for this
-lane so it cannot resume unrelated schedulers.
+lane so it cannot resume unrelated schedulers. The same `ARMED` value is
+injected into both Jobs: a manual Cloud Run Job execution returns without
+enqueueing, claiming, launching a browser, or contacting a merchant while it
+is false.
 
 ```bash
 STORE_AUDIT_COMMERCE_REPROBE_WORKER=true \

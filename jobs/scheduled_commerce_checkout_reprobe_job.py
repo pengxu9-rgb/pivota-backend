@@ -22,6 +22,7 @@ _MAX_BATCH_SIZE = 100
 def _enabled() -> bool:
     return (
         os.getenv("STORE_AUDIT_COMMERCE_REPROBE_SCHEDULER_ENABLED", "false").strip().lower() == "true"
+        and os.getenv("STORE_AUDIT_COMMERCE_REPROBE_ARMED", "false").strip().lower() == "true"
         and os.getenv("STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED", "false").strip().lower() == "true"
         and bool(str(os.getenv("STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY") or "").strip())
     )
