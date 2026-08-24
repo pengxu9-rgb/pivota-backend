@@ -64,6 +64,13 @@ _LONG_RUNNING_VERIFIERS = frozenset({
     "public_llm_citation_movement",
 })
 
+# UCP probes execute in the isolated crawl job, which claims them through the
+# dedicated internal endpoint. The in-process backend worker must never claim
+# one merely because a deploy is temporarily missing that remote runner.
+_EXTERNAL_DISPATCH_VERIFIERS = frozenset({
+    "ucp_probe", "commerce_checkout_probe",
+})
+
 
 # =====================================================================
 # Verifier contract
@@ -153,6 +160,9 @@ async def process_one_verification_run() -> bool:
 
     claimed = await ae.claim_next_pending_verification(
         worker_id=WORKER_ID,
+        # The generic worker owns only local verifiers. Remote crawl jobs use
+        # the verifier-filtered claim path in store_audit_probe_internal.
+        exclude_remote_verifiers=True,
     )
     if claimed is None:
         return False
