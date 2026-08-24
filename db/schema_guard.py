@@ -1668,6 +1668,23 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # mig 196: Store Audit route evidence is read through SQLAlchemy
+            # Tables at runtime. Production deploys do not run migrations, so
+            # keep the column subset used by the route/evidence workers alive.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS execution_routes
+                      ADD COLUMN IF NOT EXISTS last_audit_run_id UUID;
+                    ALTER TABLE IF EXISTS evidence_items
+                      ADD COLUMN IF NOT EXISTS execution_route_id UUID,
+                      ADD COLUMN IF NOT EXISTS evidence_level TEXT,
+                      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+                    ALTER TABLE IF EXISTS verification_runs
+                      ADD COLUMN IF NOT EXISTS execution_route_id UUID;
+                    """
+                )
+            )
             # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
             # (derived from refund_amount_cents, added above). Emitted LAST so this
             # lone potential table-rewrite can't block the lightweight self-heals;
