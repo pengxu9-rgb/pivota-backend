@@ -64,6 +64,32 @@ async def test_antom_catalog_stays_pending_until_a_feed_adapter_exists() -> None
 
 
 @pytest.mark.asyncio
+async def test_public_web_is_active_evidence_only_without_merchant_consent(monkeypatch) -> None:
+    async def fake_execute(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    result = await module.register_commerce_index_source(
+        merchant_id="agent_seed::brand",
+        provider="public_web",
+        status="active",
+        source_metadata={"base_url": "https://brand.example", "crawl_policy": {"evidence_only": True, "robots_checked": True}},
+    )
+    assert result["integration_layer"] == "evidence"
+    assert result["capabilities_json"]["catalog_pull"] is False
+    assert result["refresh_policy_json"]["catalog_refresh"] == "forbidden"
+
+
+@pytest.mark.asyncio
+async def test_public_web_requires_robots_checked() -> None:
+    with pytest.raises(ValueError, match="robots_checked"):
+        await module.register_commerce_index_source(
+            merchant_id="agent_seed::brand", provider="public_web", status="active",
+            source_metadata={"base_url": "https://brand.example", "crawl_policy": {"evidence_only": True}},
+        )
+
+
+@pytest.mark.asyncio
 async def test_source_metadata_rejects_credentials() -> None:
     with pytest.raises(ValueError, match="must not contain credentials"):
         await module.register_commerce_index_source(
