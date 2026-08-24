@@ -17,6 +17,7 @@ SHARED=pivota-shared
 CRAWL_SA="sa-store-audit-commerce-crawl@$PROJECT.iam.gserviceaccount.com"
 SELECTOR_SA="sa-store-audit-commerce-selector@$PROJECT.iam.gserviceaccount.com"
 SCHEDULER_SA="sa-store-audit-commerce-scheduler@$PROJECT.iam.gserviceaccount.com"
+BACKEND_SA="sa-backend@$PROJECT.iam.gserviceaccount.com"
 SECRET=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY
 have(){ "$@" >/dev/null 2>&1; }
 retry(){ local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 8 ] && return 1; sleep $((n*5)); done; }
@@ -56,9 +57,14 @@ for account in "$CRAWL_SA" "$SELECTOR_SA"; do
 done
 grant_secret "$CRAWL_SA" "$SECRET"
 grant_secret "$SELECTOR_SA" "$SECRET"
+# The receipt endpoint is served by `web`, which runs as sa-backend.  Grant
+# this key explicitly rather than relying on a broad project-level Secret
+# Manager role; otherwise Cloud Run cannot mount the declared secret.
+grant_secret "$BACKEND_SA" "$SECRET"
 grant_secret "$SELECTOR_SA" DATABASE_URL
 
 echo "Store Audit commerce identities ready in $PROJECT"
+echo "  backend:   $BACKEND_SA (only $SECRET)"
 echo "  crawl:     $CRAWL_SA (only $SECRET)"
 echo "  selector:  $SELECTOR_SA (only DATABASE_URL + $SECRET)"
 echo "  scheduler: $SCHEDULER_SA (no secrets; job-specific Run invoke is granted by setup_scheduler.sh)"
