@@ -233,8 +233,8 @@ It has a distinct Secret Manager key and three dedicated service accounts:
 ```text
 STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY
 sa-store-audit-commerce-crawl
-sa-store-audit-commerce-selector
-sa-store-audit-commerce-scheduler
+sa-store-audit-commerce-sel
+sa-store-audit-commerce-sched
 ```
 
 The browser image is built separately from the gateway, receives only that
