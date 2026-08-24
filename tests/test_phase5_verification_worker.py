@@ -131,6 +131,14 @@ async def test_no_op_when_queue_empty(monkeypatch):
     }]
 
 
+def test_generic_worker_excludes_every_remote_store_audit_verifier():
+    from services import verification_run_worker as worker
+
+    assert worker._EXTERNAL_DISPATCH_VERIFIERS == {
+        "ucp_probe", "commerce_checkout_probe",
+    }
+
+
 @pytest.mark.asyncio
 async def test_happy_path_succeeded_calls_mark_succeeded(monkeypatch):
     from services.verification_run_worker import (

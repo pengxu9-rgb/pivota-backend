@@ -67,7 +67,9 @@ _LONG_RUNNING_VERIFIERS = frozenset({
 # UCP probes execute in the isolated crawl job, which claims them through the
 # dedicated internal endpoint. The in-process backend worker must never claim
 # one merely because a deploy is temporarily missing that remote runner.
-_EXTERNAL_DISPATCH_VERIFIERS = frozenset({"ucp_probe"})
+_EXTERNAL_DISPATCH_VERIFIERS = frozenset({
+    "ucp_probe", "commerce_checkout_probe",
+})
 
 
 # =====================================================================

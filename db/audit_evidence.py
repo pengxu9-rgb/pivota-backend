@@ -687,6 +687,11 @@ _DDL_STATEMENTS = [
     "ON verification_runs (execution_route_id, verifier_id) "
     "WHERE execution_route_id IS NOT NULL "
     "AND status IN ('pending', 'claimed');",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_verification_runs_active_merchant_commerce_checkout "
+    "ON verification_runs (merchant_id, verifier_id) "
+    "WHERE merchant_id IS NOT NULL "
+    "AND verifier_id = 'commerce_checkout_probe' "
+    "AND status IN ('pending', 'claimed');",
     "CREATE INDEX IF NOT EXISTS idx_verification_runs_merchant "
     "ON verification_runs (merchant_id, audit_run_id) "
     "WHERE merchant_id IS NOT NULL;",
@@ -1172,6 +1177,34 @@ async def fetch_active_commerce_evidence(
         .order_by(evidence_items.c.created_at.desc())
     )
     return [dict(row) for row in rows or []]
+
+
+async def has_in_flight_verification_for_merchant(
+    *, merchant_id: str, verifier_id: str,
+) -> bool:
+    """Whether a remote verifier already owns this merchant audit lane."""
+    if not merchant_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .with_only_columns(verification_runs.c.verify_id)
+            .where(
+                verification_runs.c.merchant_id == merchant_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status.in_(list(VERIFICATION_ACTIVE)),
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "has_in_flight_verification_for_merchant failed merchant=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        # Fail closed: a transient lookup must not create a second merchant audit.
+        return True
 
 
 async def insert_citation_observation(
@@ -1794,7 +1827,7 @@ async def claim_next_pending_verification(
                 AND (:verifier_id IS NULL OR verifier_id = :verifier_id)
                 AND (
                     :exclude_remote_verifiers IS FALSE
-                    OR verifier_id <> 'ucp_probe'
+                    OR verifier_id NOT IN ('ucp_probe', 'commerce_checkout_probe')
                 )
                 AND (
                     claimed_until IS NULL

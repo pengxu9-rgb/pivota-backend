@@ -80,7 +80,7 @@ async def run_scheduled_commerce_checkout_reprobes() -> Dict[str, Any]:
         VERIFIER_COMMERCE_CHECKOUT_PROBE,
         enqueue_verification_run,
         fetch_active_commerce_evidence,
-        has_in_flight_verification_for_route,
+        has_in_flight_verification_for_merchant,
     )
     from services.commerce_capability_resolver import checkout_audit_decision
 
@@ -98,8 +98,8 @@ async def run_scheduled_commerce_checkout_reprobes() -> Dict[str, Any]:
         if not checkout_audit_decision(merchant_id=merchant_id, evidence=evidence, now=now)["should_audit"]:
             summary["deduped"] += 1
             continue
-        if await has_in_flight_verification_for_route(
-            execution_route_id=route_id, verifier_id=VERIFIER_COMMERCE_CHECKOUT_PROBE,
+        if await has_in_flight_verification_for_merchant(
+            merchant_id=merchant_id, verifier_id=VERIFIER_COMMERCE_CHECKOUT_PROBE,
         ):
             summary["deduped"] += 1
             continue
