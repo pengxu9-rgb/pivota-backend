@@ -30,6 +30,7 @@ _WORKERS_EXPLICIT="${WORKERS+1}"
 _MOUNT_DB_EXPLICIT="${MOUNT_DB+1}"
 : "${WORKERS:=false}"
 : "${STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED:=false}"
+: "${STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED:=false}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # CONFIG=apply    rewrite the service's env + secrets from env.<env>.yaml / secrets.<env>.list.
 # CONFIG=preserve leave every env var and secret exactly as the running service has them, and
@@ -47,6 +48,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 : "${CONFIG:=apply}"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
 # WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
 # vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
 # constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
@@ -65,6 +67,9 @@ if [ "$CONFIG" = preserve ]; then
 fi
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ]; then
   [ "$CONFIG" = apply ] || { echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED requires CONFIG=apply so the dedicated secret is mounted." >&2; exit 2; }
+fi
+if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
+  [ "$CONFIG" = apply ] || { echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED requires CONFIG=apply so the dedicated secret is mounted." >&2; exit 2; }
 fi
 # PROMOTE=0 stops after the candidate revision passes its health check, leaving it at 0% traffic.
 # The previous revision keeps serving. This is how the deploy path itself can be exercised - build,
@@ -91,6 +96,10 @@ REGION=us-west1
 SERVICE="${SERVICE:-web}"
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
   echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
+  exit 2
+fi
+if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
+  echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
   exit 2
 fi
 # Reusable for the other Python services that ship from this repo or their own image:
@@ -139,7 +148,9 @@ if [ "$CONFIG" = apply ]; then
   [ "$MOUNT_DB" = 1 ] && DB_SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,"
   UCP_RECEIPT_SECRET=""
   [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && UCP_RECEIPT_SECRET="STORE_AUDIT_UCP_PROBE_INTERNAL_KEY=STORE_AUDIT_UCP_PROBE_INTERNAL_KEY:latest,"
-  SECRETS="${DB_SECRETS}${UCP_RECEIPT_SECRET}$(paste -sd, "$SECRETS_FILE")"
+  COMMERCE_RECEIPT_SECRET=""
+  [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && COMMERCE_RECEIPT_SECRET="STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest,"
+  SECRETS="${DB_SECRETS}${UCP_RECEIPT_SECRET}${COMMERCE_RECEIPT_SECRET}$(paste -sd, "$SECRETS_FILE")"
 fi
 
 # gcloud allows only ONE env-vars flag: merge the ported file with the platform vars into a temp file
@@ -186,13 +197,14 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # against the SDK's own loader). Appending an override after the ported file therefore does NOTHING
 # whenever the ported file already defines that key - which silently made WORKERS, DB_POOL_* and even
 # PIVOTA_ENV inert. Strip the keys we are about to set before appending them.
-grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
+grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED|STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
 { :
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\nPIVOTA_PLATFORM: "cloud_run"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
   printf 'SKIP_HEAVY_STARTUP_INIT: "true"\n'
   printf 'AUDIT_WORKER_ENABLED: "%s"\n' "$WORKERS"
   printf 'REVIEWS_INVITATION_WORKER_ENABLED: "%s"\n' "$WORKERS"
   printf 'STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED: "%s"\n' "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED"
+  printf 'STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED: "%s"\n' "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED"
   # Cloud SQL max_connections=300 (bootstrap_env.sh). db/database.py defaults to a 5..20 pool PER
   # PROCESS, so MAX instances x 20 would be 400 on prod and exhaust the server. Size the pool from
   # the instance ceiling, leaving headroom for the other services and for ops sessions.
