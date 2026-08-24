@@ -59,6 +59,12 @@ EVIDENCE_TYPE_URL_MATCH = "url_match"
 EVIDENCE_TYPE_MISSING_SIGNAL = "missing_signal"
 EVIDENCE_TYPE_INDUSTRY_STAT = "industry_stat"
 EVIDENCE_TYPE_ACCEPTANCE_SIGNAL = "acceptance_signal"
+EVIDENCE_TYPE_COMMERCE_PLATFORM = "commerce_platform"
+EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE = "commerce_checkout_route"
+EVIDENCE_TYPE_COMMERCE_CARTABILITY = "commerce_cartability"
+EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION = (
+    "commerce_integration_authorization"
+)
 EVIDENCE_TYPE_CUSTOM = "custom"
 
 VALID_EVIDENCE_TYPES = frozenset({
@@ -68,6 +74,10 @@ VALID_EVIDENCE_TYPES = frozenset({
     EVIDENCE_TYPE_MISSING_SIGNAL,
     EVIDENCE_TYPE_INDUSTRY_STAT,
     EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+    EVIDENCE_TYPE_COMMERCE_PLATFORM,
+    EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+    EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+    EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
     EVIDENCE_TYPE_CUSTOM,
 })
 
@@ -141,6 +151,7 @@ VERIFIER_PIVOTA_INTERNAL_RETRIEVAL = "pivota_internal_retrieval"
 VERIFIER_FRONTEND_AGENT_CITE = "frontend_agent_cite"
 VERIFIER_PUBLIC_LLM_CITATION = "public_llm_citation_movement"
 VERIFIER_UCP_PROBE = "ucp_probe"
+VERIFIER_COMMERCE_CHECKOUT_PROBE = "commerce_checkout_probe"
 
 VALID_VERIFIERS = frozenset({
     VERIFIER_PDP_RENDERS, VERIFIER_PDP_IN_SITEMAP,
@@ -149,6 +160,7 @@ VALID_VERIFIERS = frozenset({
     VERIFIER_FRONTEND_AGENT_CITE,
     VERIFIER_PUBLIC_LLM_CITATION,
     VERIFIER_UCP_PROBE,
+    VERIFIER_COMMERCE_CHECKOUT_PROBE,
 })
 
 
@@ -1135,6 +1147,31 @@ async def insert_evidence_item(
             (idempotency_key or "")[:16], str(exc)[:200],
         )
         return None
+
+
+async def fetch_active_commerce_evidence(
+    *, merchant_id: str, now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Read unexpired Store Audit commerce evidence for one merchant only."""
+    if not merchant_id:
+        return []
+    await ensure_audit_evidence_tables()
+    current = now or _now_utc()
+    rows = await database.fetch_all(
+        evidence_items.select()
+        .where(
+            evidence_items.c.merchant_id == merchant_id,
+            evidence_items.c.evidence_type.in_([
+                EVIDENCE_TYPE_COMMERCE_PLATFORM,
+                EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+                EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+                EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
+            ]),
+            evidence_items.c.expires_at > current,
+        )
+        .order_by(evidence_items.c.created_at.desc())
+    )
+    return [dict(row) for row in rows or []]
 
 
 async def insert_citation_observation(
