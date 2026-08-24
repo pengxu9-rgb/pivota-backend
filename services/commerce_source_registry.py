@@ -45,6 +45,13 @@ _PAYMENT_ONLY_GUIDANCE = (
 )
 
 _SOURCES: Dict[str, CommerceSourceDefinition] = {
+    # Universal public-web evidence source. It is intentionally neither a
+    # storefront adapter nor a payment capability: it may cover any public
+    # domain, but can only emit review-required evidence.
+    "public_web": CommerceSourceDefinition(
+        "public_web", "public_crawl", CommerceSourceCapabilities(), "evidence",
+        "Public web is evidence-only: it cannot publish stock, price, checkout, or payment authority.",
+    ),
     "shopify": CommerceSourceDefinition("shopify", "storefront", _CATALOG_CAPABILITIES),
     "wix": CommerceSourceDefinition("wix", "storefront", _CATALOG_CAPABILITIES),
     "woocommerce": CommerceSourceDefinition("woocommerce", "storefront", _CATALOG_CAPABILITIES),
