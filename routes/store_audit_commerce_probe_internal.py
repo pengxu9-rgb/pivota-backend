@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from db.audit_evidence import (
@@ -25,7 +25,9 @@ from db.audit_evidence import (
     VERIFICATION_STATUS_BLOCKED,
     VERIFICATION_STATUS_SUCCEEDED,
     VERIFIER_COMMERCE_CHECKOUT_PROBE,
+    claim_next_pending_verification,
     fetch_active_commerce_evidence,
+    fetch_execution_route,
     get_claimed_verification_run,
     get_verification_run_for_worker,
     insert_evidence_item,
@@ -120,6 +122,26 @@ class CommerceProbeReceiptResponse(BaseModel):
     capability: Optional[dict] = None
 
 
+class CommerceProbeClaimRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("worker_id")
+    @classmethod
+    def worker_id_is_redacted(cls, value: str) -> str:
+        return _safe_text(value)
+
+
+class CommerceProbeClaimResponse(BaseModel):
+    audit_run_id: str
+    verification_run_id: str
+    worker_id: str
+    probe_id: str
+    merchant_id: str
+    target_url: str
+    product_key: Optional[str] = None
+    retry_count: int
+
+
 def _expires_at(observed_at: datetime, hours: int) -> datetime:
     value = observed_at if observed_at.tzinfo else observed_at.replace(tzinfo=timezone.utc)
     return value + timedelta(hours=hours)
@@ -139,6 +161,47 @@ def _terminal_evidence(receipt: CommerceProbeReceipt) -> dict:
         "observed_at": receipt.observed_at.isoformat(),
         "probe_id": receipt.probe_id,
     }
+
+
+@router.post("/claims", response_model=CommerceProbeClaimResponse)
+async def claim_commerce_probe(
+    payload: CommerceProbeClaimRequest,
+    response: Response,
+    x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key"),
+) -> Optional[CommerceProbeClaimResponse]:
+    """Lease one pre-authorized merchant checkout probe for the worker."""
+    _require_key(x_internal_key)
+    claimed = await claim_next_pending_verification(
+        worker_id=payload.worker_id,
+        verifier_id=VERIFIER_COMMERCE_CHECKOUT_PROBE,
+    )
+    if not claimed:
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return None
+    route = await fetch_execution_route(
+        execution_route_id=str(claimed.get("execution_route_id") or ""),
+    )
+    merchant_id = str(claimed.get("merchant_id") or "")
+    if (
+        not route
+        or route.get("route_kind") != "storefront"
+        or not merchant_id
+        or merchant_id.startswith("prospect_")
+    ):
+        await mark_verification_blocked(
+            verify_id=str(claimed["verify_id"]), worker_id=payload.worker_id,
+            error_message="commerce_probe_claim_missing_merchant_storefront_route",
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "TARGET_UNAVAILABLE"})
+    retry_count = int(claimed.get("retry_count") or 0)
+    verify_id = str(claimed["verify_id"])
+    return CommerceProbeClaimResponse(
+        audit_run_id=str(claimed["audit_run_id"]), verification_run_id=verify_id,
+        worker_id=payload.worker_id, probe_id=f"{verify_id}:attempt:{retry_count + 1}",
+        merchant_id=merchant_id, target_url=str(route["endpoint_normalized"]),
+        product_key=str(claimed.get("product_key") or "") or None,
+        retry_count=retry_count,
+    )
 
 
 @router.post("/receipts", response_model=CommerceProbeReceiptResponse)
