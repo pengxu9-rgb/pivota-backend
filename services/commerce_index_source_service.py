@@ -26,7 +26,13 @@ _SENSITIVE_CONFIG_TOKENS = {"secret", "password", "token", "private_key", "api_k
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """UTC wall-clock timestamp compatible with the v2 ``TIMESTAMP`` columns.
+
+    Commerce Index v2 deliberately uses timezone-naive PostgreSQL timestamps.
+    ``asyncpg`` rejects an aware value for those columns, so normalize the
+    application timestamp before every source-contract upsert.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def commerce_index_source_id(merchant_id: str, provider: str, integration_layer: str) -> str:

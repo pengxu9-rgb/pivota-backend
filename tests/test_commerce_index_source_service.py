@@ -9,6 +9,10 @@ def test_source_id_normalizes_legacy_antom_to_ucp() -> None:
     )
 
 
+def test_source_timestamps_are_naive_utc_for_v2_timestamp_columns() -> None:
+    assert module._utcnow().tzinfo is None
+
+
 @pytest.mark.asyncio
 async def test_active_catalog_source_records_authority_and_refresh_policy(monkeypatch) -> None:
     writes = []
