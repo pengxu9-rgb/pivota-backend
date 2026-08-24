@@ -255,29 +255,18 @@ CONFIG=preserve PROMOTE=0 STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true \
 # creates or displays it.
 infra/gcp/setup_store_audit_commerce_identity.sh staging
 
-# Create the selector and browser jobs with paused Scheduler triggers.
-STORE_AUDIT_COMMERCE_REPROBE_WORKER=true PAUSED=1 \
-STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL=https://<staging-web-run-app> \
-  infra/gcp/setup_scheduler.sh staging <backend-tag> <gateway-tag>
+# After the receipt-ready backend revision has been promoted, create only this
+# lane's selector and browser Jobs. Both are disarmed and their Scheduler
+# triggers are paused; this command does not touch shared workers or Jobs.
+infra/gcp/setup_store_audit_commerce_jobs.sh prod <backend-tag> <browser-tag>
 ```
 
 Only after a reviewed merchant source contract and a ten-product read-only
-reconciliation should the triggers be armed. `PAUSED=0` is rejected for this
-lane so it cannot resume unrelated schedulers. The same `ARMED` value is
-injected into both Jobs: a manual Cloud Run Job execution returns without
-enqueueing, claiming, launching a browser, or contacting a merchant while it
-is false.
-
-```bash
-STORE_AUDIT_COMMERCE_REPROBE_WORKER=true \
-STORE_AUDIT_COMMERCE_REPROBE_ARMED=true PAUSED=1 \
-STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL=https://<staging-web-run-app> \
-  infra/gcp/setup_scheduler.sh staging <backend-tag> <gateway-tag>
-```
-
-When the worker flag is false, rerunning the scheduler script pauses any
-existing commerce triggers; it never deletes evidence or enables any other
-job.
+reconciliation may a separately reviewed activation procedure set `ARMED=true`
+on both Jobs and resume their two triggers. The provisioning script
+intentionally has no activation option. A manual Cloud Run Job execution
+returns without enqueueing, claiming, launching a browser, or contacting a
+merchant while `ARMED` is false.
 
 ## Activation gates
 
