@@ -352,6 +352,7 @@ from routes.agent_metrics_v1 import router as agent_metrics_v1_router
 from routes.quick_index_setup import router as quick_index_setup_router
 from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.agent_internal_auth import router as agent_internal_auth_router
+from routes.store_audit_probe_internal import router as store_audit_probe_internal_router
 from routes.agent_internal_products import router as agent_internal_products_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
@@ -1138,6 +1139,7 @@ app.include_router(agent_recommendations_router)  # Agent recommendations (proxy
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
+app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
