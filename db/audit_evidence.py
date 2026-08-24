@@ -887,7 +887,7 @@ async def upsert_execution_route(
             ) VALUES (
                 :execution_route_id, :normalized_domain, :route_kind,
                 :endpoint_normalized, :merchant_id,
-                CASE WHEN :merchant_id IS NULL THEN NULL ELSE :now END,
+                CASE WHEN :merchant_id IS NULL THEN NULL ELSE CAST(:now AS timestamptz) END,
                 :profile_fingerprint, :audit_run_id, :now, :last_verified_at,
                 :expires_at, :is_active, :now, :now
             )
