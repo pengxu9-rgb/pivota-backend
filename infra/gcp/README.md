@@ -403,14 +403,52 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 
 ## Gateway (PIVOTA-Agent) on Cloud Run
 
+**Shipping a code change (the normal path).** `CONFIG=preserve` is the default: it rolls the image
+forward and restamps `PIVOTA_COMMIT_SHA`, and touches nothing else. No Railway, no generated files.
+
 ```bash
 # from a PIVOTA-Agent checkout
+SHA=$(git rev-parse HEAD)
 gcloud builds submit --config ../pivota-backend-gcp/infra/gcp/cloudbuild.gateway.yaml \
-  --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+  --project pivota-shared --substitutions=COMMIT_SHA=$SHA .
+../pivota-backend-gcp/infra/gcp/deploy_gateway.sh prod $SHA
+```
+
+That builds a candidate at 0% traffic, probes its `/health` **from inside the VPC** (prod ingress is
+`internal-and-cloud-load-balancing`, so a probe from a laptop only ever gets Google's 404), promotes
+it, and sweeps stale candidate tags. Deploying by hand with `gcloud` skips all four — which is how
+three revisions ended up pinned at `minScale: 2` on old code and live secrets, and how one revision
+inherited the previous revision's `PIVOTA_COMMIT_SHA` and under-reported the deployed commit by 7.
+
+`COMMIT_SHA` is load-bearing **twice** in that build: it tags the image, and `--build-arg` bakes it
+into `/app/.image_commit_sha`, which PIVOTA-Agent's `src/config/platform.js` prefers over every env
+var. That is what makes the commit `/health` reports a property of the code instead of a claim about
+it — an env var can be overridden or left behind by a hand deploy; a file inside the image cannot.
+Omitting the substitution degrades rather than lies: the stamp bakes blank and the env chain takes
+over. When the two disagree the app reports the baked one and logs the mismatch with both values.
+
+**Changing configuration (`CONFIG=apply`) is a separate, deliberate operation**, and today it is
+only reachable for a service being built from scratch:
+
+```bash
 python3 ../pivota-backend-gcp/infra/gcp/port_railway_env.py \
   --railway-service PIVOTA-Agent --railway-env production --env staging --prefix gateway --apply
-../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
+CONFIG=apply ../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
 ```
+
+⚠️ **`port_railway_env.py` reads Railway, which was decommissioned at the 2026-08-22 cutover.** For
+an existing service `apply` is therefore not just unavailable but wrong: it would rewrite all 382 of
+the prod gateway's environment variables from the retired platform. Cloud Run is the source of truth
+now. A config change means editing the live service or reviving the generated files deliberately —
+never as a side effect of shipping a commit.
+
+⚠️ **`gcloud run services update` does not shift traffic.** It creates a new revision carrying the
+change and reports success, but a service that pins revisions keeps serving the old one — the spec
+reads the new value while the serving revision reads the old. That is how the partner-sandbox flags
+came out armed and inert on 2026-08-24. Follow any `services update` with
+`gcloud run services update-traffic gateway --region us-west1 --project pivota-prod --to-latest`,
+or confirm `status.traffic[].latestRevision` is already `true`. A deploy through
+`deploy_gateway.sh` ends in `--to-latest`, so it leaves the service unpinned.
 
 The gateway reuses **its own repo's root Dockerfile**. That is safe there because PIVOTA-Agent's
 Railway services pin `builder=RAILPACK` explicitly, so the Dockerfile is inert on Railway - unlike
