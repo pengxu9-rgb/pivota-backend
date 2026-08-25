@@ -55,6 +55,16 @@ on:
       - 'core/**'
       - 'catalog/**'
       - 'observability/**'
+      # infra/ is here for a test that IMPORTS nothing from it. The derivation
+      # above counts which packages the swept tests import, and that method is
+      # structurally blind to a test whose subject is a FILE IT READS:
+      # tests/test_deploy_mounts_every_dropped_dsn.py parses deploy_backend.sh
+      # and port_railway_env.py off disk. Without this line, reverting the mount
+      # it guards produces a diff touching only infra/, no gate matches, and
+      # `CI Entrypoint` - the required check - goes green having enforced
+      # nothing. The test would still be collected; it just would never run for
+      # the one change class it exists to catch.
+      - 'infra/**'
       - 'main.py'
       - 'requirements*.txt'
       - '.github/workflows/backend-test-sweep.yml'

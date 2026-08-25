@@ -31,10 +31,12 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 PORTER = REPO / "infra" / "gcp" / "port_railway_env.py"
 DEPLOY_BACKEND = REPO / "infra" / "gcp" / "deploy_backend.sh"
+SWEEP_WORKFLOW = REPO / ".github" / "workflows" / "backend-test-sweep.yml"
 
 # Directories loaded by main.py in the deployed image. Excludes tests/, scripts/, infra/ and the
 # non-source trees for the reason given in SCOPE above.
@@ -118,20 +120,57 @@ def _env_reads() -> dict[str, list[str]]:
     return reads
 
 
-def _mounted_by_deploy_backend() -> set[str]:
-    """Env names deploy_backend.sh mounts from Secret Manager via DB_SECRETS.
+def _mounted_by_deploy_backend() -> dict[str, str]:
+    """Map env name -> Secret Manager secret name, from deploy_backend.sh's DB_SECRETS.
 
     Parses the quoted value of each `DB_SECRETS=` assignment, not the file text, so the surrounding
     comments — which necessarily name these same variables — cannot satisfy the assertion.
+
+    Returns the SECRET too, not just the env name. Checking only the name lets two silent breakages
+    through: a typo'd secret (which surfaces as a revision that will not boot, at deploy time, in
+    production) and — the one that matters here — a swap to the wrong variant of a real secret.
     """
     text = DEPLOY_BACKEND.read_text(encoding="utf-8")
-    mounted: set[str] = set()
+    mounted: dict[str, str] = {}
     for value in re.findall(r'^\s*(?:\[[^\]]*\]\s*&&\s*)?DB_SECRETS="([^"]*)"', text, re.M):
         for pair in value.split(","):
-            env_name = pair.split("=", 1)[0].strip()
+            if "=" not in pair:
+                continue
+            env_name, _, secret_ref = pair.partition("=")
+            env_name = env_name.strip()
             if env_name:
-                mounted.add(env_name)
+                mounted[env_name] = secret_ref.split(":", 1)[0].strip()
     return mounted
+
+
+def test_this_gate_runs_when_the_files_it_reads_change():
+    """The sweep that runs this test must be triggered by changes to what this test reads.
+
+    This test's subject is two files under infra/ that it parses off disk; it imports nothing from
+    them. backend-test-sweep.yml derives its `paths` by counting which packages the swept tests
+    IMPORT, and that method is structurally blind to that shape — so infra/ was absent, and a diff
+    reverting the mount below would have matched no gate at all. `CI Entrypoint`, the required
+    check, reports green when nothing matched, so the revert would have shipped past a green
+    required check with this test never executing.
+
+    A test that is collected but never triggered for its own change class is not coverage.
+    """
+    workflow = yaml.safe_load(SWEEP_WORKFLOW.read_text(encoding="utf-8"))
+    # `on` is the YAML 1.1 boolean `True` after parsing — quoting it in the file would change the
+    # workflow, so accept either key rather than "fixing" it.
+    triggers = workflow.get("on", workflow.get(True, {})) or {}
+    paths = (triggers.get("pull_request") or {}).get("paths") or []
+    assert paths, f"{SWEEP_WORKFLOW} has no pull_request.paths — this assertion would be vacuous"
+    watched = {p.split("/", 1)[0].rstrip("*").rstrip("/") for p in paths}
+    subjects = {PORTER.relative_to(REPO).parts[0], DEPLOY_BACKEND.relative_to(REPO).parts[0]}
+    assert subjects == {"infra"}, f"unexpected subject roots {subjects} — update this assertion"
+    for required in sorted(subjects):
+        assert required in watched, (
+            f"{SWEEP_WORKFLOW.name} does not run for changes under '{required}/', but "
+            f"{Path(__file__).name} reads its files. Reverting the mount this test guards would "
+            f"produce an infra-only diff, match no gate, and go green. Add '{required}/**' to "
+            "pull_request.paths."
+        )
 
 
 def test_porter_still_drops_the_dsns():
@@ -161,7 +200,7 @@ def test_deploy_backend_mounts_every_dsn_the_app_reads():
     required = {name for name in drop if _is_dsn(name) and name in reads}
     assert required, "no dropped DSN is read by the app — the scan is too narrow to be meaningful"
 
-    missing = sorted(required - mounted)
+    missing = sorted(required - set(mounted))
     detail = "\n".join(f"  {n}\n    read at: {', '.join(reads[n][:3])}" for n in missing)
     assert not missing, (
         "port_railway_env.py drops these DSNs from the ported env, the application reads them at "
@@ -185,4 +224,30 @@ def test_known_reader_is_mounted(name):
         f"{name} is read by services/pci_kb_scope_review.py and must be mounted by "
         "deploy_backend.sh; without it /pci-kb-scope-reviews 503s and the Shopify webhook sync "
         "silently writes catalog payloads with attached-seed runtime evidence dropped"
+    )
+
+
+def test_deploy_backend_mounts_the_verifying_dsn_variants():
+    """deploy_backend.sh serves the PYTHON image, which must get the TLS-verifying DSNs.
+
+    This repo deliberately keeps two variants of the same DSN, documented at infra/gcp/README.md:
+    `PCI_KB_DATABASE_URL` is asyncpg with `sslmode=require`, `PCI_KB_DATABASE_URL_NOVERIFY` is
+    node-pg with `sslmode=no-verify`. setup_scheduler.sh mounts the NOVERIFY secret into the same
+    env name for its three Node jobs, and deploy_gateway.sh does the same for the Node gateway —
+    so the wrong variant is not a typo anyone would notice, it is a real secret that resolves, in
+    an idiom already used two files over.
+
+    Under deploy_backend.sh every mounted secret carries the SAME name as its env var. Asserting
+    that keeps a future "make these consistent" edit from silently dropping certificate
+    verification on the Python services' connection to Cloud SQL — a change with no error, no log
+    line, and no failing deploy.
+    """
+    mounted = _mounted_by_deploy_backend()
+    assert mounted, f"DB_SECRETS parse found no mounts in {DEPLOY_BACKEND}"
+    mismatched = {env: secret for env, secret in mounted.items() if secret != env}
+    assert not mismatched, (
+        "deploy_backend.sh deploys the Python image and must mount the verifying variant of each "
+        f"DSN, i.e. a secret named exactly like its env var. These do not match: {mismatched}. "
+        "If a no-verify DSN is genuinely required here, say why in the script and update this test "
+        "deliberately — do not just widen it."
     )
