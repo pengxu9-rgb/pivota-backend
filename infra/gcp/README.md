@@ -403,14 +403,37 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 
 ## Gateway (PIVOTA-Agent) on Cloud Run
 
+**Shipping a code change (the normal path).** `CONFIG=preserve` is the default: it rolls the image
+forward and restamps `PIVOTA_COMMIT_SHA`, and touches nothing else. No Railway, no generated files.
+
 ```bash
 # from a PIVOTA-Agent checkout
+SHA=$(git rev-parse HEAD)
 gcloud builds submit --config ../pivota-backend-gcp/infra/gcp/cloudbuild.gateway.yaml \
-  --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+  --project pivota-shared --substitutions=COMMIT_SHA=$SHA .
+../pivota-backend-gcp/infra/gcp/deploy_gateway.sh prod $SHA
+```
+
+That builds a candidate at 0% traffic, probes its `/health` **from inside the VPC** (prod ingress is
+`internal-and-cloud-load-balancing`, so a probe from a laptop only ever gets Google's 404), promotes
+it, and sweeps stale candidate tags. Deploying by hand with `gcloud` skips all four — which is how
+three revisions ended up pinned at `minScale: 2` on old code and live secrets, and how one revision
+inherited the previous revision's `PIVOTA_COMMIT_SHA` and under-reported the deployed commit by 7.
+
+**Changing configuration (`CONFIG=apply`) is a separate, deliberate operation**, and today it is
+only reachable for a service being built from scratch:
+
+```bash
 python3 ../pivota-backend-gcp/infra/gcp/port_railway_env.py \
   --railway-service PIVOTA-Agent --railway-env production --env staging --prefix gateway --apply
-../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
+CONFIG=apply ../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
 ```
+
+⚠️ **`port_railway_env.py` reads Railway, which was decommissioned at the 2026-08-22 cutover.** For
+an existing service `apply` is therefore not just unavailable but wrong: it would rewrite all 382 of
+the prod gateway's environment variables from the retired platform. Cloud Run is the source of truth
+now. A config change means editing the live service (`gcloud run services update`) or reviving the
+generated files deliberately — never as a side effect of shipping a commit.
 
 The gateway reuses **its own repo's root Dockerfile**. That is safe there because PIVOTA-Agent's
 Railway services pin `builder=RAILPACK` explicitly, so the Dockerfile is inert on Railway - unlike
