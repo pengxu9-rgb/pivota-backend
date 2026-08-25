@@ -313,7 +313,36 @@ def get_canonical_url(row: Dict[str, Any], snapshot: Dict[str, Any], seed_data: 
 
 
 def get_last_extracted_at(row: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
+    """When the seed's CONTENT was last extracted. Reporting only — see the warning.
+
+    ⚠️ NOT a freshness signal, and it was used as one for months. The `updated_at` fallback
+    means any writer — a PATCH from the console, a backfill, a refresh whose fetch 404'd and
+    fell back to the cached snapshot — makes this value newer without anyone having looked at
+    the page. Ask `get_last_destination_check_at` whether the LINK is still there.
+    """
     return normalize_non_empty_string(snapshot.get("extracted_at") or row.get("updated_at") or row.get("created_at"))
+
+
+def get_last_destination_check_at(row: Dict[str, Any]) -> str:
+    """When a fetch last REACHED THE ORIGIN for this seed's destination.
+
+    Deliberately has NO fallback. An empty string means "never verified", which is the honest
+    answer for every row until the destination sweep has run, and the readiness gate must
+    treat it as a blocker rather than as a pass — the previous shape
+    (`if extracted_dt is not None and ...`) let a missing observation read as a good one.
+    """
+    return normalize_non_empty_string(row.get("destination_checked_at"))
+
+
+def get_destination_verdict(row: Dict[str, Any]) -> str:
+    return normalize_non_empty_string(row.get("destination_verdict")).lower()
+
+
+def get_destination_failure_streak(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("destination_failure_streak") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def get_primary_description(row: Dict[str, Any]) -> str:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -9,6 +10,22 @@ from fastapi.testclient import TestClient
 
 
 from main import app
+
+# A SEED ONLY SERVES IF ITS DESTINATION HAS ACTUALLY BEEN VERIFIED.
+#
+# `should_block_external_referral_runtime` used to infer freshness from `updated_at` — a column
+# any writer bumps — and its staleness check was guarded on "if we have a timestamp at all", so
+# a row nobody had ever fetched passed. `destination_checked_at` is written only by a fetch that
+# reached the origin (services/external_seed_destination_liveness), and NULL now blocks.
+#
+# Spread into every seed fixture below so these tests exercise the OFFER lane rather than the
+# readiness gate — which has its own suite in tests/test_external_referral_readiness.py.
+_VERIFIED_DESTINATION = {
+    "destination_checked_at": datetime.now(timezone.utc).isoformat(),
+    "destination_http_status": 200,
+    "destination_verdict": "live",
+    "destination_failure_streak": 0,
+}
 
 
 @pytest.fixture
@@ -49,6 +66,7 @@ def test_offers_resolve_prefers_external_outbound(monkeypatch: pytest.MonkeyPatc
                         ],
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         if "FROM products_cache" in q:
@@ -171,6 +189,7 @@ def test_offers_resolve_recovers_attached_seed_after_broad_seed_timeout(
                         ],
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         if "FROM external_product_seeds" in q:
@@ -261,6 +280,7 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
                         ],
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         if "FROM external_product_seeds" in q:
@@ -353,6 +373,7 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
                         ],
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         if "FROM external_product_seeds" in q:
@@ -670,6 +691,7 @@ def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
                         ],
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         if "FROM products_cache" in q:
@@ -767,6 +789,7 @@ def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
                         ],
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         if "FROM products_cache" in q:
@@ -962,6 +985,7 @@ _STORAGE_SEED = {
         ],
     },
     "status": "active",
+                    **_VERIFIED_DESTINATION,
 }
 
 
@@ -1353,6 +1377,7 @@ def test_the_cart_id_reaching_the_builder_is_the_evidenced_one_not_the_sku(
                         },
                     },
                     "status": "active",
+                    **_VERIFIED_DESTINATION,
                 }
             ]
         return []
@@ -1402,6 +1427,7 @@ def _seed_row_for_exec_spec(*, evidence: bool):
         "domain": "brand.com", "title": "Serum", "price_amount": 19.0,
         "price_currency": "USD", "availability": "in_stock", "utm_template": None,
         "seed_data": {"brand": "Brand", "snapshot": snapshot}, "status": "active",
+                    **_VERIFIED_DESTINATION,
     }
 
 

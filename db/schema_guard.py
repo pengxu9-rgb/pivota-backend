@@ -163,6 +163,14 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # legacy; never assumed 'self'.
             "seller_ref",
             "seed_kind",
+            # Destination liveness (migration 199). Written ONLY by a fetch that
+            # reached the origin, so the readiness gate can ask "is this link still
+            # there" instead of inferring it from `updated_at`, which any writer
+            # bumps. NULL destination_checked_at = never verified = blocked.
+            "destination_checked_at",
+            "destination_http_status",
+            "destination_verdict",
+            "destination_failure_streak",
         },
     ),
     RequiredTableColumns(
@@ -1049,6 +1057,65 @@ async def ensure_required_schema_light() -> None:
                     CREATE INDEX IF NOT EXISTS idx_external_product_seeds_seller_ref
                       ON external_product_seeds (seller_ref)
                       WHERE seller_ref IS NOT NULL;
+                    """
+                )
+            )
+            # Destination liveness (migration 199). Railway deploys skip
+            # db/migrations/, so self-heal here — and these columns are load-bearing
+            # for the readiness gate the moment the sweep starts writing them.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS external_product_seeds
+                      ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS destination_http_status INTEGER,
+                      ADD COLUMN IF NOT EXISTS destination_verdict TEXT,
+                      ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'ck_external_product_seeds_destination_verdict'
+                        ) THEN
+                            ALTER TABLE external_product_seeds
+                                ADD CONSTRAINT ck_external_product_seeds_destination_verdict
+                                CHECK (
+                                    destination_verdict IS NULL
+                                    OR destination_verdict IN (
+                                        'live',
+                                        'live_delisted',
+                                        'redirected_to_product',
+                                        'redirected_off_product',
+                                        'dead_404',
+                                        'unverifiable'
+                                    )
+                                );
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked
+                      ON external_product_seeds (destination_checked_at NULLS FIRST)
+                      WHERE status = 'active';
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict
+                      ON external_product_seeds (destination_verdict)
+                      WHERE destination_verdict IS NOT NULL;
                     """
                 )
             )

@@ -52,6 +52,17 @@ def _seed_row(**overrides):
         "attached_variant_id": None,
         "created_at": "2026-03-19T00:00:00+00:00",
         "updated_at": "2026-03-19T00:00:00+00:00",
+        # A VERIFIED destination is now part of what "a healthy seed" means. The gate used to
+        # infer freshness from `updated_at`, which any writer bumps, and passed a seed with no
+        # timestamp at all — so a row nobody had ever fetched read as fresh. These three
+        # columns are written only by an observation
+        # (services/external_seed_destination_liveness); a default row therefore has to carry
+        # one, and `_seed_row(destination_checked_at=None)` is how a test asks for the
+        # never-verified case.
+        "destination_checked_at": _iso_days_ago(1),
+        "destination_http_status": 200,
+        "destination_verdict": "live",
+        "destination_failure_streak": 0,
     }
     row.update(overrides)
     return row
@@ -92,6 +103,10 @@ async def test_evaluate_external_referral_seed_marks_blockers(monkeypatch):
         id="eps_stale",
         canonical_url="https://blocked.example/product",
         destination_url="https://blocked.example/product",
+        # Staleness is now measured from the DESTINATION CHECK, not from `snapshot.extracted_at`
+        # (and certainly not from `updated_at`): the question the gate asks is "when did we last
+        # see this URL", which only an observation can answer.
+        destination_checked_at=_iso_days_ago(30),
         seed_data={
             "title": "Blocked referral",
             "snapshot": {
@@ -123,6 +138,7 @@ async def test_build_external_referral_summary_counts_statuses(monkeypatch):
 
     blocked = _seed_row(
         id="eps_blocked",
+        destination_checked_at=_iso_days_ago(30),
         seed_data={
             "title": "Blocked referral",
             "snapshot": {
@@ -223,6 +239,7 @@ async def test_build_platform_fallback_program_summary_counts_global_seed_health
         id="eps_blocked",
         attached_product_key="merch_1|shopify|prod_1",
         domain="blocked.example",
+        destination_checked_at=_iso_days_ago(30),
         seed_data={
             "title": "Blocked referral",
             "snapshot": {
@@ -539,3 +556,170 @@ async def test_refresh_batch_tolerates_a_result_with_no_drift_report(monkeypatch
     assert summary["refreshed"] == 1
     assert summary["price_changed"] == 0
     assert summary["availability_changed"] == 0
+
+
+# --- the destination gate: a fact, and the closed fail-open ------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_never_verified_seed_is_blocked_rather_than_assumed_fresh(monkeypatch):
+    """THE FAIL-OPEN, pinned.
+
+    The staleness check used to read `if extracted_dt is not None and extracted_dt < cutoff`,
+    and `get_last_extracted_at` fell back to `updated_at`. A row with no observation behind it
+    therefore passed the gate — which is every row in the corpus, since nothing had ever
+    re-read a destination. NULL now means "never verified" and blocks.
+    """
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_unverified", destination_checked_at=None)
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "blocked"
+    assert "destination_never_verified" in status.blocker_anomaly_types
+
+
+@pytest.mark.asyncio
+async def test_bumping_updated_at_no_longer_makes_a_stale_seed_look_fresh(monkeypatch):
+    """The wrong clock, pinned.
+
+    `updated_at` moves whenever ANY writer touches the row — a console PATCH, a backfill, or a
+    refresh whose fetch 404'd and fell back to the cached snapshot. Under the old gate that
+    cleared `stale_snapshot` without anyone having loaded the page.
+    """
+    from datetime import datetime, timezone
+
+    from services import external_referral_readiness as module
+
+    row = _seed_row(
+        id="eps_touched",
+        updated_at=datetime.now(timezone.utc).isoformat(),
+        seed_data={
+            "title": "Referral Serum",
+            "description": "A helpful daily serum.",
+            "snapshot": {
+                "canonical_url": "https://example.com/en-us/product/referral-serum",
+                "title": "Referral Serum",
+                "description": "A helpful daily serum.",
+                "extracted_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "variants": [
+                {
+                    "variant_id": "v-1",
+                    "sku": "SKU-1",
+                    "title": "50ml",
+                    "price_amount": 25.0,
+                    "currency": "USD",
+                    "availability": "in_stock",
+                }
+            ],
+        },
+        destination_checked_at=_iso_days_ago(30),
+    )
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "blocked"
+    assert "stale_snapshot" in status.blocker_anomaly_types
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_dead_destination_blocks_on_the_fact_not_the_clock(monkeypatch):
+    from services import external_referral_readiness as module
+
+    row = _seed_row(
+        id="eps_dead",
+        destination_checked_at=_iso_days_ago(1),
+        destination_verdict="dead_404",
+        destination_http_status=404,
+        destination_failure_streak=2,
+    )
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "blocked"
+    assert "destination_dead" in status.blocker_anomaly_types
+    assert "stale_snapshot" not in status.blocker_anomaly_types, (
+        "the seed was verified yesterday — it is dead, not stale, and the two need "
+        "different operator actions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_dead_observation_is_not_enough_to_block(monkeypatch):
+    """Same hysteresis as retirement. A single bad probe must not withdraw a live product."""
+    from services import external_referral_readiness as module
+
+    row = _seed_row(
+        id="eps_maybe_dead",
+        destination_checked_at=_iso_days_ago(1),
+        destination_verdict="dead_404",
+        destination_http_status=404,
+        destination_failure_streak=1,
+    )
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert "destination_dead" not in status.blocker_anomaly_types
+    assert status.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_a_live_but_delisted_destination_still_serves(monkeypatch):
+    """Absent from products.json is not a broken link — 26 of 490 delisted URLs were live."""
+    from services import external_referral_readiness as module
+
+    row = _seed_row(
+        id="eps_delisted",
+        destination_checked_at=_iso_days_ago(1),
+        destination_verdict="live_delisted",
+        destination_http_status=200,
+        destination_failure_streak=0,
+    )
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_destination_never_blocks_on_deadness(monkeypatch):
+    """A bot challenge must not be able to withdraw a merchant's whole catalogue."""
+    from services import external_referral_readiness as module
+
+    row = _seed_row(
+        id="eps_blind",
+        destination_checked_at=_iso_days_ago(1),
+        destination_verdict="unverifiable",
+        destination_http_status=429,
+        destination_failure_streak=99,
+    )
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert "destination_dead" not in status.blocker_anomaly_types
+    assert status.status == "healthy"

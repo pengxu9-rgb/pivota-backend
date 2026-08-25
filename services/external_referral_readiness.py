@@ -14,8 +14,15 @@ from db.database import database
 from db.merchant_onboarding import get_all_merchant_onboardings
 from services.external_seed_audit import (
     audit_external_seed_row,
+    get_destination_failure_streak,
+    get_destination_verdict,
+    get_last_destination_check_at,
     get_last_extracted_at,
     get_snapshot,
+)
+from services.external_seed_destination_liveness import (
+    CONFIRMED_DEAD_VERDICTS,
+    RETIREMENT_STREAK,
 )
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
@@ -37,6 +44,14 @@ EXTERNAL_REFERRAL_BLOCKER_ANOMALIES = {
     "stale_snapshot",
     "redirect_unavailable",
     "destination_domain_not_allowed",
+    # A FACT, not a clock. `stale_snapshot` says "we have not looked recently";
+    # `destination_dead` says "we looked, twice, a day apart, and the product was gone".
+    # Only the second one can be trusted enough to be worth acting on, which is why
+    # retirement hangs off it and not off age (docs/external-seed-dead-pdp-link-audit.md).
+    "destination_dead",
+    # Never verified at all. This used to be the FAIL-OPEN case: the staleness check was
+    # guarded on `extracted_dt is not None`, so a seed with no observation behind it passed.
+    "destination_never_verified",
 }
 EXTERNAL_REFERRAL_REVIEW_ANOMALIES = {
     "zero_images",
@@ -763,17 +778,57 @@ async def evaluate_external_referral_seed(
                 }
             )
 
-    last_extracted_at = get_last_extracted_at(normalized_row, snapshot)
-    extracted_dt = _parse_timestamp(last_extracted_at)
-    if extracted_dt is not None and extracted_dt < (datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)):
+    # IS THE LINK STILL THERE? — three answers, and "we don't know" is one of them.
+    #
+    # This block used to ask `get_last_extracted_at`, whose fallback chain ends at
+    # `row["updated_at"]`. That column moves whenever ANY writer touches the row, so it
+    # measured "when did we last write this" and called it freshness — and it was guarded on
+    # `extracted_dt is not None`, so a row with no timestamp at all passed. Both defects had
+    # the same effect: a seed could look fresh without anyone ever having loaded the page.
+    #
+    # `destination_checked_at` is written only by a fetch that reached the origin
+    # (services/external_seed_destination_liveness), so NULL genuinely means never verified
+    # and is a blocker rather than a pass.
+    verdict = get_destination_verdict(normalized_row)
+    streak = get_destination_failure_streak(normalized_row)
+    if verdict in CONFIRMED_DEAD_VERDICTS and streak >= RETIREMENT_STREAK:
+        findings.append(
+            {
+                "anomaly_type": "destination_dead",
+                "severity": "blocker",
+                "recommended_action": "The brand no longer serves this product page. Repoint the seed or retire it.",
+                "auto_fixable": False,
+                "evidence": {
+                    "destination_verdict": verdict,
+                    "destination_failure_streak": streak,
+                    "destination_http_status": normalized_row.get("destination_http_status"),
+                },
+            }
+        )
+
+    last_checked_at = get_last_destination_check_at(normalized_row)
+    checked_dt = _parse_timestamp(last_checked_at)
+    if checked_dt is None:
+        findings.append(
+            {
+                "anomaly_type": "destination_never_verified",
+                "severity": "blocker",
+                "recommended_action": "Run the destination sweep (jobs/external_seed_destination_sweep) before serving this seed.",
+                "auto_fixable": True,
+                "evidence": {"destination_checked_at": None},
+            }
+        )
+    elif checked_dt < (datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)):
         findings.append(
             {
                 "anomaly_type": "stale_snapshot",
                 "severity": "blocker",
-                "recommended_action": f"Refresh the seed snapshot to keep referral data fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
+                "recommended_action": f"Re-verify the seed destination to keep referral data fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
                 "auto_fixable": True,
                 "evidence": {
-                    "last_extracted_at": _to_iso(extracted_dt or last_extracted_at),
+                    "destination_checked_at": _to_iso(checked_dt),
+                    # Kept for continuity with the dashboards that already read this key.
+                    "last_extracted_at": _to_iso(get_last_extracted_at(normalized_row, snapshot)),
                     "threshold_days": EXTERNAL_REFERRAL_STALE_DAYS,
                 },
             }
@@ -810,7 +865,11 @@ async def evaluate_external_referral_seed(
         blocker_anomaly_types=blocker_anomaly_types,
         review_anomaly_types=review_anomaly_types,
         findings=findings,
-        last_extracted_at=_to_iso(extracted_dt or last_extracted_at),
+        # Still the CONTENT-extraction time: this field is what the employee dashboards
+        # render, and re-pointing it at `destination_checked_at` would silently change a
+        # column of dates people read as "when was this seed last extracted". The gate above
+        # deliberately no longer uses it.
+        last_extracted_at=_to_iso(get_last_extracted_at(normalized_row, snapshot)),
         tracked_destination_url=tracked_destination_url,
     )
 

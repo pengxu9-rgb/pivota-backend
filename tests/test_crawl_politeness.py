@@ -449,9 +449,7 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
         headers = {"content-type": "text/html", "retry-after": "77"}
         encoding = "utf-8"
         content = b"<html></html>"
-
-        def raise_for_status(self) -> None:
-            raise _httpx.HTTPStatusError("429", request=None, response=None)  # type: ignore[arg-type]
+        url = "https://brand.com/products/x"
 
     class _Client:
         def __init__(self, *a: Any, **kw: Any) -> None:
@@ -469,8 +467,12 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
 
     async def go() -> None:
-        with pytest.raises(_httpx.HTTPStatusError):
+        # WAS `_httpx.HTTPStatusError` (from `raise_for_status`). It is now the typed
+        # `ExternalOfferUnavailable`, which carries the status and the final url — the seed
+        # refresh could not tell a 404 from a timeout while both arrived as bare exceptions.
+        with pytest.raises(eos.ExternalOfferUnavailable) as caught:
             await eos._fetch_html("https://brand.com/products/x")
+        assert caught.value.status_code == 429
 
     asyncio.run(go())
 
@@ -479,8 +481,8 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     )
     state = cp._STATE.get("brand.com")
     assert state is not None and state.consecutive_blocks == 1, (
-        "the 429 must be recorded even though raise_for_status raised — recording after it would "
-        "mean the backoff never sees a throttle"
+        "the 429 must be recorded even though the fetcher raised — recording after the throw "
+        "would mean the backoff never sees a throttle"
     )
     assert state.backoff_until > 0
 
@@ -761,6 +763,8 @@ def test_the_batch_scripts_opt_into_waiting_rather_than_being_refused() -> None:
 # removed gate AND on a newly added fetch, which is the moment someone should be made to think.
 _GATED_CRAWL_LANES = {
     "services/external_offers_service.py": 1,
+    # products.json paging + the per-destination PDP probe. Both fetch brand storefronts.
+    "services/external_seed_destination_liveness.py": 2,
     "services/brand_product_discovery.py": 1,
     "services/co_occurrence_finder.py": 1,
     "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch

@@ -1200,7 +1200,39 @@ def _extract_long_description_from_html(html: str) -> Optional[str]:
     return None
 
 
-async def _fetch_html(url: str, *, max_wait: Optional[float] = None) -> Tuple[str, str]:
+class ExternalOfferUnavailable(RuntimeError):
+    """The ORIGIN answered, and its answer was "not here".
+
+    Split out from the bare `httpx.HTTPStatusError` `raise_for_status()` used to raise
+    because callers could not tell it apart from a timeout, a TLS failure, or a bot
+    challenge — and the difference is the whole question. A 404 is a fact about the
+    product; a timeout is a fact about the network. `_refresh_external_seed_by_id`
+    swallowed both into `{"status": "degraded"}`, which is why a dead destination could
+    never become known (docs/external-seed-dead-pdp-link-audit.md §4.2).
+
+    `final_url` is the URL the request ENDED on, so a caller can tell a 200 that stayed
+    on the product from a 301 that dropped the shopper on a collection page.
+    """
+
+    def __init__(self, *, status_code: int, url: str, final_url: Optional[str] = None) -> None:
+        super().__init__(f"origin answered {status_code} for {url}")
+        self.status_code = int(status_code)
+        self.url = url
+        self.final_url = final_url or url
+
+
+async def _fetch_html(
+    url: str,
+    *,
+    max_wait: Optional[float] = None,
+    observed: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    # `observed` is an OUT-parameter, not a behaviour switch: pass a dict and it is filled with
+    # {"status_code", "final_url"} for the request that actually left. It exists because the
+    # return type is (text, content_type) and the FINAL url is the only way to tell a product
+    # page from a 301 that dropped the shopper on a collection — a distinction three existing
+    # callers do not need and must not have to care about. Adding it as a kwarg keeps every
+    # `html, ct = await _fetch_html(...)` call site working unchanged.
     # Every crawl now leaves from ONE reserved NAT address per environment
     # (infra/gcp/setup_crawl_egress.sh), so an unpaced loop earns a per-IP block that takes the
     # whole lane down rather than one worker. Robots + per-domain pacing are the prerequisites
@@ -1226,7 +1258,18 @@ async def _fetch_html(url: str, *, max_wait: Optional[float] = None) -> Tuple[st
         crawl_politeness.note_response(
             url, resp.status_code, retry_after=resp.headers.get("retry-after")
         )
-        resp.raise_for_status()
+        if observed is not None:
+            observed["status_code"] = resp.status_code
+            observed["final_url"] = str(resp.url)
+            observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
+        # WAS `resp.raise_for_status()`. Same control flow — every existing caller
+        # catches `Exception` — but the status and the final URL now survive the throw,
+        # which is what lets the refresh record "this product is gone" instead of
+        # "something went wrong". See ExternalOfferUnavailable.
+        if resp.status_code >= 400:
+            raise ExternalOfferUnavailable(
+                status_code=resp.status_code, url=url, final_url=str(resp.url)
+            )
         content_type = (resp.headers.get("content-type") or "").lower()
         # Read up to MAX_BODY_BYTES to keep latency predictable.
         body = resp.content[:MAX_BODY_BYTES]
@@ -1448,7 +1491,24 @@ def _is_stale(last_checked_at: Optional[datetime]) -> bool:
     return last_checked_at < (_now() - timedelta(days=MAX_AGE_DAYS))
 
 
-async def resolve_external_offer(*, market: str, url: str, force_refresh: bool = False) -> ExternalOfferSnapshot:
+async def resolve_external_offer(
+    *,
+    market: str,
+    url: str,
+    force_refresh: bool = False,
+    raise_on_unavailable: bool = False,
+    observed: Optional[Dict[str, Any]] = None,
+) -> ExternalOfferSnapshot:
+    """Resolve (and opportunistically refresh) the offer snapshot for a third-party URL.
+
+    `raise_on_unavailable` DEFAULTS TO FALSE, which is today's behaviour exactly: a failed
+    fetch silently returns the cached snapshot. That fallback is why a dead destination could
+    masquerade as a healthy one — the seed refresh got a snapshot back, wrote it, and bumped
+    `updated_at`, so a 404 actually made the row look FRESHER. A caller that is asking about
+    the LINK rather than the CONTENT passes True and gets the `ExternalOfferUnavailable`.
+
+    `observed` is an out-parameter forwarded to `_fetch_html`; see its note.
+    """
     market_norm = str(market or "US").upper()
     url_norm = _normalize_url(url)
     url_hash = _url_hash(url_norm)
@@ -1459,7 +1519,7 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
 
     # Try to refresh (best-effort). If refresh fails, return existing cached value.
     try:
-        html, _ct = await _fetch_html(url_norm)
+        html, _ct = await _fetch_html(url_norm, observed=observed)
         extracted = _extract_from_html(url_norm, html)
 
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)
@@ -1531,6 +1591,15 @@ async def resolve_external_offer(*, market: str, url: str, force_refresh: bool =
         refreshed_row = await _get_snapshot_row(market_norm, url_hash)
         if refreshed_row:
             return _row_to_snapshot(refreshed_row)
+    except ExternalOfferUnavailable:
+        # The origin ANSWERED and said no. Serving still prefers the cached snapshot (that is
+        # what keeps a transient outage from blanking the catalogue), but a caller that asked
+        # to hear about it must not be handed a stale row as if the fetch had worked.
+        if raise_on_unavailable:
+            raise
+        if existing:
+            return _row_to_snapshot(existing)
+        raise
     except Exception:
         if existing:
             return _row_to_snapshot(existing)

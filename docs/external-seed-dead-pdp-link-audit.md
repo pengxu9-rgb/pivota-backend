@@ -1,9 +1,13 @@
-# Dead PDP links in the external-seed corpus — audit + proposed fix
+# Dead PDP links in the external-seed corpus — audit + fix
 
 **Measured 2026-08-25** against prod (`external_product_seeds`, 11,352 active rows) and the
-brands' own live storefronts. Read-only throughout; no seed row was modified.
+brands' own live storefronts. The measurement was read-only; no seed row was modified by it.
 
-Reproduce with `scripts/audit_external_seed_destination_liveness.py` (added by this change).
+§1–§4 are the finding. §5 is the fix, **implemented in this change**. §6 is what it does not
+cover.
+
+Reproduce the measurement with `scripts/audit_external_seed_destination_liveness.py`; the same
+mechanism runs on a schedule as `jobs/external_seed_destination_sweep`.
 
 Scope note: this document does **not** touch the warm-handoff click lane. That lane's own
 exposure is tracked separately under `docs/runbooks/outbound_warm_handoff_rollout.md`.
@@ -227,13 +231,15 @@ a schedule.
 
 ---
 
-## 5. Proposed fix
+## 5. The fix — IMPLEMENTED
 
-Five pieces. (1)–(3) are the fix; (4) makes it run; (5) closes the serving gap.
+Shipped in this change. (1)–(3) are the mechanism; (4) makes it run; (5) closes the serving
+gap; (6) is the decision that had to be made either way.
 
-### 5.1 Store the observation, not the write
+### 5.1 Store the observation, not the write ✅
 
-Migration adding to `external_product_seeds`:
+`db/migrations/199_external_seed_destination_liveness.sql` (+ the matching `db/schema_guard.py`
+self-heal, because Railway deploys skip `db/migrations/`) adds to `external_product_seeds`:
 
 | column | meaning |
 |---|---|
@@ -243,31 +249,51 @@ Migration adding to `external_product_seeds`:
 | `destination_failure_streak INT NOT NULL DEFAULT 0` | consecutive *confirmed-dead* observations |
 
 Written **only** by a fetch that got an answer from the origin. Never by a PATCH, never by a
-backfill, never by `updated_at`. Then point `get_last_extracted_at`'s staleness check at
-`destination_checked_at` and drop the `updated_at` fallback — a NULL there must read as
-"never verified", which is the honest answer for the whole corpus today.
+backfill, never by `updated_at`. A `CHECK` constraint closes the verdict vocabulary, and a test
+asserts the constraint and the Python enum cannot drift apart.
 
-Removing the `updated_at` fallback also removes the fail-open: `extracted_dt is not None`
-becomes a real condition rather than an accident.
+The readiness gate now reads `get_last_destination_check_at` — which has **no fallback** — so
+NULL means "never verified" and raises a new `destination_never_verified` blocker. That is what
+closes the fail-open: `if extracted_dt is not None and …` had made a missing observation read
+as a good one.
 
-### 5.2 Let the refresh see a dead link
+`get_last_extracted_at` survives, still fed by `updated_at`, because the employee dashboards
+render it as "when was this seed last extracted". It now carries a warning that it is not a
+freshness signal.
 
-`_fetch_html` already knows the status code and throws it away.
+### 5.2 Let the refresh see a dead link ✅
 
-* Raise a typed `ExternalOfferUnavailable(status_code=…, url=…)` from
-  `services/external_offers_service` instead of letting the bare `httpx.HTTPStatusError`
-  escape (or attach `http_status` to the snapshot).
-* In `_refresh_external_seed_by_id`, catch it and write `destination_verdict` +
-  `destination_http_status` + `destination_checked_at`, incrementing or resetting
-  `destination_failure_streak`. Return a `destination_refresh` report next to the existing
-  `price_refresh` / `availability_refresh` so `run_external_referral_refresh_batch` can
-  aggregate a **dead-link rate per run** — the number that justifies the job existing.
-* A `raise_for_status()` on a 404 must stop meaning the same thing as a socket timeout.
+**The chain was worse than blind.** `raise_for_status()` threw, `resolve_external_offer` caught
+it and returned the *cached* snapshot, `_refresh_external_seed_by_id` wrote that snapshot and
+set `updated_at = NOW()` — so fetching a 404 made the row look **fresher** to the staleness
+gate. Three changes break it:
 
-### 5.3 Retire only on confirmed death, and never on silence
+* `services/external_offers_service` raises a typed
+  `ExternalOfferUnavailable(status_code, url, final_url)` instead of a bare
+  `httpx.HTTPStatusError`. Same control flow — every existing caller catches `Exception` — but
+  the status now survives the throw.
+* `resolve_external_offer` gains `raise_on_unavailable` (**default False**, i.e. today's
+  behaviour exactly: serving still prefers a cached snapshot over nothing). A caller asking
+  about the *link* rather than the *content* opts in. A transport failure keeps the fallback
+  either way — a timeout says nothing about the product.
+* `_fetch_html` gains an `observed` out-parameter carrying the status and the **final URL**, so
+  a 301 onto a collection page — 92 of the 490 measured, and it answers 200 — is seen too.
+* `_refresh_external_seed_by_id` records the observation and returns a `destination_refresh`
+  report beside `price_refresh` / `availability_refresh`.
 
-`status='inactive'` (plus a note) when **`destination_failure_streak >= 2`** with the
-observations at least 24h apart and the verdict in `{dead_404, redirected_off_product}`.
+### 5.3 Retire only on confirmed death, and never on silence ✅
+
+`services/external_seed_destination_liveness` sets `status='inactive'` (plus a dated note) when
+**`destination_failure_streak >= 2`** and the verdict is in
+`{dead_404, redirected_off_product}`. The 24h gap is enforced at increment time — a second look
+inside `RETIREMENT_MIN_GAP` does not advance the streak — so one bad night retires nothing and
+re-running a failed sweep is free.
+
+The mirrored `catalog_products` rows are withdrawn through the **existing** `suppressed_at`
+control that `routes/pivota_canonical_routes` already honours, not a new serving flag. The
+reason `external_seed_destination_dead` is deliberately **not** added to
+`_TERMINAL_SUPPRESSION_REASONS`: a brand can republish a product, so this is reversible
+containment and must answer 404, never a permanent 410.
 
 **Everything else must be inert.** `unverifiable` — bot challenge, 429, 5xx, DNS, TLS, timeout,
 `robots.txt` — must increment a *coverage* metric and never the failure streak. This is not a
@@ -276,14 +302,16 @@ during this audit, and 99 of the 491 delisted URLs could not be probed even on h
 `products.json` we had just read. A reaper that treated "cannot verify" as "dead" would have
 deleted most of the corpus.
 
-`live_delisted` and `redirected_to_product` must also not retire the seed — the link works.
-`live_delisted` is worth a review-severity anomaly (the brand has unlisted it, so it is
-probably being wound down), and `redirected_to_product` is a **repair signal**: rewrite
-`canonical_url` to the redirect target instead of dropping the row.
+`live_delisted` and `redirected_to_product` also do not retire the seed — the link works. Both
+reset the failure streak. `redirected_to_product` is a **repair signal** (rewrite
+`canonical_url` to the target rather than dropping the row); acting on it automatically is not
+in this change.
 
-### 5.4 Two-stage sweep, on a schedule, from the crawl egress IP
+### 5.4 Two-stage sweep, on a schedule, from the crawl egress IP ✅
 
-The catalogue join is ~90× cheaper than probing every PDP (44 requests vs 3,951 seeds), so use
+`jobs/external_seed_destination_sweep`, registered in `infra/gcp/setup_scheduler.sh` as a
+**Cloud Run Job via `mkcrawljob`** (subnet `pivota-crawl`) on a `20 2 * * *` trigger. The
+catalogue join is ~90× cheaper than probing every PDP (44 requests vs 3,951 seeds), so use
 it as the candidate finder:
 
 1. **Nightly, per host:** read `/products.json`; mark every seed whose handle is absent as a
@@ -291,49 +319,64 @@ it as the candidate finder:
    coverage instead.
 2. **Then, per candidate only:** probe the PDP and write the verdict from §5.1.
 
-Register it as a **Cloud Run Job + Cloud Scheduler** entry in `infra/gcp/setup_scheduler.sh` —
-not as a 33rd APScheduler job (`docs/card-rail-readiness-audit.md` §3.1) — so it runs on the
-reserved crawl-egress NAT (`infra/gcp/setup_crawl_egress.sh`) rather than from a web dyno.
-Size it for a **full pass inside the 7-day `stale_snapshot` window**: ~1,700 seeds/day, which
-stage 1 makes trivial. Raise `run_external_referral_refresh_batch`'s default limit accordingly
-and drop the `merchant_stores` arm (0 rows).
+Not a 33rd APScheduler job (`docs/card-rail-readiness-audit.md` §3.1): it crawls merchant
+storefronts, so it must leave from the reserved crawl-egress NAT
+(`infra/gcp/setup_crawl_egress.sh`) rather than a web dyno. Sized at **1,700 seeds/day** — a
+full pass inside the 7-day window.
 
-Publish three counters per run — `dead_links_found`, `seeds_retired`, `hosts_unverifiable` —
-and alert on the third. A crawl lane that quietly stops being able to see 74% of its hosts is
-the failure mode to watch for, and it is the one currently in force.
+**Two switches, both defaulting off**, and the trigger is created paused like every other:
+`EXTERNAL_SEED_DESTINATION_SWEEP` creates the job; `EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE`
+lets it withdraw seeds (the script refuses the second without the first). Observing is useful
+on its own — until the sweep has run, every seed is `destination_never_verified` — so the first
+production run should be observe-only.
 
-### 5.5 Close the two ungated publishers
+Each run reports `dead_links_found`, `seeds_retired` and `hosts_unverifiable`, and
+`coverage_alarm()` logs at WARNING when more hosts were unreadable than readable. **That is the
+dial to alert on, not the dead-link count**: a run that cannot see its hosts reports zero dead
+links and looks identical to a healthy one — which is the state in force from anywhere outside
+the crawl egress (213 of 286 hosts).
 
-* **`catalog_products` mirror:** propagate the verdict onto the mirrored row and stop serving
-  `merchant_canonical_url` for a confirmed-dead destination — the same "tell the truth about
-  the link" treatment `renderable` already gives our own canonical URL. Also retire mirror rows
-  whose seed went `inactive` (22 already stale).
-* **Gateway discovery provider** *(separate repo, PIVOTA-Agent):* it reads the seed table
-  directly, so give it the column, not a code path — a `destination_verdict NOT IN
-  ('dead_404','redirected_off_product')` predicate in its query is the whole fix, and it cannot
-  drift from the backend's opinion because it *is* the backend's opinion.
+### 5.5 Close the two ungated publishers — one done, one is another repo
 
-### 5.6 The `stale_snapshot` decision that has to be made either way
+* **`catalog_products` mirror ✅** — retirement suppresses every mirror row with
+  `source_ref = <seed id>`, so the sig stops serving and `merchant_canonical_url` stops being
+  emitted. Backfilling the 22 already-stale mirror rows whose seed went `inactive` before this
+  existed is a one-off script, not shipped here.
+* **Gateway discovery provider — NOT DONE** *(separate repo, PIVOTA-Agent)*. It reads
+  `external_product_seeds` straight from Postgres, so the fix is a predicate, not a code path:
+  `status = 'active' AND destination_verdict IS DISTINCT FROM 'dead_404' AND
+  destination_verdict IS DISTINCT FROM 'redirected_off_product'`. It cannot drift from the
+  backend's opinion because it *is* the backend's opinion — but until that PR lands, the
+  anonymous `commerce.mcp` search lane keeps serving whatever the seed row says.
 
-Once §5.1 lands, the gate stops being vacuous — and it will still refuse 100% of the corpus
-until the first full sweep completes. Someone has to choose, explicitly:
+### 5.6 What the gate now refuses, and why that is not a regression ✅
 
-* keep it a **blocker** and accept that the external lane serves nothing until the sweep has
-  run (safe, and honest about what we actually know); or
-* demote it to **review** and let the *destination verdict* — a fact, not a clock — be the
-  blocker.
+`stale_snapshot` **stays a blocker**, now keyed on `destination_checked_at`, and it is joined by
+`destination_never_verified` and `destination_dead`.
 
-The second is the better shape, but it is only available *after* §5.1–§5.4 exist. Until then,
-the 7-day clock is the only staleness signal there is, and it is being ignored by exactly the
-lanes that publish.
+**Today's verdicts do not change.** Before this, every one of the 11,352 active seeds was past
+the 7-day threshold on the `updated_at` clock — measured by running the shipped gate against
+live rows: 400/400 sampled seeds `blocked`, reason `stale_snapshot`. After this, all of them are
+`destination_never_verified` instead. Same answer, different — and truthful — reason, and for
+the first time a **recoverable** one: a sweep pass clears it, where nothing could clear the old
+one.
+
+Demoting staleness to `review` and letting the destination verdict carry the block on its own is
+the better long-run shape. It is deliberately not done here: it would widen serving on the
+strength of a lane that has not yet run once in production.
 
 ---
 
 ## 6. Not done here
 
-* No seed rows were modified, no columns added, no jobs registered. This is a measurement and a
-  proposal.
-* Coverage is 37% of the handle-bearing corpus. The remaining 63% needs a run from the reserved
-  crawl-egress IP; the audit script takes `--host` and a seed dump so it can be pointed at them
-  from there without change.
+* **The gateway's discovery provider** (§5.5) — a different repo. Until it ships, the anonymous
+  `commerce.mcp` search lane still serves dead seed URLs.
+* **Backfilling the 22 orphaned mirror rows** whose seed was already `inactive`.
+* **Acting on `redirected_to_product`** — the repair (rewrite `canonical_url` to the target) is
+  recorded as a verdict but not applied.
+* **Arming the sweep in production.** Both switches default off and the trigger is created
+  paused; the first run should be `--no-retire`.
+* Coverage of the measurement is 37% of the handle-bearing corpus. The remaining 63% needs a run
+  from the reserved crawl-egress IP; the audit script takes `--host` and a seed dump so it can
+  be pointed at them from there without change.
 * The warm-handoff click lane is deliberately untouched.
