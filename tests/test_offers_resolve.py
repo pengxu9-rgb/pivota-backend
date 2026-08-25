@@ -2256,6 +2256,11 @@ def test_rail_and_cart_prefilled_can_never_contradict_each_other(
 
     Asserted across every configuration that moves the verdict, because computing them from two
     separate expressions is exactly how they would drift.
+
+    LIMIT, stated so nobody over-trusts this: the single shared call is a STRUCTURAL property
+    and no behavioural test can enforce it. Re-splitting it into two byte-identical calls is
+    invisible here and always will be — only a recomputation that actually DIVERGES (a wrong
+    `destination_url`, say) gets caught. This test guards the agreement, not the sharing.
     """
     cases = [
         ("allowlisted brand, cold", "brand.com", 0, False),
@@ -2289,6 +2294,11 @@ def test_rail_still_says_referral_where_that_claim_is_provable(
     offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
     assert offer["execution_spec"]["rail"] == "referral"
 
+    # Put the host BACK on the allowlist before flipping the flag, or this leg proves nothing
+    # about the flag: eligibility returns `not_allowlisted` before it is ever consulted, and the
+    # leg silently becomes a weaker duplicate of the one above. Measured — without this line,
+    # deleting the resolve-time flag check entirely left all four of these tests green.
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "brand.com")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
     offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
     assert offer["execution_spec"]["rail"] == "referral"
