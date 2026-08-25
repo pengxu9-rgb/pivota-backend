@@ -35,6 +35,7 @@ from services.product_enrichment_ai import (
 )
 from services.product_enrichment_pipeline import run_enrichment_for_product
 from services.product_quality_service import build_quality_payload, preview_quality
+from utils.availability_vocabulary import is_out_of_stock
 
 
 class PlanSupersededError(Exception):
@@ -577,13 +578,13 @@ def _variant_agent_push_projection(variant: Any) -> dict[str, Any]:
     availability = str(inventory_data.get("availability") or "").strip().lower()
     inventory_quantity = _coerce_inventory_quantity(inventory_data.get("quantity"))
 
-    in_stock = availability not in {
-        "out_of_stock",
-        "outofstock",
-        "sold_out",
-        "soldout",
-        "unavailable",
-    }
+    # One shared vocabulary (utils.availability_vocabulary) instead of a local denylist. The
+    # denylist omitted the SPACE-separated forms, so a lowercased "out of stock" read as IN
+    # STOCK. That is unreachable today — readiness/scoring.py is the only producer of this
+    # field and it writes canonical tokens only — so this is behaviour-preserving for every
+    # value that actually arrives, and correct if a future producer ever passes raw text
+    # through. Unknown stays IN STOCK here, exactly as the denylist treated it.
+    in_stock = not is_out_of_stock(availability)
     if inventory_quantity is not None:
         in_stock = in_stock and inventory_quantity > 0
 

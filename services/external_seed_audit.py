@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from utils.availability_vocabulary import normalize_availability
 
 
 MARKET_LOCALE_SEGMENT = {
@@ -68,13 +69,17 @@ def normalize_currency(value: Any) -> str:
 
 
 def normalize_seed_availability(value: Any) -> Optional[str]:
+    """Canonicalise a seed availability string via the shared vocabulary.
+
+    Unrecognised values still pass through (lowercased, separators collapsed) so audit
+    output keeps reporting whatever the source actually said rather than erasing it.
+    """
     normalized = normalize_non_empty_string(value).lower()
     if not normalized:
         return None
-    if normalized in {"in stock", "instock", "in_stock", "available"}:
-        return "in_stock"
-    if normalized in {"out of stock", "outofstock", "out_of_stock", "oos", "sold out", "sold_out", "unavailable"}:
-        return "out_of_stock"
+    canonical = normalize_availability(normalized)
+    if canonical is not None:
+        return canonical
     return normalized.replace(" ", "_")
 
 

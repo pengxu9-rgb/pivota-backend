@@ -68,6 +68,7 @@ from services.pci_kb_scope_review import (
 )
 from db.reviews_center import product_reviews
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
+from utils.availability_vocabulary import normalize_availability
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
@@ -1533,17 +1534,23 @@ def _normalize_seed_url_for_id(url: str) -> str:
 
 
 def _normalize_seed_availability(raw: Any) -> Optional[str]:
+    """Canonicalise a seed availability string, keeping this call site's passthrough contract.
+
+    The vocabulary itself now lives in utils.availability_vocabulary so every reader shares
+    one mapping — see that module for why four divergent copies was a defect. The PASSTHROUGH
+    for unrecognised values is preserved deliberately: the caller above treats a passthrough
+    value as "unknown" (leaves `available` as None), and collapsing those to None here would
+    instead make them read as AVAILABLE.
+    """
     if raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-    v = s.strip().lower()
-    if v in {"in stock", "in_stock", "instock"}:
-        return "in_stock"
-    if v in {"out of stock", "out_of_stock", "outofstock", "sold out", "sold_out", "unavailable"}:
-        return "out_of_stock"
-    return v.replace(" ", "_")
+    canonical = normalize_availability(s)
+    if canonical is not None:
+        return canonical
+    return s.lower().replace(" ", "_")
 
 
 _CURRENCY_TO_REFERRAL_MARKET = {
