@@ -636,8 +636,14 @@ async def upsert_audited_sku_to_index(
     # (indexable + status='active'). URL-tier merchants have no synced storefront,
     # so no catalog_merchants row exists — without one the seed's canonical PDP
     # would 404 even once it's index_eligible. Upsert a minimal, indexable row
-    # (indexable defaults true; status='active' is set by upsert_catalog_merchant)
-    # so the citation read resolves. Best-effort — never break the seed.
+    # (indexable defaults true; a NEW row is minted status='active') so the
+    # citation read resolves. Best-effort — never break the seed.
+    #
+    # Deliberately passes NO `status`: an audit is a content signal, not a
+    # lifecycle one. `catalog_merchants.status` is owned by
+    # services/store_lifecycle_service.py, and re-asserting 'active' here undid
+    # the one transition that has no reconciliation backstop — the merchant who
+    # detached their LAST store (PR #1852). See upsert_catalog_merchant.
     try:
         from services.catalog_sync_service import upsert_catalog_merchant
 

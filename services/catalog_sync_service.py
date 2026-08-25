@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import select
 
@@ -757,6 +757,39 @@ def _preserve_existing_scope(existing: Optional[Dict[str, Any]], payload: Dict[s
             payload[field] = existing.get(field)
 
 
+def _preserve_caller_declared_fields(
+    existing: Optional[Dict[str, Any]],
+    payload: Dict[str, Any],
+    fields: Sequence[str],
+) -> None:
+    """Caller-declared birth-only columns: written on INSERT, left alone on UPDATE.
+
+    Two differences from `_preserve_non_stale_suppression` /
+    `_preserve_existing_scope` above, both deliberate.
+
+    The field list comes from the CALL SITE rather than a module constant,
+    because the column at issue here — `status` — is a real, update-owned field
+    for most of the tables `_upsert_by_pk` serves (`catalog_sync_jobs`,
+    `catalog_sync_events` both move it on purpose). Only
+    `catalog_merchants.status` is owned by writers OUTSIDE this module, so only
+    that call site declares it. See `upsert_catalog_merchant`.
+
+    And it DELETES the key rather than writing the existing value back. Those two
+    are equivalent only if nothing else writes the column in between. Here
+    something does: `store_lifecycle_service` writes `catalog_merchants.status`
+    from lifecycle routes and from the hourly sweep, while a sync or an audit can
+    be mid-flight — and the audit path is not inside a transaction, so its window
+    between `_fetch_one_by_pk` and the UPDATE is wide. Writing the value back
+    would REVERT a lifecycle write that landed inside that window, which is a
+    smaller version of the exact bug this guard exists to fix. Dropping the
+    column from the UPDATE leaves the concurrent write standing.
+    """
+    if not existing:
+        return
+    for field in fields:
+        payload.pop(field, None)
+
+
 async def _resolve_catalog_sku_key(
     *,
     merchant_id: str,
@@ -784,7 +817,13 @@ def _table_debug_name(table: Any) -> str:
     return str(getattr(table, "name", None) or type(table).__name__)
 
 
-async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def _upsert_by_pk(
+    table: Any,
+    pk_name: str,
+    values: Dict[str, Any],
+    *,
+    preserve_on_update: Sequence[str] = (),
+) -> Optional[Dict[str, Any]]:
     table_name = _table_debug_name(table)
     try:
         pk_value = values[pk_name]
@@ -792,6 +831,7 @@ async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Opt
         payload = dict(values)
         _preserve_non_stale_suppression(existing, payload)
         _preserve_existing_scope(existing, payload)
+        _preserve_caller_declared_fields(existing, payload, preserve_on_update)
         payload["updated_at"] = _utcnow()
         if existing:
             await database.execute(
@@ -1039,6 +1079,9 @@ async def _resolve_merchant_name(merchant_id: str) -> Optional[str]:
     return None
 
 
+MERCHANT_STATUS_ON_MINT = "active"
+
+
 async def upsert_catalog_merchant(
     *,
     merchant_id: str,
@@ -1047,13 +1090,60 @@ async def upsert_catalog_merchant(
     source_system: str,
     source_ref: Optional[str],
     metadata_json: Optional[Dict[str, Any]] = None,
-    status: str = "active",
+    status: Optional[str] = None,
 ) -> None:
-    # `status` defaults to 'active' so every existing caller (synced tenants,
-    # url_audit intake) is unchanged. Observed sellers minted at ingestion pass
-    # status='observed' (ADR-009 D2) — first-class but NOT servable as the public
-    # citation artifact until graduation (pivota_canonical_routes gates on
-    # status='active'). See services/seller_identity.py.
+    """Upsert the `catalog_merchants` row for `merchant_id`.
+
+    `status=None` (the default) means "mint as 'active', but do NOT move an
+    existing row's status". This upsert applies its whole payload on UPDATE, so
+    while the default was the literal 'active' every content re-sync silently
+    re-activated the merchant — a clobber of a column this module does not own:
+
+      * `services/store_lifecycle_service.py` owns active <-> inactive, derived
+        from `merchant_stores`. PR #1852 made deleting your LAST store flip the
+        merchant to 'inactive' so it stops serving on public recall. That
+        transition is TERMINAL by construction: `reconcile_catalog_merchant_statuses`
+        drives off `SELECT DISTINCT merchant_id FROM merchant_stores`, so a
+        merchant with zero store rows is invisible to the hourly sweep and
+        nothing ever re-derives it. Every OTHER transition this clobber touched
+        was repaired within a tick; this one was not. Reproduced through
+        `services/audit_index_intake.py` (a URL audit from the merchant portal)
+        and through `ingest_standard_products`, both of which reach here with no
+        `status` argument: detach your last store -> 'inactive' -> run one audit
+        -> 'active' again, with zero `merchant_stores` rows.
+      * `services/seller_identity.py` mints crawl-observed sellers at
+        `status='observed'` (ADR-009 D2) — deliberately not servable as the
+        public citation artifact until graduation. The clobber graduated them
+        with no review, and that half WAS reachable: `routes/catalog_routes.py`
+        takes `merchant_id` from the request body (`POST /v1/catalog/sync/jobs`)
+        or the path (`POST /v1/catalog/reconcile/merchants/{merchant_id}`,
+        `POST /v1/catalog/verticals/beauty/rebuild/{merchant_id}`) under a bare
+        `Depends(get_current_user)` with NO tenant scoping, and each runs
+        through `run_catalog_sync_job` -> `sync_products_cache_to_catalog` ->
+        `ingest_standard_products`. Reproduced in review against an
+        `merch_obs_*` row with zero `products_cache` rows — the merchant upsert
+        runs BEFORE the product loop, so an empty payload clobbers just as well.
+
+        What IS true, and is the part worth keeping: observed ids never become
+        tenant identities (`merchants` mints `merch_<hex>` /
+        `merch_<platform>_<digest>`; the claim flow attaches to an existing
+        tenant rather than re-keying an observed row). That bounds who a
+        graduated seller can be, not who can trigger the graduation. An earlier
+        draft of this comment concluded "latent, not live" from the identity
+        separation alone — a clobber needs only that an id be PASSED, not that
+        the caller be authenticated as it. The unscoped `merchant_id` on those
+        three routes is a separate, pre-existing problem and is not fixed here.
+
+        Prior art in the sibling lane: `catalog_enrichment_agent/apply.py`
+        rule 3 refuses the clobbering upsert for its observed sellers on the
+        same principle ("this module does not own the column"), though its
+        hazard is the mirror image — a DOWNGRADE of a graduated merchant back to
+        'observed' — and its refusal covers only the `_ensure_only` subset.
+
+    Callers that legitimately move the column pass `status=` explicitly
+    (`seller_identity.ensure_observed_seller` / `ensure_observed_seller_of_record`),
+    and are unchanged: they only reach here for a row that does not exist yet.
+    """
     if not merchant_name:
         merchant_name = await _resolve_merchant_name(merchant_id)
     await _upsert_by_pk(
@@ -1063,11 +1153,14 @@ async def upsert_catalog_merchant(
             "merchant_id": merchant_id,
             "merchant_name": merchant_name,
             "primary_platform": primary_platform,
-            "status": status,
+            "status": status if status is not None else MERCHANT_STATUS_ON_MINT,
             "source_system": source_system,
             "source_ref": source_ref,
             "metadata_json": metadata_json or {},
         },
+        # Birth-only unless the caller named a status. On INSERT the payload
+        # value above lands; on UPDATE the existing row's status stands.
+        preserve_on_update=() if status is not None else ("status",),
     )
 
 
