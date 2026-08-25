@@ -47,6 +47,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -101,6 +102,11 @@ class Verdict:
     live_currency: Optional[str] = None
     in_stock: Optional[bool] = None
     price_changed: bool = False
+    # Separate from `status` on purpose. A verdict can establish STOCK and not PRICE — that is the
+    # normal case when the shop's currency differs from the one the offer quoted, or when
+    # /meta.json did not answer. Folding the two into one flag is what produced the ¥4500-as-$4500
+    # bug in the first cut.
+    price_verified: bool = False
     checked_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -112,6 +118,7 @@ class Verdict:
             "live_currency": self.live_currency,
             "in_stock": self.in_stock,
             "price_changed": self.price_changed,
+            "price_verified": self.price_verified,
         }
 
 
@@ -157,8 +164,10 @@ async def _cache_get(key: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _cache_put(key: str, payload: Dict[str, Any]) -> None:
-    ttl = _f("LIVE_OFFER_VERIFICATION_CACHE_TTL_SECONDS", _DEFAULT_CACHE_TTL_S)
+async def _cache_put(key: str, payload: Dict[str, Any], *, ttl: Optional[float] = None) -> None:
+    ttl = ttl if ttl is not None else _f(
+        "LIVE_OFFER_VERIFICATION_CACHE_TTL_SECONDS", _DEFAULT_CACHE_TTL_S
+    )
     if ttl <= 0:
         return
     try:
@@ -178,6 +187,68 @@ async def _cache_put(key: str, payload: Dict[str, Any]) -> None:
 
 def reset_for_tests() -> None:
     _LOCAL.clear()
+
+
+# --- the shop's currency ----------------------------------------------------------------------
+#
+# `/products/<handle>.js` carries an amount with NO currency code, which is why the first cut of
+# this module refused to verify price at all. Shopify does publish the shop's default currency,
+# cheaply and statically, at `/meta.json`.
+#
+# MEASURED before relying on it (2026-08-25, live): celimax.jp -> JPY, arencia.jp -> USD despite
+# the .jp TLD, goongbe.us -> USD with country KR. So the domain is NOT a currency signal and
+# `/meta.json` is — which is exactly why guessing from the TLD was never an option.
+#
+# ALSO MEASURED, because the parser divides by 100: Shopify stores JPY in hundredths like every
+# other currency. celimax.jp's `.js` says 319000, the PDP renders ¥3,190 and its JSON-LD says
+# JPY 3190. The existing conversion is correct for a zero-decimal currency; the concern that it
+# might not be was unfounded, and is recorded here so nobody re-opens it from first principles.
+
+_DEFAULT_CURRENCY_TTL_S = 86_400.0    # a shop's default currency changes ~never
+
+
+async def _shop_currency(host: str, *, max_wait: Optional[float]) -> Optional[str]:
+    """The shop's default currency, or None. One fetch per domain, cached for a day.
+
+    None is a real answer and must degrade honestly: without it the `.js` amount cannot be
+    compared with the offer's, so price stays unverified rather than being guessed at.
+    """
+    key = f"lov:cur:{host}"
+    cached = await _cache_get(key)
+    if cached:
+        return cached.get("currency")
+
+    try:
+        await crawl_politeness.before_request(
+            f"https://{host}/meta.json", user_agent=_USER_AGENT, max_wait=max_wait
+        )
+    except Exception:  # noqa: BLE001 - robots or pacing; either way we simply do not learn it
+        return None
+
+    try:
+        timeout = _f("LIVE_OFFER_VERIFICATION_FETCH_TIMEOUT_SECONDS", _DEFAULT_FETCH_TIMEOUT_S)
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True, max_redirects=_MAX_REDIRECTS
+        ) as client:
+            resp = await client.get(
+                f"https://{host}/meta.json",
+                headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+            )
+        crawl_politeness.note_response(
+            f"https://{host}/meta.json", resp.status_code,
+            retry_after=resp.headers.get("retry-after"),
+        )
+        if resp.status_code != 200:
+            return None
+        currency = str((resp.json() or {}).get("currency") or "").strip().upper()
+    except Exception as exc:  # noqa: BLE001
+        logger.info("shop currency unavailable for %s: %s", host, exc)
+        return None
+
+    if len(currency) != 3 or not currency.isalpha():
+        return None
+    await _cache_put(key, {"currency": currency}, ttl=_DEFAULT_CURRENCY_TTL_S)
+    return currency
 
 
 # --- the check ---------------------------------------------------------------------------------
@@ -323,13 +394,25 @@ async def _check_one(
     live_price = chosen.get("price_amount")
     live = Decimal(str(live_price)) if live_price is not None else None
 
-    # S2: the amount is INFORMATIONAL. `/products/<handle>.js` carries no currency code and
-    # returns the SHOP'S DEFAULT currency, so this number cannot be compared with, or substituted
-    # for, an offer quoted in another currency. `price_moved` is therefore only asserted when the
-    # comparison is meaningful, and the caller never replaces the published price from it.
+    # The amount is only a PRICE once we know its unit. `/products/<handle>.js` carries no
+    # currency code, so the shop's default is read separately (one cached fetch per domain) and
+    # the comparison is made only when it matches the currency this offer quoted. A mismatch is
+    # not an error — a JPY shop and a USD-presentment offer are both correct — it simply means
+    # this source cannot speak to that offer's price.
+    host = crawl_politeness.host_of(js_url)
+    shop_currency = await _shop_currency(host, max_wait=max_wait) if host else None
+    offer_currency = str(offer.get("currency") or "").strip().upper() or None
+    comparable = bool(
+        live is not None and shop_currency and offer_currency and shop_currency == offer_currency
+    )
+
     return Verdict(
-        VERIFIED, "ok", live_price=live, live_currency=None, in_stock=True,
-        price_changed=_price_moved(live, offer),
+        VERIFIED, "ok",
+        live_price=live,
+        live_currency=shop_currency,
+        in_stock=True,
+        price_changed=_price_moved(live, offer) if comparable else False,
+        price_verified=comparable,
     )
 
 
@@ -383,6 +466,20 @@ async def verify_offers(
     return out
 
 
+_EXPECTED_TOTAL_TTL_S = 300   # audit F3: a verified spec carries a 5-minute expiry
+
+
+def _expiry_iso() -> str:
+    """When the verified total stops being a claim we stand behind.
+
+    Short on purpose: 43% of live PDPs carry an active markdown, so a total that outlived its
+    window would be exactly the stale number this hop exists to replace.
+    """
+    return (
+        datetime.now(tz=timezone.utc) + timedelta(seconds=_EXPECTED_TOTAL_TTL_S)
+    ).isoformat().replace("+00:00", "Z")
+
+
 def apply_verdicts(
     offers: List[Dict[str, Any]], verdicts: Dict[int, Verdict]
 ) -> List[Dict[str, Any]]:
@@ -407,13 +504,36 @@ def apply_verdicts(
         enriched = dict(offer)
         enriched["verification"] = verdict.as_dict()
         if verdict.status == VERIFIED:
-            # STOCK is verified; PRICE is not, and the two must not be conflated. The source
-            # carries no currency code, so replacing `price` from it would publish a shop-currency
-            # amount under the offer's own currency label — the amount-without-its-currency class
-            # this repo has fixed twice. `stock_verified` says exactly what was established.
+            # STOCK and PRICE are reported separately because they are established separately.
             enriched["stock_verified"] = True
             if verdict.in_stock is not None:
                 enriched["in_stock"] = bool(verdict.in_stock)
+
+            if verdict.price_verified and verdict.live_price is not None:
+                # Amount AND currency move together, always. This branch is only reached when the
+                # shop's own declared currency matches the one this offer quoted, so the number
+                # and the label agree by construction rather than by assumption.
+                enriched["price"] = float(verdict.live_price)
+                enriched["price_verified"] = True
+                if verdict.live_currency:
+                    enriched["currency"] = verdict.live_currency
+
+                # Audit F3: a verified offer carries an expected total and an expiry.
+                #
+                # ITEM total, not grand total. Shipping and tax need a checkout, which is item 9 —
+                # naming this `expected_total` would promise a landed cost we have not computed,
+                # and the whole point of the field is that an agent can abort on a mismatch.
+                spec = enriched.get("execution_spec")
+                if isinstance(spec, dict):
+                    spec = dict(spec)
+                    spec["expected_item_total"] = float(verdict.live_price)
+                    spec["expected_currency"] = verdict.live_currency
+                    spec["expected_total_expires_at"] = _expiry_iso()
+                    enriched["execution_spec"] = spec
+            else:
+                # Checked, but this source could not speak to the price — a currency mismatch or
+                # an unanswered /meta.json. The quoted price stands untouched and unclaimed.
+                enriched["price_verified"] = False
             kept.append((0, enriched))
         else:
             enriched["stock_verified"] = False

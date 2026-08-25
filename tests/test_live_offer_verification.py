@@ -84,6 +84,13 @@ def _serve(monkeypatch: pytest.MonkeyPatch, responses: Dict[str, Any]):
 
         async def get(self, url: str, **kw: Any) -> Any:
             seen.append(url)
+            if url.endswith("/meta.json"):
+                # The shop-currency source. Default USD so existing rows keep meaning what they
+                # meant; a test that cares passes an explicit entry.
+                cur = responses.get(url, {"currency": "USD"})
+                if isinstance(cur, int):
+                    return SimpleNamespace(status_code=cur, headers={}, json=lambda: {})
+                return SimpleNamespace(status_code=200, headers={}, json=lambda: cur)
             body = responses.get(url, 404)
             if isinstance(body, float):
                 await asyncio.sleep(body)
@@ -210,7 +217,8 @@ def test_only_the_top_K_are_checked(monkeypatch: pytest.MonkeyPatch) -> None:
     offers = [_offer(url=f"https://brand.example/products/p{i}", offer_id=f"o{i}") for i in range(6)]
     out = asyncio.run(lov.verify_offers(offers, top_k=3))
     assert set(out) == {0, 1, 2}
-    assert len(seen) == 3, f"checked more than the top 3: {seen}"
+    product_fetches = [u for u in seen if u.endswith(".js")]
+    assert len(product_fetches) == 3, f"checked more than the top 3: {product_fetches}"
 
 
 def test_an_offer_with_no_verifiable_url_costs_no_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,7 +239,7 @@ def test_our_own_tracking_params_never_reach_the_merchant(
         "https://brand.example/products/serum?utm_source=pivota&pvt_click_id=clk_secret"
     )
     asyncio.run(lov.verify_offers([offer]))
-    assert seen == ["https://brand.example/products/serum.js"]
+    assert [u for u in seen if u.endswith(".js")] == ["https://brand.example/products/serum.js"]
     assert not any("clk_secret" in u or "utm_" in u for u in seen)
 
 
@@ -241,7 +249,8 @@ def test_a_repeat_check_is_served_from_cache(monkeypatch: pytest.MonkeyPatch) ->
     seen = _serve(monkeypatch, {"https://brand.example/products/serum.js": _body()})
     asyncio.run(lov.verify_offers([_offer()]))
     out = asyncio.run(lov.verify_offers([_offer()]))
-    assert len(seen) == 1, f"the merchant was asked twice inside the TTL: {seen}"
+    product_fetches = [u for u in seen if u.endswith(".js")]
+    assert len(product_fetches) == 1, f"the merchant was asked twice inside the TTL: {seen}"
     assert out[0].status == lov.VERIFIED
 
 
@@ -259,28 +268,74 @@ def test_a_cache_outage_does_not_fail_the_check(monkeypatch: pytest.MonkeyPatch)
 
 # --- applying the verdicts (audit F3) ----------------------------------------------------------
 
-def test_a_verified_offer_does_NOT_have_its_price_replaced() -> None:
-    """`/products/<handle>.js` returns the SHOP'S DEFAULT currency and carries no currency code,
-    so its number cannot be written onto an offer quoted in another currency — that publishes
-    ¥4500 as $4500. It is the amount-without-its-currency class this repo has already fixed twice
-    (`_observed_currency` in agent_shop_gateway).
+def test_a_price_is_replaced_ONLY_when_the_shop_currency_matches_the_offer() -> None:
+    """Amount and currency move together, always.
 
-    What IS established is stock, which is currency-free. `stock_verified` rather than
-    `price_verified` is the difference between a claim we can support and one we cannot.
+    `/products/<handle>.js` carries no currency code, so the shop's default is read separately
+    from `/meta.json` and the comparison is made only between like and like. Measured live
+    2026-08-25: celimax.jp declares JPY while arencia.jp declares USD despite a .jp TLD — the
+    domain is not a currency signal, which is why this is read rather than inferred.
     """
     offers = [_offer(price=19.99)]
-    verdicts = {0: lov.Verdict(lov.VERIFIED, "ok", live_price=Decimal("14.99"),
-                               in_stock=True, price_changed=True)}
-    out = lov.apply_verdicts(offers, verdicts)
+    matching = {0: lov.Verdict(lov.VERIFIED, "ok", live_price=Decimal("14.99"),
+                               live_currency="USD", in_stock=True,
+                               price_changed=True, price_verified=True)}
+    out = lov.apply_verdicts(offers, matching)
 
-    assert out[0]["price"] == 19.99, (
-        "the quoted price was overwritten from a source that carries no currency"
-    )
+    assert out[0]["price"] == 14.99, "a like-for-like price must be corrected"
     assert out[0]["currency"] == "USD"
+    assert out[0]["price_verified"] is True
     assert out[0]["stock_verified"] is True
-    assert "price_verified" not in out[0], "this source cannot verify a price"
-    # The live amount is still carried, as information the caller may act on.
-    assert out[0]["verification"]["live_price"] == 14.99
+
+
+def test_a_JPY_shop_never_overwrites_a_USD_offer() -> None:
+    """The bug this module shipped in its first cut, pinned.
+
+    A JPY-default shop's `.js` amount written onto a USD-presentment offer publishes ¥4500 as
+    $4500 — and `offerToSignal` sorts cross-merchant on raw `price` to pick best_offer, so the
+    fabricated number wins and the agent quotes it. A currency mismatch is not an error: both
+    values are correct in their own unit. It just means THIS source cannot speak to THIS offer's
+    price, and it must say so rather than guess.
+    """
+    offers = [_offer(price=31.20)]           # a USD presentment price
+    offers[0]["currency"] = "USD"
+    mismatched = {0: lov.Verdict(lov.VERIFIED, "ok", live_price=Decimal("4500"),
+                                 live_currency="JPY", in_stock=True,
+                                 price_changed=False, price_verified=False)}
+    out = lov.apply_verdicts(offers, mismatched)
+
+    assert out[0]["price"] == 31.20, "a JPY amount was published under a USD label"
+    assert out[0]["currency"] == "USD"
+    assert out[0]["price_verified"] is False
+    # Stock IS still established — it is currency-free, and dropping it would throw away the
+    # larger half of what this hop can prove.
+    assert out[0]["stock_verified"] is True
+    assert "expected_item_total" not in out[0]["execution_spec"]
+
+
+def test_a_verified_offer_carries_an_expected_total_and_an_expiry() -> None:
+    """Audit F3's other half: "Verified -> emit spec with expected_total and a 5-min expiry."
+
+    ITEM total, not grand total. Shipping and tax need a checkout (item 9); naming it
+    `expected_total` would promise a landed cost we have not computed, and the entire point of the
+    field is that an agent can abort on a mismatch it can actually check.
+    """
+    from datetime import datetime, timezone
+
+    offers = [_offer(price=19.99)]
+    out = lov.apply_verdicts(offers, {0: lov.Verdict(
+        lov.VERIFIED, "ok", live_price=Decimal("14.99"), live_currency="USD",
+        in_stock=True, price_verified=True,
+    )})
+    spec = out[0]["execution_spec"]
+
+    assert spec["expected_item_total"] == 14.99
+    assert spec["expected_currency"] == "USD"
+    assert "expected_total" not in spec, "a grand total is not something this hop can compute"
+
+    expires = datetime.fromisoformat(spec["expected_total_expires_at"].replace("Z", "+00:00"))
+    remaining = (expires - datetime.now(tz=timezone.utc)).total_seconds()
+    assert 240 <= remaining <= 300, f"expiry should be ~5 minutes out, got {remaining:.0f}s"
 
 
 def test_a_GONE_offer_is_dropped_entirely() -> None:
@@ -596,7 +651,9 @@ def test_a_cached_verdict_recomputes_price_changed_for_THIS_offer(
     # Second offer, SAME product, quotes a stale price. Served from cache, but the flag must be
     # recomputed against this offer's own quote.
     second = asyncio.run(lov.verify_offers([_offer(price=19.99, offer_id="stale")]))
-    assert len(seen) == 1, "the cache should have served the second check"
+    assert len([u for u in seen if u.endswith(".js")]) == 1, (
+        "the cache should have served the second check"
+    )
     assert second[0].price_changed is True, (
         "a cached verdict carried the FIRST offer's price_changed onto the second"
     )
@@ -653,7 +710,10 @@ def test_three_variants_of_one_product_cost_ONE_fetch(monkeypatch: pytest.Monkey
     offers = [_offer(variant=v, offer_id=f"o{v}") for v in ("111", "222", "333")]
     out = asyncio.run(lov.verify_offers(offers))
 
-    assert len(seen) == 1, f"three variants of one product cost {len(seen)} fetches"
+    product_fetches = [u for u in seen if u.endswith(".js")]
+    assert len(product_fetches) == 1, (
+        f"three variants of one product cost {len(product_fetches)} fetches"
+    )
     assert all(v.status == lov.VERIFIED for v in out.values())
     # ...and each offer got ITS OWN variant's facts, not the first one's.
     assert out[0].live_price == Decimal("19.99")
@@ -665,7 +725,7 @@ def test_a_transient_5xx_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     seen = _serve(monkeypatch, {"https://brand.example/products/serum.js": 503})
     asyncio.run(lov.verify_offers([_offer()]))
     asyncio.run(lov.verify_offers([_offer()]))
-    assert len(seen) == 2, "a transient failure was cached"
+    assert len([u for u in seen if u.endswith(".js")]) == 2, "a transient failure was cached"
 
 
 def test_sustained_turns_against_ONE_host_do_not_collapse_the_verification_rate(
@@ -837,3 +897,102 @@ def test_a_task_past_the_deadline_is_actually_cancelled(monkeypatch: pytest.Monk
 
     assert asyncio.run(go()), "a past-deadline task was left running after the turn was answered"
     assert started, "no task was created"
+
+
+# --- the currency source, driven end to end ----------------------------------------------------
+
+def test_the_shop_currency_is_read_from_meta_json_not_guessed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JPY shop reached through the REAL check path must not have its amount compared with a
+    USD offer. Measured live: celimax.jp declares JPY, arencia.jp declares USD despite a .jp TLD."""
+    seen = _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(price_minor=450000),
+        "https://brand.example/meta.json": {"currency": "JPY", "country": "JP"},
+    })
+    out = asyncio.run(lov.verify_offers([_offer(price=31.20)]))
+
+    assert out[0].status == lov.VERIFIED, "stock is currency-free and still established"
+    assert out[0].live_currency == "JPY"
+    assert out[0].price_verified is False, "a JPY amount cannot verify a USD quote"
+    assert out[0].price_changed is False, "no comparison was possible, so nothing 'moved'"
+    assert any(u.endswith("/meta.json") for u in seen), "the currency was never read"
+
+
+def test_a_matching_currency_verifies_the_price_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(price_minor=1499),
+        "https://brand.example/meta.json": {"currency": "USD"},
+    })
+    out = asyncio.run(lov.verify_offers([_offer(price=19.99)]))
+    assert out[0].price_verified is True
+    assert out[0].price_changed is True
+    assert out[0].live_price == Decimal("14.99")
+
+
+def test_an_unreadable_meta_json_leaves_the_price_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No currency is a real answer, and it degrades honestly: stock still stands, price does not.
+    Falling back to "probably the offer's currency" is the guess this whole design refuses."""
+    _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(price_minor=1499),
+        "https://brand.example/meta.json": 404,
+    })
+    out = asyncio.run(lov.verify_offers([_offer(price=19.99)]))
+    assert out[0].status == lov.VERIFIED
+    assert out[0].price_verified is False
+    assert out[0].live_currency is None
+
+
+def test_the_currency_is_fetched_ONCE_per_domain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It is a second outbound request on a live path, so it must not scale with offers. A shop's
+    default currency changes ~never, hence the day-long TTL."""
+    seen = _serve(monkeypatch, {
+        **{f"https://brand.example/products/p{i}.js": _body() for i in range(3)},
+        "https://brand.example/meta.json": {"currency": "USD"},
+    })
+    offers = [_offer(url=f"https://brand.example/products/p{i}", offer_id=f"o{i}")
+              for i in range(3)]
+    asyncio.run(lov.verify_offers(offers))
+
+    meta = [u for u in seen if u.endswith("/meta.json")]
+    assert len(meta) == 1, f"the currency was fetched {len(meta)} times for one domain"
+
+
+def test_a_malformed_currency_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three alpha characters or nothing. A junk value written into `currency` would be worse than
+    an absent one — it would look like an answer."""
+    _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(),
+        "https://brand.example/meta.json": {"currency": "dollars"},
+    })
+    out = asyncio.run(lov.verify_offers([_offer()]))
+    assert out[0].price_verified is False
+    assert out[0].live_currency is None
+
+
+def test_EVERY_outbound_fetch_goes_through_the_gate_including_the_currency_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The currency lookup is a SECOND request to the merchant, from the same shared crawl IP.
+    Gating only the product fetch would leave it unpaced and invisible to the backoff — and the
+    module docstring claims "every fetch goes through crawl_politeness", which must be true rather
+    than aspirational."""
+    gated: List[str] = []
+
+    async def spy(url: str, *, user_agent: str, max_wait: Any = None) -> None:
+        gated.append(url)
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", spy)
+    seen = _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(),
+        "https://brand.example/meta.json": {"currency": "USD"},
+    })
+    asyncio.run(lov.verify_offers([_offer()]))
+
+    assert seen, "no outbound request was made"
+    for url in seen:
+        assert url in gated, f"{url} was fetched WITHOUT passing the politeness gate"
