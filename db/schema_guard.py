@@ -640,6 +640,7 @@ async def ensure_required_schema_light() -> None:
                       ADD COLUMN IF NOT EXISTS lifestyle_tags JSONB,
                       ADD COLUMN IF NOT EXISTS demographic VARCHAR(16),
                       ADD COLUMN IF NOT EXISTS category_path VARCHAR(255),
+                      ADD COLUMN IF NOT EXISTS category_label VARCHAR(255),
                       ADD COLUMN IF NOT EXISTS category_confidence REAL,
                       ADD COLUMN IF NOT EXISTS category_label_source VARCHAR(32),
                       ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage VARCHAR(16);
