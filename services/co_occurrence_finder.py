@@ -211,7 +211,10 @@ async def _fetch_article_text(
             # reserved NAT address as every other outbound lane, so a ban earned here takes the
             # whole crawl subnet down. `max_wait=0` because this is batch work: refusing rather
             # than waiting would turn a brief 429 into silently-dropped rows.
-            await crawl_politeness.before_request(article_url, user_agent=_USER_AGENT, max_wait=0)
+            # Bounded (default): reachable from POST .../audit/ai-commerce-readiness. The
+            # verify_many docstring promises "total wall time bounded by the slowest fetch,
+            # regardless of N" — max_wait=0 would make that false.
+            await crawl_politeness.before_request(article_url, user_agent=_USER_AGENT)
             resp = await client.get(article_url)
             crawl_politeness.note_response(
                 article_url, resp.status_code, retry_after=resp.headers.get("retry-after")

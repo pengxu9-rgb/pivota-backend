@@ -110,6 +110,10 @@ _STATE: Dict[str, _DomainState] = {}
 # positive cache of "asked, nothing to obey" — without it a site with no robots.txt would be
 # re-asked on every single fetch.
 _ROBOTS: Dict[str, Tuple[float, Optional[RobotFileParser], Optional[float]]] = {}
+# host -> the future of the fetch currently in flight, plus the loop those futures belong to.
+# Cleared whenever the running loop changes; see the note in _load_robots.
+_ROBOTS_INFLIGHT: Dict[str, "asyncio.Future[None]"] = {}
+_ROBOTS_INFLIGHT_LOOP: "Optional[asyncio.AbstractEventLoop]" = None
 
 
 def host_of(url: str) -> str:
@@ -133,22 +137,58 @@ def _bounded(store: Dict[str, Any]) -> None:
 
 def reset_for_tests() -> None:
     """Drop all pacing and robots state. Tests only."""
+    global _ROBOTS_INFLIGHT_LOOP
     _STATE.clear()
     _ROBOTS.clear()
+    _ROBOTS_INFLIGHT.clear()
+    _ROBOTS_INFLIGHT_LOOP = None
 
 
 async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFileParser], Optional[float]]:
     """Fetch + parse robots.txt for `host`, TTL-cached.
 
-    Not itself paced: it is at most one request per host per TTL, and pacing it would mean the
-    politeness gate calling into itself. Two concurrent first-callers may both fetch; that costs
-    one duplicate request and is cheaper than a single-flight primitive that would have to be
-    loop-bound (see the module docstring).
+    SINGLE-FLIGHTED, and it has to be. "Two concurrent first-callers may both fetch" was the
+    original reasoning and it was wrong at the shape that matters: the audit routes fan out with
+    `asyncio.gather` over ~20 urls on ONE merchant host, all of which miss the cache in the same
+    tick. That produced 20 simultaneous, entirely unpaced requests to that host — a burst emitted
+    from the shared crawl egress IP by the very code meant to prevent per-IP bans.
+
+    The in-flight future is stored beside the loop that created it and the map is dropped
+    whenever the running loop changes. That is the shape proven in `utils/database_readiness.py`:
+    a module-level future binds to one loop and awaiting a stale one HANGS rather than raising,
+    and a WeakKeyDictionary keyed by loop leaks (the future holds `_loop`, a strong ref back to
+    the weak key).
+
+    Still not paced against the host's own interval: it is one request per host per TTL, and
+    pacing it would mean the gate calling into itself.
     """
+    global _ROBOTS_INFLIGHT_LOOP
+
     now = time.monotonic()
     cached = _ROBOTS.get(host)
     if cached and cached[0] > now:
         return cached[1], cached[2]
+
+    loop = asyncio.get_running_loop()
+    if _ROBOTS_INFLIGHT_LOOP is not loop:
+        _ROBOTS_INFLIGHT.clear()
+        _ROBOTS_INFLIGHT_LOOP = loop
+
+    inflight = _ROBOTS_INFLIGHT.get(host)
+    if inflight is not None and not inflight.done():
+        # Adopt the leader's fetch rather than racing it. `shield` so this waiter's own
+        # cancellation cannot cancel the shared future out from under its siblings.
+        try:
+            await asyncio.shield(inflight)
+        except Exception:  # noqa: BLE001 - the leader logs; a follower just re-reads the cache
+            pass
+        again = _ROBOTS.get(host)
+        if again:
+            return again[1], again[2]
+        return None, None
+
+    leader = loop.create_future()
+    _ROBOTS_INFLIGHT[host] = leader
 
     ttl = _f("CRAWL_ROBOTS_TTL_SECONDS", _ROBOTS_TTL_DEFAULT)
     parser: Optional[RobotFileParser] = None
@@ -181,9 +221,15 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
         # Any non-200 (404 = no robots, 5xx = could not ask) caches as "nothing to obey".
     except Exception as exc:  # noqa: BLE001
         logger.info("robots.txt unavailable for %s (%s); proceeding without restrictions", host, exc)
-
-    _bounded(_ROBOTS)
-    _ROBOTS[host] = (now + ttl, parser, delay)
+    finally:
+        # In a `finally` so a follower can NEVER be stranded. Awaiting a future that is never
+        # resolved HANGS rather than raising, so an unexpected error anywhere above would wedge
+        # every sibling waiter on that host instead of failing loudly.
+        _bounded(_ROBOTS)
+        _ROBOTS[host] = (now + ttl, parser, delay)
+        if not leader.done():
+            leader.set_result(None)
+        _ROBOTS_INFLIGHT.pop(host, None)
     return parser, delay
 
 

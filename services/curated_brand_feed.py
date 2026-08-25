@@ -602,7 +602,11 @@ async def records_for_brand(
     max_products: int = 500,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
-    pdp_delay_s: float = 0.3,
+    # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
+    # STACKS on top: every INCI fetch already waits its per-host interval, so a 0.3s sleep on
+    # each of 300 fetches added ~90s of pure duplication. Left as a parameter rather than deleted
+    # so a caller that wants extra slack on a specific brand can still ask for it.
+    pdp_delay_s: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Fetch a curated brand's storefront and return Path-C validated records.
 

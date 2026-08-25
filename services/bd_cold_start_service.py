@@ -78,8 +78,12 @@ async def _fetch_shopify_native(pdp_url: str) -> Optional[Dict[str, Any]]:
             timeout=_SHOPIFY_REFETCH_TIMEOUT_S,
             follow_redirects=True,
         ) as client:
-            # Shared politeness gate; batch lane, so wait rather than drop the row.
-            await crawl_politeness.before_request(url, user_agent=_BD_UA, max_wait=0)
+            # Shared politeness gate. `max_wait` is LEFT AT THE DEFAULT (bounded), not 0:
+            # this is reachable from POST /api/merchant-center/audit/url-readiness, an
+            # authenticated LIVE request. `max_wait=0` here would let a 300s backoff — or a
+            # `Crawl-delay: 30` — hold that request open, which is #1854's bounded-wait lesson
+            # re-introduced inverted. Refusing degrades one product; stalling degrades the page.
+            await crawl_politeness.before_request(url, user_agent=_BD_UA)
             r = await client.get(
                 url,
                 headers={"Accept": "application/json", "User-Agent": _BD_UA},
@@ -87,6 +91,13 @@ async def _fetch_shopify_native(pdp_url: str) -> Optional[Dict[str, Any]]:
             crawl_politeness.note_response(
                 url, r.status_code, retry_after=r.headers.get("retry-after")
             )
+    except (crawl_politeness.RobotsDisallowed, crawl_politeness.CrawlPaced) as exc:
+        # MUST be caught here. The caller fans these out with `asyncio.gather` and NO
+        # `return_exceptions=True` (routes/merchant_audit_routes.py), so one disallowed or
+        # deferred URL out of N would take the entire audit request down with a 500 — where the
+        # designed answer is a 422 naming the URL the merchant should fix.
+        logger.info("politeness gate declined %s: %s", url, exc)
+        return None
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         logger.debug("shopify native refetch error for %s: %s", url, exc)
         return None
@@ -431,13 +442,26 @@ async def _fetch_pdp_metadata(pdp_url: str) -> Optional[Dict[str, Any]]:
         async with httpx.AsyncClient(
             timeout=_PDP_FETCH_TIMEOUT_S, follow_redirects=True,
         ) as client:
+            # Gated too. This is the FALLBACK branch for every non-Shopify url — the highest
+            # volume generic crawl in this module — and it sat ungated behind a coverage test
+            # that counts GATES, not FETCHES, so the file looked covered by its one other gate.
+            # Bounded wait: same live request path as _fetch_shopify_native.
+            await crawl_politeness.before_request(pdp_url, user_agent=_BD_UA)
             r = await client.get(
                 pdp_url,
                 headers={
-                    "User-Agent": "Pivota-BD-Audit/1.0",
+                    "User-Agent": _BD_UA,
                     "Accept": "text/html,application/xhtml+xml",
                 },
             )
+            crawl_politeness.note_response(
+                pdp_url, r.status_code, retry_after=r.headers.get("retry-after")
+            )
+    except (crawl_politeness.RobotsDisallowed, crawl_politeness.CrawlPaced) as exc:
+        # Same reason as _fetch_shopify_native: this is fanned out with asyncio.gather and no
+        # return_exceptions, so an escaping RuntimeError 500s the whole audit.
+        logger.info("politeness gate declined %s: %s", pdp_url, exc)
+        return None
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         logger.debug("pdp metadata fetch error for %s: %s", pdp_url, exc)
         return None
@@ -830,7 +854,9 @@ async def discover_products_for_audit(
     # Robots.txt check before anything (mirrors the safety pattern
     # established in Phase B). Permissive on errors — only positive
     # Disallow blocks.
-    if not await _robots_allows(base):
+    # The FULL url, not `base`: a bare origin normalizes to "/" and re-asks about the site
+    # root, which is exactly the defect the delegation was meant to remove.
+    if not await _robots_allows(url):
         raise BrandDiscoveryError(
             f"Site's robots.txt disallows our crawler "
             f"({base}/robots.txt). Cannot auto-discover products. "

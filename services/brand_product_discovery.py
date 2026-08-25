@@ -91,7 +91,9 @@ async def discover_products_from_homepage(
         )
     base = f"{parsed.scheme}://{parsed.netloc}"
 
-    if not await _robots_allows(base):
+    # The FULL url, not `base` — see the note in the helper. A bare origin normalizes to
+    # "/", so passing it re-asks about the site root and the delegation buys nothing.
+    if not await _robots_allows(url):
         raise BrandProductDiscoveryError(
             f"Site's robots.txt disallows our crawler "
             f"({base}/robots.txt). Cannot auto-discover products. "
@@ -479,7 +481,8 @@ async def _fetch_text(url: str, max_bytes: int) -> Tuple[str, str]:
             # reserved NAT address as every other outbound lane, so a ban earned here takes the
             # whole crawl subnet down. `max_wait=0` because this is batch work: refusing rather
             # than waiting would turn a brief 429 into silently-dropped rows.
-            await crawl_politeness.before_request(url, user_agent=_USER_AGENT, max_wait=0)
+            # Bounded (default): reachable from POST /api/agent-center/bd/cold-start-audit.
+            await crawl_politeness.before_request(url, user_agent=_USER_AGENT)
             resp = await client.get(url)
             crawl_politeness.note_response(
                 url, resp.status_code, retry_after=resp.headers.get("retry-after")

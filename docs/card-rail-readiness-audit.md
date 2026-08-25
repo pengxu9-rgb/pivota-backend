@@ -306,7 +306,17 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 >   defect was the missing cache.
 >
 > Coverage is pinned by an EXACT per-lane gate count, because a presence check passes when a lane
-> with two fetch sites loses one of them.
+> with two fetch sites loses one of them — and even that only counts GATES, not FETCHES, which is
+> how an ungated fallback PDP fetch survived in an otherwise-covered file. Per-lane semantics
+> (which UA robots is asked about, bounded vs unbounded wait, whether `note_response` fires) are
+> asserted separately by driving each lane's real fetch function.
+>
+> **Bounded vs unbounded wait is per-lane, and it matters.** Three of these lanes are reachable
+> from live authenticated routes (`POST /api/merchant-center/audit/url-readiness`,
+> `.../audit/ai-commerce-readiness`, `POST /api/agent-center/bd/cold-start-audit`), so they use
+> the bounded default — `max_wait=0` there would let a 300s backoff hold a real request open.
+> Only the two genuinely batch-only lanes (`curated_brand_feed`, `sitemap_freshness`) wait
+> unbounded.
 
 > | 8 — rate-limit + robots the fetcher | **shipped.** `services/crawl_politeness.py`: per-host pacing (`CRAWL_MIN_INTERVAL_SECONDS`, default 1/s), robots.txt obeyed on the FULL path with `Crawl-delay` honoured whenever it is slower than our floor, and exponential 429/503 backoff honouring `Retry-After` only ever to lengthen. `_fetch_html` is gated on it. Two things worth carrying: the wait is BOUNDED (`CrawlPaced`) because `POST /api/offers/external/resolve` has no auth dependency and is a live path — an unbounded stall there would be a new regression, not politeness; and the pre-existing `_robots_allows` (`services/brand_product_discovery.py:493`) asks about the site ROOT, so a `Disallow: /products/` never bit the paths it guards. That helper is UNCHANGED here and still has that defect. | this PR |
 > | 6 — live-verify top-3 | **not started.** Note the v2 index design partly supersedes the framing: public crawl carries authority 45 and "never auto-publishes checkout-sensitive facts", and checkout is specified to always live-validate. | `docs/commerce-index-v2.md` |
