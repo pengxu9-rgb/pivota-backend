@@ -10,12 +10,19 @@ from typing import NamedTuple, Optional, Dict, Any
 # docs.pivota.cc has no DNS (audited 2026-08-08): every per-code
 # `https://docs.pivota.cc/errors/{CODE}` link this module emitted was dead, and
 # it ships in EVERY error body — the first thing an integrating agent developer
-# follows is a URL that does not resolve. Default to the API's own live Swagger
-# page and do NOT fabricate a per-code path onto it (a link that 404s at a live
-# host is the same defect at a different layer). When a real error-docs site
-# stands up, set ERROR_DOCS_BASE_URL (e.g. "https://docs.pivota.cc/errors") and
-# per-code links come back without a code change.
-_DEFAULT_ERROR_DOCS_URL = "https://api.pivota.cc/docs"
+# follows is a URL that does not resolve. Do NOT fabricate a per-code path onto
+# whatever this points at (a link that 404s at a live host is the same defect at
+# a different layer). When a real error-docs site stands up, set
+# ERROR_DOCS_BASE_URL (e.g. "https://docs.pivota.cc/errors") and per-code links
+# come back without a code change.
+#
+# This was https://api.pivota.cc/docs, the API's own Swagger page, until that
+# page was closed in production - the full internal route list is not something
+# to serve anonymously. Pointing every error body at a now-404 URL would have
+# re-created the exact defect the paragraph above exists to prevent. The curated
+# agent docs are public, stay public, and are a better destination anyway: an
+# integrating developer following this link wants a quickstart, not 1,019 paths.
+_DEFAULT_ERROR_DOCS_URL = "https://api.pivota.cc/agent/docs/overview"
 
 
 def error_documentation_url(code: str) -> str:
