@@ -193,6 +193,7 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
     ttl = _f("CRAWL_ROBOTS_TTL_SECONDS", _ROBOTS_TTL_DEFAULT)
     parser: Optional[RobotFileParser] = None
     delay: Optional[float] = None
+    cancelled = False
     try:
         timeout = _f("CRAWL_ROBOTS_TIMEOUT_SECONDS", _ROBOTS_TIMEOUT_DEFAULT)
         # `follow_redirects` is LOAD-BEARING, not incidental: 7 of 17 domains in the live cohort
@@ -221,12 +222,22 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
         # Any non-200 (404 = no robots, 5xx = could not ask) caches as "nothing to obey".
     except Exception as exc:  # noqa: BLE001
         logger.info("robots.txt unavailable for %s (%s); proceeding without restrictions", host, exc)
+    except asyncio.CancelledError:
+        # A CANCELLED FETCH LEARNED NOTHING, and must not be cached as "no restrictions".
+        # `_load_robots` is reachable from a request path whose deadline is shorter than this
+        # fetch (the live-verification hop), so cancellation here is ROUTINE — and writing the
+        # negative entry would silently disable robots for this host for a full TTL, for this
+        # lane and for the other lanes that share `_ROBOTS`.
+        cancelled = True
+        raise
     finally:
         # In a `finally` so a follower can NEVER be stranded. Awaiting a future that is never
         # resolved HANGS rather than raising, so an unexpected error anywhere above would wedge
-        # every sibling waiter on that host instead of failing loudly.
-        _bounded(_ROBOTS)
-        _ROBOTS[host] = (now + ttl, parser, delay)
+        # every sibling waiter on that host instead of failing loudly. The cache write is the
+        # only part skipped on cancellation — the release is not.
+        if not cancelled:
+            _bounded(_ROBOTS)
+            _ROBOTS[host] = (now + ttl, parser, delay)
         if not leader.done():
             leader.set_result(None)
         _ROBOTS_INFLIGHT.pop(host, None)
