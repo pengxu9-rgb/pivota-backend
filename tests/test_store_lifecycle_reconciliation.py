@@ -1187,3 +1187,126 @@ async def test_no_credentials_is_not_upstream_evidence(monkeypatch: pytest.Monke
     row = await _store_row(store_id)
     assert row["status"] == "active"
     assert row["upstream_probe_failures"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 5. The hard-delete hole: detaching your LAST store
+# ---------------------------------------------------------------------------
+#
+# DELETE /merchant/integrations/store/{store_id} hard-deletes the row, at ANY
+# status. That erases the only evidence that this merchant ever had a
+# storefront, so the corpus-safety guard above ("no store rows => don't touch
+# it") fired and the merchant kept catalog_merchants.status='active' — still
+# serving on public recall with nothing behind it. #1648 through the one door
+# its fix did not cover.
+#
+# The caller supplies the missing evidence explicitly. These tests prove the
+# evidence is REQUIRED (default still refuses), SUFFICIENT (the flip lands in
+# the DB), and still SUBORDINATE to the 'observed' guard.
+
+
+def test_no_rows_still_means_do_not_touch_by_default():
+    """The corpus-safety default must survive the new parameter.
+
+    If this ever returns 'inactive', the ~471 prod merchants with no store row
+    are one sweep away from being dropped out of public search.
+    """
+    assert svc.derive_merchant_status([]) is None
+    assert svc.derive_merchant_status([], no_rows_means_inactive=False) is None
+
+
+def test_no_rows_means_inactive_when_the_caller_deleted_the_last_store():
+    assert svc.derive_merchant_status([], no_rows_means_inactive=True) == "inactive"
+
+
+def test_last_store_evidence_does_not_override_a_surviving_active_store():
+    """The flag answers the EMPTY case only. A merchant who deleted one of two
+    stores still has an active storefront and must stay active."""
+    assert (
+        svc.derive_merchant_status(["active"], no_rows_means_inactive=True) == "active"
+    )
+    assert (
+        svc.derive_merchant_status(["inactive"], no_rows_means_inactive=True) == "inactive"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deleting_the_last_active_store_flips_the_merchant_inactive():
+    """The defect, executed end to end: DB re-read, not a call count."""
+    merchant = f"{_MERCHANT_PREFIX}_lastdel"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(f"{_MERCHANT_PREFIX}_store_a", merchant, "active")
+
+    # What the route does: hard-delete the row, then write through.
+    await database.execute(
+        "DELETE FROM merchant_stores WHERE store_id = :s",
+        {"s": f"{_MERCHANT_PREFIX}_store_a"},
+    )
+    out = await svc.sync_catalog_merchant_status(
+        merchant, reason="store_disconnected", last_store_removed=True
+    )
+
+    assert out["changed"] is True
+    assert out["from"] == "active"
+    assert out["to"] == "inactive"
+    assert await _merchant_status(merchant) == "inactive"
+
+
+@pytest.mark.asyncio
+async def test_deleting_the_last_store_without_the_evidence_still_skips():
+    """The mutant guard for the parameter itself.
+
+    This is the pre-fix behaviour, pinned: without `last_store_removed` the
+    write-through cannot tell this merchant from a crawl-observed brand, so it
+    correctly refuses. If this test ever fails, the default has been relaxed
+    corpus-wide and the safety property is gone.
+    """
+    merchant = f"{_MERCHANT_PREFIX}_lastdel_noev"
+    await _seed_merchant(merchant, "active")
+
+    out = await svc.sync_catalog_merchant_status(merchant, reason="store_disconnected")
+
+    assert out["changed"] is False
+    assert out["skipped"] == "no_store_rows"
+    assert await _merchant_status(merchant) == "active"
+
+
+@pytest.mark.asyncio
+async def test_deleting_one_of_two_stores_keeps_the_merchant_active():
+    """The flag must not flip a merchant who still has a live storefront."""
+    merchant = f"{_MERCHANT_PREFIX}_lastdel_multi"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(f"{_MERCHANT_PREFIX}_store_b", merchant, "active")
+    await _seed_store(f"{_MERCHANT_PREFIX}_store_c", merchant, "active")
+
+    await database.execute(
+        "DELETE FROM merchant_stores WHERE store_id = :s",
+        {"s": f"{_MERCHANT_PREFIX}_store_b"},
+    )
+    out = await svc.sync_catalog_merchant_status(
+        merchant, reason="store_disconnected", last_store_removed=True
+    )
+
+    assert out["skipped"] == "already_correct"
+    assert await _merchant_status(merchant) == "active"
+
+
+@pytest.mark.asyncio
+async def test_deleting_the_last_store_leaves_an_observed_brand_alone():
+    """'observed' is crawl-sourced content store lifecycle has no authority
+    over. The new evidence parameter must not buy authority it never had."""
+    merchant = f"{_MERCHANT_PREFIX}_lastdel_observed"
+    await _seed_merchant(merchant, "observed")
+    await _seed_store(f"{_MERCHANT_PREFIX}_store_d", merchant, "active")
+
+    await database.execute(
+        "DELETE FROM merchant_stores WHERE store_id = :s",
+        {"s": f"{_MERCHANT_PREFIX}_store_d"},
+    )
+    out = await svc.sync_catalog_merchant_status(
+        merchant, reason="store_disconnected", last_store_removed=True
+    )
+
+    assert out["changed"] is False
+    assert out["skipped"] == "unmanaged_status:observed"
+    assert await _merchant_status(merchant) == "observed"
