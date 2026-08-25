@@ -539,3 +539,28 @@ def test_verification_runs_AFTER_truncation_so_the_budget_is_not_spent_on_hidden
         f"the verifier was handed {handed[0]} offers for a limit of 2 — it is running before "
         "truncation and spending the turn's budget on offers nobody will see"
     )
+
+
+def test_a_cached_verdict_recomputes_price_changed_for_THIS_offer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache key is (url, variant) — a property of the PRODUCT. "Did the price move" is a
+    property of the QUOTE, and two offers can name the same product at different quoted prices (a
+    stale seed beside a fresh one, or two markets). Reading the flag from the cache would attach
+    one offer's staleness to another's — the exact fabrication class this module removes.
+    """
+    seen = _serve(monkeypatch, {"https://brand.example/products/serum.js": _body(price_minor=1499)})
+
+    # First offer quotes the live price: nothing moved.
+    first = asyncio.run(lov.verify_offers([_offer(price=14.99)]))
+    assert first[0].price_changed is False
+
+    # Second offer, SAME product, quotes a stale price. Served from cache, but the flag must be
+    # recomputed against this offer's own quote.
+    second = asyncio.run(lov.verify_offers([_offer(price=19.99, offer_id="stale")]))
+    assert len(seen) == 1, "the cache should have served the second check"
+    assert second[0].reason.endswith("_cached")
+    assert second[0].price_changed is True, (
+        "a cached verdict carried the FIRST offer's price_changed onto the second"
+    )
+    assert second[0].live_price == Decimal("14.99")

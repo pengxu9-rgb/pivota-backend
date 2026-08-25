@@ -171,6 +171,18 @@ def _quoted_price(offer: Dict[str, Any]) -> Optional[Decimal]:
         return None
 
 
+def _price_moved(live: Optional[Decimal], offer: Dict[str, Any]) -> bool:
+    """Did the merchant's price move away from what THIS offer quoted?
+
+    Per-offer by construction: two offers can name the same product at different quoted prices,
+    so this can never be cached alongside the product facts.
+    """
+    quoted = _quoted_price(offer)
+    if live is None or quoted is None:
+        return False
+    return abs(live - quoted) > _PRICE_EPSILON
+
+
 def _target(offer: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """(product .js url, numeric variant id) for an offer, or (None, None) if unverifiable.
 
@@ -203,14 +215,23 @@ async def _check_one(offer: Dict[str, Any]) -> Verdict:
     key = _cache_key(js_url, variant_id)
     cached = await _cache_get(key)
     if cached:
+        # `price_changed` is recomputed against THIS offer's quote, never read from the cache.
+        # The cache key is (url, variant) — a property of the PRODUCT — but "did the price move"
+        # is a property of the QUOTE, and two offers for the same product can quote differently
+        # (a stale seed beside a fresh one, or two markets). Reusing the cached flag would attach
+        # one offer's staleness to another's, which is the fabrication class this module exists
+        # to remove.
+        live = (
+            Decimal(str(cached["live_price"])) if cached.get("live_price") is not None else None
+        )
         return Verdict(
             status=cached["status"],
             reason=cached["reason"] + "_cached",
             source=cached.get("source", "shopify_product_js"),
-            live_price=(Decimal(str(cached["live_price"])) if cached.get("live_price") is not None else None),
+            live_price=live,
             live_currency=cached.get("live_currency"),
             in_stock=cached.get("in_stock"),
-            price_changed=bool(cached.get("price_changed")),
+            price_changed=_price_moved(live, offer),
         )
 
     try:
@@ -272,13 +293,16 @@ async def _check_one(offer: Dict[str, Any]) -> Verdict:
 
     live_price = chosen.get("price_amount")
     live = Decimal(str(live_price)) if live_price is not None else None
-    quoted = _quoted_price(offer)
-    changed = bool(live is not None and quoted is not None and abs(live - quoted) > _PRICE_EPSILON)
 
     verdict = Verdict(
-        VERIFIED, "ok", live_price=live, live_currency=None, in_stock=True, price_changed=changed,
+        VERIFIED, "ok", live_price=live, live_currency=None, in_stock=True,
+        price_changed=_price_moved(live, offer),
     )
-    await _cache_put(key, verdict.as_dict() | {"reason": "ok"})
+    # Cache the PRODUCT facts only. `price_changed` is deliberately excluded — see the note on the
+    # cache read above.
+    cacheable = verdict.as_dict() | {"reason": "ok"}
+    cacheable.pop("price_changed", None)
+    await _cache_put(key, cacheable)
     return verdict
 
 
