@@ -5,6 +5,7 @@ FastAPI application with comprehensive dashboard and real-time metrics
 """
 
 import asyncio
+import hmac
 import logging
 import time
 from contextlib import asynccontextmanager, suppress
@@ -12,15 +13,20 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import uvicorn
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi import (
+    FastAPI, BackgroundTasks, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect,
+    Request, Response, status,
+)
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
 from middleware.structured_logging import StructuredLoggingMiddleware
 from middleware.error_handler import ErrorHandlerMiddleware
 from middleware.ap2_security import AP2SecurityMiddleware
+from middleware.security_headers import SecurityHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -415,9 +421,13 @@ app = FastAPI(
     title="Pivota Infra Dashboard", 
     version="0.2.1-build-1762178331",  # Updated to verify Railway deployment
     description="Pivota Infrastructure API with comprehensive payment processing and agent SDK support",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    # The built-ins are OFF so the same three paths can be re-mounted below behind a guard. They
+    # are not removed: /openapi.json is the full internal path list - 1,019 of them as measured on
+    # 2026-08-22 - and serving that anonymously hands an attacker the map. The curated,
+    # partner-facing spec is a different surface and stays public at /agent/docs/openapi.json.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -649,6 +659,50 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 
+async def require_docs_viewer(
+    x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
+) -> None:
+    """Gate /docs, /redoc and /openapi.json in production; leave them open elsewhere.
+
+    The spec is the full internal route list. Anonymously readable, it is a map of every path an
+    attacker might probe, which is worth more to them than any single one of those paths.
+
+    Outside production this is a no-op: /docs is how people work, and a staging service that
+    behaves differently from the one you develop against is its own hazard. `is_production()`
+    fails CLOSED toward production when it cannot tell (config/platform.py), so an environment
+    that forgets PIVOTA_ENV gets the guard rather than the hole.
+
+    Compared with `hmac.compare_digest`. The sibling admin guards in routes/ use `!=`, which leaks
+    a timing signal proportional to the shared prefix; there is no reason for a new one to inherit
+    that. It also fails closed when no key is configured at all - an empty expected value must
+    never match an empty header.
+    """
+    if not is_production():
+        return
+    expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
+    supplied = (x_admin_key or "").strip()
+    if expected and supplied and hmac.compare_digest(supplied, expected):
+        return
+    # 404, not 401. A 401 confirms the endpoint exists and is merely guarded, which re-leaks the
+    # fact worth hiding; anonymous callers should see what they would see if it were not mounted.
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+@app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(require_docs_viewer)])
+async def _guarded_openapi_spec() -> JSONResponse:
+    return JSONResponse(app.openapi())
+
+
+@app.get("/docs", include_in_schema=False, dependencies=[Depends(require_docs_viewer)])
+async def _guarded_swagger_ui() -> HTMLResponse:
+    return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} - Swagger UI")
+
+
+@app.get("/redoc", include_in_schema=False, dependencies=[Depends(require_docs_viewer)])
+async def _guarded_redoc() -> HTMLResponse:
+    return get_redoc_html(openapi_url="/openapi.json", title=f"{app.title} - ReDoc")
+
+
 async def startup_event():
     """
     Initialize database connections and ensure core tables exist.
@@ -779,6 +833,18 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
+
+# Security response headers on EVERY response, including the ones other middleware generate.
+#
+# Registered AFTER ErrorHandlerMiddleware, which in Starlette means it wraps it: add_middleware
+# prepends, so the last registered runs outermost. That ordering is the point - an error response
+# formatted by the handler below still leaves through here and still carries nosniff/HSTS. A
+# security header that is present on 200s and missing on 500s protects the requests that matter
+# least.
+#
+# CORSMiddleware is registered after this one and so stays outermost of all, which the comment
+# there explains: error responses must keep their CORS headers.
+app.add_middleware(SecurityHeadersMiddleware)
 
 # AP2 protocol security middleware. Enforces agent-consent / signature / nonce
 # headers on non-public /ap2/* routes. Inert unless ENABLE_AP2_ROUTES=true — the

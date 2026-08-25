@@ -81,6 +81,7 @@ def _fetch(
     *,
     method: str = "GET",
     token: Optional[str] = None,
+    admin_key: Optional[str] = None,
     json_body: Optional[Dict[str, Any]] = None,
     timeout: int = 45,
 ) -> Tuple[int, Dict[str, str], bytes]:
@@ -91,6 +92,8 @@ def _fetch(
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if admin_key:
+        headers["X-ADMIN-KEY"] = admin_key
     if json_body is not None:
         body = json.dumps(json_body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -319,8 +322,20 @@ def _check_portal_bundles(
 
 
 def _check_openapi(api_base: str, failures: List[str]) -> None:
-    status, _headers, data = _fetch(f"{api_base.rstrip('/')}/openapi.json", timeout=45)
+    # /openapi.json is admin-gated in production (it is the full internal route list). Anonymous
+    # callers get 404, not 401, so a missing key looks exactly like a missing endpoint - say so
+    # rather than reporting "openapi returned status=404" and sending someone after a routing bug.
+    admin_key = (os.environ.get("ADMIN_API_KEY") or os.environ.get("PROMOTIONS_ADMIN_KEY") or "").strip()
+    status, _headers, data = _fetch(
+        f"{api_base.rstrip('/')}/openapi.json", admin_key=admin_key or None, timeout=45
+    )
     text = _decode(data)
+    if status == 404 and not admin_key:
+        failures.append(
+            "openapi returned 404 and no ADMIN_API_KEY was set - the spec is admin-gated in "
+            "production; export ADMIN_API_KEY to run this check"
+        )
+        return
     if status != 200:
         failures.append(f"openapi returned status={status}")
     _fail_if_legacy_url(text, "openapi", failures)
