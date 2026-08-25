@@ -7,8 +7,11 @@ set -euo pipefail
 # The reviews backend exchanges an invitation token by calling the proof issuer internally.
 #
 # Required env:
-# - PROOF_ISSUER_BASE_URL (e.g. https://proof-issuer...railway.app)
-# - REVIEWS_BASE_URL      (e.g. https://pivota-backend...railway.app)
+# - PROOF_ISSUER_BASE_URL (prod: https://proof-issuer-gpx4jyrubq-uw.a.run.app)
+# - REVIEWS_BASE_URL      (prod: https://api.pivota.cc)
+#   Production is Cloud Run in pivota-prod/us-west1; the old *.up.railway.app
+#   hosts are the ROLLBACK and still answer, so a smoke pointed there passes
+#   against a platform nobody is served from.
 # - MERCHANT_ID
 # - PLATFORM_PRODUCT_ID
 #
@@ -176,7 +179,7 @@ EMPLOYEE_ID="emp_001"
 EMAIL="employee+smoke@pivota.invalid"
 JWT_SECRET_KEY="${EMPLOYEE_JWT_SECRET_KEY:-${JWT_SECRET_KEY:-}}"
 if [[ -z "$JWT_SECRET_KEY" ]]; then
-  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " JWT_SECRET_KEY
+  read -r -s -p "JWT_SECRET_KEY (gcloud secrets versions access latest --secret=env-JWT_SECRET_KEY --project pivota-prod): " JWT_SECRET_KEY
   echo
 fi
 [[ -n "$JWT_SECRET_KEY" ]] || { echo "ERROR: empty JWT_SECRET_KEY" >&2; exit 1; }

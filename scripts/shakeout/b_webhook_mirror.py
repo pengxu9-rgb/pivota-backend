@@ -15,9 +15,18 @@ What this exercises:
   8. replay of an already-processed event → 200 + status=duplicate
 
 Usage:
-    STAGING_WEBHOOK_SECRET=$(railway variables --json -e staging -s web-staging \\
-      | jq -r '.STRIPE_BILLING_WEBHOOK_SECRET') \\
+    STAGING_WEBHOOK_SECRET=$(gcloud secrets versions access latest \\
+      --secret=env-STRIPE_BILLING_WEBHOOK_SECRET --project pivota-staging) \\
     .venv/bin/python scripts/shakeout/b_webhook_mirror.py
+
+STAGING PLATFORM, read this before changing DEFAULT_BASE_URL. The secret above
+now comes from GCP (pivota-staging), where staging was rebuilt. The base URL
+below is still the Railway staging host ON PURPOSE: the GCP staging `web`
+service runs with `ingress: internal` (verified 2026-08-25), so it is not
+reachable from a laptop at all and this script cannot drive it from outside.
+Swapping in the Cloud Run URL would produce a command that always fails.
+Production, separately, is Cloud Run in pivota-prod — never point this script
+there; it posts synthetic Stripe events.
 
 The script constructs Stripe-signature-compatible headers itself (HMAC-SHA256
 of `{timestamp}.{payload}` per Stripe docs) so no Stripe CLI dependency.
@@ -131,8 +140,8 @@ def main() -> int:
     if not secret:
         sys.stderr.write(
             "ERROR: STAGING_WEBHOOK_SECRET not set. Source:\n"
-            "    export STAGING_WEBHOOK_SECRET=$(railway variables --json "
-            "-e staging -s web-staging | jq -r '.STRIPE_BILLING_WEBHOOK_SECRET')\n"
+            "    export STAGING_WEBHOOK_SECRET=$(gcloud secrets versions access latest "
+            "--secret=env-STRIPE_BILLING_WEBHOOK_SECRET --project pivota-staging)\n"
         )
         return 2
 

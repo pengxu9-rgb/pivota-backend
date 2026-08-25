@@ -42,7 +42,7 @@ if [[ -z "$CHECKOUT_TOKEN" && -z "$API_KEY" ]]; then
   echo
 fi
 if [[ -z "$JWT_SECRET_KEY" ]]; then
-  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " JWT_SECRET_KEY
+  read -r -s -p "JWT_SECRET_KEY (gcloud secrets versions access latest --secret=env-JWT_SECRET_KEY --project pivota-prod): " JWT_SECRET_KEY
   echo
 fi
 if [[ -z "$CHECKOUT_TOKEN" && -z "$API_KEY" ]]; then

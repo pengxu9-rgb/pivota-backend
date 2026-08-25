@@ -115,11 +115,29 @@ printf '%s\n' "$OUT"
 gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
 
+`scripts/ops/run_oneoff_job.sh` wraps exactly this, with the three footguns below
+already handled, and is what the operator scripts' own `--help` now points at:
+
+```bash
+scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py --json
+```
+
+It exits with the job's own exit status, deletes the job on every path including
+Ctrl-C, and picks an `--args` delimiter that does not occur in the payload.
+Reach for the raw form above when you need to change something it does not expose
+(`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT` and `JOB_PREFIX` are
+environment overrides).
+
 Three things that are easy to get wrong:
 
 - **Secrets are not inherited.** A job mounts only what you pass. A script that reads
   `DATABASE_URL` gets nothing unless you `--set-secrets` it, and will usually fail in a way that
-  looks like a database outage rather than a missing mount.
+  looks like a database outage rather than a missing mount. Most secret names carry an `env-`
+  prefix; the bare env-var secrets in `pivota-prod` are `DATABASE_URL`, `DATABASE_URL_NOVERIFY`, `REDIS_URL`,
+  `PCI_KB_DATABASE_URL`, `PCI_KB_DATABASE_URL_NOVERIFY`, `STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY`,
+  `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` — eight, not the three named in #1866,
+  and `GOOGLE_OAUTH_CLIENT_SECRET` exists under BOTH spellings while `web` mounts the `env-` one.
+  Read the `secretKeyRef` off the running service rather than trusting any list, this one included.
 - **`--args` splits on commas.** A Python one-liner containing a comma is shredded into separate
   argv entries. Use the alternate delimiter form: `--args="^|^-c|import x,y"`. The delimiter you
   pick **must not appear anywhere in the values** — `|` is a poor choice for Python that uses dict

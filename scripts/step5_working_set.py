@@ -40,12 +40,23 @@ re-run after each lane's apply cut to show convergence (alongside the D-1
 gauge scripts/measure_identity_duplication.py, whose group definitions it
 mirrors: content_key IS NOT NULL AND suppression_reason IS NULL).
 
-Run against prod via railway (public proxy; the pooled database.connect()
-flakes on it, so this uses a single asyncpg connection with retries — see
-docs/adr/ADR-011-rollout-handoff.md §6):
+Run against prod. Production is Cloud Run (pivota-prod/us-west1) since the
+2026-08-22 cutover; Railway is the ROLLBACK, and its database is a different one,
+so a convergence report taken there describes rows nobody is served from.
 
-  railway run bash -c 'DATABASE_URL="$DATABASE_PUBLIC_URL" PYTHONPATH="$PWD" \
-      python3.11 scripts/step5_working_set.py --output-json reports/step5/working_set.json'
+There is no `railway run` equivalent. Use a throwaway job on the production image
+(the helper mounts the DATABASE_URL secret — a job inherits NO env and NO
+secrets — and takes its verdict from the job's EXIT CODE):
+
+  scripts/ops/run_oneoff_job.sh scripts/step5_working_set.py --output-json reports/step5/working_set.json
+
+Note the job writes --output-json INSIDE the container, which is discarded on
+exit; the helper streams the run's stdout back, so redirect that locally instead
+when you want the file. Full pattern: docs/runbooks/operating_on_gcp_production.md.
+
+(This still uses a single asyncpg connection with retries rather than the pooled
+database.connect(), which flaked against the old public proxy — see
+docs/adr/ADR-011-rollout-handoff.md §6.)
 """
 
 from __future__ import annotations
@@ -351,7 +362,7 @@ async def _fetch() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument(
         "--output-json",
         help="Write the full report (group lists, orphan mirrors) to this path",

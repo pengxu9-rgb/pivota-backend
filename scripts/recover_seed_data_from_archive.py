@@ -1,4 +1,4 @@
-"""Recover regressed PDP content from a Railway PG backup snapshot.
+"""Recover regressed PDP content from a Postgres backup snapshot.
 
 Background — see conversation 2026-05-09 + PR #426. Codex skills + the
 Path B mirror were silently overwriting vetted PDP descriptions /
@@ -11,10 +11,18 @@ or dirtier than they were 3+ days ago.
 This script does the recovery:
 
   1. Connects to the LIVE prod DB (via the runtime DATABASE_URL the
-     backend already uses — works under `railway ssh`).
-  2. Connects to an ARCHIVE DB (e.g. Postgres-archive-20260506 spun up
-     by the operator from a Railway dashboard restore). The archive's
-     URL is passed via --archive-url.
+     backend already uses). Production is Cloud Run (pivota-prod/us-west1);
+     there is no `railway ssh` equivalent, and Railway is the ROLLBACK, so
+     recovering into it repairs a catalog nobody is served from. Run it as a
+     throwaway job on the production image:
+       scripts/ops/run_oneoff_job.sh scripts/recover_seed_data_from_archive.py \\
+           --archive-url "$ARCHIVE_URL"
+     A job inherits NO env and NO secrets: the helper mounts DATABASE_URL, and
+     --archive-url must be passed explicitly. Full pattern:
+     docs/runbooks/operating_on_gcp_production.md.
+  2. Connects to an ARCHIVE DB, restored by the operator from a backup of the
+     production instance (Cloud SQL: restore the relevant backup into a
+     temporary instance). The archive's URL is passed via --archive-url.
   3. Iterates external_product_seeds in the archive. For each row, looks
      up the matching row in live and compares per-field quality scores
      (services.seed_data_writer._score_field).
@@ -238,11 +246,11 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     p.add_argument(
         "--archive-url",
         required=True,
-        help="DATABASE_URL of the restored backup (separate Railway PG service)",
+        help="DATABASE_URL of the restored backup (a separate, temporary Postgres instance)",
     )
     p.add_argument(
         "--apply", action="store_true",

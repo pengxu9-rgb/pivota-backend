@@ -18,8 +18,19 @@ Run AFTER:
   - mig 094 applied (verified via schema_guard auto-apply)
 
 Usage:
-    # 1) Set SHOPIFY_METAFIELD_INGEST_ENABLED=true in the deployed env
-    #    (use Railway dashboard or `railway variables --set`).
+    # 1) Set SHOPIFY_METAFIELD_INGEST_ENABLED=true in the deployed env.
+    #    Production is Cloud Run (pivota-prod/us-west1); a `railway variables
+    #    --set` would flip the flag on the ROLLBACK, so the validation below
+    #    would keep failing while the dial reads as turned:
+    #      gcloud run services update web --project pivota-prod --region us-west1 \\
+    #        --update-env-vars SHOPIFY_METAFIELD_INGEST_ENABLED=true
+    #    --update-env-vars MERGES. Never --set-env-vars here: it removes every
+    #    existing plain env var first (192 of web's 248 entries).
+    #    Verify by the SERVING REVISION NAME, not /version — an env-only update
+    #    reuses the image, so the build SHA is identical either way:
+    #      gcloud run services describe web --project pivota-prod --region us-west1 \\
+    #        --format='value(status.latestReadyRevisionName)'
+    #    Remove it again with --remove-env-vars SHOPIFY_METAFIELD_INGEST_ENABLED.
     # 2) Pick a real Shopify merchant + product:
     python scripts/validate_fashion_metafield_pipeline.py \\
         --merchant-id merch_xxxxxxxxxxxxxxxx \\

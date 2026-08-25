@@ -4,15 +4,24 @@ Retroactively creates `commerce_attribution_edges` rows for paid orders
 that predate T9 stamping. Recomputes the affected `gmv_attribution_daily`
 rollup days so T6's downstream math reflects the backfill.
 
-Usage:
+Usage. Production is Cloud Run (pivota-prod/us-west1); run it there via a
+throwaway job on the production image, which mounts the DATABASE_URL secret (a
+job inherits NO env and NO secrets) and takes its verdict from the exit code:
+
     # Dry-run preview (DEFAULT — no writes, no auth required):
-    python3 scripts/stage2_backfill_attribution_edges.py \\
+    scripts/ops/run_oneoff_job.sh scripts/stage2_backfill_attribution_edges.py \\
         --merchant-id merch_efbc46b4619cfbdf
 
     # Live backfill (AUTHORIZATION REQUIRED per STAGE_2 §3.3):
-    python3 scripts/stage2_backfill_attribution_edges.py \\
+    scripts/ops/run_oneoff_job.sh scripts/stage2_backfill_attribution_edges.py \\
         --merchant-id merch_efbc46b4619cfbdf \\
         --commit
+
+    # Locally, against a database you already have a URL for:
+    DATABASE_URL=... python3 scripts/stage2_backfill_attribution_edges.py \\
+        --merchant-id merch_efbc46b4619cfbdf
+
+Full pattern and its footguns: docs/runbooks/operating_on_gcp_production.md.
 
 Idempotency:
 - Each edge_id is derived from uuid5(NAMESPACE_URL, "{merchant_id}:{order_id}")
@@ -79,9 +88,10 @@ def _connect():
     url = os.environ.get("DATABASE_PUBLIC_URL") or os.environ.get("DATABASE_URL")
     if not url:
         sys.stderr.write(
-            "ERROR: DATABASE_PUBLIC_URL not set. Fetch with:\n"
-            "    railway variables --json -e production -s Postgres-xMr6 "
-            "| jq -r '.DATABASE_PUBLIC_URL'\n"
+            "ERROR: neither DATABASE_PUBLIC_URL nor DATABASE_URL is set.\n"
+            "    In production, run this inside Cloud Run - it mounts the secret:\n"
+            "      scripts/ops/run_oneoff_job.sh scripts/stage2_backfill_attribution_edges.py\n"
+            "    Locally, set DATABASE_URL to a database you already have a URL for.\n"
         )
         sys.exit(2)
     return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)

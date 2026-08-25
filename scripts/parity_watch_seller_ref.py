@@ -34,10 +34,14 @@ separate phase-3 catalog re-key, `--phases catalog`): the banned external_seed
 bucket residue on catalog_products / commerce_attribution_edges, and the honest
 seed floor (seeds with no resolvable destination stay seller_ref-NULL by design).
 
-Usage:
-    # in-container (native internal DB — most reliable):
-    railway ssh ... -- python -m scripts.parity_watch_seller_ref
-    # operator, via public proxy:
+Usage (production is Cloud Run, pivota-prod/us-west1; Railway is the ROLLBACK, and
+its database is a DIFFERENT database — a parity check run there measures the wrong
+platform and reports a clean day for traffic it never saw):
+    # inside production (native internal DB — most reliable). There is no
+    # `railway ssh` equivalent; use a throwaway job on the production image, which
+    # propagates this script's clean/dirty exit code as the job's:
+    scripts/ops/run_oneoff_job.sh -m scripts.parity_watch_seller_ref
+    # operator, against a database you already have a URL for:
     DATABASE_PUBLIC_URL=... python -m scripts.parity_watch_seller_ref
     # pin a day log:
     python -m scripts.parity_watch_seller_ref >> /tmp/sellerref-parity-$(date -u +%Y%m%d).log

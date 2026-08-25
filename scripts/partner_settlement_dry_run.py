@@ -17,15 +17,30 @@ write_settlement_snapshot() (those INSERT immutable snapshots even in v2 mode).
 Safety:
 - SELECT-only. No INSERT/UPDATE/DELETE is issued by any code path it calls.
 - Tiny connection pool; short-lived.
-- Prefers DATABASE_PUBLIC_URL (Railway public proxy) like the other operator
-  scripts so it can run from a laptop with `railway run`.
 
-Usage:
-  railway run --service web python scripts/partner_settlement_dry_run.py
+Usage (PRODUCTION IS CLOUD RUN — pivota-prod/us-west1 since the 2026-08-22
+cutover; Railway is the ROLLBACK, so a `railway run` here would compute the
+settlement of a platform nobody is served from):
+
+There is no `railway run` equivalent — Cloud Run has no host to attach to. Run a
+throwaway job on the production image. The helper wraps the verified pattern and
+takes its verdict from the job's EXIT CODE:
+
+  scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py
   # or target a specific billing run / explicit period:
-  python scripts/partner_settlement_dry_run.py --billing-run-id 42
-  python scripts/partner_settlement_dry_run.py --period-start 2025-06-01 --period-end 2025-06-30
-  python scripts/partner_settlement_dry_run.py --json
+  scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py --billing-run-id 42
+  scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py \\
+      --period-start 2025-06-01 --period-end 2025-06-30
+  scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py --json
+
+The raw gcloud form, its three footguns, and the promotion procedure this feeds
+are in docs/runbooks/operating_on_gcp_production.md and
+docs/monetization/partner_settlement_promotion_runbook.md. The one that bites
+here: a job inherits NO env and NO secrets, so without DATABASE_URL mounted this
+fails looking like a database outage rather than a missing mount.
+
+Locally, against a database you have a URL for, it is just:
+  DATABASE_URL=... python scripts/partner_settlement_dry_run.py --json
 """
 
 from __future__ import annotations
@@ -125,7 +140,9 @@ async def _drive(args: argparse.Namespace) -> None:
     if not IS_POSTGRES:
         raise SystemExit(
             "Refusing to run against non-Postgres DATABASE_URL; point at the "
-            "Railway DB (e.g. `railway run --service web ...`)."
+            "production DB (e.g. `scripts/ops/run_oneoff_job.sh "
+            "scripts/partner_settlement_dry_run.py`, which mounts the "
+            "DATABASE_URL secret — a Cloud Run job inherits nothing)."
         )
 
     await database.connect()
@@ -235,7 +252,7 @@ async def _drive(args: argparse.Namespace) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument(
         "--billing-run-id",
         type=int,

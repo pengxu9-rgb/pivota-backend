@@ -99,9 +99,12 @@ Read-only: no DB writes, no feature flags, no merchant credit metering.
 
 Usage:
 
-  cd /Users/pengchydan/dev/PIVOTA-Agent
-  export PROMOTIONS_ADMIN_KEY="$(railway variables --kv \
-      | grep -m1 '^PROMOTIONS_ADMIN_KEY=' | cut -d= -f2-)"
+  # Runs LOCALLY (it calls public LLM endpoints and the public API); it needs
+  # only the admin key, which lives in Secret Manager. Most of this project's
+  # secrets carry an `env-` prefix - check the real name rather than trusting one
+  # written down: `gcloud secrets list --project pivota-prod | grep PROMOTIONS`.
+  export PROMOTIONS_ADMIN_KEY="$(gcloud secrets versions access latest \\
+      --secret=env-PROMOTIONS_ADMIN_KEY --project pivota-prod)"
   python3 /path/to/pivota-backend/scripts/aeo_phase0_citation_baseline.py \
       --output ~/dev/AEO_PHASE0_BASELINE_$(date +%F).md \
       --json-output /tmp/aeo_phase0_$(date +%F).json
@@ -135,7 +138,12 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple  # Tuple: batch grouping key
 
-DEFAULT_AGENT_URL = "https://pivota-agent-production.up.railway.app"
+# Production is Cloud Run behind gateway.pivota.cc. The old Railway host is the
+# ROLLBACK: it still answers, still serves /internal/agent-center/llm-probe, and
+# still runs a DIFFERENT build - so defaulting there produced a citation baseline
+# that looked valid and measured a platform nobody is served from. Route verified
+# 2026-08-25 (401 without a key on gateway.pivota.cc = present and authenticating).
+DEFAULT_AGENT_URL = "https://gateway.pivota.cc"
 PROBE_PATH = "/internal/agent-center/llm-probe"
 
 # `HARD_MAX_RUNS` in src/internal/agentCenterLlmProbe.js. Requests asking for
@@ -880,9 +888,8 @@ def render_markdown(payload: Dict[str, Any], agg: Dict[str, Any], meta: Dict[str
     out.append("## Method (so this is re-runnable)")
     out.append("")
     out.append("```")
-    out.append("cd /Users/pengchydan/dev/PIVOTA-Agent")
-    out.append("export PROMOTIONS_ADMIN_KEY=\"$(railway variables --kv \\")
-    out.append("    | grep -m1 '^PROMOTIONS_ADMIN_KEY=' | cut -d= -f2-)\"")
+    out.append("export PROMOTIONS_ADMIN_KEY=\"$(gcloud secrets versions access latest \\")
+    out.append("    --secret=env-PROMOTIONS_ADMIN_KEY --project pivota-prod)\"")
     out.append("python3 <pivota-backend>/scripts/aeo_phase0_citation_baseline.py \\")
     out.append("    --output ~/dev/AEO_PHASE0_BASELINE_$(date +%F).md \\")
     out.append("    --json-output /tmp/aeo_phase0_$(date +%F).json")

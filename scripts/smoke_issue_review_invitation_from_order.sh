@@ -40,7 +40,7 @@ fi
 
 JWT_SECRET_KEY="${JWT_SECRET_KEY:-}"
 if [[ -z "$JWT_SECRET_KEY" ]]; then
-  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " JWT_SECRET_KEY
+  read -r -s -p "JWT_SECRET_KEY (gcloud secrets versions access latest --secret=env-JWT_SECRET_KEY --project pivota-prod): " JWT_SECRET_KEY
   echo
 fi
 [[ -n "$JWT_SECRET_KEY" ]] || { echo "ERROR: empty JWT_SECRET_KEY" >&2; exit 2; }

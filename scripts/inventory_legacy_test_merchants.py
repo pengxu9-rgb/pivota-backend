@@ -259,7 +259,12 @@ async def _sample_table(table: str, columns: dict[str, str], merchant_id: str, l
 
 async def _drive(args: argparse.Namespace) -> None:
     if not IS_POSTGRES:
-        raise SystemExit("Refusing to inventory non-Postgres DATABASE_URL; use Railway production env.")
+        raise SystemExit(
+            "Refusing to inventory non-Postgres DATABASE_URL. Production is Cloud "
+            "Run (pivota-prod/us-west1); run this inside it, which mounts the "
+            "DATABASE_URL secret:\n"
+            "  scripts/ops/run_oneoff_job.sh scripts/inventory_legacy_test_merchants.py"
+        )
 
     known_ids = set(KNOWN_LEGACY_MERCHANT_IDS)
     known_ids.update(value.strip() for value in args.merchant_id if value.strip())
@@ -341,7 +346,7 @@ async def _drive(args: argparse.Namespace) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--merchant-id", action="append", default=[], help="Additional merchant_id to inspect.")
     parser.add_argument("--term", action="append", default=[], help="Additional lowercase text term to match.")
     parser.add_argument("--include-broad-review-terms", action="store_true", help="Also match test/demo/sandbox.")

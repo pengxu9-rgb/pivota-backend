@@ -16,12 +16,23 @@ It reports:
     no Connect account can't transfer (it fails no_stripe_connect_account), so
     no money moves.
 
-SELECT-only. Prefers DATABASE_PUBLIC_URL like the other operator scripts.
+SELECT-only.
 
-Usage:
-  railway run --service web python scripts/check_pending_settlement_files.py
-  python scripts/check_pending_settlement_files.py --as-of 2026-07-10
-  python scripts/check_pending_settlement_files.py --json
+Usage (PRODUCTION IS CLOUD RUN — pivota-prod/us-west1. Railway is the ROLLBACK,
+and this pre-check exists to prove no REAL Stripe Connect transfer is pending, so
+running it against the rollback would clear a cron that fires against Cloud Run):
+
+There is no `railway run` equivalent. Run a throwaway job on the production
+image; the helper wraps the verified pattern and takes its verdict from the job's
+EXIT CODE, not from a log read:
+
+  scripts/ops/run_oneoff_job.sh scripts/check_pending_settlement_files.py
+  scripts/ops/run_oneoff_job.sh scripts/check_pending_settlement_files.py --as-of 2026-07-10
+  scripts/ops/run_oneoff_job.sh scripts/check_pending_settlement_files.py --json
+
+Full pattern and its footguns: docs/runbooks/operating_on_gcp_production.md.
+Locally, against a database you have a URL for:
+  DATABASE_URL=... python scripts/check_pending_settlement_files.py --json
 """
 
 from __future__ import annotations
@@ -81,7 +92,9 @@ async def _drive(args: argparse.Namespace) -> None:
     if not IS_POSTGRES:
         raise SystemExit(
             "Refusing to run against non-Postgres DATABASE_URL; point at the "
-            "Railway DB (e.g. `railway run --service web ...`)."
+            "production DB (e.g. `scripts/ops/run_oneoff_job.sh "
+            "scripts/check_pending_settlement_files.py`, which mounts the "
+            "DATABASE_URL secret — a Cloud Run job inherits nothing)."
         )
 
     as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.utcnow().date()
@@ -144,7 +157,7 @@ async def _drive(args: argparse.Namespace) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     p.add_argument(
         "--as-of",
         default=None,

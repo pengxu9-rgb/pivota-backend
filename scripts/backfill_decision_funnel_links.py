@@ -25,8 +25,17 @@ that was, so we link ALL still-unlinked funnel_events for the order (they all
 belong to that order's decision). Dashboards filter by funnel stage.
 
 Default is dry-run (counts + a sample). Pass --apply to INSERT.
-Requires prod-DB authorization — run with DATABASE_URL pointed at the
-Postgres-xMr6 public proxy (see memory: reference_railway_db_public_proxy).
+
+Requires prod-DB authorization. Production is Cloud Run (pivota-prod/us-west1) on
+Cloud SQL; the Postgres-xMr6 public proxy this used to name is the ROLLBACK's
+database, so a backfill applied there writes edges nobody is served from. Run it
+inside production instead — the helper mounts the DATABASE_URL secret (a job
+inherits NO env and NO secrets) and takes its verdict from the exit code:
+
+  scripts/ops/run_oneoff_job.sh scripts/backfill_decision_funnel_links.py           # dry run
+  scripts/ops/run_oneoff_job.sh scripts/backfill_decision_funnel_links.py --apply
+
+Full pattern: docs/runbooks/operating_on_gcp_production.md.
 """
 
 from __future__ import annotations
@@ -118,7 +127,7 @@ DEFAULT_ATTRIBUTION_WINDOW = 2592000
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--apply", action="store_true", help="INSERT rows. Default is dry-run.")
     parser.add_argument("--limit", type=int, default=None, help="Cap rows processed (testing).")
     parser.add_argument("--sample", type=int, default=10, help="Sample rows to print in dry-run.")

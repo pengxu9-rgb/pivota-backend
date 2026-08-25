@@ -24,8 +24,17 @@ verdict from the checkpoint table and the live rows, independently:
   pgm_moved        group-membership rows under the checkpointed target
 
 Exit 0 when every "want" holds; exit 1 with the offending counts otherwise.
-Runs in-container by name (railway ssh ... -- python -m scripts.verify_seller_rekey)
-so the flaky public proxy is never in the loop.
+
+Runs inside production, so no public proxy is ever in the loop. Production is
+Cloud Run (pivota-prod/us-west1) and there is no `railway ssh` equivalent — Cloud
+Run has no running instance to attach to. Use a throwaway job on the production
+image, which propagates this script's exit code as the job's:
+
+    scripts/ops/run_oneoff_job.sh -m scripts.verify_seller_rekey
+
+The exit code IS the verdict; the log is printed for detail only, behind a retry,
+because Cloud Logging ingestion lag is unbounded. See
+docs/runbooks/operating_on_gcp_production.md.
 """
 
 from __future__ import annotations

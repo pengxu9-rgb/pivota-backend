@@ -16,11 +16,26 @@ Does NOT exercise:
   §J refund attribution (next shakeout)
 
 Usage:
-    export SHAKEOUT_DB_URL=$(railway variables --json -e production \\
-        -s Postgres-xMr6 | jq -r '.DATABASE_PUBLIC_URL')
-    export SHAKEOUT_DEBUG_TOKEN=$(railway variables --json -e staging \\
-        -s web-staging | jq -r '.SHAKEOUT_DEBUG_TOKEN')
+    export SHAKEOUT_DEBUG_TOKEN=$(gcloud secrets versions access latest \\
+        --secret=env-SHAKEOUT_DEBUG_TOKEN --project pivota-staging)
+    export SHAKEOUT_DB_URL=...   # see the note below
     .venv/bin/python scripts/shakeout/c_full_order_pipeline.py
+
+WHERE SHAKEOUT_DB_URL COMES FROM, and why it is not a command here. It used to be
+the `Postgres-xMr6` DATABASE_PUBLIC_URL — that is the ROLLBACK's database now.
+Production is Cloud Run in pivota-prod/us-west1 on Cloud SQL, and its
+`DATABASE_URL` secret resolves to a PRIVATE IP (verified 2026-08-25), so there is
+no URL that reaches it from a laptop and this script cannot be pointed at
+production from outside the VPC at all. To exercise the pipeline against the
+production database, run it from inside instead:
+
+    scripts/ops/run_oneoff_job.sh scripts/shakeout/c_full_order_pipeline.py
+
+which mounts the DATABASE_URL secret and runs in-VPC. Otherwise point
+SHAKEOUT_DB_URL at a staging or local database you already have a URL for.
+
+The base URL below is still the Railway staging host ON PURPOSE: GCP staging
+`web` runs with `ingress: internal`, so it is not reachable from a laptop.
 
 References:
 - docs/monetization/MERCHANT_ONBOARDING_READINESS.md §D-H
@@ -73,9 +88,11 @@ def _connect():
     )
     if not url:
         sys.stderr.write(
-            "ERROR: SHAKEOUT_DB_URL not set. Source:\n"
-            "    export SHAKEOUT_DB_URL=$(railway variables --json "
-            "-e production -s Postgres-xMr6 | jq -r '.DATABASE_PUBLIC_URL')\n"
+            "ERROR: SHAKEOUT_DB_URL not set.\n"
+            "    Production's DATABASE_URL resolves to a PRIVATE IP and is not\n"
+            "    reachable from a laptop; run this inside the VPC instead:\n"
+            "      scripts/ops/run_oneoff_job.sh scripts/shakeout/c_full_order_pipeline.py\n"
+            "    Otherwise set SHAKEOUT_DB_URL to a staging or local database URL.\n"
         )
         sys.exit(2)
     return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
@@ -403,8 +420,8 @@ def main() -> int:
     if not token:
         sys.stderr.write(
             "ERROR: SHAKEOUT_DEBUG_TOKEN not set. Source:\n"
-            "    export SHAKEOUT_DEBUG_TOKEN=$(railway variables --json "
-            "-e staging -s web-staging | jq -r '.SHAKEOUT_DEBUG_TOKEN')\n"
+            "    export SHAKEOUT_DEBUG_TOKEN=$(gcloud secrets versions access latest "
+            "--secret=env-SHAKEOUT_DEBUG_TOKEN --project pivota-staging)\n"
         )
         return 2
 

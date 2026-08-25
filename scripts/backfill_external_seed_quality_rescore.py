@@ -49,14 +49,20 @@ one timeout on row 1 silently voided the next 1,320 rows while still reporting
   * progress reports `wrote` / `eligible` / `promoted` separately, so a step-1
     failure is distinguishable from a step-2 one.
 
-Designed to run as a Railway job against the INTERNAL DB:
-  Dry-run:  python -m scripts.backfill_external_seed_quality_rescore
-  Apply:    python -m scripts.backfill_external_seed_quality_rescore --apply [--limit N]
+Designed to run inside production against the internal DB. Production is Cloud
+Run (pivota-prod/us-west1); Railway is the ROLLBACK and its database is a
+different one, so a rescore run there promotes rows nobody is served from.
 
-Local run over the public proxy (db.database reads DATABASE_URL, which is the
-internal railway.internal host under `railway run` and won't resolve locally):
-  railway run -- bash -c 'DATABASE_URL="$DATABASE_PUBLIC_URL" \
-    python -m scripts.backfill_external_seed_quality_rescore --apply'
+There is no `railway run` equivalent. Use a throwaway job on the production image
+- the helper mounts the DATABASE_URL secret (a job inherits NO env and NO
+secrets) and takes its verdict from the job's EXIT CODE:
+  Dry-run:  scripts/ops/run_oneoff_job.sh -m scripts.backfill_external_seed_quality_rescore
+  Apply:    scripts/ops/run_oneoff_job.sh -m scripts.backfill_external_seed_quality_rescore --apply [--limit N]
+
+Locally, point DATABASE_URL at a database you have a URL for and run it directly:
+  DATABASE_URL=... python -m scripts.backfill_external_seed_quality_rescore --apply
+
+Full pattern and its footguns: docs/runbooks/operating_on_gcp_production.md.
 """
 from __future__ import annotations
 
@@ -567,7 +573,7 @@ async def run(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     ap.add_argument("--apply", action="store_true", help="write (default: dry-run)")
     ap.add_argument("--limit", type=int, default=None, help="cap rows this run")
     ap.add_argument(

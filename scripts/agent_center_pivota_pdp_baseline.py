@@ -19,8 +19,13 @@ Two values:
 
 Usage:
 
+  # Runs LOCALLY against the public gateway. Point it at PRODUCTION, which is
+  # Cloud Run behind gateway.pivota.cc. The old Railway host still answers 200
+  # and still serves a DIFFERENT build (gateway 74c655ee vs Railway c151f5f8,
+  # measured 2026-08-25), so pointing here at the rollback yields a baseline that
+  # looks valid and describes a platform nobody is served from.
   PROMOTIONS_ADMIN_KEY=...   \\
-  PIVOTA_AGENT_INTERNAL_URL=https://pivota-agent-production.up.railway.app \\
+  PIVOTA_AGENT_INTERNAL_URL=https://gateway.pivota.cc \\
   python scripts/agent_center_pivota_pdp_baseline.py \\
     --output reports/pivota-pdp-baseline-2026-05-06.md
 

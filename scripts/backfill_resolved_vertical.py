@@ -31,7 +31,9 @@ Properties:
     writes NOTHING.
 
 Does NOT depend on migration 173 having run — db/schema_guard.py:663 self-heals
-the column, matching the mirror/backfill convention (Railway skips migrations).
+the column, matching the mirror/backfill convention (production startup skips
+db/migrations/; that is a property of the app's boot path, not of any one
+platform, and it is still true on Cloud Run).
 
 Usage:
   python -m scripts.backfill_resolved_vertical --dry-run
@@ -234,7 +236,7 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     p.add_argument("--dry-run", action="store_true",
                    help="Report the would-write distribution + samples; write nothing.")
     p.add_argument("--batch-size", type=int, default=500,
