@@ -1,5 +1,10 @@
 # Runbook — unauthenticated `/agent/*` rate limiting
 
+> **Production is GCP Cloud Run (`pivota-prod`, `us-west1`), not Railway.** Every command below was
+> rewritten for it on 2026-08-25; a `railway variables --set` here would have turned the dial on the
+> ROLLBACK while the incident continued. See
+> [operating_on_gcp_production.md](operating_on_gcp_production.md).
+
 Added 2026-08-11. Closes the gap where most unauthenticated `/agent/*` traffic
 was unmetered and any keyed caller could evade its bucket by rotating the header.
 
@@ -109,21 +114,26 @@ peak**. That is why enforcement ships enabled rather than defaulted off.
 Re-measure before tightening:
 
 ```bash
-railway logs --service web -n 5000 --http | grep -oE '"path":"/agent/[^"]*' | sort | uniq -c | sort -rn
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="web" AND httpRequest.requestUrl!=""' \
+  --project pivota-prod --region us-west1 --limit 5000 \
+  --format='value(httpRequest.requestUrl)' --freshness=2h \
+  | sed -E 's|https?://[^/]+||; s|\?.*||' | grep -E '^/agent/' | sort | uniq -c | sort -rn
 ```
 
-Three things matter in that command, and the earlier version of this runbook got
-them wrong:
+Three things matter in that command:
 
-- **`-n` is required.** `railway logs` *streams* by default, so `sort` never sees
-  EOF and the pipeline hangs forever, printing nothing. macOS has no
-  `timeout(1)`, so an operator cannot rescue it with a prefix.
-- **`--http` is the better source.** It carries the real `srcIp`, `edgeRegion`
-  and `clientUa` — what you need to identify who consumed the budget. The deploy
-  log does not.
-- **The deploy log is bounded by the CURRENT deployment**, so after a redeploy
-  there is no long window left to sample. Prod redeployed six times on
-  2026-08-11.
+- **`--freshness` is required.** Without it the read starts at the beginning of
+  retention and the command looks like it has hung. `--limit` is a hard cap, not
+  a page size.
+- **Request logs are structured**, so the path lives in `httpRequest.requestUrl`
+  as a full URL — hence the `sed`. That record also carries `httpRequest.remoteIp`
+  and `userAgent`, which is what identifies who consumed the budget; add them to
+  `--format` when you need to attribute rather than count.
+- **It is NOT bounded by the current deployment.** This was the Railway version's
+  worst limitation — its deploy log reset on every redeploy, and prod redeployed
+  six times on 2026-08-11. Cloud Logging spans revisions, so add
+  `AND resource.labels.revision_name="web-000NN-xxx"` when you specifically want
+  one build.
 
 A better single number, straight from the aggregated table:
 
@@ -137,16 +147,20 @@ If legitimate traffic is being rejected, disable enforcement — it takes effect
 the next deploy/restart because the value is read at middleware construction:
 
 ```bash
-railway variables --service web --set ANON_RATE_LIMIT_ENABLED=false
+gcloud run services update web --project pivota-prod --region us-west1 \
+  --update-env-vars ANON_RATE_LIMIT_ENABLED=false
 ```
 
 Accepted falsy values: `false`, `0`, `no`, `off`.
 
-**On redeploying:** the value is read once in `RateLimitMiddleware.__init__` at
-app construction, so a new process is required. `railway variables --set`
-*triggers a deploy by default*, so normally you need do nothing further — but if
-you pass `--skip-deploys` (or set the variable in the dashboard without
-deploying) **the kill switch stays inert**. Confirm the running build changed:
+**`--update-env-vars` MERGES.** `--set-env-vars` and `--env-vars-file` replace the
+entire set and would wipe the other ~250 variables on `web`. Mid-incident is
+exactly when that mistake gets made.
+
+**On restarting:** the value is read once in `RateLimitMiddleware.__init__` at app
+construction, so a new process is required. `gcloud run services update` creates a
+new revision and shifts traffic to it once healthy, so the kill switch takes
+effect on its own — no separate deploy step. Confirm the running build changed:
 
 ```bash
 curl -s https://api.pivota.cc/version
@@ -155,7 +169,8 @@ curl -s https://api.pivota.cc/version
 Prefer **raising the limit** over disabling, unless you are mid-incident:
 
 ```bash
-railway variables --service web --set ANON_RATE_LIMIT_GLOBAL_RPM=5000
+gcloud run services update web --project pivota-prod --region us-west1 \
+  --update-env-vars ANON_RATE_LIMIT_GLOBAL_RPM=5000
 ```
 
 A non-positive or unparseable value falls back to the default rather than being
@@ -232,7 +247,9 @@ without these lines an operator sees only uvicorn's bare `429` and cannot tell
 the ceiling from a per-key bucket.
 
 ```bash
-railway logs --service web -n 2000 | grep anon_rate_limit_ceiling
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="web"' \
+  --project pivota-prod --limit 2000 --format='value(textPayload)' --freshness=2h \
+  | grep anon_rate_limit_ceiling
 ```
 
 ## A note on the measured baseline
@@ -242,7 +259,7 @@ The 14-day figure below is trustworthy; the *method* in the first draft was not.
 - **Trustworthy:** `GET /agent/v1/metrics/timeline?hours=336` aggregates
   `agent_usage_logs` — 624 `/agent/v1` requests over 14 days, busiest hour 43
   requests (~0.72/min). The ceiling is ~1,600× that peak.
-- **Not trustworthy:** counting `/agent/*` lines out of `railway logs`. That
+- **Not trustworthy:** counting `/agent/*` lines out of raw logs. That
   buffer is bounded by the current deployment and dominated by scheduler noise
   (`run_executor_worker_tick` every 5s logging `skipped: maximum number of
   running instances reached`), so its denominator is not a time window.

@@ -1,5 +1,10 @@
 # Partner Settlement Promotion Runbook (Blocker #3)
 
+> **Production is GCP Cloud Run (`pivota-prod`, `us-west1`), not Railway.** Commands below were
+> rewritten for it on 2026-08-25. This runbook's own invariant warns that a missed flag risks
+> DOUBLE-PAYING — reading the flag off the rollback is exactly how that happens. See
+> [operating_on_gcp_production.md](../runbooks/operating_on_gcp_production.md).
+
 **Goal.** Turn on real channel-partner rev-share: flip `PARTNER_REV_SHARE_USE_V2`
 and resume the two paused settlement crons (T7 invoice generation, T8 partner
 settlement), so attributed brands actually pay their partner.
@@ -47,12 +52,35 @@ Two hard invariants:
 
 Verifies the v2 engine computes sane numbers against real data. Writes nothing.
 
+There is no `railway run` equivalent on Cloud Run — no shell, no host to attach to. Use a
+throwaway job on the production image. The full pattern and its three footguns are in
+[operating_on_gcp_production.md](../runbooks/operating_on_gcp_production.md); the short form:
+
 ```bash
-railway run --service web python scripts/partner_settlement_dry_run.py
-# specific period / billing run:
-railway run --service web python scripts/partner_settlement_dry_run.py --billing-run-id <id>
-railway run --service web python scripts/partner_settlement_dry_run.py --json
+JOB="settlement-dryrun-$$-$RANDOM"
+gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
+  --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest \
+  --service-account sa-worker@pivota-prod.iam.gserviceaccount.com \
+  --network default --subnet default --vpc-egress all-traffic \
+  --set-secrets DATABASE_URL=DATABASE_URL:latest \
+  --max-retries 0 --task-timeout 600s \
+  --command python --args=scripts/partner_settlement_dry_run.py
+gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait
+gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
+  --limit 200 --format='value(textPayload)' --freshness=10m
+gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
+
+For a specific period or billing run, extend `--args` — note gcloud splits it on COMMAS, so use the
+alternate-delimiter form when passing more than one:
+
+```bash
+  --args="^|^scripts/partner_settlement_dry_run.py|--billing-run-id|<id>"
+  --args="^|^scripts/partner_settlement_dry_run.py|--json"
+```
+
+**Secrets are not inherited by a job.** Without the `--set-secrets` line the script reads no
+`DATABASE_URL` and fails in a way that looks like a database outage rather than a missing mount.
 
 Pass criteria:
 - It finds the latest completed `billing_runs` row (or use `--period-*`).
@@ -83,13 +111,14 @@ not `/version`, not `/config-check`, not `/admin/config/check`. An earlier
 revision of this runbook said to "verify via `/version`", and a note I added on
 top of it implied an admin token would reveal the value; both were wrong.
 `/version` only tells you **which build is live**, which is the part that matters
-here: the flag is read at import time in `config/settings.py`, so a Railway
-variable change needs a redeploy to take effect.
+here: the flag is read at import time in `config/settings.py`, so changing the
+variable needs new processes to take effect.
 
 So verify in two steps:
 
 ```bash
-railway variables --service web --json | grep PARTNER_REV_SHARE_USE_V2
+gcloud run services describe web --project pivota-prod --region us-west1 --format=json \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env",[]); print([x for x in e if x["name"]=="PARTNER_REV_SHARE_USE_V2"] or "ABSENT")'
 ```
 
 then confirm the running build is newer than the variable change:

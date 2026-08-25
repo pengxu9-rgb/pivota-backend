@@ -1,5 +1,14 @@
 # Stage 2 — Historical Edge Backfill
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** The `railway ...` commands below have NOT been rewritten — they were left as-is
+> rather than translated by guesswork, because the procedures here were never re-verified against
+> GCP. Running one changes the platform nobody is served from: the incident continues while the
+> dial reads as turned. Translate with
+> [operating_on_gcp_production.md](../../runbooks/operating_on_gcp_production.md) before acting, or treat this
+> document as a historical record of how the Railway rollout was done.
+
+
 **Status:** DRAFT. Not executable until Stage 1 §6 promotion checklist passes + the architectural decisions in §1 are signed off by Cowork.
 
 Stage 1 turns on T9 stamping for *new* orders. Stage 2 retroactively creates `commerce_attribution_edges` rows for paid orders that predate T9 — so T6's daily rollup and downstream T7 invoice math can include the alpha merchant's full history.
