@@ -15,6 +15,7 @@ from sqlalchemy import and_, select, update
 from db.database import database
 from db.external_offers import external_offer_snapshots
 from services import crawl_politeness
+from utils.availability_vocabulary import normalize_availability
 
 
 MAX_BODY_BYTES = int(os.getenv("EXTERNAL_OFFER_MAX_BODY_BYTES") or "1200000")  # ~1.2MB
@@ -1115,14 +1116,15 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
 
 
 def _availability_from_raw(raw: Optional[str]) -> str:
-    if not raw:
-        return "unknown"
-    v = raw.lower()
-    if "instock" in v or "in_stock" in v or "in stock" in v:
-        return "in_stock"
-    if "outofstock" in v or "out_of_stock" in v or "out of stock" in v:
-        return "out_of_stock"
-    return "unknown"
+    """Map a raw availability signal (often a JSON-LD schema.org IRI) to our canonical token.
+
+    This previously matched only the InStock/OutOfStock substrings, so ten of the twelve
+    schema.org ItemAvailability values resolved to "unknown" — including SoldOut and
+    Reserved, which schema.org itself defines as not available. Plain "sold out",
+    "unavailable" and "oos" missed too.
+    """
+    canonical = normalize_availability(raw)
+    return canonical if canonical is not None else "unknown"
 
 
 def _normalize_description_text(raw: Optional[str]) -> Optional[str]:
