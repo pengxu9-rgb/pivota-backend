@@ -263,67 +263,34 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 
 ## 4. Prioritized backlog
 
-> **Status reconciliation — re-measured 2026-08-24 against `origin/main` and against live GCP.**
+> **VERIFIED STATE — re-checked 2026-08-25 against `origin/main` @ `4459f88e` and against live GCP.**
+> Every line below was confirmed by a POSITIVE check (the symbol exists / the env var reads / the
+> scheduler job answers), not by the absence of a grep hit. Two earlier passes of this section got
+> that wrong in both directions, so the method matters more than the table.
 >
-> **Correction to an earlier pass of this section:** it reported items 3a, 3 and 14 as "not
-> started" on the strength of a grep against `infra/gcp/setup_egress_nat.sh` and
-> `setup_scheduler.sh`. That was a scope error — the work landed in *new* files those greps
-> could not see (`setup_crawl_egress.sh`, `migrate_payment_nat_to_default_subnet.sh`,
-> `jobs/scheduled_ucp_reprobe_job.py`, `routes/store_audit_probe_internal.py`). The corrected
-> state is below. Where a row says "not started", it now means a positive check was run, not
-> that one filename lacked a match.
+> **7 of 17 complete · 4 built-but-inert · 6 not started.**
 >
-> | Item | State | Evidence |
+> | | items | state |
 > |---|---|---|
-> | 3a — dedicated crawl egress | **DONE, provisioned and live in BOTH projects.** `pivota-crawl-nat` is `LIST_OF_SUBNETWORKS` on `pivota-crawl`, with reserved IPs `IN_USE`: staging `34.11.177.234`, prod `34.82.199.35`. The payment NAT was narrowed to `default` while retaining its address (staging `136.66.216.216`, prod `8.231.167.230`). Confirmed by the read-only guard `migrate_payment_nat_to_default_subnet.sh <env> --check` in both. The design also solves a constraint this audit missed: Cloud NAT permits only one `ALL_SUBNETWORKS_ALL_IP_RANGES` NAT per VPC/region, so the crawl script hard-fails until the payment NAT is narrowed first. | live `gcloud`, 2026-08-24 |
-> | 3 — per-domain UCP probe + stored profile | **built, shipped inert.** Isolated probe lane with its own least-privilege identity, migration 196 (`store_audit_execution_routes`), receipt endpoint closed unless `STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED` **and** a dedicated key are both set. Triggers created `PAUSED`. Not a stored capability table yet — it writes `execution_routes` + `acceptance_signal` evidence. | `routes/store_audit_probe_internal.py`, `docs/commerce-index-crawl-lane.md` |
-> | 14 — scheduled freshness / re-probe | **built, default-off selector.** `jobs/scheduled_ucp_reprobe_job.py` + `scripts/run_scheduled_ucp_reprobes.py`; `PAUSED=0` is deliberately *rejected* while Store Audit UCP is present, so arming it cannot resume unrelated Scheduler jobs. | same |
-> | 2 — refresh can correct a stale price | **shipped** | #1812 |
-> | 1 — `recommendation_id` | **half** — minted per item and per set (#2080), logged on lane outage (#2081). The accept-it-back half is item 10 and does not exist. | #2080, #2081 |
-> | 4 — numeric variant-id backfill | **in flight** — producer merged (#1813, #1820); 864 rows written. Cohort coverage **10.0%** (1,074 / 10,763 active rows whose URL contains `/products/`). | measured live |
-> | 5 — execution spec v0 | **shipped this pass.** `merchant_domain`, `pdp_url`, `cart_url`, `variant_id`, `rail`, `expires_at`, `tracking` now ride on every external offer, composed by the same function the redirect signs. `recommendation_id` is deliberately **not** in it: it is minted in the gateway's `recommend_products`, not at `offers.resolve`, and stamping a fabricated one would defeat the join it exists for. | this PR |
-> | 12 — attribution on the agent's own lane | **shipped this pass.** One click id now spans the signed token, `pdp_url` and `cart_url`. | this PR |
-> **Item 8 now covers every third-party crawl lane, not just the offers fetcher.** The reserved
-> crawl egress IP is shared, so a ban earned anywhere takes all of them down. All five remaining
-> merchant/web-crawling lanes now route through `services/crawl_politeness`:
+> | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints AND is accepted back; the refresh can correct a stale price; dedicated crawl egress is live in staging AND prod; all 7 execution-spec fields ship; every one of the six third-party crawl lanes goes through the politeness gate; `card_rail_outcomes` + `POST /agent/v1/outcomes` exist and are mounted. |
+> | **Built, switched off** | 3, 14 | The UCP probe lane and `scheduled_ucp_reprobe` exist in code, but `store-audit-commerce-reprobe-enqueue-cron` reads **PAUSED** in prod and has no counterpart in staging. There is still **no per-row `last_crawled_at`** anywhere in `db/` or `services/`. |
+> | **Partial** | 4, 7 | Variant-id coverage **60.5%** and close to its ceiling (§4 note). Warm handoff is **ENABLED in prod** — but on the original **6** brands, not the Tier-1 cohort item 7 asks for. |
+> | **Not started** | 6, 9, 11, 13, 15, 16 | Live top-3 verification; landed total via UCP; promo codes in the spec; `p_complete` into ranking; the reco-latency work (also unmeasured post-cutover); 3C cohort seeding. |
 >
-> | lane | before | now |
-> |---|---|---|
-> | `services/brand_product_discovery.py` | robots asked about the site ROOT; no pacing | full-path robots (shared, cached) + pacing |
-> | `services/bd_cold_start_service.py` | inherited that root-only helper | same helper, now delegating |
-> | `services/co_occurrence_finder.py` | robots path-correct but UNCACHED (refetched per article) | shared cache + pacing |
-> | `services/curated_brand_feed.py` | none | both fetch sites gated |
-> | `services/executor_agents/sitemap_freshness.py` | none | sitemap + child indexes gated |
+> **What this means for the milestone.** The *plumbing* is done: an agent can be handed a spec that
+> says exactly where a buyer lands and what will be in the cart, and it can report back what
+> happened. What is NOT done is the thing this audit named as the real obstacle in §1 — **index
+> staleness**. Item 6 (live verification) is the recommended fix and has not been started; item 14
+> (the freshness floor) exists as code but is paused and lacks the per-row freshness field it was
+> specified with. Nothing currently prevents the 31.1% wrong-spec rate from reaching a buyer.
 >
-> **Correction to the earlier version of this note**, which listed six lanes and described two of
-> them wrongly. It was built by grepping for robots/pacing without checking what each lane
-> actually fetches:
-> - `services/executor_agents/canonical_pdp_enrichment.py` is **not a crawl lane**. It POSTs to
->   Google's Vertex Gemini API (`vertex_gemini.generate_content_url`). Pacing a first-party API at
->   one request per second per host would be actively wrong, so it is deliberately excluded — and
->   a test now asserts that exclusion so nobody "fixes" it later.
-> - `co_occurrence_finder` was listed as root-only robots. It was in fact path-correct; its real
->   defect was the missing cache.
->
-> Coverage is pinned by an EXACT per-lane gate count, because a presence check passes when a lane
-> with two fetch sites loses one of them — and even that only counts GATES, not FETCHES, which is
-> how an ungated fallback PDP fetch survived in an otherwise-covered file. Per-lane semantics
-> (which UA robots is asked about, bounded vs unbounded wait, whether `note_response` fires) are
-> asserted separately by driving each lane's real fetch function.
->
-> **Bounded vs unbounded wait is per-lane, and it matters.** Three of these lanes are reachable
-> from live authenticated routes (`POST /api/merchant-center/audit/url-readiness`,
-> `.../audit/ai-commerce-readiness`, `POST /api/agent-center/bd/cold-start-audit`), so they use
-> the bounded default — `max_wait=0` there would let a 300s backoff hold a real request open.
-> Only the two genuinely batch-only lanes (`curated_brand_feed`, `sitemap_freshness`) wait
-> unbounded.
-
-> | 8 — rate-limit + robots the fetcher | **shipped.** `services/crawl_politeness.py`: per-host pacing (`CRAWL_MIN_INTERVAL_SECONDS`, default 1/s), robots.txt obeyed on the FULL path with `Crawl-delay` honoured whenever it is slower than our floor, and exponential 429/503 backoff honouring `Retry-After` only ever to lengthen. `_fetch_html` is gated on it. Two things worth carrying: the wait is BOUNDED (`CrawlPaced`) because `POST /api/offers/external/resolve` has no auth dependency and is a live path — an unbounded stall there would be a new regression, not politeness; and the pre-existing `_robots_allows` (`services/brand_product_discovery.py:493`) asks about the site ROOT, so a `Disallow: /products/` never bit the paths it guards. That helper is UNCHANGED here and still has that defect. | this PR |
-> | 6 — live-verify top-3 | **not started.** Note the v2 index design partly supersedes the framing: public crawl carries authority 45 and "never auto-publishes checkout-sensitive facts", and checkout is specified to always live-validate. | `docs/commerce-index-v2.md` |
-> | 7, 10 (Wave 3) · 9, 11, 13, 15, 16 (Wave 4) | **not started** | verified by grep |
-
-
-Ordered by (blocking × effort), then sequenced against the **Sep 8–12 cutover** (§3.4). The **Where** column is load-bearing: it is what keeps this work from being built twice.
+> **One correction to an earlier finding.** I previously recorded the click-time warm-handoff
+> interaction as "latent, not live" because `OUTBOUND_WARM_HANDOFF_ENABLED` defaults to false. It
+> reads **true in prod** with the internal key set. The interaction was reconciled independently
+> (`could_upgrade_at_click_time` — the spec now answers `null` rather than a `false` the lane could
+> contradict, with a runbook at `docs/runbooks/outbound_warm_handoff_rollout.md`). A documented
+> residual remains: widening the brand allowlist invalidates `false` answers on tokens minted
+> before the widening and still inside their 7-day TTL. That matters for item 7.
 
 ### Wave 1 — now → Sep 6. Code-only, platform-agnostic, rides the cutover for free
 
