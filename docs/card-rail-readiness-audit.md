@@ -315,7 +315,7 @@ Ordered by (blocking × effort), then sequenced against the **Sep 8–12 cutover
 
 | # | Item | Effort | Where | Why |
 |---|---|---|---|---|
-| 7 | **Widen `OUTBOUND_WARM_HANDOFF_BRANDS`** from 6 to the Tier-1 cohort. | S | Env var | The cart-prefill path is already proven; it is an allowlist edit plus monitoring. |
+| 7 | **Widen `OUTBOUND_WARM_HANDOFF_BRANDS`** from 6 to the Tier-1 cohort. **Read [docs/runbooks/outbound_warm_handoff_rollout.md](./runbooks/outbound_warm_handoff_rollout.md) first** — newly-minted answers for the added brands now degrade to `cart_prefilled: null` rather than a wrong `false`, but the widening still retroactively falsifies `false` answers on redirect tokens minted up to 7 days earlier and not yet expired. | S | Env var | The cart-prefill path is already proven; it is an allowlist edit plus monitoring — plus the `cart_prefilled` conflict, which must be resolved before or with the widening. |
 | 14 | **Scheduled freshness sweep** with a real per-row `last_crawled_at`, prioritized by serving rank. | M | Cloud Run Job + Scheduler on the 3a subnet; pinned pool 1..4; statement-timeout escape hatch (§3.3) | Live verification covers the top-3; the long tail still needs a floor. Promoted from October — it is the thing the migration most changes, so build it once, on GCP. |
 | 10 | **`card_rail_outcomes` table + `POST /agent/v1/outcomes`** with the `failure_reason` vocabulary. | S–M | Cloud SQL migration + app code | The compounding asset. Starts paying off only after it has traffic, so it must exist before the first real transactions. |
 

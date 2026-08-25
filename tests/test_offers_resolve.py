@@ -1462,6 +1462,394 @@ def test_cart_prefilled_tells_the_agent_what_the_link_actually_does(
     assert ("/cart/" in built["dest"]) is expected, built["dest"]
 
 
+# ---------------------------------------------------------------------------
+# cart_prefilled vs the warm-handoff click lane
+#
+# `cart_prefilled: false` is a POSITIVE claim relayed to a buyer ("this link lands on a
+# product page, you pick the variant yourself"). The warm-handoff lane on `GET /r` can land
+# that same buyer in a prefilled cart, and its eligibility fires on exactly the cold
+# population — so an unguarded `false` is a statement we already sent and cannot correct.
+# The field is a tri-state (PIVOTA-Agent #2082); these prove the `false` leg is only emitted
+# where it is PROVABLE, and that `true` is never collateral damage.
+# See docs/runbooks/outbound_warm_handoff_rollout.md.
+# ---------------------------------------------------------------------------
+
+_WARM_HUMAN_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+@pytest.fixture
+def warm_lane(monkeypatch: pytest.MonkeyPatch):
+    """The warm canary as deployed (flag on, key set, brand allowlist) — prod posture.
+
+    Also swaps in a throwaway anonymous-invoke rate-limit store. That counter is
+    module-level and keyed on the shared "testclient" IP with a 60/min ceiling, so a
+    test that spends from it silently starves whatever runs later in the same minute —
+    adding these tests tripped a 429 in test_pdp_resolution_stability's 30-call loop.
+    Replacing the dict (rather than clearing it) isolates in both directions.
+    """
+    import routes.agent_shop_gateway as gateway
+    from config.settings import settings as app_settings
+
+    monkeypatch.setattr(gateway, "_INVOKE_ANON_IP_LIMIT_STORE", {})
+    monkeypatch.setattr(app_settings, "outbound_warm_handoff_enabled", True)
+    monkeypatch.setattr(app_settings, "outbound_warm_handoff_internal_key", "test-key")
+    monkeypatch.setattr(app_settings, "outbound_warm_handoff_brands_raw", "brand.com")
+    monkeypatch.setattr(app_settings, "outbound_warm_handoff_rollout_pct", 0)
+    return app_settings
+
+
+def _resolve_exec_spec_offer(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    *,
+    evidence: bool,
+    row_overrides: dict = None,
+    allowed_domains: list = None,
+) -> dict:
+    """One external offer for the exec-spec fixture, through the real route."""
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row_for_exec_spec(evidence=evidence)
+    row.update(row_overrides or {})
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=allowed_domains or ["brand.com"]))
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+    return offers[0]
+
+
+def _token_of(offer: dict) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    token = parse_qs(urlparse(offer["affiliate_url"]).query).get("token", [""])[0]
+    assert token, f"no signed token on the affiliate_url: {offer.get('affiliate_url')!r}"
+    return token
+
+
+def test_cart_prefilled_is_null_not_false_when_the_warm_lane_could_contradict_it(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The defect: a cold PDP offer on a warm-eligible brand must NOT claim `false`.
+
+    Without the guard this is `False` — and the buyer lands in a prefilled cart anyway.
+    """
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert "cart_prefilled" in offer, "the field must still be present — null is a STATE, not an omission"
+    assert offer["cart_prefilled"] is None, (
+        "a `false` here is a claim the warm-handoff lane can contradict after the answer "
+        "was sent; the honest tri-state answer is null/unknown"
+    )
+
+
+def test_cart_prefilled_true_is_never_downgraded_by_warm_eligibility(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """One-sided exposure: the warm lane only ever BUILDS a cart, so `true` stays `true`.
+
+    Guards the over-correction — blanket-nulling on an eligible host would destroy the
+    field's whole purpose for the offers that CAN answer it.
+    """
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=True)
+    assert offer["cart_prefilled"] is True
+
+
+def test_cart_prefilled_false_survives_when_the_host_is_not_warm_eligible(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """`false` is still emitted where it is PROVABLE — here, a brand outside the allowlist."""
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "someone-else.com")
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["cart_prefilled"] is False, (
+        "an offer the warm lane can never touch must keep its claim — otherwise the guard "
+        "is a blanket null and the field says nothing"
+    )
+
+
+def test_cart_prefilled_false_survives_when_the_lane_is_off(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["cart_prefilled"] is False
+
+
+def test_cart_prefilled_false_survives_when_the_internal_key_is_unset(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The lane fail-closes without a key even with the flag on — so `false` holds."""
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_internal_key", None)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["cart_prefilled"] is False
+
+
+@pytest.mark.parametrize("pct,expected", [(0, False), (100, None)])
+def test_cart_prefilled_tracks_the_percentage_rollout(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane, pct: int, expected
+) -> None:
+    """With an empty allowlist the rollout pct decides — and the claim must follow it."""
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", pct)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["cart_prefilled"] is expected
+
+
+def test_cart_prefilled_agrees_with_the_click_lane_on_the_SAME_token(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The INTERPRETATION must hold: `cart_prefilled is None` exactly when the click lane
+    would find the link eligible, evaluated on the token the offer actually carries.
+
+    Deliberately NOT the token-identity guarantee — this test cannot give it. A substituted
+    token only changes the answer when the two happen to land in different buckets, so
+    measured against a fabricated-token mutant this assertion kills it 3-4 times in 12. Token
+    identity is pinned deterministically by
+    test_the_token_we_evaluate_is_the_token_we_hand_out; this test covers the mapping from
+    eligibility to tri-state, which that one does not.
+    """
+    from services.outbound_warm_handoff import evaluate_warm_eligibility
+
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 50)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+
+    click_eligible, reason = evaluate_warm_eligibility(
+        dest=_dest_of(offer),
+        user_agent=_WARM_HUMAN_UA,
+        token=_token_of(offer),
+        settings=warm_lane,
+    )
+    assert reason in {"rollout", "control"}, (
+        f"the fixture no longer exercises the token-keyed bucket (reason={reason}) — "
+        "this test would prove nothing about token parity"
+    )
+    assert (offer["cart_prefilled"] is None) is click_eligible, (
+        "resolve time and click time disagreed about the SAME token: the claim we send is "
+        f"cart_prefilled={offer['cart_prefilled']!r} but the click lane says "
+        f"eligible={click_eligible} ({reason})"
+    )
+
+
+def _dest_of(offer: dict) -> str:
+    """The destination the buyer actually reaches, decoded from the signed token."""
+    import base64
+    import json as _json
+
+    tok = _token_of(offer).split(".")[0]
+    payload = _json.loads(base64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))
+    return str(payload["dest"])
+
+
+def test_a_null_claim_is_warranted_because_the_click_really_does_land_in_a_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """End-to-end, both layers in one test: resolve says "unknown", and the very link it
+    handed out then 302s the buyer into a prefilled cart.
+
+    This is the test that would have caught the defect. Asserting the field in isolation
+    cannot: `false` looks perfectly reasonable until you follow the link it describes.
+    """
+    import routes.outbound_links as outbound_routes
+    import services.outbound_warm_handoff as warm
+
+    warm.memo_clear()
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["cart_prefilled"] is None
+
+    cart_url = "https://brand.myshopify.com/cart/c/abc123?key=k"
+
+    async def _fake_resolve(**kwargs):
+        return {"continue_url": cart_url, "cart_id": "c_1"}
+
+    async def _fake_log(**kwargs):
+        return None
+
+    monkeypatch.setattr(outbound_routes, "resolve_warm_handoff", _fake_resolve)
+    monkeypatch.setattr(outbound_routes, "log_outbound_click", _fake_log)
+    try:
+        res = client.get(
+            "/r",
+            params={"token": _token_of(offer)},
+            headers={"user-agent": _WARM_HUMAN_UA},
+            follow_redirects=False,
+        )
+        assert res.status_code == 302, res.text
+        assert res.headers["location"] == cart_url, (
+            "the buyer landed in a prefilled cart — had the offer claimed "
+            "cart_prefilled=false, that answer was already sent and now wrong"
+        )
+    finally:
+        warm.memo_clear()
+
+
+def test_cart_url_is_load_bearing_for_the_cart_verdict(
+    monkeypatch: pytest.MonkeyPatch, warm_lane
+) -> None:
+    """`cart_url` — the decision compose_attributed_destinations already made — is what
+    drives the `True` leg, and it must be READ rather than re-derived.
+
+    Same warm-eligible host in both calls, so only `cart_url` differs: a `True` here proves
+    the cart leg short-circuits before the warm guard, and the `None` proves the guard runs
+    when there is no cart.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    kwargs = dict(
+        destination_url="https://brand.com/products/serum",
+        redirect_url="https://api.example.com/r?token=t",
+    )
+    assert gateway._cart_prefilled_claim(cart_url="https://brand.com/cart/41234567890123:1",
+                                         **kwargs) is True
+    assert gateway._cart_prefilled_claim(cart_url=None, **kwargs) is None
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
+    assert gateway._cart_prefilled_claim(cart_url=None, **kwargs) is False
+
+
+def test_cart_prefilled_says_unknown_when_the_token_cannot_be_recovered(
+    monkeypatch: pytest.MonkeyPatch, warm_lane
+) -> None:
+    """Defensive leg of _cart_prefilled_claim, asserted directly.
+
+    The rollout bucket is keyed on the token, so a link we cannot read a token back out of
+    makes `false` unprovable. Unknown beats a guess.
+
+    Pinned on the ROLLOUT branch (empty allowlist), because that is the only configuration
+    where the guard changes the answer: `rollout_bucket` refuses every token at pct=0, so
+    without the guard a token-less link confidently answers `false`. Asserting this against
+    an allowlisted brand instead would pass with the guard deleted — eligibility answers
+    `None` there on the host alone, and the test would prove nothing.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 0)
+    kwargs = dict(
+        cart_url=None,
+        destination_url="https://brand.com/products/serum",
+        redirect_url="https://api.example.com/r",  # no token param at all
+    )
+    assert gateway._cart_prefilled_claim(**kwargs) is None, (
+        "without a token the pct branch cannot be evaluated, so `false` is not provable"
+    )
+    # A real token in the same configuration IS provable, and answers `false`.
+    from services.outbound_links_service import make_redirect_token
+
+    token = make_redirect_token({"market": "US", "tool": "*",
+                                 "dest": "https://brand.com/products/serum", "ctx": {}})
+    assert gateway._cart_prefilled_claim(
+        **{**kwargs, "redirect_url": f"https://api.example.com/r?token={token}"}
+    ) is False, "the guard must be about the MISSING token, not a blanket null"
+    # And with the lane off there is nothing to be unknown about.
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
+    assert gateway._cart_prefilled_claim(**kwargs) is False
+
+
+def test_the_token_we_evaluate_is_the_token_we_hand_out(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The rollout bucket is a stable hash of the token, so the claim is only sound if the
+    token weighed at resolve time is the one the click will actually carry.
+
+    Asserted by identity, not by outcome: re-minting or fabricating a token still yields a
+    plausible boolean that agrees with the click roughly half the time, so an outcome-only
+    test detects it as a COIN FLIP. (Measured: a `token="fabricated"` mutant passed the
+    outcome test on the first run.)
+    """
+    import routes.agent_shop_gateway as gateway
+
+    real = gateway.could_upgrade_at_click_time
+    seen: dict = {}
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(gateway, "could_upgrade_at_click_time", spy)
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 50)
+
+    # A host/path no other fixture uses. Against the shared default a hardcoded
+    # `dest="https://brand.com/products/serum"` at the call site passes, because every
+    # fixture in this file happens to equal that literal.
+    distinctive = "https://brand.com/products/uniquely-named-fixture-sku"
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False,
+        row_overrides={"canonical_url": distinctive, "destination_url": distinctive},
+    )
+    assert seen, "the eligibility predicate was never consulted — this test proves nothing"
+    assert seen["token"] == _token_of(offer), (
+        "resolve time weighed a DIFFERENT token than the buyer's link carries; the rollout "
+        "bucket, and therefore the claim, is decided on the wrong input"
+    )
+    assert seen["dest"] == distinctive, (
+        "the predicate was handed a different URL than the link was built from"
+    )
+
+
+def test_redirect_token_is_recovered_byte_identically(client: TestClient) -> None:
+    """No percent-decoding gap between the link we write and the token `GET /r` receives."""
+    import routes.agent_shop_gateway as gateway
+    from services.outbound_links_service import make_redirect_token
+
+    token = make_redirect_token({"market": "US", "tool": "*", "dest": "https://brand.com/x", "ctx": {}})
+    assert "." in token and "=" not in token, "fixture no longer resembles a real token"
+    assert gateway._redirect_token_from_url(f"https://api.example.com/r?token={token}") == token
+    # It must key on `token=` specifically, not "the first param" or "anything with an =".
+    # Without these two rows a selector of `item.startswith("t")`, `"=" in item`, or
+    # "return the first value" passes — every other fixture URL carries a single param.
+    assert gateway._redirect_token_from_url(
+        f"https://api.example.com/r?utm_source=x&token={token}") == token
+    assert gateway._redirect_token_from_url(
+        f"https://api.example.com/r?tokenish=nope&token={token}") == token
+    # and the absent/odd cases degrade to "" rather than raising
+    assert gateway._redirect_token_from_url("https://api.example.com/r") == ""
+    assert gateway._redirect_token_from_url("https://api.example.com/r?utm_source=x") == ""
+    assert gateway._redirect_token_from_url("") == ""
+
+
+def test_the_claim_follows_the_url_the_link_was_actually_built_from(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The redirect is built from `canonical_url or destination_url`. When those two point at
+    different HOSTS, warm eligibility must be judged on the one the buyer will actually reach.
+
+    Judging the wrong column flips the answer silently: here `other.com` is off the allowlist,
+    so reading it would restore a `false` the warm lane can contradict.
+    """
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False,
+        row_overrides={
+            "canonical_url": "https://brand.com/products/serum",
+            "destination_url": "https://other.com/products/serum",
+        },
+        allowed_domains=["brand.com", "other.com"],
+    )
+    assert _dest_of(offer).startswith("https://brand.com/"), (
+        "fixture drift: the link no longer resolves to the canonical host, so this test "
+        "cannot distinguish the two columns"
+    )
+    assert offer["cart_prefilled"] is None
+
+
 def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
     """Drive the REAL route and return (offer, decoded_token_dest).
 

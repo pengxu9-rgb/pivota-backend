@@ -27,14 +27,15 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 
-from config.settings import resolve_public_api_base_url
+from config.settings import resolve_public_api_base_url, settings
+from services.outbound_warm_handoff import could_upgrade_at_click_time
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
 from models.reviews_refs import SkuRef as ReviewsSkuRef
@@ -4296,7 +4297,42 @@ async def _handle_offers_resolve(
                         #
                         # Computed by the SAME resolve_cart_permalink the redirect itself
                         # uses, so the answer cannot drift from what the link does.
-                        "cart_prefilled": bool(offer_spec.get("cart_url")),
+                        #
+                        # SCOPE — this is RESOLVE-TIME truth, and one lane can change it at
+                        # CLICK time. The public redirect (`GET /r`, routes/outbound_links.py)
+                        # has a warm-handoff lane that, for an eligible destination, calls the
+                        # gateway's internal resolve and 302s the shopper to a PRE-BUILT cart
+                        # on the brand's own storefront instead of to `dest`
+                        # (services/outbound_warm_handoff.py :: evaluate_warm_eligibility).
+                        # Nothing in that lane looks at what we said here.
+                        #
+                        # The exposure is ONE-SIDED, and it is the `false` side:
+                        #   - `true`  -> dest is already a cart permalink; a warm handoff only
+                        #                ever BUILDS a cart, so the claim cannot be falsified.
+                        #   - `false` -> we told the agent "this lands on a product page, the
+                        #                buyer picks the variant themselves". If the lane
+                        #                fires, the buyer lands in a prefilled cart and the
+                        #                answer we already sent is wrong.
+                        #
+                        # NOT hypothetical: OUTBOUND_WARM_HANDOFF_ENABLED is `true` on the
+                        # serving prod revision with a live internal key and
+                        # OUTBOUND_WARM_HANDOFF_BRANDS set to six brand domains (verified
+                        # 2026-08-22 against Cloud Run `web`, us-west1). The code DEFAULT in
+                        # config/settings.py is false — read the deployed env, not the default.
+                        #
+                        # Fed the cart_url `compose_attributed_destinations` ALREADY decided,
+                        # so the claim cannot drift from the `execution_spec.cart_url` printed
+                        # beside it or from the link `affiliate_url` resolves to.
+                        # See docs/runbooks/outbound_warm_handoff_rollout.md.
+                        "cart_prefilled": _cart_prefilled_claim(
+                            cart_url=composed_spec["cart_url"],
+                            # The SAME value compose_attributed_destinations was given
+                            # (`canonical_url or destination_url`), not the raw column.
+                            destination_url=str(canonical_url or destination_url),
+                            # The link we JUST minted, so the resolve-time rollout bucket is
+                            # computed from the very token the click will carry.
+                            redirect_url=redirect_url,
+                        ),
                         "execution_spec": offer_spec,
                         "internal_checkout_items": None,
                         "confidence": confidence,
@@ -7181,6 +7217,89 @@ def resolve_cart_permalink(
     )
 
 
+def _redirect_token_from_url(redirect_url: str) -> str:
+    """Read the signed token back out of a link _make_external_redirect_url just built.
+
+    The click lane's rollout bucket is a stable hash of this exact string, so recovering it
+    (rather than re-minting or guessing) is what makes the resolve-time eligibility check
+    agree with the click. The token is base64url with the padding stripped and a `.`
+    separator, so it survives the query string byte-identically — no percent-decoding gap
+    between what is written here and what `GET /r` receives.
+    """
+    try:
+        query = urlparse(str(redirect_url or "")).query or ""
+    except Exception:
+        return ""
+    for item in query.split("&"):
+        if item.startswith("token="):
+            return unquote(item[len("token="):])
+    return ""
+
+
+def _cart_prefilled_claim(
+    *,
+    cart_url: Optional[str],
+    destination_url: str,
+    redirect_url: str,
+) -> Optional[bool]:
+    """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
+
+    `cart_url` is the decision already made by `compose_attributed_destinations` — NOT
+    recomputed here. A third derivation of "is there a cart" could disagree with both the
+    published `execution_spec.cart_url` and the link `affiliate_url` resolves to.
+
+    `None` exists because a `False` is not merely the absence of a cart — it is a POSITIVE
+    claim to a buyer, relayed as "this link lands on a product page, you pick the variant
+    yourself", and the warm-handoff click lane (routes/outbound_links.py,
+    services/outbound_warm_handoff.py) can land that same buyer in a prefilled cart
+    afterwards. The answer has already been sent by then, so it cannot be corrected.
+    PIVOTA-Agent #2082 made the gateway field a tri-state for exactly this reason: only an
+    explicit backend `False` licenses saying it.
+
+    The exposure is ONE-SIDED, which is why only the `False` leg is guarded: the warm lane can
+    only ever BUILD a cart, so it can turn a `False` into a lie but never a `True`. That
+    guarantee is NOT enforced in this repo — eligibility has no knockout for a dest that is
+    already a cart, and _validate_continue_url checks only scheme + host. It holds because the
+    gateway derives continue_url from a UCP create_cart and returns nothing else. A change on
+    that side could falsify a `True` here with nothing local failing; see the runbook.
+
+    Why not predict `True` instead? Because the upgrade depends on a live gateway call at
+    click time that can miss (timeout, non-200, off-brand continue_url) and on a user-agent we
+    do not have. "Prefilled cart" would be just as unprovable a claim as "bare PDP". The only
+    honest answer for a warm-eligible cold offer is "unknown".
+
+    `False` still survives wherever it is provable — flag off, internal key unset, unparseable
+    destination host, affiliate destination (never warm-handed), host not allowlisted, or
+    token outside the rollout bucket — so this does not blanket the field with nulls; it
+    removes it exactly where it would be wrong.
+
+    NOTE the sibling field `execution_spec.rail`, which is `"referral"` on exactly this cold
+    population and carries the same falsifiability. It is deliberately NOT nulled here: its
+    vocabulary is a two-value string the gateway consumes, and adding a third state is a
+    contract change, not a bug fix. Recorded in the runbook.
+    """
+    if cart_url:
+        return True
+
+    # The token's `dest` for this (cold) branch is the same destination_url with UTM and the
+    # referral click param appended — query-only edits — so its HOST, the only part warm
+    # eligibility reads, is the host of the value passed here.
+    redirect_token = _redirect_token_from_url(redirect_url)
+    if settings.outbound_warm_handoff_enabled and not redirect_token:
+        # Unreachable while _make_external_redirect_url returns `{base}/r?token={token}`, and
+        # deliberately not an exception: the pct-rollout branch of eligibility is keyed on the
+        # token, so without it `False` is no longer PROVABLE. Say unknown rather than guess —
+        # a wrong `False` is the defect this whole function exists to prevent.
+        return None
+    if could_upgrade_at_click_time(
+        dest=destination_url,
+        token=redirect_token,
+        settings=settings,
+    ):
+        return None
+    return False
+
+
 def _redirect_token_expiry(redirect_url: Optional[str]) -> Optional[str]:
     """The `/r` token's own expiry, as UTC ISO-8601, or None.
 
@@ -7192,7 +7311,7 @@ def _redirect_token_expiry(redirect_url: Optional[str]) -> Optional[str]:
     must degrade to "no expiry claimed" rather than inventing one.
     """
     try:
-        token = parse_qs(urlparse(str(redirect_url or "")).query).get("token", [""])[0]
+        token = _redirect_token_from_url(str(redirect_url or ""))
         if not token:
             return None
         payload, _is_expired = parse_redirect_token_verified(token)
