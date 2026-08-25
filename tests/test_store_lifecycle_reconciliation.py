@@ -1310,3 +1310,63 @@ async def test_deleting_the_last_store_leaves_an_observed_brand_alone():
     assert out["changed"] is False
     assert out["skipped"] == "unmanaged_status:observed"
     assert await _merchant_status(merchant) == "observed"
+
+
+@pytest.mark.asyncio
+async def test_real_delete_route_flips_the_merchant_inactive():
+    """Drives the REAL route — `DELETE /merchant/integrations/store/{id}`.
+
+    Every other test in this section calls `sync_catalog_merchant_status`
+    directly and SIMULATES what the route does. That leaves the one line which
+    actually delivers the fix — `last_store_removed=True` at the route's call
+    site — covered by nothing: review confirmed that deleting it left all 81
+    other tests green while fully restoring the user-visible bug. Same standard
+    as `test_portal_status_patch_counts_as_a_reconnect` above, and for the same
+    reason.
+
+    The route's own SQL runs for real against the fixture DB; only the auth
+    identity is supplied.
+    """
+    from routes import manage_integrations
+
+    merchant = f"{_MERCHANT_PREFIX}_routedel"
+    store_id = f"{merchant}_s1"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(store_id, merchant, "active")
+
+    result = await manage_integrations.delete_store(
+        store_id,
+        {"role": "merchant", "merchant_id": merchant},
+    )
+
+    assert result["status"] == "success"
+    assert await _store_row(store_id) == {}, "the route must hard-delete the row"
+    assert await _merchant_status(merchant) == "inactive"
+
+
+@pytest.mark.asyncio
+async def test_real_delete_route_404s_without_touching_merchant_status():
+    """The retry / wrong-owner case.
+
+    The evidence flag is only sound because the route proves ownership BEFORE it
+    deletes. A double-click, a stale store_id, or another merchant's store_id
+    must 404 ahead of the transaction and never reach the write-through — if it
+    ever stopped doing so, `last_store_removed=True` would become a way to
+    deactivate a merchant who still has a live storefront.
+    """
+    from fastapi import HTTPException
+
+    from routes import manage_integrations
+
+    merchant = f"{_MERCHANT_PREFIX}_routedel404"
+    await _seed_merchant(merchant, "active")
+    await _seed_store(f"{merchant}_kept", merchant, "active")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await manage_integrations.delete_store(
+            f"{merchant}_never_existed",
+            {"role": "merchant", "merchant_id": merchant},
+        )
+
+    assert excinfo.value.status_code == 404
+    assert await _merchant_status(merchant) == "active"

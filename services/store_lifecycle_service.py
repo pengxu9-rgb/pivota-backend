@@ -209,12 +209,23 @@ def derive_merchant_status(
 
     This closes an asymmetry the previous docstring got wrong. It argued that
     hard-deleting store rows was safe to ignore because "the rows it deletes are
-    already 'inactive', so the status it keeps is already 'inactive'". That
-    holds for POST /merchant/integrations/cleanup, which only sweeps inactive
-    rows. It does NOT hold for DELETE /merchant/integrations/store/{store_id},
-    which deletes a store at ANY status: detach your last ACTIVE store and the
+    already 'inactive', so the status it keeps is already 'inactive'". That is
+    plainly false for DELETE /merchant/integrations/store/{store_id}, which
+    deletes a store at ANY status: detach your last ACTIVE store and the
     merchant kept catalog_merchants.status='active' and kept serving on public
-    recall — #1648 reopened through the one door the fix did not cover.
+    recall — #1648 reopened through the one door the fix did not cover. That is
+    the case this parameter exists for.
+
+    It is also weaker than it looks for POST /merchant/integrations/cleanup,
+    which really does only sweep status='inactive' rows and is left on the
+    default here. The argument holds only if the write-through that set those
+    rows inactive actually LANDED. This function never raises and returns a
+    `skipped` reason instead — 'disabled' (kill switch), 'no_catalog_merchant_row'
+    (the catalog row minted after the disconnect), 'error:*',
+    'write_did_not_persist'. Any of those followed by a cleanup leaves a
+    zero-row merchant at 'active', and see the note in
+    `sync_catalog_merchant_status` on why nothing later repairs it. Narrower
+    than the DELETE hole, not closed. Treat this as a known gap, not a proof.
     """
     rows = [str(s or "").strip().lower() for s in store_statuses]
     if not rows:
