@@ -41,3 +41,31 @@ def test_receipt_rejects_free_form_or_sensitive_checkout_data(value):
 def test_successful_probe_requires_merchant_checkout_evidence():
     with pytest.raises(ValidationError, match="requires checkout evidence"):
         _receipt(checkout=None)
+
+
+def test_idle_claim_returns_204_through_the_http_layer(monkeypatch):
+    # The defect lived in FastAPI's response_model validation, so a direct
+    # call to claim_commerce_probe cannot catch it — the request must cross
+    # the HTTP layer for validation to run.
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routes import store_audit_commerce_probe_internal as commerce_module
+
+    monkeypatch.setenv("STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED", "true")
+    monkeypatch.setenv("STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY", "test-key")
+
+    async def no_claim(**_kwargs):
+        return None
+
+    monkeypatch.setattr(commerce_module, "claim_next_pending_verification", no_claim)
+    app = FastAPI()
+    app.include_router(commerce_module.router)
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/internal/store-audit/commerce-probes/claims",
+        json={"worker_id": "commerce-worker-1"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+    assert response.status_code == 204
+    assert response.content == b""

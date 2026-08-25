@@ -176,8 +176,10 @@ async def claim_commerce_probe(
         verifier_id=VERIFIER_COMMERCE_CHECKOUT_PROBE,
     )
     if not claimed:
-        response.status_code = status.HTTP_204_NO_CONTENT
-        return None
+        # FastAPI validates a returned ``None`` against response_model before
+        # honoring a mutated injected Response status. Return a concrete empty
+        # response so an idle remote worker gets the intended 204, not a 500.
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     route = await fetch_execution_route(
         execution_route_id=str(claimed.get("execution_route_id") or ""),
     )
