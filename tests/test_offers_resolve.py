@@ -2225,3 +2225,90 @@ def test_merchant_domain_is_normalized_not_echoed(
     assert domain == "brand.com", f"expected a bare lowercase host, got {domain!r}"
     for leaked in ("https://", "User", "Pass", ":443", "/shop"):
         assert leaked not in (domain or ""), f"{leaked!r} must not survive into merchant_domain"
+
+
+# ---------------------------------------------------------------------------
+# execution_spec.rail vs the warm-handoff click lane (#1846 shipped `rail` after the
+# cart_prefilled guard landed, carrying the same exposure into a second field).
+# ---------------------------------------------------------------------------
+
+
+def test_rail_is_null_rather_than_referral_when_the_warm_lane_could_upgrade(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """`"referral"` is a positive claim about where the buyer ends up, on exactly the cold
+    population the warm lane targets — the same defect `cart_prefilled: false` had.
+
+    An agent that hands the buyer `affiliate_url` (the attributed link we WANT it to use) is
+    told "referral" and the buyer can land in a prefilled cart.
+    """
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    spec = offer["execution_spec"]
+    assert "rail" in spec, "the field must stay present — null is a STATE, not an omission"
+    assert spec["rail"] is None
+
+
+def test_rail_and_cart_prefilled_can_never_contradict_each_other(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """THE invariant. Both answer "what does following our link land the buyer in", so a single
+    offer must not carry two different answers in one payload.
+
+    Asserted across every configuration that moves the verdict, because computing them from two
+    separate expressions is exactly how they would drift.
+
+    LIMIT, stated so nobody over-trusts this: the single shared call is a STRUCTURAL property
+    and no behavioural test can enforce it. Re-splitting it into two byte-identical calls is
+    invisible here and always will be — only a recomputation that actually DIVERGES (a wrong
+    `destination_url`, say) gets caught. This test guards the agreement, not the sharing.
+    """
+    cases = [
+        ("allowlisted brand, cold", "brand.com", 0, False),
+        ("allowlisted brand, warm", "brand.com", 0, True),
+        ("host off the allowlist", "someone-else.com", 0, False),
+        ("no allowlist, full rollout", "", 100, False),
+        ("no allowlist, no rollout", "", 0, False),
+    ]
+    for label, brands, pct, evidence in cases:
+        monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", brands)
+        monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", pct)
+        offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=evidence)
+        rail = offer["execution_spec"]["rail"]
+        prefilled = offer["cart_prefilled"]
+        assert (rail is None) is (prefilled is None), (
+            f"{label}: rail={rail!r} but cart_prefilled={prefilled!r} — one hedges and the "
+            "other commits, about the same link in the same payload"
+        )
+        if prefilled is True:
+            assert rail == "shopify_cart", f"{label}: {rail!r}"
+        elif prefilled is False:
+            assert rail == "referral", f"{label}: {rail!r}"
+
+
+def test_rail_still_says_referral_where_that_claim_is_provable(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The guard must not blanket the field with nulls — a host the lane can never touch keeps
+    its rail, or the field stops carrying information at all."""
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "someone-else.com")
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["execution_spec"]["rail"] == "referral"
+
+    # Put the host BACK on the allowlist before flipping the flag, or this leg proves nothing
+    # about the flag: eligibility returns `not_allowlisted` before it is ever consulted, and the
+    # leg silently becomes a weaker duplicate of the one above. Measured — without this line,
+    # deleting the resolve-time flag check entirely left all four of these tests green.
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "brand.com")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    assert offer["execution_spec"]["rail"] == "referral"
+
+
+def test_a_shopify_cart_rail_is_never_nulled_by_the_guard(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """One-sided, like cart_prefilled: the lane only ever BUILDS carts (and since #1848 refuses
+    a dest that is already one), so a cart rail cannot be falsified and must survive."""
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=True)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+    assert offer["cart_prefilled"] is True
