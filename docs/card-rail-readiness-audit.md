@@ -263,6 +263,31 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 
 ## 4. Prioritized backlog
 
+> **Status reconciliation — re-measured 2026-08-24 against `origin/main` and against live GCP.**
+>
+> **Correction to an earlier pass of this section:** it reported items 3a, 3 and 14 as "not
+> started" on the strength of a grep against `infra/gcp/setup_egress_nat.sh` and
+> `setup_scheduler.sh`. That was a scope error — the work landed in *new* files those greps
+> could not see (`setup_crawl_egress.sh`, `migrate_payment_nat_to_default_subnet.sh`,
+> `jobs/scheduled_ucp_reprobe_job.py`, `routes/store_audit_probe_internal.py`). The corrected
+> state is below. Where a row says "not started", it now means a positive check was run, not
+> that one filename lacked a match.
+>
+> | Item | State | Evidence |
+> |---|---|---|
+> | 3a — dedicated crawl egress | **DONE, provisioned and live in BOTH projects.** `pivota-crawl-nat` is `LIST_OF_SUBNETWORKS` on `pivota-crawl`, with reserved IPs `IN_USE`: staging `34.11.177.234`, prod `34.82.199.35`. The payment NAT was narrowed to `default` while retaining its address (staging `136.66.216.216`, prod `8.231.167.230`). Confirmed by the read-only guard `migrate_payment_nat_to_default_subnet.sh <env> --check` in both. The design also solves a constraint this audit missed: Cloud NAT permits only one `ALL_SUBNETWORKS_ALL_IP_RANGES` NAT per VPC/region, so the crawl script hard-fails until the payment NAT is narrowed first. | live `gcloud`, 2026-08-24 |
+> | 3 — per-domain UCP probe + stored profile | **built, shipped inert.** Isolated probe lane with its own least-privilege identity, migration 196 (`store_audit_execution_routes`), receipt endpoint closed unless `STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED` **and** a dedicated key are both set. Triggers created `PAUSED`. Not a stored capability table yet — it writes `execution_routes` + `acceptance_signal` evidence. | `routes/store_audit_probe_internal.py`, `docs/commerce-index-crawl-lane.md` |
+> | 14 — scheduled freshness / re-probe | **built, default-off selector.** `jobs/scheduled_ucp_reprobe_job.py` + `scripts/run_scheduled_ucp_reprobes.py`; `PAUSED=0` is deliberately *rejected* while Store Audit UCP is present, so arming it cannot resume unrelated Scheduler jobs. | same |
+> | 2 — refresh can correct a stale price | **shipped** | #1812 |
+> | 1 — `recommendation_id` | **half** — minted per item and per set (#2080), logged on lane outage (#2081). The accept-it-back half is item 10 and does not exist. | #2080, #2081 |
+> | 4 — numeric variant-id backfill | **in flight** — producer merged (#1813, #1820); 864 rows written. Cohort coverage **10.0%** (1,074 / 10,763 active rows whose URL contains `/products/`). | measured live |
+> | 5 — execution spec v0 | **shipped this pass.** `merchant_domain`, `pdp_url`, `cart_url`, `variant_id`, `rail`, `expires_at`, `tracking` now ride on every external offer, composed by the same function the redirect signs. `recommendation_id` is deliberately **not** in it: it is minted in the gateway's `recommend_products`, not at `offers.resolve`, and stamping a fabricated one would defeat the join it exists for. | this PR |
+> | 12 — attribution on the agent's own lane | **shipped this pass.** One click id now spans the signed token, `pdp_url` and `cart_url`. | this PR |
+> | 8 — rate-limit + robots the fetcher | **not started for the offers fetcher.** `_fetch_html` (`services/external_offers_service.py:1200`) has no token bucket and no robots check; the `_robots_allows` helper lives in a different lane (`services/bd_brand_signals.py`). The crawl-lane doc makes robots + per-domain rate-limit + consent + dry-run explicit prerequisites before any crawl Job is deployed onto `pivota-crawl`, so this is now the gate on using the egress that already exists. | verified by grep |
+> | 6 — live-verify top-3 | **not started.** Note the v2 index design partly supersedes the framing: public crawl carries authority 45 and "never auto-publishes checkout-sensitive facts", and checkout is specified to always live-validate. | `docs/commerce-index-v2.md` |
+> | 7, 10 (Wave 3) · 9, 11, 13, 15, 16 (Wave 4) | **not started** | verified by grep |
+
+
 Ordered by (blocking × effort), then sequenced against the **Sep 8–12 cutover** (§3.4). The **Where** column is load-bearing: it is what keeps this work from being built twice.
 
 ### Wave 1 — now → Sep 6. Code-only, platform-agnostic, rides the cutover for free

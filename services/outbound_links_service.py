@@ -133,7 +133,11 @@ def apply_utm(destination_url: str, utm_template: str, tokens: Dict[str, str]) -
 # setup (order-side join, closable by T2-2). Non-Shopify destinations get the id
 # as a plain query param for click-side attribution only (honest degradation).
 
-_SHOPIFY_CART_CLICK_ATTRIBUTE = "attributes[pivota_click_id]"
+# Public: the execution spec has to tell an agent WHICH carrier holds the join key on the URL
+# it was handed. `attributes[...]` for a cart, REFERRAL_CLICK_PARAM for a referral — naming
+# the wrong one sends the agent looking for a key that is not in the string.
+SHOPIFY_CART_CLICK_ATTRIBUTE = "attributes[pivota_click_id]"
+_SHOPIFY_CART_CLICK_ATTRIBUTE = SHOPIFY_CART_CLICK_ATTRIBUTE  # back-compat alias
 REFERRAL_CLICK_PARAM = "pvt_click_id"
 
 
