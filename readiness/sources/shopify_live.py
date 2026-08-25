@@ -20,6 +20,11 @@ from services.merchant_store_service import get_primary_store
 
 logger = logging.getLogger(__name__)
 
+# Mirrors `merchant_stores`' own active-status vocabulary
+# (services/store_lifecycle_service.ACTIVE_STORE_STATUSES). A store outside this
+# set is attached in name only and must not keep a catalog alive.
+_ATTACHED_STORE_STATUSES = frozenset({"active", "connected"})
+
 _POLICY_FIXTURE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "alpha_merchant_policies.json"
 
 
@@ -280,13 +285,34 @@ class ShopifyLiveMerchantSource:
         # Does this merchant still have a storefront attached at all?
         #
         # `shopify_connected` cannot answer that. `_get_shopify_config_for_merchant`
-        # falls back to the GLOBAL settings/env Shopify credentials when the
-        # merchant has none of their own, so it reads "connected" for a merchant
-        # with zero stores whenever SHOPIFY_SHOP_DOMAIN/SHOPIFY_ACCESS_TOKEN are
-        # set in the environment — which they are in prod. `get_primary_store`
-        # is the structural signal: it returns the newest merchant_stores row
-        # with status IN ('active','connected'), falling back to the legacy
-        # merchant_onboarding.mcp_* connection, and None when neither exists.
+        # resolves credentials in three steps, and the FIRST is the merchant's own
+        # encrypted `connector_credentials` row — which NO detach path deletes
+        # (not the portal DELETE, not the app/uninstalled webhook, not the
+        # auto-disconnect job). So a merchant keeps returning a decryptable
+        # shop_domain + access_token long after their last store is gone, and
+        # `shopify_connected` stays True. Its third step also falls back to the
+        # GLOBAL settings/env Shopify credentials, which would have the same
+        # effect wherever those are configured.
+        #
+        # `get_primary_store` is the structural signal, but `is not None` is NOT
+        # the right test on it. Its merchant_stores leg does filter
+        # `status IN ('active','connected')`; its LEGACY leg
+        # (`get_merchant_active_stores`, services/merchant_store_service.py)
+        # does not — it appends a store dict whenever
+        # `merchant_onboarding.mcp_platform` is truthy and merely LABELS it
+        # `status='disconnected'` when `mcp_connected` is false.
+        #
+        # That distinction decides which detach paths this gate covers.
+        # `DELETE /merchant/integrations/store/{store_id}` — the portal's detach
+        # button — clears `mcp_platform = NULL` when the last store goes, so the
+        # legacy leg goes quiet and `is not None` would have sufficed. But the
+        # Shopify `app/uninstalled` webhook and the hourly auto-disconnect job
+        # both set `merchant_stores.status='disconnected'` and touch NO `mcp_*`
+        # column, leaving `mcp_platform` set forever. Those merchants would come
+        # back from `get_primary_store` as a non-None, 'disconnected' legacy
+        # store and sail straight through an `is not None` gate — the exact bug
+        # this function is here to fix, on the two paths a merchant is most
+        # likely to hit. So: require the store to actually be ACTIVE.
         #
         # This matters because the product cache is keyed on merchant_id +
         # platform ALONE — no store_id — and readiness reads it with
@@ -301,7 +327,11 @@ class ShopifyLiveMerchantSource:
         #
         # Detaching a store must retire its catalog from this report, not merely
         # add one more merchant-level blocker alongside a full issue list.
-        store_connected = store is not None
+        store_status = str((store or {}).get("status") or "").strip().lower()
+        store_connected = store is not None and store_status in _ATTACHED_STORE_STATUSES
+        # An attached store AND usable credentials — the precondition for any
+        # capability that actually talks to the storefront.
+        storefront_live = store_connected and shopify_connected
         if not store_connected:
             merchant_blockers.append("store_connection_missing")
         if not policy:
@@ -490,20 +520,26 @@ class ShopifyLiveMerchantSource:
             merchant_warnings.append("active_psp_configuration_missing")
 
         payment_capabilities = {
-            "merchant_native_checkout_supported": bool(shopify_connected and psp_config),
-            "merchant_platform_writeback_supported": bool(shopify_connected),
-            "ucp_checkout_supported": bool(shopify_connected and psp_config),
-            "acp_checkout_supported": bool(shopify_connected and psp_config),
+            # `store_connected and shopify_connected`, not credentials alone:
+            # surviving connector_credentials keep `shopify_connected` True after
+            # a detach, and a merchant with no storefront cannot execute checkout
+            # or write orders back to one. Leaving these on credentials alone is
+            # what made a detached merchant's card read "ready" beside a summary
+            # saying "blocked".
+            "merchant_native_checkout_supported": bool(storefront_live and psp_config),
+            "merchant_platform_writeback_supported": bool(storefront_live),
+            "ucp_checkout_supported": bool(storefront_live and psp_config),
+            "acp_checkout_supported": bool(storefront_live and psp_config),
             "payment_mode": "merchant_psp" if psp_config else "blocked",
             "psp_provider": (psp_config or {}).get("provider"),
             "psp_id": (psp_config or {}).get("psp_id"),
         }
 
         capability_status = {
-            "merchant_adapter": "ready" if shopify_connected else "blocked",
+            "merchant_adapter": "ready" if storefront_live else "blocked",
             "channel_export": "ready" if products else "blocked",
             "checkout": "ready" if payment_capabilities["merchant_native_checkout_supported"] else "blocked",
-            "order_sync": "ready" if shopify_connected else "blocked",
+            "order_sync": "ready" if storefront_live else "blocked",
             "reviews_confidence": "ready"
             if review_diagnostics.get("integration_status") == "ready" and review_diagnostics.get("products_with_reviews")
             else "partial"

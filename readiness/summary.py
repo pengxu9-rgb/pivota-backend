@@ -2717,6 +2717,14 @@ def _recommended_actions(
         return ["Run the merchant readiness assessment and review the remediation checklist."]
 
     actions: list[str] = []
+    # First, because with no storefront there are no products, so every
+    # product-shaped branch below is silent and the function used to fall all
+    # the way through to "ready for supervised LLM commerce" — rendered on the
+    # overview card directly beside a summary reading "currently blocked".
+    if "store_connection_missing" in blockers:
+        actions.append("Reconnect your store to restore this merchant's catalog.")
+    elif "shopify_configuration_missing" in blockers:
+        actions.append("Repair the store connection credentials so the catalog can sync.")
     if blocker_counts.get("missing_price") or blocker_counts.get("missing_currency"):
         actions.append("Fix pricing sync for variants with missing price or currency.")
     if blocker_counts.get("out_of_stock"):
@@ -2781,6 +2789,11 @@ def _next_action(
         return "Enable readiness assessment before using LLM commerce for this merchant."
     if assessment_state == "not_assessed":
         return "Run readiness assessment and merchant remediation before enabling LLM commerce."
+    # Before the checkout branch: with no storefront there is nothing to connect
+    # checkout TO, and `ready_variant_count == 0` would otherwise answer with
+    # "make a variant discovery-ready" for a merchant who has no catalog.
+    if "store_connection_missing" in blockers:
+        return "Reconnect a storefront before this merchant can be assessed for LLM commerce."
     if "merchant_checkout_capability_missing" in blockers or capability_status.get("checkout_execution") == "blocked":
         return "Connect and verify checkout and payment execution before enabling checkout flows."
     if "merchant_writeback_unavailable" in blockers or capability_status.get("order_writeback_state_sync") == "blocked":
