@@ -17,9 +17,18 @@ is enforced with `asyncio.wait`, NOT `wait_for` around a `gather`: a gather that
 every task, so one slow merchant would cost the verdicts of two fast ones. Whatever finished inside
 the budget is kept.
 
+WHAT IT VERIFIES, AND WHAT IT DELIBERATELY DOES NOT. Shopify's `/products/<handle>.js` returns the
+shop's DEFAULT-currency amount in minor units and carries NO currency code. So this source can
+establish EXISTENCE and STOCK — both currency-free facts — but it cannot establish PRICE: writing
+its number onto an offer quoted in another currency publishes ¥4500 as $4500. That is the
+amount-without-its-currency class this repo has already fixed twice (see `_observed_currency` in
+agent_shop_gateway). Verifying price needs a currency-bearing source, which is UCP `create_checkout`
+— audit item 9. Until then the live amount is carried as INFORMATIONAL only and never replaces the
+quoted one. That still addresses the larger half of the 31.1%: 11.1% out-of-stock plus the dead PDPs.
+
 DEGRADATION IS NEVER SILENT (audit F3):
-  * `verified`   — the merchant answered. The live price and stock are returned, and they REPLACE
-                   the remembered ones. A price that moved is the point of the exercise, not an error.
+  * `verified`   — the merchant answered and the item is buyable. Stock is replaced; the price is
+                   NOT (see above).
   * `gone`       — 404, or the variant is absent or out of stock. DROP the offer and take the
                    next-best merchant; we have duplicate coverage of many products.
   * `unverified` — timed out, blocked, or not a storefront we can read. Keep the snapshot, but the
@@ -45,7 +54,11 @@ from urllib.parse import urlparse
 import httpx
 
 from services import crawl_politeness
-from services.shopify_variant_identity import parse_product_js, product_js_url
+from services.shopify_variant_identity import (
+    parse_product_js,
+    product_js_url,
+    storefront_is_shopify,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +70,7 @@ _DEFAULT_TOP_K = 3
 _DEFAULT_DEADLINE_S = 1.5
 _DEFAULT_CACHE_TTL_S = 90.0          # audit F2 says 60-120s
 _DEFAULT_FETCH_TIMEOUT_S = 1.2       # inside the batch deadline, so one fetch cannot eat it all
+_MAX_REDIRECTS = 3
 _USER_AGENT = os.getenv("EXTERNAL_OFFER_USER_AGENT") or "Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)"
 
 # A price is "the same" if it rounds to the same cent. Anything looser would let a real markdown
@@ -112,8 +126,16 @@ _LOCAL: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _LOCAL_MAX = 5_000
 
 
-def _cache_key(url: str, variant_id: Optional[str]) -> str:
-    return f"lov:{url}|{variant_id or '-'}"
+def _cache_key(url: str) -> str:
+    """Keyed by URL ALONE.
+
+    The fetched document contains EVERY variant, so keying per variant made three variants of one
+    product cost three identical fetches — and the external builder routinely emits exactly that
+    shape (one offer per variant of one seed). Keying per URL also removes any chance of one
+    variant's facts being served for another, because the variant is selected from the cached
+    document per offer rather than baked into the key.
+    """
+    return f"lov:doc:{url}"
 
 
 async def _cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -207,78 +229,87 @@ def _target(offer: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     return product_js_url(str(page_url).split("?", 1)[0]), (str(variant_id) if variant_id else None)
 
 
-async def _check_one(offer: Dict[str, Any]) -> Verdict:
+async def _check_one(
+    offer: Dict[str, Any], *, max_wait: Optional[float] = None
+) -> Verdict:
     js_url, variant_id = _target(offer)
     if not js_url:
         return Verdict(UNVERIFIED, "no_verifiable_url")
 
-    key = _cache_key(js_url, variant_id)
-    cached = await _cache_get(key)
-    if cached:
-        # `price_changed` is recomputed against THIS offer's quote, never read from the cache.
-        # The cache key is (url, variant) — a property of the PRODUCT — but "did the price move"
-        # is a property of the QUOTE, and two offers for the same product can quote differently
-        # (a stale seed beside a fresh one, or two markets). Reusing the cached flag would attach
-        # one offer's staleness to another's, which is the fabrication class this module exists
-        # to remove.
-        live = (
-            Decimal(str(cached["live_price"])) if cached.get("live_price") is not None else None
-        )
-        return Verdict(
-            status=cached["status"],
-            reason=cached["reason"] + "_cached",
-            source=cached.get("source", "shopify_product_js"),
-            live_price=live,
-            live_currency=cached.get("live_currency"),
-            in_stock=cached.get("in_stock"),
-            price_changed=_price_moved(live, offer),
-        )
+    # S3: `gone` DELETES a merchant from the shortlist, so it may only be concluded from positive
+    # evidence that this is a Shopify storefront. `/products/<slug>` in a path is a URL SHAPE, not
+    # a platform: headless Hydrogen, Squarespace `/store/products/`, SFCC `/products/x.html` and
+    # any WAF that 404s an unknown UA all match it and none serve the `.js` route. Without
+    # evidence a 404 means "we could not ask", not "it is gone".
+    seed = offer.get("source") if isinstance(offer.get("source"), dict) else {}
+    shopify_evidenced = storefront_is_shopify(seed.get("seed_data") or seed)
 
-    try:
-        # BOUNDED wait. This is a live request path; an unbounded pace would be #1854's P1 again.
-        await crawl_politeness.before_request(js_url, user_agent=_USER_AGENT)
-    except crawl_politeness.RobotsDisallowed:
-        return Verdict(UNVERIFIED, "robots_disallowed")
-    except crawl_politeness.CrawlPaced:
-        return Verdict(UNVERIFIED, "paced_out")
-
-    timeout = _f("LIVE_OFFER_VERIFICATION_FETCH_TIMEOUT_SECONDS", _DEFAULT_FETCH_TIMEOUT_S)
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(
-                js_url, headers={"User-Agent": _USER_AGENT, "Accept": "application/json"}
+    doc = await _cache_get(_cache_key(js_url))
+    if doc is None:
+        try:
+            # S1: the gate is given the CALLER'S remaining budget, not its own 10s default.
+            # `await_slot` refuses BEFORE reserving, so an over-budget host answers `paced_out`
+            # immediately instead of reserving a slot and then being cancelled at the deadline —
+            # which left the reservation consumed and pushed every later turn further out. Three
+            # 1s-paced requests cannot fit a 1.5s batch, so under the defaults that backlog grew
+            # monotonically and verification collapsed to ~8%.
+            await crawl_politeness.before_request(
+                js_url, user_agent=_USER_AGENT, max_wait=max_wait
             )
-        crawl_politeness.note_response(
-            js_url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
-    except Exception as exc:  # noqa: BLE001 - a failed check degrades, it never raises
-        logger.info("live-verify fetch failed for %s: %s", js_url, exc)
-        return Verdict(UNVERIFIED, "fetch_failed")
+        except crawl_politeness.RobotsDisallowed:
+            return Verdict(UNVERIFIED, "robots_disallowed")
+        except crawl_politeness.CrawlPaced:
+            return Verdict(UNVERIFIED, "paced_out")
 
-    if resp.status_code == 404:
-        # A dead PDP is 14.5% of the crawl cohort. Serving it is worse than serving nothing.
-        verdict = Verdict(GONE, "pdp_404")
-        await _cache_put(key, verdict.as_dict() | {"reason": "pdp_404"})
-        return verdict
-    if resp.status_code != 200:
-        return Verdict(UNVERIFIED, f"http_{resp.status_code}")
+        timeout = _f("LIVE_OFFER_VERIFICATION_FETCH_TIMEOUT_SECONDS", _DEFAULT_FETCH_TIMEOUT_S)
+        try:
+            # `max_redirects` capped for the same reason crawl_politeness caps it: the gate is
+            # consulted ONCE, before hop 1, so httpx's default of 20 would turn one paced request
+            # into up to 21 unpaced ones from the shared crawl NAT IP — and no intermediate hop
+            # reaches `note_response`, so a 429 mid-chain never feeds the backoff.
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=True, max_redirects=_MAX_REDIRECTS
+            ) as client:
+                resp = await client.get(
+                    js_url, headers={"User-Agent": _USER_AGENT, "Accept": "application/json"}
+                )
+            crawl_politeness.note_response(
+                js_url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed check degrades, it never raises
+            logger.info("live-verify fetch failed for %s: %s", js_url, exc)
+            return Verdict(UNVERIFIED, "fetch_failed")
 
-    try:
-        variants = parse_product_js(resp.json())
-    except Exception:  # noqa: BLE001
-        return Verdict(UNVERIFIED, "unparseable")
+        if resp.status_code == 404:
+            if not shopify_evidenced:
+                return Verdict(UNVERIFIED, "not_a_known_shopify_storefront")
+            doc = {"status": 404, "variants": []}
+        elif resp.status_code != 200:
+            # NOT cached: a 5xx is transient, and caching it would keep a recovering merchant
+            # out of the shortlist for the whole TTL.
+            return Verdict(UNVERIFIED, f"http_{resp.status_code}")
+        else:
+            try:
+                doc = {"status": 200, "variants": parse_product_js(resp.json())}
+            except Exception:  # noqa: BLE001
+                return Verdict(UNVERIFIED, "unparseable")
+        await _cache_put(_cache_key(js_url), doc)
+
+    if doc.get("status") == 404:
+        return Verdict(GONE, "pdp_404")
+
+    variants = doc.get("variants") or []
     if not variants:
         return Verdict(UNVERIFIED, "no_variants")
 
-    chosen = None
     if variant_id:
         chosen = next((v for v in variants if v.get("shopify_variant_id") == variant_id), None)
         if chosen is None:
-            # We published a variant id the storefront no longer lists. Dropping is the honest
-            # answer: the cart permalink we handed out cannot be built any more.
-            verdict = Verdict(GONE, "variant_absent")
-            await _cache_put(key, verdict.as_dict() | {"reason": "variant_absent"})
-            return verdict
+            if not shopify_evidenced:
+                return Verdict(UNVERIFIED, "not_a_known_shopify_storefront")
+            # We published a variant id the storefront no longer lists: the cart permalink we
+            # handed out cannot be built any more.
+            return Verdict(GONE, "variant_absent")
     elif len(variants) == 1:
         chosen = variants[0]
     else:
@@ -287,23 +318,19 @@ async def _check_one(offer: Dict[str, Any]) -> Verdict:
         return Verdict(UNVERIFIED, "ambiguous_variant")
 
     if not chosen.get("available"):
-        verdict = Verdict(GONE, "out_of_stock", in_stock=False)
-        await _cache_put(key, verdict.as_dict() | {"reason": "out_of_stock"})
-        return verdict
+        return Verdict(GONE, "out_of_stock", in_stock=False)
 
     live_price = chosen.get("price_amount")
     live = Decimal(str(live_price)) if live_price is not None else None
 
-    verdict = Verdict(
+    # S2: the amount is INFORMATIONAL. `/products/<handle>.js` carries no currency code and
+    # returns the SHOP'S DEFAULT currency, so this number cannot be compared with, or substituted
+    # for, an offer quoted in another currency. `price_moved` is therefore only asserted when the
+    # comparison is meaningful, and the caller never replaces the published price from it.
+    return Verdict(
         VERIFIED, "ok", live_price=live, live_currency=None, in_stock=True,
         price_changed=_price_moved(live, offer),
     )
-    # Cache the PRODUCT facts only. `price_changed` is deliberately excluded — see the note on the
-    # cache read above.
-    cacheable = verdict.as_dict() | {"reason": "ok"}
-    cacheable.pop("price_changed", None)
-    await _cache_put(key, cacheable)
-    return verdict
 
 
 async def verify_offers(
@@ -329,7 +356,12 @@ async def verify_offers(
         return {}
 
     targets = list(enumerate(offers))[:k]
-    tasks = {asyncio.ensure_future(_check_one(o)): i for i, o in targets}
+    # The gate is handed the BATCH budget, not its own 10s default. `await_slot` refuses before
+    # reserving, so a host that cannot be served inside this turn says so immediately instead of
+    # consuming a slot it will be cancelled out of.
+    tasks = {
+        asyncio.ensure_future(_check_one(o, max_wait=budget)): i for i, o in targets
+    }
 
     # `asyncio.wait`, not `wait_for(gather(...))`. A gather that times out cancels EVERY task, so
     # one slow merchant would throw away the verdicts of the two fast ones. Partial results are
@@ -375,18 +407,20 @@ def apply_verdicts(
         enriched = dict(offer)
         enriched["verification"] = verdict.as_dict()
         if verdict.status == VERIFIED:
-            enriched["price_verified"] = True
-            # The live price REPLACES the remembered one. Keeping the stale number beside a
-            # "verified" flag would be the worst of both — a claim of freshness attached to the
-            # value we just proved wrong.
-            if verdict.live_price is not None:
-                enriched["price"] = float(verdict.live_price)
+            # STOCK is verified; PRICE is not, and the two must not be conflated. The source
+            # carries no currency code, so replacing `price` from it would publish a shop-currency
+            # amount under the offer's own currency label — the amount-without-its-currency class
+            # this repo has fixed twice. `stock_verified` says exactly what was established.
+            enriched["stock_verified"] = True
             if verdict.in_stock is not None:
                 enriched["in_stock"] = bool(verdict.in_stock)
             kept.append((0, enriched))
         else:
-            enriched["price_verified"] = False
-            enriched["confidence"] = "unverified"
+            enriched["stock_verified"] = False
+            # S7: a DISTINCT key. Both offer builders publish a numeric `confidence` (0.6/0.8/1.0)
+            # and `_merit` calls float() on it, so writing a string there would be a silent
+            # type-contract change on a published field with no response_model to catch it.
+            enriched["verification_confidence"] = "unverified"
             # F3: expected totals must not be asserted for something we could not check.
             spec = enriched.get("execution_spec")
             if isinstance(spec, dict):
@@ -396,4 +430,13 @@ def apply_verdicts(
             kept.append((1, enriched))
 
     kept.sort(key=lambda pair: pair[0])
-    return [offer for _rank, offer in kept]
+    out = [offer for _rank, offer in kept]
+
+    # S6: the guarantee is ABSOLUTE, not relative. A relative demotion says nothing when the
+    # WHOLE batch is unverified — which is the outage case the rule was written for, and the one
+    # where an agent is most likely to act on a stale price. We cannot invent a verified offer,
+    # so the honest move is to say so on the offer itself: the caller can then refuse to present
+    # it as a confident rank 1 rather than discovering the fact from a dashboard.
+    if out and out[0].get("stock_verified") is False:
+        out[0]["rank_one_unverified"] = True
+    return out

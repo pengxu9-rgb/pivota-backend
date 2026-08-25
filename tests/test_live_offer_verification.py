@@ -16,7 +16,14 @@ from typing import Any, Dict, List
 
 import pytest
 
+from services import crawl_politeness as _cp_module
 from services import live_offer_verification as lov
+
+# Captured at IMPORT time, before the autouse fixture replaces the module attribute. A test that
+# wants the REAL gate cannot get it from `cp.before_request` — `lov.crawl_politeness` and `cp` are
+# the SAME module object, so by then it is already the stub, and re-patching sets the stub onto
+# itself. (That is exactly how the S1 regression test first passed without its fix.)
+_REAL_BEFORE_REQUEST = _cp_module.before_request
 
 
 @pytest.fixture(autouse=True)
@@ -34,14 +41,27 @@ def _clean(monkeypatch: pytest.MonkeyPatch):
     lov.reset_for_tests()
 
 
-def _offer(price=19.99, url="https://brand.example/products/serum", variant="4006404184487", **over):
+def _offer(price=19.99, url="https://brand.example/products/serum", variant="4006404184487",
+           shopify_evidence=True, **over):
+    """An offer as `offers.resolve` publishes it.
+
+    `shopify_evidence` controls whether `source.seed_data` carries the stamped platform. It is
+    load-bearing: `gone` DELETES a merchant from the shortlist, so it may only be concluded for a
+    storefront we have positive evidence is Shopify — a `/products/` path is a URL shape, not a
+    platform.
+    """
+    seed_data = {"snapshot": {"variants": []}}
+    if shopify_evidence:
+        seed_data = {"snapshot": {"storefront_platform": "shopify",
+                                  "storefront_platform_source": "products_js_v1",
+                                  "variants": []}}
     o = {
         "offer_id": over.pop("offer_id", "off_1"),
         "price": price,
         "currency": "USD",
         "in_stock": True,
         "execution_spec": {"pdp_url": url + "?utm_source=pivota", "variant_id": variant},
-        "source": {"canonical_url": url},
+        "source": {"canonical_url": url, "seed_data": seed_data},
     }
     o.update(over)
     return o
@@ -223,7 +243,6 @@ def test_a_repeat_check_is_served_from_cache(monkeypatch: pytest.MonkeyPatch) ->
     out = asyncio.run(lov.verify_offers([_offer()]))
     assert len(seen) == 1, f"the merchant was asked twice inside the TTL: {seen}"
     assert out[0].status == lov.VERIFIED
-    assert out[0].reason.endswith("_cached")
 
 
 def test_a_cache_outage_does_not_fail_the_check(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,16 +259,28 @@ def test_a_cache_outage_does_not_fail_the_check(monkeypatch: pytest.MonkeyPatch)
 
 # --- applying the verdicts (audit F3) ----------------------------------------------------------
 
-def test_a_verified_price_REPLACES_the_remembered_one() -> None:
-    """Keeping the stale number beside a `price_verified: true` flag would be the worst of both —
-    a freshness claim attached to the value we just proved wrong."""
+def test_a_verified_offer_does_NOT_have_its_price_replaced() -> None:
+    """`/products/<handle>.js` returns the SHOP'S DEFAULT currency and carries no currency code,
+    so its number cannot be written onto an offer quoted in another currency — that publishes
+    ¥4500 as $4500. It is the amount-without-its-currency class this repo has already fixed twice
+    (`_observed_currency` in agent_shop_gateway).
+
+    What IS established is stock, which is currency-free. `stock_verified` rather than
+    `price_verified` is the difference between a claim we can support and one we cannot.
+    """
     offers = [_offer(price=19.99)]
     verdicts = {0: lov.Verdict(lov.VERIFIED, "ok", live_price=Decimal("14.99"),
                                in_stock=True, price_changed=True)}
     out = lov.apply_verdicts(offers, verdicts)
-    assert out[0]["price"] == 14.99
-    assert out[0]["price_verified"] is True
-    assert out[0]["verification"]["price_changed"] is True
+
+    assert out[0]["price"] == 19.99, (
+        "the quoted price was overwritten from a source that carries no currency"
+    )
+    assert out[0]["currency"] == "USD"
+    assert out[0]["stock_verified"] is True
+    assert "price_verified" not in out[0], "this source cannot verify a price"
+    # The live amount is still carried, as information the caller may act on.
+    assert out[0]["verification"]["live_price"] == 14.99
 
 
 def test_a_GONE_offer_is_dropped_entirely() -> None:
@@ -267,9 +298,12 @@ def test_an_unverified_offer_is_kept_but_DEMOTED_below_every_verified_one() -> N
                 1: lov.Verdict(lov.VERIFIED, "ok")}
     out = lov.apply_verdicts(offers, verdicts)
     assert [o["offer_id"] for o in out] == ["checked", "unchecked"]
-    assert out[0]["price_verified"] is True
-    assert out[1]["price_verified"] is False
-    assert out[1]["confidence"] == "unverified"
+    assert out[0]["stock_verified"] is True
+    assert out[1]["stock_verified"] is False
+    # A DISTINCT key: both offer builders publish a NUMERIC `confidence` and `_merit` calls
+    # float() on it, so writing a string there would be a silent type-contract change.
+    assert out[1]["verification_confidence"] == "unverified"
+    assert not isinstance(out[1].get("confidence"), str)
 
 
 def test_an_unverified_offer_asserts_no_expected_total() -> None:
@@ -290,7 +324,7 @@ def test_an_offer_outside_the_top_K_is_left_alone_and_not_marked_unverified() ->
     out = lov.apply_verdicts(offers, {0: lov.Verdict(lov.VERIFIED, "ok")})
     unchecked = [o for o in out if o["offer_id"] == "never_looked"][0]
     assert "verification" not in unchecked
-    assert "price_verified" not in unchecked
+    assert "stock_verified" not in unchecked
 
 
 def test_every_outbound_check_goes_through_the_politeness_gate_with_a_BOUNDED_wait(
@@ -315,8 +349,12 @@ def test_every_outbound_check_goes_through_the_politeness_gate_with_a_BOUNDED_wa
 
     assert calls, "the verifier fetched without asking the politeness gate"
     assert calls[0]["url"] == "https://brand.example/products/serum.js"
-    assert calls[0]["max_wait"] is None, (
-        f"a live request path must use the BOUNDED wait, got max_wait={calls[0]['max_wait']!r}"
+    # The gate is handed the BATCH budget — not None (its own 10s default) and never 0
+    # (unbounded). A ceiling larger than the turn is what let a task reserve a slot and then be
+    # cancelled out of it, which is what collapsed verification to ~8%.
+    budget = calls[0]["max_wait"]
+    assert isinstance(budget, float) and 0 < budget <= 2.0, (
+        f"the gate must get the caller's remaining budget, got max_wait={budget!r}"
     )
 
 
@@ -559,8 +597,243 @@ def test_a_cached_verdict_recomputes_price_changed_for_THIS_offer(
     # recomputed against this offer's own quote.
     second = asyncio.run(lov.verify_offers([_offer(price=19.99, offer_id="stale")]))
     assert len(seen) == 1, "the cache should have served the second check"
-    assert second[0].reason.endswith("_cached")
     assert second[0].price_changed is True, (
         "a cached verdict carried the FIRST offer's price_changed onto the second"
     )
     assert second[0].live_price == Decimal("14.99")
+
+
+def test_when_the_WHOLE_batch_is_unverified_rank_one_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S6. The module's docstring and audit F3 both promise "never return an unverified item as
+    rank 1", but a RELATIVE demotion says nothing when everything is unverified — which is the
+    outage case the rule exists for, and precisely when an agent is most likely to act on a stale
+    price. We cannot invent a verified offer, so rank 1 must at least declare itself."""
+    offers = [_offer(offer_id="a"), _offer(offer_id="b")]
+    verdicts = {0: lov.Verdict(lov.UNVERIFIED, "deadline_exceeded"),
+                1: lov.Verdict(lov.UNVERIFIED, "paced_out")}
+    out = lov.apply_verdicts(offers, verdicts)
+    assert out[0]["rank_one_unverified"] is True
+
+
+def test_rank_one_is_not_flagged_when_it_WAS_verified() -> None:
+    offers = [_offer(offer_id="checked"), _offer(offer_id="not")]
+    verdicts = {0: lov.Verdict(lov.VERIFIED, "ok", in_stock=True),
+                1: lov.Verdict(lov.UNVERIFIED, "fetch_failed")}
+    out = lov.apply_verdicts(offers, verdicts)
+    assert "rank_one_unverified" not in out[0]
+
+
+@pytest.mark.parametrize("body", [404, {"variants": [{"id": 999, "title": "x", "price": 100,
+                                                      "available": True, "options": []}]}])
+def test_a_storefront_we_cannot_prove_is_shopify_is_never_declared_GONE(
+    monkeypatch: pytest.MonkeyPatch, body
+) -> None:
+    """S3. `gone` DELETES a merchant from the shortlist for the whole cache TTL, so it may only be
+    concluded from positive evidence this is a Shopify storefront. `/products/<slug>` is a URL
+    SHAPE: headless Hydrogen, Squarespace `/store/products/`, SFCC `/products/x.html` and any WAF
+    that 404s an unknown UA all match it and none serve the `.js` route. Without evidence, a 404
+    means "we could not ask"."""
+    _serve(monkeypatch, {"https://brand.example/products/serum.js": body})
+    out = asyncio.run(lov.verify_offers([_offer(shopify_evidence=False)]))
+    assert out[0].status == lov.UNVERIFIED, "a live non-Shopify merchant was deleted on a guess"
+    assert out[0].reason == "not_a_known_shopify_storefront"
+
+
+def test_three_variants_of_one_product_cost_ONE_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S9. The external builder emits one offer per variant of one seed, so the top-3 routinely
+    holds three variants of ONE product — and the fetched document already contains all of them.
+    Keying the cache per variant made that three identical fetches, tripling the egress this
+    module exists to minimise and feeding the pacing backlog it is bounded by."""
+    doc = {"variants": [
+        {"id": 111, "title": "A", "price": 1999, "available": True, "options": ["A"]},
+        {"id": 222, "title": "B", "price": 2999, "available": True, "options": ["B"]},
+        {"id": 333, "title": "C", "price": 3999, "available": True, "options": ["C"]},
+    ]}
+    seen = _serve(monkeypatch, {"https://brand.example/products/serum.js": doc})
+    offers = [_offer(variant=v, offer_id=f"o{v}") for v in ("111", "222", "333")]
+    out = asyncio.run(lov.verify_offers(offers))
+
+    assert len(seen) == 1, f"three variants of one product cost {len(seen)} fetches"
+    assert all(v.status == lov.VERIFIED for v in out.values())
+    # ...and each offer got ITS OWN variant's facts, not the first one's.
+    assert out[0].live_price == Decimal("19.99")
+    assert out[2].live_price == Decimal("39.99")
+
+
+def test_a_transient_5xx_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Caching a 5xx would keep a recovering merchant out of the shortlist for the whole TTL."""
+    seen = _serve(monkeypatch, {"https://brand.example/products/serum.js": 503})
+    asyncio.run(lov.verify_offers([_offer()]))
+    asyncio.run(lov.verify_offers([_offer()]))
+    assert len(seen) == 2, "a transient failure was cached"
+
+
+def test_sustained_turns_against_ONE_host_do_not_collapse_the_verification_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S1 — the finding that made this feature not work at all under its own defaults.
+
+    `crawl_politeness.await_slot` reserves a host's slot BEFORE sleeping, and a cancelled task
+    never releases it. With a 1s per-host interval, top_k=3 and a 1.5s batch deadline, the third
+    request could not fit — so it was cancelled AFTER pushing `next_allowed` out by another
+    interval. Those abandoned reservations accumulated: measured 2/24 verified (8%) across five
+    waves against a merchant answering instantly, with the merchant never contacted from wave 2
+    onward, while every caller still paid the full 1.5s and got the stale snapshot back.
+
+    The fix is to hand the gate the caller's REMAINING BUDGET: `await_slot` refuses before
+    reserving, so an over-budget host answers `paced_out` immediately instead of consuming a slot
+    it will be killed out of. This drives real turns against a real gate and asserts the rate
+    stays high rather than decaying.
+    """
+    from services import crawl_politeness as cp
+
+    cp.reset_for_tests()
+    # THE CACHE MUST BE OFF HERE. With it on, turns 2+ are served from cache and never reach the
+    # gate at all — so the test measures cache effectiveness and passes with OR without the fix.
+    # (It did exactly that on the first attempt.) Disabling it makes every turn exercise the
+    # pacing, which is the thing under test.
+    monkeypatch.setenv("LIVE_OFFER_VERIFICATION_CACHE_TTL_SECONDS", "0")
+    # Scaled down from the 1.0s/1.5s defaults to keep the test quick; the SHAPE is what matters —
+    # the per-host interval is large enough that not all of top-K can fit in one batch deadline,
+    # which is exactly the production default (3 x 1.0s against 1.5s).
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0.4")
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "false")
+    # The REAL gate, not the fixture's stub — this test is about the gate's interaction.
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", _REAL_BEFORE_REQUEST)
+
+    _serve(monkeypatch, {f"https://brand.example/products/p{i}.js": _body() for i in range(3)})
+
+    verified = 0
+    total = 0
+    per_turn = []
+    for _turn in range(4):
+        offers = [_offer(url=f"https://brand.example/products/p{i}", offer_id=f"o{i}")
+                  for i in range(3)]
+        out = asyncio.run(lov.verify_offers(offers, deadline_s=0.5))
+        total += len(out)
+        hit = sum(1 for v in out.values() if v.status == lov.VERIFIED)
+        per_turn.append(hit)
+        verified += hit
+
+    cp.reset_for_tests()
+    # Before the fix this decayed to ~8% and the merchant stopped being contacted entirely.
+    # The cache carries repeat turns, so the rate should be high — the point is that it does not
+    # COLLAPSE, and that no turn is starved by reservations abandoned in an earlier one.
+    assert total == 12
+    # Not every offer can be verified — the interval genuinely does not fit three in one batch,
+    # and refusing is the CORRECT answer. What must not happen is DECAY: turn 4 must do as well
+    # as turn 1. Before the fix the rate fell to zero after the first turn because abandoned
+    # reservations pushed `next_allowed` further out on every wave.
+    assert verified >= 4, (
+        f"only {verified}/12 verified across four sustained turns — the pacing backlog is "
+        "growing, which is the reserve-then-cancel collapse this guards"
+    )
+    # The FIRST turn does better than the rest and that is correct: it starts with empty pacing
+    # state, so its first request is free. What matters is that the following turns reach a
+    # STEADY STATE rather than decaying to zero. With the bug the shape was [2, 0, 0, 0] — the
+    # merchant was never contacted again, because each cancelled task had pushed `next_allowed`
+    # out by another interval on its way out. Fixed, it is [2, 1, 1, 1]: every turn still gets
+    # served, at the rate the host's interval actually permits.
+    assert min(per_turn[1:]) >= 1, (
+        f"verification decayed to zero after the first turn ({per_turn}) — later turns are being "
+        "starved by reservations abandoned in earlier ones"
+    )
+
+
+# --- the stated bounds are real, not just documented ------------------------------------------
+#
+# Every constant below is asserted by a comment somewhere in the module. Review found all of them
+# unpinned: a mutant could move any one and the suite stayed green, which makes the comment a
+# claim rather than a guarantee.
+
+def test_the_declared_defaults_are_the_defaults() -> None:
+    """top-K=3, 90s cache and a 1.2s fetch timeout are the budget the module docstring promises.
+    Raising top-K to 99 would verify every offer up to `limit` — 30 parallel outbound requests per
+    turn — and a 0 TTL removes all rate damping."""
+    assert lov._DEFAULT_TOP_K == 3
+    assert 60.0 <= lov._DEFAULT_CACHE_TTL_S <= 120.0, "audit F2 specifies a 60-120s cache"
+    assert lov._DEFAULT_FETCH_TIMEOUT_S < lov._DEFAULT_DEADLINE_S, (
+        "one fetch must not be able to consume the whole batch budget"
+    )
+    assert lov._MAX_REDIRECTS <= 3
+
+
+def test_the_fetch_caps_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S4. The gate is consulted ONCE, before hop 1, so httpx's default of 20 turns one paced
+    request into up to 21 unpaced ones from the shared crawl NAT IP — and no intermediate hop
+    reaches `note_response`, so a 429 mid-chain never feeds the backoff."""
+    seen_kwargs: List[Dict[str, Any]] = []
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            seen_kwargs.append(kw)
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kw: Any) -> Any:
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: _body())
+
+    monkeypatch.setattr(lov.httpx, "AsyncClient", _Client)
+    asyncio.run(lov.verify_offers([_offer()]))
+
+    assert seen_kwargs, "no client was constructed"
+    assert seen_kwargs[0].get("max_redirects") is not None, "redirects are uncapped"
+    assert seen_kwargs[0]["max_redirects"] <= 3
+
+
+def test_a_verified_offer_has_its_stock_corrected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inverse of the audit's 11.1% listed-but-out-of-stock finding: a remembered
+    `in_stock: false` on an item that IS buyable must be corrected, or verification only ever
+    removes offers and never restores one."""
+    offers = [_offer()]
+    offers[0]["in_stock"] = False
+    out = lov.apply_verdicts(offers, {0: lov.Verdict(lov.VERIFIED, "ok", in_stock=True)})
+    assert out[0]["in_stock"] is True
+
+
+def test_an_unchecked_offer_ranks_BELOW_a_verified_one() -> None:
+    """Three buckets, not two. "Verified", "checked and could not tell", and "never looked" are
+    different states, and an offer nobody checked must not sit level with one we confirmed."""
+    offers = [_offer(offer_id="never_looked"), _offer(offer_id="verified")]
+    out = lov.apply_verdicts(offers, {1: lov.Verdict(lov.VERIFIED, "ok", in_stock=True)})
+    assert [o["offer_id"] for o in out] == ["verified", "never_looked"]
+
+
+def test_top_k_of_zero_disables_cleanly_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`TOP_K=0` is the natural way an operator throttles this without touching the flag.
+    `asyncio.wait(set())` raises ValueError, so the guard is what stands between that and a 500
+    on the serving path."""
+    seen = _serve(monkeypatch, {"https://brand.example/products/serum.js": _body()})
+    assert asyncio.run(lov.verify_offers([_offer()], top_k=0)) == {}
+    assert seen == []
+
+
+def test_a_task_past_the_deadline_is_actually_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leaving it pending would keep an outbound request alive after the turn has been answered —
+    unpaced work the caller no longer has any use for, plus a 'task was destroyed' warning."""
+    started: List[asyncio.Task] = []
+    real_ensure = asyncio.ensure_future
+
+    def tracking_ensure(coro, **kw):
+        task = real_ensure(coro, **kw)
+        started.append(task)
+        return task
+
+    monkeypatch.setattr(lov.asyncio, "ensure_future", tracking_ensure)
+    _serve(monkeypatch, {"https://brand.example/products/serum.js": 5.0})
+
+    # Checked INSIDE the loop. `asyncio.run` tears the loop down on exit and marks everything
+    # done, so inspecting afterwards cannot tell a cancelled task from an abandoned one — which
+    # is exactly why the mutant removing `.cancel()` survived the first version of this row.
+    async def go() -> bool:
+        await lov.verify_offers([_offer()], deadline_s=0.05)
+        return started[0].cancelling() > 0 or started[0].cancelled() or started[0].done()
+
+    assert asyncio.run(go()), "a past-deadline task was left running after the turn was answered"
+    assert started, "no task was created"

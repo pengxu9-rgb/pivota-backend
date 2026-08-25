@@ -1107,3 +1107,49 @@ def test_brand_discovery_robots_actually_consults_the_shared_gate(
 
     assert asyncio.run(bpd._robots_allows("https://brand.example/products/x")) is False
     assert asyncio.run(bpd._robots_allows("https://brand.example/pages/about")) is True
+
+
+def test_a_cancelled_robots_fetch_does_not_cache_no_restrictions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled fetch learned NOTHING and must not be recorded as "nothing to obey".
+
+    `_load_robots` is reachable from a request path whose deadline is shorter than this fetch
+    (the live-verification hop cancels at 1.5s while the robots timeout is 5s), so cancellation
+    is routine — and `_ROBOTS` is module-global, shared with every other crawl lane. Caching the
+    negative entry would silently disable robots compliance for that host for a full TTL, for
+    lanes that never had a deadline at all.
+    """
+    class _Hanging:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Hanging":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            await asyncio.sleep(30)
+            raise AssertionError("should have been cancelled")
+
+    monkeypatch.setattr(cp, "httpx", SimpleNamespace(AsyncClient=_Hanging))
+
+    async def go() -> None:
+        task = asyncio.ensure_future(
+            cp.robots_allows("https://slowbots.example/products/x", user_agent="PivotaBot")
+        )
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(go())
+    assert "slowbots.example" not in cp._ROBOTS, (
+        "a cancelled robots fetch cached 'no restrictions' — robots is now off for this host "
+        "for a full TTL, across every lane that shares this cache"
+    )
+    assert "slowbots.example" not in cp._ROBOTS_INFLIGHT, "the in-flight entry leaked"
