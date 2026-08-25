@@ -186,24 +186,50 @@ def _min_fleet_for_ratio_breaker() -> int:
 # ---------------------------------------------------------------------------
 
 
-def derive_merchant_status(store_statuses: List[str]) -> Optional[str]:
+def derive_merchant_status(
+    store_statuses: List[str],
+    *,
+    no_rows_means_inactive: bool = False,
+) -> Optional[str]:
     """Pure: what should catalog_merchants.status be, given this merchant's
     merchant_stores statuses?
 
     Returns None when the answer is "don't touch it" — no store rows at all,
     which is the case for external_seed, crawl-observed brands, and every
-    merchant that was never onboarded through a storefront integration.
+    merchant that was never onboarded through a storefront integration. On prod
+    (2026-07-31) that is 471 of 483 catalog_merchants; a rule of "no active
+    store => inactive" applied corpus-wide empties public search. Do not relax
+    the default.
 
-    Note the one asymmetry this creates: a merchant whose store rows are all
-    HARD-deleted (POST /merchant/integrations/cleanup) falls back to "don't
-    touch it" and keeps whatever status it had. That is intentional — the rows
-    it deletes are already 'inactive', so the status it keeps is already
-    'inactive', and inventing a status for a merchant with no integration at
-    all is exactly the corpus-wide flip this precondition exists to prevent.
+    `no_rows_means_inactive` is how a CALLER supplies the one piece of evidence
+    the table cannot: "this merchant did have a storefront integration, because
+    I just deleted its row in this request". Zero rows then means "had one, has
+    none" rather than "never had one", and 'inactive' is the correct answer.
+    Only a path that itself removed a store row may pass it.
+
+    This closes an asymmetry the previous docstring got wrong. It argued that
+    hard-deleting store rows was safe to ignore because "the rows it deletes are
+    already 'inactive', so the status it keeps is already 'inactive'". That is
+    plainly false for DELETE /merchant/integrations/store/{store_id}, which
+    deletes a store at ANY status: detach your last ACTIVE store and the
+    merchant kept catalog_merchants.status='active' and kept serving on public
+    recall — #1648 reopened through the one door the fix did not cover. That is
+    the case this parameter exists for.
+
+    It is also weaker than it looks for POST /merchant/integrations/cleanup,
+    which really does only sweep status='inactive' rows and is left on the
+    default here. The argument holds only if the write-through that set those
+    rows inactive actually LANDED. This function never raises and returns a
+    `skipped` reason instead — 'disabled' (kill switch), 'no_catalog_merchant_row'
+    (the catalog row minted after the disconnect), 'error:*',
+    'write_did_not_persist'. Any of those followed by a cleanup leaves a
+    zero-row merchant at 'active', and see the note in
+    `sync_catalog_merchant_status` on why nothing later repairs it. Narrower
+    than the DELETE hole, not closed. Treat this as a known gap, not a proof.
     """
     rows = [str(s or "").strip().lower() for s in store_statuses]
     if not rows:
-        return None
+        return "inactive" if no_rows_means_inactive else None
     if any(s in ACTIVE_STORE_STATUSES for s in rows):
         return "active"
     return "inactive"
@@ -213,6 +239,7 @@ async def sync_catalog_merchant_status(
     merchant_id: str,
     *,
     reason: str = "store_lifecycle",
+    last_store_removed: bool = False,
 ) -> Dict[str, Any]:
     """Re-derive one merchant's catalog_merchants.status from its stores.
 
@@ -223,6 +250,13 @@ async def sync_catalog_merchant_status(
 
     Never raises: a lifecycle route must not 500 because this bookkeeping
     failed. The tick sweep will converge it.
+
+    `last_store_removed=True` is for callers that HARD-DELETE a store row (see
+    `derive_merchant_status`). Note what it costs: the convergent sweep drives
+    off `SELECT DISTINCT merchant_id FROM merchant_stores`, so a merchant with
+    zero rows is invisible to it. Unlike every other transition here, this one
+    has no reconciliation backstop — if the write-through is skipped, nothing
+    later re-derives it. Pass it from the delete path, and only there.
     """
     result: Dict[str, Any] = {
         "merchant_id": merchant_id,
@@ -247,7 +281,10 @@ async def sync_catalog_merchant_status(
             "SELECT status FROM merchant_stores WHERE merchant_id = :merchant_id",
             {"merchant_id": mid},
         )
-        desired = derive_merchant_status([dict(r).get("status") for r in store_rows])
+        desired = derive_merchant_status(
+            [dict(r).get("status") for r in store_rows],
+            no_rows_means_inactive=last_store_removed,
+        )
         if desired is None:
             result["skipped"] = "no_store_rows"
             return result
