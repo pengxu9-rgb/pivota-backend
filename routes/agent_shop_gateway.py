@@ -25,9 +25,9 @@ import unicodedata
 import mimetypes
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -71,8 +71,10 @@ from services.outbound_links_service import (
     extract_shopify_numeric_variant_id,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
+    REFERRAL_CLICK_PARAM,
     make_redirect_token,
     normalize_shop_host,
+    parse_redirect_token_verified,
     shopify_cart_base_url,
 )
 from services.shopify_variant_identity import (
@@ -4146,11 +4148,18 @@ async def _handle_offers_resolve(
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
                 )
+                # T2-12: mint the join key HERE, not inside the builder, and hand the same one
+                # to both. The id has to be identical on the surface_click_events row, on the
+                # merchant's order, and on the `cart_url` / `pdp_url` we publish below — if the
+                # builder minted its own, the agent's lane and the /r hop would be two different
+                # clicks and the order-side join would silently split.
+                stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
+                    click_id=stable_click_id,
                     ctx={
                         "seedId": seed_id,
                         "variantId": vid,
@@ -4170,6 +4179,52 @@ async def _handle_offers_resolve(
                 )
                 if not redirect_url:
                     continue
+
+                # EXECUTION SPEC v0. Composed by the SAME function the redirect itself used, with
+                # the SAME click id, so `cart_url` cannot describe a different destination from
+                # the one `affiliate_url` resolves to.
+                composed_spec = compose_attributed_destinations(
+                    # The SAME value the builder above was called with (`canonical_url or
+                    # destination_url`), not the raw column — _seed_domain_from_url reads the
+                    # host off it, so a different input here could disagree with the link.
+                    destination_url=str(canonical_url or destination_url),
+                    utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
+                    market=used_market,
+                    tool=used_tool,
+                    shop_domain=redirect_identity.get("shop_domain"),
+                    platform=redirect_identity.get("platform"),
+                    cart_variant_id=redirect_identity.get("cart_variant_id"),
+                    click_id=stable_click_id,
+                )
+                offer_spec = {
+                    "merchant_domain": normalize_shop_host(
+                        redirect_identity.get("shop_domain")
+                        or row_dict.get("domain")
+                        or seed_data.get("domain")
+                        or str(canonical_url or destination_url)
+                    )
+                    or None,
+                    "pdp_url": composed_spec["pdp_url"],
+                    "cart_url": composed_spec["cart_url"],
+                    # The NUMERIC storefront variant id a cart permalink can actually be built
+                    # from — not the catalog SKU. None when we could not justify one, which is
+                    # exactly when cart_url is None too.
+                    "variant_id": redirect_identity.get("cart_variant_id"),
+                    # What the buyer is handed off TO. `shopify_cart` and `referral` are the two
+                    # this lane can produce today. UCP is NOT claimed here: this route does not
+                    # call a merchant's UCP endpoint, and naming a rail we do not execute would
+                    # be the fabrication the rest of this spec exists to avoid.
+                    "rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
+                    "expires_at": _redirect_token_expiry(redirect_url),
+                    # T2-12: attribution on the lane the agent actually uses. Until now the join
+                    # key existed only inside the signed /r token, so an agent that used
+                    # `pdp_url` / `cart_url` directly generated revenue we could not see.
+                    "tracking": {
+                        "click_id": stable_click_id,
+                        "param": REFERRAL_CLICK_PARAM,
+                        "join_mode": composed_spec["join_mode"],
+                    },
+                }
 
                 title = (
                     v.get("title")
@@ -4219,18 +4274,8 @@ async def _handle_offers_resolve(
                         #
                         # Computed by the SAME resolve_cart_permalink the redirect itself
                         # uses, so the answer cannot drift from what the link does.
-                        "cart_prefilled": bool(
-                            resolve_cart_permalink(
-                                # The SAME value the builder above was called with
-                                # (`canonical_url or destination_url`), not the raw column —
-                                # _seed_domain_from_url reads the host off it, so a different
-                                # input here could disagree with the link it describes.
-                                destination_url=str(canonical_url or destination_url),
-                                shop_domain=redirect_identity.get("shop_domain"),
-                                platform=redirect_identity.get("platform"),
-                                cart_variant_id=redirect_identity.get("cart_variant_id"),
-                            )
-                        ),
+                        "cart_prefilled": bool(offer_spec.get("cart_url")),
+                        "execution_spec": offer_spec,
                         "internal_checkout_items": None,
                         "confidence": confidence,
                         "source": {
@@ -7114,6 +7159,91 @@ def resolve_cart_permalink(
     )
 
 
+def _redirect_token_expiry(redirect_url: Optional[str]) -> Optional[str]:
+    """The `/r` token's own expiry, as UTC ISO-8601, or None.
+
+    Read back OFF THE TOKEN rather than recomputed from the TTL constant: an agent caching a
+    spec needs to know when `affiliate_url` stops resolving, and a second copy of the TTL would
+    be free to drift from the one that actually signed it.
+
+    Returns None for anything unparseable — including a stubbed redirect URL in a test, which
+    must degrade to "no expiry claimed" rather than inventing one.
+    """
+    try:
+        token = parse_qs(urlparse(str(redirect_url or "")).query).get("token", [""])[0]
+        if not token:
+            return None
+        payload, _is_expired = parse_redirect_token_verified(token)
+        exp = int(payload.get("exp") or 0)
+        if exp <= 0:
+            return None
+        return datetime.fromtimestamp(exp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def compose_attributed_destinations(
+    *,
+    destination_url: str,
+    utm_template: Optional[str],
+    market: str,
+    tool: str,
+    shop_domain: Optional[str],
+    platform: Optional[str],
+    cart_variant_id: Optional[str],
+    click_id: str,
+    quantity: int = 1,
+) -> Dict[str, Any]:
+    """Compose every attributed URL for one external offer, ONCE.
+
+    EXECUTION SPEC v0 / T2-12. Two consumers need the same answer and must never disagree:
+    `_make_external_redirect_url` picks the destination it signs into the `/r` token, and
+    `offers.resolve` publishes `cart_url` / `pdp_url` so the agent's OWN lane carries
+    attribution instead of only the `/r` hop. Deriving those separately is the twin-
+    implementation drift this codebase keeps paying for — see the note on resolve_cart_permalink.
+
+    `click_id` is REQUIRED and caller-minted on purpose. The join key has to be identical on
+    the surface_click_events row, the merchant's order, and the URLs we hand the agent; a
+    default here would mint a second id and silently split the join.
+
+    Returns `primary` (what the redirect signs), `cart_url` (None for an honest referral),
+    `pdp_url` (always the product page, attributed), and `join_mode`.
+    """
+    cart_base = resolve_cart_permalink(
+        destination_url=destination_url,
+        shop_domain=shop_domain,
+        platform=platform,
+        cart_variant_id=cart_variant_id,
+        quantity=quantity,
+    )
+    join_mode = "cart_permalink" if cart_base else "referral_only"
+    utm_ctx = {"market": market, "tool": tool}
+    template = utm_template or DEFAULT_UTM_TEMPLATE
+
+    # The PDP is always composed, including when a cart exists: an agent may legitimately show
+    # the product page while still handing off to the cart, and it must not have to strip cart
+    # syntax to get there. It carries the plain query param, never the cart-attribute form —
+    # `attributes[...]` is only meaningful on /cart/.
+    pdp_utm = apply_utm(destination_url, template, utm_ctx)
+    cart_utm = apply_utm(cart_base, template, utm_ctx) if cart_base else None
+
+    pdp_url = append_referral_click_param(pdp_utm, click_id)
+    cart_url = (
+        append_shopify_cart_click_attribute(cart_utm, click_id) if cart_utm else None
+    )
+    return {
+        "primary": cart_url or pdp_url,
+        "cart_url": cart_url,
+        "pdp_url": pdp_url,
+        # The same destination BEFORE the join key is appended. The allowlist reader is checked
+        # against this: the cart-attribute form carries literal `[` / `]`, and the click param
+        # is ours, so neither belongs in a domain decision. Keeping both forms here is what lets
+        # the allowlist keep seeing exactly what it saw before this function existed.
+        "primary_unkeyed": cart_utm or pdp_utm,
+        "join_mode": join_mode,
+    }
+
+
 async def _make_external_redirect_url(
     *,
     market: str,
@@ -7163,35 +7293,33 @@ async def _make_external_redirect_url(
     #     (order-side join, closable by T2-2) with zero merchant setup.
     #   referral_only  -> otherwise: keep the product URL and append the id as a plain query
     #     param for click-side attribution only. Honest degradation (no order-side join).
-    cart_base = resolve_cart_permalink(
+    # ONE composition, shared with offers.resolve (see compose_attributed_destinations), so the
+    # URL we sign and the URLs we publish to the agent cannot describe different destinations.
+    composed = compose_attributed_destinations(
         destination_url=destination_url,
+        utm_template=utm_template,
+        market=market,
+        tool=tool,
         shop_domain=shop_domain,
         platform=platform,
         cart_variant_id=cart_variant_id,
+        click_id=stable_click_id,
         quantity=quantity,
     )
-    join_mode = "cart_permalink" if cart_base else "referral_only"
+    join_mode = composed["join_mode"]
+    dest = composed["primary"]
 
-    dest_with_utm = apply_utm(
-        cart_base or destination_url,
-        utm_template or DEFAULT_UTM_TEMPLATE,
-        {"market": market, "tool": tool},
-    )
     runtime_allowed_domains = allowed_domains
     if runtime_allowed_domains is None:
         runtime_allowed_domains = await get_allowed_domains_for_market(market=market)
+    # Checked on the destination WITHOUT the join key appended — byte-identical to the
+    # pre-refactor `dest_with_utm`. The cart-attribute form carries literal brackets, and the
+    # click param is ours; neither belongs in a domain decision.
     if not is_destination_domain_allowed(
-        destination_url=dest_with_utm,
+        destination_url=composed["primary_unkeyed"],
         allowed_domains=runtime_allowed_domains,
     ):
         return None
-
-    # Append the join key AFTER the allowlist + UTM pass so the cart attribute's brackets stay
-    # literal (Shopify's documented cart-permalink form).
-    if join_mode == "cart_permalink":
-        dest = append_shopify_cart_click_attribute(dest_with_utm, stable_click_id)
-    else:
-        dest = append_referral_click_param(dest_with_utm, stable_click_id)
 
     # Enrich the token ctx with the exact keys materialize_attribution_context reads so
     # record_surface_event stamps the stable click id + merchant + product onto
