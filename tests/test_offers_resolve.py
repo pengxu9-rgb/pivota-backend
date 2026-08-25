@@ -1636,6 +1636,7 @@ def test_cart_prefilled_agrees_with_the_click_lane_on_the_SAME_token(
         dest=_dest_of(offer),
         user_agent=_WARM_HUMAN_UA,
         token=_token_of(offer),
+        ctx=_ctx_of(offer),
         settings=warm_lane,
     )
     assert reason in {"rollout", "control"}, (
@@ -1651,12 +1652,26 @@ def test_cart_prefilled_agrees_with_the_click_lane_on_the_SAME_token(
 
 def _dest_of(offer: dict) -> str:
     """The destination the buyer actually reaches, decoded from the signed token."""
+    return str(_payload_of(offer)["dest"])
+
+
+def _payload_of(offer: dict) -> dict:
     import base64
     import json as _json
 
     tok = _token_of(offer).split(".")[0]
-    payload = _json.loads(base64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))
-    return str(payload["dest"])
+    return _json.loads(base64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))
+
+
+def _ctx_of(offer: dict) -> dict:
+    """The signed ctx the CLICK path would read off this exact token.
+
+    Passing the real ctx (not `{}`) is what keeps the parity test below honest: eligibility
+    now reads `join_mode` from it, so an empty dict would compare the click lane against
+    inputs it never sees.
+    """
+    ctx = _payload_of(offer).get("ctx")
+    return ctx if isinstance(ctx, dict) else {}
 
 
 def test_a_null_claim_is_warranted_because_the_click_really_does_land_in_a_cart(
