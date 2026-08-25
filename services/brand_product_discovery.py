@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 from xml.etree import ElementTree as ET
+from services import crawl_politeness
 
 logger = logging.getLogger(__name__)
 
@@ -474,7 +475,15 @@ async def _fetch_text(url: str, max_bytes: int) -> Tuple[str, str]:
             follow_redirects=True,
             headers={"User-Agent": _USER_AGENT},
         ) as client:
+            # Shared politeness gate. These lanes crawl merchant storefronts from the SAME
+            # reserved NAT address as every other outbound lane, so a ban earned here takes the
+            # whole crawl subnet down. `max_wait=0` because this is batch work: refusing rather
+            # than waiting would turn a brief 429 into silently-dropped rows.
+            await crawl_politeness.before_request(url, user_agent=_USER_AGENT, max_wait=0)
             resp = await client.get(url)
+            crawl_politeness.note_response(
+                url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            )
             if resp.status_code != 200:
                 return ("", "error")
             content = resp.content[:max_bytes]
@@ -490,22 +499,16 @@ async def _fetch_text(url: str, max_bytes: int) -> Tuple[str, str]:
         return ("", "error")
 
 
-async def _robots_allows(base: str) -> bool:
-    """Check the site's robots.txt for our User-Agent. Permissive on
-    errors (don't block discovery on robots.txt outages); only
-    explicit Disallow blocks."""
-    try:
-        import httpx
-        async with httpx.AsyncClient(
-            timeout=_FETCH_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": _USER_AGENT},
-        ) as client:
-            resp = await client.get(f"{base}/robots.txt")
-            if resp.status_code != 200:
-                return True
-            rp = RobotFileParser()
-            rp.parse(resp.text.splitlines())
-            return rp.can_fetch(_USER_AGENT, base + "/")
-    except Exception:
-        return True
+async def _robots_allows(url: str) -> bool:
+    """Is `url` crawlable for our User-Agent? Delegates to the shared politeness gate.
+
+    THIS USED TO ASK ABOUT THE SITE ROOT. The old body ended in
+    `rp.can_fetch(_USER_AGENT, base + "/")`, so a `Disallow: /products/` never bit — and
+    /products/ is exactly what this lane fetches. It read as a robots check and enforced almost
+    nothing. `crawl_politeness.robots_allows` consults the FULL path, and additionally caches
+    per host (this refetched robots.txt on every call), caps the response size, and bounds the
+    redirect chain.
+
+    Same permissive-on-error contract as before: only an explicit Disallow blocks.
+    """
+    return await crawl_politeness.robots_allows(url, user_agent=_USER_AGENT)

@@ -719,3 +719,68 @@ def test_the_batch_scripts_opt_into_waiting_rather_than_being_refused() -> None:
             assert "max_wait=0" in call, (
                 f"{rel}: a BATCH fetch must opt into waiting out a backoff, got: {call}"
             )
+
+
+# --- every merchant-crawling lane goes through the gate ---------------------------------------
+
+# Lanes that fetch THIRD-PARTY hosts (merchant storefronts, sitemaps, editorial articles) and so
+# share the one reserved crawl egress IP. A ban earned by any of them takes all of them down,
+# which is why coverage is asserted as a SET rather than per-lane: a new lane added without the
+# gate should fail this, not slip through because nobody wrote it a test.
+#
+# Deliberately EXCLUDED, with reasons — this list is the interesting half:
+#   * services/executor_agents/canonical_pdp_enrichment.py — POSTs to Google's Vertex Gemini API
+#     (`vertex_gemini.generate_content_url`), not a merchant. Pacing a first-party API at one
+#     request per second per host would be actively wrong. It appeared in an earlier audit table
+#     of "unpaced crawl lanes" only because that table was built by grepping for robots/pacing
+#     without checking what each lane actually fetches.
+#   * every LLM / partner-API client (agent_center_llm_client, connector_service, …) — same
+#     reason: first-party or contracted endpoints, not crawling.
+# lane -> how many outbound fetch sites it gates. An EXACT count, not a presence check: a lane
+# with two fetch sites where one loses its gate still contains the string, so `in text` would
+# pass while half the lane crawled unpaced — the same "a guard on one path does not cover the
+# path that bypasses it" shape this whole change exists to close. An exact count fails on a
+# removed gate AND on a newly added fetch, which is the moment someone should be made to think.
+_GATED_CRAWL_LANES = {
+    "services/external_offers_service.py": 1,
+    "services/brand_product_discovery.py": 1,
+    "services/co_occurrence_finder.py": 1,
+    "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch
+    "services/bd_cold_start_service.py": 1,
+    "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
+}
+
+
+def test_every_third_party_crawl_lane_goes_through_the_politeness_gate() -> None:
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    wrong = {}
+    for rel, expected in sorted(_GATED_CRAWL_LANES.items()):
+        found = (repo / rel).read_text().count("crawl_politeness.before_request")
+        if found != expected:
+            wrong[rel] = f"expected {expected} gated fetch(es), found {found}"
+    assert not wrong, (
+        "these lanes crawl third-party hosts from the shared crawl egress IP and their gating "
+        f"changed: {wrong}. If you ADDED a fetch, gate it. If you removed one, update the count."
+    )
+
+
+def test_the_vertex_lane_is_NOT_gated_because_it_is_not_a_crawl() -> None:
+    """The exclusion, asserted rather than left as a comment.
+
+    `canonical_pdp_enrichment` POSTs to Google's Vertex Gemini API. Someone reading the list
+    above may reasonably wonder why one 'pdp' module is absent; this fails loudly if a future
+    change either makes it crawl merchants (in which case it belongs in the set) or wraps the
+    Gemini call in a per-host crawl limiter (which would throttle a first-party API to 1/s).
+    """
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    text = (repo / "services/executor_agents/canonical_pdp_enrichment.py").read_text()
+    assert "vertex_gemini.generate_content_url" in text, (
+        "this lane no longer targets the Vertex API — re-assess whether it now crawls merchants"
+    )
+    assert "crawl_politeness" not in text, (
+        "a first-party API call must not be paced by the per-host crawl gate"
+    )

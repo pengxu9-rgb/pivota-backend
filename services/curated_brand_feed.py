@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
+from services import crawl_politeness
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -58,7 +59,14 @@ async def fetch_shopify_products(
             page = 1
             while len(out) < max_products:
                 url = f"https://{host}/products.json?limit={_PER_PAGE}&page={page}"
+                # Shared politeness gate: merchant storefront, same reserved NAT address as every
+                # other crawl lane. Paging is a loop against ONE host, which is exactly the shape
+                # that earns a per-IP block. max_wait=0 — batch, so wait rather than drop pages.
+                await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
                 resp = await client.get(url)
+                crawl_politeness.note_response(
+                    url, resp.status_code, retry_after=resp.headers.get("retry-after")
+                )
                 if resp.status_code != 200 or "application/json" not in (resp.headers.get("content-type") or ""):
                     break
                 products = (resp.json() or {}).get("products") or []
@@ -466,6 +474,10 @@ async def fetch_pdp_inci(
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "text/html"}
     try:
+        # Gated on BOTH branches. The caller-supplied-client branch is the one the batch loop
+        # uses, so gating only the standalone branch would leave the high-volume path unpaced —
+        # the shape of "a guard on one path does not cover the path that bypasses it".
+        await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
         if client is not None:
             resp = await client.get(url)
         else:
@@ -473,6 +485,9 @@ async def fetch_pdp_inci(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
+        crawl_politeness.note_response(
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        )
         if resp.status_code != 200:
             return None
         return inci_from_pdp_html(resp.text)

@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
+from services import crawl_politeness
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 # storefronts use different patterns; we skip the refetch for them.
 _SHOPIFY_PRODUCT_URL_RE = re.compile(r"/products/[A-Za-z0-9_-]+/?(?:\?.*)?$")
 _SHOPIFY_REFETCH_TIMEOUT_S = 6.0
+# Named because the politeness gate must be asked about the SAME agent we then send.
+_BD_UA = "Pivota-BD-Audit/1.0"
 
 
 class BrandDiscoveryError(RuntimeError):
@@ -75,12 +78,14 @@ async def _fetch_shopify_native(pdp_url: str) -> Optional[Dict[str, Any]]:
             timeout=_SHOPIFY_REFETCH_TIMEOUT_S,
             follow_redirects=True,
         ) as client:
+            # Shared politeness gate; batch lane, so wait rather than drop the row.
+            await crawl_politeness.before_request(url, user_agent=_BD_UA, max_wait=0)
             r = await client.get(
                 url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "Pivota-BD-Audit/1.0",
-                },
+                headers={"Accept": "application/json", "User-Agent": _BD_UA},
+            )
+            crawl_politeness.note_response(
+                url, r.status_code, retry_after=r.headers.get("retry-after")
             )
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         logger.debug("shopify native refetch error for %s: %s", url, exc)

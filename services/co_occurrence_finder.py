@@ -40,6 +40,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
+from services import crawl_politeness
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +207,15 @@ async def _fetch_article_text(
             follow_redirects=True,
             headers={"User-Agent": _USER_AGENT},
         ) as client:
+            # Shared politeness gate. These lanes crawl merchant storefronts from the SAME
+            # reserved NAT address as every other outbound lane, so a ban earned here takes the
+            # whole crawl subnet down. `max_wait=0` because this is batch work: refusing rather
+            # than waiting would turn a brief 429 into silently-dropped rows.
+            await crawl_politeness.before_request(article_url, user_agent=_USER_AGENT, max_wait=0)
             resp = await client.get(article_url)
+            crawl_politeness.note_response(
+                article_url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            )
             if resp.status_code != 200:
                 return ("", "error")
             ctype = (resp.headers.get("content-type") or "").lower()
@@ -227,30 +236,17 @@ async def _fetch_article_text(
 
 
 async def _robots_allows(article_url: str) -> bool:
-    """Fetch + parse the host's robots.txt; return True if our UA is
-    allowed to read article_url. Errors → permissive (don't block
-    legitimate fetches on robots.txt outages); blocking decisions
-    require a positive disallow signal."""
-    try:
-        parsed = urlparse(article_url)
-        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    except Exception:
-        return True
-    try:
-        import httpx
-        async with httpx.AsyncClient(
-            timeout=_FETCH_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": _USER_AGENT},
-        ) as client:
-            resp = await client.get(robots_url)
-            if resp.status_code != 200:
-                return True  # No robots.txt → permissive
-            rp = RobotFileParser()
-            rp.parse(resp.text.splitlines())
-            return rp.can_fetch(_USER_AGENT, article_url)
-    except Exception:
-        return True  # Errors are permissive — see docstring
+    """Is `article_url` crawlable for our User-Agent? Delegates to the shared politeness gate.
+
+    This one was already correct about the PATH — unlike the sibling in
+    brand_product_discovery, it passed the full url to `can_fetch`. What it lacked was a cache:
+    it refetched robots.txt on EVERY article, so a run over 200 articles on one host made 200
+    robots requests to that host purely to ask permission. The shared gate caches per host, caps
+    the response size, and bounds the redirect chain.
+
+    Unchanged contract: errors are permissive; only an explicit Disallow blocks.
+    """
+    return await crawl_politeness.robots_allows(article_url, user_agent=_USER_AGENT)
 
 
 async def verify_brand_report_co_occurrence(

@@ -283,23 +283,31 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 > | 4 — numeric variant-id backfill | **in flight** — producer merged (#1813, #1820); 864 rows written. Cohort coverage **10.0%** (1,074 / 10,763 active rows whose URL contains `/products/`). | measured live |
 > | 5 — execution spec v0 | **shipped this pass.** `merchant_domain`, `pdp_url`, `cart_url`, `variant_id`, `rail`, `expires_at`, `tracking` now ride on every external offer, composed by the same function the redirect signs. `recommendation_id` is deliberately **not** in it: it is minted in the gateway's `recommend_products`, not at `offers.resolve`, and stamping a fabricated one would defeat the join it exists for. | this PR |
 > | 12 — attribution on the agent's own lane | **shipped this pass.** One click id now spans the signed token, `pdp_url` and `cart_url`. | this PR |
-> **Item 8 is scoped to the offers fetcher, and that is NOT the same as "safe to run crawl jobs
-> on `pivota-crawl`".** The reserved egress IP is shared by every outbound lane, so a ban earned
-> anywhere takes all of them down. Measured 2026-08-25 — merchant-crawling lanes that still
-> bypass the gate:
+> **Item 8 now covers every third-party crawl lane, not just the offers fetcher.** The reserved
+> crawl egress IP is shared, so a ban earned anywhere takes all of them down. All five remaining
+> merchant/web-crawling lanes now route through `services/crawl_politeness`:
 >
-> | lane | robots | pacing |
+> | lane | before | now |
 > |---|---|---|
-> | `services/executor_agents/sitemap_freshness.py` | none | none |
-> | `services/executor_agents/canonical_pdp_enrichment.py` | none | none |
-> | `services/curated_brand_feed.py` | none | none |
-> | `services/brand_product_discovery.py` | root-only (never sees path rules) | none |
-> | `services/bd_cold_start_service.py` | root-only | none |
-> | `services/co_occurrence_finder.py` | root-only | none |
+> | `services/brand_product_discovery.py` | robots asked about the site ROOT; no pacing | full-path robots (shared, cached) + pacing |
+> | `services/bd_cold_start_service.py` | inherited that root-only helper | same helper, now delegating |
+> | `services/co_occurrence_finder.py` | robots path-correct but UNCACHED (refetched per article) | shared cache + pacing |
+> | `services/curated_brand_feed.py` | none | both fetch sites gated |
+> | `services/executor_agents/sitemap_freshness.py` | none | sitemap + child indexes gated |
 >
-> Routing these through `services/crawl_politeness` is the remaining work before the crawl subnet
-> carries real traffic. Cheap — the gate is one `await` — but it is six call sites, not one.
+> **Correction to the earlier version of this note**, which listed six lanes and described two of
+> them wrongly. It was built by grepping for robots/pacing without checking what each lane
+> actually fetches:
+> - `services/executor_agents/canonical_pdp_enrichment.py` is **not a crawl lane**. It POSTs to
+>   Google's Vertex Gemini API (`vertex_gemini.generate_content_url`). Pacing a first-party API at
+>   one request per second per host would be actively wrong, so it is deliberately excluded — and
+>   a test now asserts that exclusion so nobody "fixes" it later.
+> - `co_occurrence_finder` was listed as root-only robots. It was in fact path-correct; its real
+>   defect was the missing cache.
 >
+> Coverage is pinned by an EXACT per-lane gate count, because a presence check passes when a lane
+> with two fetch sites loses one of them.
+
 > | 8 — rate-limit + robots the fetcher | **shipped.** `services/crawl_politeness.py`: per-host pacing (`CRAWL_MIN_INTERVAL_SECONDS`, default 1/s), robots.txt obeyed on the FULL path with `Crawl-delay` honoured whenever it is slower than our floor, and exponential 429/503 backoff honouring `Retry-After` only ever to lengthen. `_fetch_html` is gated on it. Two things worth carrying: the wait is BOUNDED (`CrawlPaced`) because `POST /api/offers/external/resolve` has no auth dependency and is a live path — an unbounded stall there would be a new regression, not politeness; and the pre-existing `_robots_allows` (`services/brand_product_discovery.py:493`) asks about the site ROOT, so a `Disallow: /products/` never bit the paths it guards. That helper is UNCHANGED here and still has that defect. | this PR |
 > | 6 — live-verify top-3 | **not started.** Note the v2 index design partly supersedes the framing: public crawl carries authority 45 and "never auto-publishes checkout-sensitive facts", and checkout is specified to always live-validate. | `docs/commerce-index-v2.md` |
 > | 7, 10 (Wave 3) · 9, 11, 13, 15, 16 (Wave 4) | **not started** | verified by grep |
