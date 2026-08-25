@@ -37,8 +37,12 @@ below — synthetic paid orders written into the production ledger from a stagin
 shakeout. Point SHAKEOUT_DB_URL at a staging or local database whose URL you
 already have; that is the only supported venue.
 
-The base URL below is still the Railway staging host ON PURPOSE: GCP staging
-`web` runs with `ingress: internal`, so it is not reachable from a laptop.
+THERE IS NO WORKING DEFAULT BASE URL TODAY. GCP staging `web` runs with
+`ingress: internal` so it is unreachable from a laptop, and the Railway staging
+host below is mid-teardown after the 2026-08-25 decommission (#1872): `/health`
+is 503 and its `/` reports a disconnected database. It is the last known value,
+not a working default. Set SHAKEOUT_BASE_URL yourself and confirm the target
+serves `/__shakeout/*` (401 = present, 404 = wrong app) before trusting a run.
 
 References:
 - docs/monetization/MERCHANT_ONBOARDING_READINESS.md §D-H

@@ -18,7 +18,7 @@ set -euo pipefail
 #   here - naming the run.app URL would ship a command that always fails. Run the
 #   proof-issuer leg from inside the VPC, or point it at a local/staging issuer.
 #
-#   Do not fall back to a *.up.railway.app host. Railway is the ROLLBACK, and its
+#   Do not fall back to a *.up.railway.app host. Railway is RETIRED (#1872), and its
 #   liveness is perishable in both directions: the production agent host answered
 #   200 on the morning of 2026-08-25 and by that afternoon returned 404 with
 #   `x-railway-fallback: true` (no service bound). A smoke that passes there

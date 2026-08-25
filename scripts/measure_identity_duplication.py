@@ -12,7 +12,7 @@ intra-merchant dup keys=1,076; pg groups=8,500 (3,609 memberships in
 multi-member groups); active unattached seeds with an exact catalog URL
 twin=249 (the Tier-0 attach population).
 
-Usage (prod is Cloud Run, pivota-prod/us-west1; Railway is the ROLLBACK and its
+Usage (prod is Cloud Run, pivota-prod/us-west1; Railway is RETIRED (#1872) and its
 database is a different one, so a duplication gauge read there measures a catalog
 nobody is served from). There is no `railway run` equivalent — run a throwaway
 job on the production image, which mounts the DATABASE_URL secret:

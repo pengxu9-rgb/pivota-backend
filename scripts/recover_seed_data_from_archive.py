@@ -12,7 +12,7 @@ This script does the recovery:
 
   1. Connects to the LIVE prod DB (via the runtime DATABASE_URL the
      backend already uses). Production is Cloud Run (pivota-prod/us-west1);
-     there is no `railway ssh` equivalent, and Railway is the ROLLBACK, so
+     there is no `railway ssh` equivalent, and Railway is RETIRED (#1872), so
      recovering into it repairs a catalog nobody is served from. Run it as a
      throwaway job on the production image:
        scripts/ops/run_oneoff_job.sh scripts/recover_seed_data_from_archive.py \\

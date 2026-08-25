@@ -14,7 +14,7 @@ Idempotent — only touches rows where pivota_signature_id IS NULL.
 Defaults to dry-run; pass --apply to actually persist.
 
 Usage (production is Cloud Run, pivota-prod/us-west1, since the 2026-08-22
-cutover; Railway is the ROLLBACK, so a `railway run` backfill would write to a
+cutover; Railway is RETIRED (#1872), so a `railway run` backfill would write to a
 database nobody is served from). There is no `railway run` equivalent — use a
 throwaway job on the production image; the helper mounts the DATABASE_URL secret
 (a job inherits NO env and NO secrets) and takes its verdict from the exit code:

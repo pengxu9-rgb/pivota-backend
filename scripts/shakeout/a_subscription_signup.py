@@ -40,11 +40,13 @@ from typing import Any
 DEFAULT_BASE_URL = "https://web-staging-staging-5257.up.railway.app"
 # Stripe Test starter price on staging.
 #
-# DEFAULT_BASE_URL is still the Railway staging host ON PURPOSE. Staging was
-# rebuilt on GCP (pivota-staging), but its `web` service runs with
-# `ingress: internal` (verified 2026-08-25), so it is not reachable from a laptop
-# and this script cannot drive it from outside. Production is Cloud Run in
-# pivota-prod — never point this script there; it signs real subscriptions up.
+# DEFAULT_BASE_URL has no working value today. Staging was rebuilt on GCP
+# (pivota-staging), but its `web` runs with `ingress: internal` (verified
+# 2026-08-25) so it is unreachable from a laptop; and the Railway host below is
+# mid-teardown after the 2026-08-25 decommission (#1872) — it is the last known
+# value, not a working default. Set SHAKEOUT_BASE_URL yourself. Production is
+# Cloud Run in pivota-prod — never point this script there; it signs real
+# subscriptions up.
 DEFAULT_PRICE_ID = "price_1TZLrOGeIEg0wZyUP6lYbUJ6"
 
 

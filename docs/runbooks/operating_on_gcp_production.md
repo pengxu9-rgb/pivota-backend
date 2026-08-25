@@ -161,8 +161,24 @@ are how three of those ended up running old code against live secrets on 2026-08
 CONFIG=preserve infra/gcp/deploy_backend.sh prod <sha>
 ```
 
-## Still on Railway, deliberately
+## Railway: decommissioned as of 2026-08-25 (#1872)
 
-Railway remains the rollback until it is decommissioned, so `railway` commands are still the right
-thing when you are **operating the rollback on purpose** — verifying it can still serve, or
-comparing its state against production. They are the wrong thing when you mean "production".
+This section used to say Railway "remains the rollback until it is decommissioned". It has been:
+#1872 archived the dumps, repointed the last GCP→Railway dependency, took every service down across
+all three projects, and deleted the `railway-*` DSN secrets from `pivota-prod`. **There is no
+rollback platform any more, so there is no longer any correct reason to run a `railway` command.**
+
+Teardown is not instantaneous, and half-gone reads as alive, so do not infer state from one probe:
+
+- `pivota-agent-production.up.railway.app` returned **200 with its own build SHA in the morning of
+  2026-08-25 and 404 with `x-railway-fallback: true` the same afternoon.** A rollback host's
+  liveness is perishable in both directions; re-probe before citing either state.
+- `web-staging-staging-5257.up.railway.app` is mid-teardown as this is written: `/` answers 200 but
+  reports `db_status: disconnected`, `/health` is 503, and the `/__shakeout/*` routes still answer
+  401. Serving a route is not the same as being able to do anything useful with it.
+- Probe **the path that actually serves**, not `/`. #1872 records the inverse of the trap above:
+  catalog-intelligence 404s on `/` while healthy, and was briefly declared dead on that basis.
+
+`railway-prod-db-url` and `railway-pcikb-db-url` still exist in `pivota-staging`. And per #1872,
+service shells keep their auto-deploy triggers until deleted in the dashboard — `pivota-acp`'s was
+never disarmed, so a push to that repo could still resurrect a service.

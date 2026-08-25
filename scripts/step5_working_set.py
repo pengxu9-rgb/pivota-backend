@@ -41,7 +41,7 @@ gauge scripts/measure_identity_duplication.py, whose group definitions it
 mirrors: content_key IS NOT NULL AND suppression_reason IS NULL).
 
 Run against prod. Production is Cloud Run (pivota-prod/us-west1) since the
-2026-08-22 cutover; Railway is the ROLLBACK, and its database is a different one,
+2026-08-22 cutover; Railway is RETIRED (#1872), and its database is a different one,
 so a convergence report taken there describes rows nobody is served from.
 
 There is no `railway run` equivalent. Use a throwaway job on the production image

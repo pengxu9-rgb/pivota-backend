@@ -18,7 +18,7 @@ It reports:
 
 SELECT-only.
 
-Usage (PRODUCTION IS CLOUD RUN — pivota-prod/us-west1. Railway is the ROLLBACK,
+Usage (PRODUCTION IS CLOUD RUN — pivota-prod/us-west1. Railway is RETIRED (#1872),
 and this pre-check exists to prove no REAL Stripe Connect transfer is pending, so
 running it against the rollback would clear a cron that fires against Cloud Run):
 

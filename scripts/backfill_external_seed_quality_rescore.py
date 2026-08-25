@@ -50,7 +50,7 @@ one timeout on row 1 silently voided the next 1,320 rows while still reporting
     failure is distinguishable from a step-2 one.
 
 Designed to run inside production against the internal DB. Production is Cloud
-Run (pivota-prod/us-west1); Railway is the ROLLBACK and its database is a
+Run (pivota-prod/us-west1); Railway is RETIRED (#1872) and its database is a
 different one, so a rescore run there promotes rows nobody is served from.
 
 There is no `railway run` equivalent. Use a throwaway job on the production image

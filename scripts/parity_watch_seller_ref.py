@@ -34,7 +34,7 @@ separate phase-3 catalog re-key, `--phases catalog`): the banned external_seed
 bucket residue on catalog_products / commerce_attribution_edges, and the honest
 seed floor (seeds with no resolvable destination stay seller_ref-NULL by design).
 
-Usage (production is Cloud Run, pivota-prod/us-west1; Railway is the ROLLBACK, and
+Usage (production is Cloud Run, pivota-prod/us-west1; Railway is RETIRED (#1872), and
 its database is a DIFFERENT database — a parity check run there measures the wrong
 platform and reports a clean day for traffic it never saw):
     # inside production (native internal DB — most reliable). There is no

@@ -19,7 +19,7 @@ Safety:
 - Tiny connection pool; short-lived.
 
 Usage (PRODUCTION IS CLOUD RUN — pivota-prod/us-west1 since the 2026-08-22
-cutover; Railway is the ROLLBACK, so a `railway run` here would compute the
+cutover; Railway is RETIRED (#1872), so a `railway run` here would compute the
 settlement of a platform nobody is served from):
 
 There is no `railway run` equivalent — Cloud Run has no host to attach to. Run a

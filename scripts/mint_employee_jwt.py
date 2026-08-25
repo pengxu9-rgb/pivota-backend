@@ -20,7 +20,7 @@ def _parse_args() -> argparse.Namespace:
         ),
         epilog=(
             "Production is Cloud Run in pivota-prod/us-west1 since the 2026-08-22 "
-            "cutover; Railway is the ROLLBACK and holds its own JWT_SECRET_KEY. A "
+            "cutover; Railway is RETIRED (#1872) and holds its own JWT_SECRET_KEY. A "
             "token minted from the rollback's secret is rejected by production, "
             "which reads as 'my admin account is broken' rather than 'I signed "
             "with the wrong key'. Prefer:\n"
@@ -69,10 +69,13 @@ def _parse_args() -> argparse.Namespace:
         "--railway-service",
         default=None,
         help=(
-            "ROLLBACK ONLY. Load JWT_SECRET_KEY from `railway variables "
-            "--service <name> --json`. Railway is not production; a token signed "
-            "with its secret will not authenticate against api.pivota.cc. Use "
-            "--gcp-secret unless you are deliberately operating the rollback."
+            "DEAD PLATFORM. Loads JWT_SECRET_KEY from `railway variables "
+            "--service <name> --json`. Railway was decommissioned on 2026-08-25 "
+            "(#1872) - every service is down and the prod DSN secrets are "
+            "deleted - so this cannot succeed, and a token signed with its "
+            "secret would not authenticate against api.pivota.cc anyway. Kept "
+            "only so an operator who reaches for it gets this sentence instead "
+            "of a confusing failure. Use --gcp-secret."
         ),
     )
     parser.add_argument(
