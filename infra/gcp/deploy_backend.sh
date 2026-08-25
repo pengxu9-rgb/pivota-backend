@@ -254,13 +254,14 @@ probe_health(){ # url -> echoes the status code
   # ^|^ delimiter: gcloud splits --args on COMMAS, and this probe is Python that contains commas
   # (`,timeout=25`), which would otherwise be shredded into separate argv entries.
   local job="verify-$$-$RANDOM"
+  local out="" i probe_rc=0 create_rc=0
   "$GCLOUD" run jobs create "$job" --region "$REGION" --project "$PROJECT" \
     --image "$REGION-docker.pkg.dev/pivota-shared/pivota/backend:latest" \
     --service-account "sa-worker@$PROJECT.iam.gserviceaccount.com" \
     --network default --subnet default --vpc-egress all-traffic \
     --max-retries 0 --task-timeout 120s --command python \
-    --args="^|^-c|import urllib.request,sys;s=urllib.request.urlopen('$url',timeout=25).status;print('PROBE_STATUS='+str(s));sys.exit(0 if s==200 else 1)" \
-    --quiet >/dev/null 2>&1
+    --args="^|^-c|import urllib.request,sys;r=urllib.request.urlopen('$url',timeout=25);s=r.status;u=r.geturl();print('PROBE_STATUS='+str(s)+' FINAL_URL='+u);sys.exit(0 if s==200 and u=='$url' else 1)" \
+    --quiet >/dev/null 2>&1 || create_rc=$?
   # THE VERDICT IS THE JOB'S EXIT CODE, NOT ITS LOGS.
   #
   # urlopen raises on any non-2xx (HTTPError) and on any connection failure (URLError), and the
@@ -277,25 +278,37 @@ probe_health(){ # url -> echoes the status code
   #
   # Failure direction is unchanged and still safe: a missing image, a shredded --args, no python,
   # an unroutable URL, or a non-200 all exit non-zero and still refuse the promotion.
-  local out="" i probe_rc=0
+  # An unchecked create would make "exit 0 means healthy" rest on an unverified precondition:
+  # `set -e` does not fire inside this function (see the `|| true` note below), so a failed create
+  # was entirely silent, and only the execute failing afterwards kept it safe by luck.
+  [ "$create_rc" = 0 ] || { echo "   could not create the in-VPC probe job (gcloud exited $create_rc)" >&2; echo 000; return 0; }
   "$GCLOUD" run jobs execute "$job" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1 \
     || probe_rc=$?
 
-  # Best-effort, for the human-readable line ONLY. It can no longer downgrade a pass, so a slow
-  # or empty read costs a vaguer message and nothing else.
+  if [ "$probe_rc" = 0 ]; then
+    # Nothing left to look up: the exit code already said 200. Skipping the scrape on the happy
+    # path also keeps ~15s of `sleep` and three `logging read` calls off every good deploy.
+    "$GCLOUD" run jobs delete "$job" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
+    echo 200
+    return 0
+  fi
+
+  # FAILURE PATH ONLY, and best-effort: recover the specific status for the operator's message.
+  #
+  # `|| true` is load-bearing, for the same reason it is on the CAND_URL pipeline below: under
+  # `set -o pipefail` a grep that matches NOTHING makes the whole pipeline exit 1, `VAR=$(...)`
+  # adopts that status, and `set -euo pipefail` (line 11) kills the script. A missing log line is
+  # the NORMAL case here — the probe raises before printing for any non-2xx — so without this the
+  # common failure would abort mid-function and leak the probe job that the delete below reaps.
+  # It survived review only because a function called inside `$( )` is exempt from `-e`; that is
+  # an accident of the ONE call site, not a property of this function.
   for i in 1 2 3; do
     out=$("$GCLOUD" logging read "resource.labels.job_name=\"$job\"" --project "$PROJECT" --limit 15 \
-      --format='value(textPayload)' 2>/dev/null | grep -oE 'PROBE_STATUS=[0-9]+' | head -1 | cut -d= -f2)
+      --format='value(textPayload)' 2>/dev/null | grep -oE 'PROBE_STATUS=[0-9]+' | head -1 | cut -d= -f2 || true)
     [ -n "$out" ] && break
     sleep 5
   done
   "$GCLOUD" run jobs delete "$job" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
-
-  if [ "$probe_rc" = 0 ]; then
-    [ -n "$out" ] || echo "   in-VPC probe passed (its PROBE_STATUS line has not surfaced in Cloud Logging yet)" >&2
-    echo 200
-    return 0
-  fi
   echo "   in-VPC probe job exited $probe_rc${out:+ (PROBE_STATUS=$out)}" >&2
   # A PASS is the exit code and nothing else. If the scrape reports 200 for a job that FAILED
   # the two disagree, and the scrape does not get to win: echoing it here would hand the caller
