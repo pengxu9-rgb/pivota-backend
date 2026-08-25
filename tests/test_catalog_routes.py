@@ -12,14 +12,18 @@ from utils.auth import get_current_user
 def _build_app() -> FastAPI:
     app = FastAPI()
     app.include_router(module.router)
-    # Admin: these routes are ops-driven (see the ADMIN_JWT block in
-    # docs/ops/CELESTIAL_PIVOT_MULTI_RELEASE_RUNBOOK.md), and non-admins are
-    # scoped to their own merchant_id. Refusal cases live in
+    # Merchant-scoped on purpose, NOT admin. These routes are ops-driven (see
+    # the ADMIN_JWT block in docs/ops/CELESTIAL_PIVOT_MULTI_RELEASE_RUNBOOK.md),
+    # so admin would have been the obvious fixture — but then every test in this
+    # file would reach its subject through the admin bypass, and the
+    # merchant-equality branch could break completely with this file still
+    # green. Both tests below already act on `merch_1`. Refusal cases live in
     # tests/test_catalog_routes_tenant_scope.py.
     app.dependency_overrides[get_current_user] = lambda: {
         "user_id": "user_123",
         "email": "user@example.com",
-        "role": "admin",
+        "role": "merchant",
+        "merchant_id": "merch_1",
     }
     return app
 

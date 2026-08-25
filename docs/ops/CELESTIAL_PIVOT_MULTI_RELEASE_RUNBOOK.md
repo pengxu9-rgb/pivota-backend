@@ -319,6 +319,9 @@ Required auth:
   routes are tenant-scoped: a non-admin token may only name the `merchant_id` in
   its own `merchant_id` claim, so ADR-009 `merch_obs_*` observed-seller ids —
   which no tenant token carries — are reachable by admins only.
+  This applies to `scripts/run_commerce_channels_signoff_batch.py` too, which fans
+  one `--header` set across every merchant case — so the batch run needs an admin
+  token for ALL cases, not just the single-merchant block below.
 
 ```bash
 ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \

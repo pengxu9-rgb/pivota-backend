@@ -39,11 +39,24 @@ AGENT = {"sub": "u_a", "email": "a@x.invalid", "role": "agent", "agent_id": "age
 EMPLOYEE = {"sub": "u_e", "email": "e@x.invalid", "role": "employee", "employee_id": "emp_1"}
 NO_MERCHANT_CLAIM = {"sub": "u_n", "email": "n@x.invalid", "role": "merchant"}
 
+# Near-misses. The comparison must be EXACT equality: case-insensitive,
+# prefix, or substring matching all look harmless until you notice that a
+# tenant legitimately holding `merch_obs` would reach every ADR-009
+# `merch_obs_*` observed-seller id — precisely the population this gate exists
+# to protect.
+NEAR_MISS_IDENTITIES = [
+    pytest.param({**SELF_MERCHANT, "merchant_id": VICTIM.upper()}, id="claim-differs-only-in-case"),
+    pytest.param({**SELF_MERCHANT, "merchant_id": "merch_obs"}, id="claim-is-a-prefix-of-the-target"),
+    pytest.param({**SELF_MERCHANT, "merchant_id": "obs"}, id="claim-is-a-substring-of-the-target"),
+    pytest.param({**SELF_MERCHANT, "merchant_id": VICTIM + "_x"}, id="target-is-a-prefix-of-the-claim"),
+]
+
 REFUSED_IDENTITIES = [
     pytest.param(OTHER_MERCHANT, id="other-merchant"),
     pytest.param(AGENT, id="agent"),
     pytest.param(EMPLOYEE, id="employee"),
     pytest.param(NO_MERCHANT_CLAIM, id="merchant-token-without-merchant_id-claim"),
+    *NEAR_MISS_IDENTITIES,
 ]
 
 ALLOWED_IDENTITIES = [
@@ -231,6 +244,46 @@ def test_blank_merchant_id_does_not_match_a_token_without_the_claim(sinks) -> No
     assert sinks["create_catalog_sync_job"] == []
 
 
+@pytest.mark.parametrize(
+    "spec,sink_key,padded",
+    [
+        pytest.param(
+            {"method": "post", "url": "/v1/catalog/sync/jobs",
+             "json": {"merchant_id": "\u00a0" + VICTIM + "\n", "connector": "shopify"}},
+            "create_catalog_sync_job", None, id="body-merchant_id",
+        ),
+        pytest.param(
+            {"method": "post", "url": f"/v1/catalog/verticals/beauty/rebuild/%20{VICTIM}%20"},
+            "rebuild_beauty_verticals_for_merchant", None, id="path-merchant_id",
+        ),
+        pytest.param(
+            {"method": "post",
+             "url": f"/v1/catalog/connectors/shopify/webhooks?merchant_id=%20{VICTIM}%20&event_type=products/update",
+             "json": {}},
+            "record_catalog_sync_event", None, id="query-merchant_id",
+        ),
+    ],
+)
+def test_the_id_that_was_authorized_is_the_id_that_is_written(sinks, spec, sink_key, padded) -> None:
+    """The gate must normalize ONCE and pass the normalized id downstream.
+
+    `.strip()` eats NBSP, newlines and spaces, so authorizing the stripped
+    value while handing the sink the raw one lets a caller mint a
+    `catalog_merchants` row keyed on "\xa0merch_obs_victim\n". Self-targeted
+    only — you can pad only your own id — so this is data pollution rather
+    than escalation, but the authorized id and the written id must agree.
+    """
+    client = TestClient(_build_app(SELF_MERCHANT))
+
+    response = _call(client, spec)
+
+    assert response.status_code == 200, response.text
+    assert sinks[sink_key][0]["merchant_id"] == VICTIM
+    if sink_key == "create_catalog_sync_job":
+        # The BackgroundTask carries its own copy of the id.
+        assert sinks["background"][0]["merchant_id"] == VICTIM
+
+
 def test_whitespace_padding_does_not_defeat_the_comparison(sinks) -> None:
     client = TestClient(_build_app({**SELF_MERCHANT, "merchant_id": f"  {VICTIM}  "}))
 
@@ -268,22 +321,33 @@ def test_admins_and_the_owning_merchant_can_read_the_sync_job(sinks, user) -> No
     assert body["stats"]["products_ingested"] == 41
 
 
-def test_every_route_on_the_catalog_router_is_scope_checked() -> None:
-    """A new route added to this router must not silently skip the gate.
+def test_every_route_on_the_catalog_router_refuses_a_foreign_identity(sinks) -> None:
+    """A new route on this router must actually REFUSE, not merely mention the guard.
 
-    `_has_catalog_scope` / `_require_catalog_scope` are called by name, so a
-    route that forgets them is visible in the source of its own handler.
+    This deliberately does not inspect source text. The previous version of this
+    canary grepped `inspect.getsource` for the guard's name, which a handler
+    satisfied by naming it in a docstring or comment while being wide open — a
+    realistic copy-paste, since `_require_catalog_scope`'s own docstring mentions
+    it three times. So drive every route with a foreign identity instead and
+    require a refusal.
     """
-    import inspect
+    client = TestClient(_build_app(AGENT))
 
-    exempt: set = set()
-    unscoped = []
+    unguarded = []
     for route in module.router.routes:
-        name = getattr(route.endpoint, "__name__", "")
-        if name in exempt:
-            continue
-        source = inspect.getsource(route.endpoint)
-        if "_require_catalog_scope" not in source and "_has_catalog_scope" not in source:
-            unscoped.append(f"{sorted(route.methods)} {route.path} ({name})")
+        path = route.path.replace("{merchant_id}", VICTIM).replace("{job_id}", "job_of_victim")
+        for method in sorted(set(route.methods) - {"HEAD", "OPTIONS"}):
+            response = client.request(
+                method,
+                path,
+                # Satisfy every handler's schema so the refusal we observe is the
+                # gate and never a 422 from validation running first.
+                params={"merchant_id": VICTIM, "event_type": "products/update"},
+                json={"merchant_id": VICTIM, "connector": "shopify"},
+            )
+            if response.status_code not in (403, 404):
+                unguarded.append(f"{method} {route.path} -> {response.status_code}")
 
-    assert unscoped == [], f"catalog routes with no tenant scope check: {unscoped}"
+    assert unguarded == [], f"catalog routes that did not refuse a foreign identity: {unguarded}"
+    # And nothing was written on the way to those refusals.
+    assert all(calls == [] for key, calls in sinks.items() if key != "get_catalog_sync_job")
