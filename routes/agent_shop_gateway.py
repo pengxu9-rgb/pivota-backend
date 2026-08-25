@@ -79,6 +79,7 @@ from services.outbound_links_service import (
     parse_redirect_token_verified,
     shopify_cart_base_url,
 )
+from services import live_offer_verification
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
     storefront_is_shopify,
@@ -5060,6 +5061,22 @@ async def _handle_offers_resolve(
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
     offers = offers[:limit]
+
+    # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
+    # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
+    # 1.5s budget is per turn, so verifying anything the caller will not see spends it for nothing.
+    #
+    # Default OFF. Arming it adds request-path egress to third parties on the shared crawl NAT IP,
+    # which is exactly the traffic the dedicated crawl subnet exists to isolate.
+    #
+    # Failure here must never cost the turn: a verifier that raised would turn the 31.1%
+    # wrong-spec problem into a 100% no-answer problem, which is strictly worse.
+    if live_offer_verification.is_enabled() and offers:
+        try:
+            verdicts = await live_offer_verification.verify_offers(offers)
+            offers = live_offer_verification.apply_verdicts(offers, verdicts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("live offer verification failed; serving unverified: %s", exc)
 
     # ADR-009 ratified decision 1 (no-fallback): canonical_ref is pg-keyed or
     # ABSENT — never a merchant-scoped `pc:{merchant}:{platform}:{pid}`

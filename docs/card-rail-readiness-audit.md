@@ -268,19 +268,21 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 > scheduler job answers), not by the absence of a grep hit. Two earlier passes of this section got
 > that wrong in both directions, so the method matters more than the table.
 >
-> **7 of 17 complete · 4 built-but-inert · 6 not started.**
+> **8 of 17 complete · 4 built-but-inert · 5 not started.** Item 6 (live verification)
+> shipped 2026-08-25 as `services/live_offer_verification.py`, wired into `offers.resolve`
+> behind `LIVE_OFFER_VERIFICATION_ENABLED` (default OFF).
 >
 > | | items | state |
 > |---|---|---|
 > | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints AND is accepted back; the refresh can correct a stale price; dedicated crawl egress is live in staging AND prod; all 7 execution-spec fields ship; every one of the six third-party crawl lanes goes through the politeness gate; `card_rail_outcomes` + `POST /agent/v1/outcomes` exist and are mounted. |
 > | **Built, switched off** | 3, 14 | The UCP probe lane and `scheduled_ucp_reprobe` exist in code, but `store-audit-commerce-reprobe-enqueue-cron` reads **PAUSED** in prod and has no counterpart in staging. There is still **no per-row `last_crawled_at`** anywhere in `db/` or `services/`. |
 > | **Partial** | 4, 7 | Variant-id coverage **60.5%** and close to its ceiling (§4 note). Warm handoff is **ENABLED in prod** — but on the original **6** brands, not the Tier-1 cohort item 7 asks for. |
-> | **Not started** | 6, 9, 11, 13, 15, 16 | Live top-3 verification; landed total via UCP; promo codes in the spec; `p_complete` into ranking; the reco-latency work (also unmeasured post-cutover); 3C cohort seeding. |
+> | **Not started** | 9, 11, 13, 15, 16 | Live top-3 verification; landed total via UCP; promo codes in the spec; `p_complete` into ranking; the reco-latency work (also unmeasured post-cutover); 3C cohort seeding. |
 >
 > **What this means for the milestone.** The *plumbing* is done: an agent can be handed a spec that
 > says exactly where a buyer lands and what will be in the cart, and it can report back what
 > happened. What is NOT done is the thing this audit named as the real obstacle in §1 — **index
-> staleness**. Item 6 (live verification) is the recommended fix and has not been started; item 14
+> staleness**. Item 6 (live verification) now EXISTS but ships inert — arming it is a deliberate act because it adds request-path egress on the shared crawl IP; item 14
 > (the freshness floor) exists as code but is paused and lacks the per-row freshness field it was
 > specified with. Nothing currently prevents the 31.1% wrong-spec rate from reaching a buyer.
 >
