@@ -219,6 +219,10 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 dest=dest,
                 user_agent=req.headers.get("user-agent"),
                 token=token,
+                # The signed ctx carries `join_mode`, so a dest that is ALREADY a prefilled
+                # cart is knocked out (`already_cart`) instead of being rebuilt from a
+                # request that carries no product identity.
+                ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
                 settings=settings,
             )
             if eligible:

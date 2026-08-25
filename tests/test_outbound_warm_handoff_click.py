@@ -91,6 +91,10 @@ def test_warm_302_to_brand_cart_and_ctx_instrumentation(monkeypatch) -> None:
     assert res.status_code == 302
     assert res.headers["location"] == CONTINUE_URL
     assert len(calls) == 1
+    assert calls[0]["ctx"]["pvt_click_id"] == "clk_test", (
+        "the ROUTE must forward the real token ctx to the resolver — it is what carries the "
+        "click id into the gateway's cart `attribution` arg"
+    )
     ctx = logged[0]["token_payload"]["ctx"]
     assert ctx["handoff"] == "warm"
     assert ctx["warm_reason"] == "ok"
@@ -276,7 +280,17 @@ async def test_resolve_warm_handoff_rejects_off_brand_continue_url(monkeypatch) 
 
 
 @pytest.mark.asyncio
-async def test_resolve_warm_handoff_passes_variant_hint_and_attribution(monkeypatch) -> None:
+async def test_resolve_warm_handoff_sends_handle_and_attribution_but_never_a_variant(monkeypatch) -> None:
+    """The payload carries the product handle + attribution — and NO variant id, ever.
+
+    This test previously hand-built a ctx containing `shopify_variant_id` and asserted the
+    value was forwarded. It passed, and it was misleading: NOTHING writes that key into a
+    redirect token, so the branch it covered could never fire in production. The fixture
+    manufactured the very evidence the assertion checked. It is kept here as a knockout in
+    the opposite direction — even when that key IS present, no variant id is sent — with the
+    real invariant (no producer exists) pinned separately in
+    `test_real_mint_stamps_cart_permalink_and_never_a_variant_id`.
+    """
     seen: Dict[str, Any] = {}
 
     class _FakeResponse:
@@ -302,7 +316,10 @@ async def test_resolve_warm_handoff_passes_variant_hint_and_attribution(monkeypa
     assert out == {"continue_url": CONTINUE_URL, "cart_id": "gid://shopify/Cart/abc"}
     assert seen["json"]["brand_domain"] == "cosrx.com"
     assert seen["json"]["product_handle"] == "peptide-132-hair-home-care-kit"
-    assert seen["json"]["variant_id"] == "51895645012184"
+    assert "variant_id" not in seen["json"], (
+        "no variant id may be sent: the only Shopify-issued id we hold travels on "
+        "cart_variant_id, which #1813 round 4 forbids stamping into the token ctx"
+    )
     assert seen["json"]["attribution"] == {"pivota_click_id": "clk_1"}
     assert seen["headers"]["X-Internal-Key"] == "test-key"
 
@@ -355,12 +372,13 @@ def test_could_upgrade_at_click_time_never_under_reports(
     monkeypatch.setattr(settings, "outbound_warm_handoff_rollout_pct", pct)
     token = _mint_token(dest)
 
-    resolve_says = warm.could_upgrade_at_click_time(dest=dest, token=token, settings=settings)
+    resolve_says = warm.could_upgrade_at_click_time(dest=dest, token=token, ctx={}, settings=settings)
     if expected is not TOKEN_DEPENDENT:
         assert resolve_says is expected, f"{label}: expected {expected}, got {resolve_says}"
     if not enabled:
         return
     click_says, reason = warm.evaluate_warm_eligibility(
+        ctx={},
         dest=dest, user_agent=HUMAN_UA, token=token, settings=settings
     )
     assert resolve_says == click_says, f"{label}: resolve={resolve_says} click={click_says} ({reason})"
@@ -395,8 +413,9 @@ def test_could_upgrade_at_click_time_over_reports_for_a_bot_and_that_is_correct(
     reverse (claiming `false` and serving a cart) is the defect.
     """
     token = _mint_token()
-    assert warm.could_upgrade_at_click_time(dest=BRAND_DEST, token=token, settings=settings) is True
+    assert warm.could_upgrade_at_click_time(dest=BRAND_DEST, token=token, ctx={}, settings=settings) is True
     bot_eligible, reason = warm.evaluate_warm_eligibility(
+        ctx={},
         dest=BRAND_DEST, user_agent="Mozilla/5.0 (compatible; GPTBot/1.0)", token=token, settings=settings
     )
     assert (bot_eligible, reason) == (False, "bot")
@@ -407,19 +426,23 @@ def test_assume_human_skips_only_the_user_agent_knockout(monkeypatch):
     token = _mint_token()
     # It does waive the UA knockout...
     assert warm.evaluate_warm_eligibility(
+        ctx={},
         dest=BRAND_DEST, user_agent="curl/8.4.0", token=token, settings=settings, assume_human=True
     ) == (True, "allowlisted")
     # ...and nothing else. Affiliate hosts and non-allowlisted brands still refuse.
     assert warm.evaluate_warm_eligibility(
+        ctx={},
         dest="https://track.linksynergy.com/x?u=1", user_agent=None, token=token,
         settings=settings, assume_human=True
     ) == (False, "affiliate")
     monkeypatch.setattr(settings, "outbound_warm_handoff_brands_raw", "someone-else.com")
     assert warm.evaluate_warm_eligibility(
+        ctx={},
         dest=BRAND_DEST, user_agent=None, token=token, settings=settings, assume_human=True
     ) == (False, "not_allowlisted")
     monkeypatch.setattr(settings, "outbound_warm_handoff_internal_key", "")
     assert warm.evaluate_warm_eligibility(
+        ctx={},
         dest=BRAND_DEST, user_agent=None, token=token, settings=settings, assume_human=True
     ) == (False, "no_internal_key")
 
@@ -428,6 +451,335 @@ def test_the_click_path_still_knocks_out_bots_by_default(monkeypatch):
     """The new parameter must default OFF — the click lane passes no `assume_human`."""
     token = _mint_token()
     assert warm.evaluate_warm_eligibility(
+        ctx={},
         dest=BRAND_DEST, user_agent="Mozilla/5.0 (compatible; ClaudeBot/1.0)",
         token=token, settings=settings
     ) == (False, "bot")
+# ---------------------------------------------------------------------------------------------
+# An ALREADY-PREFILLED cart is never rebuilt.
+#
+# The lane exists to upgrade a COLD PDP redirect into a cart. On a dest that is already a cart
+# permalink there is nothing to upgrade, and the rebuild is strictly destructive: the resolve
+# request carries NO product identity (a `/cart/...` path cannot match `_HANDLE_RE`, and no
+# variant id is ever stamped into a token ctx), so a correct cart — right variant, carrying the
+# `attributes[pivota_click_id]` order-side attribution join — could be replaced at click time by
+# whatever an identity-less request happened to return.
+# ---------------------------------------------------------------------------------------------
+
+CART_DEST = (
+    "https://cosrx.com/cart/51895645012184:1"
+    "?utm_source=pivota&attributes[pivota_click_id]=clk_test"
+)
+
+
+async def _mint_real_redirect(**overrides: Any) -> str:
+    """Mint through the REAL production builder, so the ctx under test is the one prod stamps.
+
+    `allowed_domains` is passed explicitly only to keep the market allowlist off the database;
+    every other input is the builder's own.
+    """
+    from routes.agent_shop_gateway import _make_external_redirect_url
+
+    kwargs: Dict[str, Any] = {
+        "market": "US",
+        "tool": "*",
+        "destination_url": "https://www.cosrx.com/products/peptide-132-hair-home-care-kit",
+        "utm_template": None,
+        "ctx": {},
+        "allowed_domains": ["cosrx.com"],
+        "cart_variant_id": "51895645012184",
+        "shop_domain": "cosrx.com",
+        "platform": "shopify",
+        "quantity": 1,
+    }
+    kwargs.update(overrides)
+    url = await _make_external_redirect_url(**kwargs)
+    assert url, "the builder must produce a redirect for this fixture"
+    return url.split("token=", 1)[1]
+
+
+def _decode_ctx(token: str) -> Dict[str, Any]:
+    import base64
+    import json as _json
+
+    body = token.split(".", 1)[0]
+    body += "=" * (-len(body) % 4)
+    return _json.loads(base64.urlsafe_b64decode(body))
+
+
+@pytest.mark.asyncio
+async def test_real_mint_stamps_cart_permalink_and_never_a_variant_id() -> None:
+    """The mint->click contract this whole guard rests on, pinned against the real builder.
+
+    Two facts, neither of which was covered anywhere: a cart-capable offer stamps
+    `join_mode='cart_permalink'` (so the knockout has something to read), and the ctx does NOT
+    carry `shopify_variant_id` (so the resolve payload can never name the product). The second
+    is the invariant the deleted dead branch falsely implied was satisfied.
+    """
+    token = await _mint_real_redirect()
+    payload = _decode_ctx(token)
+    ctx = payload["ctx"]
+
+    assert ctx["join_mode"] == "cart_permalink"
+    assert "/cart/51895645012184:1" in payload["dest"]
+    assert "attributes[pivota_click_id]=" in payload["dest"], (
+        "the order-side attribution join is exactly what a rebuild would discard"
+    )
+    assert "shopify_variant_id" not in ctx, (
+        "no producer may stamp a numeric variant id into the token ctx (#1813 round 4): "
+        "attribution cross-fills product<->variant ids, so it would leak up a grain into "
+        "surface_click_events.canonical_product_id"
+    )
+    # And the dest the lane would have tried to rebuild yields no product identity at all.
+    assert warm.extract_product_handle(payload["dest"]) is None
+
+
+@pytest.mark.asyncio
+async def test_real_cart_permalink_token_is_never_warmed_end_to_end(monkeypatch) -> None:
+    """End to end on a REAL minted token: no resolver call, and the cart 302 is untouched."""
+    token = await _mint_real_redirect()
+    dest = _decode_ctx(token)["dest"]
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+
+    client = TestClient(app)
+    res = client.get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+    assert res.status_code == 302
+    assert res.headers["location"] == dest, "an already-prefilled cart must 302 unchanged"
+    assert "attributes[pivota_click_id]=" in res.headers["location"], (
+        "the order-side attribution join must survive the click"
+    )
+    assert calls == [], "the gateway must not be called for a dest that is already a cart"
+    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "already_cart"
+    assert logged[0]["token_payload"]["ctx"]["handoff"] == "cold"
+
+
+def test_already_cart_knockout_beats_the_allowlist(monkeypatch) -> None:
+    """The knockout fires on an allowlisted brand — the population that is actually live."""
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _mint_token(dest=CART_DEST, ctx={"join_mode": "cart_permalink"})
+    client = TestClient(app)
+    res = client.get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.headers["location"] == CART_DEST
+    assert calls == []
+    ctx = logged[0]["token_payload"]["ctx"]
+    assert (ctx["handoff"], ctx["warm_reason"]) == ("cold", "already_cart")
+
+
+def test_referral_only_pdp_still_warms(monkeypatch) -> None:
+    """The legitimate upgrade path is untouched — the guard must not disarm the whole lane."""
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    token = _mint_token(dest=BRAND_DEST, ctx={"join_mode": "referral_only"})
+    client = TestClient(app)
+    res = client.get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.headers["location"] == CONTINUE_URL
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("ctx", "expected"),
+    [
+        ({"join_mode": "cart_permalink"}, True),
+        ({"join_mode": "CART_PERMALINK"}, True),  # case-insensitive
+        ({"join_mode": " cart_permalink "}, True),  # whitespace-tolerant
+        ({"join_mode": "referral_only"}, False),
+        ({}, False),  # legacy token with no join_mode -> lane behaves as before
+        ({"join_mode": None}, False),
+        ({"join_mode": "cart"}, False),  # only the exact token counts
+        (None, False),
+        # A non-dict ctx must not crash and must not be treated as a cart. `(ctx or {}).get`
+        # would raise on a string; the isinstance guard is what makes these safe.
+        ("cart_permalink", False),
+        (["cart_permalink"], False),
+        (42, False),
+    ],
+)
+def test_is_already_cart_join(ctx: Optional[Dict[str, Any]], expected: bool) -> None:
+    assert warm.is_already_cart_join(ctx) is expected
+
+
+def test_evaluate_warm_eligibility_requires_ctx() -> None:
+    """`ctx` has NO default on purpose: a call site that forgets it must fail loudly rather
+    than silently stop knocking out already-prefilled carts."""
+    with pytest.raises(TypeError, match="ctx"):
+        warm.evaluate_warm_eligibility(  # type: ignore[call-arg]
+            dest=CART_DEST, user_agent=HUMAN_UA, token="t" * 20, settings=settings
+        )
+
+
+@pytest.mark.parametrize(
+    ("path_url", "ok"),
+    [
+        # Both shapes the gateway actually returns are legitimate and must keep working.
+        ("https://cosrx.com/cart/c/abc123?key=k", True),
+        ("https://cosrx.com/cart/51895645012184:1", True),
+        ("https://cosrx.com/checkouts/xyz", True),
+        ("https://cosrx.com/en/cart/c/abc", True),  # locale prefix
+        ("https://cosrx.com/CART/c/abc", True),  # case-folded before matching
+        ("https://cosrx.com/Checkouts/xyz", True),
+        # Everything host+scheme alone used to wave through.
+        ("https://cosrx.com/", False),
+        ("https://cosrx.com", False),
+        ("https://cosrx.com/404-not-found", False),
+        ("https://cosrx.com/products/some-other-product", False),
+        # Segment EQUALITY, not substring — this is what makes any-position matching safe.
+        ("https://cosrx.com/products/cart-organizer", False),
+        ("https://cosrx.com/collections/checkout-bags", False),
+        # A PREFILLED cart always names WHAT is in it. These are cart-WORDED but carry no
+        # cart identity, so they are refused: 302-ing a shopper off a correct PDP onto the
+        # storefront's EMPTY cart page is a wrong landing, not merely a missed upgrade.
+        ("https://cosrx.com/cart", False),  # the empty cart page
+        ("https://cosrx.com/checkout", False),  # bare checkout, no cart token
+        ("https://cosrx.com/products/cart", False),  # a PDP whose handle IS "cart"
+        ("https://cosrx.com/pages/cart", False),
+        ("https://cosrx.com/blogs/news/cart", False),
+    ],
+)
+def test_continue_url_must_be_cart_shaped(path_url: str, ok: bool) -> None:
+    assert warm._validate_continue_url(path_url, "cosrx.com") is ok
+
+
+@pytest.mark.asyncio
+async def test_non_cart_continue_url_is_refused_and_click_lands_on_the_pdp(monkeypatch) -> None:
+    """A gateway answer that is not a cart resolves to None, so the shopper keeps the PDP."""
+
+    class _FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> Dict[str, Any]:
+            return {"continue_url": "https://cosrx.com/404-not-found"}
+
+    class _FakeClient:
+        async def post(self, *args: Any, **kwargs: Any) -> Any:
+            return _FakeResponse()
+
+    out = await warm.resolve_warm_handoff(
+        dest=BRAND_DEST, ctx={"pvt_click_id": "c"}, settings=settings, client=_FakeClient()
+    )
+    assert out is None
+
+
+# ---------------------------------------------------------------------------------------------
+# Adversarial-review findings (2026-08-24).
+#
+# 1. `join_mode` records "we BUILT a cart", not "dest IS a cart". A destination_url that was
+#    ALREADY a cart, with no recoverable variant id, mints `referral_only` — so reading
+#    join_mode alone left the original defect wide open on that population. Four other token
+#    minters make it worse: two omit join_mode, two HARDCODE "referral_only".
+# 2. Ordered first, the knockout swallowed bots, non-allowlisted hosts and affiliate links —
+#    none ever at risk — corrupting the rollout dial the runbook points operators at.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_already_a_cart_is_knocked_out_even_when_join_mode_says_referral_only() -> None:
+    """The false negative that `join_mode` alone could not see.
+
+    Built through the REAL production builder with a destination that is already a cart and
+    no recoverable variant id — which is exactly what mints `referral_only` over a cart dest.
+    """
+    token = await _mint_real_redirect(
+        destination_url="https://cosrx.com/cart/51895645012184:1", cart_variant_id=None
+    )
+    payload = _decode_ctx(token)
+
+    assert payload["ctx"]["join_mode"] == "referral_only", "the premise of this test"
+    assert warm.is_already_cart_join(payload["ctx"]) is False, "join_mode alone cannot see it"
+    assert warm.extract_product_handle(payload["dest"]) is None, "so no identity would be sent"
+
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=payload["dest"], user_agent=HUMAN_UA, token=token,
+        ctx=payload["ctx"], settings=settings,
+    )
+    assert (eligible, reason) == (False, "already_cart"), (
+        "the dest PATH arm must catch what join_mode misses"
+    )
+
+
+def test_cart_dest_is_knocked_out_for_tokens_that_never_stamp_join_mode() -> None:
+    """Minters that omit join_mode, or hardcode 'referral_only', are covered by the path arm."""
+    for ctx in ({}, {"join_mode": "referral_only"}, {"join_mode": None}):
+        eligible, reason = warm.evaluate_warm_eligibility(
+            dest=CART_DEST, user_agent=HUMAN_UA, token="t" * 20, ctx=ctx, settings=settings,
+        )
+        assert (eligible, reason) == (False, "already_cart"), f"ctx={ctx}"
+
+
+@pytest.mark.parametrize(
+    ("dest", "user_agent", "brands", "expected_reason"),
+    [
+        # The knockout runs LAST, so populations that were never at risk keep their own
+        # reason and stay out of the already_cart dial.
+        (CART_DEST, "Googlebot/2.1 (+http://www.google.com/bot.html)", "cosrx.com", "bot"),
+        (CART_DEST, HUMAN_UA, "example.com", "not_allowlisted"),
+        ("https://www.linksynergy.com/cart/c/abc", HUMAN_UA, "cosrx.com", "affiliate"),
+        (CART_DEST, None, "cosrx.com", "bot"),  # no UA at all is treated as non-human
+        # ...and a click that WOULD have been warmed is the one that reports already_cart.
+        (CART_DEST, HUMAN_UA, "cosrx.com", "already_cart"),
+    ],
+)
+def test_already_cart_dial_counts_only_clicks_that_would_have_been_warmed(
+    monkeypatch, dest: str, user_agent: Optional[str], brands: str, expected_reason: str
+) -> None:
+    monkeypatch.setattr(settings, "outbound_warm_handoff_brands_raw", brands)
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=dest, user_agent=user_agent, token="t" * 20,
+        ctx={"join_mode": "cart_permalink"}, settings=settings,
+    )
+    assert eligible is False
+    assert reason == expected_reason
+
+
+def test_pdp_dest_is_never_seen_as_a_cart() -> None:
+    """The path arm must cost nothing on the legitimate upgrade population."""
+    for dest in (
+        BRAND_DEST,
+        "https://cosrx.com/products/cart-organizer",
+        "https://cosrx.com/collections/checkout-bags",
+        "https://cosrx.com/products/cart",
+    ):
+        assert warm._is_cart_shaped_path(warm._path_of(dest)) is False, dest
+
+
+def test_join_mode_arm_catches_a_cart_shape_the_path_set_does_not_know() -> None:
+    """The `join_mode` arm is NOT redundant with the path arm, and this pins it.
+
+    Today the two agree on every real cart, so a test using a real minted cart dest is killed
+    by the path arm alone and would let the join_mode arm rot. The arms differ precisely where
+    a cart URL does not use a segment in `_CART_PATH_SEGMENTS` — a non-Shopify or localized
+    permalink (Wix `/cart-page`, `/panier/...`) that a future `resolve_cart_permalink` learns
+    to build. `join_mode` is shape-independent, so it still knocks that out.
+    """
+    exotic_cart = "https://cosrx.com/cart-page/abc123"
+    assert warm._is_cart_shaped_path(warm._path_of(exotic_cart)) is False, "the premise"
+
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=exotic_cart, user_agent=HUMAN_UA, token="t" * 20,
+        ctx={"join_mode": "cart_permalink"}, settings=settings,
+    )
+    assert (eligible, reason) == (False, "already_cart")
+
+
+def test_route_forwards_ctx_so_join_mode_alone_can_knock_out(monkeypatch) -> None:
+    """The ROUTE must pass the real signed ctx to eligibility, not an empty dict.
+
+    Uses a cart shape the path arm does NOT recognise, so the knockout can only fire via
+    `join_mode` — which it can only see if the route actually forwarded the ctx. With a
+    cart-shaped dest this would pass even on an empty ctx, and the wiring would rot.
+    """
+    exotic_cart = "https://cosrx.com/cart-page/abc123"
+    assert warm._is_cart_shaped_path(warm._path_of(exotic_cart)) is False, "the premise"
+
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _mint_token(dest=exotic_cart, ctx={"join_mode": "cart_permalink"})
+
+    client = TestClient(app)
+    res = client.get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+
+    assert res.headers["location"] == exotic_cart
+    assert calls == [], "an empty ctx here would have warmed an already-prefilled cart"
+    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "already_cart"
