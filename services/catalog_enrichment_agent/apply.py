@@ -49,7 +49,39 @@ _MERCHANT_UPSERT_SQL = """
                   primary_platform = COALESCE(EXCLUDED.primary_platform, catalog_merchants.primary_platform),
                   status = EXCLUDED.status,
                   source_ref = COALESCE(EXCLUDED.source_ref, catalog_merchants.source_ref),
-                  metadata_json = EXCLUDED.metadata_json,
+                  -- MERGED, not replaced. `catalog_merchants.metadata_json` is a
+                  -- union of independently-owned key namespaces —
+                  -- `brand_relationship` belongs to
+                  -- services/brand_claim_service.set_merchant_brand_direct (a
+                  -- verified ownership proof, and the ONLY value
+                  -- classify_offer_type trusts to surface a brand-direct offer),
+                  -- `observed`/`minted_by`/`adr`/`seller_identity` to
+                  -- services/seller_identity.py, `ingested_from` to
+                  -- services/catalog_sync_service.py. `EXCLUDED.metadata_json`
+                  -- destroys all of them to write this lane's two keys. PR #1857
+                  -- fixed the same shape for `status` in catalog_sync_service and
+                  -- #1862 fixed it for this column there; this is the third
+                  -- writer of the same column, and it must agree with the other
+                  -- two about who owns what.
+                  --
+                  -- Not currently a measured data loss: the rows this arm UPDATEs
+                  -- are keyed `agent_seed::<slug>` (ingestion.derive_merchant_id),
+                  -- a namespace disjoint from the tenant `merch_*` ids brand
+                  -- claims are written against, and the observed seller-of-record
+                  -- row rides `_ENSURE_MERCHANT_INSERT_SQL` (DO NOTHING) instead
+                  -- of this statement. It is fixed because a replace here and a
+                  -- merge there is precisely the disagreement that produced the
+                  -- original bug, and because `routes/catalog_routes.py` takes
+                  -- `merchant_id` from the request body with no tenant scoping —
+                  -- so an `agent_seed::` id CAN be pushed through
+                  -- ingest_standard_products, which (post-#1862) merges its own
+                  -- key into exactly these rows.
+                  --
+                  -- Both COALESCEs are load-bearing: `NULL || x` and `x || NULL`
+                  -- are both NULL in Postgres, which would ERASE the column
+                  -- rather than merely clobber it.
+                  metadata_json = COALESCE(catalog_merchants.metadata_json, CAST('{}' AS JSONB))
+                                  || COALESCE(EXCLUDED.metadata_json, CAST('{}' AS JSONB)),
                   updated_at = NOW()
                 """
 

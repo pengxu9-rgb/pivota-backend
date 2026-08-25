@@ -50,6 +50,10 @@ pytestmark = pytest.mark.skipif(
 
 _PREFIX = "cmmetapg"
 
+# `ingestion.derive_merchant_id` shape — the only population
+# `apply._MERCHANT_UPSERT_SQL` ever reaches on its DO UPDATE arm.
+_AGENT_PREFIX = "agent_seed::cmmetapg"
+
 _BRAND_DIRECT = "brand_direct"
 
 
@@ -67,7 +71,14 @@ async def _db():
             "it first). Run this file with a Postgres DATABASE_URL."
         )
 
-    from db.catalog import catalog_merchants
+    from db.brand_claims import brand_claims
+    from db.catalog import (
+        catalog_merchants,
+        catalog_offers,
+        catalog_products,
+        catalog_skus,
+        writer_audit_log,
+    )
     from db.merchant_onboarding import merchant_onboarding
     from tests.model_schema import ensure_model_tables
 
@@ -78,7 +89,20 @@ async def _db():
     # merchant_onboarding rides along because `upsert_catalog_merchant` falls
     # back to `_resolve_merchant_name` whenever the caller passes
     # `merchant_name=None` — which both live call sites do.
-    await ensure_model_tables((catalog_merchants, merchant_onboarding))
+    # catalog_products / catalog_skus / catalog_offers / writer_audit_log /
+    # brand_claims are what `apply_ingest_plan` reads and writes around the
+    # merchant stage (its seller-of-record prep and its writer audit).
+    await ensure_model_tables(
+        (
+            catalog_merchants,
+            merchant_onboarding,
+            catalog_products,
+            catalog_skus,
+            catalog_offers,
+            writer_audit_log,
+            brand_claims,
+        )
+    )
     await _reset()
     try:
         yield
@@ -91,9 +115,10 @@ async def _db():
 async def _reset() -> None:
     from db.database import database
 
-    await database.execute(
-        "DELETE FROM catalog_merchants WHERE merchant_id LIKE :p", {"p": f"{_PREFIX}%"}
-    )
+    for pattern in (f"{_PREFIX}%", f"{_AGENT_PREFIX}%"):
+        await database.execute(
+            "DELETE FROM catalog_merchants WHERE merchant_id LIKE :p", {"p": pattern}
+        )
 
 
 async def _seed_merchant(merchant_id: str, metadata: Optional[Dict[str, Any]]) -> None:
@@ -128,6 +153,15 @@ async def _metadata(merchant_id: str) -> Optional[Dict[str, Any]]:
     if raw is None:
         return None
     return json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
+
+
+async def database_row(merchant_id: str) -> Dict[str, Any]:
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT * FROM catalog_merchants WHERE merchant_id = :m", {"m": merchant_id}
+    )
+    return dict(row)
 
 
 async def _brand_relationship_as_the_serving_path_reads_it(
@@ -289,3 +323,182 @@ async def test_the_mint_path_still_writes_the_whole_object():
     )
 
     assert await _metadata(merchant) == stamp
+
+
+# ---------------------------------------------------------------------------
+# The third writer of the same column: services/catalog_enrichment_agent/apply.py
+# ---------------------------------------------------------------------------
+#
+# `_MERCHANT_UPSERT_SQL` carried `metadata_json = EXCLUDED.metadata_json` — the
+# same whole-column write, in the crawl-enrichment lane. It reaches only
+# `agent_seed::<slug>` rows (`ingestion.derive_merchant_id`), a namespace
+# disjoint from the tenant `merch_*` ids brand claims are written against, and
+# the observed seller-of-record row rides `_ENSURE_MERCHANT_INSERT_SQL`
+# (`DO NOTHING`) instead — so no CURRENT loss is measurable through it. It is
+# fixed anyway: a replace here and a merge in `catalog_sync_service` is exactly
+# the disagreement between two owners of one column that produced the original
+# bug, and `routes/catalog_routes.py` takes `merchant_id` from the request body
+# with no tenant scoping, so an `agent_seed::` id can be pushed through
+# `ingest_standard_products` — which now merges its own key into these rows.
+#
+# These drive the REAL `apply_ingest_plan`, both executors, because the SQL is
+# reached two different ways: one row at a time (`database.execute`) and through
+# `bulk_writer.bulk_upsert`, which rewrites the statement into a chunked
+# multi-row VALUES. A fix verified on one executor says nothing about the other.
+
+
+def _agent_merchant_row(merchant_id: str, domain: str) -> Dict[str, Any]:
+    """The row shape `ingestion._build_merchant_upserts` emits — note
+    `metadata_json` arrives as a JSON STRING here, not a dict, because this SQL
+    binds it through `CAST(:metadata_json AS jsonb)`."""
+    return {
+        "merchant_id": merchant_id,
+        "merchant_name": "CM Meta Fixture",
+        "primary_platform": "external_seed",
+        "status": "active",
+        "source_system": "catalog_enrichment_agent_v1",
+        "source_ref": domain,
+        "metadata_json": json.dumps(
+            {"agent_version": "catalog_enrichment_agent_v1", "domain": domain}
+        ),
+    }
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["per_row", "bulk_multirow"])
+async def test_the_enrichment_apply_lane_merges_rather_than_replacing(batch):
+    """Drives `services/catalog_enrichment_agent/apply.apply_ingest_plan` for
+    real. A merchants-only plan is enough and is the honest scope: the merchant
+    stage runs first in both executors, before any product row exists."""
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+
+    merchant = f"{_AGENT_PREFIX}_{'bulk' if batch else 'perrow'}"
+    # `domain` is seeded STALE and collides with a key the plan also writes. A
+    # merge whose operands are the wrong way round preserves the untouched key
+    # just as well and would pass every other assertion here — the collision is
+    # the only thing that tells "new value wins" from "old value wins".
+    await _seed_merchant(
+        merchant,
+        {"brand_relationship": _BRAND_DIRECT, "domain": "stale.example"},
+    )
+
+    counts = await apply_ingest_plan(
+        {"merchants": [_agent_merchant_row(merchant, "fixture.example")]},
+        batch_label="cmmeta-gate",
+        batch=batch,
+    )
+    # The merchant stage swallows per-row failures and only counts successes, so
+    # without this a statement that never ran would read as "metadata preserved".
+    assert counts["merchants"] == 1
+
+    md = await _metadata(merchant)
+    assert md["brand_relationship"] == _BRAND_DIRECT
+    # ...and this lane's own keys still landed. A blanket refusal to write the
+    # column would pass the assertion above and be a different bug.
+    assert md["agent_version"] == "catalog_enrichment_agent_v1"
+    assert md["domain"] == "fixture.example"  # not the seeded "stale.example"
+    # The row really moved through the DO UPDATE arm, not the INSERT arm.
+    row = await database_row(merchant)
+    assert row["source_ref"] == "fixture.example"
+
+
+async def test_the_enrichment_lane_mint_still_writes_the_whole_object():
+    """The INSERT arm is untouched: a brand-new `agent_seed::` row is born with
+    exactly the plan's metadata and nothing merged into it."""
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+
+    merchant = f"{_AGENT_PREFIX}_mint"
+
+    counts = await apply_ingest_plan(
+        {"merchants": [_agent_merchant_row(merchant, "mint.example")]},
+        batch_label="cmmeta-gate",
+    )
+    assert counts["merchants"] == 1
+
+    assert await _metadata(merchant) == {
+        "agent_version": "catalog_enrichment_agent_v1",
+        "domain": "mint.example",
+    }
+
+
+async def test_a_null_metadata_row_is_not_erased_by_the_enrichment_lane():
+    """`NULL || x` is NULL in Postgres. Both COALESCEs in the merged assignment
+    are load-bearing — without the left one this fix would ERASE the column on
+    legacy rows rather than merely clobber it."""
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+
+    merchant = f"{_AGENT_PREFIX}_nullmd"
+    await _seed_merchant(merchant, None)
+
+    counts = await apply_ingest_plan(
+        {"merchants": [_agent_merchant_row(merchant, "nullmd.example")]},
+        batch_label="cmmeta-gate",
+    )
+    assert counts["merchants"] == 1
+
+    assert await _metadata(merchant) == {
+        "agent_version": "catalog_enrichment_agent_v1",
+        "domain": "nullmd.example",
+    }
+
+
+async def test_a_null_plan_patch_does_not_erase_the_existing_column():
+    """The RIGHT COALESCE, which no caller exercises today: `_build_merchant_upserts`
+    always json.dumps a dict, so `EXCLUDED.metadata_json` is never NULL in
+    practice. `x || NULL` is also NULL, so a plan row that ever did carry a null
+    patch would erase the column outright — the failure mode that is worse than
+    the bug being fixed."""
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+
+    merchant = f"{_AGENT_PREFIX}_nullpatch"
+    await _seed_merchant(merchant, {"brand_relationship": _BRAND_DIRECT})
+
+    row = _agent_merchant_row(merchant, "nullpatch.example")
+    row["metadata_json"] = None
+    counts = await apply_ingest_plan(
+        {"merchants": [row]}, batch_label="cmmeta-gate"
+    )
+    assert counts["merchants"] == 1
+
+    assert await _metadata(merchant) == {"brand_relationship": _BRAND_DIRECT}
+
+
+async def test_the_backfill_script_merges_through_its_own_binder():
+    """`scripts/backfill_canonical_chain_for_agent_seeds.py` held a VERBATIM copy
+    of this SQL and writes the SAME `agent_seed::` rows (both are fed by
+    `ingestion._build_merchant_upserts`). A copy is how a one-site fix silently
+    fails: whichever statement runs last decides the column. It now shares the
+    constant.
+
+    Driving `_upsert_merchant` rather than asserting the import, because the
+    import is not the delivering line — a re-pasted local copy leaves the import
+    in place and still clobbers, and an identity assertion goes green through it
+    (verified: that mutant SURVIVED an `is`-comparison version of this test).
+
+    It also has to run through the script's OWN binder. `_Conn._bind` rewrites
+    every `:name` in the WHOLE statement to `$N` — including the ON CONFLICT tail
+    and its comments, unlike `bulk_writer`, which only rewrites the VALUES tuple.
+    So the shared SQL now has a second, stricter consumer, and this is the test
+    that notices if a future comment on it contains a colon-word.
+    """
+    import asyncpg
+
+    import scripts.backfill_canonical_chain_for_agent_seeds as backfill
+
+    merchant = f"{_AGENT_PREFIX}_backfill"
+    await _seed_merchant(merchant, {"brand_relationship": _BRAND_DIRECT})
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    previous = backfill._db
+    backfill._db = backfill._Conn(conn)
+    try:
+        await backfill._upsert_merchant(
+            _agent_merchant_row(merchant, "backfill.example")
+        )
+    finally:
+        backfill._db = previous
+        await conn.close()
+
+    md = await _metadata(merchant)
+    assert md["brand_relationship"] == _BRAND_DIRECT
+    assert md["agent_version"] == "catalog_enrichment_agent_v1"
+    assert md["domain"] == "backfill.example"
