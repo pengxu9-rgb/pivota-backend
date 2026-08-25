@@ -47,7 +47,20 @@ def _patch_sleep(monkeypatch: pytest.MonkeyPatch) -> List[float]:
     async def fake_sleep(d: float) -> None:
         slept.append(d)
 
-    monkeypatch.setattr(cp, "asyncio", SimpleNamespace(sleep=fake_sleep))
+    class _AsyncioProxy:
+        """Real asyncio for everything except `sleep`.
+
+        A bare SimpleNamespace(sleep=...) is not enough: the module also uses
+        `get_running_loop`, `shield` and `Future` for the robots single-flight, and hiding those
+        makes the whole module fail for a reason that has nothing to do with the test.
+        """
+
+        sleep = staticmethod(fake_sleep)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(cp, "asyncio", _AsyncioProxy())
     return slept
 
 
@@ -67,6 +80,11 @@ def _serve_robots(monkeypatch: pytest.MonkeyPatch, bodies: Dict[str, Any]) -> Li
 
         async def get(self, url: str) -> httpx.Response:
             fetched.append(url)
+            # YIELD. An `async def` with no await inside never suspends, so gathered tasks would
+            # each run to completion before the next started and the cache would be warm by the
+            # second one — concurrency would never actually be exercised. That is exactly why an
+            # earlier version of the fan-out test could not tell single-flight from its absence.
+            await asyncio.sleep(0)
             host = url.split("://", 1)[1].split("/", 1)[0]
             body = bodies.get(host, 404)
             if isinstance(body, Exception):
@@ -719,3 +737,373 @@ def test_the_batch_scripts_opt_into_waiting_rather_than_being_refused() -> None:
             assert "max_wait=0" in call, (
                 f"{rel}: a BATCH fetch must opt into waiting out a backoff, got: {call}"
             )
+
+
+# --- every merchant-crawling lane goes through the gate ---------------------------------------
+
+# Lanes that fetch THIRD-PARTY hosts (merchant storefronts, sitemaps, editorial articles) and so
+# share the one reserved crawl egress IP. A ban earned by any of them takes all of them down,
+# which is why coverage is asserted as a SET rather than per-lane: a new lane added without the
+# gate should fail this, not slip through because nobody wrote it a test.
+#
+# Deliberately EXCLUDED, with reasons — this list is the interesting half:
+#   * services/executor_agents/canonical_pdp_enrichment.py — POSTs to Google's Vertex Gemini API
+#     (`vertex_gemini.generate_content_url`), not a merchant. Pacing a first-party API at one
+#     request per second per host would be actively wrong. It appeared in an earlier audit table
+#     of "unpaced crawl lanes" only because that table was built by grepping for robots/pacing
+#     without checking what each lane actually fetches.
+#   * every LLM / partner-API client (agent_center_llm_client, connector_service, …) — same
+#     reason: first-party or contracted endpoints, not crawling.
+# lane -> how many outbound fetch sites it gates. An EXACT count, not a presence check: a lane
+# with two fetch sites where one loses its gate still contains the string, so `in text` would
+# pass while half the lane crawled unpaced — the same "a guard on one path does not cover the
+# path that bypasses it" shape this whole change exists to close. An exact count fails on a
+# removed gate AND on a newly added fetch, which is the moment someone should be made to think.
+_GATED_CRAWL_LANES = {
+    "services/external_offers_service.py": 1,
+    "services/brand_product_discovery.py": 1,
+    "services/co_occurrence_finder.py": 1,
+    "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch
+    "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
+    "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
+}
+
+
+def test_every_third_party_crawl_lane_goes_through_the_politeness_gate() -> None:
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    wrong = {}
+    for rel, expected in sorted(_GATED_CRAWL_LANES.items()):
+        found = (repo / rel).read_text().count("crawl_politeness.before_request")
+        if found != expected:
+            wrong[rel] = f"expected {expected} gated fetch(es), found {found}"
+    assert not wrong, (
+        "these lanes crawl third-party hosts from the shared crawl egress IP and their gating "
+        f"changed: {wrong}. If you ADDED a fetch, gate it. If you removed one, update the count."
+    )
+
+
+def test_the_vertex_lane_is_NOT_gated_because_it_is_not_a_crawl() -> None:
+    """The exclusion, asserted rather than left as a comment.
+
+    `canonical_pdp_enrichment` POSTs to Google's Vertex Gemini API. Someone reading the list
+    above may reasonably wonder why one 'pdp' module is absent; this fails loudly if a future
+    change either makes it crawl merchants (in which case it belongs in the set) or wraps the
+    Gemini call in a per-host crawl limiter (which would throttle a first-party API to 1/s).
+    """
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    text = (repo / "services/executor_agents/canonical_pdp_enrichment.py").read_text()
+    assert "vertex_gemini.generate_content_url" in text, (
+        "this lane no longer targets the Vertex API — re-assess whether it now crawls merchants"
+    )
+    assert "crawl_politeness" not in text, (
+        "a first-party API call must not be paced by the per-host crawl gate"
+    )
+
+
+# --- the gate must not itself become the burst ------------------------------------------------
+
+def test_a_fan_out_over_one_host_makes_exactly_ONE_robots_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review P0. The audit routes `asyncio.gather` over ~20 urls on ONE merchant host, so all
+    20 miss the robots cache in the same tick. Without single-flight that is 20 simultaneous,
+    entirely UNPACED requests to that host — a burst emitted from the shared crawl egress IP by
+    the very code whose purpose is preventing per-IP bans.
+
+    Measured before the fix: 20 fetches for one request.
+    """
+    fetched = _serve_robots(monkeypatch, {"shop.example": "User-agent: *\nAllow: /\n"})
+    _patch_sleep(monkeypatch)
+
+    async def fan_out() -> None:
+        await asyncio.gather(*[
+            cp.robots_allows(f"https://shop.example/products/{i}", user_agent="PivotaBot")
+            for i in range(20)
+        ])
+
+    asyncio.run(fan_out())
+    assert len(fetched) == 1, f"the gate must not amplify a fan-out: {len(fetched)} robots fetches"
+
+
+def test_followers_get_the_leaders_answer_not_a_blank_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-flight is only correct if the waiters end up with the SAME verdict. A follower that
+    adopted "no rules" while the leader read a Disallow would crawl a forbidden path."""
+    _serve_robots(monkeypatch, {"shop.example": "User-agent: *\nDisallow: /products/\n"})
+    _patch_sleep(monkeypatch)
+
+    async def fan_out() -> List[bool]:
+        return list(await asyncio.gather(*[
+            cp.robots_allows("https://shop.example/products/x", user_agent="PivotaBot")
+            for _ in range(10)
+        ]))
+
+    verdicts = asyncio.run(fan_out())
+    assert verdicts == [False] * 10, f"every waiter must see the Disallow, got {verdicts}"
+
+
+def test_a_robots_fetch_that_explodes_does_not_strand_its_followers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Awaiting an unresolved future HANGS rather than raising, so an error in the leader would
+    wedge every sibling on that host. The resolution lives in a `finally` for exactly this."""
+    class _Boom:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Boom":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            raise RuntimeError("upstream exploded")
+
+    monkeypatch.setattr(cp, "httpx", SimpleNamespace(AsyncClient=_Boom))
+    _patch_sleep(monkeypatch)
+
+    async def fan_out() -> List[bool]:
+        return list(await asyncio.gather(*[
+            cp.robots_allows("https://shop.example/products/x", user_agent="PivotaBot")
+            for _ in range(5)
+        ]))
+
+    # Would hang forever if the leader failed to resolve; the timeout turns a wedge into a
+    # failure you can read.
+    verdicts = asyncio.run(asyncio.wait_for(fan_out(), timeout=5))
+    assert verdicts == [True] * 5, "a robots outage is permissive for leader and followers alike"
+
+
+def test_the_inflight_map_is_dropped_when_the_event_loop_changes() -> None:
+    """A future binds to the loop that created it, and awaiting a stale one HANGS instead of
+    raising — the failure mode recorded against this repo's module-level primitives. Each
+    asyncio.run() below is a DIFFERENT loop, which is also what the test suite does per test."""
+    async def once() -> bool:
+        return await cp.robots_allows("https://shop.example/x", user_agent="PivotaBot")
+
+    assert asyncio.run(once()) is True
+    cp._ROBOTS.clear()          # force a cache miss so the second run takes the leader path
+    assert asyncio.run(once()) is True, "a second event loop must not inherit a stale future"
+
+
+# --- per-lane semantics, not just "the string is present" -------------------------------------
+#
+# Review found FIVE semantic mutants surviving: a lane could ask robots about a different agent
+# than it sends, drop a note_response, or flip max_wait, and every test stayed green. The only
+# property under test was the literal string `crawl_politeness.before_request`. These assert what
+# the gate is actually asked, per lane, by driving the real functions.
+
+def _gate_spy(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
+    """Record every (url, user_agent, max_wait) the lanes hand the gate."""
+    seen: List[Dict[str, Any]] = []
+
+    async def spy(url: str, *, user_agent: str, max_wait: Any = None) -> None:
+        seen.append({"url": url, "user_agent": user_agent, "max_wait": max_wait})
+
+    monkeypatch.setattr(cp, "before_request", spy)
+    return seen
+
+
+def _http_stub(monkeypatch: pytest.MonkeyPatch, module: Any, *, status: int = 200,
+               text: str = "", headers: Any = None) -> List[str]:
+    got: List[str] = []
+    hdrs = headers or {"content-type": "text/html"}
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kw: Any) -> Any:
+            got.append(url)
+            return SimpleNamespace(
+                status_code=status, headers=hdrs, text=text,
+                content=text.encode(), json=lambda: {},
+            )
+
+    # Several lanes do `import httpx` INSIDE the function, so there is no module-level attribute
+    # to patch — the real httpx module is the only handle. Safe here precisely because
+    # `_gate_spy` has already replaced `before_request`, so `crawl_politeness` makes no robots
+    # fetch of its own and cannot collide with this stub. monkeypatch reverts it either way.
+    target = module.httpx if hasattr(module, "httpx") else httpx
+    monkeypatch.setattr(target, "AsyncClient", _Client)
+    return got
+
+
+@pytest.mark.parametrize("lane", ["bd_cold_start", "co_occurrence", "brand_discovery"])
+def test_a_request_reachable_lane_uses_the_BOUNDED_wait(
+    monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """max_wait=0 means UNBOUNDED. On a lane reachable from a live authenticated route that is
+    #1854's bounded-wait lesson re-introduced inverted: a 300s backoff, or a `Crawl-delay: 30`,
+    would hold a real request open. Measured in review at 19s of added wall-clock for a 20-URL
+    audit even with no adverse conditions.
+    """
+    seen = _gate_spy(monkeypatch)
+
+    if lane == "bd_cold_start":
+        from services import bd_cold_start_service as m
+        _http_stub(monkeypatch, m, text="{}")
+        asyncio.run(m._fetch_shopify_native("https://shop.example/products/x"))
+    elif lane == "co_occurrence":
+        from services import co_occurrence_finder as m
+        _http_stub(monkeypatch, m, text="<html></html>")
+        asyncio.run(m._fetch_article_text("https://news.example/a"))
+    else:
+        from services import brand_product_discovery as m
+        _http_stub(monkeypatch, m, text="<html></html>")
+        asyncio.run(m._fetch_text("https://brand.example/products/x", 1000))
+
+    assert seen, f"{lane}: the gate was never called"
+    for call in seen:
+        assert call["max_wait"] is None, (
+            f"{lane}: a request-reachable lane must use the BOUNDED default, "
+            f"got max_wait={call['max_wait']!r}"
+        )
+
+
+@pytest.mark.parametrize("lane", ["curated_feed", "sitemap"])
+def test_a_batch_only_lane_opts_into_waiting(monkeypatch: pytest.MonkeyPatch, lane: str) -> None:
+    """The mirror. A batch lane must pass 0, or a backoff past the default ceiling makes the gate
+    refuse and the lane's broad `except` records it as an ordinary fetch failure."""
+    seen = _gate_spy(monkeypatch)
+
+    if lane == "curated_feed":
+        from services import curated_brand_feed as m
+        _http_stub(monkeypatch, m, status=404, text="")
+        asyncio.run(m.fetch_shopify_products("shop.example", max_products=1))
+    else:
+        from services.executor_agents import sitemap_freshness as m
+        _http_stub(monkeypatch, m, status=404, text="")
+        asyncio.run(m._fetch_sitemap_urls_recursive("https://shop.example/sitemap.xml", max_child_sitemaps=2))
+
+    assert seen, f"{lane}: the gate was never called"
+    for call in seen:
+        assert call["max_wait"] == 0, (
+            f"{lane}: a batch lane must wait a backoff out, got max_wait={call['max_wait']!r}"
+        )
+
+
+@pytest.mark.parametrize(
+    "lane,expected_ua_attr",
+    [("bd_cold_start", "_BD_UA"), ("sitemap", "_SITEMAP_UA"),
+     ("co_occurrence", "_USER_AGENT"), ("brand_discovery", "_USER_AGENT")],
+)
+def test_the_gate_is_asked_about_the_SAME_agent_the_lane_then_sends(
+    monkeypatch: pytest.MonkeyPatch, lane: str, expected_ua_attr: str
+) -> None:
+    """Asking robots about one agent and sending another is worse than not asking: it produces a
+    confident "allowed" for a UA the site never ruled on. The `_BD_UA` / `_SITEMAP_UA` constants
+    were introduced with a comment claiming exactly this property and nothing tested it — both
+    mutants that swapped the queried agent survived.
+    """
+    seen = _gate_spy(monkeypatch)
+
+    if lane == "bd_cold_start":
+        from services import bd_cold_start_service as m
+        _http_stub(monkeypatch, m, text="{}")
+        asyncio.run(m._fetch_shopify_native("https://shop.example/products/x"))
+    elif lane == "sitemap":
+        from services.executor_agents import sitemap_freshness as m
+        _http_stub(monkeypatch, m, status=404)
+        asyncio.run(m._fetch_sitemap_urls_recursive("https://shop.example/sitemap.xml", max_child_sitemaps=2))
+    elif lane == "co_occurrence":
+        from services import co_occurrence_finder as m
+        _http_stub(monkeypatch, m, text="<html></html>")
+        asyncio.run(m._fetch_article_text("https://news.example/a"))
+    else:
+        from services import brand_product_discovery as m
+        _http_stub(monkeypatch, m, text="<html></html>")
+        asyncio.run(m._fetch_text("https://brand.example/products/x", 1000))
+
+    expected = getattr(m, expected_ua_attr)
+    assert seen, f"{lane}: the gate was never called"
+    for call in seen:
+        assert call["user_agent"] == expected, (
+            f"{lane}: robots was asked about {call['user_agent']!r} but the lane sends "
+            f"{expected!r} — a verdict for an agent the site never ruled on"
+        )
+
+
+def test_a_child_sitemap_response_is_fed_back_to_the_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child-index loop is the high-volume half of that lane — a sitemap index can point at
+    many children on the same host. Recording only the PARENT's status means a 429 arriving on
+    child 2 of 20 never arms the backoff, and we keep hammering the host that just throttled us.
+    """
+    from services.executor_agents import sitemap_freshness as m
+
+    _gate_spy(monkeypatch)
+    index_xml = (
+        '<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<sitemap><loc>https://shop.example/sitemap-products-1.xml</loc></sitemap>"
+        "</sitemapindex>"
+    )
+    seen: List[int] = []
+    real_note = cp.note_response
+
+    def spy_note(url: str, status_code: int, *, retry_after: Any = None) -> None:
+        seen.append(status_code)
+        real_note(url, status_code, retry_after=retry_after)
+
+    monkeypatch.setattr(cp, "note_response", spy_note)
+
+    calls = {"n": 0}
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kw: Any) -> Any:
+            calls["n"] += 1
+            # Parent 200 (an index), child 429 — the case the backoff exists for.
+            if calls["n"] == 1:
+                return SimpleNamespace(
+                    status_code=200, headers={}, content=index_xml.encode(),
+                )
+            return SimpleNamespace(status_code=429, headers={"retry-after": "120"}, content=b"")
+
+    monkeypatch.setattr(m.httpx, "AsyncClient", _Client)
+    asyncio.run(m._fetch_sitemap_urls_recursive(
+        "https://shop.example/sitemap.xml", max_child_sitemaps=2
+    ))
+
+    assert 429 in seen, (
+        f"a child sitemap's 429 must reach the backoff, statuses recorded: {seen}"
+    )
+
+
+def test_brand_discovery_robots_actually_consults_the_shared_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_robots_allows` is the pre-flight that raises the operator-facing "site disallows our
+    crawler, fall back to manual entry" error. Nothing drove it, so `return True` survived — the
+    helper could have been gutted entirely and every test stayed green.
+
+    Also pins that it asks about the FULL path: the old body ended in `can_fetch(ua, base + "/")`
+    and a bare origin normalizes to "/", so a `Disallow: /products/` never bit.
+    """
+    from services import brand_product_discovery as bpd
+
+    _serve_robots(monkeypatch, {"brand.example": "User-agent: *\nDisallow: /products/\n"})
+
+    assert asyncio.run(bpd._robots_allows("https://brand.example/products/x")) is False
+    assert asyncio.run(bpd._robots_allows("https://brand.example/pages/about")) is True
