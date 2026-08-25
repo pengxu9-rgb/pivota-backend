@@ -1102,14 +1102,32 @@ async def upsert_catalog_merchant(
         -> 'active' again, with zero `merchant_stores` rows.
       * `services/seller_identity.py` mints crawl-observed sellers at
         `status='observed'` (ADR-009 D2) — deliberately not servable as the
-        public citation artifact until graduation. `catalog_enrichment_agent`
-        already refuses the clobbering upsert for exactly this reason (see
-        `catalog_enrichment_agent/apply.py`, rule 3). Both live default-status
-        callers here take an AUTHENTICATED tenant `merchant_id`, and observed
-        ids (`merch_obs_*`) are minted only into `catalog_merchants`, never into
-        `merchants` — so no reachable path graduates an observed seller today.
-        Latent, not live; this closes it structurally rather than relying on
-        that gap holding.
+        public citation artifact until graduation. The clobber graduated them
+        with no review, and that half WAS reachable: `routes/catalog_routes.py`
+        takes `merchant_id` from the request body (`POST /v1/catalog/sync/jobs`)
+        or the path (`POST /v1/catalog/reconcile/merchants/{merchant_id}`,
+        `POST /v1/catalog/verticals/beauty/rebuild/{merchant_id}`) under a bare
+        `Depends(get_current_user)` with NO tenant scoping, and each runs
+        through `run_catalog_sync_job` -> `sync_products_cache_to_catalog` ->
+        `ingest_standard_products`. Reproduced in review against an
+        `merch_obs_*` row with zero `products_cache` rows — the merchant upsert
+        runs BEFORE the product loop, so an empty payload clobbers just as well.
+
+        What IS true, and is the part worth keeping: observed ids never become
+        tenant identities (`merchants` mints `merch_<hex>` /
+        `merch_<platform>_<digest>`; the claim flow attaches to an existing
+        tenant rather than re-keying an observed row). That bounds who a
+        graduated seller can be, not who can trigger the graduation. An earlier
+        draft of this comment concluded "latent, not live" from the identity
+        separation alone — a clobber needs only that an id be PASSED, not that
+        the caller be authenticated as it. The unscoped `merchant_id` on those
+        three routes is a separate, pre-existing problem and is not fixed here.
+
+        Prior art in the sibling lane: `catalog_enrichment_agent/apply.py`
+        rule 3 refuses the clobbering upsert for its observed sellers on the
+        same principle ("this module does not own the column"), though its
+        hazard is the mirror image — a DOWNGRADE of a graduated merchant back to
+        'observed' — and its refusal covers only the `_ensure_only` subset.
 
     Callers that legitimately move the column pass `status=` explicitly
     (`seller_identity.ensure_observed_seller` / `ensure_observed_seller_of_record`),

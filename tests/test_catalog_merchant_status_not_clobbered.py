@@ -351,6 +351,37 @@ async def test_ingest_standard_products_does_not_reactivate_a_detached_merchant(
     assert row["source_ref"] == f"catalog_reconcile:{merchant}:shopify"
 
 
+async def test_ingest_standard_products_does_not_graduate_an_observed_seller():
+    """The reachable half of the ADR-009 D2 hazard, driven on the real caller.
+
+    `routes/catalog_routes.py` takes `merchant_id` from the request body or the
+    path under a bare `Depends(get_current_user)` with no tenant scoping, and
+    runs it through `run_catalog_sync_job` -> `sync_products_cache_to_catalog`
+    -> here. So an observed seller's id genuinely could arrive at this call
+    site, and 'observed' -> 'active' is a graduation with no review. The
+    merchant upsert runs BEFORE the product loop, which is why an empty payload
+    is enough to show it.
+    """
+    from services.catalog_sync_service import ingest_standard_products
+
+    # Shaped like a real seller_identity mint: merch_obs_<digest>, prefixed so
+    # the fixture can still clean it up.
+    merchant = f"{_PREFIX}_merch_obs_deadbeefcafe0001"
+    await _seed_merchant(merchant, "observed")
+
+    await ingest_standard_products(
+        merchant_id=merchant,
+        platform="shopify",
+        product_payloads=[],
+        source_system="products_cache",
+        source_ref="catalog_sync_job:probe",
+    )
+
+    row = await _merchant_row(merchant)
+    assert row["status"] == "observed"
+    assert row["source_system"] == "products_cache"
+
+
 # ---------------------------------------------------------------------------
 # 3. The whole arc: PR #1852's transition is the one with no backstop
 # ---------------------------------------------------------------------------
