@@ -27,6 +27,15 @@ _VERIFIED_DESTINATION = {
     "destination_failure_streak": 0,
 }
 
+# ...AND ITS CONTENT HAS ACTUALLY BEEN READ. A SECOND, INDEPENDENT FACT.
+#
+# The sweep proves the LINK resolves without ever reading a price; a content refresh reads the
+# price without proving the link still resolves. `stale_snapshot` asks the first question and
+# `destination_stale` the second, and a seed needs both before it may serve. Collapsing them
+# onto one column is what would have let ~11.3k rows with a 99-day-old price start serving the
+# day the first destination sweep completed.
+_VERIFIED_CONTENT = {"extracted_at": datetime.now(timezone.utc).isoformat()}
+
 
 @pytest.fixture
 def client() -> TestClient:
@@ -54,6 +63,7 @@ def test_offers_resolve_prefers_external_outbound(monkeypatch: pytest.MonkeyPatc
                     "availability": "in_stock",
                     "utm_template": None,
                     "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
                         "brand": "Fenty Beauty",
                         "variants": [
                             {
@@ -177,6 +187,7 @@ def test_offers_resolve_recovers_attached_seed_after_broad_seed_timeout(
                     "attached_product_key": "merch_2|shopify|prod_internal_1",
                     "attached_variant_id": "SKU_INT_002",
                     "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
                         "brand": "Merchant Example",
                         "variants": [
                             {
@@ -268,6 +279,7 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
                     "attached_product_key": "merch_9|shopify|prod_internal_prefetch",
                     "attached_variant_id": "SKU_PREFETCH_1",
                     "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
                         "brand": "Merchant Example",
                         "variants": [
                             {
@@ -361,6 +373,7 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
                     "attached_product_key": "old_merch|shopify|old_product",
                     "attached_variant_id": "old_variant",
                     "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
                         "brand": "KraveBeauty",
                         "variants": [
                             {
@@ -679,6 +692,7 @@ def test_offers_resolve_ranks_higher_merit_external_above_lower_merit_internal(
                     "availability": "in_stock",
                     "utm_template": None,
                     "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
                         "brand": "Brand Example",
                         "variants": [
                             {
@@ -777,6 +791,7 @@ def test_offers_resolve_exact_internal_beats_exact_external_end_to_end(
                     "availability": "in_stock",
                     "utm_template": None,
                     "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
                         "brand": "Brand Example",
                         "variants": [
                             {
@@ -973,6 +988,7 @@ _STORAGE_SEED = {
     "attached_product_key": "prod::merch_x::shopify::123",
     "attached_variant_id": "var_9",
     "seed_data": {
+        "snapshot": dict(_VERIFIED_CONTENT),
         "brand": "Brand Example",
         "variants": [
             {
@@ -1360,6 +1376,7 @@ def test_the_cart_id_reaching_the_builder_is_the_evidenced_one_not_the_sku(
                     "seed_data": {
                         "brand": "Brand",
                         "snapshot": {
+                            **_VERIFIED_CONTENT,
                             "storefront_platform": "shopify",
                             "storefront_platform_source": "products_js_v1",
                             "variants": [
@@ -1413,7 +1430,8 @@ def test_the_cart_id_reaching_the_builder_is_the_evidenced_one_not_the_sku(
 
 
 def _seed_row_for_exec_spec(*, evidence: bool):
-    snapshot = {"variants": [{"variant_id": "SKU-1", "title": "30ml",
+    snapshot = {**_VERIFIED_CONTENT,
+                "variants": [{"variant_id": "SKU-1", "title": "30ml",
                               "price_amount": 19.0, "price_currency": "USD",
                               "availability": "in_stock"}]}
     if evidence:

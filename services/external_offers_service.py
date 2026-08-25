@@ -1266,7 +1266,16 @@ async def _fetch_html(
         # catches `Exception` — but the status and the final URL now survive the throw,
         # which is what lets the refresh record "this product is gone" instead of
         # "something went wrong". See ExternalOfferUnavailable.
-        if resp.status_code >= 400:
+        #
+        # The 2xx RANGE, not `>= 400`, because those are NOT the same predicate and the
+        # difference is a silent behaviour change: `raise_for_status` throws for anything
+        # outside 2xx, which includes a 3xx that survived `follow_redirects=True` (a 302 with
+        # no Location has no redirect to follow). Under `>= 400` such a response would be
+        # parsed as if it were the product page, and its body written into the snapshot.
+        #
+        # Spelled out rather than using httpx's `resp.is_success`: the predicate is the point
+        # and it should not depend on an attribute every test double has to remember to grow.
+        if not (200 <= resp.status_code < 300):
             raise ExternalOfferUnavailable(
                 status_code=resp.status_code, url=url, final_url=str(resp.url)
             )

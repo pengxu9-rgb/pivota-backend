@@ -163,7 +163,7 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # legacy; never assumed 'self'.
             "seller_ref",
             "seed_kind",
-            # Destination liveness (migration 199). Written ONLY by a fetch that
+            # Destination liveness (migration 200). Written ONLY by a fetch that
             # reached the origin, so the readiness gate can ask "is this link still
             # there" instead of inferring it from `updated_at`, which any writer
             # bumps. NULL destination_checked_at = never verified = blocked.
@@ -1060,7 +1060,7 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
-            # Destination liveness (migration 199). Railway deploys skip
+            # Destination liveness (migration 200). Railway deploys skip
             # db/migrations/, so self-heal here — and these columns are load-bearing
             # for the readiness gate the moment the sweep starts writing them.
             await database.execute(

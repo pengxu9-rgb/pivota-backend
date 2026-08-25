@@ -44,6 +44,7 @@ import httpx
 
 from db.database import database
 from services import crawl_politeness
+from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.outbound_warm_handoff import extract_product_handle
 
 logger = logging.getLogger("external_seed_destination_liveness")
@@ -93,6 +94,8 @@ SWEEP_HOST_CONCURRENCY = 4
 CATALOGUE_OK = "ok"
 CATALOGUE_INCOMPLETE = "incomplete"
 CATALOGUE_BOT_CHALLENGE = "bot_challenge"
+# 200 with an empty product list — answered, but not a catalogue we can join against.
+CATALOGUE_EMPTY = "empty"
 
 
 def _now() -> datetime:
@@ -107,6 +110,18 @@ class DestinationObservation:
     http_status: Optional[int]
     final_url: Optional[str]
     note: str = ""
+    # Did STAGE 1 independently agree the product is gone — i.e. did we read this brand's
+    # `/products.json` successfully and find the handle absent from it?
+    #
+    # THIS IS WHAT MAKES A RETIREMENT SAFE, and a probe on its own does not have it.
+    # `/products/<slug>` is a URL SHAPE, not a platform, and a WAF that answers 404 to an
+    # unfamiliar client is indistinguishable from a deleted product by looking at the status
+    # code alone — see the same argument in services/live_offer_verification._check_one, which
+    # refuses to call a 404 `gone` without positive evidence of a Shopify storefront. A
+    # successful catalogue read IS that evidence, and the missing handle is a second,
+    # independent witness. Repetition cannot substitute: a WAF policy is MORE persistent than
+    # a dead product, so it clears the 24h gap by construction.
+    corroborated: bool = False
 
     @property
     def confirmed_dead(self) -> bool:
@@ -132,6 +147,10 @@ def classify_destination(
     same-handle 200 from `live` to `live_delisted`; it can never turn a live page into a dead
     one, because a missing handle is not evidence of a missing page.
     """
+    # Stage 1 said the handle is absent from a catalogue it could actually read. Only that
+    # combination may ever advance the failure streak — see `DestinationObservation`.
+    corroborated = listed_in_catalogue is False
+
     if transport_error:
         return DestinationObservation(VERDICT_UNVERIFIABLE, None, None, transport_error)
     if bot_challenged:
@@ -140,7 +159,9 @@ def classify_destination(
         return DestinationObservation(VERDICT_UNVERIFIABLE, None, final_url, "no status")
 
     if status_code in (404, 410):
-        return DestinationObservation(VERDICT_DEAD_404, status_code, final_url, f"http_{status_code}")
+        return DestinationObservation(
+            VERDICT_DEAD_404, status_code, final_url, f"http_{status_code}", corroborated=corroborated
+        )
     if status_code >= 400:
         # 403/429/5xx are the origin refusing or failing, NOT the product being gone. Calling
         # these dead is how a reaper eats a corpus.
@@ -150,9 +171,28 @@ def classify_destination(
 
     wanted = (extract_product_handle(requested_url) or "").lower()
     landed = (extract_product_handle(final_url or requested_url) or "").lower()
+    if not wanted:
+        # THE SEED NEVER NAMED A PRODUCT HANDLE, so "did we land on the same handle" has no
+        # answer and its absence is not evidence of anything. Without this, a perfectly healthy
+        # 200 on a non-Shopify-shaped URL (`/p/<sku>`, `/store/products/<x>`, `/shop/<x>.html`)
+        # fell straight into `redirected_off_product` — a CONFIRMED-DEAD verdict — and two
+        # observations a day apart retired a live product. 682 of the 11,352 active seeds carry
+        # such a URL, and the sweep never sees them (`group_by_host` drops handle-less rows), so
+        # this was reachable only from the refresh route, where nothing else stood in the way.
+        return DestinationObservation(
+            VERDICT_UNVERIFIABLE,
+            status_code,
+            final_url,
+            "destination is not product-shaped",
+            corroborated=False,
+        )
     if not landed:
         return DestinationObservation(
-            VERDICT_REDIRECTED_OFF_PRODUCT, status_code, final_url, "left /products/"
+            VERDICT_REDIRECTED_OFF_PRODUCT,
+            status_code,
+            final_url,
+            "left /products/",
+            corroborated=corroborated,
         )
     if landed != wanted:
         return DestinationObservation(
@@ -246,6 +286,14 @@ async def read_brand_catalogue(
                 return CatalogueRead(status, set(), total, note)
             return CatalogueRead(CATALOGUE_INCOMPLETE, set(), total, f"broke at page {page}: {note}")
         if not payload:
+            if page == 1:
+                # ZERO PRODUCTS ON PAGE 1 IS NOT A CATALOGUE OF ZERO PRODUCTS. A storefront
+                # that has genuinely sold nothing is vanishingly rare next to one that gates
+                # `/products.json` behind a market, a password, or a bot rule while still
+                # answering 200. Treating it as usable marks every seed on the host delisted
+                # and turns "one request per host" into one PDP fetch per seed — aimed at
+                # exactly the hosts most likely to be refusing us.
+                return CatalogueRead(CATALOGUE_EMPTY, set(), 0, "page 1 listed no products")
             return CatalogueRead(CATALOGUE_OK, handles, total, f"{page - 1} page(s)")
         total += len(payload)
         for product in payload:
@@ -312,13 +360,21 @@ async def record_destination_observation(
 ) -> Dict[str, Any]:
     """Write one observation. Returns what the row now says.
 
-    Three rules, all of them load-bearing:
+    Four rules, all of them load-bearing:
 
-    * `destination_checked_at` moves ONLY when the origin answered. An `unverifiable` leaves
-      it where it was, so "we could not look" never reads as "we looked and it was fine".
-    * the failure streak advances only on a confirmed-dead verdict AND only when the previous
-      observation is at least `RETIREMENT_MIN_GAP` old — two probes in one run cannot retire a
-      seed, which is what makes a sweep re-run free.
+    * an `unverifiable` observation writes NO FACT ABOUT THE DESTINATION — not the verdict,
+      not the status, not the clock. "We could not look" must never read as "we looked and it
+      was fine", and it must never read as "we looked and it was alive" either: writing the
+      verdict alone was enough to clear the `destination_dead` blocker on a seed sitting at a
+      confirmed 404 with a full streak, handing its dead link straight back to the serving
+      lane. The row keeps its last CONCLUSIVE answer until a new one arrives.
+    * the failure streak advances only on a confirmed-dead verdict that stage 1 CORROBORATED
+      (see `DestinationObservation.corroborated`), and only when the previous observation is
+      at least `RETIREMENT_MIN_GAP` old — two probes in one run cannot retire a seed, which is
+      what makes a sweep re-run free.
+    * an uncorroborated confirmed-dead verdict is recorded but HOLDS the streak. It is a real
+      observation and the serving lane may act on it; it is just not, on its own, enough to
+      withdraw a row.
     * any non-dead ANSWER resets the streak to 0. An `unverifiable` does not: it is not
       evidence the link came back.
     """
@@ -342,18 +398,32 @@ async def record_destination_observation(
 
     if not observation.reached_origin:
         next_streak = streak
-    elif advance_streak:
+    elif not advance_streak:
+        next_streak = 0
+    elif not observation.corroborated:
+        # A CONFIRMED-DEAD PROBE WITH NO SECOND WITNESS HOLDS THE STREAK WHERE IT IS.
+        # It is recorded (the verdict is real and worth serving on) but it may not push the
+        # seed toward retirement on its own, because a 404 from a WAF and a 404 from a deleted
+        # product are the same bytes. Only the sweep, which has just read this brand's
+        # catalogue and found the handle missing, sets `corroborated`. See
+        # `DestinationObservation.corroborated` for why repetition is not a substitute.
+        next_streak = streak
+    else:
         # A second look inside the gap is not a second observation.
         within_gap = previous_checked_at is not None and _as_utc(previous_checked_at) > gap_cutoff
         next_streak = streak if within_gap else streak + 1
-    else:
-        next_streak = 0
 
     await database.execute(
         """
         UPDATE external_product_seeds
-        SET destination_verdict = :verdict,
-            destination_http_status = :http_status,
+        SET destination_verdict = CASE
+                WHEN CAST(:reached_origin AS BOOLEAN) THEN :verdict
+                ELSE destination_verdict
+            END,
+            destination_http_status = CASE
+                WHEN CAST(:reached_origin AS BOOLEAN) THEN :http_status
+                ELSE destination_http_status
+            END,
             destination_failure_streak = :streak,
             destination_checked_at = CASE
                 WHEN CAST(:reached_origin AS BOOLEAN) THEN :checked_at
@@ -420,11 +490,25 @@ async def retire_seed_for_dead_destination(
         """
         UPDATE catalog_products
         SET suppressed_at = :stamp,
-            suppression_reason = :reason
+            suppression_reason = :reason,
+            updated_at = NOW()
         WHERE source_ref = :id
+          AND source_system = :source_system
           AND suppressed_at IS NULL
         """,
-        {"id": seed_id, "stamp": stamp, "reason": SUPPRESSION_REASON},
+        {
+            "id": seed_id,
+            "stamp": stamp,
+            "reason": SUPPRESSION_REASON,
+            # `source_ref` ALONE IS NOT THE LINK. services/external_offer_dual_write states the
+            # contract: "catalog_products.source_ref = external_product_seeds.id WITH THIS
+            # source_system — that pair is the stable seed->product link", and
+            # `resolve_mirror_product` queries on both. Matching on source_ref alone would
+            # suppress any row from another door that happens to carry the same value.
+            "source_system": MIRROR_SOURCE_SYSTEM,
+            # `updated_at` matches services/identity_resolution.SUPPRESS_SQL: a consumer doing
+            # incremental work off catalog_products.updated_at must be able to see a withdrawal.
+        },
     )
     logger.info(
         "external seed retired for dead destination",

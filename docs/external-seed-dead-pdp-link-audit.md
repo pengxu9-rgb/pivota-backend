@@ -238,7 +238,7 @@ gap; (6) is the decision that had to be made either way.
 
 ### 5.1 Store the observation, not the write ✅
 
-`db/migrations/199_external_seed_destination_liveness.sql` (+ the matching `db/schema_guard.py`
+`db/migrations/200_external_seed_destination_liveness.sql` (+ the matching `db/schema_guard.py`
 self-heal, because Railway deploys skip `db/migrations/`) adds to `external_product_seeds`:
 
 | column | meaning |
@@ -289,6 +289,32 @@ gate. Three changes break it:
 inside `RETIREMENT_MIN_GAP` does not advance the streak — so one bad night retires nothing and
 re-running a failed sweep is free.
 
+**A dead verdict only advances the streak when stage 1 CORROBORATED it** — i.e. we read this
+brand's `/products.json` successfully *and* the handle was absent from it. A probe on its own
+never can, no matter how often it repeats.
+
+Why repetition is not enough on its own: `/products/<slug>` is a URL *shape*, not a platform,
+and a WAF that answers 404 to an unfamiliar client is byte-identical to a deleted product. A
+WAF policy is also **more** persistent than a dead product, so it clears the 24h gap by
+construction — the hysteresis filters transients, and this is not one.
+`services/live_offer_verification._check_one` (#1868) refuses the same inference for the same
+reason, requiring positive evidence of a Shopify storefront before it will call a 404 `gone`.
+A successful catalogue read is that evidence, and the missing handle is a second, independent
+witness.
+
+The consequence: **only the sweep can retire.** `_refresh_external_seed_by_id` records its
+observation — a real fact the serving gate acts on — but its verdicts are uncorroborated, so
+they hold the streak where it is. That also closes an unflagged path: the refresh called
+`retire_seed_for_dead_destination` directly, and `EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE` gates
+only the sweep, so `jobs/external_referral_refresh` could retire seeds with the sweep switched
+off entirely.
+
+**A verdict only ever describes the URL we actually serve.** The refresh fetches
+`destination_url` while the gate and the sweep both resolve a seed to
+`canonical_url or destination_url` — and the refresh itself rewrites `canonical_url` from the
+fetched page, so the two drift apart by design. When they differ the refresh records nothing;
+the sweep observes the served URL.
+
 The mirrored `catalog_products` rows are withdrawn through the **existing** `suppressed_at`
 control that `routes/pivota_canonical_routes` already honours, not a new serving flag. The
 reason `external_seed_destination_dead` is deliberately **not** added to
@@ -296,7 +322,12 @@ reason `external_seed_destination_dead` is deliberately **not** added to
 containment and must answer 404, never a permanent 410.
 
 **Everything else must be inert.** `unverifiable` — bot challenge, 429, 5xx, DNS, TLS, timeout,
-`robots.txt` — must increment a *coverage* metric and never the failure streak. This is not a
+`robots.txt` — increments a *coverage* metric and **writes no destination fact at all**: not the
+verdict, not the status, not the clock. Freezing only the clock and the streak is not enough,
+because the verdict is the field serving reads: a single 429 landing on a seed sitting at
+`dead_404` with a full streak would otherwise overwrite the verdict, clear `destination_dead`,
+and hand the 404 link back to the serving lane until another confirmed-dead observation
+happened to arrive. This is not a
 hypothetical guard rail: **213 of 286 hosts were unreadable** from a non-crawl-egress client
 during this audit, and 99 of the 491 delisted URLs could not be probed even on hosts whose
 `products.json` we had just read. A reaper that treated "cannot verify" as "dead" would have
@@ -351,19 +382,67 @@ the crawl egress (213 of 286 hosts).
 
 ### 5.6 What the gate now refuses, and why that is not a regression ✅
 
-`stale_snapshot` **stays a blocker**, now keyed on `destination_checked_at`, and it is joined by
-`destination_never_verified` and `destination_dead`.
+The gate asks **two independent questions**, because one field cannot answer both:
+
+| blocker | asks | cleared by |
+|---|---|---|
+| `stale_snapshot` | is the CONTENT (price, availability) recent? | a content refresh |
+| `destination_stale` | has the LINK been re-verified recently? | a sweep pass |
+| `destination_never_verified` | has the link EVER been verified? | a sweep pass |
+| `destination_dead` | did we look, twice, a day apart, and find it gone? | repointing or retiring the seed |
+
+**Collapsing those first two was a defect in the first draft of this change, and a serious one.**
+Replacing the content-age check with the destination check reads as a strict improvement and is
+not: the sweep stamps `destination_checked_at` from a catalogue read *without ever reading a
+price*. So on the day the first full pass completed, ~11.3k rows carrying a median-56-to-99-day
+old price would have flipped from blocked to healthy — a serving regression created by the
+change meant to close one, and invisible to any measurement taken before the sweep ran.
+`stale_snapshot` therefore keeps its own clock (`snapshot.extracted_at`, with the `updated_at`
+fallback and the fail-open both removed), and the link check is a separate blocker.
 
 **Today's verdicts do not change.** Before this, every one of the 11,352 active seeds was past
 the 7-day threshold on the `updated_at` clock — measured by running the shipped gate against
-live rows: 400/400 sampled seeds `blocked`, reason `stale_snapshot`. After this, all of them are
-`destination_never_verified` instead. Same answer, different — and truthful — reason, and for
-the first time a **recoverable** one: a sweep pass clears it, where nothing could clear the old
-one.
+live rows: 400/400 sampled seeds `blocked`, reason `stale_snapshot`. After this they are
+`destination_never_verified` (all of them) and, for the ~2,793 rows with no
+`snapshot.extracted_at` at all, `stale_snapshot` as well. Same answer, truthful reasons, and for
+the first time **recoverable** ones: a sweep pass clears the first and a content refresh the
+second, where nothing could clear the old one.
+
+That the two clear separately is the point. A seed does not serve again until we have both read
+its page *and* confirmed its link — which is exactly the pair that was missing when 10.4% of
+measurable links were already dead.
 
 Demoting staleness to `review` and letting the destination verdict carry the block on its own is
 the better long-run shape. It is deliberately not done here: it would widen serving on the
 strength of a lane that has not yet run once in production.
+
+---
+
+### 5.7 What an adversarial review of this change found ✅
+
+Five defects, all in code that already had passing tests. Recorded because the shape repeats:
+
+1. **A healthy 200 on a non-Shopify-shaped URL was a CONFIRMED-DEAD verdict.** `classify_destination`
+   asked "did we land on the handle we asked for"; when the seed's URL carries no handle the
+   question has no answer, and its absence fell straight through to `redirected_off_product`.
+   **682 of the 11,352 active seeds** carry such a URL. The sweep never sees them
+   (`group_by_host` drops handle-less rows), so only the refresh route reached it — the same
+   route that could then retire.
+2. **An `unverifiable` observation cleared the `destination_dead` blocker** by overwriting the
+   verdict, even though it correctly froze the clock and the streak. See §5.3.
+3. **The content-freshness gate was replaced rather than joined.** See §5.6.
+4. **The `observed` out-param — the sole delivery mechanism for the live path — had no test.**
+   Deleting all three lines that populate it left 181 tests green, because every refresh test
+   stubs `resolve_external_offer` and hand-fills the dict. Now driven through the real
+   `_fetch_html`.
+5. **The mirror withdrawal matched on `source_ref` alone**, where the documented seed→product
+   link is the `(source_ref, source_system)` pair, and omitted the `updated_at` bump every other
+   suppression writer sets.
+
+Two more, found while checking what had landed on `main` in the meantime: the migration was
+numbered **199**, colliding with #1867's — the number was picked from a listing taken before the
+branch was cut — and `resp.status_code >= 400` is not the predicate `raise_for_status()` used,
+which throws on any non-2xx including an unfollowed 3xx.
 
 ---
 

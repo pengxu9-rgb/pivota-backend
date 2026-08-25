@@ -628,7 +628,13 @@ async def test_bumping_updated_at_no_longer_makes_a_stale_seed_look_fresh(monkey
     status = await module.evaluate_external_referral_seed(row, matched_via="test")
 
     assert status.status == "blocked"
-    assert "stale_snapshot" in status.blocker_anomaly_types
+    # `destination_stale`, not `stale_snapshot`: these are now separate facts. This row's
+    # CONTENT was extracted recently; what has gone stale is the LINK check. Reporting
+    # `stale_snapshot` here would be answering the wrong question — and collapsing the two
+    # is what would have let ~11.3k rows with a 99-day-old price serve the moment the first
+    # destination sweep stamped them.
+    assert "destination_stale" in status.blocker_anomaly_types
+    assert "stale_snapshot" not in status.blocker_anomaly_types
 
 
 @pytest.mark.asyncio
@@ -723,3 +729,99 @@ async def test_an_unverifiable_destination_never_blocks_on_deadness(monkeypatch)
 
     assert "destination_dead" not in status.blocker_anomaly_types
     assert status.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_a_verified_link_does_not_buy_freshness_for_a_stale_price(monkeypatch):
+    """THE DELAYED REGRESSION. Pinning the two facts apart.
+
+    The first version of this change replaced the content-age check with the destination
+    check, which reads as a strict improvement and is not one. The sweep stamps
+    `destination_checked_at` from a catalogue read WITHOUT ever fetching a price — so on the
+    day the first full pass completed, every row carrying a median-56-to-99-day-old price
+    would have flipped from blocked to healthy. A serving regression created by the change
+    meant to close one, and invisible to any measurement taken before the sweep ran.
+    """
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_link_ok_price_old")
+    row["seed_data"]["snapshot"]["extracted_at"] = _iso_days_ago(400)
+    row["destination_checked_at"] = _iso_days_ago(0)
+    row["destination_verdict"] = "live"
+    row["destination_failure_streak"] = 0
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "blocked"
+    assert "stale_snapshot" in status.blocker_anomaly_types
+    assert "destination_stale" not in status.blocker_anomaly_types
+    assert "destination_never_verified" not in status.blocker_anomaly_types
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_price_does_not_buy_a_pass_for_an_unverified_link(monkeypatch):
+    """And the converse — otherwise the old fail-open comes back through the other door."""
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_price_ok_link_never")
+    row["seed_data"]["snapshot"]["extracted_at"] = _iso_days_ago(0)
+    row["destination_checked_at"] = None
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "blocked"
+    assert "destination_never_verified" in status.blocker_anomaly_types
+    assert "stale_snapshot" not in status.blocker_anomaly_types
+
+
+@pytest.mark.asyncio
+async def test_a_seed_with_no_extraction_timestamp_at_all_is_blocked(monkeypatch):
+    """The original fail-open, from the content side.
+
+    The old check was guarded on `extracted_dt is not None`, so a row with no extraction
+    recorded passed. `get_content_extracted_at` has no `updated_at` fallback, so the absence
+    is now visible — and it must read as a blocker, not as a pass.
+    """
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_no_extraction")
+    row["seed_data"]["snapshot"].pop("extracted_at", None)
+    row["destination_checked_at"] = _iso_days_ago(0)
+    row["destination_verdict"] = "live"
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "blocked"
+    assert "stale_snapshot" in status.blocker_anomaly_types
+
+
+@pytest.mark.asyncio
+async def test_both_clocks_fresh_and_the_link_alive_serves(monkeypatch):
+    """The lane has to be able to reach healthy, or the gate is just an off switch."""
+    from services import external_referral_readiness as module
+
+    row = _seed_row(id="eps_all_good")
+    row["seed_data"]["snapshot"]["extracted_at"] = _iso_days_ago(1)
+    row["destination_checked_at"] = _iso_days_ago(1)
+    row["destination_verdict"] = "live"
+    row["destination_failure_streak"] = 0
+
+    async def fake_allowed_domains(*, market: str):
+        return ["example.com"]
+
+    monkeypatch.setattr(module, "get_allowed_domains_for_market", fake_allowed_domains)
+    status = await module.evaluate_external_referral_seed(row, matched_via="test")
+
+    assert status.status == "healthy", status.blocker_anomaly_types

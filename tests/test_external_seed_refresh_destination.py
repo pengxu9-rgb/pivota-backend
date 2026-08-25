@@ -170,7 +170,18 @@ def test_a_404_does_not_touch_the_seed_row(monkeypatch: pytest.MonkeyPatch) -> N
         assert row[column] == before[column], f"{column} must not move on a dead destination"
 
 
-def test_a_second_dead_observation_retires_the_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_refresh_records_a_dead_destination_but_never_retires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement belongs to the sweep, which has stage-1 corroboration. This path does not.
+
+    A refresh sees ONE url and ONE status code. It has not read the brand catalogue, so it
+    cannot tell a deleted product from a WAF that answers 404 to an unfamiliar client — and
+    repetition does not help, because a WAF policy outlasts a dead product. This used to call
+    `retire_seed_for_dead_destination` directly, which also meant it was the one retirement
+    path with NO feature flag in front of it: `EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE` gates
+    the sweep only, and `jobs/external_referral_refresh` batch-calls this function.
+    """
     recorder = _Recorder()
     recorder.streak = 1  # yesterday's sweep already saw it dead
 
@@ -179,8 +190,55 @@ def test_a_second_dead_observation_retires_the_seed(monkeypatch: pytest.MonkeyPa
 
     result = _run_refresh(monkeypatch, _seed_row(), resolve=resolve, recorder=recorder)
 
-    assert result["destination_refresh"]["retired"] is True
-    assert recorder.retired == ["eps_dest_1"]
+    assert [o.verdict for o in recorder.observations] == [liveness.VERDICT_DEAD_404]
+    assert recorder.retired == [], "the refresh may observe; it may not withdraw"
+    assert "retired" not in result["destination_refresh"]
+
+
+def test_the_refresh_marks_its_observations_uncorroborated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag is what `record_destination_observation` keys the streak on.
+
+    Asserting "did not retire" alone would still pass if the route regained the retire call
+    while the recorder happened to report a streak below the threshold.
+    """
+
+    async def resolve(**kwargs):
+        raise ExternalOfferUnavailable(status_code=404, url="https://brand.com/products/toner")
+
+    result = _run_refresh(monkeypatch, _seed_row(), resolve=resolve)
+    observations = result["_recorder"].observations
+
+    assert [o.corroborated for o in observations] == [False]
+
+
+def test_a_seed_whose_served_url_differs_from_the_fetched_one_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verdict must describe the link we hand out, not a legacy column.
+
+    This function fetches `destination_url` but the gate and the sweep both resolve a seed to
+    `canonical_url or destination_url` — and this same function rewrites `canonical_url` from
+    the fetched page, so the two drift apart by design. Recording a 404 on a superseded
+    `destination_url` would mark a seed dead whose served link is healthy.
+    """
+    row = _seed_row()
+    row["canonical_url"] = "https://brand.com/products/toner-2024"
+    row["destination_url"] = "https://brand.com/products/toner-legacy"
+
+    async def resolve(**kwargs):
+        raise ExternalOfferUnavailable(
+            status_code=404, url="https://brand.com/products/toner-legacy"
+        )
+
+    result = _run_refresh(monkeypatch, row, resolve=resolve, recorder=_Recorder())
+
+    assert result["destination_refresh"] == {
+        "status": "not_observed",
+        "reason": "not_the_served_url",
+    }
+    assert result["_recorder"].observations == []
 
 
 @pytest.mark.parametrize("status_code", [403, 429, 500, 503])
@@ -277,4 +335,74 @@ def test_a_resolve_that_reports_no_observation_records_nothing(
 
     assert result["status"] == "success"
     assert recorder.observations == []
-    assert result["destination_refresh"] == {"status": "not_observed"}
+    assert result["destination_refresh"] == {
+        "status": "not_observed",
+        "reason": "no_origin_response",
+    }
+
+
+def test_a_200_on_a_url_we_do_not_serve_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The served-URL guard on the SUCCESS path, not just the unavailable one.
+
+    The two paths carry the same guard and a mutant that removes only one of them survived a
+    battery that exercised only the other — the exception path. A 200 is the more dangerous
+    direction anyway: it is what produces `redirected_off_product`, a confirmed-dead verdict,
+    from a legacy `destination_url` that 301s to a collection while the served `canonical_url`
+    is perfectly healthy.
+    """
+    row = _seed_row()
+    row["canonical_url"] = "https://brand.com/products/toner-2024"
+    row["destination_url"] = "https://brand.com/products/toner-legacy"
+
+    async def resolve(*, observed=None, **kwargs):
+        if observed is not None:
+            observed["status_code"] = 200
+            observed["final_url"] = "https://brand.com/collections/all"
+        return _snapshot()
+
+    result = _run_refresh(monkeypatch, row, resolve=resolve, recorder=_Recorder())
+
+    assert result["status"] == "success"
+    assert result["destination_refresh"] == {
+        "status": "not_observed",
+        "reason": "not_the_served_url",
+    }
+    assert result["_recorder"].observations == []
+
+
+def test_a_200_on_the_url_we_DO_serve_is_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must not be so tight that the ordinary case stops being observed."""
+    row = _seed_row()
+    row["canonical_url"] = "https://brand.com/products/toner"
+    row["destination_url"] = "https://brand.com/products/toner"
+
+    async def resolve(*, observed=None, **kwargs):
+        if observed is not None:
+            observed["status_code"] = 200
+            observed["final_url"] = "https://brand.com/products/toner"
+        return _snapshot()
+
+    result = _run_refresh(monkeypatch, row, resolve=resolve, recorder=_Recorder())
+
+    assert [o.verdict for o in result["_recorder"].observations] == [liveness.VERDICT_LIVE]
+
+
+def test_a_trailing_slash_is_not_a_different_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two columns are written by different paths and differ cosmetically constantly."""
+    row = _seed_row()
+    row["canonical_url"] = "https://brand.com/products/toner/"
+    row["destination_url"] = "https://brand.com/products/toner"
+
+    async def resolve(*, observed=None, **kwargs):
+        if observed is not None:
+            observed["status_code"] = 200
+            observed["final_url"] = "https://brand.com/products/toner"
+        return _snapshot()
+
+    result = _run_refresh(monkeypatch, row, resolve=resolve, recorder=_Recorder())
+
+    assert [o.verdict for o in result["_recorder"].observations] == [liveness.VERDICT_LIVE]

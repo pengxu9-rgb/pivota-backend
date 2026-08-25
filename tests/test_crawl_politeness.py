@@ -1157,3 +1157,151 @@ def test_a_cancelled_robots_fetch_does_not_cache_no_restrictions(
         "for a full TTL, across every lane that shares this cache"
     )
     assert "slowbots.example" not in cp._ROBOTS_INFLIGHT, "the in-flight entry leaked"
+
+
+# --------------------------------------------------------------- the `observed` out-param
+
+def _fetch_with_observed(
+    monkeypatch: "pytest.MonkeyPatch",
+    *,
+    status_code: int,
+    final_url: str,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Drive the REAL `_fetch_html` and return what it stamped into `observed`."""
+    from services import external_offers_service as eos
+
+    class _Resp:
+        pass
+
+    resp = _Resp()
+    resp.status_code = status_code
+    resp.headers = {"content-type": "text/html", **(headers or {})}
+    resp.encoding = "utf-8"
+    resp.content = b"<html><title>t</title></html>"
+    resp.url = final_url
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            return resp
+
+    _serve_robots(monkeypatch, {"brand.com": ""})
+    monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
+    _patch_sleep(monkeypatch)
+
+    observed: Dict[str, Any] = {}
+
+    async def go() -> None:
+        try:
+            await eos._fetch_html("https://brand.com/products/x", observed=observed)
+        except eos.ExternalOfferUnavailable:
+            pass
+
+    asyncio.run(go())
+    return observed
+
+
+def test_fetch_html_reports_what_it_saw_on_a_200(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """`observed` is the ONLY channel the live path has for a destination verdict.
+
+    Every refresh test stubs `resolve_external_offer` and hand-fills this dict, so deleting
+    the three lines that populate it left the whole suite green while
+    `_refresh_external_seed_by_id` would report `not_observed` forever in production.
+    """
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 200
+    assert observed["final_url"] == "https://brand.com/products/x"
+    assert observed["bot_challenged"] is False
+
+
+def test_fetch_html_reports_the_FINAL_url_after_a_redirect(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """The final url is what separates a live product from a 301 onto a collection page."""
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/collections/all"
+    )
+    assert observed["final_url"] == "https://brand.com/collections/all"
+    assert observed["status_code"] == 200
+
+
+def test_fetch_html_reports_a_404_before_it_raises(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """The stamp has to happen BEFORE the throw, or the dead-link path learns nothing."""
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=404, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 404
+    assert observed["bot_challenged"] is False
+
+
+def test_fetch_html_flags_a_bot_challenge(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """429 + `cf-mitigated` is a refusal; the refresh must not read it as a dead product."""
+    observed = _fetch_with_observed(
+        monkeypatch,
+        status_code=429,
+        final_url="https://brand.com/products/x",
+        headers={"cf-mitigated": "challenge"},
+    )
+    assert observed["status_code"] == 429
+    assert observed["bot_challenged"] is True
+
+
+def test_fetch_html_raises_on_a_3xx_that_was_not_followed(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """`raise_for_status` threw for any non-2xx; `>= 400` did not, and that is not the same.
+
+    A 302 with no Location survives `follow_redirects=True`. Under the old predicate its body
+    was parsed as the product page and written into the snapshot.
+    """
+    from services import external_offers_service as eos
+
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=302, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 302
+
+    class _Resp:
+        pass
+
+    resp = _Resp()
+    resp.status_code = 302
+    resp.headers = {"content-type": "text/html"}
+    resp.encoding = "utf-8"
+    resp.content = b"<html></html>"
+    resp.url = "https://brand.com/products/x"
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            return resp
+
+    _serve_robots(monkeypatch, {"brand.com": ""})
+    monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
+    _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        with pytest.raises(eos.ExternalOfferUnavailable) as caught:
+            await eos._fetch_html("https://brand.com/products/x")
+        assert caught.value.status_code == 302
+
+    asyncio.run(go())

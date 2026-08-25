@@ -270,7 +270,7 @@ def test_a_confirmed_dead_observation_advances_the_streak(monkeypatch):
         "destination_failure_streak": 1,
         "status": "active",
     }
-    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None)
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
     result, db = _observe(monkeypatch, row, obs, now=NOW)
     assert result["failure_streak"] == 2
     assert result["retire"] is True
@@ -286,7 +286,7 @@ def test_a_second_look_inside_the_gap_does_not_advance_the_streak(monkeypatch):
         "destination_failure_streak": 1,
         "status": "active",
     }
-    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None)
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
     result, _db = _observe(monkeypatch, row, obs, now=NOW)
     assert result["failure_streak"] == 1
     assert result["retire"] is False
@@ -356,7 +356,7 @@ def test_a_never_checked_row_advances_on_its_first_dead_observation(monkeypatch)
         "destination_failure_streak": 0,
         "status": "active",
     }
-    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None)
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
     result, _db = _observe(monkeypatch, row, obs, now=NOW)
     assert result["failure_streak"] == 1
     assert result["retire"] is False, "one observation is never enough"
@@ -398,10 +398,10 @@ def test_the_verdict_vocabulary_matches_the_database_constraint():
     import pathlib
 
     repo = pathlib.Path(__file__).resolve().parent.parent
-    sql = (repo / "db/migrations/199_external_seed_destination_liveness.sql").read_text()
+    sql = (repo / "db/migrations/200_external_seed_destination_liveness.sql").read_text()
     guard = (repo / "db/schema_guard.py").read_text()
     for verdict in liveness.ALL_VERDICTS:
-        assert f"'{verdict}'" in sql, f"{verdict} missing from migration 199's CHECK"
+        assert f"'{verdict}'" in sql, f"{verdict} missing from migration 200's CHECK"
         assert f"'{verdict}'" in guard, f"{verdict} missing from the schema_guard CHECK"
 
 
@@ -569,3 +569,170 @@ def test_one_exploding_host_does_not_void_the_rest_of_the_pass(monkeypatch):
     assert [seed_id for seed_id, _ in recorded] == ["eps_a"]
     assert summary["hosts_unverifiable"] == 1
     assert summary["listed"] == 1
+
+
+# ------------------------------------------------- corroboration is what licenses a retirement
+
+def test_a_url_that_never_named_a_product_handle_is_unverifiable_not_dead():
+    """A 200 on a non-Shopify-shaped URL must not be a CONFIRMED-DEAD verdict.
+
+    `redirected_off_product` is reached by asking "did we land on the handle we asked for".
+    When the seed's URL carries no handle at all that question has no answer, and its absence
+    is not evidence — but the comparison still failed, so a perfectly healthy page on
+    `/p/<sku>`, `/store/products/<x>` or `/shop/<x>.html` was classified dead. 682 of the
+    11,352 active seeds carry such a URL. The sweep never sees them (`group_by_host` drops
+    handle-less rows); the refresh route classified them unconditionally.
+    """
+    # NB `/store/products/<h>` is deliberately absent: `_HANDLE_RE` searches rather than
+    # anchors, so that URL really does name a handle and really is judgeable. These do not.
+    for url in (
+        "https://www.ulta.com/p/hydrating-serum-pimprod2031234",
+        "https://brand.com/shop/toner.html",
+        "https://brand.com/collections/all",
+        "https://brand.com/",
+    ):
+        obs = liveness.classify_destination(requested_url=url, status_code=200, final_url=url)
+        assert obs.verdict == liveness.VERDICT_UNVERIFIABLE, url
+        assert obs.confirmed_dead is False, url
+        assert obs.corroborated is False, url
+
+
+def test_only_a_catalogue_corroborated_verdict_is_marked_corroborated():
+    """`listed_in_catalogue is False` is the stage-1 witness. Nothing else sets the flag."""
+    dead = dict(requested_url="https://b.com/products/x", status_code=404)
+    assert liveness.classify_destination(**dead, listed_in_catalogue=False).corroborated is True
+    assert liveness.classify_destination(**dead).corroborated is False
+    assert liveness.classify_destination(**dead, listed_in_catalogue=True).corroborated is False
+
+
+def test_an_uncorroborated_dead_observation_holds_the_streak(monkeypatch):
+    """A 404 with no second witness is recorded, but it may not push toward retirement.
+
+    A WAF that answers 404 to an unfamiliar client and a deleted product are the same bytes,
+    and a WAF policy is MORE persistent than a dead product — so repetition plus the 24h gap
+    cannot tell them apart. `services/live_offer_verification._check_one` refuses the same
+    inference for the same reason. Without this, two employee refreshes a day apart retired a
+    live product.
+    """
+    row = {
+        "destination_checked_at": NOW - timedelta(days=3),
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 1,
+        "status": "active",
+    }
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=False)
+    result, _db = _observe(monkeypatch, row, obs, now=NOW)
+    assert result["failure_streak"] == 1, "held, not advanced"
+    assert result["retire"] is False
+    assert result["verdict"] == liveness.VERDICT_DEAD_404, "still recorded — it is a real answer"
+
+
+def test_an_uncorroborated_dead_observation_can_never_reach_the_retirement_threshold(monkeypatch):
+    """Repeat it as often as you like, days apart: it never retires."""
+    streak = 0
+    for day in range(6):
+        row = {
+            "destination_checked_at": NOW - timedelta(days=90 - day * 10),
+            "destination_verdict": liveness.VERDICT_DEAD_404,
+            "destination_failure_streak": streak,
+            "status": "active",
+        }
+        obs = liveness.DestinationObservation(
+            liveness.VERDICT_DEAD_404, 404, None, corroborated=False
+        )
+        result, _db = _observe(monkeypatch, row, obs, now=NOW)
+        streak = result["failure_streak"]
+        assert result["retire"] is False, f"retired on day {day}"
+    assert streak == 0
+
+
+# ------------------------------------------------- a non-observation writes no fact
+
+def test_an_unverifiable_observation_does_not_overwrite_a_confirmed_dead_verdict(monkeypatch):
+    """The verdict is the field SERVING reads, so overwriting it un-blocks a dead seed.
+
+    The clock and the streak were already frozen for an `unverifiable`, but the verdict was
+    written unconditionally. `destination_dead` requires `verdict in CONFIRMED_DEAD_VERDICTS`,
+    so one 429 on a seed sitting at dead_404/streak-2 cleared the blocker and handed its 404
+    link back to the serving lane until another confirmed-dead observation happened to land.
+    """
+    row = {
+        "destination_checked_at": NOW - timedelta(days=1),
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 2,
+        "status": "active",
+    }
+    obs = liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge")
+    _result, db = _observe(monkeypatch, row, obs, now=NOW)
+
+    sql, params = db.executed[0]
+    assert params["reached_origin"] is False
+    # The guard has to be in the STATEMENT: with a params-only assertion, a mutant that drops
+    # the CASE and writes :verdict unconditionally still passes.
+    assert "destination_verdict = CASE" in sql
+    assert "destination_http_status = CASE" in sql
+    assert "WHEN CAST(:reached_origin AS BOOLEAN) THEN :verdict" in sql
+
+
+def test_a_conclusive_observation_does_overwrite_the_verdict(monkeypatch):
+    """The freeze applies to `unverifiable` only — a real answer still lands."""
+    row = {
+        "destination_checked_at": NOW - timedelta(days=1),
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 2,
+        "status": "active",
+    }
+    obs = liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None)
+    result, db = _observe(monkeypatch, row, obs, now=NOW)
+    assert db.executed[0][1]["reached_origin"] is True
+    assert db.executed[0][1]["verdict"] == liveness.VERDICT_LIVE
+    assert result["failure_streak"] == 0, "a live answer resets the streak"
+
+
+# ------------------------------------------------- an empty catalogue is not a catalogue
+
+def test_a_page_one_with_no_products_is_not_a_usable_catalogue():
+    """200 + `{"products": []}` is far more often a gated feed than a shop selling nothing.
+
+    Treating it as usable marks every seed on the host delisted and converts the sweep's
+    one-request-per-host economy into one PDP fetch per seed — aimed at exactly the hosts most
+    likely to be refusing us.
+    """
+    client = _CannedClient([_page([])])
+    read = _run(liveness.read_brand_catalogue(client, "brand.com", attempts=1))
+    assert read.status == liveness.CATALOGUE_EMPTY
+    assert read.usable is False
+    assert read.handles == set()
+
+
+def test_an_empty_LATER_page_still_ends_a_good_catalogue():
+    """The empty-page-1 rule must not break normal pagination termination."""
+    client = _CannedClient([_page([f"h{i}" for i in range(liveness.PAGE_LIMIT)]), _page([])])
+    read = _run(liveness.read_brand_catalogue(client, "brand.com", attempts=1))
+    assert read.status == liveness.CATALOGUE_OK
+    assert read.usable is True
+    assert len(read.handles) == liveness.PAGE_LIMIT
+
+
+# ------------------------------------------------- the mirror withdrawal is scoped
+
+def test_retirement_scopes_the_mirror_by_source_system_and_stamps_updated_at(monkeypatch):
+    """`source_ref` alone is not the seed->product link; the PAIR is.
+
+    services/external_offer_dual_write states it and `resolve_mirror_product` queries on both,
+    so matching on source_ref alone would suppress any row from another door carrying the same
+    value. `updated_at` matches identity_resolution.SUPPRESS_SQL so incremental consumers can
+    see the withdrawal.
+    """
+    db = _FakeDb({"status": "active"})
+    monkeypatch.setattr(liveness, "database", db)
+    obs = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    _run(liveness.retire_seed_for_dead_destination("eps_1", obs, now=NOW))
+
+    mirror_sql, mirror_params = next(
+        (sql, params) for sql, params in db.executed if "catalog_products" in sql
+    )
+    assert "source_system = :source_system" in mirror_sql
+    assert mirror_params["source_system"] == liveness.MIRROR_SOURCE_SYSTEM
+    assert "updated_at = NOW()" in mirror_sql
+    assert mirror_params["reason"] == liveness.SUPPRESSION_REASON

@@ -323,6 +323,22 @@ def get_last_extracted_at(row: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
     return normalize_non_empty_string(snapshot.get("extracted_at") or row.get("updated_at") or row.get("created_at"))
 
 
+def get_content_extracted_at(row: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
+    """When the seed's CONTENT (price, availability, title) was last extracted from the page.
+
+    `get_last_extracted_at` minus the `updated_at` / `created_at` fallbacks, which is what made
+    that helper unusable as a gate. An empty string means no extraction has ever been recorded
+    and must be treated as a blocker, not as a pass.
+
+    THIS IS A DIFFERENT FACT FROM `get_last_destination_check_at`, and collapsing the two is a
+    mistake this module has already made once. A destination sweep proves the LINK resolves
+    without reading a single price; a content extraction proves the PRICE was read without
+    proving the link still resolves today. A gate that asks only one of them serves either a
+    dead link or a stale price.
+    """
+    return normalize_non_empty_string(snapshot.get("extracted_at"))
+
+
 def get_last_destination_check_at(row: Dict[str, Any]) -> str:
     """When a fetch last REACHED THE ORIGIN for this seed's destination.
 

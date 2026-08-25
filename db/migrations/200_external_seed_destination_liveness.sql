@@ -1,4 +1,4 @@
--- 199_external_seed_destination_liveness.sql
+-- 200_external_seed_destination_liveness.sql
 --
 -- Record whether a seed's published destination URL still resolves.
 --

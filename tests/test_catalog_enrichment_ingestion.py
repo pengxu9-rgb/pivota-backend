@@ -551,6 +551,12 @@ def test_seed_clears_every_audit_blocker_it_can_earn_at_mint_time():
     jobs/external_seed_destination_sweep has actually loaded it, which it does first,
     because the sweep queue is ordered `destination_checked_at NULLS FIRST`.
 
+    `stale_snapshot` is blocked for the SAME reason and it is a second, independent fact:
+    the builder writes no `snapshot.extracted_at` because it never extracted anything from a
+    page. Gemini asserted the price; nobody read it. A gate that let an LLM-asserted price
+    serve as "fresh content" is the fabrication this lane exists to keep out, so both
+    blockers standing here is the honest state, not a fixture gap.
+
     So the assertion is the one this test was always about: every blocker the BUILDER can
     clear is cleared.
     """
@@ -568,7 +574,7 @@ def test_seed_clears_every_audit_blocker_it_can_earn_at_mint_time():
 
     status = _asyncio.run(_check())
     blockers = set(status.blocker_anomaly_types or [])
-    assert blockers == {"destination_never_verified"}, (
+    assert blockers == {"destination_never_verified", "stale_snapshot"}, (
         f"the builder must leave no blocker of its own; got {sorted(blockers)}"
     )
     assert "zero_variants" not in blockers, "the Phase-7c defect, pinned"
@@ -589,6 +595,17 @@ def test_a_minted_seed_serves_once_its_destination_is_actually_verified():
         destination_verdict="live",
         destination_failure_streak=0,
     )
+    # BOTH facts, because they are two facts. The sweep proves the link resolves; it reads no
+    # price. A content refresh is what clears `stale_snapshot`, and a seed needs both before
+    # it may serve — that is precisely the pair a single `destination_checked_at` collapsed.
+    import json as _json
+
+    raw = seed.get("seed_data") or {}
+    seed_data = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+    snapshot = dict(seed_data.get("snapshot") or {})
+    snapshot["extracted_at"] = datetime.now(timezone.utc).isoformat()
+    seed_data["snapshot"] = snapshot
+    seed["seed_data"] = seed_data
 
     async def _check():
         return await evaluate_external_referral_seed(

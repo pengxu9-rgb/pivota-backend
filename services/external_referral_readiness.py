@@ -14,6 +14,7 @@ from db.database import database
 from db.merchant_onboarding import get_all_merchant_onboardings
 from services.external_seed_audit import (
     audit_external_seed_row,
+    get_content_extracted_at,
     get_destination_failure_streak,
     get_destination_verdict,
     get_last_destination_check_at,
@@ -52,6 +53,10 @@ EXTERNAL_REFERRAL_BLOCKER_ANOMALIES = {
     # Never verified at all. This used to be the FAIL-OPEN case: the staleness check was
     # guarded on `extracted_dt is not None`, so a seed with no observation behind it passed.
     "destination_never_verified",
+    # The LINK check has gone stale. Distinct from `stale_snapshot`, which is about the
+    # CONTENT: a sweep proves the URL resolves without reading a price, and a content refresh
+    # reads a price without proving the URL still resolves. One field cannot answer both.
+    "destination_stale",
 }
 EXTERNAL_REFERRAL_REVIEW_ANOMALIES = {
     "zero_images",
@@ -806,6 +811,37 @@ async def evaluate_external_referral_seed(
             }
         )
 
+    # TWO INDEPENDENT QUESTIONS, AND ONE FIELD CANNOT ANSWER BOTH.
+    #
+    # The first version of this block replaced the content-age check with the destination
+    # check, which reads as a strict improvement and is not one: the sweep stamps
+    # `destination_checked_at` from a catalogue read or a HEAD-shaped probe WITHOUT ever
+    # reading a price. So the day the first full pass completed, ~11.3k rows carrying a
+    # median-56-to-99-day-old price would have flipped from blocked to healthy — a serving
+    # regression created by the very change meant to close one, and invisible to any
+    # measurement taken before the sweep ran.
+    #
+    #   stale_snapshot     the CONTENT (price, availability) is old  -> the number we quote is wrong
+    #   destination_stale  the LINK has not been re-verified         -> it may be gone by now
+    #
+    # Both are blockers, both are separately clearable, and neither substitutes for the other.
+    extracted_at = get_content_extracted_at(normalized_row, snapshot)
+    extracted_dt = _parse_timestamp(extracted_at)
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
+    if extracted_dt is None or extracted_dt < stale_cutoff:
+        findings.append(
+            {
+                "anomaly_type": "stale_snapshot",
+                "severity": "blocker",
+                "recommended_action": f"Refresh the seed snapshot to keep referral content fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
+                "auto_fixable": True,
+                "evidence": {
+                    "last_extracted_at": _to_iso(extracted_dt) if extracted_dt else None,
+                    "threshold_days": EXTERNAL_REFERRAL_STALE_DAYS,
+                },
+            }
+        )
+
     last_checked_at = get_last_destination_check_at(normalized_row)
     checked_dt = _parse_timestamp(last_checked_at)
     if checked_dt is None:
@@ -818,12 +854,12 @@ async def evaluate_external_referral_seed(
                 "evidence": {"destination_checked_at": None},
             }
         )
-    elif checked_dt < (datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)):
+    elif checked_dt < stale_cutoff:
         findings.append(
             {
-                "anomaly_type": "stale_snapshot",
+                "anomaly_type": "destination_stale",
                 "severity": "blocker",
-                "recommended_action": f"Re-verify the seed destination to keep referral data fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
+                "recommended_action": f"Re-verify the seed destination to keep the link check fresher than {EXTERNAL_REFERRAL_STALE_DAYS} days.",
                 "auto_fixable": True,
                 "evidence": {
                     "destination_checked_at": _to_iso(checked_dt),
