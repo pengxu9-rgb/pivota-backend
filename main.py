@@ -327,6 +327,7 @@ except ModuleNotFoundError:
     )
 from routes.after_sales_cases import router as after_sales_cases_router
 from routes.agent_events import router as agent_events_router
+from routes.card_rail_outcomes import router as card_rail_outcomes_router
 from routes.agent_management import router as agent_management_router
 from routes.shopify_setup import router as shopify_setup_router
 from routes.shopify_manual import router as shopify_manual_router
@@ -1301,6 +1302,7 @@ app.include_router(subject_resolve_router)  # Stable subject resolution contract
 app.include_router(after_sales_cases_router)  # After-sales Case API (refund/return_refund)
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
+app.include_router(card_rail_outcomes_router)  # POST /agent/v1/outcomes — handoff results
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
