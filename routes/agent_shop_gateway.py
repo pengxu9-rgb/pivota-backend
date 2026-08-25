@@ -72,6 +72,7 @@ from services.outbound_links_service import (
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
     REFERRAL_CLICK_PARAM,
+    SHOPIFY_CART_CLICK_ATTRIBUTE,
     make_redirect_token,
     normalize_shop_host,
     parse_redirect_token_verified,
@@ -4204,7 +4205,19 @@ async def _handle_offers_resolve(
                         or str(canonical_url or destination_url)
                     )
                     or None,
-                    "pdp_url": composed_spec["pdp_url"],
+                    # F1: the allowlist ran on `primary_unkeyed` — which is the CART when one
+                    # exists, built on shop_domain. `pdp_url` comes from `canonical_url or
+                    # destination_url`, which can be a DIFFERENT host that nothing vetted. Before
+                    # this spec that URL was never emitted, so publishing it unchecked — with our
+                    # click id on it — would be net-new egress to an unapproved destination, and
+                    # would also contradict the `merchant_domain` printed beside it. Publish it
+                    # only when it is the same host the allowlist already approved.
+                    "pdp_url": (
+                        composed_spec["pdp_url"]
+                        if _seed_domain_from_url(composed_spec["pdp_url"])
+                        == _seed_domain_from_url(composed_spec["primary_unkeyed"])
+                        else None
+                    ),
                     "cart_url": composed_spec["cart_url"],
                     # The NUMERIC storefront variant id a cart permalink can actually be built
                     # from — not the catalog SKU. None when we could not justify one, which is
@@ -4221,7 +4234,16 @@ async def _handle_offers_resolve(
                     # `pdp_url` / `cart_url` directly generated revenue we could not see.
                     "tracking": {
                         "click_id": stable_click_id,
-                        "param": REFERRAL_CLICK_PARAM,
+                        # F2: the carrier differs by join mode and the agent needs the one that is
+                        # actually IN the URL it was handed. A cart carries the id as a cart
+                        # ATTRIBUTE; a referral carries it as a plain query param. Naming
+                        # REFERRAL_CLICK_PARAM unconditionally pointed an agent following
+                        # `cart_url` at a string that appears nowhere in it.
+                        "param": (
+                            SHOPIFY_CART_CLICK_ATTRIBUTE
+                            if composed_spec["cart_url"]
+                            else REFERRAL_CLICK_PARAM
+                        ),
                         "join_mode": composed_spec["join_mode"],
                     },
                 }

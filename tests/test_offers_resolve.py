@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 from unittest.mock import AsyncMock
@@ -1479,6 +1480,13 @@ def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
             return [_seed_row_for_exec_spec(evidence=evidence)]
         return []
 
+    # These tests are about the execution spec, not about rate limiting, and the anon limiter is
+    # MODULE-LEVEL shared state (`_INVOKE_ANON_IP_LIMIT_STORE`, 60 rpm per IP per minute). Every
+    # request here would spend budget that a later file needs — adding these tests tipped
+    # test_pdp_resolution_stability's 30-call loop into a 429. `rpm == 0` short-circuits BEFORE
+    # the store is incremented, so this spends nothing rather than merely resetting a counter.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
                         AsyncMock(return_value=["brand.com"]))
@@ -1648,3 +1656,169 @@ def test_the_allowlist_still_sees_the_destination_without_the_join_key(
         "of a domain decision"
     )
     assert "pivota_click_id" not in checked and "pvt_click_id" not in checked
+
+
+def _seed_row_split_hosts():
+    """A seed whose canonical_url is on a DIFFERENT host from its shop domain.
+
+    Nothing corrupt: the crawl can legitimately record a mirror/CDN canonical while the
+    storefront evidence names the real shop. It is exactly the case where the allowlist gate
+    and the published PDP part company.
+    """
+    row = _seed_row_for_exec_spec(evidence=True)
+    row["canonical_url"] = "https://cdn-mirror.example/products/serum"
+    row["destination_url"] = "https://cdn-mirror.example/products/serum"
+    row["domain"] = "brand.com"
+    row["seed_data"]["snapshot"]["shop_domain"] = "brand.com"
+    return row
+
+
+def test_pdp_url_is_never_published_for_a_host_the_allowlist_did_not_approve(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The allowlist gate runs on ONE url. When a cart exists that url is the CART, built on the
+    shop domain — so a `pdp_url` composed from `canonical_url` can be a host nothing vetted.
+
+    Publishing it would be net-new egress to an unapproved destination carrying our click id,
+    and would contradict the `merchant_domain` printed beside it. Withhold it instead: a spec
+    that omits a field is honest, one that points at an unvetted host is not.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [_seed_row_split_hosts()]
+        return []
+
+    # These tests are about the execution spec, not about rate limiting, and the anon limiter is
+    # MODULE-LEVEL shared state (`_INVOKE_ANON_IP_LIMIT_STORE`, 60 rpm per IP per minute). Every
+    # request here would spend budget that a later file needs — adding these tests tipped
+    # test_pdp_resolution_stability's 30-call loop into a 429. `rpm == 0` short-circuits BEFORE
+    # the store is incremented, so this spends nothing rather than merely resetting a counter.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    if not offers:
+        pytest.skip("this seed shape produced no external offer; the gate is unreachable here")
+
+    spec = offers[0]["execution_spec"]
+    assert spec["cart_url"], "the cart is on the approved host and must still be served"
+    assert spec["pdp_url"] is None, (
+        f"pdp_url on an unvetted host must be withheld, got {spec['pdp_url']!r}"
+    )
+    # And the spec stays internally consistent: no field names a host another field contradicts.
+    assert "cdn-mirror.example" not in json.dumps(spec)
+
+
+def test_tracking_param_names_the_carrier_that_is_actually_in_the_url(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`tracking.param` tells an agent where to FIND the join key. A cart carries it as a cart
+    attribute, a referral as a plain query param. A constant here points an agent following
+    `cart_url` at a string that appears nowhere in it — the key looks missing when it is present.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    cart_offer, _ = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    cart_spec = cart_offer["execution_spec"]
+    assert cart_spec["cart_url"]
+    assert cart_spec["tracking"]["param"] == gateway.SHOPIFY_CART_CLICK_ATTRIBUTE
+    assert f'{cart_spec["tracking"]["param"]}={cart_spec["tracking"]["click_id"]}' in (
+        cart_spec["cart_url"]
+    ), "the named carrier must literally appear in the url it describes"
+
+
+def test_tracking_param_names_the_referral_carrier_when_there_is_no_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    offer, _ = _resolve_offer_with_spec(monkeypatch, client, evidence=False)
+    spec = offer["execution_spec"]
+    assert spec["cart_url"] is None
+    assert spec["tracking"]["param"] == gateway.REFERRAL_CLICK_PARAM
+    assert f'{spec["tracking"]["param"]}={spec["tracking"]["click_id"]}' in spec["pdp_url"]
+
+
+def test_pdp_url_stays_the_product_page_even_when_a_cart_exists(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Review F3. The only test pinning `pdp_url` as a product page ran in the NO-CART branch,
+    where composing it from `cart_base or destination_url` is inert. An agent may legitimately
+    want to show the PDP while still handing off to the cart, so the distinction has to hold
+    exactly where it is destroyable.
+    """
+    offer, _payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    spec = offer["execution_spec"]
+
+    assert spec["cart_url"] and "/cart/" in spec["cart_url"]
+    assert spec["pdp_url"], "the PDP must still be published on the approved host"
+    assert "/cart/" not in spec["pdp_url"], "pdp_url must be the PRODUCT page, not the cart"
+    assert "/products/serum" in spec["pdp_url"]
+    assert spec["pdp_url"] != spec["cart_url"]
+
+
+def test_merchant_domain_is_normalized_not_echoed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Review F3. `merchant_domain` is a HOST, and the fixture's bare `domain` column made the
+    normalization unassertable. Drive a shop_domain carrying scheme, userinfo, port and path —
+    every part that must not survive into a field an agent may compare or key on.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    # The messy value must go on the `domain` COLUMN: _external_seed_redirect_identity reads
+    # `row["domain"] or seed_data["domain"]` RAW and only falls back to a URL-derived host,
+    # which is already normalized. Putting it anywhere else makes this test pass without ever
+    # exercising the normalization — which is exactly how it failed to kill its mutant first time.
+    row = _seed_row_for_exec_spec(evidence=True)
+    row["domain"] = "https://User:Pass@Brand.COM:443/shop/"
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    # These tests are about the execution spec, not about rate limiting, and the anon limiter is
+    # MODULE-LEVEL shared state (`_INVOKE_ANON_IP_LIMIT_STORE`, 60 rpm per IP per minute). Every
+    # request here would spend budget that a later file needs — adding these tests tipped
+    # test_pdp_resolution_stability's 30-call loop into a 429. `rpm == 0` short-circuits BEFORE
+    # the store is incremented, so this spends nothing rather than merely resetting a counter.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    if not offers:
+        pytest.skip("no external offer for this shape")
+
+    domain = offers[0]["execution_spec"]["merchant_domain"]
+    assert domain == "brand.com", f"expected a bare lowercase host, got {domain!r}"
+    for leaked in ("https://", "User", "Pass", ":443", "/shop"):
+        assert leaked not in (domain or ""), f"{leaked!r} must not survive into merchant_domain"
