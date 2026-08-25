@@ -115,11 +115,33 @@ printf '%s\n' "$OUT"
 gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
 
+`scripts/ops/run_oneoff_job.sh` wraps exactly this, with the three footguns below
+already handled, and is what the operator scripts' own `--help` now points at:
+
+```bash
+scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py --json
+```
+
+It exits 0 when the container exited 0 and non-zero when it did not, deletes the
+job on every path including Ctrl-C, and picks an `--args` delimiter that does not
+occur in the payload. Note that non-zero is not the container's OWN code —
+`gcloud run jobs execute` raises an error carrying no exit code, so every job
+failure surfaces as 1 alike; that is why the helper prints gcloud's stderr on
+failure rather than discarding it.
+Reach for the raw form above when you need to change something it does not expose
+(`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT` and `JOB_PREFIX` are
+environment overrides).
+
 Three things that are easy to get wrong:
 
 - **Secrets are not inherited.** A job mounts only what you pass. A script that reads
   `DATABASE_URL` gets nothing unless you `--set-secrets` it, and will usually fail in a way that
-  looks like a database outage rather than a missing mount.
+  looks like a database outage rather than a missing mount. Most secret names carry an `env-`
+  prefix; the bare env-var secrets in `pivota-prod` are `DATABASE_URL`, `DATABASE_URL_NOVERIFY`, `REDIS_URL`,
+  `PCI_KB_DATABASE_URL`, `PCI_KB_DATABASE_URL_NOVERIFY`, `STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY`,
+  `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` — eight, not the three named in #1866,
+  and `GOOGLE_OAUTH_CLIENT_SECRET` exists under BOTH spellings while `web` mounts the `env-` one.
+  Read the `secretKeyRef` off the running service rather than trusting any list, this one included.
 - **`--args` splits on commas.** A Python one-liner containing a comma is shredded into separate
   argv entries. Use the alternate delimiter form: `--args="^|^-c|import x,y"`. The delimiter you
   pick **must not appear anywhere in the values** — `|` is a poor choice for Python that uses dict
@@ -139,8 +161,24 @@ are how three of those ended up running old code against live secrets on 2026-08
 CONFIG=preserve infra/gcp/deploy_backend.sh prod <sha>
 ```
 
-## Still on Railway, deliberately
+## Railway: decommissioned as of 2026-08-25 (#1872)
 
-Railway remains the rollback until it is decommissioned, so `railway` commands are still the right
-thing when you are **operating the rollback on purpose** — verifying it can still serve, or
-comparing its state against production. They are the wrong thing when you mean "production".
+This section used to say Railway "remains the rollback until it is decommissioned". It has been:
+#1872 archived the dumps, repointed the last GCP→Railway dependency, took every service down across
+all three projects, and deleted the `railway-*` DSN secrets from `pivota-prod`. **There is no
+rollback platform any more, so there is no longer any correct reason to run a `railway` command.**
+
+Teardown is not instantaneous, and half-gone reads as alive, so do not infer state from one probe:
+
+- `pivota-agent-production.up.railway.app` returned **200 with its own build SHA in the morning of
+  2026-08-25 and 404 with `x-railway-fallback: true` the same afternoon.** A rollback host's
+  liveness is perishable in both directions; re-probe before citing either state.
+- `web-staging-staging-5257.up.railway.app` is mid-teardown as this is written: `/` answers 200 but
+  reports `db_status: disconnected`, `/health` is 503, and the `/__shakeout/*` routes still answer
+  401. Serving a route is not the same as being able to do anything useful with it.
+- Probe **the path that actually serves**, not `/`. #1872 records the inverse of the trap above:
+  catalog-intelligence 404s on `/` while healthy, and was briefly declared dead on that basis.
+
+`railway-prod-db-url` and `railway-pcikb-db-url` still exist in `pivota-staging`. And per #1872,
+service shells keep their auto-deploy triggers until deleted in the dashboard — `pivota-acp`'s was
+never disarmed, so a push to that repo could still resurrect a service.

@@ -148,7 +148,12 @@ async def _group_counts(table: str, merchant_id: str) -> list[dict[str, Any]]:
 
 async def _drive(args: argparse.Namespace) -> None:
     if not IS_POSTGRES:
-        raise SystemExit("Refusing to inspect non-Postgres DATABASE_URL; use Railway production env.")
+        raise SystemExit(
+            "Refusing to inspect non-Postgres DATABASE_URL. Production is Cloud "
+            "Run (pivota-prod/us-west1); run this inside it, which mounts the "
+            "DATABASE_URL secret:\n"
+            "  scripts/ops/run_oneoff_job.sh scripts/inspect_merchant_store_sources.py"
+        )
     merchant_ids = [value.strip() for value in args.merchant_id if value.strip()]
     if not merchant_ids:
         raise SystemExit("--merchant-id is required")
@@ -174,7 +179,7 @@ async def _drive(args: argparse.Namespace) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--merchant-id", action="append", default=[], help="Merchant ID to inspect.")
     return parser.parse_args()
 

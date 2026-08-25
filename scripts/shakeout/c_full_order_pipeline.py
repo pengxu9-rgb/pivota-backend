@@ -16,11 +16,33 @@ Does NOT exercise:
   §J refund attribution (next shakeout)
 
 Usage:
-    export SHAKEOUT_DB_URL=$(railway variables --json -e production \\
-        -s Postgres-xMr6 | jq -r '.DATABASE_PUBLIC_URL')
-    export SHAKEOUT_DEBUG_TOKEN=$(railway variables --json -e staging \\
-        -s web-staging | jq -r '.SHAKEOUT_DEBUG_TOKEN')
+    export SHAKEOUT_DEBUG_TOKEN=$(gcloud secrets versions access latest \\
+        --secret=env-SHAKEOUT_DEBUG_TOKEN --project pivota-staging)
+    export SHAKEOUT_DB_URL=...   # see the note below
     .venv/bin/python scripts/shakeout/c_full_order_pipeline.py
+
+WHERE SHAKEOUT_DB_URL COMES FROM, and why there is deliberately no production
+command here. It used to be the `Postgres-xMr6` DATABASE_PUBLIC_URL — that is the
+ROLLBACK's database now. Production is Cloud Run in pivota-prod/us-west1 on Cloud
+SQL, and its `DATABASE_URL` secret resolves to a PRIVATE IP (verified
+2026-08-25), so nothing reaches it from a laptop.
+
+🚨 DO NOT POINT THIS SCRIPT AT THE PRODUCTION DATABASE, and in particular do not
+run it under `scripts/ops/run_oneoff_job.sh` — that helper mounts the PRODUCTION
+`DATABASE_URL`. This is not a read-only probe: it `INSERT`s into `orders` and
+`commerce_attribution_edges` and `UPDATE`s orders to `payment_status='paid'`
+(lines ~148, ~185, ~249). It also drives an HTTP surface separately from the DB,
+so under that helper `SHAKEOUT_BASE_URL` would still default to the STAGING host
+below — synthetic paid orders written into the production ledger from a staging
+shakeout. Point SHAKEOUT_DB_URL at a staging or local database whose URL you
+already have; that is the only supported venue.
+
+THERE IS NO WORKING DEFAULT BASE URL TODAY. GCP staging `web` runs with
+`ingress: internal` so it is unreachable from a laptop, and the Railway staging
+host below is mid-teardown after the 2026-08-25 decommission (#1872): `/health`
+is 503 and its `/` reports a disconnected database. It is the last known value,
+not a working default. Set SHAKEOUT_BASE_URL yourself and confirm the target
+serves `/__shakeout/*` (401 = present, 404 = wrong app) before trusting a run.
 
 References:
 - docs/monetization/MERCHANT_ONBOARDING_READINESS.md §D-H
@@ -73,9 +95,12 @@ def _connect():
     )
     if not url:
         sys.stderr.write(
-            "ERROR: SHAKEOUT_DB_URL not set. Source:\n"
-            "    export SHAKEOUT_DB_URL=$(railway variables --json "
-            "-e production -s Postgres-xMr6 | jq -r '.DATABASE_PUBLIC_URL')\n"
+            "ERROR: SHAKEOUT_DB_URL not set.\n"
+            "    Set it to a STAGING or LOCAL database URL. This script writes\n"
+            "    (INSERT orders / attribution edges, UPDATE orders to paid), so it\n"
+            "    must never be aimed at the production database - including via\n"
+            "    scripts/ops/run_oneoff_job.sh, which mounts the production\n"
+            "    DATABASE_URL secret.\n"
         )
         sys.exit(2)
     return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
@@ -403,8 +428,8 @@ def main() -> int:
     if not token:
         sys.stderr.write(
             "ERROR: SHAKEOUT_DEBUG_TOKEN not set. Source:\n"
-            "    export SHAKEOUT_DEBUG_TOKEN=$(railway variables --json "
-            "-e staging -s web-staging | jq -r '.SHAKEOUT_DEBUG_TOKEN')\n"
+            "    export SHAKEOUT_DEBUG_TOKEN=$(gcloud secrets versions access latest "
+            "--secret=env-SHAKEOUT_DEBUG_TOKEN --project pivota-staging)\n"
         )
         return 2
 

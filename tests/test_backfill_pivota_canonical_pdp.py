@@ -1,7 +1,8 @@
 """
 Smoke tests for scripts/backfill_pivota_canonical_pdp.py — focused on
 the pure logic (chunking, identity validation, sig shape) since the
-script's DB layer is exercised end-to-end via railway run.
+script's DB layer is exercised end-to-end by running it against production
+(a throwaway Cloud Run job — see the script's own docstring).
 """
 
 from __future__ import annotations

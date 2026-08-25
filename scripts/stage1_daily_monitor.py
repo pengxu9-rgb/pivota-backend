@@ -1,14 +1,14 @@
 """Stage 1 daily shadow-mode monitor.
 
 Runs every Stage 1 promotion-gate check (§A.1–§A.6 + §6 future-date dry run)
-against production via the public Postgres proxy. Produces a one-page
-report — pass/fail per check, expected vs actual, and an exit code that
-reflects whether the day is clean.
+against production. Produces a one-page report — pass/fail per check, expected vs
+actual, and an exit code that reflects whether the day is clean.
 
-Usage (operator):
-    DATABASE_PUBLIC_URL=$(railway variables --json -e production \
-      -s Postgres-xMr6 | jq -r '.DATABASE_PUBLIC_URL') \
-    python3 scripts/stage1_daily_monitor.py
+Usage (operator). Production is Cloud Run (pivota-prod/us-west1); the Railway
+public Postgres proxy this used to reach is the ROLLBACK's database, so a day
+graded there is clean for traffic it never saw. Run it inside production, where
+the job's exit code carries the clean/dirty verdict out:
+    scripts/ops/run_oneoff_job.sh scripts/stage1_daily_monitor.py
 
 Or pipe to a daily log file:
     python3 scripts/stage1_daily_monitor.py >> /tmp/stage1-day-$(date -u +%Y%m%d).log
@@ -65,9 +65,10 @@ def _connect():
     url = os.environ.get("DATABASE_PUBLIC_URL") or os.environ.get("DATABASE_URL")
     if not url:
         sys.stderr.write(
-            "ERROR: DATABASE_PUBLIC_URL not set. Fetch with:\n"
-            "    railway variables --json -e production -s Postgres-xMr6 "
-            "| jq -r '.DATABASE_PUBLIC_URL'\n"
+            "ERROR: neither DATABASE_PUBLIC_URL nor DATABASE_URL is set.\n"
+            "    In production, run this inside Cloud Run - it mounts the secret:\n"
+            "      scripts/ops/run_oneoff_job.sh scripts/stage1_daily_monitor.py\n"
+            "    Locally, set DATABASE_URL to a database you already have a URL for.\n"
         )
         sys.exit(2)
     return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)

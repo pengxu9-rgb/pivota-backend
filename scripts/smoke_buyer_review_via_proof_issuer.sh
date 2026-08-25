@@ -4,8 +4,23 @@ set -euo pipefail
 # E2E smoke: proof-issuer -> exchange -> buyer create -> buyer media -> employee approve -> read path visible + media 200/304
 #
 # Required env:
-# - PROOF_ISSUER_BASE_URL (e.g. https://proof-issuer...railway.app)
-# - REVIEWS_BASE_URL      (e.g. https://pivota-backend...railway.app)
+# - PROOF_ISSUER_BASE_URL  NO REACHABLE PRODUCTION VALUE - see below.
+# - REVIEWS_BASE_URL      (prod: https://api.pivota.cc)
+#
+#   Production is Cloud Run in pivota-prod/us-west1. `api.pivota.cc` is public and
+#   is the right REVIEWS_BASE_URL. The proof-issuer is NOT: the `proof-issuer`
+#   service runs with `ingress: internal-and-cloud-load-balancing`, its bare
+#   *.run.app URL 404s from outside, and `pivota-urlmap` publishes no hostname for
+#   it (verified 2026-08-25). So there is deliberately no production value written
+#   here - naming the run.app URL would ship a command that always fails. Run the
+#   proof-issuer leg from inside the VPC, or point it at a local/staging issuer.
+#
+#   Do not fall back to a *.up.railway.app host. Railway is RETIRED (#1872), and its
+#   liveness is perishable in both directions: the production agent host answered
+#   200 on the morning of 2026-08-25 and by that afternoon returned 404 with
+#   `x-railway-fallback: true` (no service bound). A smoke that passes there
+#   passed against a platform nobody is served from; one that fails there tells
+#   you nothing about production.
 # - MERCHANT_ID
 # - PLATFORM_PRODUCT_ID
 #
@@ -185,7 +200,7 @@ EMPLOYEE_ID="emp_001"
 EMAIL="employee+smoke@pivota.invalid"
 JWT_SECRET_KEY="${EMPLOYEE_JWT_SECRET_KEY:-${JWT_SECRET_KEY:-}}"
 if [[ -z "$JWT_SECRET_KEY" ]]; then
-  read -r -s -p "JWT_SECRET_KEY (reviews backend Railway env): " JWT_SECRET_KEY
+  read -r -s -p "JWT_SECRET_KEY (gcloud secrets versions access latest --secret=env-JWT_SECRET_KEY --project pivota-prod): " JWT_SECRET_KEY
   echo
 fi
 [[ -n "$JWT_SECRET_KEY" ]] || { echo "ERROR: empty JWT_SECRET_KEY" >&2; exit 1; }
@@ -309,7 +324,17 @@ curl -sS -o /dev/null -w "tamper_exp_status=%{http_code}\n" "$TAMPER_URL"
 
 if [[ "$WAIT_FOR_REDEPLOY" == "true" ]]; then
   echo "== redeploy persistence check =="
-  echo "NOW redeploy reviews backend (Railway), then press Enter."
+  echo "NOW redeploy the reviews backend, then press Enter."
+  echo "  Production is Cloud Run (pivota-prod/us-west1). Do not deploy by hand -"
+  echo "  a hand 'gcloud run deploy' skips the candidate/health-gate/tag-sweep flow:"
+  echo "    CONFIG=preserve infra/gcp/deploy_backend.sh prod <sha>"
+  echo "  This check only needs new instances, so an env-var no-op also works:"
+  echo "    gcloud run services update web --project pivota-prod --region us-west1 \\"
+  echo "      --update-env-vars REDEPLOY_MARKER=\$(date +%s)"
+  echo "  Confirm by the SERVING REVISION NAME, not /version - an env-only update"
+  echo "  reuses the image, so the build SHA is identical either way:"
+  echo "    gcloud run services describe web --project pivota-prod --region us-west1 \\"
+  echo "      --format='value(status.latestReadyRevisionName)'"
   read -r _
 
   echo "== find NEW signed url for same public_id (after redeploy) =="

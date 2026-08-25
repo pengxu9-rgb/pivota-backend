@@ -66,7 +66,8 @@ def _ensure_obj(value: Any) -> Dict[str, Any]:
 def _dsn() -> str:
     # Ops script: connect directly with asyncpg (the `databases` pool wrapper
     # times out through the Railway public proxy; plain asyncpg does not).
-    # DATABASE_URL is the in-cluster host on Railway; DATABASE_PUBLIC_URL is
+    # DATABASE_URL is the in-cluster host (on Cloud Run it is a private Cloud SQL
+    # IP, reachable only from inside the VPC); DATABASE_PUBLIC_URL is
     # the laptop-reachable proxy (TLS must be disabled — proxy rejects it).
     import os
 
@@ -175,7 +176,7 @@ async def run(*, tool: str, epid_prefix: str, limit: int, apply: bool) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--tool", default=TOOL_DEFAULT)
     parser.add_argument("--epid-prefix", default="")
     parser.add_argument("--limit", type=int, default=5000)

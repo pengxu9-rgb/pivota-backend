@@ -68,7 +68,8 @@ _operating_mode_backstop_done = False
 async def ensure_operating_mode_column() -> None:
     """Backstop DDL for declared merchant mode (migration 164).
 
-    Prod skips the migration runner (applied via railway ssh / admin), so mirror
+    Prod skips the migration runner — a property of the app's boot path, not of
+    any one platform, and still true on Cloud Run — so mirror
     the repo's inline `ADD COLUMN IF NOT EXISTS` pattern (see
     update_platform_profile) to make signup self-heal: relax store_url NOT NULL
     and ensure the operating_mode discriminator exists. Idempotent + run-once
