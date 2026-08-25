@@ -75,29 +75,6 @@ Postgres was not reachable from this session). The upper bound is "all cold rows
 six hosts"; the card-rail audit's finding that a numeric Shopify variant id exists for only
 ~28% of rows suggests the cold share on Shopify brands is the majority, not the tail.
 
-## Constraint 4 — `execution_spec.rail` has the same defect, and is NOT fixed
-
-PR #1846 shipped a fuller `execution_spec` beside `cart_prefilled`, and one of its fields
-carries the identical exposure:
-
-```python
-"rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
-```
-
-`rail: "referral"` is emitted on exactly the cold population the warm lane targets, so an
-agent that hands the buyer off via `affiliate_url` can be told "referral" and have the buyer
-land in a Shopify cart — the same already-sent claim, contradicted the same way.
-
-It is deliberately left alone. `rail` is a two-value string vocabulary the gateway consumes;
-adding a third state (or a null) is a **contract change across two repos**, not a bug fix,
-and doing it silently inside a fix for a different field is how consumers break. Fixing it
-means agreeing the vocabulary with the gateway first.
-
-Narrower scope than `cart_prefilled`, worth knowing: `execution_spec.pdp_url` and `cart_url`
-are direct URLs that bypass `/r` entirely, so an agent that follows *those* never meets the
-warm lane. Only the `affiliate_url` path is exposed. `rail` is ambiguous about which it
-describes, which is part of why it needs a decision rather than a patch.
-
 ## Constraint 2 — a widening has a ~7-day tail of already-issued claims
 
 Redirect tokens are minted with a **7-day TTL** (`make_redirect_token`,
@@ -118,6 +95,39 @@ disappears from the API globally** — no code change, no deploy, no alarm. That
 behaviour (we genuinely could not promise a PDP landing any more), but it silently removes an
 execution-spec signal agents plan on. Widen the allowlist brand by brand rather than emptying
 it, or accept the loss deliberately.
+
+## Constraint 4 — `execution_spec.rail` had the same defect (FIXED)
+
+PR #1846 shipped a fuller `execution_spec` beside `cart_prefilled`, and one of its fields
+carried the identical exposure:
+
+```python
+"rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
+```
+
+`rail: "referral"` was emitted on exactly the cold population the warm lane targets, so an
+agent handing the buyer `affiliate_url` — the attributed link we want it to use — could be told
+"referral" and have the buyer land in a Shopify cart.
+
+**Fixed the same way, and from the same decision.** `_cart_prefilled_claim` is now computed
+once per offer as `prefilled_claim` and read by BOTH fields, so `rail` is `null` exactly when
+`cart_prefilled` is `null`. They cannot disagree about one link in one payload — a test asserts
+the agreement across every configuration that moves the verdict, because two separate
+expressions answering the same question is precisely how they would drift.
+
+Safe to send: the gateway passes `rail` through as an opaque label rather than checking it
+against a known set (`PIVOTA-Agent src/agentSignals/offerToSignal.js::toExecutionSpec`, whose
+own comment says an unknown rail "is information the agent can ignore"). The earlier concern
+here — that a third state was a breaking cross-repo contract change — was wrong; that mapper
+was built to tolerate new rails.
+
+### What is deliberately NOT changed: `execution_spec.tracking.param`
+
+It looks like the same defect and is not. `param` names where the click id sits in a URL **the
+agent is holding** — `pdp_url`, `cart_url`, `affiliate_url` — and every one of those does carry
+it as stated. The warm upgrade rewrites only the destination the buyer's browser is handed
+(`continue_url`, built by the gateway from a UCP `create_cart`), which the agent never inspects.
+`rail` differs because it claims where the BUYER ends up, and that is what the lane changes.
 
 ## Rollout checklist
 

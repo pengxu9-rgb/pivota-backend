@@ -4198,6 +4198,16 @@ async def _handle_offers_resolve(
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
                     click_id=stable_click_id,
                 )
+                # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
+                # same question — what does following our link land the buyer in — so computing
+                # them separately would let them disagree about a single offer in a single
+                # payload. Deriving both from this call makes that impossible by construction.
+                prefilled_claim = _cart_prefilled_claim(
+                    cart_url=composed_spec["cart_url"],
+                    destination_url=str(canonical_url or destination_url),
+                    redirect_url=redirect_url,
+                )
+
                 offer_spec = {
                     "merchant_domain": normalize_shop_host(
                         redirect_identity.get("shop_domain")
@@ -4228,7 +4238,28 @@ async def _handle_offers_resolve(
                     # this lane can produce today. UCP is NOT claimed here: this route does not
                     # call a merchant's UCP endpoint, and naming a rail we do not execute would
                     # be the fabrication the rest of this spec exists to avoid.
-                    "rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
+                    #
+                    # NULL is the third state, for the same reason `cart_prefilled` has one and
+                    # keyed off the SAME decision so the two can never disagree. `"referral"` is
+                    # a positive claim about where the buyer ends up, and it is emitted on
+                    # exactly the cold population the warm-handoff click lane targets: an agent
+                    # that hands the buyer `affiliate_url` — the attributed link we want them to
+                    # use — can be told "referral" and have the buyer land in a prefilled cart.
+                    # Same defect as a falsifiable `cart_prefilled: false`, same fix.
+                    #
+                    # NOT nulled merely because a cart exists: a `shopify_cart` cannot be
+                    # falsified (the lane only ever BUILDS carts, and since #1848 it refuses a
+                    # dest that is already one), so the `true` side needs no guard here either.
+                    #
+                    # Safe to send: the gateway passes `rail` through as an opaque label rather
+                    # than checking it against a known set (PIVOTA-Agent
+                    # `src/agentSignals/offerToSignal.js::toExecutionSpec`), so a null reads as
+                    # "no rail named" rather than breaking a consumer.
+                    "rail": (
+                        None
+                        if prefilled_claim is None
+                        else "shopify_cart" if composed_spec["cart_url"] else "referral"
+                    ),
                     "expires_at": _redirect_token_expiry(redirect_url),
                     # T2-12: attribution on the lane the agent actually uses. Until now the join
                     # key existed only inside the signed /r token, so an agent that used
@@ -4324,15 +4355,9 @@ async def _handle_offers_resolve(
                         # so the claim cannot drift from the `execution_spec.cart_url` printed
                         # beside it or from the link `affiliate_url` resolves to.
                         # See docs/runbooks/outbound_warm_handoff_rollout.md.
-                        "cart_prefilled": _cart_prefilled_claim(
-                            cart_url=composed_spec["cart_url"],
-                            # The SAME value compose_attributed_destinations was given
-                            # (`canonical_url or destination_url`), not the raw column.
-                            destination_url=str(canonical_url or destination_url),
-                            # The link we JUST minted, so the resolve-time rollout bucket is
-                            # computed from the very token the click will carry.
-                            redirect_url=redirect_url,
-                        ),
+                        # Computed above as `prefilled_claim`, and shared with
+                        # `execution_spec.rail` so the two cannot contradict each other.
+                        "cart_prefilled": prefilled_claim,
                         "execution_spec": offer_spec,
                         "internal_checkout_items": None,
                         "confidence": confidence,
