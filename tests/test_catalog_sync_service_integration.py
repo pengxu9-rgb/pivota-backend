@@ -261,6 +261,205 @@ async def test_upsert_field_fact_uses_logical_key_and_prunes_run_duplicates(
 
 
 @pytest.mark.asyncio
+async def test_emit_product_projection_facts_covers_content_taxonomy_and_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+
+    async def fake_upsert_field_fact(**kwargs):
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    product = module.StandardProduct(
+        id="product_1",
+        product_id="product_1",
+        platform="shopify",
+        merchant_id="merchant_1",
+        title="Barrier Cream",
+        description="A rich daily moisturizer.",
+        product_type="Moisturizer",
+        tags=["barrier", "barrier", "dry skin"],
+        price=24.0,
+        image_url="https://cdn.example/primary.jpg",
+        images=["https://cdn.example/primary.jpg", "https://cdn.example/detail.jpg"],
+    )
+
+    await module._emit_product_projection_facts(
+        product=product,
+        product_key="prod::merchant_1::shopify::product_1",
+        description="A rich daily moisturizer.",
+        category_path="beauty.skincare.moisturizer",
+        category_label_source="merchant_payload",
+        category_confidence=1.0,
+        normalized_category="moisturizer",
+        source_system="shopify_products_sync",
+        source_ref="sync_1",
+        merchant_id="merchant_1",
+        commerce_index_source={
+            "source_id": "ci_source_merchant_1_shopify",
+            "field_source_kind": "merchant_api",
+        },
+    )
+
+    assert [(row["field_family"], row["field_key"]) for row in emitted] == [
+        ("content", "description"),
+        ("taxonomy", "classification"),
+        ("media", "images"),
+    ]
+    assert emitted[1]["value"]["tags"] == ["barrier", "dry skin"]
+    assert emitted[2]["value"] == {
+        "primary": "https://cdn.example/primary.jpg",
+        "items": ["https://cdn.example/primary.jpg", "https://cdn.example/detail.jpg"],
+    }
+    assert all(row["commerce_index_source_id"] == "ci_source_merchant_1_shopify" for row in emitted)
+
+
+@pytest.mark.asyncio
+async def test_emit_product_projection_facts_emits_tombstones_when_fields_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+
+    async def fake_upsert_field_fact(**kwargs):
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(module, "_upsert_field_fact", fake_upsert_field_fact)
+    product = module.StandardProduct(
+        id="product_1",
+        product_id="product_1",
+        platform="shopify",
+        merchant_id="merchant_1",
+        title="Barrier Cream",
+        description=None,
+        product_type=None,
+        tags=[],
+        price=24.0,
+        image_url=None,
+        images=[],
+    )
+
+    await module._emit_product_projection_facts(
+        product=product,
+        product_key="prod::merchant_1::shopify::product_1",
+        description=None,
+        category_path=None,
+        category_label_source=None,
+        category_confidence=None,
+        normalized_category=None,
+        source_system="shopify_products_sync",
+        source_ref="sync_2",
+        merchant_id="merchant_1",
+        commerce_index_source={
+            "source_id": "ci_source_merchant_1_shopify",
+            "field_source_kind": "merchant_api",
+        },
+    )
+
+    assert [(row["field_family"], row["field_key"], row["value"]) for row in emitted] == [
+        ("content", "description", None),
+        ("taxonomy", "classification", None),
+        ("media", "images", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_field_fact_emits_v2_delta_only_when_feature_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+
+    async def fake_fetch_one(_query):
+        return None
+
+    async def fake_execute(_query, _values=None):
+        return None
+
+    async def fake_upsert_by_pk(*_args, **_kwargs):
+        return None
+
+    async def fake_delta(**kwargs):
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "record_field_change_and_publications", fake_delta)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_1")
+
+    await module._upsert_field_fact(
+        entity_type="offer",
+        entity_id="offer_1",
+        field_family="pricing",
+        field_key="merchant_effective_price",
+        source_system="shopify_products_sync",
+        source_ref="sync_1",
+        value={"amount": "12.00", "currency": "USD"},
+        merchant_id="merchant_1",
+        commerce_index_source_id="ci_source_merchant_1_shopify",
+        commerce_index_source_kind="merchant_api",
+    )
+
+    assert len(emitted) == 1
+    assert emitted[0]["merchant_id"] == "merchant_1"
+    assert emitted[0]["observation"].source_kind == "merchant_api"
+    assert emitted[0]["source_id"] == "ci_source_merchant_1_shopify"
+
+
+@pytest.mark.asyncio
+async def test_upsert_field_fact_withholds_v2_delta_without_active_source_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def should_not_emit(**_kwargs):
+        raise AssertionError("v2 publication requires an active source contract")
+
+    async def fake_upsert_by_pk(*_args, **_kwargs):
+        return None
+
+    async def fake_execute(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(module, "record_field_change_and_publications", should_not_emit)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_1")
+
+    await module._upsert_field_fact(
+        entity_type="offer",
+        entity_id="offer_1",
+        field_family="pricing",
+        field_key="merchant_effective_price",
+        source_system="universal_product_sync",
+        source_ref="sync_1",
+        value={"amount": "12.00", "currency": "USD"},
+        merchant_id="merchant_1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_v2_ingest_does_not_mutate_catalog_without_active_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_source(**_kwargs):
+        return None
+
+    monkeypatch.setattr(module, "resolve_active_catalog_source", no_source)
+    monkeypatch.setenv("COMMERCE_INDEX_V2_ENABLED", "true")
+    monkeypatch.setenv("COMMERCE_INDEX_V2_MERCHANT_ALLOWLIST", "merchant_1")
+
+    result = await module.ingest_standard_products(
+        merchant_id="merchant_1",
+        platform="shopify",
+        product_payloads=[{"id": "p_1", "title": "Blocked product"}],
+        source_system="universal_product_sync",
+    )
+
+    assert result["commerce_index_v2_withheld"] is True
+    assert result["products_ingested"] == 0
+
+
+@pytest.mark.asyncio
 async def test_append_snapshot_keeps_latest_offer_source_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

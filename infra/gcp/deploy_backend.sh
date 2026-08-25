@@ -24,7 +24,13 @@ esac
 # a deliberate step, AFTER Railway's workers are stopped.
 #   pre-cutover:  WORKERS=false infra/gcp/deploy_backend.sh prod <tag>   (default below)
 #   at cutover:   WORKERS=true  infra/gcp/deploy_backend.sh prod <tag>
+# Captured before the default below, because after `: "${WORKERS:=false}"` there is no way left to
+# tell "caller asked for false" from "caller said nothing". The CONFIG=preserve check needs that.
+_WORKERS_EXPLICIT="${WORKERS+1}"
+_MOUNT_DB_EXPLICIT="${MOUNT_DB+1}"
 : "${WORKERS:=false}"
+: "${STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED:=false}"
+: "${STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED:=false}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # CONFIG=apply    rewrite the service's env + secrets from env.<env>.yaml / secrets.<env>.list.
 # CONFIG=preserve leave every env var and secret exactly as the running service has them, and
@@ -41,11 +47,40 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # reviewed, human operation.
 : "${CONFIG:=apply}"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
+# WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
+# vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
+# constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
+# --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live prod today so
+# nothing drifts - but an operator who widened --max-instances by hand during an incident will
+# have it pulled back silently by the next CI deploy.
+#
+# WORKERS and MOUNT_DB only take effect through the env/secret files, so under `preserve` they are
+# read and then ignored. Refuse rather than ignore: the cutover runbook's headline command is
+# `WORKERS=true infra/gcp/deploy_backend.sh prod <tag>`, and running that with CONFIG=preserve
+# would report a clean, promoted, health-checked deploy while leaving the drainers exactly as they
+# were - a successful-looking deploy that did not do the one thing it was run for.
+if [ "$CONFIG" = preserve ]; then
+  [ -z "$_WORKERS_EXPLICIT" ] || { echo "WORKERS has no effect under CONFIG=preserve (it is applied via the env file). Use CONFIG=apply." >&2; exit 2; }
+  [ -z "$_MOUNT_DB_EXPLICIT" ] || { echo "MOUNT_DB has no effect under CONFIG=preserve (it is applied via --set-secrets). Use CONFIG=apply." >&2; exit 2; }
+fi
+if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ]; then
+  [ "$CONFIG" = apply ] || { echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED requires CONFIG=apply so the dedicated secret is mounted." >&2; exit 2; }
+fi
 # PROMOTE=0 stops after the candidate revision passes its health check, leaving it at 0% traffic.
 # The previous revision keeps serving. This is how the deploy path itself can be exercised - build,
 # auth, revision, in-VPC probe - without putting anything in front of users.
 : "${PROMOTE:=1}"
 case "$PROMOTE" in 0|1) ;; *) echo "PROMOTE must be exactly 0 or 1 (got '$PROMOTE')" >&2; exit 2 ;; esac
+# The GCP cutover deliberately leaves env.prod.yaml and secrets.prod.list out
+# of source control.  A receipt-contract candidate can therefore preserve the
+# running configuration and make only the two reviewed, incremental changes
+# below.  Never use this escape hatch to promote traffic: a promotion still
+# requires a reviewed CONFIG=apply deployment or an explicit traffic action.
+if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && [ "$CONFIG" = preserve ]; then
+  [ "$PROMOTE" = 0 ] || { echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED with CONFIG=preserve is candidate-only; set PROMOTE=0." >&2; exit 2; }
+fi
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
 # all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
@@ -64,6 +99,14 @@ case "$PROMOTE" in 0|1) ;; *) echo "PROMOTE must be exactly 0 or 1 (got '$PROMOT
 GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
 SERVICE="${SERVICE:-web}"
+if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
+  echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
+  exit 2
+fi
+if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
+  echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
+  exit 2
+fi
 # Reusable for the other Python services that ship from this repo or their own image:
 #   IMAGE_NAME  which Artifact Registry image to run (backend | acp | ...)
 #   ENV_PREFIX  which ported env/secrets files to use (empty = the backend's)
@@ -108,7 +151,11 @@ case "$MOUNT_DB" in 0|1) ;; *) echo "MOUNT_DB must be exactly 0 or 1 (got '$MOUN
 DB_SECRETS=""
 if [ "$CONFIG" = apply ]; then
   [ "$MOUNT_DB" = 1 ] && DB_SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,"
-  SECRETS="${DB_SECRETS}$(paste -sd, "$SECRETS_FILE")"
+  UCP_RECEIPT_SECRET=""
+  [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && UCP_RECEIPT_SECRET="STORE_AUDIT_UCP_PROBE_INTERNAL_KEY=STORE_AUDIT_UCP_PROBE_INTERNAL_KEY:latest,"
+  COMMERCE_RECEIPT_SECRET=""
+  [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && COMMERCE_RECEIPT_SECRET="STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest,"
+  SECRETS="${DB_SECRETS}${UCP_RECEIPT_SECRET}${COMMERCE_RECEIPT_SECRET}$(paste -sd, "$SECRETS_FILE")"
 fi
 
 # gcloud allows only ONE env-vars flag: merge the ported file with the platform vars into a temp file
@@ -143,7 +190,16 @@ if [ "$CONFIG" = preserve ]; then
   #
   # --update-env-vars MERGES one key. --set-env-vars / --env-vars-file REPLACE the whole set, and
   # would wipe the other 187.
-  CONFIG_ARGS=(--update-env-vars "PIVOTA_COMMIT_SHA=$TAG")
+  PRESERVE_ENV_UPDATES="PIVOTA_COMMIT_SHA=$TAG"
+  if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
+    # --update-* merges only these two keys.  It must not replace the active
+    # service's configuration, which is now the production source of truth.
+    PRESERVE_ENV_UPDATES="$PRESERVE_ENV_UPDATES,STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true"
+    CONFIG_ARGS=(--update-env-vars "$PRESERVE_ENV_UPDATES" \
+                 --update-secrets "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest")
+  else
+    CONFIG_ARGS=(--update-env-vars "$PRESERVE_ENV_UPDATES")
+  fi
 else
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # NOTE: port_railway_env.py drops RAILWAY_*, but several gates in this codebase still read those
@@ -155,12 +211,14 @@ MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
 # against the SDK's own loader). Appending an override after the ported file therefore does NOTHING
 # whenever the ported file already defines that key - which silently made WORKERS, DB_POOL_* and even
 # PIVOTA_ENV inert. Strip the keys we are about to set before appending them.
-grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
+grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED|STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
 { :
   printf 'PIVOTA_ENV: "%s"\nPIVOTA_SERVICE_NAME: "%s"\nPIVOTA_COMMIT_SHA: "%s"\nPIVOTA_PLATFORM: "cloud_run"\n' "$PIVOTA_ENV" "$SERVICE" "$TAG"
   printf 'SKIP_HEAVY_STARTUP_INIT: "true"\n'
   printf 'AUDIT_WORKER_ENABLED: "%s"\n' "$WORKERS"
   printf 'REVIEWS_INVITATION_WORKER_ENABLED: "%s"\n' "$WORKERS"
+  printf 'STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED: "%s"\n' "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED"
+  printf 'STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED: "%s"\n' "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED"
   # Cloud SQL max_connections=300 (bootstrap_env.sh). db/database.py defaults to a 5..20 pool PER
   # PROCESS, so MAX instances x 20 would be 400 on prod and exhaust the server. Size the pool from
   # the instance ceiling, leaving headroom for the other services and for ops sessions.
@@ -179,7 +237,13 @@ fi
 # INSIDE the VPC with a one-shot Cloud Run job. Only a real 200 from the application passes.
 probe_health(){ # url -> echoes the status code
   local url="$1" code
-  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null || echo 000)
+  # curl emits the -w template even when the transfer FAILS - "000", no trailing newline - and
+  # only then exits non-zero. The old `|| echo 000` therefore appended a second one and produced
+  # "000000", which matches no arm of the case below except the catch-all, so the function returned
+  # early and the in-VPC re-probe underneath - the entire reason this function exists - was dead
+  # code for every timeout and connection reset. Only a real HTTP status ever reached it.
+  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null) || true
+  code="${code:-000}"
   case "$code" in
     200) rm -f /tmp/pivota-health.$$; echo 200; return 0 ;;
     403|404|000) : ;;                     # possibly ingress/IAM, not the app - fall through
@@ -233,7 +297,11 @@ probe_health(){ # url -> echoes the status code
 # reports success as soon as the container passes its startup probe, which a revision that boots
 # but cannot serve still does.
 CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
-  --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1)
+  --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1 || true)
+# ^ `|| true` is load-bearing. Under `set -o pipefail` a grep that matches nothing makes the whole
+# pipeline exit 1, `VAR=$(...)` adopts that status, and `set -e` kills the script - silently, right
+# after a successful `run deploy`. That is exactly the FIRST_DEPLOY case the next two lines were
+# written to handle, so they could never run.
 [ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
 CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
 # macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under

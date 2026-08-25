@@ -28,6 +28,7 @@ from services.merchant_psp_config_service import (
     SUPPORTED_CANONICAL_PSPS,
     persist_canonical_merchant_psp,
 )
+from services.commerce_index_source_service import register_commerce_index_source
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from routes.after_sales_cases import _ensure_after_sales_cases_table, _serialize_case
@@ -2037,6 +2038,33 @@ async def get_merchant_mcp_summary(current_user: dict = Depends(get_current_user
         print(f"❌ Failed to load MCP summary for merchant {merchant_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to load MCP summary: {str(e)}")
 
+@router.post("/merchant/integrations/commerce-index/sources")
+async def register_merchant_commerce_index_source(
+    source_data: Dict[str, Any] = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Register a merchant-authorized source without accepting connector secrets.
+
+    Credentials continue to use each connector's existing secure onboarding
+    path.  This endpoint stores only the audit contract that governs catalogue
+    facts and downstream Commerce Index publication.
+    """
+    if current_user["role"] != "merchant":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    merchant_id = await get_merchant_id_from_user(current_user)
+    try:
+        source = await register_commerce_index_source(
+            merchant_id=merchant_id,
+            provider=str(source_data.get("provider") or ""),
+            status=str(source_data.get("status") or "pending"),
+            consent_ref=source_data.get("consent_ref"),
+            source_metadata=source_data.get("source_metadata") or {},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "success", "data": source}
+
+
 @router.post("/merchant/integrations/psp/connect")
 async def connect_psp(
     psp_data: Dict[str, Any] = Body(...),
@@ -2102,7 +2130,23 @@ async def connect_psp(
             "processing_channel_id": processing_channel_id,
             "public_key": public_key,
         }
-    capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen", "checkout"] else ["card"]
+    elif provider == "antom":
+        merchant_account = str(psp_data.get("merchant_id") or account_id or "").strip()
+        client_id = str(psp_data.get("client_id") or "").strip()
+        if not merchant_account:
+            raise HTTPException(status_code=400, detail="Antom requires merchant_id")
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Antom requires client_id")
+        account_id = merchant_account
+        provider_config = {
+            "merchant_id": merchant_account,
+            "client_id": client_id,
+        }
+    capabilities = ["card", "bank_transfer"] if provider in ["stripe", "adyen", "checkout", "antom"] else ["card"]
+    # Antom credentials are stored for onboarding and signed-contract setup, but
+    # must not enter generic payment routing before its dedicated adapter and
+    # verified webhook flow are enabled.
+    connection_status = "inactive" if provider == "antom" else "active"
     
     try:
         # Use transaction to ensure data is committed
@@ -2117,7 +2161,7 @@ async def connect_psp(
                 provider_config=provider_config,
                 name=f"{provider.capitalize()} Account",
                 capabilities=capabilities,
-                status="active",
+                status=connection_status,
                 stripe_mode="payment_intent",
             )
             print(f"✅ PSP saved to DB: {persisted['psp_id']} for merchant {merchant_id}")
@@ -2171,6 +2215,9 @@ async def connect_psp(
     return {
         "status": "success",
         "message": (
+            "Antom settings saved; payment execution is pending signed-contract enablement"
+            if provider == "antom"
+            else
             f"{provider.capitalize()} settings updated successfully"
             if persisted["reused_existing"]
             else f"{provider.capitalize()} connected successfully"

@@ -36,9 +36,12 @@ CONTRACT
   than serving half-guarded traffic.  Local dev and tests (no ``K_SERVICE``, no
   ``RAILWAY_*``) resolve to ``"development"`` and never raise.
 
-Cloud Run does NOT inject a git commit sha.  It must be supplied at deploy time
-as ``PIVOTA_COMMIT_SHA`` (``COMMIT_SHA`` / ``SOURCE_VERSION`` are also honoured
-because Cloud Build and buildpacks set those).
+Cloud Run does NOT inject a git commit sha.  The image stamps it at BUILD time
+into ``/app/.image_commit_sha`` (see ``infra/gcp/Dockerfile``) and that wins,
+because it is a property of the code rather than a claim made about it at deploy
+time.  ``PIVOTA_COMMIT_SHA`` (and ``COMMIT_SHA`` / ``SOURCE_VERSION``, which
+Cloud Build and buildpacks set) remain the fallback for images built without the
+build arg, and for local runs.
 """
 
 from __future__ import annotations
@@ -166,6 +169,31 @@ def _mapping(env: Optional[Mapping[str, str]]) -> Mapping[str, str]:
 def _get(env: Optional[Mapping[str, str]], key: str) -> str:
     """Read one variable, stripped.  Absent and empty are the same thing."""
     return (_mapping(env).get(key) or "").strip()
+
+
+#: Written by ``infra/gcp/Dockerfile`` at build time.  Module-level so tests can point it
+#: somewhere writable.
+_IMAGE_COMMIT_SHA_FILE = "/app/.image_commit_sha"
+_UNREAD = object()
+_image_commit_sha_cache: Any = _UNREAD
+
+
+def _baked_commit_sha() -> Optional[str]:
+    """The commit stamped into the image, or ``None`` outside a stamped image.
+
+    Cached: this is read on every ``/health``, and the file cannot change without the
+    process being replaced along with it.  Tests reset ``_image_commit_sha_cache``.
+    """
+    global _image_commit_sha_cache
+    if _image_commit_sha_cache is _UNREAD:
+        try:
+            with open(_IMAGE_COMMIT_SHA_FILE, "r", encoding="utf-8") as handle:
+                _image_commit_sha_cache = handle.read().strip() or None
+        except OSError:
+            # Not running from a stamped image - local dev, tests, or an image built
+            # without the build arg. The env-var fallback covers those.
+            _image_commit_sha_cache = None
+    return _image_commit_sha_cache
 
 
 def _first(env: Optional[Mapping[str, str]], *keys: str) -> Optional[str]:
@@ -337,12 +365,22 @@ def project_id(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
 def commit_sha(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     """Build commit.
 
-    Cloud Run injects nothing here — ``PIVOTA_COMMIT_SHA`` must be baked in at
-    deploy time.  ``COMMIT_SHA`` (Cloud Build substitution) and
+    Prefers the sha stamped into the image at build time.  It outranks every env
+    var deliberately: the env var is set by whoever deploys, so a deploy that
+    forgets it reports the PREVIOUS commit while running the new code — which is
+    exactly what happened on 2026-08-23, and it fed the prod-drift alarm a commit
+    that was not the one serving traffic.  The stamped file cannot disagree with
+    the code it ships beside.
+
+    Cloud Run injects nothing here, so images built without the build arg fall
+    back to ``PIVOTA_COMMIT_SHA``.  ``COMMIT_SHA`` (Cloud Build substitution) and
     ``SOURCE_VERSION`` (buildpacks) are accepted as conventional aliases.
     ``GIT_COMMIT_SHA`` / ``VERCEL_GIT_COMMIT_SHA`` are pre-existing fallbacks
     kept so ``/version`` behaves exactly as before.
     """
+    baked = _baked_commit_sha()
+    if baked:
+        return baked
     return _first(
         env,
         "PIVOTA_COMMIT_SHA",

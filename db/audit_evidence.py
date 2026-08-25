@@ -31,6 +31,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import (
     ARRAY,
@@ -46,9 +47,10 @@ logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Evidence type taxonomy. Validated at insert time; rows with an
-# unknown evidence_type are coerced to 'custom' + the original
-# value preserved in payload_jsonb._raw_type so we don't lose data.
+# Evidence type taxonomy. Validated at insert time. `custom` remains
+# available for intentionally free-form evidence, but unknown values are
+# rejected: silently coercing a newly introduced type makes it impossible to
+# query or render correctly.
 # =====================================================================
 
 EVIDENCE_TYPE_GROUNDING_CHUNK = "grounding_chunk"
@@ -56,6 +58,15 @@ EVIDENCE_TYPE_COMPETITOR_MENTION = "competitor_mention"
 EVIDENCE_TYPE_URL_MATCH = "url_match"
 EVIDENCE_TYPE_MISSING_SIGNAL = "missing_signal"
 EVIDENCE_TYPE_INDUSTRY_STAT = "industry_stat"
+EVIDENCE_TYPE_ACCEPTANCE_SIGNAL = "acceptance_signal"
+EVIDENCE_TYPE_COMMERCE_PLATFORM = "commerce_platform"
+EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE = "commerce_checkout_route"
+EVIDENCE_TYPE_COMMERCE_CARTABILITY = "commerce_cartability"
+EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION = (
+    "commerce_integration_authorization"
+)
+EVIDENCE_TYPE_COMMERCE_RETURN_POLICY = "commerce_return_policy"
+EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW = "commerce_after_sales_review"
 EVIDENCE_TYPE_CUSTOM = "custom"
 
 VALID_EVIDENCE_TYPES = frozenset({
@@ -64,6 +75,13 @@ VALID_EVIDENCE_TYPES = frozenset({
     EVIDENCE_TYPE_URL_MATCH,
     EVIDENCE_TYPE_MISSING_SIGNAL,
     EVIDENCE_TYPE_INDUSTRY_STAT,
+    EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+    EVIDENCE_TYPE_COMMERCE_PLATFORM,
+    EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+    EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+    EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
+    EVIDENCE_TYPE_COMMERCE_RETURN_POLICY,
+    EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW,
     EVIDENCE_TYPE_CUSTOM,
 })
 
@@ -136,6 +154,8 @@ VERIFIER_GSC_INDEXING_STATUS = "gsc_indexing_status"
 VERIFIER_PIVOTA_INTERNAL_RETRIEVAL = "pivota_internal_retrieval"
 VERIFIER_FRONTEND_AGENT_CITE = "frontend_agent_cite"
 VERIFIER_PUBLIC_LLM_CITATION = "public_llm_citation_movement"
+VERIFIER_UCP_PROBE = "ucp_probe"
+VERIFIER_COMMERCE_CHECKOUT_PROBE = "commerce_checkout_probe"
 
 VALID_VERIFIERS = frozenset({
     VERIFIER_PDP_RENDERS, VERIFIER_PDP_IN_SITEMAP,
@@ -143,6 +163,19 @@ VALID_VERIFIERS = frozenset({
     VERIFIER_PIVOTA_INTERNAL_RETRIEVAL,
     VERIFIER_FRONTEND_AGENT_CITE,
     VERIFIER_PUBLIC_LLM_CITATION,
+    VERIFIER_UCP_PROBE,
+    VERIFIER_COMMERCE_CHECKOUT_PROBE,
+})
+
+
+# Store Audit route evidence is intentionally a narrow vocabulary. Evidence
+# level describes the fact captured in evidence_items; verification status is
+# the existing verification_runs work-queue state machine below.
+EVIDENCE_LEVEL_DETECTED = "detected"
+EVIDENCE_LEVEL_TESTED = "tested"
+VALID_EVIDENCE_LEVELS = frozenset({
+    EVIDENCE_LEVEL_DETECTED,
+    EVIDENCE_LEVEL_TESTED,
 })
 
 
@@ -253,15 +286,45 @@ evidence_items = Table(
     # accretes on the cross-merchant product entity, not just the listing.
     Column("content_key", Text, nullable=True),
     Column("probe_run_id", UUID(as_uuid=False), nullable=True),
+    Column("execution_route_id", UUID(as_uuid=False), nullable=True),
     Column("evidence_type", Text, nullable=False),
+    Column("evidence_level", Text, nullable=True),
     Column("payload_jsonb", JSONB, nullable=False),
     Column("confidence", Integer, nullable=True),
     # P5.8.1: idempotency key — deterministic per (audit, item-sig);
     # paired with partial unique index for ON CONFLICT DO NOTHING.
     Column("idempotency_key", Text, nullable=True),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Index("idx_evidence_items_audit_run", "audit_run_id", "created_at"),
     Index("idx_evidence_items_type", "evidence_type", "audit_run_id"),
+    extend_existing=True,
+)
+
+
+execution_routes = Table(
+    "execution_routes",
+    metadata,
+    Column("execution_route_id", UUID(as_uuid=False), primary_key=True),
+    Column("normalized_domain", Text, nullable=False),
+    Column("route_kind", Text, nullable=False),
+    Column("endpoint_normalized", Text, nullable=False),
+    # Nullable until a prospect converts; route identity is domain-based.
+    Column("merchant_id", Text, nullable=True),
+    Column("claimed_at", DateTime(timezone=True), nullable=True),
+    Column("profile_fingerprint", Text, nullable=True),
+    Column("last_audit_run_id", UUID(as_uuid=False), nullable=True),
+    Column("first_detected_at", DateTime(timezone=True), nullable=False),
+    Column("last_verified_at", DateTime(timezone=True), nullable=True),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
+    Column("is_active", Boolean, nullable=False, server_default="true"),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "normalized_domain", "route_kind", "endpoint_normalized",
+        name="uq_execution_routes_domain_kind_endpoint",
+    ),
+    Index("idx_execution_routes_merchant", "merchant_id", "is_active"),
     extend_existing=True,
 )
 
@@ -321,6 +384,7 @@ verification_runs = Table(
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
     Column("merchant_id", Text, nullable=True),  # P5.8.7
     Column("product_key", Text, nullable=True),
+    Column("execution_route_id", UUID(as_uuid=False), nullable=True),
     Column("verifier_id", Text, nullable=False),
     Column("status", Text, nullable=False, server_default="pending"),
     Column("evidence_jsonb", JSONB, nullable=True),
@@ -396,6 +460,30 @@ _DDL_LOCK = asyncio.Lock()
 
 
 _DDL_STATEMENTS = [
+    # Store Audit Phase 1: domain-keyed routes. merchant_id is deliberately
+    # nullable because cold-start prospects are not merchants yet.
+    """
+    CREATE TABLE IF NOT EXISTS execution_routes (
+        execution_route_id UUID PRIMARY KEY,
+        normalized_domain TEXT NOT NULL,
+        route_kind TEXT NOT NULL,
+        endpoint_normalized TEXT NOT NULL,
+        merchant_id TEXT NULL,
+        claimed_at TIMESTAMPTZ NULL,
+        profile_fingerprint TEXT NULL,
+        last_audit_run_id UUID NULL,
+        first_detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_verified_at TIMESTAMPTZ NULL,
+        expires_at TIMESTAMPTZ NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (normalized_domain, route_kind, endpoint_normalized)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_execution_routes_merchant "
+    "ON execution_routes (merchant_id, is_active) "
+    "WHERE merchant_id IS NOT NULL;",
     # evidence_items
     """
     CREATE TABLE IF NOT EXISTS evidence_items (
@@ -547,6 +635,17 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
     "ALTER TABLE evidence_items "
     "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS execution_route_id UUID;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS evidence_level TEXT;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+    "ALTER TABLE execution_routes "
+    "ADD COLUMN IF NOT EXISTS last_audit_run_id UUID;",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_execution_route "
+    "ON evidence_items (execution_route_id, created_at) "
+    "WHERE execution_route_id IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS idx_evidence_items_merchant "
     "ON evidence_items (merchant_id, audit_run_id) "
     "WHERE merchant_id IS NOT NULL;",
@@ -583,6 +682,20 @@ _DDL_STATEMENTS = [
 
     "ALTER TABLE verification_runs "
     "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS execution_route_id UUID;",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_execution_route "
+    "ON verification_runs (execution_route_id, status, created_at) "
+    "WHERE execution_route_id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_verification_runs_active_route_verifier "
+    "ON verification_runs (execution_route_id, verifier_id) "
+    "WHERE execution_route_id IS NOT NULL "
+    "AND status IN ('pending', 'claimed');",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_verification_runs_active_merchant_commerce_checkout "
+    "ON verification_runs (merchant_id, verifier_id) "
+    "WHERE merchant_id IS NOT NULL "
+    "AND verifier_id = 'commerce_checkout_probe' "
+    "AND status IN ('pending', 'claimed');",
     "CREATE INDEX IF NOT EXISTS idx_verification_runs_merchant "
     "ON verification_runs (merchant_id, audit_run_id) "
     "WHERE merchant_id IS NOT NULL;",
@@ -619,13 +732,305 @@ def _now_utc() -> datetime:
 
 
 # =====================================================================
-# Validation helpers — coerce unknown values rather than reject
+# Validation helpers — reject unknown taxonomy values
 # =====================================================================
 
+class UnknownAuditTaxonomyValue(ValueError):
+    """Raised before persistence for an unregistered evidence/verifier type."""
+
+
 def _coerce_evidence_type(t: str) -> str:
+    """Return a registered evidence type or reject an accidental new one.
+
+    `custom` remains an explicit, registered escape hatch. It is never the
+    fallback for a misspelled or unregistered type because that silently loses
+    the querying/rendering contract for that type.
+    """
     if t in VALID_EVIDENCE_TYPES:
         return t
-    return EVIDENCE_TYPE_CUSTOM
+    raise UnknownAuditTaxonomyValue(
+        "unregistered evidence_type: %r; add it to VALID_EVIDENCE_TYPES "
+        "before writing evidence" % (t,)
+    )
+
+
+def _require_known_verifier(verifier_id: str) -> str:
+    """Return a registered verifier id or reject it before queue insertion."""
+    if verifier_id in VALID_VERIFIERS:
+        return verifier_id
+    raise UnknownAuditTaxonomyValue(
+        "unregistered verifier_id: %r; add it to VALID_VERIFIERS "
+        "before enqueueing verification work" % (verifier_id,)
+    )
+
+
+def _validate_route_evidence(
+    *,
+    evidence_type: str,
+    execution_route_id: Optional[str],
+    evidence_level: Optional[str],
+    merchant_id: Optional[str],
+) -> None:
+    """Keep acceptance-signal rows queryable and semantically complete."""
+    if evidence_level is not None and evidence_level not in VALID_EVIDENCE_LEVELS:
+        raise UnknownAuditTaxonomyValue(
+            "unregistered evidence_level: %r; expected one of %s" % (
+                evidence_level, sorted(VALID_EVIDENCE_LEVELS),
+            )
+        )
+    if evidence_type == EVIDENCE_TYPE_ACCEPTANCE_SIGNAL:
+        if not execution_route_id:
+            raise ValueError(
+                "acceptance_signal evidence requires execution_route_id"
+            )
+        if evidence_level is None:
+            raise ValueError(
+                "acceptance_signal evidence requires evidence_level"
+            )
+        if merchant_id and merchant_id.startswith("prospect_"):
+            raise ValueError(
+                "acceptance_signal evidence must not use a synthetic "
+                "prospect merchant_id; link it through execution_route_id"
+            )
+
+
+def normalize_execution_route_identity(
+    *,
+    normalized_domain: str,
+    route_kind: str,
+    endpoint: str,
+) -> tuple[str, str, str]:
+    """Canonicalize the domain + kind + endpoint route identity.
+
+    The caller supplies the commerce domain deliberately: an endpoint may live
+    on a provider host (for example, a Shopify host) rather than the merchant
+    vanity domain. We therefore normalize both values but do not require their
+    hosts to match.
+    """
+    domain = (normalized_domain or "").strip().lower().rstrip(".")
+    if (
+        not domain
+        or "/" in domain
+        or ":" in domain
+        or any(char.isspace() for char in domain)
+    ):
+        raise ValueError("normalized_domain must be a lower-case host only")
+
+    kind = (route_kind or "").strip().lower()
+    if not kind or not all(char.isalnum() or char == "_" for char in kind):
+        raise ValueError("route_kind must use lower-case letters, digits, or _")
+
+    parsed = urlsplit((endpoint or "").strip())
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "endpoint must be an absolute HTTPS URL without credentials, "
+            "query, or fragment"
+        )
+    host = parsed.hostname.lower().rstrip(".")
+    if not host:
+        raise ValueError("endpoint must contain a host")
+    # Port 443 is semantically identical to no explicit port. Other ports are
+    # kept because they are part of the reachable endpoint identity.
+    netloc = host if parsed.port in (None, 443) else f"{host}:{parsed.port}"
+    path = parsed.path.rstrip("/") or "/"
+    endpoint_normalized = urlunsplit(("https", netloc, path, "", ""))
+    return domain, kind, endpoint_normalized
+
+
+def _validate_route_association_merchant_id(merchant_id: Optional[str]) -> None:
+    if merchant_id and merchant_id.startswith("prospect_"):
+        raise ValueError(
+            "execution routes must not be associated with a synthetic "
+            "prospect merchant_id; leave merchant_id NULL until conversion"
+        )
+
+
+async def upsert_execution_route(
+    *,
+    normalized_domain: str,
+    route_kind: str,
+    endpoint: str,
+    merchant_id: Optional[str] = None,
+    profile_fingerprint: Optional[str] = None,
+    audit_run_id: Optional[str] = None,
+    last_verified_at: Optional[datetime] = None,
+    expires_at: Optional[datetime] = None,
+    is_active: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Create or refresh one domain-keyed route without changing ownership.
+
+    The conflict target deliberately excludes merchant_id. If an existing route
+    is unclaimed, a caller must use claim_execution_route after completing its
+    ownership check; discovery must never opportunistically attach or reassign
+    it.
+    """
+    domain, kind, endpoint_normalized = normalize_execution_route_identity(
+        normalized_domain=normalized_domain,
+        route_kind=route_kind,
+        endpoint=endpoint,
+    )
+    _validate_route_association_merchant_id(merchant_id)
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    route_id = str(uuid.uuid4())
+    try:
+        row = await database.fetch_one(
+            """
+            INSERT INTO execution_routes (
+                execution_route_id, normalized_domain, route_kind,
+                endpoint_normalized, merchant_id, claimed_at,
+                profile_fingerprint, last_audit_run_id, first_detected_at, last_verified_at,
+                expires_at, is_active, created_at, updated_at
+            ) VALUES (
+                :execution_route_id, :normalized_domain, :route_kind,
+                :endpoint_normalized, :merchant_id,
+                CASE WHEN CAST(:merchant_id AS text) IS NULL THEN NULL ELSE CAST(:now AS timestamptz) END,
+                :profile_fingerprint, :audit_run_id, :now, :last_verified_at,
+                :expires_at, :is_active, :now, :now
+            )
+            ON CONFLICT (normalized_domain, route_kind, endpoint_normalized)
+            DO UPDATE SET
+                profile_fingerprint = COALESCE(
+                    EXCLUDED.profile_fingerprint,
+                    execution_routes.profile_fingerprint
+                ),
+                last_audit_run_id = COALESCE(
+                    EXCLUDED.last_audit_run_id,
+                    execution_routes.last_audit_run_id
+                ),
+                last_verified_at = COALESCE(
+                    EXCLUDED.last_verified_at,
+                    execution_routes.last_verified_at
+                ),
+                expires_at = COALESCE(
+                    EXCLUDED.expires_at, execution_routes.expires_at
+                ),
+                is_active = EXCLUDED.is_active,
+                updated_at = EXCLUDED.updated_at
+            RETURNING execution_route_id, normalized_domain, route_kind,
+                      endpoint_normalized, merchant_id, claimed_at,
+                      profile_fingerprint, first_detected_at,
+                      last_audit_run_id, last_verified_at, expires_at, is_active
+            """,
+            {
+                "execution_route_id": route_id,
+                "normalized_domain": domain,
+                "route_kind": kind,
+                "endpoint_normalized": endpoint_normalized,
+                "merchant_id": merchant_id,
+                "profile_fingerprint": profile_fingerprint,
+                "audit_run_id": audit_run_id,
+                "last_verified_at": last_verified_at,
+                "expires_at": expires_at,
+                "is_active": bool(is_active),
+                "now": now,
+            },
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "upsert_execution_route failed domain=%s kind=%s: %s",
+            domain, kind, str(exc)[:200],
+        )
+        return None
+
+
+async def claim_execution_route(
+    *, execution_route_id: str, merchant_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Claim an unclaimed route, never reassigning one owned by another tenant.
+
+    The caller is responsible for performing the merchant/domain ownership
+    check before this durable write. A NULL result means the route is missing
+    or already belongs to a different merchant.
+    """
+    _validate_route_association_merchant_id(merchant_id)
+    if not execution_route_id or not merchant_id:
+        raise ValueError("execution_route_id and merchant_id are required")
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            """
+            UPDATE execution_routes
+               SET merchant_id = :merchant_id,
+                   claimed_at = COALESCE(claimed_at, :now),
+                   updated_at = :now
+             WHERE execution_route_id = :execution_route_id
+               AND (merchant_id IS NULL OR merchant_id = :merchant_id)
+            RETURNING execution_route_id, normalized_domain, route_kind,
+                      endpoint_normalized, merchant_id, claimed_at,
+                      profile_fingerprint, first_detected_at,
+                      last_audit_run_id, last_verified_at, expires_at, is_active
+            """,
+            {
+                "execution_route_id": execution_route_id,
+                "merchant_id": merchant_id,
+                "now": _now_utc(),
+            },
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "claim_execution_route failed route=%s merchant=%s: %s",
+            execution_route_id, merchant_id, str(exc)[:200],
+        )
+        return None
+
+
+async def fetch_execution_route(
+    *, execution_route_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Fetch one route for an authenticated internal crawl worker."""
+    if not execution_route_id:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            execution_routes.select().where(
+                execution_routes.c.execution_route_id == execution_route_id,
+                execution_routes.c.is_active.is_(True),
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_execution_route failed route=%s: %s",
+            execution_route_id, str(exc)[:200],
+        )
+        return None
+
+
+async def deactivate_execution_route(
+    *, execution_route_id: str, last_verified_at: datetime,
+) -> bool:
+    """Mark a formerly reachable route inactive after a clean no-route probe."""
+    if not execution_route_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        result = await database.execute(
+            execution_routes.update()
+            .where(execution_routes.c.execution_route_id == execution_route_id)
+            .values(
+                is_active=False,
+                last_verified_at=last_verified_at,
+                updated_at=_now_utc(),
+            )
+        )
+        return result > 0 if isinstance(result, int) else True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "deactivate_execution_route failed route=%s: %s",
+            execution_route_id, str(exc)[:200],
+        )
+        return False
 
 
 def _coerce_severity(s: Optional[str]) -> str:
@@ -664,11 +1069,13 @@ async def insert_evidence_item(
     product_key: Optional[str] = None,
     content_key: Optional[str] = None,
     probe_run_id: Optional[str] = None,
+    execution_route_id: Optional[str] = None,
+    evidence_level: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
     confidence: Optional[int] = None,
     idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
-    """Best-effort write. Unknown evidence_type is coerced to
-    'custom' with the original value preserved in payload_jsonb.
+    """Best-effort database write after strict taxonomy validation.
 
     P5.8.1: merchant_id + idempotency_key plumbed through for
     two-layer tenancy + idempotent re-runs. When idempotency_key
@@ -677,14 +1084,18 @@ async def insert_evidence_item(
     CONFLICT — we catch + return the existing-row marker rather
     than the new uuid.
 
-    Returns the new evidence_id, or None on persistence failure /
-    idempotent skip.
+    Returns the new evidence_id (including the pre-existing id on an
+    idempotent replay), or None on a genuine persistence failure.
     """
-    await ensure_audit_evidence_tables()
     coerced_type = _coerce_evidence_type(evidence_type)
+    _validate_route_evidence(
+        evidence_type=coerced_type,
+        execution_route_id=execution_route_id,
+        evidence_level=evidence_level,
+        merchant_id=merchant_id,
+    )
+    await ensure_audit_evidence_tables()
     safe_payload = dict(payload or {})
-    if coerced_type == EVIDENCE_TYPE_CUSTOM and evidence_type != EVIDENCE_TYPE_CUSTOM:
-        safe_payload["_raw_type"] = evidence_type
     # Coerce UUID / datetime / Decimal at the JSONB write boundary
     # (mirrors upsert_projection's PR #477 fix). Builders sometimes
     # pass-through asyncpg-returned columns; without this, a single
@@ -700,31 +1111,104 @@ async def insert_evidence_item(
                 product_key=product_key,
                 content_key=content_key,
                 probe_run_id=probe_run_id,
+                execution_route_id=execution_route_id,
                 evidence_type=coerced_type,
+                evidence_level=evidence_level,
                 payload_jsonb=safe_payload,
                 confidence=(
                     int(confidence) if confidence is not None else None
                 ),
                 idempotency_key=idempotency_key,
+                expires_at=expires_at,
                 created_at=_now_utc(),
             )
         )
         return evidence_id
     except Exception as exc:  # noqa: BLE001
-        # ON CONFLICT (unique violation on idempotency_key) is the
-        # expected case on re-run. But genuine errors (JSONB
-        # encoder failures, FK violations, etc.) also land here —
-        # and on Railway prod, root logger filters at WARNING so
-        # logger.debug is invisible. Always log at WARNING; the
-        # caller distinguishes "deduped" from "failed" via the
-        # post-insert SELECT it already does.
+        # A retry can race a prior successful insert after the worker lost its
+        # response. Resolve that expected duplicate to the durable row so a
+        # caller can safely continue its terminal verifier transition.
+        if idempotency_key:
+            try:
+                existing = await database.fetch_one(
+                    evidence_items.select()
+                    .with_only_columns(evidence_items.c.evidence_id)
+                    .where(
+                        evidence_items.c.audit_run_id == audit_run_id,
+                        evidence_items.c.idempotency_key == idempotency_key,
+                    )
+                    .limit(1)
+                )
+                if existing is not None:
+                    return str(dict(existing).get("evidence_id") or existing[0])
+            except Exception as lookup_exc:  # noqa: BLE001
+                logger.warning(
+                    "insert_evidence_item duplicate lookup failed "
+                    "audit_run=%s key=%s: %s",
+                    audit_run_id, idempotency_key[:16], str(lookup_exc)[:200],
+                )
+        # The original exception may be a conflict or a real JSONB/FK error.
+        # Keep it visible at WARNING in production either way.
         logger.warning(
-            "insert_evidence_item idempotent-skip or failed "
+            "insert_evidence_item failed "
             "audit_run=%s type=%s key=%s: %s",
             audit_run_id, evidence_type,
             (idempotency_key or "")[:16], str(exc)[:200],
         )
         return None
+
+
+async def fetch_active_commerce_evidence(
+    *, merchant_id: str, now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Read unexpired Store Audit commerce evidence for one merchant only."""
+    if not merchant_id:
+        return []
+    await ensure_audit_evidence_tables()
+    current = now or _now_utc()
+    rows = await database.fetch_all(
+        evidence_items.select()
+        .where(
+            evidence_items.c.merchant_id == merchant_id,
+            evidence_items.c.evidence_type.in_([
+                EVIDENCE_TYPE_COMMERCE_PLATFORM,
+                EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+                EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+                EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
+            ]),
+            evidence_items.c.expires_at > current,
+        )
+        .order_by(evidence_items.c.created_at.desc())
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def has_in_flight_verification_for_merchant(
+    *, merchant_id: str, verifier_id: str,
+) -> bool:
+    """Whether a remote verifier already owns this merchant audit lane."""
+    if not merchant_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .with_only_columns(verification_runs.c.verify_id)
+            .where(
+                verification_runs.c.merchant_id == merchant_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status.in_(list(VERIFICATION_ACTIVE)),
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "has_in_flight_verification_for_merchant failed merchant=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        # Fail closed: a transient lookup must not create a second merchant audit.
+        return True
 
 
 async def insert_citation_observation(
@@ -954,19 +1438,15 @@ async def insert_verification_run(
     audit_run_id: str,
     verifier_id: str,
     product_key: Optional[str] = None,
+    execution_route_id: Optional[str] = None,
     status: str = "pending",
     evidence_jsonb: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort write. Phase 5 worker calls this when starting
     a verifier; subsequent transitions go through update_verification_run."""
+    _require_known_verifier(verifier_id)
     await ensure_audit_evidence_tables()
-    if verifier_id not in VALID_VERIFIERS:
-        logger.warning(
-            "insert_verification_run: unknown verifier_id %r "
-            "for audit_run=%s — inserting anyway",
-            verifier_id, audit_run_id,
-        )
     verify_id = str(uuid.uuid4())
     try:
         await database.execute(
@@ -974,6 +1454,7 @@ async def insert_verification_run(
                 verify_id=verify_id,
                 audit_run_id=audit_run_id,
                 product_key=product_key,
+                execution_route_id=execution_route_id,
                 verifier_id=verifier_id,
                 status=status,
                 # JSONB write boundary — coerce UUID/datetime/Decimal
@@ -1242,12 +1723,48 @@ async def find_in_flight_verification_by_idempotency(
         return None
 
 
+async def has_in_flight_verification_for_route(
+    *, execution_route_id: str, verifier_id: str,
+) -> bool:
+    """Whether a route already has active work for this verifier.
+
+    Route re-probes are TTL-driven, so a date-bucketed idempotency key alone
+    is insufficient: a stale active job from yesterday must still prevent a
+    second job for the same endpoint today.
+    """
+    _require_known_verifier(verifier_id)
+    if not execution_route_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .with_only_columns(verification_runs.c.verify_id)
+            .where(
+                verification_runs.c.execution_route_id == execution_route_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status.in_(list(VERIFICATION_ACTIVE)),
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "has_in_flight_verification_for_route failed route=%s: %s",
+            execution_route_id, str(exc)[:200],
+        )
+        # Fail closed: a transient lookup failure must not create duplicate
+        # external UCP traffic.
+        return True
+
+
 async def enqueue_verification_run(
     *,
     audit_run_id: str,
     verifier_id: str,
     merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
+    execution_route_id: Optional[str] = None,
     not_before: Optional[datetime] = None,
     max_retries: int = 2,
     idempotency_key: Optional[str] = None,
@@ -1256,13 +1773,8 @@ async def enqueue_verification_run(
     worker to claim. The enqueue path (P5.7 at audit completion)
     typically calls find_in_flight_verification_by_idempotency
     first to dedupe."""
+    _require_known_verifier(verifier_id)
     await ensure_audit_evidence_tables()
-    if verifier_id not in VALID_VERIFIERS:
-        logger.warning(
-            "enqueue_verification_run: unknown verifier_id %r "
-            "for audit_run=%s — inserting anyway",
-            verifier_id, audit_run_id,
-        )
     verify_id = str(uuid.uuid4())
     try:
         await database.execute(
@@ -1271,6 +1783,7 @@ async def enqueue_verification_run(
                 audit_run_id=audit_run_id,
                 merchant_id=merchant_id,
                 product_key=product_key,
+                execution_route_id=execution_route_id,
                 verifier_id=verifier_id,
                 status=VERIFICATION_STATUS_PENDING,
                 not_before=not_before,
@@ -1292,6 +1805,8 @@ async def claim_next_pending_verification(
     *,
     worker_id: str,
     lease_seconds: int = DEFAULT_VERIFICATION_LEASE_SECONDS,
+    verifier_id: Optional[str] = None,
+    exclude_remote_verifiers: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Atomically claim the oldest pending or stale-leased
     verification. Skips rows where not_before > NOW() (the citation
@@ -1313,6 +1828,11 @@ async def claim_next_pending_verification(
              SELECT verify_id
                FROM verification_runs
               WHERE status IN ('pending', 'claimed')
+                AND (:verifier_id IS NULL OR verifier_id = :verifier_id)
+                AND (
+                    :exclude_remote_verifiers IS FALSE
+                    OR verifier_id NOT IN ('ucp_probe', 'commerce_checkout_probe')
+                )
                 AND (
                     claimed_until IS NULL
                  OR claimed_until < :now
@@ -1325,14 +1845,21 @@ async def claim_next_pending_verification(
               FOR UPDATE SKIP LOCKED
               LIMIT 1
          )
-        RETURNING verify_id, audit_run_id, product_key, verifier_id,
+        RETURNING verify_id, audit_run_id, merchant_id, product_key,
+                  execution_route_id, verifier_id,
                   retry_count, max_retries, idempotency_key,
                   created_at
     """
     try:
         row = await database.fetch_one(
             query,
-            {"worker_id": worker_id, "new_until": new_until, "now": now},
+            {
+                "worker_id": worker_id,
+                "new_until": new_until,
+                "now": now,
+                "verifier_id": verifier_id,
+                "exclude_remote_verifiers": bool(exclude_remote_verifiers),
+            },
         )
         if row is None:
             return None
@@ -1343,7 +1870,12 @@ async def claim_next_pending_verification(
                 str(d.get("audit_run_id"))
                 if d.get("audit_run_id") else None
             ),
+            "merchant_id": d.get("merchant_id"),
             "product_key": d.get("product_key"),
+            "execution_route_id": (
+                str(d.get("execution_route_id"))
+                if d.get("execution_route_id") else None
+            ),
             "verifier_id": d.get("verifier_id"),
             "retry_count": int(d.get("retry_count") or 0),
             "max_retries": int(d.get("max_retries") or 2),
@@ -1360,6 +1892,97 @@ async def claim_next_pending_verification(
             worker_id, str(exc)[:200],
         )
         return None
+
+
+async def get_claimed_verification_run(
+    *, verify_id: str, worker_id: str, verifier_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return a verifier job only while its worker lease is valid.
+
+    Receipt endpoints use this before accepting a result from a remote worker.
+    It keeps the work-queue's claim boundary authoritative: knowing a UUID is
+    not enough to read or complete another worker's verification.
+    """
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select().where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > _now_utc(),
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "get_claimed_verification_run failed verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return None
+
+
+async def get_verification_run_for_worker(
+    *, verify_id: str, worker_id: str, verifier_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read one verifier row bound to its original worker identity.
+
+    This narrow lookup exists solely for idempotent receipt acknowledgement
+    after a network timeout: a terminal row still retains ``claimed_by_worker``
+    while a retryable failure clears it before returning to ``pending``.
+    """
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select().where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "get_verification_run_for_worker failed verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return None
+
+
+async def attach_execution_route_to_claimed_verification(
+    *, verify_id: str, worker_id: str, execution_route_id: str,
+) -> bool:
+    """Associate a discovered route before terminally completing a job.
+
+    The row must still be claimed by ``worker_id``. This makes the route
+    association subject to the same ownership check as the result transition.
+    """
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
+            )
+            .values(execution_route_id=execution_route_id)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "attach_execution_route_to_claimed_verification failed "
+            "verify=%s route=%s: %s",
+            verify_id, execution_route_id, str(exc)[:200],
+        )
+        return False
 
 
 async def mark_verification_succeeded(
@@ -1385,6 +2008,7 @@ async def mark_verification_succeeded(
                 verification_runs.c.verify_id == verify_id,
                 verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
                 verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
             )
             .values(**values)
         )
@@ -1429,6 +2053,7 @@ async def mark_verification_blocked(
                 verification_runs.c.verify_id == verify_id,
                 verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
                 verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
             )
             .values(**values)
         )
@@ -1489,6 +2114,7 @@ async def mark_verification_failed_with_retry(
          WHERE verify_id = :verify_id
            AND status = 'claimed'
            AND claimed_by_worker = :worker_id
+           AND claimed_until > :now
          RETURNING status
     """
     import json as _json

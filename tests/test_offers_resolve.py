@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 from unittest.mock import AsyncMock
@@ -1700,26 +1701,27 @@ def test_a_null_claim_is_warranted_because_the_click_really_does_land_in_a_cart(
         warm.memo_clear()
 
 
-def test_shop_domain_is_load_bearing_for_the_cart_verdict(
+def test_cart_url_is_load_bearing_for_the_cart_verdict(
     monkeypatch: pytest.MonkeyPatch, warm_lane
 ) -> None:
-    """`_cart_prefilled_claim` forwards four values into resolve_cart_permalink; without this
-    row, dropping `shop_domain` to None changes nothing any test can see.
+    """`cart_url` — the decision compose_attributed_destinations already made — is what
+    drives the `True` leg, and it must be READ rather than re-derived.
 
-    Here the destination host says nothing about Shopify and `platform` is unset, so
-    `shop_domain` is the ONLY evidence that a cart permalink can be built at all.
+    Same warm-eligible host in both calls, so only `cart_url` differs: a `True` here proves
+    the cart leg short-circuits before the warm guard, and the `None` proves the guard runs
+    when there is no cart.
     """
     import routes.agent_shop_gateway as gateway
 
-    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
     kwargs = dict(
         destination_url="https://brand.com/products/serum",
-        platform=None,
-        cart_variant_id="41234567890123",
         redirect_url="https://api.example.com/r?token=t",
     )
-    assert gateway._cart_prefilled_claim(shop_domain="brand.myshopify.com", **kwargs) is True
-    assert gateway._cart_prefilled_claim(shop_domain=None, **kwargs) is False
+    assert gateway._cart_prefilled_claim(cart_url="https://brand.com/cart/41234567890123:1",
+                                         **kwargs) is True
+    assert gateway._cart_prefilled_claim(cart_url=None, **kwargs) is None
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
+    assert gateway._cart_prefilled_claim(cart_url=None, **kwargs) is False
 
 
 def test_cart_prefilled_says_unknown_when_the_token_cannot_be_recovered(
@@ -1741,10 +1743,8 @@ def test_cart_prefilled_says_unknown_when_the_token_cannot_be_recovered(
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 0)
     kwargs = dict(
+        cart_url=None,
         destination_url="https://brand.com/products/serum",
-        shop_domain=None,
-        platform=None,
-        cart_variant_id=None,
         redirect_url="https://api.example.com/r",  # no token param at all
     )
     assert gateway._cart_prefilled_claim(**kwargs) is None, (
@@ -1848,3 +1848,365 @@ def test_the_claim_follows_the_url_the_link_was_actually_built_from(
         "cannot distinguish the two columns"
     )
     assert offer["cart_prefilled"] is None
+
+
+def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
+    """Drive the REAL route and return (offer, decoded_token_dest).
+
+    The real `_make_external_redirect_url` runs — only the DB read is faked. The token is
+    decoded so every assertion can compare the published spec against the destination a buyer
+    would actually reach, rather than against another copy of our own intent.
+    """
+    import base64
+    import json as _json
+    from urllib.parse import parse_qs, urlparse
+
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [_seed_row_for_exec_spec(evidence=evidence)]
+        return []
+
+    # These tests are about the execution spec, not about rate limiting, and the anon limiter is
+    # MODULE-LEVEL shared state (`_INVOKE_ANON_IP_LIMIT_STORE`, 60 rpm per IP per minute). Every
+    # request here would spend budget that a later file needs — adding these tests tipped
+    # test_pdp_resolution_stability's 30-call loop into a 429. `rpm == 0` short-circuits BEFORE
+    # the store is incremented, so this spends nothing rather than merely resetting a counter.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+    offer = offers[0]
+
+    tok = parse_qs(urlparse(offer["affiliate_url"]).query)["token"][0].split(".")[0]
+    payload = _json.loads(base64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))
+    return offer, payload
+
+
+def test_cart_url_is_byte_identical_to_what_the_redirect_signs(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """THE anti-drift assertion for execution spec v0.
+
+    `cart_url` is published to the agent; `affiliate_url` resolves to the token's `dest`. Two
+    code paths compose them. If they can disagree, the spec is worse than absent — the agent
+    would plan against a URL the buyer never reaches. They are equal by construction only
+    because both go through `compose_attributed_destinations` with the same click id, and this
+    is what proves it stays that way.
+    """
+    offer, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    spec = offer["execution_spec"]
+
+    assert spec["cart_url"], "evidence-stamped seed must produce a cart"
+    assert spec["cart_url"] == payload["dest"], (
+        "the published cart_url and the destination the token resolves to must be the SAME "
+        "string — a spec that describes a different URL from the one the buyer reaches is a "
+        "fabrication, not an approximation"
+    )
+    assert "/cart/41234567890123:1" in spec["cart_url"]
+
+
+def test_one_click_id_spans_the_agents_lane_and_the_signed_token(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """T2-12. The join key must be ONE id across every surface, or attribution splits.
+
+    Before this, the id lived only inside the signed `/r` token: an agent that used the
+    destination URL directly produced revenue with no way to join it back. Minting per-surface
+    would look correct in every isolated test and still split the join in production, so the
+    identity is asserted across all three at once.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    offer, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    spec = offer["execution_spec"]
+    click_id = spec["tracking"]["click_id"]
+
+    assert click_id, "a spec with no join key attributes nothing"
+    assert payload["ctx"]["pvt_click_id"] == click_id, (
+        "the token ctx feeds surface_click_events; a different id here means the click row and "
+        "the merchant order can never be joined"
+    )
+    # The cart carries it as a cart ATTRIBUTE (Shopify persists that into note_attributes);
+    # the PDP carries it as a plain query param. Same id, two carriers.
+    assert f"attributes[pivota_click_id]={click_id}" in spec["cart_url"]
+    assert f"{gateway.REFERRAL_CLICK_PARAM}={click_id}" in spec["pdp_url"]
+
+
+def test_a_seed_with_no_variant_evidence_gets_a_pdp_but_never_a_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Honest degradation. No justifiable numeric variant id means no cart — and the spec must
+    say so consistently across FOUR fields, not just the one an agent happens to read."""
+    offer, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=False)
+    spec = offer["execution_spec"]
+
+    assert spec["cart_url"] is None
+    assert spec["variant_id"] is None
+    assert spec["rail"] == "referral"
+    assert offer["cart_prefilled"] is False
+    assert spec["tracking"]["join_mode"] == "referral_only"
+    # ...and the PDP is still attributed, which is the whole point of degrading rather than
+    # dropping the offer.
+    assert spec["pdp_url"].startswith("https://brand.com/products/serum")
+    assert spec["tracking"]["click_id"] in spec["pdp_url"]
+    assert "/cart/" not in payload["dest"]
+
+
+def test_rail_and_variant_id_track_the_cart_rather_than_being_asserted(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`rail` names what we will actually execute. It is derived from the composed cart, never
+    from the platform label — a seed can be Shopify and still have no cart-able variant, and
+    claiming `shopify_cart` there would send an agent down a path we cannot deliver."""
+    offer, _payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    spec = offer["execution_spec"]
+
+    assert spec["rail"] == "shopify_cart"
+    assert spec["variant_id"] == "41234567890123", "the NUMERIC storefront id, not the SKU"
+    assert spec["merchant_domain"] == "brand.com"
+    # `rail` is never a rail we do not execute on this route.
+    assert spec["rail"] in {"shopify_cart", "referral"}
+
+
+def test_expires_at_is_read_off_the_token_not_recomputed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """An agent caching a spec needs to know when `affiliate_url` stops resolving. Recomputing
+    the TTL beside the signer would be free to drift from it, so the value is read back off the
+    token that was actually signed — and this asserts they are the same instant."""
+    from datetime import datetime
+
+    offer, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    spec = offer["execution_spec"]
+
+    assert spec["expires_at"], "a spec with no expiry invites an agent to cache it forever"
+    parsed = datetime.fromisoformat(spec["expires_at"].replace("Z", "+00:00"))
+    assert int(parsed.timestamp()) == int(payload["exp"]), (
+        "expires_at must be the token's own exp; any other number is a second TTL that can "
+        "disagree with the one that signed the link"
+    )
+
+
+def test_the_allowlist_still_sees_the_destination_without_the_join_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the refactor that introduced `compose_attributed_destinations`.
+
+    The domain allowlist historically ran on the UTM'd destination BEFORE the join key was
+    appended. Passing the keyed URL instead would hand the allowlist reader literal `[` and `]`
+    from the cart-attribute form. Nothing else in the suite pins which of the two it receives.
+    """
+    import asyncio
+
+    import routes.agent_shop_gateway as gateway
+
+    seen: dict = {}
+
+    def recording_allowed(*, destination_url: str, allowed_domains):
+        seen["destination_url"] = destination_url
+        return True
+
+    monkeypatch.setattr(gateway, "is_destination_domain_allowed", recording_allowed)
+
+    url = asyncio.run(
+        gateway._make_external_redirect_url(
+            market="US", tool="*",
+            destination_url="https://brand.com/products/serum",
+            utm_template=None, ctx={},
+            merchant_id=None, product_id=None, variant_id="SKU-1",
+            cart_variant_id="41234567890123",
+            shop_domain="brand.com", platform="shopify",
+            seller_ref=None, seed_kind=None,
+            allowed_domains=["brand.com"],
+        )
+    )
+    assert url, "the redirect must still be built"
+    checked = seen["destination_url"]
+    assert "/cart/41234567890123:1" in checked, "it must still be the CART destination"
+    assert "attributes[" not in checked, (
+        "the allowlist must not receive the cart-attribute form — literal brackets are not part "
+        "of a domain decision"
+    )
+    assert "pivota_click_id" not in checked and "pvt_click_id" not in checked
+
+
+def _seed_row_split_hosts():
+    """A seed whose canonical_url is on a DIFFERENT host from its shop domain.
+
+    Nothing corrupt: the crawl can legitimately record a mirror/CDN canonical while the
+    storefront evidence names the real shop. It is exactly the case where the allowlist gate
+    and the published PDP part company.
+    """
+    row = _seed_row_for_exec_spec(evidence=True)
+    row["canonical_url"] = "https://cdn-mirror.example/products/serum"
+    row["destination_url"] = "https://cdn-mirror.example/products/serum"
+    row["domain"] = "brand.com"
+    row["seed_data"]["snapshot"]["shop_domain"] = "brand.com"
+    return row
+
+
+def test_pdp_url_is_never_published_for_a_host_the_allowlist_did_not_approve(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The allowlist gate runs on ONE url. When a cart exists that url is the CART, built on the
+    shop domain — so a `pdp_url` composed from `canonical_url` can be a host nothing vetted.
+
+    Publishing it would be net-new egress to an unapproved destination carrying our click id,
+    and would contradict the `merchant_domain` printed beside it. Withhold it instead: a spec
+    that omits a field is honest, one that points at an unvetted host is not.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [_seed_row_split_hosts()]
+        return []
+
+    # These tests are about the execution spec, not about rate limiting, and the anon limiter is
+    # MODULE-LEVEL shared state (`_INVOKE_ANON_IP_LIMIT_STORE`, 60 rpm per IP per minute). Every
+    # request here would spend budget that a later file needs — adding these tests tipped
+    # test_pdp_resolution_stability's 30-call loop into a 429. `rpm == 0` short-circuits BEFORE
+    # the store is incremented, so this spends nothing rather than merely resetting a counter.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    if not offers:
+        pytest.skip("this seed shape produced no external offer; the gate is unreachable here")
+
+    spec = offers[0]["execution_spec"]
+    assert spec["cart_url"], "the cart is on the approved host and must still be served"
+    assert spec["pdp_url"] is None, (
+        f"pdp_url on an unvetted host must be withheld, got {spec['pdp_url']!r}"
+    )
+    # And the spec stays internally consistent: no field names a host another field contradicts.
+    assert "cdn-mirror.example" not in json.dumps(spec)
+
+
+def test_tracking_param_names_the_carrier_that_is_actually_in_the_url(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`tracking.param` tells an agent where to FIND the join key. A cart carries it as a cart
+    attribute, a referral as a plain query param. A constant here points an agent following
+    `cart_url` at a string that appears nowhere in it — the key looks missing when it is present.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    cart_offer, _ = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    cart_spec = cart_offer["execution_spec"]
+    assert cart_spec["cart_url"]
+    assert cart_spec["tracking"]["param"] == gateway.SHOPIFY_CART_CLICK_ATTRIBUTE
+    assert f'{cart_spec["tracking"]["param"]}={cart_spec["tracking"]["click_id"]}' in (
+        cart_spec["cart_url"]
+    ), "the named carrier must literally appear in the url it describes"
+
+
+def test_tracking_param_names_the_referral_carrier_when_there_is_no_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    import routes.agent_shop_gateway as gateway
+
+    offer, _ = _resolve_offer_with_spec(monkeypatch, client, evidence=False)
+    spec = offer["execution_spec"]
+    assert spec["cart_url"] is None
+    assert spec["tracking"]["param"] == gateway.REFERRAL_CLICK_PARAM
+    assert f'{spec["tracking"]["param"]}={spec["tracking"]["click_id"]}' in spec["pdp_url"]
+
+
+def test_pdp_url_stays_the_product_page_even_when_a_cart_exists(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Review F3. The only test pinning `pdp_url` as a product page ran in the NO-CART branch,
+    where composing it from `cart_base or destination_url` is inert. An agent may legitimately
+    want to show the PDP while still handing off to the cart, so the distinction has to hold
+    exactly where it is destroyable.
+    """
+    offer, _payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    spec = offer["execution_spec"]
+
+    assert spec["cart_url"] and "/cart/" in spec["cart_url"]
+    assert spec["pdp_url"], "the PDP must still be published on the approved host"
+    assert "/cart/" not in spec["pdp_url"], "pdp_url must be the PRODUCT page, not the cart"
+    assert "/products/serum" in spec["pdp_url"]
+    assert spec["pdp_url"] != spec["cart_url"]
+
+
+def test_merchant_domain_is_normalized_not_echoed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Review F3. `merchant_domain` is a HOST, and the fixture's bare `domain` column made the
+    normalization unassertable. Drive a shop_domain carrying scheme, userinfo, port and path —
+    every part that must not survive into a field an agent may compare or key on.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    # The messy value must go on the `domain` COLUMN: _external_seed_redirect_identity reads
+    # `row["domain"] or seed_data["domain"]` RAW and only falls back to a URL-derived host,
+    # which is already normalized. Putting it anywhere else makes this test pass without ever
+    # exercising the normalization — which is exactly how it failed to kill its mutant first time.
+    row = _seed_row_for_exec_spec(evidence=True)
+    row["domain"] = "https://User:Pass@Brand.COM:443/shop/"
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    # These tests are about the execution spec, not about rate limiting, and the anon limiter is
+    # MODULE-LEVEL shared state (`_INVOKE_ANON_IP_LIMIT_STORE`, 60 rpm per IP per minute). Every
+    # request here would spend budget that a later file needs — adding these tests tipped
+    # test_pdp_resolution_stability's 30-call loop into a 429. `rpm == 0` short-circuits BEFORE
+    # the store is incremented, so this spends nothing rather than merely resetting a counter.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    if not offers:
+        pytest.skip("no external offer for this shape")
+
+    domain = offers[0]["execution_spec"]["merchant_domain"]
+    assert domain == "brand.com", f"expected a bare lowercase host, got {domain!r}"
+    for leaked in ("https://", "User", "Pass", ":443", "/shop"):
+        assert leaked not in (domain or ""), f"{leaked!r} must not survive into merchant_domain"

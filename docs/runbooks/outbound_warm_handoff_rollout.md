@@ -73,6 +73,29 @@ Postgres was not reachable from this session). The upper bound is "all cold rows
 six hosts"; the card-rail audit's finding that a numeric Shopify variant id exists for only
 ~28% of rows suggests the cold share on Shopify brands is the majority, not the tail.
 
+## Constraint 4 — `execution_spec.rail` has the same defect, and is NOT fixed
+
+PR #1846 shipped a fuller `execution_spec` beside `cart_prefilled`, and one of its fields
+carries the identical exposure:
+
+```python
+"rail": "shopify_cart" if composed_spec["cart_url"] else "referral",
+```
+
+`rail: "referral"` is emitted on exactly the cold population the warm lane targets, so an
+agent that hands the buyer off via `affiliate_url` can be told "referral" and have the buyer
+land in a Shopify cart — the same already-sent claim, contradicted the same way.
+
+It is deliberately left alone. `rail` is a two-value string vocabulary the gateway consumes;
+adding a third state (or a null) is a **contract change across two repos**, not a bug fix,
+and doing it silently inside a fix for a different field is how consumers break. Fixing it
+means agreeing the vocabulary with the gateway first.
+
+Narrower scope than `cart_prefilled`, worth knowing: `execution_spec.pdp_url` and `cart_url`
+are direct URLs that bypass `/r` entirely, so an agent that follows *those* never meets the
+warm lane. Only the `affiliate_url` path is exposed. `rail` is ambiguous about which it
+describes, which is part of why it needs a decision rather than a patch.
+
 ## Constraint 2 — a widening has a ~7-day tail of already-issued claims
 
 Redirect tokens are minted with a **7-day TTL** (`make_redirect_token`,

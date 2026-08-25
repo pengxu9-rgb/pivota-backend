@@ -8,6 +8,8 @@ SQLite — verified against real Postgres in the P4.3+ dual-write flow).
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -24,6 +26,13 @@ def test_evidence_taxonomy_constants_match_valid_set():
         EVIDENCE_TYPE_URL_MATCH,
         EVIDENCE_TYPE_MISSING_SIGNAL,
         EVIDENCE_TYPE_INDUSTRY_STAT,
+        EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+        EVIDENCE_TYPE_COMMERCE_PLATFORM,
+        EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+        EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+        EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
+        EVIDENCE_TYPE_COMMERCE_RETURN_POLICY,
+        EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW,
         EVIDENCE_TYPE_CUSTOM,
     )
     assert EVIDENCE_TYPE_GROUNDING_CHUNK in VALID_EVIDENCE_TYPES
@@ -31,8 +40,15 @@ def test_evidence_taxonomy_constants_match_valid_set():
     assert EVIDENCE_TYPE_URL_MATCH in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_MISSING_SIGNAL in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_INDUSTRY_STAT in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_ACCEPTANCE_SIGNAL in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_COMMERCE_PLATFORM in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_COMMERCE_CARTABILITY in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_COMMERCE_RETURN_POLICY in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_CUSTOM in VALID_EVIDENCE_TYPES
-    assert len(VALID_EVIDENCE_TYPES) == 6
+    assert len(VALID_EVIDENCE_TYPES) == 13
 
 
 def test_severity_constants_canonicalized():
@@ -63,8 +79,8 @@ def test_owner_taxonomy_mirrors_pr_8b_recommendation_engine():
     }
 
 
-def test_verifier_taxonomy_has_all_7_phase5_verifiers():
-    """The 7-stage verify loop documented in the audit doc:
+def test_verifier_taxonomy_has_all_registered_verifiers():
+    """The legacy 7-stage verify loop plus Store Audit UCP probing:
     pdp_renders, pdp_in_sitemap, gsc_url_submitted,
     gsc_indexing_status, pivota_internal_retrieval,
     frontend_agent_cite, public_llm_citation_movement."""
@@ -76,6 +92,8 @@ def test_verifier_taxonomy_has_all_7_phase5_verifiers():
         VERIFIER_PIVOTA_INTERNAL_RETRIEVAL,
         VERIFIER_FRONTEND_AGENT_CITE,
         VERIFIER_PUBLIC_LLM_CITATION,
+        VERIFIER_UCP_PROBE,
+        VERIFIER_COMMERCE_CHECKOUT_PROBE,
     )
     expected = {
         VERIFIER_PDP_RENDERS, VERIFIER_PDP_IN_SITEMAP,
@@ -84,9 +102,11 @@ def test_verifier_taxonomy_has_all_7_phase5_verifiers():
         VERIFIER_PIVOTA_INTERNAL_RETRIEVAL,
         VERIFIER_FRONTEND_AGENT_CITE,
         VERIFIER_PUBLIC_LLM_CITATION,
+        VERIFIER_UCP_PROBE,
+        VERIFIER_COMMERCE_CHECKOUT_PROBE,
     }
     assert VALID_VERIFIERS == expected
-    assert len(VALID_VERIFIERS) == 7
+    assert len(VALID_VERIFIERS) == 9
 
 
 def test_audience_taxonomy_has_all_5_projections():
@@ -120,16 +140,138 @@ def test_coerce_evidence_type_passes_through_valid():
     )
 
 
-def test_coerce_evidence_type_falls_back_to_custom_for_unknown():
-    """Forward compat: agents that emit a new evidence_type before
-    the taxonomy gets updated still produce a row; the original
-    value is preserved in payload_jsonb._raw_type (tested in the
-    write accessor when DB is available)."""
+def test_coerce_evidence_type_rejects_unknown():
+    """Unknown values must fail before they can silently become custom."""
     from db.audit_evidence import (
-        _coerce_evidence_type, EVIDENCE_TYPE_CUSTOM,
+        _coerce_evidence_type, UnknownAuditTaxonomyValue,
     )
-    assert _coerce_evidence_type("brand_new_type") == EVIDENCE_TYPE_CUSTOM
-    assert _coerce_evidence_type("") == EVIDENCE_TYPE_CUSTOM
+    with pytest.raises(UnknownAuditTaxonomyValue):
+        _coerce_evidence_type("brand_new_type")
+    with pytest.raises(UnknownAuditTaxonomyValue):
+        _coerce_evidence_type("")
+
+
+def test_insert_evidence_rejects_unknown_before_any_db_write():
+    """The public write accessor cannot turn a typo into `custom`."""
+    from db.audit_evidence import (
+        UnknownAuditTaxonomyValue,
+        insert_evidence_item,
+    )
+
+    with pytest.raises(UnknownAuditTaxonomyValue):
+        asyncio.run(insert_evidence_item(
+            audit_run_id="00000000-0000-0000-0000-000000000001",
+            evidence_type="acceptance_singal",
+            payload={},
+        ))
+
+
+def test_insert_evidence_returns_existing_row_on_idempotent_replay(monkeypatch):
+    import db.audit_evidence as evidence_module
+
+    class DuplicateDatabase:
+        async def execute(self, _query):
+            raise RuntimeError("duplicate key")
+
+        async def fetch_one(self, _query):
+            return {"evidence_id": "existing-evidence-id"}
+
+    async def no_ddl():
+        return None
+
+    monkeypatch.setattr(evidence_module, "database", DuplicateDatabase())
+    monkeypatch.setattr(evidence_module, "ensure_audit_evidence_tables", no_ddl)
+    result = asyncio.run(evidence_module.insert_evidence_item(
+        audit_run_id="00000000-0000-0000-0000-000000000001",
+        evidence_type="acceptance_signal",
+        execution_route_id="00000000-0000-0000-0000-000000000002",
+        evidence_level="tested",
+        payload={"ok": True},
+        idempotency_key="ucp_probe:retry:acceptance",
+    ))
+    assert result == "existing-evidence-id"
+
+
+def test_ucp_probe_verifier_is_registered_and_unknown_verifier_rejected():
+    from db.audit_evidence import (
+        UnknownAuditTaxonomyValue,
+        VERIFIER_UCP_PROBE,
+        _require_known_verifier,
+    )
+    assert _require_known_verifier(VERIFIER_UCP_PROBE) == VERIFIER_UCP_PROBE
+    with pytest.raises(UnknownAuditTaxonomyValue):
+        _require_known_verifier("ucp_proeb")
+
+
+def test_acceptance_signal_requires_route_and_level():
+    from db.audit_evidence import (
+        EVIDENCE_LEVEL_TESTED,
+        EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+        _validate_route_evidence,
+    )
+    _validate_route_evidence(
+        evidence_type=EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+        execution_route_id="00000000-0000-0000-0000-000000000001",
+        evidence_level=EVIDENCE_LEVEL_TESTED,
+        merchant_id=None,
+    )
+    with pytest.raises(ValueError, match="execution_route_id"):
+        _validate_route_evidence(
+            evidence_type=EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+            execution_route_id=None,
+            evidence_level=EVIDENCE_LEVEL_TESTED,
+            merchant_id=None,
+        )
+    with pytest.raises(ValueError, match="evidence_level"):
+        _validate_route_evidence(
+            evidence_type=EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+            execution_route_id="00000000-0000-0000-0000-000000000001",
+            evidence_level=None,
+            merchant_id=None,
+        )
+    with pytest.raises(ValueError, match="synthetic"):
+        _validate_route_evidence(
+            evidence_type=EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+            execution_route_id="00000000-0000-0000-0000-000000000001",
+            evidence_level=EVIDENCE_LEVEL_TESTED,
+            merchant_id="prospect_ab12cd34ef56",
+        )
+
+
+def test_execution_route_identity_is_domain_keyed_and_canonicalized():
+    from db.audit_evidence import normalize_execution_route_identity
+
+    assert normalize_execution_route_identity(
+        normalized_domain="Shop.Example.COM.",
+        route_kind="UCP",
+        endpoint="https://Store.MyShopify.com:443/api/ucp/mcp/",
+    ) == (
+        "shop.example.com",
+        "ucp",
+        "https://store.myshopify.com/api/ucp/mcp",
+    )
+
+
+@pytest.mark.parametrize(
+    "domain, kind, endpoint",
+    [
+        ("https://shop.example.com", "ucp", "https://a.example/mcp"),
+        ("shop.example.com", "ucp-probe", "https://a.example/mcp"),
+        ("shop.example.com", "ucp", "http://a.example/mcp"),
+        ("shop.example.com", "ucp", "https://a.example/mcp?token=x"),
+    ],
+)
+def test_execution_route_identity_rejects_noncanonical_inputs(
+    domain, kind, endpoint,
+):
+    from db.audit_evidence import normalize_execution_route_identity
+
+    with pytest.raises(ValueError):
+        normalize_execution_route_identity(
+            normalized_domain=domain,
+            route_kind=kind,
+            endpoint=endpoint,
+        )
 
 
 def test_coerce_severity_defaults_to_medium():

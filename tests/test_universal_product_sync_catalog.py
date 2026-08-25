@@ -106,3 +106,18 @@ def test_universal_sync_returns_success_when_catalog_ingest_succeeds(monkeypatch
     assert payload["products_synced"] == 1
     assert payload["catalog_synced"] == 1
     assert payload["error"] is None
+
+
+def test_universal_sync_rejects_payment_only_source_before_catalog_fetch(monkeypatch):
+    client = _client(monkeypatch, {"products_ingested": 1})
+
+    response = client.post(
+        "/products/sync-universal/",
+        json={"merchant_id": "merch_1", "platform": "antom", "limit": 50},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "unsupported"
+    assert payload["products_synced"] == 0
+    assert "payment-orchestration" in payload["message"]

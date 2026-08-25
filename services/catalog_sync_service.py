@@ -73,6 +73,12 @@ from services.catalog_row_trust_upserter import (
     upsert_catalog_row_trust,
     upsert_catalog_row_trust_many,
 )
+from services.commerce_index_delta_service import record_field_change_and_publications
+from services.commerce_index_v2 import (
+    FieldObservation,
+    commerce_index_v2_enabled_for_merchant,
+)
+from services.commerce_index_source_service import resolve_active_catalog_source
 from services.strong_identifier import (
 
     MPN_CAPTURED_AS_BARCODE,
@@ -854,8 +860,23 @@ async def _upsert_field_fact(
     fresh_until: Optional[datetime] = None,
     confidence: Optional[Decimal] = None,
     review_state: str = "observed",
+    merchant_id: Optional[str] = None,
+    commerce_index_source_id: Optional[str] = None,
+    commerce_index_source_kind: Optional[str] = None,
 ) -> None:
     fact_id = _stable_key("fact", entity_type, entity_id, field_family, field_key, source_system)
+    # Source identity and merchant scoping are mandatory for v2 publication.
+    # Legacy canonical fact ingestion remains unchanged when the v2 canary is
+    # disabled or the merchant has not granted source consent.
+    v2_enabled = bool(
+        merchant_id
+        and commerce_index_source_id
+        and commerce_index_source_kind
+        and commerce_index_v2_enabled_for_merchant(merchant_id)
+    )
+    # Migration-safe: legacy sync behavior remains a single fact upsert until
+    # the Commerce Index v2 tables are deployed and the feature is enabled.
+    previous = await _fetch_one_by_pk(catalog_field_facts, "fact_id", fact_id) if v2_enabled else None
     await database.execute(
         catalog_field_facts.delete()
         .where(catalog_field_facts.c.entity_type == entity_type)
@@ -882,6 +903,116 @@ async def _upsert_field_fact(
             "confidence": confidence,
             "review_state": review_state,
         },
+    )
+    if v2_enabled:
+        await record_field_change_and_publications(
+            merchant_id=merchant_id,
+            observation=FieldObservation(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                field_family=field_family,
+                field_key=field_key,
+                value=value,
+                source_system=source_system,
+                source_kind=str(commerce_index_source_kind),
+                source_ref=source_ref,
+                observed_at=observed_at or _utcnow(),
+                fresh_until=fresh_until,
+                confidence=float(confidence) if confidence is not None else 0.0,
+            ),
+            previous_value=previous.get("value_json") if previous else None,
+            source_id=str(commerce_index_source_id),
+        )
+
+
+def _dedupe_nonempty_strings(values: List[Any]) -> List[str]:
+    """Preserve source order while producing a stable media-fact payload."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+async def _emit_product_projection_facts(
+    *,
+    product: StandardProduct,
+    product_key: str,
+    description: Optional[str],
+    category_path: Optional[str],
+    category_label_source: Optional[str],
+    category_confidence: Optional[float],
+    normalized_category: Optional[str],
+    source_system: str,
+    source_ref: Optional[str],
+    merchant_id: str,
+    commerce_index_source: Optional[Dict[str, Any]],
+) -> None:
+    """Emit the non-commercial product facts that drive incremental projections.
+
+    Price and stock retain their offer-level cadence below.  Content, taxonomy,
+    and media used to mutate the serving projection without a v2 field fact,
+    leaving search, relation graph, and Insights stale after a normal merchant
+    sync.  These facts intentionally carry only merchant catalogue data.  Review
+    aggregates belong to a separately-authorized ``reviews_pull`` source and
+    must not be inferred from arbitrary storefront metadata here.
+    """
+    common = {
+        "entity_type": "product",
+        "entity_id": product_key,
+        "source_system": source_system,
+        "source_ref": source_ref,
+        "merchant_id": merchant_id,
+        "commerce_index_source_id": (commerce_index_source or {}).get("source_id"),
+        "commerce_index_source_kind": (commerce_index_source or {}).get("field_source_kind"),
+    }
+    # Every authoritative full catalog observation must carry a value for each
+    # projected field, including an explicit ``None`` when the merchant removed
+    # it.  The nullable fact is a deletion tombstone: it replaces the previous
+    # source fact and emits a v2 delta so downstream search, graph and insight
+    # projections cannot retain stale content.
+    await _upsert_field_fact(
+        **common,
+        field_family="content",
+        field_key="description",
+        value=str(description or "").strip() or None,
+        fresh_until=_utcnow() + timedelta(days=7),
+        confidence=Decimal("1.0"),
+    )
+
+    taxonomy = {
+        "product_type": str(product.product_type or "").strip() or None,
+        "category": normalized_category,
+        "category_path": category_path,
+        "category_label_source": category_label_source,
+        "category_confidence": category_confidence,
+        "tags": _dedupe_nonempty_strings(list(product.tags or [])),
+    }
+    await _upsert_field_fact(
+        **common,
+        field_family="taxonomy",
+        field_key="classification",
+        value=(
+            taxonomy
+            if any(value not in (None, "", []) for value in taxonomy.values())
+            else None
+        ),
+        fresh_until=_utcnow() + timedelta(days=7),
+        confidence=Decimal("1.0"),
+    )
+
+    images = _dedupe_nonempty_strings([product.image_url, *(product.images or [])])
+    await _upsert_field_fact(
+        **common,
+        field_family="media",
+        field_key="images",
+        value={"primary": images[0], "items": images} if images else None,
+        fresh_until=_utcnow() + timedelta(days=7),
+        confidence=Decimal("1.0"),
     )
 
 
@@ -967,7 +1098,29 @@ async def ingest_standard_products(
         "beauty_content_assets_upserted": 0,
         "beauty_compatibility_rules_upserted": 0,
         "brand_conflicts_flagged": 0,
+        "commerce_index_v2_withheld": False,
     }
+    commerce_index_source: Optional[Dict[str, Any]] = None
+    if commerce_index_v2_enabled_for_merchant(merchant_id):
+        # `platform`, not the generic writer label, establishes the source
+        # contract. This keeps portal universal sync as merchant API data and
+        # prevents a free-form `source_system` from granting authority.
+        commerce_index_source = await resolve_active_catalog_source(
+            merchant_id=merchant_id,
+            provider=platform,
+        )
+        if commerce_index_source is None:
+            # For an allowlisted v2 merchant, do not let an unconsented or
+            # unsupported source mutate canonical price/stock before the
+            # authority gate runs. Legacy merchants remain on the unchanged
+            # pre-v2 path because they never enter this branch.
+            logger.warning(
+                "Commerce Index v2 catalog intake withheld: no active consented source merchant=%s provider=%s",
+                merchant_id,
+                platform,
+            )
+            stats["commerce_index_v2_withheld"] = True
+            return stats
     # ADR-008 prevent-at-intake (convergence P1.4): guard once per distinct
     # brand per ingest run — a merchant's catalog is usually one brand, so
     # this is ~1 extra lookup per sync, not per product.
@@ -1361,6 +1514,9 @@ async def ingest_standard_products(
                 value=product.title,
                 fresh_until=_utcnow() + timedelta(hours=24),
                 confidence=Decimal("1.0"),
+                merchant_id=merchant_id,
+                commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
             )
             if brand:
                 await _upsert_field_fact(
@@ -1373,7 +1529,24 @@ async def ingest_standard_products(
                     value=brand,
                     fresh_until=_utcnow() + timedelta(days=7),
                     confidence=Decimal("1.0"),
+                    merchant_id=merchant_id,
+                    commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                    commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
+
+            await _emit_product_projection_facts(
+                product=product,
+                product_key=product_key,
+                description=_description_for_ingest,
+                category_path=_cat_path,
+                category_label_source=_cat_source,
+                category_confidence=_cat_confidence,
+                normalized_category=_normalized_category,
+                source_system=source_system,
+                source_ref=source_ref,
+                merchant_id=merchant_id,
+                commerce_index_source=commerce_index_source,
+            )
 
             variants = _iter_variants(product)
             beauty_usage_rows: List[Dict[str, Any]] = []
@@ -1566,6 +1739,9 @@ async def ingest_standard_products(
                     },
                     fresh_until=_utcnow() + timedelta(hours=1),
                     confidence=Decimal("1.0"),
+                    merchant_id=merchant_id,
+                    commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                    commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
                 await _upsert_field_fact(
                     entity_type="offer",
@@ -1577,6 +1753,9 @@ async def ingest_standard_products(
                     value={"availability": availability, "inventory_quantity": inventory_quantity},
                     fresh_until=_utcnow() + timedelta(minutes=15),
                     confidence=Decimal("1.0"),
+                    merchant_id=merchant_id,
+                    commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                    commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                 )
 
                 if _beauty_is_candidate(product):
@@ -1611,6 +1790,9 @@ async def ingest_standard_products(
                         value=list(product.ingredient_ids or []),
                         fresh_until=_utcnow() + timedelta(days=30),
                         confidence=Decimal("0.8"),
+                        merchant_id=merchant_id,
+                        commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                        commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                     )
 
                     how_to_use_text, steps = _extract_how_to_use(metadata)
@@ -1641,6 +1823,9 @@ async def ingest_standard_products(
                             value={"text": how_to_use_text, "steps": steps},
                             fresh_until=_utcnow() + timedelta(days=30),
                             confidence=Decimal("0.8"),
+                            merchant_id=merchant_id,
+                            commerce_index_source_id=(commerce_index_source or {}).get("source_id"),
+                            commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                         )
 
                     beauty_shade_rows.extend(

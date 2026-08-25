@@ -45,14 +45,135 @@ esac
 #   at cutover:   WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>
 : "${WORKERS:=false}"
 : "${PAUSED:=1}"
+: "${RELGRAPH_PUBLICATION_WORKER:=false}"
+: "${SEARCH_INDEX_PUBLICATION_WORKER:=false}"
+: "${CHECKOUT_VALIDATION_WORKER:=false}"
+: "${INSIGHT_REFRESH_WORKER:=false}"
+: "${STORE_AUDIT_UCP_REPROBE_WORKER:=false}"
+: "${STORE_AUDIT_UCP_REPROBE_ARMED:=false}"
+: "${STORE_AUDIT_COMMERCE_REPROBE_WORKER:=false}"
+: "${STORE_AUDIT_COMMERCE_REPROBE_ARMED:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
+case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
+case "$SEARCH_INDEX_PUBLICATION_WORKER" in true|false) ;; *) echo "SEARCH_INDEX_PUBLICATION_WORKER must be exactly true or false (got '$SEARCH_INDEX_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
+case "$CHECKOUT_VALIDATION_WORKER" in true|false) ;; *) echo "CHECKOUT_VALIDATION_WORKER must be exactly true or false (got '$CHECKOUT_VALIDATION_WORKER')" >&2; exit 2 ;; esac
+case "$INSIGHT_REFRESH_WORKER" in true|false) ;; *) echo "INSIGHT_REFRESH_WORKER must be exactly true or false (got '$INSIGHT_REFRESH_WORKER')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_UCP_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_UCP_REPROBE_WORKER must be exactly true or false (got '$STORE_AUDIT_UCP_REPROBE_WORKER')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_UCP_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_UCP_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_UCP_REPROBE_ARMED')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_WORKER must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_WORKER')" >&2; exit 2 ;; esac
+case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
+if [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_UCP_REPROBE_WORKER" != true ]; then
+  echo "STORE_AUDIT_UCP_REPROBE_ARMED=true requires STORE_AUDIT_UCP_REPROBE_WORKER=true" >&2; exit 2
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" != true ]; then
+  echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED=true requires STORE_AUDIT_COMMERCE_REPROBE_WORKER=true" >&2; exit 2
+fi
+if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ] && [ "$PAUSED" = 0 ]; then
+  echo "refusing PAUSED=0 with Store Audit UCP enabled: it resumes unrelated schedulers; use PAUSED=1 STORE_AUDIT_UCP_REPROBE_ARMED=true to arm only UCP" >&2
+  exit 2
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ] && [ "$PAUSED" = 0 ]; then
+  echo "refusing PAUSED=0 with Store Audit commerce enabled: use PAUSED=1 STORE_AUDIT_COMMERCE_REPROBE_ARMED=true to arm only commerce" >&2
+  exit 2
+fi
+if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
+  # Validate before touching even the ordinary worker/jobs below. A missing
+  # Store Audit endpoint must be a no-write configuration error, not a partial
+  # scheduler reconciliation followed by a failure.
+  : "${STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL:?set an https backend base URL before enabling Store Audit UCP jobs}"
+  [[ "$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
+    || { echo "STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL must be a bare HTTPS origin (no path, query, userinfo, or port)" >&2; exit 2; }
+  STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL%/}"
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  : "${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL:?set an https backend base URL before enabling Store Audit commerce jobs}"
+  [[ "$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
+    || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must be a bare HTTPS origin (no path, query, userinfo, or port)" >&2; exit 2; }
+  STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL%/}"
+fi
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
 GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
+BROWSER_AUDIT_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/store-audit-browser:$GATEWAY_TAG"
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
+UCP_CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
+UCP_SELECTOR_SA="sa-store-audit-ucp-selector@$PROJECT.iam.gserviceaccount.com"
+UCP_SCHEDULER_SA="sa-store-audit-ucp-scheduler@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_CRAWL_SA="sa-store-audit-commerce-crawl@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_SELECTOR_SA="sa-store-audit-commerce-sel@$PROJECT.iam.gserviceaccount.com"
+COMMERCE_SCHEDULER_SA="sa-store-audit-commerce-sched@$PROJECT.iam.gserviceaccount.com"
 have(){ "$@" >/dev/null 2>&1; }
+require_service_account(){
+  have "$GCLOUD" iam service-accounts describe "$1" \
+    || { echo "missing $1; provision the matching Store Audit identity script for $ENV first" >&2; exit 1; }
+}
+if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
+  WEB_UCP_SPEC="$("$GCLOUD" run services describe web --region "$REGION" --format=json)"
+  EXPECTED_UCP_BACKEND_BASE_URL="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
+  [ "$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL" = "$EXPECTED_UCP_BACKEND_BASE_URL" ] \
+    || { echo "STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_UCP_BACKEND_BASE_URL)" >&2; exit 2; }
+  # The service template can describe a 0%-traffic candidate. The untagged
+  # service URL used by the Job instead reaches the single untagged 100%
+  # revision. Refuse a split/candidate state rather than declaring receipt
+  # ready based on code that is not actually serving the URL.
+  WEB_ACTIVE_REVISION="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c '
+import json,sys
+o=json.load(sys.stdin)
+active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if not t.get("tag") and t.get("percent") == 100]
+print(active[0] if len(active) == 1 else "")
+')"
+  [ -n "$WEB_ACTIVE_REVISION" ] \
+    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit Jobs are created" >&2; exit 2; }
+  WEB_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_ACTIVE_REVISION" --region "$REGION" --format=json)"
+  # Refuse to create or arm a crawler against a revision where Cloud Run would
+  # accept OIDC but the app would still return a disabled-receipt 404. This
+  # reads only the active revision's configuration; it never renders a secret.
+  WEB_UCP_RECEIPT_READY="$(printf '%s' "$WEB_ACTIVE_SPEC" | python3 -c '
+import json,sys
+o=json.load(sys.stdin)
+env=o.get("spec",{}).get("containers",[{}])[0].get("env",[])
+by_name={e.get("name"):e for e in env}
+flag=by_name.get("STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED",{}).get("value") == "true"
+secret=by_name.get("STORE_AUDIT_UCP_PROBE_INTERNAL_KEY",{}).get("valueFrom",{}).get("secretKeyRef",{}).get("name") == "STORE_AUDIT_UCP_PROBE_INTERNAL_KEY"
+print("true" if flag and secret else "false")
+')"
+  [ "$WEB_UCP_RECEIPT_READY" = true ] \
+    || { echo "web must mount STORE_AUDIT_UCP_PROBE_INTERNAL_KEY and set STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED=true before Store Audit Jobs are created" >&2; exit 2; }
+  require_service_account "$UCP_CRAWL_SA"
+  require_service_account "$UCP_SELECTOR_SA"
+  require_service_account "$UCP_SCHEDULER_SA"
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  WEB_COMMERCE_SPEC="$("$GCLOUD" run services describe web --region "$REGION" --format=json)"
+  EXPECTED_COMMERCE_BACKEND_BASE_URL="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
+  [ "$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" = "$EXPECTED_COMMERCE_BACKEND_BASE_URL" ] \
+    || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_COMMERCE_BACKEND_BASE_URL)" >&2; exit 2; }
+  WEB_COMMERCE_ACTIVE_REVISION="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c '
+import json,sys
+o=json.load(sys.stdin)
+active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if not t.get("tag") and t.get("percent") == 100]
+print(active[0] if len(active) == 1 else "")
+')"
+  [ -n "$WEB_COMMERCE_ACTIVE_REVISION" ] \
+    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit commerce Jobs are created" >&2; exit 2; }
+  WEB_COMMERCE_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_COMMERCE_ACTIVE_REVISION" --region "$REGION" --format=json)"
+  WEB_COMMERCE_RECEIPT_READY="$(printf '%s' "$WEB_COMMERCE_ACTIVE_SPEC" | python3 -c '
+import json,sys
+o=json.load(sys.stdin)
+env=o.get("spec",{}).get("containers",[{}])[0].get("env",[])
+by_name={e.get("name"):e for e in env}
+flag=by_name.get("STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED",{}).get("value") == "true"
+secret=by_name.get("STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY",{}).get("valueFrom",{}).get("secretKeyRef",{}).get("name") == "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY"
+print("true" if flag and secret else "false")
+')"
+  [ "$WEB_COMMERCE_RECEIPT_READY" = true ] \
+    || { echo "web must mount STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY and set STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true before Store Audit commerce Jobs are created" >&2; exit 2; }
+  require_service_account "$COMMERCE_CRAWL_SA"
+  require_service_account "$COMMERCE_SELECTOR_SA"
+  require_service_account "$COMMERCE_SCHEDULER_SA"
+fi
 
 # ---------------------------------------------------------------- 1. the single-instance worker
 ENV_FILE="$HERE/env.$ENV.yaml"; SECRETS_FILE="$HERE/secrets.$ENV.list"
@@ -77,19 +198,71 @@ echo "== worker service (min=max=1, ingress internal)"
   --labels "env=$ENV,service=worker,managed-by=infra-gcp" --quiet
 
 # ---------------------------------------------------------------- 2. Cloud Run Jobs
-mkjob(){ # name image sa command...
-  local name="$1" image="$2"; shift 2
+mkjob(){ # name image service-account command...
+  local name="$1" image="$2" service_account="$3"; shift 3
   local verb=create; have "$GCLOUD" run jobs describe "$name" --region "$REGION" && verb=update
-  "$GCLOUD" run jobs "$verb" "$name" --region "$REGION" --image "$image" --service-account "$SA" \
+  "$GCLOUD" run jobs "$verb" "$name" --region "$REGION" --image "$image" --service-account "$service_account" \
     --network default --subnet default --vpc-egress all-traffic \
     --max-retries 1 --task-timeout 3600s --cpu 1 --memory 2Gi \
     --labels "env=$ENV,managed-by=infra-gcp" --quiet "$@"
 }
+mkcrawljob(){ # name image service-account command... -- the only crawl egress workload
+  local name="$1" image="$2" service_account="$3"; shift 3
+  local verb=create; have "$GCLOUD" run jobs describe "$name" --region "$REGION" && verb=update
+  "$GCLOUD" run jobs "$verb" "$name" --region "$REGION" --image "$image" --service-account "$service_account" \
+    --network default --subnet pivota-crawl --vpc-egress all-traffic \
+    --max-retries 1 --task-timeout 300s --cpu 1 --memory 1Gi \
+    --labels "env=$ENV,managed-by=infra-gcp,lane=store-audit-crawl" --quiet "$@"
+}
+mkbrowserauditjob(){ # Browser is intentionally isolated to the crawl subnet.
+  local name="$1" image="$2" service_account="$3"; shift 3
+  local verb=create; have "$GCLOUD" run jobs describe "$name" --region "$REGION" && verb=update
+  "$GCLOUD" run jobs "$verb" "$name" --region "$REGION" --image "$image" --service-account "$service_account" \
+    --network default --subnet pivota-crawl --vpc-egress all-traffic \
+    --max-retries 1 --task-timeout 300s --cpu 2 --memory 2Gi \
+    --labels "env=$ENV,managed-by=infra-gcp,lane=store-audit-crawl" --quiet "$@"
+}
 echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
-mkjob relgraph-sync "$GATEWAY_IMAGE" \
+mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
   --command npm --args "run,relgraph:sync-routine:cron"
+
+echo "== job: commerce-index-relgraph (v2 targeted graph publication)"
+# This worker is independently opt-in. It is safe to create while inert, but it
+# must not consume queue rows until migration 194 is applied, v2 fact emission is
+# enabled, and the affected-product bridge has passed a canary. The script itself
+# refuses to claim work without COMMERCE_INDEX_RELGRAPH_APPLY=true.
+mkjob commerce-index-relgraph "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-relgraph,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,COMMERCE_INDEX_RELGRAPH_APPLY=$RELGRAPH_PUBLICATION_WORKER,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1" \
+  --task-timeout 1800s \
+  --command node --args "scripts/drain-commerce-index-relgraph.js,--worker-id,cloud-run-relgraph"
+
+echo "== job: commerce-index-search-index (v2 targeted OpenSearch publication)"
+# Requires CATALOG_SERVING_INDEX_BASE_URL and CATALOG_SERVING_INDEX_API_KEY to
+# be provisioned on the job before SEARCH_INDEX_PUBLICATION_WORKER is enabled.
+# The worker refuses to claim jobs if either the explicit apply gate or index
+# configuration is absent, so an incomplete setup cannot drain the queue.
+mkjob commerce-index-search-index "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,CATALOG_SERVING_INDEX_API_KEY=CATALOG_SERVING_INDEX_API_KEY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-search-index,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,COMMERCE_INDEX_SEARCH_PUBLICATION_APPLY=$SEARCH_INDEX_PUBLICATION_WORKER,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1" \
+  --task-timeout 900s \
+  --command node --args "scripts/drain-commerce-index-search-index.js,--worker-id,cloud-run-search-index"
+
+echo "== job: commerce-index-checkout-validation (v2 quote-first marker)"
+mkjob commerce-index-checkout-validation "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-checkout-validation,PIVOTA_COMMIT_SHA=$BACKEND_TAG,COMMERCE_INDEX_CHECKOUT_VALIDATION_ENABLED=$CHECKOUT_VALIDATION_WORKER,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+  --task-timeout 300s \
+  --command python --args "scripts/drain_commerce_index_checkout_validation_jobs.py"
+
+echo "== job: commerce-index-insight-refresh (v2 reviewed insights requests)"
+mkjob commerce-index-insight-refresh "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-insight-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,COMMERCE_INDEX_INSIGHT_REFRESH_ENABLED=$INSIGHT_REFRESH_WORKER,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+  --task-timeout 300s \
+  --command python --args "scripts/drain_commerce_index_insight_refresh_jobs.py"
 
 echo "== job: reviews-invitation-send (was a 60s bash loop)"
 # Run the one-shot processor DIRECTLY, not scripts/run_reviews_invitation_send_loop.sh.
@@ -100,28 +273,77 @@ echo "== job: reviews-invitation-send (was a 60s bash loop)"
 # connection headroom is gone and every service starts throwing TooManyConnectionsError.
 # The wrapper's own loop body is exactly this script, so a per-minute Scheduler tick IS the loop.
 # DB_POOL_* are pinned because a Job inherits no pool sizing from the deploy scripts.
-mkjob reviews-invitation-send "$BACKEND_IMAGE" \
+mkjob reviews-invitation-send "$BACKEND_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=reviews-invitation-send,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=4" \
   --task-timeout 300s \
   --command python --args "scripts/process_due_reviews_invitation_send_jobs.py"
 
+# Store Audit UCP work has a dedicated, explicitly armed pair of Jobs. The
+# selector only writes bounded verification rows; the probe Job is the sole
+# workload placed on the crawl subnet. Do not create either Job until its
+# dedicated receipt secret and staging endpoint exist: an empty/dummy key would
+# turn a configuration omission into a silently unauthenticated lane.
+if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
+  STORE_AUDIT_UCP_PROBE_CLAIM_URL="$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL/internal/store-audit/ucp-probes/claims"
+  STORE_AUDIT_UCP_PROBE_RECEIPT_URL="$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL/internal/store-audit/ucp-probes/receipts"
+  echo "== job: store-audit-ucp-reprobe-enqueue (domain/TTL selector)"
+  mkjob store-audit-ucp-reprobe-enqueue "$BACKEND_IMAGE" "$UCP_SELECTOR_SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL:latest,STORE_AUDIT_UCP_PROBE_INTERNAL_KEY=STORE_AUDIT_UCP_PROBE_INTERNAL_KEY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=store-audit-ucp-reprobe-enqueue,PIVOTA_COMMIT_SHA=$BACKEND_TAG,STORE_AUDIT_UCP_REPROBE_SCHEDULER_ENABLED=true,STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED=true,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 300s \
+    --command python --args "scripts/run_scheduled_ucp_reprobes.py"
+  echo "== job: store-audit-ucp-probe (anonymous crawl egress)"
+  mkcrawljob store-audit-ucp-probe "$GATEWAY_IMAGE" "$UCP_CRAWL_SA" \
+    --set-secrets "STORE_AUDIT_UCP_PROBE_INTERNAL_KEY=STORE_AUDIT_UCP_PROBE_INTERNAL_KEY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=store-audit-ucp-probe,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,STORE_AUDIT_UCP_PROBE_CLAIM_URL=$STORE_AUDIT_UCP_PROBE_CLAIM_URL,STORE_AUDIT_UCP_PROBE_RECEIPT_URL=$STORE_AUDIT_UCP_PROBE_RECEIPT_URL,STORE_AUDIT_UCP_PROBE_ID_TOKEN_AUDIENCE=$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL" \
+    --command node --args "scripts/run_store_audit_ucp_worker.js"
+  "$GCLOUD" run services add-iam-policy-binding web --region "$REGION" \
+    --member="serviceAccount:$UCP_CRAWL_SA" --role=roles/run.invoker --quiet
+else
+  echo "== Store Audit UCP Jobs not created (STORE_AUDIT_UCP_REPROBE_WORKER=false)"
+fi
+
+# Commerce checkout audit is merchant-scoped, so the selector emits at most
+# one active probe per merchant. The browser job may add one item to cart and
+# reveal checkout routing only; its backend receipt contract rejects address,
+# payment, and order-submission data.
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  COMMERCE_CLAIM_URL="$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL/internal/store-audit/commerce-probes/claims"
+  COMMERCE_RECEIPT_URL="$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL/internal/store-audit/commerce-probes/receipts"
+  echo "== job: store-audit-commerce-reprobe-enqueue (merchant checkout selector)"
+  mkjob store-audit-commerce-reprobe-enqueue "$BACKEND_IMAGE" "$COMMERCE_SELECTOR_SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL:latest,STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=store-audit-commerce-reprobe-enqueue,PIVOTA_COMMIT_SHA=$BACKEND_TAG,STORE_AUDIT_COMMERCE_REPROBE_SCHEDULER_ENABLED=true,STORE_AUDIT_COMMERCE_REPROBE_ARMED=$STORE_AUDIT_COMMERCE_REPROBE_ARMED,STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED=true,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 300s \
+    --command python --args "scripts/run_scheduled_commerce_checkout_reprobes.py"
+  echo "== job: store-audit-commerce-probe (anonymous browser crawl egress)"
+  mkbrowserauditjob store-audit-commerce-probe "$BROWSER_AUDIT_IMAGE" "$COMMERCE_CRAWL_SA" \
+    --set-secrets "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=store-audit-commerce-probe,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,STORE_AUDIT_COMMERCE_REPROBE_ARMED=$STORE_AUDIT_COMMERCE_REPROBE_ARMED,STORE_AUDIT_COMMERCE_PROBE_CLAIM_URL=$COMMERCE_CLAIM_URL,STORE_AUDIT_COMMERCE_PROBE_RECEIPT_URL=$COMMERCE_RECEIPT_URL,STORE_AUDIT_COMMERCE_PROBE_ID_TOKEN_AUDIENCE=$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" \
+    --command node --args "scripts/run_store_audit_commerce_worker.js"
+  "$GCLOUD" run services add-iam-policy-binding web --region "$REGION" \
+    --member="serviceAccount:$COMMERCE_CRAWL_SA" --role=roles/run.invoker --quiet
+else
+  echo "== Store Audit commerce Jobs not created (STORE_AUDIT_COMMERCE_REPROBE_WORKER=false)"
+fi
+
 # ---------------------------------------------------------------- 3. Cloud Scheduler triggers
 PROJECT_NUMBER=$("$GCLOUD" projects describe "$PROJECT" --format='value(projectNumber)')
 RUN_INVOKER="$SA"
 have "$GCLOUD" projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$RUN_INVOKER" --role=roles/run.invoker --condition=None
-sched(){ # name schedule job-name
-  local name="$1" cron="$2" job="$3"
+sched(){ # name schedule job-name [invoker] [paused: 0|1]
+  local name="$1" cron="$2" job="$3" invoker="${4:-$RUN_INVOKER}" paused="${5:-$PAUSED}"
   local uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT/jobs/$job:run"
   local verb=create; have "$GCLOUD" scheduler jobs describe "$name" --location "$REGION" && verb=update
   "$GCLOUD" scheduler jobs "$verb" http "$name" --location "$REGION" \
     --schedule="$cron" --time-zone=Etc/UTC --uri="$uri" --http-method=POST \
-    --oauth-service-account-email="$RUN_INVOKER" \
+    --oauth-service-account-email="$invoker" \
     --attempt-deadline=1800s --quiet
   # FAIL CLOSED on anything that is not exactly 0. `[ "$PAUSED" = 1 ]` treated PAUSED=true, yes, on
   # and "1 " as UNPAUSED - an operator typing PAUSED=true for safety would have armed
   # reviews-invitation-send on a one-minute schedule against a copy of production.
-  case "$PAUSED" in
+  case "$paused" in
     0) "$GCLOUD" scheduler jobs resume "$name" --location "$REGION" --quiet \
          || { echo "FAILED to resume $name" >&2; exit 1; }
        echo "   (RESUMED: $name)" ;;
@@ -133,6 +355,64 @@ sched(){ # name schedule job-name
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
+sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
+sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
+sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
+sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-refresh
+if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
+  for job in store-audit-ucp-reprobe-enqueue store-audit-ucp-probe; do
+    "$GCLOUD" run jobs add-iam-policy-binding "$job" --region "$REGION" \
+      --member="serviceAccount:$UCP_SCHEDULER_SA" --role=roles/run.invoker --quiet
+  done
+  UCP_PAUSED=1
+  [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && UCP_PAUSED=0
+  sched store-audit-ucp-reprobe-enqueue-cron "30 3 * * *" store-audit-ucp-reprobe-enqueue "$UCP_SCHEDULER_SA" "$UCP_PAUSED"
+  sched store-audit-ucp-probe-cron "*/5 * * * *" store-audit-ucp-probe "$UCP_SCHEDULER_SA" "$UCP_PAUSED"
+else
+  # Default false is an idempotent operational disarm, not merely a creation
+  # skip. Existing Jobs may remain for forensic inspection, but their triggers
+  # must never keep crawling after an operator turns the feature off.
+  for trigger in store-audit-ucp-reprobe-enqueue-cron store-audit-ucp-probe-cron; do
+    if have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
+      "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet
+      echo "   (paused: $trigger; STORE_AUDIT_UCP_REPROBE_WORKER=false)"
+    fi
+  done
+fi
+if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
+  for job in store-audit-commerce-reprobe-enqueue store-audit-commerce-probe; do
+    "$GCLOUD" run jobs add-iam-policy-binding "$job" --region "$REGION" \
+      --member="serviceAccount:$COMMERCE_SCHEDULER_SA" --role=roles/run.invoker --quiet
+  done
+  COMMERCE_PAUSED=1
+  [ "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" = true ] && COMMERCE_PAUSED=0
+  sched store-audit-commerce-reprobe-enqueue-cron "45 3 * * *" store-audit-commerce-reprobe-enqueue "$COMMERCE_SCHEDULER_SA" "$COMMERCE_PAUSED"
+  sched store-audit-commerce-probe-cron "*/5 * * * *" store-audit-commerce-probe "$COMMERCE_SCHEDULER_SA" "$COMMERCE_PAUSED"
+else
+  for trigger in store-audit-commerce-reprobe-enqueue-cron store-audit-commerce-probe-cron; do
+    if have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
+      "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet
+      echo "   (paused: $trigger; STORE_AUDIT_COMMERCE_REPROBE_WORKER=false)"
+    fi
+  done
+fi
+# A global scheduler resume must never activate this new writer by accident.
+if [ "$RELGRAPH_PUBLICATION_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-relgraph-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-relgraph-cron; RELGRAPH_PUBLICATION_WORKER=false)"
+fi
+if [ "$SEARCH_INDEX_PUBLICATION_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-search-index-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-search-index-cron; SEARCH_INDEX_PUBLICATION_WORKER=false)"
+fi
+if [ "$CHECKOUT_VALIDATION_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-checkout-validation-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-checkout-validation-cron; CHECKOUT_VALIDATION_WORKER=false)"
+fi
+if [ "$INSIGHT_REFRESH_WORKER" != true ]; then
+  "$GCLOUD" scheduler jobs pause commerce-index-insight-refresh-cron --location "$REGION" --quiet
+  echo "   (paused: commerce-index-insight-refresh-cron; INSIGHT_REFRESH_WORKER=false)"
+fi
 
 echo
 echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=$WORKERS)"

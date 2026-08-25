@@ -61,12 +61,23 @@ jobs:
     steps:
       # TWO checkouts, and the split is deliberate.
       #
-      # This one is the DEPLOY TOOLING, at the current tip: deploy_backend.sh, the ancestry check,
-      # full history. It must be current, because a rollback targets an OLD commit whose copy of
-      # deploy_backend.sh predates CONFIG=preserve and would abort looking for a git-ignored env
-      # file that no runner has.
+      # This one is the DEPLOY TOOLING: deploy_backend.sh, the ancestry check, full history. It
+      # must be current, because a rollback targets an OLD commit whose copy of deploy_backend.sh
+      # predates CONFIG=preserve and would abort looking for a git-ignored env file no runner has.
       - uses: actions/checkout@v4
         with:
+          # `ref: main` is a security control, not tidiness. Without it checkout defaults to
+          # `github.ref`, which for workflow_dispatch is THE BRANCH IT WAS DISPATCHED FROM - so the
+          # deploy tooling would come from that branch too. Anyone with push access could dispatch
+          # a branch carrying a hostile deploy_backend.sh: the ancestry check below would pass (the
+          # SHA really is on main), the image would be built from the validated src/ checkout, and
+          # then line-for-line THAT branch's script would run against production. The same trap
+          # catches an honest operator testing a workflow change from a feature branch.
+          #
+          # The provider's attribute condition now also pins assertion.ref to refs/heads/main, so
+          # a non-main dispatch fails at auth. This is the second lock, in the layer a reader of
+          # this file can actually see.
+          ref: main
           # The ancestry check below is the control that stops an arbitrary or unmerged commit
           # reaching production, and it cannot run on a shallow clone.
           fetch-depth: 0

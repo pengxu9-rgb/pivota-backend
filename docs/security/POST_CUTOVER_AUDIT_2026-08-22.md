@@ -197,7 +197,47 @@ Both scheduler-driven Cloud Run jobs run as the **default compute SA**, which ad
 `roles/owner → user:peng@woopay.tech` is the **only** human principal across all three projects.
 **No break-glass second owner.**
 
-### 2.6 A client has a Railway hostname hardcoded, and its writes are being lost
+### 2.6 A client has a Railway hostname hardcoded, and its writes are being lost — DIAGNOSED AND FIXED 2026-08-25
+
+**The "client" was us.** No third party was involved, and no customer data was lost. The investigation
+found something more useful and slightly different from the original finding.
+
+`PIVOTA-Agent` on Railway — the old gateway, still running as part of the rollback stack — carries
+**7 variables still pointing at `web-production-fedb.up.railway.app`**
+(`AGENT_AUTH_INTROSPECT_URL`, `PIVOTA_API_BASE`, `PIVOTA_BACKEND_BASE_URL`,
+`DISCOVERY_PRODUCTS_SEARCH_BASE_URL`, `AURORA_BFF_RECO_CATALOG_SEARCH_BASE_URLS`,
+`NEXT_PUBLIC_API_URL`, `PROMOTIONS_BACKEND_BASE_URL`). It was calling Railway `web`, which
+authenticated the calls and served them — which is what the photo-upload and `/agent/shop/v1/invoke`
+traffic in the original finding actually was.
+
+**The real problem it exposed: the rollback stack was never inert.** The Railway gateway was running
+`pdp_identity_auto_resolve` on a 30-minute in-process timer with `dry_run=false`, writing **200 rows
+per tick** into the Railway database — roughly **25,000 rows since the cutover**, still going three
+days later.
+
+This is the *same defect class* as the GCP zombie revisions fixed on 2026-08-22, and it is worth
+naming as a class: **an in-process timer keeps running wherever the container runs.** Retiring a
+platform by moving DNS does not stop the code on it. Stopping a *scheduler* (Cloud Scheduler, a
+Railway cron) is visible and obvious; stopping a `setInterval` inside a long-lived process is
+neither, and nothing alerts on it.
+
+**Fixed:** `PDP_IDENTITY_AUTO_RESOLVE_ENABLED=false` on the Railway gateway, then **restarted** —
+a variable change alone does not affect a running container, which is the same trap that made the
+worker flags look applied during the cutover. Verified by waiting past the next scheduled tick
+(~00:54) and confirming **zero** ticks since the 00:24 restart, with the service still healthy and
+all five of its custom-domain hosts still 200 on GCP. The GCP gateway continues to tick against
+live data, as it should.
+
+**Assessed, and less alarming than first stated:** the divergence is confined to derived identity
+and review-queue rows, which both platforms recompute independently. Catalog integrity is still
+byte-identical across the two databases (14,124 / 14,128, drift 0), so the rollback remains viable
+for the data that matters.
+
+**Still open:** the 7 Railway-pointing variables are left as they are *on purpose* — the Railway
+gateway is the rollback, and a rollback stack should point at the rollback backend. They must be
+revisited as part of §2.3 decommissioning, not before.
+
+#### Original finding
 
 Railway edge logs show `POST /photos/presign`, `/photos/confirm` and `GET /photos/download-url`
 arriving on the legacy `web-production-fedb` Railway host from an AWS us-west-1 address — **not**
