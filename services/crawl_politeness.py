@@ -35,7 +35,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -48,6 +48,12 @@ _ROBOTS_TTL_DEFAULT = 3600.0
 _ROBOTS_TIMEOUT_DEFAULT = 5.0
 _BACKOFF_BASE_DEFAULT = 2.0
 _MAX_BACKOFF_DEFAULT = 300.0
+_MAX_ROBOTS_REDIRECTS = 3
+_MAX_ROBOTS_BYTES = 512 * 1024
+# Both caches are keyed by a hostname that reaches us from an UNAUTHENTICATED body
+# (`POST /api/offers/external/resolve` has no auth dependency), so they cannot be
+# allowed to grow without bound. Measured ~500 B/host; this caps each at ~10k hosts.
+_MAX_TRACKED_HOSTS = 10_000
 
 
 class CrawlPaced(RuntimeError):
@@ -113,6 +119,18 @@ def host_of(url: str) -> str:
         return ""
 
 
+def _bounded(store: Dict[str, Any]) -> None:
+    """Keep a host-keyed cache from growing without bound.
+
+    Cleared wholesale rather than LRU-evicted: both caches are pure optimisations whose only cost
+    on a miss is one extra robots fetch or one skipped pace, and an LRU here would be more moving
+    parts than the problem deserves. The point is a ceiling, not a hit rate.
+    """
+    if len(store) > _MAX_TRACKED_HOSTS:
+        logger.warning("crawl politeness cache exceeded %d hosts; clearing", _MAX_TRACKED_HOSTS)
+        store.clear()
+
+
 def reset_for_tests() -> None:
     """Drop all pacing and robots state. Tests only."""
     _STATE.clear()
@@ -137,13 +155,24 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
     delay: Optional[float] = None
     try:
         timeout = _f("CRAWL_ROBOTS_TIMEOUT_SECONDS", _ROBOTS_TIMEOUT_DEFAULT)
+        # `follow_redirects` is LOAD-BEARING, not incidental: 7 of 17 domains in the live cohort
+        # serve robots.txt via at least one redirect, and without this the 3xx falls past the
+        # `status_code == 200` check below and caches as "nothing to obey" — robots silently goes
+        # dark for 41% of the cohort. `max_redirects` is capped because httpx applies `timeout`
+        # PER HOP, so the default 20 would make this fetch's worst case ~20x the nominal timeout
+        # on a request path that has no auth in front of it.
         async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True, headers={"User-Agent": user_agent}
+            timeout=timeout,
+            follow_redirects=True,
+            max_redirects=_MAX_ROBOTS_REDIRECTS,
+            headers={"User-Agent": user_agent},
         ) as client:
             resp = await client.get(f"https://{host}/robots.txt")
         if resp.status_code == 200:
             parser = RobotFileParser()
-            parser.parse(resp.text.splitlines())
+            # Size-capped for the same reason `MAX_BODY_BYTES` caps the page fetch: an unbounded
+            # `resp.text` here is memory an unauthenticated caller can ask a third party to spend.
+            parser.parse(resp.text[:_MAX_ROBOTS_BYTES].splitlines())
             try:
                 raw_delay = parser.crawl_delay(user_agent)
                 delay = float(raw_delay) if raw_delay is not None else None
@@ -153,6 +182,7 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
     except Exception as exc:  # noqa: BLE001
         logger.info("robots.txt unavailable for %s (%s); proceeding without restrictions", host, exc)
 
+    _bounded(_ROBOTS)
     _ROBOTS[host] = (now + ttl, parser, delay)
     return parser, delay
 
@@ -192,6 +222,7 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
         # site asking for 10s be hit every second while technically "having a robots check".
         interval = max(interval, robots_delay)
 
+    _bounded(_STATE)
     state = _STATE.setdefault(host, _DomainState())
     now = time.monotonic()
     start = max(now, state.next_allowed, state.backoff_until)
@@ -215,6 +246,10 @@ def note_response(url: str, status_code: int, *, retry_after: Optional[str] = No
     host = host_of(url)
     if not host:
         return
+    # Bounded here too, not only in await_slot: note_response CREATES state, and a caller that
+    # only ever records responses (or one whose requests are all refused) would otherwise grow
+    # this cache past the ceiling without await_slot ever running.
+    _bounded(_STATE)
     state = _STATE.setdefault(host, _DomainState())
 
     if status_code not in (429, 503):

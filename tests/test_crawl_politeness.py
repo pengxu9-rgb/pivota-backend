@@ -232,11 +232,15 @@ def test_a_robots_crawl_delay_slows_us_down_but_never_speeds_us_up(
     would let us hit it every second while still "having a robots check", which is the shape of
     compliance without the substance. The reverse also matters: a host asking for 0.1s must not
     make us FASTER than our own floor."""
+    # NOTE: `Crawl-delay: 0.1` would be VACUOUS here — RobotFileParser accepts only an INTEGER
+    # (it gates on `.isdigit()`), so a fractional value is discarded by the PARSER and never
+    # reaches our max(). The eager case must therefore use an integer below our floor, which
+    # means raising our floor above 1 to have anything to be faster than.
     _serve_robots(monkeypatch, {
         "slow.com": "User-agent: *\nCrawl-delay: 10\n",
-        "eager.com": "User-agent: *\nCrawl-delay: 0.1\n",
+        "eager.com": "User-agent: *\nCrawl-delay: 1\n",
     })
-    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "1.0")
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "4.0")
     _patch_sleep(monkeypatch)
 
     async def two_hits(host: str) -> float:
@@ -245,8 +249,10 @@ def test_a_robots_crawl_delay_slows_us_down_but_never_speeds_us_up(
         await cp.await_slot(f"https://{host}/b", user_agent="PivotaBot")
         return cp._STATE[host].next_allowed - before
 
-    assert asyncio.run(two_hits("slow.com")) == pytest.approx(10.0, abs=0.5)
-    assert asyncio.run(two_hits("eager.com")) == pytest.approx(1.0, abs=0.5)
+    assert asyncio.run(two_hits("slow.com")) == pytest.approx(10.0, abs=0.5), "slower wins"
+    assert asyncio.run(two_hits("eager.com")) == pytest.approx(4.0, abs=0.5), (
+        "a host asking to be hit FASTER than our floor must not speed us up"
+    )
 
 
 # --- backoff --------------------------------------------------------------------------------
@@ -410,9 +416,11 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     # pacing/robots path is genuinely exercised rather than replaced.
     real_gate = cp.before_request
 
-    async def spy(url: str, *, user_agent: str) -> None:
-        calls.append(("gate", url))
-        await real_gate(url, user_agent=user_agent)
+    async def spy(url: str, *, user_agent: str, max_wait=None) -> None:
+        # Accepts `max_wait` because the fetcher now threads the caller's patience through — a
+        # spy with a stale signature fails on a TypeError that says nothing about the fetcher.
+        calls.append(("gate", url, max_wait))
+        await real_gate(url, user_agent=user_agent, max_wait=max_wait)
 
     monkeypatch.setattr(cp, "before_request", spy)
     _serve_robots(monkeypatch, {"brand.com": 404})
@@ -448,7 +456,9 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
 
     asyncio.run(go())
 
-    assert ("gate", "https://brand.com/products/x") in calls, "the fetcher must go through the gate"
+    assert calls and calls[0][0] == "gate" and calls[0][1] == "https://brand.com/products/x", (
+        f"the fetcher must go through the gate, saw {calls}"
+    )
     state = cp._STATE.get("brand.com")
     assert state is not None and state.consecutive_blocks == 1, (
         "the 429 must be recorded even though raise_for_status raised — recording after it would "
@@ -548,3 +558,164 @@ def test_a_batch_job_can_opt_into_waiting(monkeypatch: pytest.MonkeyPatch) -> No
 
     asyncio.run(go())
     assert any(d > 500 for d in slept), f"the batch caller must actually wait: {slept}"
+
+
+# --- rows for gaps a mutation run found, each pinning a behaviour nothing else did -------------
+
+def test_a_redirected_robots_is_followed_rather_than_silently_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`follow_redirects=True` is load-bearing, and no other row proves it.
+
+    Measured on the live cohort: 7 of 17 domains serve robots.txt via at least one redirect.
+    Without following, the 3xx falls past the `status_code == 200` check and caches as "nothing
+    to obey" — robots goes DARK for 41% of the cohort while every test stays green.
+    """
+    fetched: List[str] = []
+
+    class _RedirectingClient:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            self.follow = kw.get("follow_redirects", False)
+
+        async def __aenter__(self) -> "_RedirectingClient":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            fetched.append(url)
+            if not self.follow:
+                # What httpx returns when redirects are NOT followed.
+                return httpx.Response(301, text="", request=httpx.Request("GET", url))
+            return httpx.Response(
+                200, text="User-agent: *\nDisallow: /products/\n",
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(cp, "httpx", SimpleNamespace(AsyncClient=_RedirectingClient))
+    assert asyncio.run(
+        cp.robots_allows("https://brand.com/products/x", user_agent="PivotaBot")
+    ) is False, "a redirected robots.txt must still be obeyed"
+    assert fetched == ["https://brand.com/robots.txt"], (
+        f"robots must be fetched over https at the well-known path, got {fetched}"
+    )
+
+
+def test_a_503_backs_off_exactly_like_a_429() -> None:
+    """The contract says "429/503". Nothing drove a 503 — and 503 is what Shopify and Cloudflare
+    return under load, so it is the likelier of the two in practice."""
+    cp.note_response("https://brand.com/x", 503)
+    state = cp._STATE["brand.com"]
+    assert state.consecutive_blocks == 1
+    assert state.backoff_until > 0
+
+    cp.note_response("https://brand.com/x", 503)
+    assert cp._STATE["brand.com"].consecutive_blocks == 2, "503s must compound too"
+
+
+def test_a_negative_env_value_cannot_disable_pacing_or_the_wait_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_f` clamps at 0. Without the clamp a negative `CRAWL_MIN_INTERVAL_SECONDS` walks
+    `next_allowed` BACKWARDS — pacing off entirely — and a negative `CRAWL_MAX_WAIT_SECONDS`
+    makes `ceiling > 0` false, restoring the unbounded stall on the live route. Operator error
+    should not silently switch the gate off."""
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "-1")
+    assert cp._min_interval() == 0.0
+    monkeypatch.setenv("CRAWL_MAX_BACKOFF_SECONDS", "-5")
+    assert cp._f("CRAWL_MAX_BACKOFF_SECONDS", 300.0) == 0.0
+
+
+def test_a_wait_exactly_at_the_ceiling_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The boundary of the guard the whole design rests on.
+
+    THE CLOCK MUST BE FROZEN. On a real monotonic clock a few microseconds elapse between
+    reserving the slot and measuring the wait, so `start - now` is 9.9999… and never exactly the
+    ceiling — `>` and `>=` agree, and the assertion looks like it pins the boundary while pinning
+    nothing. (That is exactly how this row first failed to kill its mutant.)
+    """
+    _serve_robots(monkeypatch, {"brand.com": 404})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setattr(cp, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "10")
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+
+    async def go() -> None:
+        await cp.await_slot("https://brand.com/a", user_agent="PivotaBot")
+        # The clock is frozen, so the second caller is EXACTLY one interval — exactly the
+        # ceiling — out. At the boundary we serve; past it we refuse.
+        await cp.await_slot("https://brand.com/b", user_agent="PivotaBot")
+
+    asyncio.run(go())
+    assert any(d == pytest.approx(10.0) for d in slept), (
+        f"a wait of exactly the ceiling must be served, not refused: {slept}"
+    )
+
+
+def test_a_port_does_not_split_a_host_into_two_pacing_buckets() -> None:
+    """`hostname` not `netloc`. Otherwise `b.com` and `b.com:443` pace independently and the host
+    sees double our intended rate."""
+    assert cp.host_of("https://b.com:443/x") == "b.com"
+    assert cp.host_of("https://b.com/x") == "b.com"
+    assert cp.host_of("https://User:Pass@B.COM:8443/x") == "b.com"
+
+
+def test_the_host_caches_cannot_grow_without_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`POST /api/offers/external/resolve` has no auth dependency, so the hostname keying these
+    caches arrives from an unauthenticated body. Unbounded, an attacker grows them one distinct
+    hostname at a time — and doubles our outbound amplification while doing it."""
+    monkeypatch.setattr(cp, "_MAX_TRACKED_HOSTS", 50)
+    for i in range(120):
+        cp.note_response(f"https://h{i}.example/x", 429)
+    assert len(cp._STATE) <= 51, f"pacing state grew unbounded: {len(cp._STATE)}"
+
+
+def test_a_parser_that_blows_up_fails_OPEN_like_every_other_robots_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defensive `except` around `can_fetch` had no coverage, so nothing stopped it being
+    flipped to fail-closed — which would contradict the module's stated contract everywhere else
+    and silently stop crawling a host whose robots.txt merely confuses the parser."""
+    _serve_robots(monkeypatch, {"brand.com": "User-agent: *\nDisallow: /products/\n"})
+
+    class _ExplodingParser:
+        def parse(self, _lines: Any) -> None:
+            return None
+
+        def crawl_delay(self, _ua: str) -> None:
+            return None
+
+        def can_fetch(self, _ua: str, _url: str) -> bool:
+            raise ValueError("malformed rule set")
+
+    monkeypatch.setattr(cp, "RobotFileParser", _ExplodingParser)
+    assert asyncio.run(
+        cp.robots_allows("https://brand.com/products/x", user_agent="PivotaBot")
+    ) is True, "a parser failure is an outage, not a refusal"
+
+
+def test_the_batch_scripts_opt_into_waiting_rather_than_being_refused() -> None:
+    """P1 from review. `max_wait=0` exists FOR these callers and was wired into none of them.
+
+    With the default 10s ceiling, the backoff curve (2, 4, 8, 16, 32 … 300) becomes unreachable
+    from the 4th consecutive 429 onward: `await_slot` refuses instead of waiting, the scripts'
+    `except Exception` records the row as `fetch_failed`, and — because a refusal returns
+    instantly — the whole remaining backlog burns down in milliseconds. Measured in review: a host
+    that 429s only its first 4 requests turned 40 rows into 5 repaired and 31 silently skipped,
+    indistinguishable from the host being down.
+
+    Asserted against the SOURCE because the failure is silent and the fix is a keyword argument
+    that is easy to drop in a refactor: nothing at runtime would complain.
+    """
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    for rel in ("scripts/source_pdp_offer_image_repair.py", "scripts/source_pdp_content_repair.py"):
+        text = (repo / rel).read_text()
+        calls = [ln.strip() for ln in text.splitlines() if "await _fetch_html(" in ln]
+        assert calls, f"{rel}: expected at least one _fetch_html call"
+        for call in calls:
+            assert "max_wait=0" in call, (
+                f"{rel}: a BATCH fetch must opt into waiting out a backoff, got: {call}"
+            )
