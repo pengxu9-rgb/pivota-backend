@@ -259,21 +259,50 @@ probe_health(){ # url -> echoes the status code
     --service-account "sa-worker@$PROJECT.iam.gserviceaccount.com" \
     --network default --subnet default --vpc-egress all-traffic \
     --max-retries 0 --task-timeout 120s --command python \
-    --args="^|^-c|import urllib.request;print('PROBE_STATUS='+str(urllib.request.urlopen('$url',timeout=25).status))" \
+    --args="^|^-c|import urllib.request,sys;s=urllib.request.urlopen('$url',timeout=25).status;print('PROBE_STATUS='+str(s));sys.exit(0 if s==200 else 1)" \
     --quiet >/dev/null 2>&1
-  local out="" i
-  if "$GCLOUD" run jobs execute "$job" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1; then
-    # Cloud Logging ingestion lags the job's exit by a few seconds. Reading immediately returns
-    # nothing and the probe reports 000 - which reads exactly like a failed health check and would
-    # strand a healthy revision. Poll instead of guessing a sleep.
-    for i in 1 2 3 4 5 6; do
-      out=$("$GCLOUD" logging read "resource.labels.job_name=\"$job\"" --project "$PROJECT" --limit 15 \
-        --format='value(textPayload)' 2>/dev/null | grep -oE 'PROBE_STATUS=[0-9]+' | head -1 | cut -d= -f2)
-      [ -n "$out" ] && break
-      sleep 5
-    done
-  fi
+  # THE VERDICT IS THE JOB'S EXIT CODE, NOT ITS LOGS.
+  #
+  # urlopen raises on any non-2xx (HTTPError) and on any connection failure (URLError), and the
+  # probe now exits non-zero for a 2xx that is not exactly 200 - so `exit 0` means, precisely,
+  # "the application answered 200 from inside the VPC". The job already carries that answer out
+  # through --wait. Scraping it back out of Cloud Logging was asking a second, slower, less
+  # reliable system to re-tell us something we had already been told.
+  #
+  # That indirection stranded a healthy revision on 2026-08-25. The probe DID return 200
+  # (PROBE_STATUS=200, logged 02:25:10.788Z) and the candidate was Ready/ContainerHealthy, but the
+  # entry had not become QUERYABLE inside the 30s poll below, so the read came back empty, the
+  # function returned 000, and the deploy refused to promote. Ingestion lag is unbounded; any
+  # fixed window is a guess, and every guess eventually loses. The exit code has no such window.
+  #
+  # Failure direction is unchanged and still safe: a missing image, a shredded --args, no python,
+  # an unroutable URL, or a non-200 all exit non-zero and still refuse the promotion.
+  local out="" i probe_rc=0
+  "$GCLOUD" run jobs execute "$job" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1 \
+    || probe_rc=$?
+
+  # Best-effort, for the human-readable line ONLY. It can no longer downgrade a pass, so a slow
+  # or empty read costs a vaguer message and nothing else.
+  for i in 1 2 3; do
+    out=$("$GCLOUD" logging read "resource.labels.job_name=\"$job\"" --project "$PROJECT" --limit 15 \
+      --format='value(textPayload)' 2>/dev/null | grep -oE 'PROBE_STATUS=[0-9]+' | head -1 | cut -d= -f2)
+    [ -n "$out" ] && break
+    sleep 5
+  done
   "$GCLOUD" run jobs delete "$job" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
+
+  if [ "$probe_rc" = 0 ]; then
+    [ -n "$out" ] || echo "   in-VPC probe passed (its PROBE_STATUS line has not surfaced in Cloud Logging yet)" >&2
+    echo 200
+    return 0
+  fi
+  echo "   in-VPC probe job exited $probe_rc${out:+ (PROBE_STATUS=$out)}" >&2
+  # A PASS is the exit code and nothing else. If the scrape reports 200 for a job that FAILED
+  # the two disagree, and the scrape does not get to win: echoing it here would hand the caller
+  # the single value that promotes, on the strength of the slower, less reliable signal this
+  # function was just rewritten to stop trusting. Any other recovered code is safe to pass
+  # through - it cannot promote, and it makes the failure message specific.
+  [ "${out:-000}" = 200 ] && out=000
   echo "${out:-000}"
 }
 
