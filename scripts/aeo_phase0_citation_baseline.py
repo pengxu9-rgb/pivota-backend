@@ -138,11 +138,18 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple  # Tuple: batch grouping key
 
-# Production is Cloud Run behind gateway.pivota.cc. The old Railway host is the
-# ROLLBACK: it still answers, still serves /internal/agent-center/llm-probe, and
-# still runs a DIFFERENT build - so defaulting there produced a citation baseline
-# that looked valid and measured a platform nobody is served from. Route verified
-# 2026-08-25 (401 without a key on gateway.pivota.cc = present and authenticating).
+# Production is Cloud Run behind gateway.pivota.cc. Route verified 2026-08-25: an
+# unauthenticated POST to PROBE_PATH there returns 401, i.e. present and
+# authenticating, not 404.
+#
+# This used to default to pivota-agent-production.up.railway.app. That host is now
+# GONE - 404 on every path including PROBE_PATH, with `x-railway-fallback: true`
+# from Railway's edge, meaning no service is bound to the domain - so the old
+# default did not merely measure the rollback, it could not complete a run at all.
+# It DID answer 200 earlier the same day, which is the point: a rollback host's
+# liveness is perishable, and while it lives, defaulting to it yields a citation
+# baseline that looks valid and describes a platform nobody is served from.
+# Re-probe before citing either state.
 DEFAULT_AGENT_URL = "https://gateway.pivota.cc"
 PROBE_PATH = "/internal/agent-center/llm-probe"
 

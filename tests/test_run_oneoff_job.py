@@ -48,7 +48,9 @@ GCLOUD_STUB = r"""#!/bin/sh
 case "$1 $2" in
   "run jobs")
     case "$3" in
-      create) exit "$STUB_JOB_CREATE_RC" ;;
+      create)
+        [ "$STUB_JOB_CREATE_RC" = 0 ] || echo "stub: PERMISSION_DENIED on secret" >&2
+        exit "$STUB_JOB_CREATE_RC" ;;
       # Without --wait this returns 0 as soon as the execution is CREATED rather
       # than when it FINISHES, so the exit code stops meaning "the script ran".
       execute)
@@ -103,7 +105,7 @@ class Run:
 
 def run(tmp_path: Path, args: list[str], **env_overrides: str) -> Run:
     stub_dir = tmp_path / "bin"
-    stub_dir.mkdir()
+    stub_dir.mkdir(exist_ok=True)
     (stub_dir / "gcloud").write_text(GCLOUD_STUB)
     (stub_dir / "gcloud").chmod(0o755)
     (stub_dir / "sleep").write_text(SLEEP_STUB)
@@ -168,7 +170,7 @@ def test_success_with_no_readable_log_is_still_a_pass(tmp_path: Path) -> None:
 
     assert r.rc == 0
     assert "no log entries readable" in r.err
-    assert "exit 0" in r.err
+    assert "succeeded" in r.err
 
 
 def test_the_job_is_deleted_on_the_failure_path(tmp_path: Path) -> None:
@@ -258,3 +260,128 @@ def test_no_arguments_is_refused_rather_than_running_a_bare_interpreter(tmp_path
 
     assert r.rc == 2
     assert not r.has("run", "jobs", "create")
+
+
+# ---------------------------------------------------------------------------
+# Coverage for the `gcloud logging read` invocation and the create-time flags.
+#
+# The first version of this file asserted five flags on `create` and NOTHING on
+# `logging read`, so ten separate one-line mutations of the script survived the
+# whole suite — including dropping `--max-retries 0` (Cloud Run then defaults to
+# THREE retries, so a failing --apply re-runs up to four times) and pointing the
+# log filter at a different job name (you get someone else's output as yours).
+# ---------------------------------------------------------------------------
+
+
+def test_the_log_read_is_scoped_to_this_job_and_to_stdout(tmp_path: Path) -> None:
+    r = run(tmp_path, ["scripts/x.py"], STUB_LOG_OUTPUT="line\n")
+
+    assert r.rc == 0
+    read = r.call("logging", "read")
+    filt = read[2]
+    # Someone else's job output presented as yours is worse than no output.
+    job = r.call("run", "jobs", "create")[3]
+    assert f'job_name="{job}"' in filt
+    # cloudaudit system_event entries carry no textPayload and render as blank
+    # lines interleaved through the report.
+    assert "logName" in filt and "stdout" in filt
+    # A structured logger writes to jsonPayload, not textPayload.
+    fmt = r.flag(read, "--format")
+    assert "textPayload" in fmt and "jsonPayload" in fmt
+    # Newest-first means a low --limit silently returns the LAST N lines and
+    # presents them as the whole run. Keep the cap far above a real script's
+    # output rather than near it.
+    assert int(r.flag(read, "--limit")) >= 5000
+
+
+def test_the_log_window_is_wider_than_the_task_can_run(tmp_path: Path) -> None:
+    """--freshness=10m against a 600s task timeout drops the start of a long run."""
+    r = run(tmp_path, ["scripts/x.py"], STUB_LOG_OUTPUT="line\n", TASK_TIMEOUT="3600s")
+
+    assert r.rc == 0
+    freshness = r.flag(r.call("logging", "read"), "--freshness")
+    assert int(freshness.rstrip("s")) > 3600
+
+
+def test_retries_run_lost_to_ingestion_lag_are_retried(tmp_path: Path) -> None:
+    """The header promises the read happens 'behind a retry'. Prove it does."""
+    r = run(tmp_path, ["scripts/x.py"], STUB_LOG_OUTPUT="", STUB_JOB_EXECUTE_RC="0")
+
+    assert r.rc == 0
+    reads = [c for c in r.calls if c[:2] == ["logging", "read"]]
+    assert len(reads) == 6, f"want 6 attempts, got {len(reads)}"
+
+
+def test_the_job_does_not_silently_rerun_a_failing_apply(tmp_path: Path) -> None:
+    """Cloud Run defaults --max-retries to 3; an --apply script would run 4x."""
+    r = run(tmp_path, ["scripts/x.py", "--apply"])
+
+    assert r.flag(r.call("run", "jobs", "create"), "--max-retries") == "0"
+
+
+def test_create_carries_the_identity_image_and_vpc_route(tmp_path: Path) -> None:
+    r = run(tmp_path, ["scripts/x.py"])
+    create = r.call("run", "jobs", "create")
+
+    # The default compute SA has no secretAccessor on DATABASE_URL.
+    assert r.flag(create, "--service-account") == "sa-worker@pivota-prod.iam.gserviceaccount.com"
+    assert r.flag(create, "--image").endswith("/pivota/backend:latest")
+    # Cloud SQL is on a private IP; without the VPC route there is no path to it.
+    # Adjacency, not mere membership — `--vpc-egress` must carry THIS value.
+    assert r.flag(create, "--vpc-egress") == "all-traffic"
+    assert r.flag(create, "--network") == "default"
+    assert r.flag(create, "--subnet") == "default"
+    assert r.flag(create, "--task-timeout") == "600s"
+
+
+def test_the_database_guardrails_are_resupplied(tmp_path: Path) -> None:
+    """A job inherits nothing — including the timeouts that bound a bad query.
+
+    db/database.py defaults BOTH of these to 0.0, which means OFF, so a job that
+    did not re-supply them would run against production with statement timeouts
+    disabled.
+    """
+    r = run(tmp_path, ["scripts/x.py"])
+    env = r.flag(r.call("run", "jobs", "create"), "--set-env-vars")
+
+    assert "DB_STATEMENT_TIMEOUT_SECONDS=30" in env
+    assert "DB_COMMAND_TIMEOUT_SECONDS=600" in env
+
+
+def test_env_vars_are_overridable(tmp_path: Path) -> None:
+    r = run(tmp_path, ["scripts/x.py"], ENV_VARS="FOO=bar")
+
+    assert r.flag(r.call("run", "jobs", "create"), "--set-env-vars") == "FOO=bar"
+
+
+def test_help_prints_usage_without_touching_production(tmp_path: Path) -> None:
+    """`--help` used to become the PAYLOAD: it mounted the production database
+    secret to print Python's help, then reported success."""
+    for flag in ("--help", "-h"):
+        r = run(tmp_path, [flag])
+        assert r.rc == 2, flag
+        assert not r.has("run", "jobs", "create"), flag
+        assert "Usage:" in r.err, flag
+
+
+def test_an_empty_argument_is_refused_not_silently_dropped(tmp_path: Path) -> None:
+    """gcloud drops a leading/trailing empty value and SHIFTS argv after it.
+
+    `--merchant-id "$MID"` with MID unset would otherwise ship
+    `['scripts/x.py', '--merchant-id']` — a different command than the one
+    written down, run against production.
+    """
+    for args in (["", "scripts/x.py"], ["scripts/x.py", "--merchant-id", ""]):
+        r = run(tmp_path, args)
+        assert r.rc == 2, args
+        assert "empty" in r.err, args
+        assert not r.has("run", "jobs", "create"), args
+
+
+def test_a_failed_create_says_why(tmp_path: Path) -> None:
+    """The exit code says THAT it failed; only gcloud's stderr says WHY."""
+    r = run(tmp_path, ["scripts/x.py"], STUB_JOB_CREATE_RC="1")
+
+    assert r.rc != 0
+    assert "PERMISSION_DENIED" in r.err
+    assert not r.has("run", "jobs", "execute")

@@ -122,8 +122,12 @@ already handled, and is what the operator scripts' own `--help` now points at:
 scripts/ops/run_oneoff_job.sh scripts/partner_settlement_dry_run.py --json
 ```
 
-It exits with the job's own exit status, deletes the job on every path including
-Ctrl-C, and picks an `--args` delimiter that does not occur in the payload.
+It exits 0 when the container exited 0 and non-zero when it did not, deletes the
+job on every path including Ctrl-C, and picks an `--args` delimiter that does not
+occur in the payload. Note that non-zero is not the container's OWN code —
+`gcloud run jobs execute` raises an error carrying no exit code, so every job
+failure surfaces as 1 alike; that is why the helper prints gcloud's stderr on
+failure rather than discarding it.
 Reach for the raw form above when you need to change something it does not expose
 (`SECRETS`, `IMAGE`, `TASK_TIMEOUT`, `SERVICE_ACCOUNT` and `JOB_PREFIX` are
 environment overrides).

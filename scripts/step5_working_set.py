@@ -48,11 +48,13 @@ There is no `railway run` equivalent. Use a throwaway job on the production imag
 (the helper mounts the DATABASE_URL secret — a job inherits NO env and NO
 secrets — and takes its verdict from the job's EXIT CODE):
 
-  scripts/ops/run_oneoff_job.sh scripts/step5_working_set.py --output-json reports/step5/working_set.json
+  scripts/ops/run_oneoff_job.sh scripts/step5_working_set.py > working_set.txt
 
-Note the job writes --output-json INSIDE the container, which is discarded on
-exit; the helper streams the run's stdout back, so redirect that locally instead
-when you want the file. Full pattern: docs/runbooks/operating_on_gcp_production.md.
+Do NOT pass --output-json to the job: it writes inside the container, whose
+filesystem is destroyed on exit, and nothing retrieves it — the flag would appear
+to work and produce nothing. The helper streams the run's stdout back, so
+redirect THAT when you want a file. Full pattern:
+docs/runbooks/operating_on_gcp_production.md.
 
 (This still uses a single asyncpg connection with retries rather than the pooled
 database.connect(), which flaked against the old public proxy — see

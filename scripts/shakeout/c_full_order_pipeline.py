@@ -21,18 +21,21 @@ Usage:
     export SHAKEOUT_DB_URL=...   # see the note below
     .venv/bin/python scripts/shakeout/c_full_order_pipeline.py
 
-WHERE SHAKEOUT_DB_URL COMES FROM, and why it is not a command here. It used to be
-the `Postgres-xMr6` DATABASE_PUBLIC_URL — that is the ROLLBACK's database now.
-Production is Cloud Run in pivota-prod/us-west1 on Cloud SQL, and its
-`DATABASE_URL` secret resolves to a PRIVATE IP (verified 2026-08-25), so there is
-no URL that reaches it from a laptop and this script cannot be pointed at
-production from outside the VPC at all. To exercise the pipeline against the
-production database, run it from inside instead:
+WHERE SHAKEOUT_DB_URL COMES FROM, and why there is deliberately no production
+command here. It used to be the `Postgres-xMr6` DATABASE_PUBLIC_URL — that is the
+ROLLBACK's database now. Production is Cloud Run in pivota-prod/us-west1 on Cloud
+SQL, and its `DATABASE_URL` secret resolves to a PRIVATE IP (verified
+2026-08-25), so nothing reaches it from a laptop.
 
-    scripts/ops/run_oneoff_job.sh scripts/shakeout/c_full_order_pipeline.py
-
-which mounts the DATABASE_URL secret and runs in-VPC. Otherwise point
-SHAKEOUT_DB_URL at a staging or local database you already have a URL for.
+🚨 DO NOT POINT THIS SCRIPT AT THE PRODUCTION DATABASE, and in particular do not
+run it under `scripts/ops/run_oneoff_job.sh` — that helper mounts the PRODUCTION
+`DATABASE_URL`. This is not a read-only probe: it `INSERT`s into `orders` and
+`commerce_attribution_edges` and `UPDATE`s orders to `payment_status='paid'`
+(lines ~148, ~185, ~249). It also drives an HTTP surface separately from the DB,
+so under that helper `SHAKEOUT_BASE_URL` would still default to the STAGING host
+below — synthetic paid orders written into the production ledger from a staging
+shakeout. Point SHAKEOUT_DB_URL at a staging or local database whose URL you
+already have; that is the only supported venue.
 
 The base URL below is still the Railway staging host ON PURPOSE: GCP staging
 `web` runs with `ingress: internal`, so it is not reachable from a laptop.
@@ -89,10 +92,11 @@ def _connect():
     if not url:
         sys.stderr.write(
             "ERROR: SHAKEOUT_DB_URL not set.\n"
-            "    Production's DATABASE_URL resolves to a PRIVATE IP and is not\n"
-            "    reachable from a laptop; run this inside the VPC instead:\n"
-            "      scripts/ops/run_oneoff_job.sh scripts/shakeout/c_full_order_pipeline.py\n"
-            "    Otherwise set SHAKEOUT_DB_URL to a staging or local database URL.\n"
+            "    Set it to a STAGING or LOCAL database URL. This script writes\n"
+            "    (INSERT orders / attribution edges, UPDATE orders to paid), so it\n"
+            "    must never be aimed at the production database - including via\n"
+            "    scripts/ops/run_oneoff_job.sh, which mounts the production\n"
+            "    DATABASE_URL secret.\n"
         )
         sys.exit(2)
     return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)

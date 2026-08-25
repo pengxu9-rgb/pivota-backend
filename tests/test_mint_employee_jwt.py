@@ -137,3 +137,75 @@ def test_mint_employee_jwt_requires_a_secret_source(monkeypatch) -> None:
         _run(monkeypatch, ["--email", "ops+audit@pivota.invalid", "--jwt-secret", ""])
     message = str(excinfo.value)
     assert "--gcp-secret" in message and "--railway-service" in message
+
+
+# ---------------------------------------------------------------------------
+# `_load_secret_from_gcp` itself: the three tests above monkeypatch it, so
+# nothing covered what it actually SHELLS OUT. Four mutations of its argv
+# survived the original suite — swapping --secret/--project, pinning ":1"
+# instead of "latest", and dropping the empty-value guard.
+# ---------------------------------------------------------------------------
+
+
+def test_gcp_loader_asks_for_the_right_secret_in_the_right_project(monkeypatch) -> None:
+    seen: dict = {}
+
+    def _fake(cmd, text=False):
+        seen["cmd"] = cmd
+        return "the-key"
+
+    monkeypatch.setattr(module.subprocess, "check_output", _fake)
+
+    assert module._load_secret_from_gcp("env-JWT_SECRET_KEY", "pivota-prod") == "the-key"
+    assert seen["cmd"] == [
+        "gcloud", "secrets", "versions", "access", "latest",
+        "--secret=env-JWT_SECRET_KEY", "--project=pivota-prod",
+    ]
+
+
+def test_gcp_loader_does_not_strip_the_payload(monkeypatch) -> None:
+    """Cloud Run mounts the payload verbatim and the app reads a bare os.getenv.
+
+    A secret stored with a trailing newline is what the SERVICE verifies with, so
+    stripping it here would sign with a different key and produce a 401 that
+    looks like a broken account rather than a mangled key.
+    """
+    monkeypatch.setattr(module.subprocess, "check_output", lambda cmd, text=False: "the-key\n")
+
+    assert module._load_secret_from_gcp("env-JWT_SECRET_KEY", "pivota-prod") == "the-key\n"
+
+
+def test_gcp_loader_refuses_an_empty_payload(monkeypatch) -> None:
+    monkeypatch.setattr(module.subprocess, "check_output", lambda cmd, text=False: "")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        module._load_secret_from_gcp("env-JWT_SECRET_KEY", "pivota-prod")
+    assert "empty" in str(excinfo.value)
+
+
+def test_gcp_secret_does_not_silently_override_an_explicit_jwt_secret(monkeypatch) -> None:
+    """B2: the old guard covered gcp-vs-railway only.
+
+    `--jwt-secret abc --gcp-secret` signed with the GCP key and never said that
+    `abc` had been discarded — the exact hazard the guard's own comment names.
+    """
+    monkeypatch.setattr(module, "_load_secret_from_gcp", lambda secret, project: "gcp-secret")
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, ["--email", "a@b.c", "--jwt-secret", "abc", "--gcp-secret"])
+    assert "only one" in str(excinfo.value)
+
+
+def test_an_empty_gcp_secret_name_does_not_fall_through_to_railway(monkeypatch) -> None:
+    """B3: a truthiness guard let `--gcp-secret=` skip both the check and the load."""
+    monkeypatch.setattr(module, "_load_secret_from_railway", lambda service, environment: "rail-secret")
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, ["--email", "a@b.c", "--gcp-secret=", "--railway-service", "web"])
+    assert "only one" in str(excinfo.value)
+
+
+def test_an_empty_gcp_secret_name_alone_is_refused(monkeypatch) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, ["--email", "a@b.c", "--gcp-secret="])
+    assert "empty secret name" in str(excinfo.value)

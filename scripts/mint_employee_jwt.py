@@ -25,10 +25,11 @@ def _parse_args() -> argparse.Namespace:
             "which reads as 'my admin account is broken' rather than 'I signed "
             "with the wrong key'. Prefer:\n"
             "  scripts/mint_employee_jwt.py --email you@pivota.cc --gcp-secret\n"
-            "Most of this project's secrets carry an 'env-' prefix; a handful "
-            "(DATABASE_URL, REDIS_URL, PCI_KB_DATABASE_URL, "
-            "STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY) are bare. Confirm the real "
-            "name from the running service rather than trusting one written down:\n"
+            "Most of this project's secrets carry an 'env-' prefix and a few are "
+            "bare; the list lives in docs/runbooks/operating_on_gcp_production.md "
+            "and is not restated here, because a copy is a copy that goes stale "
+            "separately. Confirm the real name from the running service rather "
+            "than trusting any list, that one included:\n"
             "  gcloud run services describe web --project pivota-prod "
             "--region us-west1 --format=json   # read the secretKeyRef"
         ),
@@ -105,7 +106,13 @@ def _load_secret_from_gcp(secret: str, project: str) -> str:
         f"--secret={secret}",
         f"--project={project}",
     ]
-    value = subprocess.check_output(cmd, text=True).strip()
+    # NOT .strip(). Cloud Run mounts the payload verbatim and the app reads it
+    # with a bare os.getenv (config/settings.py:623), so the service's key is the
+    # exact bytes stored. If a payload was created with a trailing newline — the
+    # classic `echo ... | gcloud secrets create --data-file=-` — stripping here
+    # would sign with a DIFFERENT key than the service verifies with, producing
+    # exactly the "401 with nothing in the logs" this flag exists to avoid.
+    value = subprocess.check_output(cmd, text=True)
     if not value:
         raise RuntimeError(f"{secret} is empty in project {project}")
     return value
@@ -144,24 +151,40 @@ def _build_claims(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> int:
     args = _parse_args()
-    secret = str(args.jwt_secret or "").strip()
-    if args.gcp_secret and args.railway_service:
-        # Not a style preference: these are two DIFFERENT keys on two different
-        # platforms. Letting one silently win would mint a token that works
-        # against exactly one of them, with no way to tell which from the output.
+
+    # Exactly one source, chosen EXPLICITLY. These name different signing keys —
+    # production's and the rollback's, or one you typed — and letting a later
+    # branch silently overwrite an earlier one mints a token that authenticates
+    # against exactly one platform, with nothing in the output to say which.
+    #
+    # Membership, not truthiness: `--gcp-secret=` with an empty value is still a
+    # source the caller ASKED for, and treating it as absent would skip both the
+    # guard and the load and quietly fall through to another key.
+    sources = []
+    if args.gcp_secret is not None:
+        sources.append(("--gcp-secret", lambda: _load_secret_from_gcp(str(args.gcp_secret), str(args.gcp_project))))
+    if args.railway_service is not None:
+        sources.append(("--railway-service", lambda: _load_secret_from_railway(str(args.railway_service), args.railway_environment)))
+    if args.jwt_secret:
+        sources.append(("--jwt-secret/JWT_SECRET_KEY", lambda: str(args.jwt_secret)))
+
+    if len(sources) > 1:
         raise SystemExit(
-            "--gcp-secret (production) and --railway-service (the rollback) name "
-            "different signing keys; pass only one"
+            "more than one signing-key source given ("
+            + ", ".join(name for name, _ in sources)
+            + "); they name different keys, so pass only one"
         )
-    if args.gcp_secret:
-        secret = _load_secret_from_gcp(str(args.gcp_secret), str(args.gcp_project))
-    if args.railway_service:
-        secret = _load_secret_from_railway(str(args.railway_service), args.railway_environment)
-    if not secret:
+    if not sources:
         raise SystemExit(
             "JWT secret is required via --jwt-secret, JWT_SECRET_KEY, --gcp-secret "
             "(production), or --railway-service (the rollback)"
         )
+    if args.gcp_secret is not None and not args.gcp_secret:
+        raise SystemExit("--gcp-secret was given an empty secret name")
+
+    secret = sources[0][1]()
+    if not secret:
+        raise SystemExit(f"{sources[0][0]} produced an empty signing key")
 
     claims = _build_claims(args)
     token = jwt.encode(claims, secret, algorithm="HS256")

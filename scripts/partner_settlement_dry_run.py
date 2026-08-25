@@ -252,7 +252,8 @@ async def _drive(args: argparse.Namespace) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
+    parser = argparse.ArgumentParser(description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument(
         "--billing-run-id",
         type=int,

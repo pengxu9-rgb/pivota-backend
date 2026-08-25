@@ -157,7 +157,8 @@ async def _drive(args: argparse.Namespace) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
+    p = argparse.ArgumentParser(description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,)
     p.add_argument(
         "--as-of",
         default=None,

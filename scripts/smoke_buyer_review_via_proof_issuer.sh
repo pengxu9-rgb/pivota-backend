@@ -4,11 +4,23 @@ set -euo pipefail
 # E2E smoke: proof-issuer -> exchange -> buyer create -> buyer media -> employee approve -> read path visible + media 200/304
 #
 # Required env:
-# - PROOF_ISSUER_BASE_URL (prod: https://proof-issuer-gpx4jyrubq-uw.a.run.app)
+# - PROOF_ISSUER_BASE_URL  NO REACHABLE PRODUCTION VALUE - see below.
 # - REVIEWS_BASE_URL      (prod: https://api.pivota.cc)
-#   Production is Cloud Run in pivota-prod/us-west1; the old *.up.railway.app
-#   hosts are the ROLLBACK and still answer, so a smoke pointed there passes
-#   against a platform nobody is served from.
+#
+#   Production is Cloud Run in pivota-prod/us-west1. `api.pivota.cc` is public and
+#   is the right REVIEWS_BASE_URL. The proof-issuer is NOT: the `proof-issuer`
+#   service runs with `ingress: internal-and-cloud-load-balancing`, its bare
+#   *.run.app URL 404s from outside, and `pivota-urlmap` publishes no hostname for
+#   it (verified 2026-08-25). So there is deliberately no production value written
+#   here - naming the run.app URL would ship a command that always fails. Run the
+#   proof-issuer leg from inside the VPC, or point it at a local/staging issuer.
+#
+#   Do not fall back to a *.up.railway.app host. Railway is the ROLLBACK, and its
+#   liveness is perishable in both directions: the production agent host answered
+#   200 on the morning of 2026-08-25 and by that afternoon returned 404 with
+#   `x-railway-fallback: true` (no service bound). A smoke that passes there
+#   passed against a platform nobody is served from; one that fails there tells
+#   you nothing about production.
 # - MERCHANT_ID
 # - PLATFORM_PRODUCT_ID
 #
