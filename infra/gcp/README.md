@@ -709,6 +709,35 @@ in the cutover would notice if it disappeared.
 - Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
 
+## Edge rate limiting (Cloud Armor)
+
+`pivota-edge-protection` is attached to both backend services: per-IP 600 req/min, exceed → 429.
+Managed by `infra/gcp/setup_cloud_armor.sh prod`, which is idempotent.
+
+**It is in PREVIEW — it logs what it would deny and denies nothing.** Promote it only after
+reviewing a period that includes real partner traffic:
+
+```bash
+gcloud logging read 'resource.type="http_load_balancer"
+  AND jsonPayload.previewSecurityPolicy.outcome="DENY"' \
+  --project pivota-prod --freshness=24h --limit=50 \
+  --format="value(timestamp,httpRequest.remoteIp,httpRequest.requestUrl)"
+
+ENFORCE=1 infra/gcp/setup_cloud_armor.sh prod    # when the log is clean
+```
+
+Two things that will mislead you otherwise. **Policy changes take minutes to reach every edge** — a
+burst immediately after applying passes unthrottled and proves nothing (a 700-request test at +5min
+produced zero denials; the same test after propagation produced 889). And **`--enforce-on-key=IP`
+is not optional**: without an explicit key the counter can aggregate on the load balancer's own
+address, so a single abusive client would 429 everybody.
+
+Instant rollback, without deleting anything:
+
+```bash
+gcloud compute backend-services update pivota-bes-web --global --project pivota-prod --security-policy=""
+```
+
 ## Secret access is per-service for the gateway, project-wide for the rest
 
 `sa-gateway` holds `secretmanager.secretAccessor` on **each of its 39 secrets individually**, not at
