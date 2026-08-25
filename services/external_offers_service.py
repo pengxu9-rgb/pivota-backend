@@ -1118,9 +1118,10 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
 def _availability_from_raw(raw: Optional[str]) -> str:
     """Map a raw availability signal (often a JSON-LD schema.org IRI) to our canonical token.
 
-    This previously matched only the InStock/OutOfStock substrings, so eight of the ten
+    This previously matched only the InStock/OutOfStock substrings, so ten of the twelve
     schema.org ItemAvailability values resolved to "unknown" — including SoldOut and
-    Discontinued, which are unambiguous. Plain "sold out" and "unavailable" missed too.
+    Reserved, which schema.org itself defines as not available. Plain "sold out",
+    "unavailable" and "oos" missed too.
     """
     canonical = normalize_availability(raw)
     return canonical if canonical is not None else "unknown"
