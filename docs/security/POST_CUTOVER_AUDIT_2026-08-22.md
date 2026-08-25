@@ -91,7 +91,37 @@ TLS breaks.
 Minimum viable: LB 5xx rate, Cloud Run job `failedCount > 0`, Cloud SQL connections > 80%, one
 uptime check per public host — plus at least one notification channel, since there are zero.
 
-### 2.2 No Cloud Armor; rate limiting covers 1 slice of the API
+### 2.2 No Cloud Armor; rate limiting covers 1 slice of the API — EDGE LIMIT ADDED 2026-08-25 (in preview)
+
+`pivota-edge-protection` now exists and is attached to both `pivota-bes-web` and
+`pivota-bes-gateway`: a **per-IP rate limit of 600 req/min**, exceed → 429, `enforce-on-key=IP`.
+Reproducible via `infra/gcp/setup_cloud_armor.sh prod`.
+
+**The threshold is measured, not guessed.** Over a 6h window on 2026-08-24, excluding this
+project's own uptime checks, real traffic was **317 requests across 32 client IPs**, peaking at
+**52 req/min** from one browser session with every other client at **≤16 req/min**. 600 is ~11×
+that peak — unreachable by any current caller, low enough to stop a flood.
+
+**It ships in PREVIEW and blocks nothing yet**, because this fronts a live payments API and the
+partner integration has not happened, so the traffic profile is about to change in a way nobody can
+predict. Verified working rather than assumed: a 1,500-request burst produced **889 preview DENY
+entries at rule priority 1000 and zero actual 429s**.
+
+Worth keeping from that test — an identical 700-request burst *five minutes after applying the
+policy* produced **zero** denials. Cloud Armor takes minutes to propagate to every edge, so a test
+run immediately after applying proves nothing. That is the same shape as an alert whose filter
+matches nothing: the control looks present and is not yet doing anything.
+
+`enforce-on-key=IP` is deliberate. Behind a load balancer, a counter without an explicit key can
+end up aggregating on the LB's own address, so one abusive client denies service to everyone —
+the mirror image of the gateway limiter defect noted in the original finding below.
+
+**Still open:** the application limiter still returns early for any path outside `/agent/*`, so
+edge limiting is now the only control on the other ~1,000 paths. No WAF rules (OWASP CRS) were
+added — on an API that carries product prose and LLM prompts in request bodies, `sqli`/`xss` rules
+need a tuning cycle that should not be compressed into the week before a partner integration.
+
+#### Original finding
 
 `gcloud compute security-policies list` → 0. Both backend services have an empty `SECURITY_POLICY`.
 
