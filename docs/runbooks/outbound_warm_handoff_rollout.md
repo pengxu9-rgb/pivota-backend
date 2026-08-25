@@ -21,7 +21,7 @@ The **code default is `false` and the deployed value is `true`.** Reading the de
 concluding "the lane is dark" is wrong, and has already been read that way once. Check the
 deployed env.
 
-## Constraint 1 — enabling/widening makes `cart_prefilled: false` a false negative
+## Constraint 1 — the click lane can contradict `cart_prefilled: false` (HANDLED)
 
 `offers.resolve` returns an execution-spec field `cart_prefilled` on external offers
 (`routes/agent_shop_gateway.py::_append_external_offers_from_seed_rows`, PR #1822). It is
@@ -30,14 +30,26 @@ deployed env.
 redirect builder uses, so it cannot drift *from the link*. It can, however, be contradicted
 *by this lane*.
 
-`evaluate_warm_eligibility` knocks out affiliate hosts, bot user-agents, and non-allowlisted
-brands — but it never asks whether `dest` is already a cart. Its effective target population
-is therefore precisely the cold PDPs, i.e. exactly the offers we reported as `false`.
+`evaluate_warm_eligibility` knocks out, in order: a missing internal key (`no_internal_key`),
+an unparseable destination host (`no_dest_host`), affiliate/redirector hosts (`affiliate`),
+bot and prefetch user-agents (`bot`), brands outside a non-empty allowlist
+(`not_allowlisted`), and tokens outside the percentage bucket (`control`). It never asks
+whether `dest` is already a cart. Its effective target population is therefore precisely the
+cold PDPs, i.e. exactly the offers we reported as `false`.
 
 The exposure is **one-sided**:
 
 - `cart_prefilled: true` — the lane can only ever *build* a cart, so the claim cannot be
   falsified. No action needed.
+
+  **Know where that guarantee actually lives.** Nothing in *this* repo enforces it:
+  `evaluate_warm_eligibility` has no knockout for a `dest` that is already a cart permalink,
+  so a `true` offer on an allowlisted host is warm-eligible and will attempt an upgrade, and
+  `_validate_continue_url` checks only scheme + host — it would accept a brand homepage or
+  PDP as the 302 target. The invariant holds because the gateway builds `continue_url` from a
+  UCP `create_cart` response and returns nothing else (`PIVOTA-Agent`
+  `src/services/ucpWarmHandoff.js`: cart-build + return continue_url ONLY). A change on THAT
+  side could falsify a `true` here with nothing in this repo failing.
 - `cart_prefilled: false` — we told the agent "this link lands on a product page, the buyer
   must pick the variant themselves". The agent plans that flow and says so. The buyer lands
   in a prefilled cart. **The answer was already sent and cannot be corrected.**
@@ -47,7 +59,7 @@ Why `false` specifically matters: the paired gateway PR (PIVOTA-Agent #2082) mad
 claim to a buyer about where they will land, and only an explicit backend `false` licenses
 saying it. A `false` that click-time behaviour contradicts is that same defect one layer down.
 
-**Status: FIXED in code** (see "Preferred fix", now implemented). `cart_prefilled` no
+**Status: FIXED in code** (see "The fix" below). `cart_prefilled` no
 longer emits a `false` the warm lane could contradict — it emits `null` there instead.
 
 The window this closed: `cart_prefilled` (#1822) was merged to `main` but **not** on the
@@ -72,6 +84,16 @@ still being clicked. A widening is not a clean cutover; budget the tail.
 (Expired tokens are exempt — `redirect_endpoint` returns the cold 302 before the warm lane
 for `is_expired`.)
 
+## Constraint 3 — an empty allowlist at a full rollout deletes the `false` state
+
+`OUTBOUND_WARM_HANDOFF_BRANDS` empty means the percentage rollout decides. At
+`OUTBOUND_WARM_HANDOFF_ROLLOUT_PCT=100` every non-affiliate host with a parseable dest is
+warm-eligible, so `cart_prefilled` degenerates to `true`/`null` and **the `false` state
+disappears from the API globally** — no code change, no deploy, no alarm. That is correct
+behaviour (we genuinely could not promise a PDP landing any more), but it silently removes an
+execution-spec signal agents plan on. Widen the allowlist brand by brand rather than emptying
+it, or accept the loss deliberately.
+
 ## Rollout checklist
 
 Before flipping `OUTBOUND_WARM_HANDOFF_ENABLED`, adding domains to
@@ -85,11 +107,13 @@ Before flipping `OUTBOUND_WARM_HANDOFF_ENABLED`, adding domains to
       **But** re-read Constraint 2 — the fix is evaluated at mint time, so it does not cover
       tokens already in flight.
 - [ ] Account for the ~7-day tail of Constraint 2 in the canary window.
+- [ ] If you are reaching for an empty allowlist + a high rollout pct, read Constraint 3
+      first — that combination removes the `false` state from the API entirely.
 - [ ] Watch the `handoff` / `warm_reason` pair on click-event ctx — that is the
       substitution-rate instrument, and it is also what tells you how many `false` answers
       were actually contradicted (`handoff=warm` on a cold-dest token).
 
-## Preferred fix (decision — NOT yet implemented)
+## The fix (decision + implementation)
 
 Two candidates:
 
@@ -108,11 +132,12 @@ Where it lives:
 
 Tests: `tests/test_offers_resolve.py` (field-level, plus an end-to-end one that follows the
 minted link through `GET /r` and asserts the buyer really does reach a cart) and
-`tests/test_outbound_warm_handoff_click.py` (the soundness matrix). Ten mutants were run
-against them, including "no guard", "blanket null", and a fabricated token; all were killed.
-Note the fabricated-token mutant initially SURVIVED an outcome-only assertion — token
-mismatch is a coin flip at a 50% rollout — so parity is asserted by token identity, not by
-the resulting boolean.
+`tests/test_outbound_warm_handoff_click.py` (the soundness matrix). The mutation sweep run when this
+shipped (no guard, blanket null, fabricated token, and seven others) left no artifact beyond
+those tests — re-run it rather than trusting this sentence. One result is worth carrying
+forward: the fabricated-token mutant SURVIVED an outcome-only assertion, because a token
+mismatch is a coin flip at a 50% rollout. Parity is therefore asserted by token identity, not
+by the resulting boolean; keep it that way.
 
 Rationale:
 
@@ -128,7 +153,8 @@ Rationale:
    input, the UA, can only ever *remove* eligibility (bots get the cold redirect). So a
    resolve-time "not eligible" implies a click-time "not eligible": a conservative
    over-approximation, never a missed case. `false` survives wherever it is safe — flag off,
-   host not allowlisted / outside the rollout bucket, affiliate destination (never warm-handed).
+   internal key unset, unparseable destination host, affiliate destination (never
+   warm-handed), host not allowlisted, or token outside the rollout bucket.
 3. **(b) inverts the priority.** It would deliberately hand the buyer the *worse* landing
    experience to protect a sentence we wrote earlier — and it caps the warm lane at nothing,
    since cold PDPs are the only population it serves. It is also not free to build: nothing

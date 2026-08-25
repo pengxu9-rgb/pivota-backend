@@ -7200,7 +7200,11 @@ def _cart_prefilled_claim(
     for exactly this reason: only an explicit backend `False` licenses saying it.
 
     The exposure is ONE-SIDED, which is why only the `False` leg is guarded: the warm lane can
-    only ever BUILD a cart, so it can turn a `False` into a lie but never a `True`.
+    only ever BUILD a cart, so it can turn a `False` into a lie but never a `True`. That
+    guarantee is NOT enforced in this repo — eligibility has no knockout for a dest that is
+    already a cart, and _validate_continue_url checks only scheme + host. It holds because the
+    gateway derives continue_url from a UCP create_cart and returns nothing else. A change on
+    that side could falsify a `True` here with nothing local failing; see the runbook.
 
     Why not predict `True` instead? Because the upgrade depends on a live gateway call at
     click time that can miss (timeout, non-200, off-brand continue_url) and on a user-agent we
