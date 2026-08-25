@@ -225,8 +225,10 @@ async def claim_ucp_probe(
         verifier_id=VERIFIER_UCP_PROBE,
     )
     if not claimed:
-        response.status_code = status.HTTP_204_NO_CONTENT
-        return None
+        # FastAPI validates a returned ``None`` against response_model before
+        # honoring a mutated injected Response status. Return a concrete empty
+        # response so an idle remote worker gets the intended 204, not a 500.
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     route_id = str(claimed.get("execution_route_id") or "")
     route = await fetch_execution_route(execution_route_id=route_id)
     if not route:

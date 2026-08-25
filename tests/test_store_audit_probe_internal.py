@@ -265,3 +265,29 @@ def test_claim_returns_only_domain_and_claim_context(monkeypatch):
     assert result.brand_domain == "shop.example"
     assert result.variant_gid == "gid://shopify/ProductVariant/123"
     assert observed["claim"]["verifier_id"] == "ucp_probe"
+
+
+def test_idle_claim_returns_204_through_the_http_layer(monkeypatch):
+    # The defect lived in FastAPI's response_model validation, so a direct
+    # call to claim_ucp_probe cannot catch it — the request must cross the
+    # HTTP layer for validation to run.
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED", "true")
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_INTERNAL_KEY", "test-key")
+
+    async def no_claim(**_kwargs):
+        return None
+
+    monkeypatch.setattr(receipt_module, "claim_next_pending_verification", no_claim)
+    app = FastAPI()
+    app.include_router(receipt_module.router)
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/internal/store-audit/ucp-probes/claims",
+        json={"worker_id": "worker-1"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+    assert response.status_code == 204
+    assert response.content == b""
