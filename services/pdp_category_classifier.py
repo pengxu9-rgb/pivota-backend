@@ -17,8 +17,18 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Tuple
 
+# A base-makeup product that carries an SPF claim is FOUNDATION, not sunscreen:
+# "Foundation Broad Spectrum SPF 50+" is a foundation. The leading negative
+# lookahead declines those titles here so they fall through to the Foundation
+# pattern further down, which is what a3940018 set out to fix. Doing it this way
+# rather than hoisting Foundation to the top of CATEGORY_PATTERNS matters:
+# hoisting also lifted Foundation above Primer and Cleanser, which re-labelled
+# every "foundation primer" as a foundation. Only sunscreen is narrowed here, so
+# a real sunscreen is untouched.
 _SUNSCREEN_RE = re.compile(
-    r"\b(sunscreen|sun\s*screen|broad\s+spectrum|spf\s*\d{2,3}\+?|pa\s*\+{2,4}|"
+    r"^(?!.*\b(?:foundation|bb\s+cream|cc\s+cream|skin\s+tint|"
+    r"cushion|concealer|primer)\b)"
+    r".*\b(sunscreen|sun\s*screen|broad\s+spectrum|spf\s*\d{2,3}\+?|pa\s*\+{2,4}|"
     r"sun\s+(?:serum|fluid|cream|gel|milk|stick)|"
     r"uv\s*(?:protection|shield|defen[cs]e|lock))\b",
     re.IGNORECASE,
@@ -104,12 +114,6 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(hair care|hair repair|repair bundle|maintenance crew|"
         r"detangling|leave-in|leave in|hair|scalp)\b",
         re.IGNORECASE)),
-    # Foundation before Sunscreen: "Foundation Broad Spectrum SPF 50+" should
-    # match Foundation, not Sunscreen.
-    ("Foundation", "beauty/makeup/face/foundation", re.compile(
-        r"\b(foundation|bb\s+cream|cc\s+cream|skin\s+tint|tint\s+stick|"
-        r"foundation\s+stick|cushion\s+foundation)\b",
-        re.IGNORECASE)),
     ("Sunscreen", "beauty/skincare/sun/sunscreen", _SUNSCREEN_RE),
     ("Fragrance", "beauty/fragrance/perfume", re.compile(
         r"\b(perfume|parfum|extrait|extract|eau de parfum|eau de toilette|cologne|body spray|scent)\b|"
@@ -120,14 +124,13 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/treat/toner", re.compile(
-        # essence added: K-beauty essences are functionally toners; placing it
-        # here (before Mask) prevents "Mask Fit Tone Up Essence" from matching
-        # Mask on the product-line word "Mask".
-        r"\b(toner|tonic|mist|pad|skin booster|essence)\b", re.IGNORECASE)),
+        r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
+    # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
+    # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
     ("Mask", "beauty/skincare/treat/mask", re.compile(
-        r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
-        r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
-        r"spot cover patch|spot patch|patchs|patches|lip\s?patch|mask)\b",
+        r"\b(face mask|clay mask|charcoal mask|sheet mask|mask sheet|gel mask|"
+        r"sleeping mask|sleep mask|wash[-\s]?off mask|under eye patch|eye patch|"
+        r"pimple patch|spot cover patch|spot patch|patchs|patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
@@ -144,6 +147,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Serum", "beauty/skincare/treat/serum", re.compile(
         r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    # Bare `mask` LAST among the skincare-treat family, so a line-name "Mask"
+    # ("Mask Fit Tone Up Essence") no longer beats the real form noun. A title
+    # whose only signal is the word "mask" still lands here.
+    ("Mask", "beauty/skincare/treat/mask", re.compile(
+        r"\bmask\b", re.IGNORECASE)),
     ("Tanning", "beauty/body/tanning", re.compile(
         r"\b(self[-\s]?tan|self[-\s]?tanning|sunless tan|gradual tanning|gradualglow)\b",
         re.IGNORECASE)),
@@ -152,6 +160,13 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Concealer", "beauty/makeup/face/concealer", re.compile(
         r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick|"
         r"eye brightener|bright fix)\b",
+        re.IGNORECASE)),
+    # Stays BELOW Primer and Cleanser: "foundation primer" is a primer and
+    # "foundation cleansing balm" is a cleanser. The SPF ordering this pattern
+    # used to be hoisted for is handled by _SUNSCREEN_RE's lookahead instead.
+    ("Foundation", "beauty/makeup/face/foundation", re.compile(
+        r"\b(foundation|bb\s+cream|cc\s+cream|skin\s+tint|tint\s+stick|"
+        r"foundation\s+stick|cushion\s+foundation)\b",
         re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
         r"\b(powder|setting powder|pressed powder|loose powder|"

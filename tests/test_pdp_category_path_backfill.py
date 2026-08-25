@@ -139,6 +139,7 @@ SERUM_FIXTURES = [
     "Naturium Vitamin C Complex Face Serum",
     "Caudalie Vinopure Salicylic Serum",
     "Beauty of Joseon Glow Serum",
+    "COSRX Advanced Snail 96 Mucin Power Essence",
     "Vichy Mineral 89 Hyaluronic Acid Booster Serum",
     "Kiehl's Midnight Recovery Concentrate",
 ]
@@ -149,10 +150,6 @@ TONER_FIXTURES = [
     "Round Lab DIVE IN Skin Booster",
     "Laneige Cream Skin Refiner Mist",
     "I'm From Rice Toner",
-    # "essence" is a Toner keyword: a K-beauty essence is functionally a toner,
-    # and matching it here also keeps "Mask Fit Tone Up Essence" off the Mask
-    # pattern, which would otherwise win on the product-line word "Mask".
-    "COSRX Advanced Snail 96 Mucin Power Essence",
 ]
 
 TREATMENT_FIXTURES = [
@@ -281,6 +278,48 @@ def test_lip_liner_resolves(title: str) -> None:
     assert hit is not None, f"no classification for {title!r}"
     assert hit[0] == "Lip Liner"
     assert hit[1] == "beauty/makeup/lip/liner"
+
+
+# Ordering regressions. Each of these is a title where an EARLIER pattern used
+# to swallow a more specific later one. They are asserted as (title -> path)
+# pairs rather than added to a *_FIXTURES list because what is under test is the
+# ORDER of CATEGORY_PATTERNS, not the vocabulary of any single pattern.
+PATTERN_ORDER_FIXTURES = [
+    # "essence" is a Serum token, but it must not outrank a real mask/exfoliant/
+    # treatment/oil FORM noun that appears alongside it.
+    ("Real Rice Essence Sheet Mask 10 Pack", "beauty/skincare/treat/mask"),
+    ("Mediheal Essence Mask Sheet Tea Tree", "beauty/skincare/treat/mask"),
+    ("Snail Essence Sleeping Mask", "beauty/skincare/treat/mask"),
+    ("Acne Care Essence Spot Patch 18ct", "beauty/skincare/treat/mask"),
+    ("Some By Mi Miracle Essence Peeling Gel", "beauty/skincare/treat/exfoliant"),
+    ("Blemish Essence Spot Treatment Gel", "beauty/skincare/treat/treatment"),
+    ("Lavender Essence Body Oil", "beauty/skincare/moisturize/oil"),
+    # ...and a bare product-line "Mask" must not outrank the real form noun.
+    # This is the title a3940018 set out to fix; its own message says Serum
+    # should catch it on "essence".
+    ("Missha Mask Fit Tone Up Essence", "beauty/skincare/treat/serum"),
+    # A base-makeup product carrying an SPF claim is foundation, not sunscreen.
+    ("Pro Filt'r Soft Matte Longwear Foundation Broad Spectrum SPF 50+",
+     "beauty/makeup/face/foundation"),
+    ("Maybelline Dream BB Cream SPF 30", "beauty/makeup/face/foundation"),
+    ("Erborian CC Cream SPF 50", "beauty/makeup/face/foundation"),
+    ("Cushion Foundation Refill SPF 50+", "beauty/makeup/face/foundation"),
+    ("Glow Skin Tint SPF 30", "beauty/makeup/face/foundation"),
+    # ...but "foundation" as a MODIFIER must not outrank primer/cleanser.
+    ("Smashbox Photo Finish Foundation Primer", "beauty/makeup/face/primer"),
+    ("Pore Filling Foundation Primer 30ml", "beauty/makeup/face/primer"),
+    ("Foundation Cleansing Balm", "beauty/skincare/cleanse/cleanser"),
+    # A real sunscreen is untouched by the lookahead that makes the above work.
+    ("Supergoop Unseen Sunscreen SPF 40", "beauty/skincare/sun/sunscreen"),
+    ("Bioderma Photoderm Nude Touch SPF 50+", "beauty/skincare/sun/sunscreen"),
+]
+
+
+@pytest.mark.parametrize("title,expected_path", PATTERN_ORDER_FIXTURES)
+def test_pattern_order_resolves(title: str, expected_path: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[1] == expected_path, f"{title!r} -> {hit[1]!r}, expected {expected_path!r}"
 
 
 @pytest.mark.parametrize("title", FOUNDATION_FIXTURES)
