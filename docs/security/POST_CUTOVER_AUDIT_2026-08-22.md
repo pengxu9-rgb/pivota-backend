@@ -136,6 +136,36 @@ a trustworthy per-IP bucket is newly available.
 
 ### 2.3 Railway is a second live copy of every production secret
 
+**CLOSED 2026-08-25.** Executed per-service across all three Railway projects, in the safe order —
+archive, then repoint, then teardown, each step verified rather than assumed:
+
+- **Final archival dumps first**, from inside GCP (`cloudbuild.dump-railway.yaml`):
+  `gs://pivota-prod-migration/prod-final-20260825T1547Z.sql.gz` (**440MB** — sane for the 4.4GB
+  rollback DB) and `pcikb-final-20260825T1547Z.sql.gz` (2.1MB). Verified present and plausibly
+  sized before anything was torn down.
+- **The one live GCP→Railway dependency found and repointed**: `CATALOG_INTELLIGENCE_BASE_URL` on
+  `web` and `worker` pointed at `pivota-catalog-intelligence-production.up.railway.app`. The client
+  fails soft and prod logged zero calls in 3 days, so this was repointed to the GCP
+  `catalog-intelligence` service, verified on the new revisions, before its Railway host went down.
+- **All services taken down** — Pivota Infra (`web`, `invitation worker`, `reviews-proof-issuer`,
+  `relgraph-sync-routine`, `Redis`, `Postgres-xMr6`, and the ADR-021-retired `pivota-acp`), Pivota
+  Agent (`PIVOTA-Agent`), catalog-intelligence (app + `Postgres` + `Postgres-4hoG` + `Redis`; both
+  Postgres volumes were at the 0.2GB empty baseline, which also settles the orphaned
+  `Postgres-4hoG` question). Every `*.up.railway.app` URL now 404s **on a path that previously
+  served** — an earlier sweep wrongly declared the catalog-intelligence app dead by probing `/`,
+  which 404s on that app even when healthy; `/health` was still 200. Probe the path that serves.
+- **Both `railway-*` DSN secrets deleted from GCP** Secret Manager (held until the dumps verified,
+  per the note in `cloudbuild.dump-railway.yaml` — the dump build reads one of them).
+
+**Residue, deliberate:** the service SHELLS still exist in Railway (CLI removes deployments, not
+services) — delete them in the dashboard at leisure, which also removes volumes and any armed
+auto-deploy trigger (pivota-acp's was never disarmed; until its shell is deleted, a push to that
+repo could resurrect the service). Credential rotation (admin keys, `PIVOTA_API_KEY`, Stripe live
+keys) is the remaining human step and is not verifiable from here.
+
+The section below records what 2.3 looked like while open.
+
+
 Still serving on a valid certificate (`api.pivota.cc` via its direct IP → `200`, `environment:
 production`), with background sweeps **on** (`EXTERNAL_CONVERSION_POLLER_ENABLED`,
 `PAYMENT_RECONCILE_SWEEP_ENABLED`, `ENABLE_IDENTITY_RECONCILE_SWEEP`, `PDP_SCOPE_BACKFILL_ENABLED`).
