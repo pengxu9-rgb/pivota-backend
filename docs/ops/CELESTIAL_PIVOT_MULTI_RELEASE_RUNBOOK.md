@@ -314,6 +314,12 @@ Bundle integration:
 Run this after the all-sources observation window is green and production is stable.
 This signoff is intentionally direct and merchant-specific; it supplements the corpus-based release bundle instead of replacing it.
 
+Required auth:
+- admin/super_admin JWT for every `/v1/catalog/*` route (`ADMIN_JWT` below). These
+  routes are tenant-scoped: a non-admin token may only name the `merchant_id` in
+  its own `merchant_id` claim, so ADR-009 `merch_obs_*` observed-seller ids —
+  which no tenant token carries — are reachable by admins only.
+
 ```bash
 ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \
   --railway-service web \

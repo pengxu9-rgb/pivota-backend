@@ -12,9 +12,14 @@ from utils.auth import get_current_user
 def _build_app() -> FastAPI:
     app = FastAPI()
     app.include_router(module.router)
+    # Admin: these routes are ops-driven (see the ADMIN_JWT block in
+    # docs/ops/CELESTIAL_PIVOT_MULTI_RELEASE_RUNBOOK.md), and non-admins are
+    # scoped to their own merchant_id. Refusal cases live in
+    # tests/test_catalog_routes_tenant_scope.py.
     app.dependency_overrides[get_current_user] = lambda: {
         "user_id": "user_123",
         "email": "user@example.com",
+        "role": "admin",
     }
     return app
 
