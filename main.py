@@ -672,34 +672,86 @@ async def require_docs_viewer(
     fails CLOSED toward production when it cannot tell (config/platform.py), so an environment
     that forgets PIVOTA_ENV gets the guard rather than the hole.
 
-    Compared with `hmac.compare_digest`. The sibling admin guards in routes/ use `!=`, which leaks
-    a timing signal proportional to the shared prefix; there is no reason for a new one to inherit
-    that. It also fails closed when no key is configured at all - an empty expected value must
-    never match an empty header.
+    Compared with `hmac.compare_digest` ON BYTES. The sibling admin guards in routes/ use `!=`,
+    which leaks a timing signal proportional to the shared prefix; there is no reason for a new one
+    to inherit that. But the str form of compare_digest RAISES TypeError on any codepoint above
+    0x7F, and ASGI decodes header values as latin-1 - so a single byte >= 0x80 in X-ADMIN-KEY turned
+    this guard into an unhandled 500. That was worse than the `!=` it replaced, three ways: it is a
+    remotely triggerable 5xx on a payments API; it distinguishes this path (500) from a genuinely
+    unmounted one (404), which is a STRONGER existence oracle than the 401 this design rejected; and
+    because `expected and ...` short-circuits, it fired only when a key was configured - a free
+    unauthenticated probe for "is an admin key mounted on this revision". Encoding both sides first
+    removes all three.
+
+    It also fails closed when no key is configured at all - an empty expected value must never match
+    an empty header.
     """
     if not is_production():
         return
     expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
     supplied = (x_admin_key or "").strip()
-    if expected and supplied and hmac.compare_digest(supplied, expected):
+    if expected and supplied and hmac.compare_digest(
+        supplied.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    ):
         return
     # 404, not 401. A 401 confirms the endpoint exists and is merely guarded, which re-leaks the
     # fact worth hiding; anonymous callers should see what they would see if it were not mounted.
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
 
-@app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(require_docs_viewer)])
-async def _guarded_openapi_spec() -> JSONResponse:
+async def require_docs_ui_enabled() -> None:
+    """The HTML doc pages are not served in production at all.
+
+    They are shells that fetch /openapi.json FROM THE BROWSER, and a browser cannot attach an
+    X-ADMIN-KEY header to that fetch - so an admin-gated Swagger page in production renders
+    "Failed to load API definition". Serving a page that cannot work is worse than not serving
+    one: it reads as a broken API rather than a deliberate closure, and it still advertises that
+    the surface exists. Admins read the spec with curl and the key.
+    """
+    if is_production():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+# Every method, not just GET. Mounting GET alone left FastAPI answering 405 with `Allow: GET` on
+# anything else, so one `curl -X POST` proved all three routes exist - which is the very fact the
+# 404 above exists to hide.
+_DOC_ROUTE_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+
+
+@app.api_route(
+    "/openapi.json",
+    methods=_DOC_ROUTE_METHODS,
+    include_in_schema=False,
+    dependencies=[Depends(require_docs_viewer)],
+)
+async def _guarded_openapi_spec(request: Request) -> JSONResponse:
+    if request.method not in ("GET", "HEAD"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     return JSONResponse(app.openapi())
 
 
-@app.get("/docs", include_in_schema=False, dependencies=[Depends(require_docs_viewer)])
-async def _guarded_swagger_ui() -> HTMLResponse:
+@app.api_route(
+    "/docs",
+    methods=_DOC_ROUTE_METHODS,
+    include_in_schema=False,
+    dependencies=[Depends(require_docs_ui_enabled)],
+)
+async def _guarded_swagger_ui(request: Request) -> HTMLResponse:
+    if request.method not in ("GET", "HEAD"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} - Swagger UI")
 
 
-@app.get("/redoc", include_in_schema=False, dependencies=[Depends(require_docs_viewer)])
-async def _guarded_redoc() -> HTMLResponse:
+@app.api_route(
+    "/redoc",
+    methods=_DOC_ROUTE_METHODS,
+    include_in_schema=False,
+    dependencies=[Depends(require_docs_ui_enabled)],
+)
+async def _guarded_redoc(request: Request) -> HTMLResponse:
+    if request.method not in ("GET", "HEAD"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     return get_redoc_html(openapi_url="/openapi.json", title=f"{app.title} - ReDoc")
 
 

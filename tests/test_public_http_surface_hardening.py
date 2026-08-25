@@ -16,7 +16,7 @@ the guard would prove only that the test agrees with itself.
 """
 from __future__ import annotations
 
-import importlib
+
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,21 +28,22 @@ DOC_PATHS = ("/openapi.json", "/docs", "/redoc")
 def client_factory(monkeypatch):
     """Build a TestClient for a chosen environment.
 
-    main.py reads PIVOTA_ENV at request time through config.platform.is_production(), so the app
-    does not need rebuilding per case — but the import is done here so a failure to import shows up
-    as a test error rather than a collection error.
+    main.py bound `is_production` BY NAME at import, and that function reads os.environ live — so
+    monkeypatch.setenv is what actually switches environments here. An importlib.reload of
+    config.platform used to sit in this fixture and did nothing at all; it was removed rather than
+    left in place reading as load-bearing.
     """
     import main
 
-    def _build(*, production: bool, admin_key: str | None = "test-admin-key"):
+    def _build(*, production: bool, admin_key: str | None = "test-admin-key",
+               raise_server_exceptions: bool = True):
         monkeypatch.setenv("PIVOTA_ENV", "production" if production else "staging")
         if admin_key is None:
             monkeypatch.delenv("ADMIN_API_KEY", raising=False)
             monkeypatch.delenv("PROMOTIONS_ADMIN_KEY", raising=False)
         else:
             monkeypatch.setenv("ADMIN_API_KEY", admin_key)
-        importlib.reload(importlib.import_module("config.platform"))
-        return TestClient(main.app)
+        return TestClient(main.app, raise_server_exceptions=raise_server_exceptions)
 
     return _build
 
@@ -59,12 +60,62 @@ def test_production_serves_no_anonymous_spec(client_factory, path):
     )
 
 
-@pytest.mark.parametrize("path", DOC_PATHS)
-def test_production_serves_the_spec_to_an_admin(client_factory, path):
-    """The guard must not simply delete the surface — ops scripts read it in production."""
+def test_production_serves_the_spec_to_an_admin(client_factory):
+    """The guard must not simply delete the surface — ops scripts read the spec in production."""
+    with client_factory(production=True) as client:
+        resp = client.get("/openapi.json", headers={"X-ADMIN-KEY": "test-admin-key"})
+    assert resp.status_code == 200, f"/openapi.json refused a valid admin key ({resp.status_code})"
+    assert resp.json().get("paths"), "the spec came back empty — app.openapi() is not producing one"
+
+
+@pytest.mark.parametrize("path", ("/docs", "/redoc"))
+def test_production_does_not_serve_a_doc_page_even_to_an_admin(client_factory, path):
+    """A Swagger shell that cannot fetch its spec is worse than no page.
+
+    The browser cannot attach X-ADMIN-KEY to the page's own /openapi.json fetch, so an
+    admin-gated doc page renders "Failed to load API definition" — which reads as a broken API
+    rather than a deliberate closure, while still advertising that the surface exists.
+    """
     with client_factory(production=True) as client:
         resp = client.get(path, headers={"X-ADMIN-KEY": "test-admin-key"})
-    assert resp.status_code == 200, f"{path} refused a valid admin key (status {resp.status_code})"
+    assert resp.status_code == 404, (
+        f"{path} served an HTML shell in production ({resp.status_code}); it cannot load its spec"
+    )
+
+
+@pytest.mark.parametrize("path", DOC_PATHS)
+@pytest.mark.parametrize("method", ("post", "put", "patch", "delete"))
+def test_non_get_does_not_reveal_the_route_exists(client_factory, path, method):
+    """FastAPI answers 405 with `Allow: GET` for a GET-only route.
+
+    That made one `curl -X POST` prove all three routes exist — the exact fact the 404 above is
+    there to hide, leaked through the method channel instead of the status one.
+    """
+    with client_factory(production=True) as client:
+        resp = getattr(client, method)(path)
+    assert resp.status_code == 404, (
+        f"{method.upper()} {path} returned {resp.status_code}, which distinguishes this path "
+        "from an unmounted one"
+    )
+
+
+def test_a_non_ascii_admin_key_does_not_500(client_factory):
+    """`hmac.compare_digest` on str raises TypeError above codepoint 0x7F.
+
+    ASGI decodes header values as latin-1, so one byte >= 0x80 reached it and the guard returned
+    an unhandled 500 — a remotely triggerable 5xx, and a sharper existence oracle than the 401
+    this design rejected. Worse, `expected and ...` short-circuits, so it fired ONLY when a key
+    was configured: a free unauthenticated probe for whether this revision mounts an admin key.
+    """
+    # BYTES, not str: httpx refuses to ascii-encode a non-ASCII str header, which is not what a
+    # real client does. A raw socket sends the byte, and ASGI hands the app a latin-1 str — which
+    # is precisely how a codepoint above 0x7F reaches compare_digest.
+    with client_factory(production=True) as client:
+        resp = client.get("/openapi.json", headers={b"X-ADMIN-KEY": "caf\u00e9".encode("latin-1")})
+    assert resp.status_code == 404, (
+        f"a non-ASCII admin key returned {resp.status_code}; it must be indistinguishable from "
+        "any other wrong key"
+    )
 
 
 @pytest.mark.parametrize("path", DOC_PATHS)
@@ -128,11 +179,68 @@ def test_hsts_only_on_https(client_factory):
     assert "preload" not in secure.headers["Strict-Transport-Security"]
 
 
-def test_security_headers_survive_an_error_response(client_factory):
-    """Headers present on 200s and missing on errors protect the requests that matter least."""
+def test_security_headers_survive_an_unhandled_exception(client_factory):
+    """Headers present on 200s and missing on 500s protect the requests that matter least.
+
+    This must drive a REAL unhandled exception, not a 404. middleware/error_handler.py copies
+    inner headers onto its 4xx responses but builds its 500 from scratch with none — so a 404
+    carries nosniff whichever side of the error handler this middleware sits on, and only a 500
+    tells the two orderings apart. The earlier version of this test used a 404 and survived a
+    mutant that moved the middleware inside the error handler.
+    """
+    import main
+
+    path = "/__security_headers_probe__"
+
+    async def _boom():
+        raise RuntimeError("deliberate failure for the ordering assertion")
+
+    main.app.add_api_route(path, _boom, methods=["GET"], include_in_schema=False)
+    try:
+        with client_factory(production=True, raise_server_exceptions=False) as client:
+            resp = client.get(path, headers={"X-Forwarded-Proto": "https"})
+        assert resp.status_code == 500
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff", (
+            "the middleware must WRAP the error handler, not sit inside it"
+        )
+        assert resp.headers.get("Strict-Transport-Security") == "max-age=31536000"
+    finally:
+        main.app.router.routes = [
+            r for r in main.app.router.routes if getattr(r, "path", None) != path
+        ]
+
+
+def test_forwarded_proto_takes_the_first_hop(client_factory):
+    """X-Forwarded-Proto accumulates left-to-right; the ORIGINAL client scheme is first.
+
+    Taking the last element would read the scheme of the hop nearest this service, which behind
+    the load balancer is http — HSTS would then never be sent in production.
+    """
     with client_factory(production=True) as client:
-        resp = client.get("/this-path-does-not-exist-anywhere")
-    assert resp.status_code == 404
-    assert resp.headers.get("X-Content-Type-Options") == "nosniff", (
-        "the middleware must wrap the error handler, not sit inside it"
-    )
+        resp = client.get("/health", headers={"X-Forwarded-Proto": "https,http"})
+    assert resp.headers.get("Strict-Transport-Security") == "max-age=31536000"
+
+
+def test_a_header_set_by_a_handler_is_not_overwritten(client_factory):
+    """The middleware documents setdefault semantics; nothing asserted it."""
+    import main
+
+    path = "/__security_headers_override_probe__"
+
+    async def _explicit():
+        from fastapi.responses import JSONResponse as _JSONResponse
+
+        return _JSONResponse({"ok": True}, headers={"Referrer-Policy": "same-origin"})
+
+    main.app.add_api_route(path, _explicit, methods=["GET"], include_in_schema=False)
+    try:
+        with client_factory(production=True) as client:
+            resp = client.get(path)
+        assert resp.headers.get("Referrer-Policy") == "same-origin", (
+            "the middleware overwrote a value the handler set deliberately"
+        )
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    finally:
+        main.app.router.routes = [
+            r for r in main.app.router.routes if getattr(r, "path", None) != path
+        ]

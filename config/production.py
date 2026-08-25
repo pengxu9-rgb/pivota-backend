@@ -116,15 +116,10 @@ def get_production_settings() -> ProductionSettings:
     """Get cached production settings"""
     return ProductionSettings()
 
-# Security Headers for production
-SECURITY_HEADERS = {
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "X-XSS-Protection": "1; mode=block",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline';"
-}
+# Security headers live in middleware/security_headers.py, which is the one that actually runs.
+# A dict here was referenced by nothing, and disagreed with the shipped policy on three of five
+# headers (includeSubDomains, Referrer-Policy, CSP) - two answers to one question, with the wrong
+# one easier to find. Removed rather than reconciled: it had no caller to reconcile with.
 
 # Production Database Configuration
 DATABASE_CONFIG = {

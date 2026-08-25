@@ -32,7 +32,15 @@ from starlette.requests import Request
 HSTS_MAX_AGE = 31536000
 
 # Paths that render HTML with their own asset bundles. A JSON-API CSP would blank them.
-_DOC_PATHS = frozenset({"/docs", "/redoc", "/docs/oauth2-redirect"})
+#
+# /docs/oauth2-redirect is deliberately NOT here: FastAPI mounts it only when docs_url is set, and
+# main.py turns the built-ins off, so it exists in no environment. Listing a path that is never
+# served reads as coverage and is not.
+#
+# In production both of these 404 anyway - a Swagger shell cannot fetch an admin-gated spec from a
+# browser, so main.py does not serve one. This exemption is what keeps them working in staging and
+# local, where they are open.
+_DOC_PATHS = frozenset({"/docs", "/redoc"})
 
 _STATIC_HEADERS = {
     # Stop content-type sniffing turning a JSON error body into executable script.
