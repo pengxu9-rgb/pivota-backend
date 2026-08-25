@@ -764,19 +764,30 @@ def _preserve_caller_declared_fields(
 ) -> None:
     """Caller-declared birth-only columns: written on INSERT, left alone on UPDATE.
 
-    Same preservation shape as `_preserve_non_stale_suppression` /
-    `_preserve_existing_scope` above, but the field list comes from the CALL SITE
-    rather than a module constant, because the column at issue here — `status` —
-    is a real, update-owned field for most of the tables `_upsert_by_pk` serves
-    (`catalog_sync_jobs`, `catalog_sync_events` both move it on purpose). Only
+    Two differences from `_preserve_non_stale_suppression` /
+    `_preserve_existing_scope` above, both deliberate.
+
+    The field list comes from the CALL SITE rather than a module constant,
+    because the column at issue here — `status` — is a real, update-owned field
+    for most of the tables `_upsert_by_pk` serves (`catalog_sync_jobs`,
+    `catalog_sync_events` both move it on purpose). Only
     `catalog_merchants.status` is owned by writers OUTSIDE this module, so only
     that call site declares it. See `upsert_catalog_merchant`.
+
+    And it DELETES the key rather than writing the existing value back. Those two
+    are equivalent only if nothing else writes the column in between. Here
+    something does: `store_lifecycle_service` writes `catalog_merchants.status`
+    from lifecycle routes and from the hourly sweep, while a sync or an audit can
+    be mid-flight — and the audit path is not inside a transaction, so its window
+    between `_fetch_one_by_pk` and the UPDATE is wide. Writing the value back
+    would REVERT a lifecycle write that landed inside that window, which is a
+    smaller version of the exact bug this guard exists to fix. Dropping the
+    column from the UPDATE leaves the concurrent write standing.
     """
     if not existing:
         return
     for field in fields:
-        if field in payload:
-            payload[field] = existing.get(field)
+        payload.pop(field, None)
 
 
 async def _resolve_catalog_sku_key(

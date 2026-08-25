@@ -18,7 +18,7 @@ other transition this clobber touched was repaired within a tick; this one was
 not. `test_a_url_audit_cannot_undo_the_last_store_detach` is that whole arc.
 
 These tests EXECUTE and every assertion is a DB re-read, matching
-`tests/test_store_lifecycle_reconciliation.py`. Two of them drive the REAL
+`tests/test_store_lifecycle_reconciliation.py`. Three of them drive the REAL
 callers (`upsert_audited_sku_to_index`, `ingest_standard_products`) rather than
 a hand-rolled stand-in, because the delivering line is the call site, not the
 helper. Each of those asserts the row's CONTENT fields moved as well, so a
@@ -277,13 +277,90 @@ async def test_other_upsert_by_pk_tables_still_move_their_status():
     assert str(dict(row)["status"]) == "completed"
 
 
+async def test_a_lifecycle_write_landing_mid_upsert_is_not_reverted(monkeypatch):
+    """Preserving by DELETING the key, not by writing the read-back value.
+
+    `_upsert_by_pk` SELECTs the existing row, then UPDATEs. The audit path is not
+    inside a transaction, so a `store_lifecycle_service` write can land in
+    between — and re-asserting the value we read a moment earlier would revert
+    it, which is a smaller version of the bug this guard exists to fix.
+
+    The race is made deterministic by handing the upsert a STALE snapshot while
+    the real row has already moved on; everything downstream is the real code,
+    and the assertion is a DB re-read.
+    """
+    import services.catalog_sync_service as css
+
+    merchant = f"{_PREFIX}_race"
+    await _seed_merchant(merchant, "active")
+
+    real_fetch = css._fetch_one_by_pk
+
+    async def _stale_read(table, pk_name, pk_value):
+        row = await real_fetch(table, pk_name, pk_value)
+        if row is not None and pk_value == merchant:
+            # The lifecycle writer lands here — after our SELECT, before our
+            # UPDATE. `row` is now the stale snapshot the upsert will reason on.
+            await database.execute(
+                "UPDATE catalog_merchants SET status = 'inactive' "
+                "WHERE merchant_id = :m",
+                {"m": merchant},
+            )
+        return row
+
+    monkeypatch.setattr(css, "_fetch_one_by_pk", _stale_read)
+
+    await upsert_catalog_merchant(
+        merchant_id=merchant,
+        merchant_name=None,
+        primary_platform="url_audit",
+        source_system="url_audit_intake",
+        source_ref="statfixture.com",
+    )
+
+    row = await _merchant_row(merchant)
+    assert row["status"] == "inactive"
+    assert row["source_system"] == "url_audit_intake"
+
+
+async def test_preserve_on_update_never_touches_the_insert():
+    """"Birth-only" means the INSERT carries the caller's value EXPLICITLY.
+
+    Pinned on `catalog_sync_jobs`, whose `status` column defaults to 'pending'
+    rather than 'active'. That difference is what makes the property observable:
+    if the guard ever dropped `status` from an INSERT payload, the row would
+    silently fall through to the column default and still look plausible on
+    `catalog_merchants` (whose default happens to be 'active' — the very value
+    we mint). A test that can only be run against a table whose default agrees
+    with the expected value cannot fail.
+    """
+    from services.catalog_sync_service import _upsert_by_pk
+
+    job_id = f"{_PREFIX}_birthjob"
+    await _upsert_by_pk(
+        catalog_sync_jobs,
+        "job_id",
+        {
+            "job_id": job_id,
+            "merchant_id": f"{_PREFIX}_jobmerchant",
+            "connector": "shopify",
+            "mode": "full",
+            "status": "completed",
+        },
+        preserve_on_update=("status",),
+    )
+
+    row = await database.fetch_one(
+        "SELECT status FROM catalog_sync_jobs WHERE job_id = :j", {"j": job_id}
+    )
+    assert str(dict(row)["status"]) == "completed"
+
+
 async def test_a_declared_field_absent_from_the_payload_is_not_invented():
-    """`_preserve_caller_declared_fields` copies the existing value only for
-    fields the payload actually carries — the same `if field in payload` shape
-    its two siblings use. Pinned with a name that is not a column at all,
-    because that is the only case with an observable difference: for a real
-    column the copied value equals what is already stored. Without the check the
-    helper would inject the key and the UPDATE would fail on an unknown column.
+    """A declared field the payload does not carry is simply not there to drop.
+
+    Pinned with a name that is not a column at all — a typo in a call site's
+    tuple must be inert, not an UPDATE that fails on an unknown column.
     """
     from services.catalog_sync_service import _upsert_by_pk
 
