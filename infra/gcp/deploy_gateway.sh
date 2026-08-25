@@ -138,6 +138,23 @@ if [ "$CONFIG" = preserve ]; then
   # --update-env-vars MERGES one key. --set-env-vars / --env-vars-file REPLACE the whole set, and on
   # the live prod gateway that is the other 381.
   CONFIG_ARGS=(--update-env-vars "PIVOTA_COMMIT_SHA=$TAG")
+  # THE ONE WAY THIS DEFAULT CAN BITE, said out loud where the operator will see it.
+  #
+  # `preserve` being the default means a deploy run straight after `port_railway_env.py --apply`
+  # silently ships the image and NOTHING ELSE: the two files that were just generated are never
+  # read, and the script still prints a promoted, health-checked, 100%-traffic success. That is
+  # the same shape deploy_backend.sh refuses for WORKERS/MOUNT_DB - a successful-looking deploy
+  # that did not do the one thing it was run for.
+  #
+  # Their presence on disk is the intent signal, so say so rather than ignoring it. A WARNING and
+  # not a refusal: these files are git-ignored build output that can sit in a checkout for months
+  # after the port that made them, so refusing would break the ordinary case to catch the rare
+  # one. The deploy is still correct - it just is not the deploy the operator may have meant.
+  if [ -f "$ENV_FILE" ] || [ -f "$SECRETS_FILE" ]; then
+    echo "WARNING: ported config files exist next to this script but CONFIG=preserve IGNORES them." >&2
+    echo "         Only the image and PIVOTA_COMMIT_SHA will change. Re-run with CONFIG=apply to" >&2
+    echo "         apply $ENV_FILE / $SECRETS_FILE." >&2
+  fi
 else
 [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "missing $ENV_FILE / $SECRETS_FILE - run port_railway_env.py --prefix gateway first" >&2; exit 1; }
 

@@ -439,8 +439,16 @@ CONFIG=apply ../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
 ⚠️ **`port_railway_env.py` reads Railway, which was decommissioned at the 2026-08-22 cutover.** For
 an existing service `apply` is therefore not just unavailable but wrong: it would rewrite all 382 of
 the prod gateway's environment variables from the retired platform. Cloud Run is the source of truth
-now. A config change means editing the live service (`gcloud run services update`) or reviving the
-generated files deliberately — never as a side effect of shipping a commit.
+now. A config change means editing the live service or reviving the generated files deliberately —
+never as a side effect of shipping a commit.
+
+⚠️ **`gcloud run services update` does not shift traffic.** It creates a new revision carrying the
+change and reports success, but a service that pins revisions keeps serving the old one — the spec
+reads the new value while the serving revision reads the old. That is how the partner-sandbox flags
+came out armed and inert on 2026-08-24. Follow any `services update` with
+`gcloud run services update-traffic gateway --region us-west1 --project pivota-prod --to-latest`,
+or confirm `status.traffic[].latestRevision` is already `true`. A deploy through
+`deploy_gateway.sh` ends in `--to-latest`, so it leaves the service unpinned.
 
 The gateway reuses **its own repo's root Dockerfile**. That is safe there because PIVOTA-Agent's
 Railway services pin `builder=RAILPACK` explicitly, so the Dockerfile is inert on Railway - unlike

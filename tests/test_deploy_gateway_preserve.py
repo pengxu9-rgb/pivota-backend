@@ -152,7 +152,7 @@ def _run(
     job_create_rc: int = 0,
     deploy_rc: int = 0,
     log_output: str = "",
-    ported_files: bool = False,
+    ported_files: "bool | str" = False,
     curl_out: str = "404",
 ) -> Run:
     """Run the REAL deploy_gateway.sh against stubs.
@@ -165,8 +165,11 @@ def _run(
     here.mkdir()
     script = here / "deploy_gateway.sh"
     shutil.copy2(SCRIPT, script)
-    if ported_files:
+    # True writes both; "env" / "secrets" write just one, for the half-ported state a run
+    # interrupted partway through port_railway_env.py leaves behind.
+    if ported_files in (True, "env"):
         (here / f"env.{env_arg}.gateway.yaml").write_text('SOME_PORTED_KEY: "ported-value"\n')
+    if ported_files in (True, "secrets"):
         (here / f"secrets.{env_arg}.gateway.list").write_text("SOME_SECRET=SOME_SECRET:latest\n")
 
     bin_dir = tmp_path / "bin"
@@ -410,3 +413,49 @@ def test_a_failed_deploy_never_reaches_the_traffic_shift(tmp_path):
     r = _run(tmp_path, "prod", deploy_rc=1)
     assert r.rc != 0
     assert r.traffic_calls() == []
+
+
+@pytest.mark.parametrize("present", [True, "env", "secrets"])
+def test_preserve_says_so_when_ported_config_files_are_sitting_right_there(tmp_path, present):
+    """The one way the new default can bite.
+
+    A deploy run straight after `port_railway_env.py --apply` ships the image and NOTHING ELSE,
+    while still printing a promoted, health-checked success — the same shape deploy_backend.sh
+    refuses for WORKERS/MOUNT_DB. Their presence on disk is the only intent signal available, so
+    it must not be ignored. A warning, not a refusal: these are git-ignored build artefacts that
+    can outlive by months the port that made them.
+
+    HALF-PORTED COUNTS. `port_railway_env.py` writes two files, and a run interrupted between
+    them leaves one — which is when an operator most needs telling, and the case a `&&` here
+    would silently drop. Hence the parametrize, and hence `||` rather than `&&` in the guard.
+    """
+    r = _run(tmp_path, "prod", ported_files=present)   # preserve is the default
+    assert r.rc == 0, r.err
+    assert "CONFIG=apply" in r.err
+    assert "IGNORES" in r.err
+    # It must still be a preserve deploy — the warning does not change what is sent.
+    assert "--env-vars-file" not in r.deploy()
+
+
+def test_preserve_is_quiet_when_there_is_no_ported_config_to_ignore(tmp_path):
+    """The normal case — a fresh checkout. Warning on every deploy would train people past it."""
+    r = _run(tmp_path, "prod", ported_files=False)
+    assert r.rc == 0, r.err
+    assert "IGNORES" not in r.err
+
+
+def test_apply_can_still_create_a_service_from_scratch(tmp_path):
+    """`apply` on a service that does not exist is now the documented way to stand one up, and it
+    was the one path through this script with no coverage at all.
+
+    `--no-traffic` and `--tag` are REJECTED by gcloud on service creation, so a candidate flow that
+    leaked into the first deploy would fail the whole thing.
+    """
+    r = _run(tmp_path, "staging", config="apply", ported_files=True, service_exists=False)
+    assert r.rc == 0, r.err
+    argv = r.deploy()
+    assert "--no-traffic" not in argv
+    assert "--tag" not in argv
+    assert "--env-vars-file" in argv
+    # A first revision already holds 100%; shifting traffic to itself is not attempted.
+    assert not any("--to-latest" in c for c in r.traffic_calls())
