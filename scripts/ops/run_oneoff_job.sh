@@ -81,9 +81,16 @@ done
 # `--args="^X^aXb"` -> the literal prefix `^X^`, then the values joined by X (so that example is two
 # args, `a` and `b`). If X occurs inside a value the split is silent and wrong, so the choice is
 # checked against the actual payload rather than assumed.
+# Shell-builtin `case`, not `printf | grep`: the old form fed NUL-separated data to
+# grep, whose handling of NULs in input differs between GNU and BSD. This needs no
+# subprocess and no agreement about binary input.
 DELIM=""
 for c in '|' '@' '#' '%' '~' '+' '!' ';' ':' '?'; do
-  if ! printf '%s\0' "$@" | grep -qF -- "$c"; then DELIM="$c"; break; fi
+  clash=0
+  for a in "$@"; do
+    case "$a" in *"$c"*) clash=1; break ;; esac
+  done
+  [ "$clash" = 0 ] && { DELIM="$c"; break; }
 done
 [ -n "$DELIM" ] || { echo "run_oneoff_job: no safe --args delimiter for these arguments; pass fewer/simpler args" >&2; exit 2; }
 
@@ -94,7 +101,11 @@ for a in "$@"; do
 done
 
 JOB="$JOB_PREFIX-$$-$RANDOM"
-ERRLOG="$(mktemp -t oneoff-job-err)"
+# Explicit XXXXXX template, not `mktemp -t PREFIX`: BSD mktemp appends randomness
+# to a bare prefix, GNU coreutils rejects it ("too few X's in template"). The bare
+# form worked on the author's macOS and killed the script on line one everywhere
+# Linux runs it, CI included.
+ERRLOG="$(mktemp "${TMPDIR:-/tmp}/oneoff-job-err.XXXXXX")"
 cleanup(){ gcloud run jobs delete "$JOB" --project "$PROJECT" --region "$REGION" --quiet >/dev/null 2>&1 || true; rm -f "$ERRLOG"; }
 # Bare `trap cleanup INT` would run the handler and then CONTINUE, swallowing the signal: the script
 # would finish the log read and exit 0, leaving no trace that anyone asked it to stop.
