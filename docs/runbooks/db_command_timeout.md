@@ -238,9 +238,15 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --set-env-vars DB_COMMAND_TIMEOUT_SECONDS=600 \
   --max-retries 0 --task-timeout 120s --command python \
   --args="^|^-c|import db.database as d;print('CT=' + str(d.database_kwargs.get('command_timeout')))"
-gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait
-gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
-  --limit 20 --format='value(textPayload)' --freshness=10m | grep CT=
+gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait || {
+  echo "job FAILED - do not read the log for a verdict, the exit code already gave you one" >&2; }
+for i in 1 2 3 4 5 6; do
+  OUT=$(gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
+    --limit 20 --format='value(textPayload)' --freshness=10m)
+  [ -n "$OUT" ] && break
+  sleep 5
+done
+printf '%s\n' "$OUT" | grep CT=
 gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
 

@@ -84,7 +84,15 @@ meaning depending on whether Redis is up.
 
 ### Why not `request.client.host`
 
-Because behind Railway it is the platform's internal proxy, not the client.
+Because behind Railway it was the platform's internal proxy, not the client.
+
+**This changed at the 2026-08-22 cutover and the paragraphs below are pre-cutover analysis.**
+Measured on Cloud Run 2026-08-25: `request.client.host` now carries real public client addresses
+(`71.202.214.234`, `98.92.15.176`) and `httpRequest.remoteIp` agrees — zero `100.64.0.0/10` CGNAT
+peers. So the per-IP dial is no longer inherently untrustworthy the way it was on Railway, and the
+"Known limitation" below — establishing the trusted-proxy hop count for *Railway's* edge — is
+obsolete rather than outstanding. Re-derive it for the GCP load balancer before enabling
+`ANON_RATE_LIMIT_PER_IP_RPM`; do not carry the Railway conclusion across.
 Sampled from prod access logs on 2026-08-11, **every** peer address was in
 `100.64.0.0/10` (RFC 6598 CGNAT) across 12 distinct addresses:
 
@@ -115,7 +123,7 @@ Re-measure before tightening:
 
 ```bash
 gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="web" AND httpRequest.requestUrl!=""' \
-  --project pivota-prod --region us-west1 --limit 5000 \
+  --project pivota-prod --limit 5000 \
   --format='value(httpRequest.requestUrl)' --freshness=2h \
   | sed -E 's|https?://[^/]+||; s|\?.*||' | grep -E '^/agent/' | sort | uniq -c | sort -rn
 ```
@@ -160,10 +168,13 @@ exactly when that mistake gets made.
 **On restarting:** the value is read once in `RateLimitMiddleware.__init__` at app
 construction, so a new process is required. `gcloud run services update` creates a
 new revision and shifts traffic to it once healthy, so the kill switch takes
-effect on its own — no separate deploy step. Confirm the running build changed:
+effect on its own — no separate deploy step. Confirm NEW PROCESSES are serving by checking the
+revision moved. **Not `/version`:** an env-only update reuses the same image, so the build SHA is
+identical before and after whether or not the change applied.
 
 ```bash
-curl -s https://api.pivota.cc/version
+gcloud run services describe web --project pivota-prod --region us-west1 \
+  --format='value(status.latestReadyRevisionName)'
 ```
 
 Prefer **raising the limit** over disabling, unless you are mid-incident:

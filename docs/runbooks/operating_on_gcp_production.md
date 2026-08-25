@@ -39,9 +39,11 @@ builds into one count:
 AND resource.labels.revision_name="web-00030-m9h"
 ```
 
-**Cloud Logging ingestion lags a few seconds behind the process.** Reading immediately after an
-event returns nothing, which looks exactly like "the event never happened". Poll rather than
-guessing a sleep; `probe_health()` in `infra/gcp/deploy_backend.sh` is the worked example.
+**Cloud Logging ingestion lag is unbounded.** Reading immediately after an event returns nothing,
+which looks exactly like "the event never happened" — that stranded a healthy revision at 0% traffic
+on 2026-08-25. Any fixed window is a guess and every guess eventually loses, so never take a VERDICT
+from a log scrape: use the exit code, and read logs only for detail, behind a retry. `probe_health()`
+in `infra/gcp/deploy_backend.sh` is the worked example of both halves.
 
 ## Read one env var
 
@@ -61,21 +63,35 @@ gcloud run services update web --project pivota-prod --region us-west1 \
   --update-env-vars ANON_RATE_LIMIT_ENABLED=false
 ```
 
-`--update-env-vars` **merges** the named keys and leaves the other ~250 alone.
-`--set-env-vars` and `--env-vars-file` **REPLACE the entire set** — using either by mistake wipes
-production configuration. Reach for `--update-env-vars` unless you have specifically decided
-otherwise.
+`--update-env-vars` **merges** the named keys. `--set-env-vars` and `--env-vars-file` **remove every
+existing plain env var first** — on `web` that is 192 of its 248 entries. Secret-backed variables
+live in a separate flag group and survive, which makes the damage worse rather than better: the
+service still boots, still reaches its database, and fails only in whatever depended on the 192.
+Reach for `--update-env-vars` unless you have specifically decided otherwise.
 
 This creates a new revision and starts new processes, which is what makes a value read at app
 construction actually take effect. It also shifts traffic once the revision is healthy, so it is a
 deploy: expect the usual cold-start cost on the first requests.
 
+**Verify with the REVISION NAME, never with `/version`.** The image is unchanged by an env-only
+update, so the build SHA is identical before and after whether or not the change applied:
+
+```bash
+gcloud run services describe web --project pivota-prod --region us-west1 \
+  --format='value(status.latestReadyRevisionName)'
+```
+
+Traffic follows the new revision only while the service is on `latestRevision: true` — which all
+three services are today. A service someone has pinned to a specific revision will accept the
+update and keep serving the old one.
+
 To remove one: `--remove-env-vars NAME`.
 
 ## Run a one-off script in the production environment
 
-There is **no** equivalent of `railway run` or `railway ssh`. Cloud Run has no shell and no
-long-lived host to attach to. The pattern is a throwaway Cloud Run **job** on the same image, which
+There is **no** equivalent of `railway run` or `railway ssh`. Cloud Run gives you no way to attach
+to a running instance — the image does ship `sh`, and `--command sh` works in a job, but there is no
+live process to enter. The pattern is a throwaway Cloud Run **job** on the same image, which
 `infra/gcp/deploy_backend.sh` already uses for its in-VPC health probe:
 
 ```bash
@@ -87,9 +103,15 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --set-secrets DATABASE_URL=DATABASE_URL:latest \
   --max-retries 0 --task-timeout 600s \
   --command python --args=scripts/partner_settlement_dry_run.py
-gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait
-gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
-  --limit 200 --format='value(textPayload)' --freshness=10m
+gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait || {
+  echo "job FAILED - do not read the log for a verdict, the exit code already gave you one" >&2; }
+for i in 1 2 3 4 5 6; do
+  OUT=$(gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
+    --limit 200 --format='value(textPayload)' --freshness=10m)
+  [ -n "$OUT" ] && break
+  sleep 5
+done
+printf '%s\n' "$OUT"
 gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
 
@@ -99,7 +121,10 @@ Three things that are easy to get wrong:
   `DATABASE_URL` gets nothing unless you `--set-secrets` it, and will usually fail in a way that
   looks like a database outage rather than a missing mount.
 - **`--args` splits on commas.** A Python one-liner containing a comma is shredded into separate
-  argv entries. Use the alternate delimiter form: `--args="^|^-c|import x,y"`.
+  argv entries. Use the alternate delimiter form: `--args="^|^-c|import x,y"`. The delimiter you
+  pick **must not appear anywhere in the values** — `|` is a poor choice for Python that uses dict
+  merge, regex alternation or bitwise or, and it fails by silently splitting rather than erroring.
+  Pick a character the payload cannot contain.
 - **Delete the job when you are done.** A left-behind job is a standing execution surface with a
   service account attached.
 

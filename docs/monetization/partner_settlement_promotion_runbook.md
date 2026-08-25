@@ -65,9 +65,15 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --set-secrets DATABASE_URL=DATABASE_URL:latest \
   --max-retries 0 --task-timeout 600s \
   --command python --args=scripts/partner_settlement_dry_run.py
-gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait
-gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
-  --limit 200 --format='value(textPayload)' --freshness=10m
+gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait || {
+  echo "job FAILED - do not read the log for a verdict, the exit code already gave you one" >&2; }
+for i in 1 2 3 4 5 6; do
+  OUT=$(gcloud logging read "resource.labels.job_name=\"$JOB\"" --project pivota-prod \
+    --limit 200 --format='value(textPayload)' --freshness=10m)
+  [ -n "$OUT" ] && break
+  sleep 5
+done
+printf '%s\n' "$OUT"
 gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
 
@@ -97,14 +103,23 @@ before promoting; it is not a settlement bug.
 
 ## Step 1 — Flip the flag (reversible, inert while crons paused)
 
-Set on the Railway **web** service:
+Set on the Cloud Run **web** service:
 
+```bash
+gcloud run services update web --project pivota-prod --region us-west1 \
+  --update-env-vars PARTNER_REV_SHARE_USE_V2=true
 ```
-PARTNER_REV_SHARE_USE_V2=true
-```
+
+`--update-env-vars` MERGES. `--set-env-vars` and `--env-vars-file` remove every existing plain
+env var first — on `web` that is 192 of them — so reaching for the wrong one here replaces a
+reversible flag flip with a configuration outage.
 
 This changes nothing until a settlement actually runs (both crons are still
 paused), so it is safe to set now.
+
+**Check first — it may already be set.** As of 2026-08-25 `PARTNER_REV_SHARE_USE_V2` is already
+`true` on prod `web`. Run the verify command below before the update; flipping a flag that is
+already flipped rolls a pointless revision.
 
 **Verifying it took (corrected 2026-08-11).** No HTTP probe publishes this flag —
 not `/version`, not `/config-check`, not `/admin/config/check`. An earlier
@@ -121,18 +136,22 @@ gcloud run services describe web --project pivota-prod --region us-west1 --forma
   | python3 -c 'import json,sys; e=json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env",[]); print([x for x in e if x["name"]=="PARTNER_REV_SHARE_USE_V2"] or "ABSENT")'
 ```
 
-then confirm the running build is newer than the variable change:
+then confirm NEW PROCESSES picked it up, by checking the serving revision changed:
 
 ```bash
-curl -s https://api.pivota.cc/version
+gcloud run services describe web --project pivota-prod --region us-west1 \
+  --format='value(status.latestReadyRevisionName)'
 ```
 
-(`/version`'s `settings_contract` block became ADMIN-ONLY on 2026-08-11 — it was
-publishing the rate-limit threshold and whether discount reconciliation is
-enforcing to anonymous callers. The `version` / `commit_time` fields you need
-here are still public.)
+**Not `/version`.** `services update --update-env-vars` reuses the same image, so the build SHA is
+unchanged by construction — curling `/version` before and after an env-only change returns the
+identical value whether or not it applied. The revision name is what moves. (`/version`'s
+`settings_contract` block became ADMIN-ONLY on 2026-08-11; it was publishing the rate-limit
+threshold and whether discount reconciliation is enforcing, to anonymous callers.)
 
-Rollback: set back to `false` **and redeploy** — the variable alone is inert.
+Rollback: `--update-env-vars PARTNER_REV_SHARE_USE_V2=false`. On Cloud Run that IS the redeploy —
+`services update` rolls a new revision and shifts traffic to it once healthy, so unlike Railway
+there is no separate step and no window where the variable is set but inert.
 
 ## Step 2 — Resume T7, then T8
 
