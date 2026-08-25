@@ -28,12 +28,25 @@ LIPSTICK_FIXTURES = [
     "Glossier Generation G Sheer Lipstick",
     "Pat McGrath MatteTrance Lipstick",
     "Rare Beauty Stay Vulnerable Lip Color",
-    "Pixi Glow-y Lip Oil",
-    "Kylie Precision Pout Lip Liner",
-    "Tom Ford Gloss Luxe",
-    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
     "Kylie Rosy Radiance Lip Combo",
     "Pixi Lip Duo - Choose Your Shades",
+]
+
+# Lip subtypes. These four titles used to live in LIPSTICK_FIXTURES because the
+# Lipstick regex was a lip catch-all. They moved here — not deleted — when the
+# dedicated Lip Gloss / Lip Oil / Lip Liner / Lip Tint patterns landed ahead of
+# Lipstick, so each keeps its coverage under the label it now resolves to.
+LIP_GLOSS_FIXTURES = [
+    "Tom Ford Gloss Luxe",
+    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
+]
+
+LIP_OIL_FIXTURES = [
+    "Pixi Glow-y Lip Oil",
+]
+
+LIP_LINER_FIXTURES = [
+    "Kylie Precision Pout Lip Liner",
 ]
 
 FOUNDATION_FIXTURES = [
@@ -126,7 +139,6 @@ SERUM_FIXTURES = [
     "Naturium Vitamin C Complex Face Serum",
     "Caudalie Vinopure Salicylic Serum",
     "Beauty of Joseon Glow Serum",
-    "COSRX Advanced Snail 96 Mucin Power Essence",
     "Vichy Mineral 89 Hyaluronic Acid Booster Serum",
     "Kiehl's Midnight Recovery Concentrate",
 ]
@@ -137,6 +149,10 @@ TONER_FIXTURES = [
     "Round Lab DIVE IN Skin Booster",
     "Laneige Cream Skin Refiner Mist",
     "I'm From Rice Toner",
+    # "essence" is a Toner keyword: a K-beauty essence is functionally a toner,
+    # and matching it here also keeps "Mask Fit Tone Up Essence" off the Mask
+    # pattern, which would otherwise win on the product-line word "Mask".
+    "COSRX Advanced Snail 96 Mucin Power Essence",
 ]
 
 TREATMENT_FIXTURES = [
@@ -241,6 +257,30 @@ def test_lipstick_resolves(title: str) -> None:
     assert hit is not None, f"no classification for {title!r}"
     assert hit[0] == "Lipstick"
     assert hit[1] == "beauty/makeup/lip/lipstick"
+
+
+@pytest.mark.parametrize("title", LIP_GLOSS_FIXTURES)
+def test_lip_gloss_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Gloss"
+    assert hit[1] == "beauty/makeup/lip/gloss"
+
+
+@pytest.mark.parametrize("title", LIP_OIL_FIXTURES)
+def test_lip_oil_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Oil"
+    assert hit[1] == "beauty/makeup/lip/oil"
+
+
+@pytest.mark.parametrize("title", LIP_LINER_FIXTURES)
+def test_lip_liner_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Liner"
+    assert hit[1] == "beauty/makeup/lip/liner"
 
 
 @pytest.mark.parametrize("title", FOUNDATION_FIXTURES)
