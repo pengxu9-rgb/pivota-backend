@@ -571,6 +571,51 @@ def _guard_legacy_psp_maintenance_routes() -> None:
         )
 
 
+# Paths banned by `_guard_legacy_inmemory_auth_routes`. Module-level so tests
+# assert against this set itself rather than a hand-copy that silently drifts.
+LEGACY_INMEMORY_AUTH_PATHS = frozenset({
+    "/auth/signup",
+    "/auth/admin-token",
+    "/auth/admin/users",
+    "/auth/admin/users/{user_id}/approve",
+    "/auth/admin/users/{user_id}/role",
+})
+
+
+def _guard_legacy_inmemory_auth_routes() -> None:
+    """Fail startup if the removed in-memory auth fixtures are ever re-mounted.
+
+    These `/auth/*` endpoints were backed by module-level dicts and honoured a
+    caller-supplied `role`, so an anonymous caller could mint a JWT with
+    `role: "admin"` -- satisfying `require_admin`, `get_current_admin`,
+    `require_admin_or_key`, `ADMIN_ROLES`, and every route that checks
+    `role in ["admin", "super_admin"]`. `/auth/admin-token` handed out an admin
+    JWT to an anonymous GET with no credentials at all.
+
+    `auth_router` is mounted unconditionally (no env flag, no host gate, no
+    middleware), so nothing downstream would catch a re-introduction.
+
+    This is a ban on the PATHS, not on the implementation, and it is
+    exact-match (a near-miss like `/auth/signup/verify` does not trip it). A
+    legitimate, authenticated, DB-backed admin user list at
+    `/auth/admin/users` would therefore fail startup here -- that is
+    deliberate: reclaiming one of these paths should be a conscious edit to
+    this set in review, not something that happens by accident. The converse
+    also holds: re-adding a route with a renamed path parameter would slip
+    past, so this guard backs up the tests rather than replacing them.
+    """
+    mounted = sorted(
+        route.path
+        for route in app.routes
+        if getattr(route, "path", None) in LEGACY_INMEMORY_AUTH_PATHS
+    )
+    if mounted:
+        raise RuntimeError(
+            "Legacy in-memory auth routes must not be mounted "
+            "(anonymous privilege escalation):\n- " + "\n- ".join(mounted)
+        )
+
+
 def _settings_contract_payload() -> dict:
     rate_limit_rpm = getattr(settings, "rate_limit_rpm", None)
     reconciliation_mode_raw = str(os.getenv("SHOPIFY_DISCOUNT_RECONCILIATION_MODE", "observe") or "").strip().lower()
@@ -1306,6 +1351,7 @@ if OPERATIONS_AVAILABLE:
     logger.info("✅ Operations router included")
 
 _guard_legacy_psp_maintenance_routes()
+_guard_legacy_inmemory_auth_routes()
 
 @app.get("/version")
 async def get_version(request: Request):

@@ -10,9 +10,10 @@ import os
 import hashlib
 from datetime import datetime
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, field_validator
 
 from config.settings import settings
@@ -28,10 +29,12 @@ from db.auth_identity import (
 )
 from db.database import database
 from utils.auth import (
+    ADMIN_ROLES,
     hash_password,
     verify_password,
     create_access_token,
     get_current_user,
+    optional_security,
     require_admin,
 )
 from utils.database_readiness import (
@@ -72,6 +75,49 @@ def _validate_role_value(value: str) -> str:
     if value not in valid_roles:
         raise ValueError(f'Invalid role. Must be one of: {", ".join(valid_roles)}')
     return value
+
+
+# Roles a caller is allowed to hand themselves at registration time. Everything
+# else in `_validate_role_value` is privileged -- `admin`/`super_admin` satisfy
+# `ADMIN_ROLES` and `require_admin`, and `employee`/`outsourced` satisfy
+# `require_employee` -- so those may only be granted by an authenticated admin.
+# `/api/auth/register` is mounted unauthenticated, so without this split an
+# anonymous caller could persist themselves an admin row and then log in.
+SELF_SERVICE_REGISTRATION_ROLES = frozenset({"merchant", "agent"})
+
+
+async def _optional_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+) -> Optional[Dict[str, Any]]:
+    """Resolve the caller when a Bearer token is present; None when anonymous.
+
+    A non-empty token that is presented must still be valid -- an unparseable or
+    expired one raises 401 rather than silently degrading to the anonymous path.
+    An EMPTY credential (`Authorization: Bearer `) is not a token at all:
+    `HTTPBearer(auto_error=False)` yields None for it, so it takes the anonymous
+    path. That is safe, because anonymous is the least-privileged caller here
+    and still cannot self-assign a privileged role.
+    """
+    if credentials is None:
+        return None
+    return await get_current_user(credentials)
+
+
+def _authorize_requested_role(role: str, caller: Optional[Dict[str, Any]]) -> None:
+    """Reject any privileged role that the caller is not an admin to grant."""
+    if role in SELF_SERVICE_REGISTRATION_ROLES:
+        return
+    if (caller or {}).get("role") in ADMIN_ROLES:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            f"Role '{role}' may only be granted by an authenticated admin. "
+            "Self-service registration accepts: "
+            + ", ".join(sorted(SELF_SERVICE_REGISTRATION_ROLES))
+            + "."
+        ),
+    )
 
 # Request/Response Models
 class RegisterRequest(BaseModel):
@@ -697,16 +743,22 @@ def _send_reset_password_email(email: str, reset_link: str) -> None:
         logger.warning("[Auth] Reset-password email send raised error=%s", type(exc).__name__)
 
 @router.post("/register", response_model=MessageResponse)
-async def register(data: RegisterRequest):
+async def register(
+    data: RegisterRequest,
+    caller: Optional[Dict[str, Any]] = Depends(_optional_current_user),
+):
     """
     Register a new user
-    
+
     - **email**: Valid email address
     - **password**: At least 8 characters, with uppercase, lowercase, and digit
     - **full_name**: Optional full name
-    - **role**: super_admin, admin, employee, outsourced, merchant, or agent (default: employee)
+    - **role**: `merchant` or `agent` for self-service registration. The
+      privileged roles (`super_admin`, `admin`, `employee`, `outsourced`) --
+      including the `employee` default -- require an admin Bearer token.
     """
     try:
+        _authorize_requested_role(data.role, caller)
         normalized_email = _normalize_email(data.email)
         # Check if user already exists
         query = "SELECT id FROM users WHERE email = :email"
