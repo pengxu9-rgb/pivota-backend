@@ -28,12 +28,25 @@ LIPSTICK_FIXTURES = [
     "Glossier Generation G Sheer Lipstick",
     "Pat McGrath MatteTrance Lipstick",
     "Rare Beauty Stay Vulnerable Lip Color",
-    "Pixi Glow-y Lip Oil",
-    "Kylie Precision Pout Lip Liner",
-    "Tom Ford Gloss Luxe",
-    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
     "Kylie Rosy Radiance Lip Combo",
     "Pixi Lip Duo - Choose Your Shades",
+]
+
+# Lip subtypes. These four titles used to live in LIPSTICK_FIXTURES because the
+# Lipstick regex was a lip catch-all. They moved here — not deleted — when the
+# dedicated Lip Gloss / Lip Oil / Lip Liner / Lip Tint patterns landed ahead of
+# Lipstick, so each keeps its coverage under the label it now resolves to.
+LIP_GLOSS_FIXTURES = [
+    "Tom Ford Gloss Luxe",
+    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
+]
+
+LIP_OIL_FIXTURES = [
+    "Pixi Glow-y Lip Oil",
+]
+
+LIP_LINER_FIXTURES = [
+    "Kylie Precision Pout Lip Liner",
 ]
 
 FOUNDATION_FIXTURES = [
@@ -241,6 +254,72 @@ def test_lipstick_resolves(title: str) -> None:
     assert hit is not None, f"no classification for {title!r}"
     assert hit[0] == "Lipstick"
     assert hit[1] == "beauty/makeup/lip/lipstick"
+
+
+@pytest.mark.parametrize("title", LIP_GLOSS_FIXTURES)
+def test_lip_gloss_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Gloss"
+    assert hit[1] == "beauty/makeup/lip/gloss"
+
+
+@pytest.mark.parametrize("title", LIP_OIL_FIXTURES)
+def test_lip_oil_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Oil"
+    assert hit[1] == "beauty/makeup/lip/oil"
+
+
+@pytest.mark.parametrize("title", LIP_LINER_FIXTURES)
+def test_lip_liner_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Liner"
+    assert hit[1] == "beauty/makeup/lip/liner"
+
+
+# Ordering regressions. Each of these is a title where an EARLIER pattern used
+# to swallow a more specific later one. They are asserted as (title -> path)
+# pairs rather than added to a *_FIXTURES list because what is under test is the
+# ORDER of CATEGORY_PATTERNS, not the vocabulary of any single pattern.
+PATTERN_ORDER_FIXTURES = [
+    # "essence" is a Serum token, but it must not outrank a real mask/exfoliant/
+    # treatment/oil FORM noun that appears alongside it.
+    ("Real Rice Essence Sheet Mask 10 Pack", "beauty/skincare/treat/mask"),
+    ("Mediheal Essence Mask Sheet Tea Tree", "beauty/skincare/treat/mask"),
+    ("Snail Essence Sleeping Mask", "beauty/skincare/treat/mask"),
+    ("Acne Care Essence Spot Patch 18ct", "beauty/skincare/treat/mask"),
+    ("Some By Mi Miracle Essence Peeling Gel", "beauty/skincare/treat/exfoliant"),
+    ("Blemish Essence Spot Treatment Gel", "beauty/skincare/treat/treatment"),
+    ("Lavender Essence Body Oil", "beauty/skincare/moisturize/oil"),
+    # ...and a bare product-line "Mask" must not outrank the real form noun.
+    # This is the title a3940018 set out to fix; its own message says Serum
+    # should catch it on "essence".
+    ("Missha Mask Fit Tone Up Essence", "beauty/skincare/treat/serum"),
+    # A base-makeup product carrying an SPF claim is foundation, not sunscreen.
+    ("Pro Filt'r Soft Matte Longwear Foundation Broad Spectrum SPF 50+",
+     "beauty/makeup/face/foundation"),
+    ("Maybelline Dream BB Cream SPF 30", "beauty/makeup/face/foundation"),
+    ("Erborian CC Cream SPF 50", "beauty/makeup/face/foundation"),
+    ("Cushion Foundation Refill SPF 50+", "beauty/makeup/face/foundation"),
+    ("Glow Skin Tint SPF 30", "beauty/makeup/face/foundation"),
+    # ...but "foundation" as a MODIFIER must not outrank primer/cleanser.
+    ("Smashbox Photo Finish Foundation Primer", "beauty/makeup/face/primer"),
+    ("Pore Filling Foundation Primer 30ml", "beauty/makeup/face/primer"),
+    ("Foundation Cleansing Balm", "beauty/skincare/cleanse/cleanser"),
+    # A real sunscreen is untouched by the lookahead that makes the above work.
+    ("Supergoop Unseen Sunscreen SPF 40", "beauty/skincare/sun/sunscreen"),
+    ("Bioderma Photoderm Nude Touch SPF 50+", "beauty/skincare/sun/sunscreen"),
+]
+
+
+@pytest.mark.parametrize("title,expected_path", PATTERN_ORDER_FIXTURES)
+def test_pattern_order_resolves(title: str, expected_path: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[1] == expected_path, f"{title!r} -> {hit[1]!r}, expected {expected_path!r}"
 
 
 @pytest.mark.parametrize("title", FOUNDATION_FIXTURES)

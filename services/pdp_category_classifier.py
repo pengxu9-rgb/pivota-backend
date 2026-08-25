@@ -17,8 +17,18 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Tuple
 
+# A base-makeup product that carries an SPF claim is FOUNDATION, not sunscreen:
+# "Foundation Broad Spectrum SPF 50+" is a foundation. The leading negative
+# lookahead declines those titles here so they fall through to the Foundation
+# pattern further down, which is what a3940018 set out to fix. Doing it this way
+# rather than hoisting Foundation to the top of CATEGORY_PATTERNS matters:
+# hoisting also lifted Foundation above Primer and Cleanser, which re-labelled
+# every "foundation primer" as a foundation. Only sunscreen is narrowed here, so
+# a real sunscreen is untouched.
 _SUNSCREEN_RE = re.compile(
-    r"\b(sunscreen|sun\s*screen|broad\s+spectrum|spf\s*\d{2,3}\+?|pa\s*\+{2,4}|"
+    r"^(?!.*\b(?:foundation|bb\s+cream|cc\s+cream|skin\s+tint|"
+    r"cushion|concealer|primer)\b)"
+    r".*\b(sunscreen|sun\s*screen|broad\s+spectrum|spf\s*\d{2,3}\+?|pa\s*\+{2,4}|"
     r"sun\s+(?:serum|fluid|cream|gel|milk|stick)|"
     r"uv\s*(?:protection|shield|defen[cs]e|lock))\b",
     re.IGNORECASE,
@@ -115,10 +125,12 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/treat/toner", re.compile(
         r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
+    # Mask is SPLIT in two. Everything here names an unambiguous mask FORM, so
+    # it wins over "essence" below: "Real Rice Essence Sheet Mask" is a mask.
     ("Mask", "beauty/skincare/treat/mask", re.compile(
-        r"\b(face mask|clay mask|charcoal mask|sheet mask|gel mask|sleeping mask|"
-        r"sleep mask|wash[-\s]?off mask|under eye patch|eye patch|pimple patch|"
-        r"spot cover patch|spot patch|patchs|patches|lip\s?patch|mask)\b",
+        r"\b(face mask|clay mask|charcoal mask|sheet mask|mask sheet|gel mask|"
+        r"sleeping mask|sleep mask|wash[-\s]?off mask|under eye patch|eye patch|"
+        r"pimple patch|spot cover patch|spot patch|patchs|patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
@@ -135,6 +147,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Serum", "beauty/skincare/treat/serum", re.compile(
         r"\b(serum|essence|ampoule|concentrate)\b", re.IGNORECASE)),
+    # Bare `mask` LAST among the skincare-treat family, so a line-name "Mask"
+    # ("Mask Fit Tone Up Essence") no longer beats the real form noun. A title
+    # whose only signal is the word "mask" still lands here.
+    ("Mask", "beauty/skincare/treat/mask", re.compile(
+        r"\bmask\b", re.IGNORECASE)),
     ("Tanning", "beauty/body/tanning", re.compile(
         r"\b(self[-\s]?tan|self[-\s]?tanning|sunless tan|gradual tanning|gradualglow)\b",
         re.IGNORECASE)),
@@ -144,12 +161,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick|"
         r"eye brightener|bright fix)\b",
         re.IGNORECASE)),
+    # Stays BELOW Primer and Cleanser: "foundation primer" is a primer and
+    # "foundation cleansing balm" is a cleanser. The SPF ordering this pattern
+    # used to be hoisted for is handled by _SUNSCREEN_RE's lookahead instead.
     ("Foundation", "beauty/makeup/face/foundation", re.compile(
-        r"\b(foundation|skin tint|tint stick|foundation stick|cushion foundation)\b",
+        r"\b(foundation|bb\s+cream|cc\s+cream|skin\s+tint|tint\s+stick|"
+        r"foundation\s+stick|cushion\s+foundation)\b",
         re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
         r"\b(powder|setting powder|pressed powder|loose powder|"
         r"blurring powder|finishing powder)\b",
+        re.IGNORECASE)),
+    # Lip Gloss before Highlighter: "Gloss Bomb Universal Lip Luminizer" contains
+    # "luminizer" which the Highlighter pattern would catch — but it's a lip gloss.
+    # Placing Lip Gloss here lets "gloss bomb" win before "luminizer" is seen.
+    ("Lip Gloss", "beauty/makeup/lip/gloss", re.compile(
+        r"\b(lip\s+gloss|gloss\s+bomb|gloss\s+luxe|gloss\s+drip|"
+        r"gloss\s+stick|gloss\s+stix|lip\s+luminizer|clear\s+gloss)\b",
         re.IGNORECASE)),
     ("Highlighter", "beauty/makeup/face/highlighter", re.compile(
         r"\b(highlighter|illuminator|luminizer|luminiser|killawatt|diamond bomb|"
@@ -173,15 +201,19 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(lip balm|lip butter|lip treatment|lip care|lip serum|lipserum|"
         r"nightbalm|lip scrub|scrubstick)\b",
         re.IGNORECASE)),
+    ("Lip Oil", "beauty/makeup/lip/oil", re.compile(
+        r"\b(lip\s+oil)\b", re.IGNORECASE)),
+    ("Lip Liner", "beauty/makeup/lip/liner", re.compile(
+        r"\b(lip\s+liner|lip\s+pencil|pout\s+liner|precision\s+pout)\b",
+        re.IGNORECASE)),
+    ("Lip Tint", "beauty/makeup/lip/tint", re.compile(
+        r"\b(lip\s+tint|lip\s+stain)\b", re.IGNORECASE)),
     ("Lipstick", "beauty/makeup/lip/lipstick", re.compile(
-        # `lip[\s-]*stick` matches "lipstick", "lip stick", "lip-stick",
-        # and double-space variants. User typos like "lip stick" were
-        # silently classifying as None and falling back to a generic
-        # skincare term list, returning serums/cleansers for lipstick
-        # queries. See lipstick-recall regression 2026-05-09.
-        r"\b(lip[\s-]*stick|lip color|lip colour|liquid lip|lip luxe|lip lacquer|"
-        r"lip gloss|lip oil|lip liner|lip stain|lip tint|pout lip|gloss luxe|"
-        r"gloss drip|gloss bomb|gloss stick|gloss stix|lip combo|lip duo)\b",
+        # Narrowed: lip gloss/oil/liner/tint/stain each have their own patterns above.
+        # `lip[\s-]*stick` catches "lipstick", "lip stick", "lip-stick".
+        # See lipstick-recall regression 2026-05-09.
+        r"\b(lip[\s-]*stick|lip\s+color|lip\s+colour|liquid\s+lip|lip\s+luxe|"
+        r"lip\s+lacquer|pout\s+lip|lip\s+combo|lip\s+duo)\b",
         re.IGNORECASE)),
     ("Moisturizer", "beauty/skincare/moisturize/cream", re.compile(
         r"\b(moisturizer|moisturiser|cream|lotion|gel cream|gel-cream|"
@@ -214,7 +246,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(skirt|mini\s+skirt|midi\s+skirt|maxi\s+skirt|pencil\s+skirt)\b",
         re.IGNORECASE)),
     ("Pants", "fashion/apparel/bottoms/pants", re.compile(
-        r"\b(pants|trousers|chinos|slacks|jogger\s+pants|cargo\s+pants|leggings)\b",
+        r"\b(pants|trousers|chinos|slacks|joggers?\s+pants|joggers\b|cargo\s+pants|leggings)\b",
         re.IGNORECASE)),
     ("Jeans", "fashion/apparel/bottoms/jeans", re.compile(
         r"\b(jeans|denim|skinny\s+jeans|straight\s+leg|boot[-\s]?cut)\b",
@@ -283,6 +315,23 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # Generic apparel/clothing fallback — last so specific patterns win.
     ("Apparel", "fashion/apparel/general", re.compile(
         r"\b(apparel|clothing|garment|womenswear|menswear|kidswear)\b",
+        re.IGNORECASE)),
+    # ----- Electronics patterns -----
+    # Keyword-matchable subset only. Model-number-only products (WH-1000XM5,
+    # AirPods, etc.) have no keyword signal and go to the LLM backfill path.
+    ("Headphones", "electronics/audio/headphones", re.compile(
+        r"\b(headphones|over[-\s]?ear\s+headphones|on[-\s]?ear\s+headphones|"
+        r"wireless\s+headphones|noise[-\s]?cancell?ing\s+headphones)\b",
+        re.IGNORECASE)),
+    ("Earbuds", "electronics/audio/earbuds", re.compile(
+        r"\b(earbuds|ear\s+buds|true\s+wireless\s+earbuds|wireless\s+earbuds|"
+        r"in[-\s]?ear\s+(?:headphones|earphones))\b",
+        re.IGNORECASE)),
+    ("E-Reader", "electronics/ereader", re.compile(
+        r"\b(e[-\s]?reader|ebook\s+reader|e[-\s]?book\s+reader)\b",
+        re.IGNORECASE)),
+    ("Bluetooth Speaker", "electronics/audio/speaker", re.compile(
+        r"\b(bluetooth\s+speaker|wireless\s+speaker|portable\s+speaker|smart\s+speaker)\b",
         re.IGNORECASE)),
     ("Gift Set", "beauty/sets/gift-set", re.compile(
         r"\b(skincare set|skin care set|gift set|holiday edition|routine|bundle|"

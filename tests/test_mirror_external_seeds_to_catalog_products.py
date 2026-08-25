@@ -104,16 +104,18 @@ def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
 
 
 def test_mirror_insert_classifies_category_path() -> None:
+    # A lip gloss resolves to the Lip Gloss subtype, not the Lipstick catch-all:
+    # the classifier grew dedicated lip subtype patterns ahead of Lipstick.
     meta = resolve_mirror_category_metadata(
         category=None,
         product_type="Lip Gloss",
         title="Fenty Beauty Gloss Bomb Lip Gloss",
     )
 
-    assert meta["category_path"] == "beauty/makeup/lip/lipstick"
+    assert meta["category_path"] == "beauty/makeup/lip/gloss"
     assert meta["category_confidence"] == CATEGORY_CONFIDENCE_REGEX_AT_MIRROR
     assert meta["category_label_source"] == CATEGORY_LABEL_SOURCE_AT_MIRROR
-    assert meta["category_label"] == "Lipstick"
+    assert meta["category_label"] == "Lip Gloss"
 
 
 def test_mirror_insert_leaves_unknown_category_null() -> None:
