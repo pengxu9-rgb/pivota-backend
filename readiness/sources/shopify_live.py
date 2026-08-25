@@ -276,6 +276,34 @@ class ShopifyLiveMerchantSource:
         shopify_connected = bool(shop_domain and access_token)
         if not shopify_connected:
             merchant_blockers.append("shopify_configuration_missing")
+
+        # Does this merchant still have a storefront attached at all?
+        #
+        # `shopify_connected` cannot answer that. `_get_shopify_config_for_merchant`
+        # falls back to the GLOBAL settings/env Shopify credentials when the
+        # merchant has none of their own, so it reads "connected" for a merchant
+        # with zero stores whenever SHOPIFY_SHOP_DOMAIN/SHOPIFY_ACCESS_TOKEN are
+        # set in the environment — which they are in prod. `get_primary_store`
+        # is the structural signal: it returns the newest merchant_stores row
+        # with status IN ('active','connected'), falling back to the legacy
+        # merchant_onboarding.mcp_* connection, and None when neither exists.
+        #
+        # This matters because the product cache is keyed on merchant_id +
+        # platform ALONE — no store_id — and readiness reads it with
+        # include_expired=True (`_load_runtime_cache_rows`). So every product a
+        # store ever synced stays readable forever after that store is detached:
+        # DELETE /merchant/integrations/store/{store_id} drops the merchant_stores
+        # row and nothing retires the cached rows. Readiness kept enumerating
+        # them and minting per-variant blockers (out_of_stock, inventory_stale,
+        # ...) for a store that no longer exists, which is what the merchant
+        # portal rendered as "historical issues" on the overview card and the
+        # product-optimization workspace.
+        #
+        # Detaching a store must retire its catalog from this report, not merely
+        # add one more merchant-level blocker alongside a full issue list.
+        store_connected = store is not None
+        if not store_connected:
+            merchant_blockers.append("store_connection_missing")
         if not policy:
             merchant_blockers.append("merchant_policy_missing")
             policy = {
@@ -288,11 +316,17 @@ class ShopifyLiveMerchantSource:
             }
 
         cached_rows: List[Dict[str, Any]] = []
-        try:
-            cached_rows = await _load_runtime_cache_rows(merchant_id)
-        except Exception:
-            merchant_warnings.append("products_cache_lookup_failed")
-            logger.warning("products_cache lookup failed for merchant=%s", merchant_id, exc_info=True)
+        if store_connected:
+            try:
+                cached_rows = await _load_runtime_cache_rows(merchant_id)
+            except Exception:
+                merchant_warnings.append("products_cache_lookup_failed")
+                logger.warning("products_cache lookup failed for merchant=%s", merchant_id, exc_info=True)
+        else:
+            audit_notes.append(
+                "No storefront is connected, so this report does not read the product cache. "
+                "Cached products from a detached store are not assessed."
+            )
 
         products: List[StandardProduct] = []
         product_diagnostics: Dict[str, Dict[str, Any]] = {}
@@ -335,7 +369,13 @@ class ShopifyLiveMerchantSource:
                         },
                     }
 
-        live_overlay_needed = bool(shopify_connected and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time)))
+        # `store_connected` gates the overlay too: without it a merchant with no
+        # stores would still hit the live Admin API on the global env credentials.
+        live_overlay_needed = bool(
+            store_connected
+            and shopify_connected
+            and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time))
+        )
         live_fetch_error: Optional[str] = None
         live_overlay_started_at: Optional[datetime] = None
         live_overlay_elapsed_ms: Optional[float] = None
@@ -412,7 +452,11 @@ class ShopifyLiveMerchantSource:
                 merchant_warnings.append("live_shopify_overlay_failed")
             audit_notes.append(f"Live Shopify catalog fetch failed: {live_fetch_error}")
 
-        if not products:
+        # "catalog_missing" means "you have a store but we cannot see its
+        # products" — an actionable sync problem. A merchant with no store at all
+        # already carries `store_connection_missing`; adding `catalog_missing`
+        # there would point them at a sync they have no store to run.
+        if not products and store_connected:
             merchant_blockers.append("catalog_missing")
 
         product_review_summaries: Dict[str, Dict[str, Any]] = {}
