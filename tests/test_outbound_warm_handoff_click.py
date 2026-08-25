@@ -313,29 +313,41 @@ async def test_resolve_warm_handoff_passes_variant_hint_and_attribution(monkeypa
 # later upgrade. See docs/runbooks/outbound_warm_handoff_rollout.md.
 # ---------------------------------------------------------------------------
 
+# `expected` is the ABSOLUTE answer, not just "whatever the click path says". Agreement alone
+# is worthless here: both sides call the SAME evaluate_warm_eligibility, so INVERTING any
+# knockout keeps them equal and an agreement-only assertion stays green. Measured — inverting
+# `no_dest_host` to `return True` survived the entire 11,038-test suite when this matrix
+# asserted agreement only, and nothing else in the repo covers that knockout.
+TOKEN_DEPENDENT = "token-dependent"
+
 _ELIGIBILITY_MATRIX = [
-    # (label, dest, brands_raw, pct, enabled, key)
-    ("allowlisted brand", BRAND_DEST, "cosrx.com", 0, True, "k"),
-    ("brand off the allowlist", BRAND_DEST, "someone-else.com", 0, True, "k"),
-    ("no allowlist, full rollout", BRAND_DEST, "", 100, True, "k"),
-    ("no allowlist, no rollout", BRAND_DEST, "", 0, True, "k"),
-    ("no allowlist, half rollout", BRAND_DEST, "", 50, True, "k"),
-    ("affiliate destination", "https://track.linksynergy.com/x?u=1", "", 100, True, "k"),
-    ("hostless destination", "not-a-url", "", 100, True, "k"),
-    ("lane disabled", BRAND_DEST, "cosrx.com", 100, False, "k"),
-    ("no internal key", BRAND_DEST, "cosrx.com", 100, True, None),
+    # (label, dest, brands_raw, pct, enabled, key, expected)
+    ("allowlisted brand", BRAND_DEST, "cosrx.com", 0, True, "k", True),
+    ("brand off the allowlist", BRAND_DEST, "someone-else.com", 0, True, "k", False),
+    ("no allowlist, full rollout", BRAND_DEST, "", 100, True, "k", True),
+    ("no allowlist, no rollout", BRAND_DEST, "", 0, True, "k", False),
+    # The only row whose answer rides on the token hash — the minted token embeds `iat`, so
+    # it differs per run. Agreement is all this row can honestly assert.
+    ("no allowlist, half rollout", BRAND_DEST, "", 50, True, "k", TOKEN_DEPENDENT),
+    ("affiliate destination", "https://track.linksynergy.com/x?u=1", "", 100, True, "k", False),
+    ("hostless destination", "not-a-url", "", 100, True, "k", False),
+    ("lane disabled", BRAND_DEST, "cosrx.com", 100, False, "k", False),
+    ("no internal key", BRAND_DEST, "cosrx.com", 100, True, None, False),
 ]
 
 
-@pytest.mark.parametrize("label,dest,brands,pct,enabled,key", _ELIGIBILITY_MATRIX)
+@pytest.mark.parametrize("label,dest,brands,pct,enabled,key,expected", _ELIGIBILITY_MATRIX)
 def test_could_upgrade_at_click_time_never_under_reports(
-    monkeypatch, label, dest, brands, pct, enabled, key
+    monkeypatch, label, dest, brands, pct, enabled, key, expected
 ):
     """SOUNDNESS: a resolve-time `False` must guarantee the click also refuses.
 
     That direction is the one the caller relies on — it is what licenses emitting an explicit
     `cart_prefilled: false`. Over-reporting (True where the click would refuse) is allowed and
     costs only a `null`; under-reporting reinstates the false claim.
+
+    Each row pins the ABSOLUTE verdict as well as the agreement, so an inverted knockout is
+    caught here rather than sliding through on both sides moving together.
     """
     monkeypatch.setattr(settings, "outbound_warm_handoff_enabled", enabled)
     monkeypatch.setattr(settings, "outbound_warm_handoff_internal_key", key)
@@ -344,13 +356,35 @@ def test_could_upgrade_at_click_time_never_under_reports(
     token = _mint_token(dest)
 
     resolve_says = warm.could_upgrade_at_click_time(dest=dest, token=token, settings=settings)
+    if expected is not TOKEN_DEPENDENT:
+        assert resolve_says is expected, f"{label}: expected {expected}, got {resolve_says}"
+    if not enabled:
+        return
     click_says, reason = warm.evaluate_warm_eligibility(
         dest=dest, user_agent=HUMAN_UA, token=token, settings=settings
     )
-    if not enabled:
-        assert resolve_says is False, label
-        return
     assert resolve_says == click_says, f"{label}: resolve={resolve_says} click={click_says} ({reason})"
+
+
+@pytest.mark.parametrize("pct", [25, 50, 75])
+def test_rollout_bucket_actually_reads_the_token(pct):
+    """The claim "the bucket is a stable hash of the token" is what makes recovering the REAL
+    token load-bearing — and nothing asserted it. A bucket that ignored its token entirely, or
+    flipped `<` to `>=`, satisfied every existing rollout test.
+
+    Pinned two ways: the assignment must SPLIT a fixed token set (not all-in / all-out, which
+    is what a constant-hash or inverted comparison produces), and one golden value.
+    """
+    tokens = [f"tok-{i}" for i in range(20)]
+    in_bucket = sum(warm.rollout_bucket(t, pct) for t in tokens)
+    assert 0 < in_bucket < len(tokens), (
+        f"pct={pct} put {in_bucket}/20 tokens in the bucket — the assignment is not reading "
+        "the token (a constant hash or an inverted comparison lands on 0 or 20)"
+    )
+    # Golden: pins the direction of the comparison, which a distribution check cannot.
+    assert warm.rollout_bucket("tok-0", 50) is True
+    assert warm.rollout_bucket("tok-0", 0) is False
+    assert warm.rollout_bucket("tok-0", 100) is True
 
 
 def test_could_upgrade_at_click_time_over_reports_for_a_bot_and_that_is_correct(monkeypatch):

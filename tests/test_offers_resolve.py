@@ -1615,12 +1615,15 @@ def test_cart_prefilled_tracks_the_percentage_rollout(
 def test_cart_prefilled_agrees_with_the_click_lane_on_the_SAME_token(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
 ) -> None:
-    """The two code paths must agree, on a bucket where the answer depends on the token.
+    """The INTERPRETATION must hold: `cart_prefilled is None` exactly when the click lane
+    would find the link eligible, evaluated on the token the offer actually carries.
 
-    The rollout bucket is a stable hash of the token string. A resolve-time check that
-    re-minted, truncated, or fabricated a token would still produce a plausible boolean and
-    pass every test above — and would silently disagree with the click roughly half the time.
-    This pins the two together on the one input that can expose the difference.
+    Deliberately NOT the token-identity guarantee — this test cannot give it. A substituted
+    token only changes the answer when the two happen to land in different buckets, so
+    measured against a fabricated-token mutant this assertion kills it 3-4 times in 12. Token
+    identity is pinned deterministically by
+    test_the_token_we_evaluate_is_the_token_we_hand_out; this test covers the mapping from
+    eligibility to tri-state, which that one does not.
     """
     from services.outbound_warm_handoff import evaluate_warm_eligibility
 
@@ -1697,6 +1700,28 @@ def test_a_null_claim_is_warranted_because_the_click_really_does_land_in_a_cart(
         warm.memo_clear()
 
 
+def test_shop_domain_is_load_bearing_for_the_cart_verdict(
+    monkeypatch: pytest.MonkeyPatch, warm_lane
+) -> None:
+    """`_cart_prefilled_claim` forwards four values into resolve_cart_permalink; without this
+    row, dropping `shop_domain` to None changes nothing any test can see.
+
+    Here the destination host says nothing about Shopify and `platform` is unset, so
+    `shop_domain` is the ONLY evidence that a cart permalink can be built at all.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_enabled", False)
+    kwargs = dict(
+        destination_url="https://brand.com/products/serum",
+        platform=None,
+        cart_variant_id="41234567890123",
+        redirect_url="https://api.example.com/r?token=t",
+    )
+    assert gateway._cart_prefilled_claim(shop_domain="brand.myshopify.com", **kwargs) is True
+    assert gateway._cart_prefilled_claim(shop_domain=None, **kwargs) is False
+
+
 def test_cart_prefilled_says_unknown_when_the_token_cannot_be_recovered(
     monkeypatch: pytest.MonkeyPatch, warm_lane
 ) -> None:
@@ -1762,13 +1787,22 @@ def test_the_token_we_evaluate_is_the_token_we_hand_out(
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 50)
 
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    # A host/path no other fixture uses. Against the shared default a hardcoded
+    # `dest="https://brand.com/products/serum"` at the call site passes, because every
+    # fixture in this file happens to equal that literal.
+    distinctive = "https://brand.com/products/uniquely-named-fixture-sku"
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False,
+        row_overrides={"canonical_url": distinctive, "destination_url": distinctive},
+    )
     assert seen, "the eligibility predicate was never consulted — this test proves nothing"
     assert seen["token"] == _token_of(offer), (
         "resolve time weighed a DIFFERENT token than the buyer's link carries; the rollout "
         "bucket, and therefore the claim, is decided on the wrong input"
     )
-    assert seen["dest"] == "https://brand.com/products/serum"
+    assert seen["dest"] == distinctive, (
+        "the predicate was handed a different URL than the link was built from"
+    )
 
 
 def test_redirect_token_is_recovered_byte_identically(client: TestClient) -> None:
@@ -1779,8 +1813,16 @@ def test_redirect_token_is_recovered_byte_identically(client: TestClient) -> Non
     token = make_redirect_token({"market": "US", "tool": "*", "dest": "https://brand.com/x", "ctx": {}})
     assert "." in token and "=" not in token, "fixture no longer resembles a real token"
     assert gateway._redirect_token_from_url(f"https://api.example.com/r?token={token}") == token
+    # It must key on `token=` specifically, not "the first param" or "anything with an =".
+    # Without these two rows a selector of `item.startswith("t")`, `"=" in item`, or
+    # "return the first value" passes — every other fixture URL carries a single param.
+    assert gateway._redirect_token_from_url(
+        f"https://api.example.com/r?utm_source=x&token={token}") == token
+    assert gateway._redirect_token_from_url(
+        f"https://api.example.com/r?tokenish=nope&token={token}") == token
     # and the absent/odd cases degrade to "" rather than raising
     assert gateway._redirect_token_from_url("https://api.example.com/r") == ""
+    assert gateway._redirect_token_from_url("https://api.example.com/r?utm_source=x") == ""
     assert gateway._redirect_token_from_url("") == ""
 
 
