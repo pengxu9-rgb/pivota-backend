@@ -187,6 +187,7 @@ async def _cache_put(key: str, payload: Dict[str, Any], *, ttl: Optional[float] 
 
 def reset_for_tests() -> None:
     _LOCAL.clear()
+    _CURRENCY_REFRESHING.clear()
 
 
 # --- the shop's currency ----------------------------------------------------------------------
@@ -205,50 +206,97 @@ def reset_for_tests() -> None:
 # might not be was unfounded, and is recorded here so nobody re-opens it from first principles.
 
 _DEFAULT_CURRENCY_TTL_S = 86_400.0    # a shop's default currency changes ~never
+# A host that cannot answer is remembered too, but briefly. Without this an unanswerable host is
+# re-asked once per offer per turn, forever — and those retries feed the shared per-host backoff,
+# so a 429 on an endpoint that contributes NOTHING to stock verification drove product
+# verification to zero. Short enough that a fixed shop recovers without a deploy.
+_DEFAULT_CURRENCY_MISS_TTL_S = 600.0
+
+# Hosts with a currency refresh already in flight, so N offers on one domain spawn ONE.
+_CURRENCY_REFRESHING: set = set()
 
 
-async def _shop_currency(host: str, *, max_wait: Optional[float]) -> Optional[str]:
-    """The shop's default currency, or None. One fetch per domain, cached for a day.
+def _currency_ttl() -> float:
+    return _f("LIVE_OFFER_VERIFICATION_CURRENCY_TTL_SECONDS", _DEFAULT_CURRENCY_TTL_S)
 
-    None is a real answer and must degrade honestly: without it the `.js` amount cannot be
-    compared with the offer's, so price stays unverified rather than being guessed at.
+
+def _currency_miss_ttl() -> float:
+    return _f("LIVE_OFFER_VERIFICATION_CURRENCY_MISS_TTL_SECONDS", _DEFAULT_CURRENCY_MISS_TTL_S)
+
+
+async def _fetch_shop_currency(host: str) -> None:
+    """Populate the currency cache for `host`. Runs OFF the request's critical path.
+
+    THE COST MODEL IS THE WHOLE POINT. A shop's default currency is a per-DOMAIN fact that changes
+    ~never, and fetching it inside a per-OFFER task bounded at 1.5s was measured to make this
+    feature net-negative: one offer then needed two 1s-paced requests against a 1.5s cap, so on a
+    cold cache the currency leg never completed AND it stole the budget the product fetch needed —
+    stock verification fell from 11/12 to 7/12 while price verification never fired once.
+
+    So the verdict never waits for this. A cold cache simply means "price unverified this turn",
+    which is exactly #1868's behaviour — the floor is no-regression — and the next turn for that
+    domain can compare. Refreshes are deduplicated per host so a shortlist of N offers on one
+    domain spawns one.
     """
-    key = f"lov:cur:{host}"
-    cached = await _cache_get(key)
-    if cached:
-        return cached.get("currency")
-
+    url = f"https://{host}/meta.json"
+    currency: Optional[str] = None
     try:
-        await crawl_politeness.before_request(
-            f"https://{host}/meta.json", user_agent=_USER_AGENT, max_wait=max_wait
-        )
-    except Exception:  # noqa: BLE001 - robots or pacing; either way we simply do not learn it
-        return None
-
-    try:
+        # Bounded, like every other outbound request here — never `max_wait=0`.
+        await crawl_politeness.before_request(url, user_agent=_USER_AGENT)
         timeout = _f("LIVE_OFFER_VERIFICATION_FETCH_TIMEOUT_SECONDS", _DEFAULT_FETCH_TIMEOUT_S)
         async with httpx.AsyncClient(
             timeout=timeout, follow_redirects=True, max_redirects=_MAX_REDIRECTS
         ) as client:
             resp = await client.get(
-                f"https://{host}/meta.json",
-                headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+                url, headers={"User-Agent": _USER_AGENT, "Accept": "application/json"}
             )
         crawl_politeness.note_response(
-            f"https://{host}/meta.json", resp.status_code,
-            retry_after=resp.headers.get("retry-after"),
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
         )
-        if resp.status_code != 200:
-            return None
-        currency = str((resp.json() or {}).get("currency") or "").strip().upper()
-    except Exception as exc:  # noqa: BLE001
+        if resp.status_code == 200:
+            raw = str((resp.json() or {}).get("currency") or "").strip().upper()
+            if len(raw) == 3 and raw.isalpha():
+                currency = raw
+    except Exception as exc:  # noqa: BLE001 - never surfaces; the verdict does not depend on it
         logger.info("shop currency unavailable for %s: %s", host, exc)
-        return None
+    finally:
+        # RELEASED IN A `finally`, including on cancellation. The claim is what stops N offers
+        # spawning N fetches; leaking it would leave the host claimed forever, so its currency
+        # would never be looked up again and price verification for that shop would be
+        # permanently off — a silent, unrecoverable state.
+        _CURRENCY_REFRESHING.discard(host)
 
-    if len(currency) != 3 or not currency.isalpha():
+    # A miss is cached too, briefly. See _DEFAULT_CURRENCY_MISS_TTL_S.
+    await _cache_put(
+        f"lov:cur:{host}",
+        {"currency": currency},
+        ttl=_currency_ttl() if currency else _currency_miss_ttl(),
+    )
+
+
+async def _shop_currency(host: str) -> Optional[str]:
+    """The shop's currency IF we already know it. Never blocks; schedules a refresh on a miss."""
+    cached = await _cache_get(f"lov:cur:{host}")
+    if cached is not None:
+        return cached.get("currency")
+
+    # The host is claimed SYNCHRONOUSLY, before the task is created. `ensure_future` only
+    # schedules the coroutine — its body does not run until the loop yields — so a check made
+    # inside `_fetch_shop_currency` let every offer in the same tick spawn its own fetch. Measured:
+    # 3 offers on one domain produced 3 identical /meta.json requests, which then consumed the
+    # host's pacing slots and starved the product fetches they were supposed to complement.
+    if host in _CURRENCY_REFRESHING:
         return None
-    await _cache_put(key, {"currency": currency}, ttl=_DEFAULT_CURRENCY_TTL_S)
-    return currency
+    _CURRENCY_REFRESHING.add(host)
+
+    # Fire and forget, deliberately outside the batch deadline. The done-callback consumes the
+    # result so a failure cannot surface as "exception was never retrieved".
+    try:
+        task = asyncio.ensure_future(_fetch_shop_currency(host))
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    except RuntimeError:  # pragma: no cover - no running loop
+        _CURRENCY_REFRESHING.discard(host)
+    return None
 
 
 # --- the check ---------------------------------------------------------------------------------
@@ -400,7 +448,7 @@ async def _check_one(
     # not an error — a JPY shop and a USD-presentment offer are both correct — it simply means
     # this source cannot speak to that offer's price.
     host = crawl_politeness.host_of(js_url)
-    shop_currency = await _shop_currency(host, max_wait=max_wait) if host else None
+    shop_currency = await _shop_currency(host) if host else None
     offer_currency = str(offer.get("currency") or "").strip().upper() or None
     comparable = bool(
         live is not None and shop_currency and offer_currency and shop_currency == offer_currency
@@ -514,7 +562,12 @@ def apply_verdicts(
                 # shop's own declared currency matches the one this offer quoted, so the number
                 # and the label agree by construction rather than by assumption.
                 enriched["price"] = float(verdict.live_price)
-                enriched["price_verified"] = True
+                # `merchant_price_verified`, NOT `price_verified`. The gateway's reco lane
+                # already publishes `price_verified` from its own `get_pdp_v2` loopback, which
+                # means "consistent with our own projection" — the opposite provenance. Two
+                # agent-visible surfaces with one key and contradictory meanings is the
+                # reads-like-one-thing-measures-another class the audit itself flags.
+                enriched["merchant_price_verified"] = True
                 if verdict.live_currency:
                     enriched["currency"] = verdict.live_currency
 
@@ -528,12 +581,19 @@ def apply_verdicts(
                     spec = dict(spec)
                     spec["expected_item_total"] = float(verdict.live_price)
                     spec["expected_currency"] = verdict.live_currency
+                    # Explicit, because the total is only right for the quantity the cart encodes.
+                    # `compose_attributed_destinations` defaults to 1 and no caller overrides it
+                    # today, but `quantity` is threaded live through four functions and a test
+                    # already exercises 2 — nothing else links it to this number.
+                    spec["expected_quantity"] = 1
                     spec["expected_total_expires_at"] = _expiry_iso()
                     enriched["execution_spec"] = spec
             else:
-                # Checked, but this source could not speak to the price — a currency mismatch or
-                # an unanswered /meta.json. The quoted price stands untouched and unclaimed.
-                enriched["price_verified"] = False
+                # Checked, but this source could not speak to the price — a currency mismatch, or
+                # a shop currency we do not know YET (the lookup is off the critical path, so the
+                # first turn for a domain lands here by design). The quoted price stands
+                # untouched and unclaimed.
+                enriched["merchant_price_verified"] = False
             kept.append((0, enriched))
         else:
             enriched["stock_verified"] = False
@@ -545,7 +605,12 @@ def apply_verdicts(
             spec = enriched.get("execution_spec")
             if isinstance(spec, dict):
                 spec = dict(spec)
-                spec["expected_total"] = None
+                # The keys this module actually publishes. Nulling `expected_total` — which
+                # nothing sets — left a live `expected_item_total` standing on an offer we could
+                # not verify.
+                spec["expected_item_total"] = None
+                spec["expected_currency"] = None
+                spec["expected_total_expires_at"] = None
                 enriched["execution_spec"] = spec
             kept.append((1, enriched))
 

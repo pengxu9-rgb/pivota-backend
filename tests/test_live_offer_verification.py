@@ -110,6 +110,28 @@ def _body(variant_id="4006404184487", price_minor=1999, available=True):
                           "available": available, "options": []}]}
 
 
+async def _verify_draining(offers, **kw):
+    """Run a turn, then let the background currency refresh finish.
+
+    The currency lookup is deliberately OFF the request's critical path, so a turn returns before
+    it lands. `asyncio.run` cancels pending tasks at exit, which would make it never complete in a
+    test. Draining here models the real process, where the loop is long-lived.
+    """
+    out = await lov.verify_offers(offers, **kw)
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.wait(pending, timeout=2)
+    return out
+
+
+def _warm_currency(offers, **kw):
+    """First turn: populates the currency in the background. Returns the SECOND turn's verdicts."""
+    async def go():
+        await _verify_draining(offers, **kw)
+        return await lov.verify_offers(offers, **kw)
+    return asyncio.run(go())
+
+
 # --- the flag ---------------------------------------------------------------------------------
 
 def test_it_is_OFF_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,7 +161,8 @@ def test_a_MOVED_price_still_verifies_and_reports_the_live_number(
     active markdown, so treating a change as an error would discard the freshest information we
     have."""
     _serve(monkeypatch, {"https://brand.example/products/serum.js": _body(price_minor=1499)})
-    out = asyncio.run(lov.verify_offers([_offer(price=19.99)]))
+    # Second turn: the currency lookup is off the critical path, so turn 1 populates it.
+    out = _warm_currency([_offer(price=19.99)])
     assert out[0].status == lov.VERIFIED
     assert out[0].price_changed is True
     assert out[0].live_price == Decimal("14.99")
@@ -284,7 +307,7 @@ def test_a_price_is_replaced_ONLY_when_the_shop_currency_matches_the_offer() -> 
 
     assert out[0]["price"] == 14.99, "a like-for-like price must be corrected"
     assert out[0]["currency"] == "USD"
-    assert out[0]["price_verified"] is True
+    assert out[0]["merchant_price_verified"] is True
     assert out[0]["stock_verified"] is True
 
 
@@ -306,7 +329,7 @@ def test_a_JPY_shop_never_overwrites_a_USD_offer() -> None:
 
     assert out[0]["price"] == 31.20, "a JPY amount was published under a USD label"
     assert out[0]["currency"] == "USD"
-    assert out[0]["price_verified"] is False
+    assert out[0]["merchant_price_verified"] is False
     # Stock IS still established — it is currency-free, and dropping it would throw away the
     # larger half of what this hop can prove.
     assert out[0]["stock_verified"] is True
@@ -365,11 +388,11 @@ def test_an_unverified_offer_asserts_no_expected_total() -> None:
     """F3 again. An expected total is a promise about money; we do not get to make one for
     something we could not check."""
     offer = _offer()
-    offer["execution_spec"]["expected_total"] = 41.99
+    offer["execution_spec"]["expected_item_total"] = 41.99
     out = lov.apply_verdicts([offer], {0: lov.Verdict(lov.UNVERIFIED, "fetch_failed")})
-    assert out[0]["execution_spec"]["expected_total"] is None
+    assert out[0]["execution_spec"]["expected_item_total"] is None
     # ...and the original dict was not mutated underneath the caller.
-    assert offer["execution_spec"]["expected_total"] == 41.99
+    assert offer["execution_spec"]["expected_item_total"] == 41.99
 
 
 def test_an_offer_outside_the_top_K_is_left_alone_and_not_marked_unverified() -> None:
@@ -769,7 +792,10 @@ def test_sustained_turns_against_ONE_host_do_not_collapse_the_verification_rate(
     for _turn in range(4):
         offers = [_offer(url=f"https://brand.example/products/p{i}", offer_id=f"o{i}")
                   for i in range(3)]
-        out = asyncio.run(lov.verify_offers(offers, deadline_s=0.5))
+        # Drained so the background currency refresh completes, as it would in a
+        # long-lived server loop. `asyncio.run` otherwise cancels it at exit, which
+        # would make every turn re-spawn it and steal the host's pacing slots.
+        out = asyncio.run(_verify_draining(offers, deadline_s=0.5))
         total += len(out)
         hit = sum(1 for v in out.values() if v.status == lov.VERIFIED)
         per_turn.append(hit)
@@ -910,7 +936,7 @@ def test_the_shop_currency_is_read_from_meta_json_not_guessed(
         "https://brand.example/products/serum.js": _body(price_minor=450000),
         "https://brand.example/meta.json": {"currency": "JPY", "country": "JP"},
     })
-    out = asyncio.run(lov.verify_offers([_offer(price=31.20)]))
+    out = _warm_currency([_offer(price=31.20)])
 
     assert out[0].status == lov.VERIFIED, "stock is currency-free and still established"
     assert out[0].live_currency == "JPY"
@@ -926,7 +952,7 @@ def test_a_matching_currency_verifies_the_price_end_to_end(
         "https://brand.example/products/serum.js": _body(price_minor=1499),
         "https://brand.example/meta.json": {"currency": "USD"},
     })
-    out = asyncio.run(lov.verify_offers([_offer(price=19.99)]))
+    out = _warm_currency([_offer(price=19.99)])
     assert out[0].price_verified is True
     assert out[0].price_changed is True
     assert out[0].live_price == Decimal("14.99")
@@ -941,7 +967,7 @@ def test_an_unreadable_meta_json_leaves_the_price_unverified(
         "https://brand.example/products/serum.js": _body(price_minor=1499),
         "https://brand.example/meta.json": 404,
     })
-    out = asyncio.run(lov.verify_offers([_offer(price=19.99)]))
+    out = _warm_currency([_offer(price=19.99)])
     assert out[0].status == lov.VERIFIED
     assert out[0].price_verified is False
     assert out[0].live_currency is None
@@ -956,7 +982,7 @@ def test_the_currency_is_fetched_ONCE_per_domain(monkeypatch: pytest.MonkeyPatch
     })
     offers = [_offer(url=f"https://brand.example/products/p{i}", offer_id=f"o{i}")
               for i in range(3)]
-    asyncio.run(lov.verify_offers(offers))
+    asyncio.run(_verify_draining(offers))
 
     meta = [u for u in seen if u.endswith("/meta.json")]
     assert len(meta) == 1, f"the currency was fetched {len(meta)} times for one domain"
@@ -969,7 +995,7 @@ def test_a_malformed_currency_is_refused(monkeypatch: pytest.MonkeyPatch) -> Non
         "https://brand.example/products/serum.js": _body(),
         "https://brand.example/meta.json": {"currency": "dollars"},
     })
-    out = asyncio.run(lov.verify_offers([_offer()]))
+    out = _warm_currency([_offer()])
     assert out[0].price_verified is False
     assert out[0].live_currency is None
 
@@ -991,8 +1017,197 @@ def test_EVERY_outbound_fetch_goes_through_the_gate_including_the_currency_one(
         "https://brand.example/products/serum.js": _body(),
         "https://brand.example/meta.json": {"currency": "USD"},
     })
-    asyncio.run(lov.verify_offers([_offer()]))
+    asyncio.run(_verify_draining([_offer()]))
 
     assert seen, "no outbound request was made"
     for url in seen:
         assert url in gated, f"{url} was fetched WITHOUT passing the politeness gate"
+
+
+# --- the currency leg is held to the same rules as the product leg ------------------------------
+#
+# Review found six mutants surviving, all on the NEW fetch: it could skip the bounded wait, uncap
+# redirects, drop note_response, cache a None, or stop upper-casing either side of the comparison,
+# and every test stayed green. The module docstring makes claims about "every fetch"; these make
+# them true of the second one too.
+
+def test_the_currency_fetch_uses_a_BOUNDED_wait_like_every_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_wait=0` is unbounded. The module docstring says never — on a live path it is #1854's
+    P1 re-introduced, and this fetch is on the same path as the product one."""
+    calls: List[Dict[str, Any]] = []
+
+    async def spy(url: str, *, user_agent: str, max_wait: Any = None) -> None:
+        calls.append({"url": url, "max_wait": max_wait})
+
+    monkeypatch.setattr(lov.crawl_politeness, "before_request", spy)
+    _serve(monkeypatch, {"https://brand.example/products/serum.js": _body()})
+    asyncio.run(_verify_draining([_offer()]))
+
+    meta = [c for c in calls if c["url"].endswith("/meta.json")]
+    assert meta, "the currency fetch never reached the gate"
+    assert meta[0]["max_wait"] != 0, "an unbounded pace wait on a live path"
+
+
+def test_the_currency_fetch_caps_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same reason as the product fetch: the gate is consulted once, before hop 1, so an uncapped
+    chain is up to 20 unpaced requests off the shared crawl NAT IP."""
+    kwargs: List[Dict[str, Any]] = []
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            kwargs.append(kw)
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kw: Any) -> Any:
+            if url.endswith("/meta.json"):
+                return SimpleNamespace(status_code=200, headers={}, json=lambda: {"currency": "USD"})
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: _body())
+
+    monkeypatch.setattr(lov.httpx, "AsyncClient", _Client)
+    asyncio.run(_verify_draining([_offer()]))
+
+    assert len(kwargs) >= 2, "expected both a product and a currency client"
+    for kw in kwargs:
+        assert kw.get("max_redirects") is not None and kw["max_redirects"] <= 3
+
+
+def test_a_currency_429_reaches_the_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It is the same host. A 429 on /meta.json is the host telling us to slow down, and ignoring
+    it because the endpoint is 'only' the currency would keep hammering a host that already said
+    no — the shared backoff is per-host for exactly this reason."""
+    noted: List[Any] = []
+    monkeypatch.setattr(lov.crawl_politeness, "note_response",
+                        lambda url, status, **kw: noted.append((url, status)))
+    _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(),
+        "https://brand.example/meta.json": 429,
+    })
+    asyncio.run(_verify_draining([_offer()]))
+    assert any(u.endswith("/meta.json") and s == 429 for u, s in noted), (
+        "a 429 on the currency endpoint never fed the backoff"
+    )
+
+
+def test_a_host_that_cannot_answer_is_not_re_asked_every_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A miss is cached, briefly. Without it an unanswerable host is re-asked once per offer per
+    turn forever — and those retries consume the pacing slots the PRODUCT fetches need, so the
+    currency leg would subtract from stock verification instead of adding to it."""
+    seen = _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(),
+        "https://brand.example/meta.json": 404,
+    })
+
+    async def two_turns() -> None:
+        await _verify_draining([_offer()])
+        await _verify_draining([_offer()])
+
+    asyncio.run(two_turns())
+    meta = [u for u in seen if u.endswith("/meta.json")]
+    assert len(meta) == 1, f"an unanswerable host was re-asked: {len(meta)} times"
+
+
+@pytest.mark.parametrize("shop,offer_cur", [("usd", "USD"), ("USD", "usd"), ("Usd", "uSd")])
+def test_the_currency_comparison_is_case_insensitive(
+    monkeypatch: pytest.MonkeyPatch, shop: str, offer_cur: str
+) -> None:
+    """A lowercase currency on either side is the same currency. Dropping the normalisation would
+    silently stop verifying price for whichever side sent it — with no error anywhere."""
+    _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": _body(price_minor=1499),
+        "https://brand.example/meta.json": {"currency": shop},
+    })
+    offer = _offer(price=19.99)
+    offer["currency"] = offer_cur
+    out = _warm_currency([offer])
+    assert out[0].price_verified is True, f"{shop!r} vs {offer_cur!r} should compare equal"
+
+
+def test_price_is_never_claimed_verified_without_an_amount() -> None:
+    """`price_verified: true` beside `live_price: null` is a claim about a number that is not
+    there."""
+    out = lov.apply_verdicts([_offer()], {0: lov.Verdict(
+        lov.VERIFIED, "ok", live_price=None, live_currency="USD",
+        in_stock=True, price_verified=True,
+    )})
+    assert "expected_item_total" not in out[0]["execution_spec"]
+
+
+def test_one_domain_spawns_ONE_currency_refresh_even_in_the_same_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dedup claim must be made SYNCHRONOUSLY. `ensure_future` only schedules the coroutine —
+    its body does not run until the loop yields — so a check made inside the task let every offer
+    in the same tick spawn its own fetch. Measured before the fix: 3 offers, 3 identical requests,
+    which then consumed the host's pacing slots and starved the product fetches."""
+    seen = _serve(monkeypatch, {
+        **{f"https://brand.example/products/p{i}.js": _body() for i in range(3)},
+        "https://brand.example/meta.json": {"currency": "USD"},
+    })
+    offers = [_offer(url=f"https://brand.example/products/p{i}", offer_id=f"o{i}")
+              for i in range(3)]
+    asyncio.run(_verify_draining(offers))
+    assert len([u for u in seen if u.endswith("/meta.json")]) == 1
+
+
+def test_a_cancelled_refresh_releases_its_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The claim is released in a `finally`. Leaking it would leave the host claimed forever, so
+    its currency would never be looked up again — price verification for that shop silently and
+    permanently off, with no error and no way to notice."""
+    class _Hanging:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Hanging":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kw: Any) -> Any:
+            if url.endswith("/meta.json"):
+                await asyncio.sleep(30)
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: _body())
+
+    monkeypatch.setattr(lov.httpx, "AsyncClient", _Hanging)
+
+    async def go() -> None:
+        await lov.verify_offers([_offer()])
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(go())
+    assert "brand.example" not in lov._CURRENCY_REFRESHING, (
+        "a cancelled refresh leaked its claim — this host can never look up its currency again"
+    )
+
+
+def test_a_variant_with_no_price_is_never_price_verified(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Driven through the REAL check, not a hand-built Verdict.
+
+    `comparable` guards on `live is not None` as well as the currencies. A test that constructs
+    the Verdict itself cannot exercise that guard — which is why the mutant dropping it survived.
+    A variant whose `.js` entry carries no price must not be reported as a verified price, or the
+    spec would publish `expected_item_total: null` under a verified claim.
+    """
+    priceless = {"variants": [{"id": 4006404184487, "title": "Default", "price": None,
+                               "available": True, "options": []}]}
+    _serve(monkeypatch, {
+        "https://brand.example/products/serum.js": priceless,
+        "https://brand.example/meta.json": {"currency": "USD"},
+    })
+    out = _warm_currency([_offer(price=19.99)])
+
+    assert out[0].status == lov.VERIFIED, "stock is still established"
+    assert out[0].live_price is None
+    assert out[0].price_verified is False, "a missing amount cannot be a verified price"
