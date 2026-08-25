@@ -149,8 +149,15 @@ fi
 # otherwise evaluate false and deploy `web` with NO DATABASE_URL, which fails at runtime, not here.
 case "$MOUNT_DB" in 0|1) ;; *) echo "MOUNT_DB must be exactly 0 or 1 (got '$MOUNT_DB')" >&2; exit 2 ;; esac
 DB_SECRETS=""
+# PCI_KB_DATABASE_URL rides MOUNT_DB with the other two because port_railway_env.py's DROP_EXACT
+# strips EVERY DSN out of the ported env - deliberately, so a Railway DSN can never win the
+# last-wins --set-secrets merge and keep a service reading the old platform after cutover. That drop
+# is only safe if each deploy path re-mounts the DSNs its own service reads, and three of the four
+# did: deploy_gateway.sh and setup_scheduler.sh both name PCI_KB_DATABASE_URL explicitly. This one
+# did not, so `web` shipped without it. See tests/test_deploy_mounts_every_dropped_dsn.py, which
+# holds the two halves together so the next name added to DROP_EXACT cannot repeat this.
 if [ "$CONFIG" = apply ]; then
-  [ "$MOUNT_DB" = 1 ] && DB_SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,"
+  [ "$MOUNT_DB" = 1 ] && DB_SECRETS="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL:latest,"
   UCP_RECEIPT_SECRET=""
   [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && UCP_RECEIPT_SECRET="STORE_AUDIT_UCP_PROBE_INTERNAL_KEY=STORE_AUDIT_UCP_PROBE_INTERNAL_KEY:latest,"
   COMMERCE_RECEIPT_SECRET=""
