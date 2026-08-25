@@ -790,6 +790,127 @@ def _preserve_caller_declared_fields(
         payload.pop(field, None)
 
 
+def _json_merge_expression(table: Any, column: str, patch: Dict[str, Any]) -> Any:
+    """A SERVER-SIDE shallow merge of `patch` into `table.column`, expressed as
+    the value of that column inside the UPDATE that carries it.
+
+    NOT a read-modify-write. `services/brand_claim_service.set_merchant_brand_direct`
+    already writes `catalog_merchants.metadata_json` this way and says why in its
+    own docstring: it stamps ONE key (`brand_relationship`) and must not disturb
+    the others, and reading the column then writing a whole dict back would
+    revert whatever landed in between (B2). The same reasoning applies in the
+    other direction here — this module stamps `ingested_from` and must not
+    disturb `brand_relationship`. Both writers therefore let the database do the
+    combining, and neither can lose the other's key regardless of interleaving.
+
+    Dialect-split because the two engines spell the same shallow merge
+    differently, and BOTH spellings must be server-side or the SQLite half of
+    the suite would be exercising a read-modify-write the production path does
+    not have:
+
+      * Postgres — `COALESCE(col, '{}') || patch`, with the patch bound as
+        `CAST(:param AS JSONB)`. NOT the cast-after-parameter form: SQLAlchemy's
+        text() parser would read the parameter name and the cast that follows it
+        as ONE parameter, and the bind would not resolve.
+        `tests/test_phase5_8_meta_invariants.py::test_no_param_double_colon_cast_in_raw_sql`
+        fails the build on that form — including, as this comment learned, when
+        it appears in a docstring quoting the form it warns against.
+      * SQLite — `json_patch(COALESCE(col, '{}'), patch)`.
+
+    The two agree for every patch this repo writes (flat, string-valued, no
+    nulls) but are not identical in general: RFC 7396 `json_patch` DELETES a key
+    whose patch value is null and merges nested objects RECURSIVELY, where `||`
+    stores the null and replaces a nested object wholesale. Production semantics
+    are Postgres', and are pinned by the Postgres gate in
+    `tests/test_catalog_merchant_metadata_merge_postgres.py` rather than by the
+    SQLite suite, which cannot see that difference.
+    """
+    from sqlalchemy import text as _sa_text
+
+    from db.database import IS_POSTGRES
+
+    qualified = f"{_table_debug_name(table)}.{column}"
+    param = f"_merge_{column}"
+    if IS_POSTGRES:
+        sql = (
+            f"COALESCE({qualified}, CAST('{{}}' AS JSONB)) "
+            f"|| CAST(:{param} AS JSONB)"
+        )
+    else:
+        sql = f"json_patch(COALESCE({qualified}, '{{}}'), :{param})"
+    return _sa_text(sql).bindparams(**{param: json.dumps(patch, default=str)})
+
+
+def _merge_caller_declared_json(
+    existing: Optional[Dict[str, Any]],
+    payload: Dict[str, Any],
+    table: Any,
+    fields: Sequence[str],
+) -> None:
+    """Caller-declared MULTI-OWNER JSON columns: written whole on INSERT, merged
+    key-by-key on UPDATE.
+
+    `catalog_merchants.metadata_json` is not one writer's column. It is a union
+    of independently-owned key namespaces:
+
+      * `brand_relationship` — `services/brand_claim_service.set_merchant_brand_direct`,
+        the result of a DNS/email ownership proof. It is the ONLY thing
+        `services/offer_classification.classify_offer_type` trusts to surface an
+        offer as brand-direct, and `services/pivot_query_service` reads it back
+        out on three serving paths (`bm.metadata_json->>'brand_relationship'`).
+      * `observed` / `minted_by` / `adr` / `brand_identity` / `seller_identity` —
+        `services/seller_identity.py`, stamped when an ADR-009 D2 observed
+        seller-of-record is minted.
+      * `ingested_from` — this module and `services/audit_index_intake.py`.
+
+    So a whole-column write from any one of them destroys the others. That is
+    the same defect PR #1857 fixed for `status` one column over, and it was live:
+    a URL audit (`{"ingested_from": "url_audit_intake"}`) or any
+    `ingest_standard_products` run (`{"ingested_from": <source_system>}`) REPLACED
+    the column outright, so the next catalog sync silently undid a verified brand
+    claim and a serving offer stopped being labelled brand-direct.
+
+    MERGE rather than the birth-only `preserve_on_update` treatment `status`
+    got, because the two columns differ in who owns them. `status` has exactly
+    one rightful owner outside this module, so dropping it from the UPDATE
+    restores the right answer. `metadata_json` has several, and this module
+    genuinely owns one of its keys — preserving the whole column would make
+    `ingested_from` unwritable on any row that already exists. Merging is the
+    treatment that lets every owner keep writing its own keys.
+
+    An empty patch is DROPPED from the UPDATE rather than merged: a caller with
+    nothing to say must not rewrite the column at all, and `metadata_json or {}`
+    at the call site turns "said nothing" into `{}`. On INSERT nothing happens
+    here, so `{}` still lands and a fresh row is born with an object rather than
+    NULL.
+
+    A payload value that is not a dict is also dropped rather than merged. No
+    caller does that today (the parameter is typed `Optional[Dict[str, Any]]`),
+    and dropping is the fail-safe reading: the alternative — falling back to a
+    whole-column write — would silently reintroduce exactly the clobber this
+    function exists to prevent.
+    """
+    if not existing:
+        return
+    for field in fields:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if not isinstance(value, dict):
+            if value is not None:
+                logger.warning(
+                    "catalog upsert: %s.%s declared mergeable but got %s — "
+                    "dropping it from the UPDATE rather than clobbering",
+                    _table_debug_name(table), field, type(value).__name__,
+                )
+            payload.pop(field, None)
+            continue
+        if not value:
+            payload.pop(field, None)
+            continue
+        payload[field] = _json_merge_expression(table, field, value)
+
+
 async def _resolve_catalog_sku_key(
     *,
     merchant_id: str,
@@ -823,6 +944,7 @@ async def _upsert_by_pk(
     values: Dict[str, Any],
     *,
     preserve_on_update: Sequence[str] = (),
+    merge_json_on_update: Sequence[str] = (),
 ) -> Optional[Dict[str, Any]]:
     table_name = _table_debug_name(table)
     try:
@@ -832,6 +954,7 @@ async def _upsert_by_pk(
         _preserve_non_stale_suppression(existing, payload)
         _preserve_existing_scope(existing, payload)
         _preserve_caller_declared_fields(existing, payload, preserve_on_update)
+        _merge_caller_declared_json(existing, payload, table, merge_json_on_update)
         payload["updated_at"] = _utcnow()
         if existing:
             await database.execute(
@@ -1094,6 +1217,12 @@ async def upsert_catalog_merchant(
 ) -> None:
     """Upsert the `catalog_merchants` row for `merchant_id`.
 
+    TWO of this row's columns are owned by writers OUTSIDE this module, and each
+    needs its own treatment on UPDATE. `status` is birth-only (below).
+    `metadata_json` is MERGED key-by-key rather than replaced, because it is a
+    union of several owners' key namespaces — see `_merge_caller_declared_json`
+    for which key belongs to whom and what the whole-column write destroyed.
+
     `status=None` (the default) means "mint as 'active', but do NOT move an
     existing row's status". This upsert applies its whole payload on UPDATE, so
     while the default was the literal 'active' every content re-sync silently
@@ -1161,6 +1290,12 @@ async def upsert_catalog_merchant(
         # Birth-only unless the caller named a status. On INSERT the payload
         # value above lands; on UPDATE the existing row's status stands.
         preserve_on_update=() if status is not None else ("status",),
+        # metadata_json is a UNION of independently-owned key namespaces, so a
+        # whole-column write here destroys the other owners' keys — the same
+        # defect as the status clobber above, one column over. Merged rather
+        # than preserved because this module does legitimately own one of its
+        # keys (`ingested_from`). See `_merge_caller_declared_json`.
+        merge_json_on_update=("metadata_json",),
     )
 
 
