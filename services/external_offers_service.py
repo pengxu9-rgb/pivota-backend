@@ -14,6 +14,7 @@ from sqlalchemy import and_, select, update
 
 from db.database import database
 from db.external_offers import external_offer_snapshots
+from services import crawl_politeness
 
 
 MAX_BODY_BYTES = int(os.getenv("EXTERNAL_OFFER_MAX_BODY_BYTES") or "1200000")  # ~1.2MB
@@ -1197,10 +1198,32 @@ def _extract_long_description_from_html(html: str) -> Optional[str]:
     return None
 
 
-async def _fetch_html(url: str) -> Tuple[str, str]:
+async def _fetch_html(url: str, *, max_wait: Optional[float] = None) -> Tuple[str, str]:
+    # Every crawl now leaves from ONE reserved NAT address per environment
+    # (infra/gcp/setup_crawl_egress.sh), so an unpaced loop earns a per-IP block that takes the
+    # whole lane down rather than one worker. Robots + per-domain pacing are the prerequisites
+    # docs/commerce-index-crawl-lane.md sets before any job runs on that subnet.
+    #
+    # RobotsDisallowed propagates. The caller already treats a fetch exception as "keep the
+    # cached snapshot", which is the right answer for "we were told not to" as well — and the
+    # distinct type means a caller that wants to stop retrying can tell it from a timeout.
+    # `max_wait` is the caller's patience, and it MATTERS which caller you are. The default
+    # ceiling exists for the live route; a BATCH job must pass 0 (unbounded) or the backoff curve
+    # above ~16s becomes unreachable — `await_slot` would refuse instead of waiting, and the
+    # script's `except Exception` would silently record the row as fetch_failed. A host that 429s
+    # four times in a row would then void the rest of the run in milliseconds while looking like
+    # the host was down.
+    await crawl_politeness.before_request(url, user_agent=DEFAULT_UA, max_wait=max_wait)
+
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA}) as client:
         resp = await client.get(url)
+        # BEFORE raise_for_status: a 429 IS the signal the backoff exists to consume, and
+        # raise_for_status would leave with it unrecorded — so the next call would hit the same
+        # host at the same rate that just got us throttled.
+        crawl_politeness.note_response(
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        )
         resp.raise_for_status()
         content_type = (resp.headers.get("content-type") or "").lower()
         # Read up to MAX_BODY_BYTES to keep latency predictable.
