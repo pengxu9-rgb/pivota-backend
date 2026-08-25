@@ -420,6 +420,13 @@ it, and sweeps stale candidate tags. Deploying by hand with `gcloud` skips all f
 three revisions ended up pinned at `minScale: 2` on old code and live secrets, and how one revision
 inherited the previous revision's `PIVOTA_COMMIT_SHA` and under-reported the deployed commit by 7.
 
+`COMMIT_SHA` is load-bearing **twice** in that build: it tags the image, and `--build-arg` bakes it
+into `/app/.image_commit_sha`, which PIVOTA-Agent's `src/config/platform.js` prefers over every env
+var. That is what makes the commit `/health` reports a property of the code instead of a claim about
+it — an env var can be overridden or left behind by a hand deploy; a file inside the image cannot.
+Omitting the substitution degrades rather than lies: the stamp bakes blank and the env chain takes
+over. When the two disagree the app reports the baked one and logs the mismatch with both values.
+
 **Changing configuration (`CONFIG=apply`) is a separate, deliberate operation**, and today it is
 only reachable for a service being built from scratch:
 
