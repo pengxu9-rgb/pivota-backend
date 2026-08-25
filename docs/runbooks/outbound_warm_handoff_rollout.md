@@ -123,11 +123,33 @@ was built to tolerate new rails.
 
 ### What is deliberately NOT changed: `execution_spec.tracking.param`
 
-It looks like the same defect and is not. `param` names where the click id sits in a URL **the
-agent is holding** — `pdp_url`, `cart_url`, `affiliate_url` — and every one of those does carry
-it as stated. The warm upgrade rewrites only the destination the buyer's browser is handed
-(`continue_url`, built by the gateway from a UCP `create_cart`), which the agent never inspects.
-`rail` differs because it claims where the BUYER ends up, and that is what the lane changes.
+It looks like the same defect and is not — but state the reason carefully, because the obvious
+one is wrong.
+
+`param` names the carrier in the **static URLs we publish**: `pdp_url` and `cart_url`. The warm
+lane provably never rewrites those; it only replaces the 302 target. So the claim holds for the
+URLs it actually describes.
+
+It does **not** describe `affiliate_url`. That is `{base}/r?token={token}` — the click id rides
+*inside* the signed token, and the literal `pvt_click_id` never appears as a query parameter on
+it. An agent parsing `affiliate_url` for `tracking.param` finds nothing, warm lane or not.
+
+Do NOT justify this with "the agent never inspects the `continue_url`". That is the weak link:
+the 302 `Location` is returned to any client that follows `affiliate_url`, so the argument would
+rest on client behaviour rather than on what the field describes. (It happens to be true today —
+no consumer in either repo reads a post-`/r` landing URL, and the click event records only
+`handoff`/`warm_reason`, never the URL — but that is a fact about consumers, not a property of
+the contract.)
+
+`rail` differs because it claims where the **buyer** ends up, and that is precisely what the
+lane changes.
+
+Two smaller things in the same neighbourhood, both pre-existing from #1846 and neither fixed
+here: `param` is singular while the spec publishes two URLs with *different* carriers (a cart
+uses the attribute, `pdp_url` always uses the query param), so an agent showing the PDP while
+handing off to the cart is pointed at a string absent from the URL it used; and `expires_at` is
+glossed as "when `affiliate_url` stops resolving" when a validly-signed expired token still
+302s to `dest` — what stops is click logging and warm eligibility, not the link.
 
 ## Rollout checklist
 

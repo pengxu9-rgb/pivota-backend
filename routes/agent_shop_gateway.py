@@ -4204,7 +4204,13 @@ async def _handle_offers_resolve(
                 # payload. Deriving both from this call makes that impossible by construction.
                 prefilled_claim = _cart_prefilled_claim(
                     cart_url=composed_spec["cart_url"],
+                    # The SAME value compose_attributed_destinations was given
+                    # (`canonical_url or destination_url`), not the raw column —
+                    # _seed_domain_from_url reads the host off it, so a different input here
+                    # could disagree with the link it describes.
                     destination_url=str(canonical_url or destination_url),
+                    # The link we JUST minted, so the resolve-time rollout bucket is computed
+                    # from the very token the click will carry.
                     redirect_url=redirect_url,
                 )
 
@@ -7300,10 +7306,18 @@ def _cart_prefilled_claim(
     token outside the rollout bucket — so this does not blanket the field with nulls; it
     removes it exactly where it would be wrong.
 
-    NOTE the sibling field `execution_spec.rail`, which is `"referral"` on exactly this cold
-    population and carries the same falsifiability. It is deliberately NOT nulled here: its
-    vocabulary is a two-value string the gateway consumes, and adding a third state is a
-    contract change, not a bug fix. Recorded in the runbook.
+    READ ONCE, USED TWICE. The caller stores this as `prefilled_claim` and derives BOTH
+    `cart_prefilled` and `execution_spec.rail` from it — `rail` is `"referral"` on exactly this
+    cold population and carries the same falsifiability, so it is null whenever this is. Do not
+    recompute either of them separately: one offer must not carry two different answers to the
+    same question in one payload.
+
+    (An earlier version of this note said `rail` was deliberately left alone because its
+    two-value vocabulary was one the gateway CONSUMED, making a third state a contract change.
+    That was wrong on the facts — `PIVOTA-Agent src/agentSignals/offerToSignal.js` passes `rail`
+    through as an opaque label, never checks it against a known set, and has a standing test
+    that an unknown rail is relayed rather than nulled. Verify a consumer before deciding a
+    field cannot change.)
     """
     if cart_url:
         return True
