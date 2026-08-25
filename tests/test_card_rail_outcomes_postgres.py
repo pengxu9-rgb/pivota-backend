@@ -11,6 +11,7 @@ the contract, and the route's validation only mirrors it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -33,10 +34,34 @@ pytestmark = pytest.mark.skipif(
 
 _MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/199_card_rail_outcomes.sql"
 
+# THIS GATE DROPS `card_rail_outcomes`, so it must be incapable of running anywhere but a
+# throwaway. `skipif(_IS_PG)` only asks "is this Postgres" — point it at staging and it would
+# destroy the outcomes table and every row in it, which is precisely the compounding asset this
+# PR exists to create. Marker list and helper copied from
+# tests/test_dead_quality_component_canary_postgres.py, which drops a table for the same reason;
+# the convention there is that the docstring's "never point this at prod" must be MADE true
+# rather than merely stated.
+_SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
+
+
+def _assert_throwaway_database() -> None:
+    dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
+    if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
+        pytest.skip(
+            f"refusing to drop card_rail_outcomes in database {dbname!r} — this gate drops and "
+            f"recreates that table and must only run against a throwaway "
+            f"(e.g. pivota_dialect_check)"
+        )
+
 
 @pytest.fixture(autouse=True)
 async def _db():
     from db.database import database
+
+    # BEFORE connecting. Refusing to open a connection at all is a stronger guarantee than
+    # refusing to drop after we are already in, and it means a non-existent database cannot error
+    # first and mask the refusal.
+    _assert_throwaway_database()
 
     # Connect/disconnect PER TEST: each test runs on a fresh event loop and an asyncpg pool that
     # outlives its loop fails with "attached to a different loop".
@@ -255,3 +280,72 @@ async def test_updated_at_moves_on_a_correction_so_a_late_report_is_visible():
     after = (await _row(rec))["updated_at"]
     assert after >= before
     assert (await _row(rec))["created_at"] <= after
+
+
+# --- rows added after a mutation run showed the originals could not see these -----------------
+
+async def test_an_amount_with_no_currency_is_refused_on_EVERY_amount_column():
+    """Review found the first cut guarded `quoted_grand_total` alone. `actual_grand_total` is the
+    CHARGED amount — half the comparison this table exists for — and it was free to be stored with
+    no currency anywhere on the row. That is the currency-less-price class this repo has been
+    burned by before. Deleting either CHECK left the whole gate green."""
+    from db.card_rail_outcomes import record_outcome
+
+    for field in (
+        "quoted_grand_total", "quoted_item_total", "actual_grand_total", "actual_item_total",
+    ):
+        with pytest.raises(Exception) as exc:
+            await record_outcome(_vals(**{field: Decimal("41.99")}))
+        assert "pair" in str(exc.value), f"{field} accepted without a currency: {exc.value}"
+
+    # A currency with NO amount is fine — it asserts no price.
+    assert await record_outcome(_vals(quoted_currency="USD"))
+
+
+async def test_another_agent_cannot_rewrite_an_outcome_it_did_not_report():
+    """Review P1. `recommendation_id` is caller-supplied with no foreign key, so scoping the
+    upsert to the owning agent is the only thing standing between this table and forged evidence.
+    Without the WHERE clause agent B rewrites agent A's outcome, failure reason and reported_by
+    while `agent_id` keeps naming A."""
+    from db.card_rail_outcomes import record_outcome
+
+    rec = f"rec_pgtest_{uuid.uuid4().hex[:12]}"
+    assert await record_outcome(_vals(
+        recommendation_id=rec, agent_id="agent_A", outcome="completed"
+    ))
+
+    stolen = await record_outcome(_vals(
+        recommendation_id=rec, agent_id="agent_B", outcome="failed",
+        failure_reason="price_mismatch", reported_by="reap",
+    ))
+    assert stolen is None, "a foreign agent's upsert must match no row"
+
+    row = await _row(rec)
+    assert row["agent_id"] == "agent_A"
+    assert row["outcome"] == "completed", "agent A's outcome was rewritten"
+    assert row["reported_by"] == "agent", "agent B relabelled A's self-report"
+
+    # ...and the owner can still correct its own row.
+    assert await record_outcome(_vals(
+        recommendation_id=rec, agent_id="agent_A", outcome="abandoned"
+    ))
+    assert (await _row(rec))["outcome"] == "abandoned"
+
+
+async def test_updated_at_STRICTLY_advances_on_a_correction():
+    """The earlier version asserted `after >= before`, a non-strict inequality that a FROZEN
+    timestamp satisfies — so a mutant removing `updated_at = CURRENT_TIMESTAMP` survived a test
+    named for exactly that behaviour. Postgres's CURRENT_TIMESTAMP is transaction-scoped, so the
+    two writes must be in separate transactions for this to be strict."""
+    from db.card_rail_outcomes import record_outcome
+
+    rec = f"rec_pgtest_{uuid.uuid4().hex[:12]}"
+    await record_outcome(_vals(recommendation_id=rec, outcome="abandoned"))
+    before = (await _row(rec))["updated_at"]
+    await asyncio.sleep(0.01)
+    await record_outcome(_vals(recommendation_id=rec, outcome="completed"))
+    after = (await _row(rec))["updated_at"]
+    assert after > before, (
+        f"updated_at did not advance ({before} -> {after}); a correction is indistinguishable "
+        "from the original report"
+    )

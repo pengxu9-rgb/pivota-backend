@@ -150,7 +150,7 @@ def test_a_total_we_cannot_represent_exactly_is_refused_rather_than_rounded(clie
     """This table's whole point is measuring the gap between what we quoted and what was charged.
     A rounding WE introduce would be indistinguishable from the merchant's error."""
     client, writes = client_and_writes
-    res = _post(client, quoted_grand_total=bad)
+    res = _post(client, quoted_grand_total=bad, quoted_currency="USD")
     assert res.status_code == INVALID, res.text
     assert "quoted_grand_total" in res.text
     assert writes == []
@@ -158,9 +158,18 @@ def test_a_total_we_cannot_represent_exactly_is_refused_rather_than_rounded(clie
 
 def test_a_legitimate_total_is_kept_exactly(client_and_writes):
     client, writes = client_and_writes
-    assert _post(client, quoted_grand_total=41.99, actual_grand_total=48.5).status_code == 200
-    assert str(writes[0]["quoted_grand_total"]) == "41.99"
-    assert str(writes[0]["actual_grand_total"]) == "48.5"
+    from decimal import Decimal as _D
+
+    res = _post(
+        client,
+        quoted_grand_total=41.99, quoted_currency="USD",
+        actual_grand_total=48.5, actual_currency="USD",
+    )
+    assert res.status_code == 200, res.text
+    # Compared by VALUE, not by str(): totals are quantized to 4dp on the way in, so 41.99 is
+    # stored as 41.9900. Asserting the string would pin the representation rather than the amount.
+    assert writes[0]["quoted_grand_total"] == _D("41.99")
+    assert writes[0]["actual_grand_total"] == _D("48.5")
 
 
 # --- the JSONB field is agent-supplied --------------------------------------------------------
@@ -201,7 +210,7 @@ def test_a_non_dict_latency_does_not_cost_the_outcome(client_and_writes):
 
 # --- honest reporting -------------------------------------------------------------------------
 
-def test_a_write_that_did_not_land_is_reported_as_a_failure_not_an_ok(
+def test_a_write_that_matched_no_row_is_a_409_naming_the_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """The reason this hop is an inbound endpoint at all. The pivota-acp outbox failed quietly
@@ -221,8 +230,8 @@ def test_a_write_that_did_not_land_is_reported_as_a_failure_not_an_ok(
                 "/agent/v1/outcomes",
                 json={"recommendation_id": "rec_x", "outcome": "completed"},
             )
-        assert res.status_code == 500
-        assert "not recorded" in res.text
+        assert res.status_code == 409, res.text
+        assert "different agent" in res.text
     finally:
         app.dependency_overrides.pop(get_agent_context, None)
 
@@ -270,3 +279,110 @@ def test_the_request_model_HAS_no_agent_id_field_at_all(client_and_writes):
         "an undeclared agent_id must not survive parsing; if the model ever sets "
         "model_config extra='allow', this endpoint becomes forgeable"
     )
+
+
+# --- rows added after review; each corresponds to a defect that shipped in the first cut -------
+
+@pytest.mark.parametrize(
+    "expr,value",
+    [
+        ("29.99 + 5.00 (item + shipping)", 29.99 + 5.00),
+        ("sum([19.99] * 7) (7-unit cart)", sum([19.99] * 7)),
+        ("1.1 * 3", 1.1 * 3),
+        ("0.7 * 3", 0.7 * 3),
+        ("19.99 * 3", 19.99 * 3),
+    ],
+)
+def test_an_ORDINARY_computed_total_is_accepted(client_and_writes, expr, value):
+    """Review P0. The first cut rejected anything whose `str()` had more than 4 decimal places —
+    which is most totals summed from IEEE floats. `29.99 + 5.00` is `34.989999999999995` in both
+    JS and Python. It would have presented as agents silently unable to report exactly the
+    completed high-value handoffs this table exists to count."""
+    client, writes = client_and_writes
+    res = _post(client, quoted_grand_total=value, quoted_currency="USD")
+    assert res.status_code == 200, f"{expr} -> {value!r} was rejected: {res.text}"
+    stored = writes[0]["quoted_grand_total"]
+    assert abs(float(stored) - value) < 1e-4, f"{expr}: stored {stored} for {value}"
+
+
+@pytest.mark.parametrize("bad", [12.345678, 0.000012345])
+def test_genuine_sub_cent_precision_is_still_refused(client_and_writes, bad):
+    """The other half. Absorbing float noise must not become "round anything" — a rounding WE
+    introduce is indistinguishable from the merchant's error, which is the one thing this table
+    is for."""
+    client, writes = client_and_writes
+    res = _post(client, quoted_grand_total=bad, quoted_currency="USD")
+    assert res.status_code == INVALID, res.text
+    assert "4 decimal places" in res.text
+    assert writes == []
+
+
+def test_a_total_too_large_for_the_column_is_a_4xx_not_a_500(client_and_writes):
+    """NUMERIC(18,4) tops out below 10^14; past that Postgres raises 22003 and the outcome is
+    lost to an unhandled 500."""
+    client, writes = client_and_writes
+    res = _post(client, quoted_grand_total=1e14, quoted_currency="USD")
+    assert res.status_code == INVALID, res.text
+    assert "too large" in res.text
+    assert writes == []
+
+
+def test_an_infinite_latency_cannot_produce_invalid_json(client_and_writes):
+    """Review P0. `Infinity` passed both the NaN and the negative filters, and `json.dumps` emits
+    it as a bare token that is NOT valid JSON — `CAST(... AS jsonb)` then raises 22P02 and the
+    outcome is lost to a 500. That defeats the function's own promise that a malformed latency
+    never costs the outcome it was attached to."""
+    client, writes = client_and_writes
+    res = client.post(
+        "/agent/v1/outcomes",
+        content=json.dumps({
+            "recommendation_id": "rec_inf", "outcome": "completed",
+            "latency_ms": {"recommend": float("inf"), "verify": float("-inf"), "ok": 5},
+        }),
+        headers={"content-type": "application/json"},
+    )
+    assert res.status_code == 200, res.text
+    stored = json.loads(writes[0]["latency_ms"])
+    assert stored == {"ok": 5.0}, f"non-finite latency survived: {stored}"
+    # And what we stored is round-trippable as strict JSON.
+    json.loads(json.dumps(stored))
+
+
+def test_a_zero_latency_is_kept(client_and_writes):
+    """`>= 0`, not `> 0`. A 0ms hop is a measurement, not an absence."""
+    client, writes = client_and_writes
+    assert _post(client, latency_ms={"handoff": 0}).status_code == 200
+    assert json.loads(writes[0]["latency_ms"]) == {"handoff": 0.0}
+
+
+@pytest.mark.parametrize("prefix", ["quoted", "actual"])
+def test_an_amount_without_a_currency_is_a_4xx_not_a_500(client_and_writes, prefix):
+    """The CHECK would catch it, but as a 500 with the outcome lost — the exact shape this
+    route's validation exists to avoid."""
+    client, writes = client_and_writes
+    res = _post(client, **{f"{prefix}_grand_total": 41.99})
+    assert res.status_code == INVALID, res.text
+    assert f"{prefix}_currency" in res.text
+    assert writes == []
+
+
+def test_a_blank_recommendation_id_is_refused(client_and_writes):
+    """`Field(min_length=1)` accepts "   ", which strips to an EMPTY-STRING primary key — one
+    global row that every agent would clobber in turn."""
+    client, writes = client_and_writes
+    res = _post(client, recommendation_id="   ")
+    assert res.status_code == INVALID, res.text
+    assert writes == []
+
+
+def test_a_naive_occurred_at_is_read_as_UTC_not_the_container_zone(client_and_writes):
+    """asyncpg converts a naive datetime client-side using the CONTAINER's local zone, so the same
+    `2026-08-25T10:00:00` stores as 10:00Z, 14:00Z or 01:00Z depending on where the process runs.
+    Reading it as UTC is the only stable answer."""
+    from datetime import timezone as _tz
+
+    client, writes = client_and_writes
+    assert _post(client, occurred_at="2026-08-25T10:00:00").status_code == 200
+    stored = writes[0]["occurred_at"]
+    assert stored.tzinfo is not None, "a naive datetime must never reach the driver"
+    assert stored.astimezone(_tz.utc).hour == 10, f"reinterpreted: {stored}"

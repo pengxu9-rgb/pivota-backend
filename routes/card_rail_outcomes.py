@@ -15,6 +15,7 @@ for free: the absence of a row is unambiguous, and the response says exactly wha
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
@@ -79,12 +80,26 @@ class CardRailOutcome(BaseModel):
     occurred_at: Optional[datetime] = None
 
 
+# NUMERIC(18,4) tops out just below 10^14. Past that Postgres raises 22003, which without this
+# check is an unhandled 500 and a lost outcome.
+_MAX_TOTAL = Decimal("10") ** 14
+
+# A total that came from summing IEEE floats carries noise ~1e-15 RELATIVE; a caller genuinely
+# sending sub-cent precision is off by ~1e-5 ABSOLUTE. This threshold separates them, and it has
+# to: `29.99 + 5.00` is `34.989999999999995` in both JS and Python, so a naive
+# "more than 4 decimal places" test rejects an ordinary item-plus-shipping total. Review measured
+# that against realistic carts — `sum([19.99] * 7)`, `1.1 * 3`, `0.7 * 3` all failed — which
+# would have shown up as agents silently unable to report exactly the completed handoffs this
+# table exists to count.
+_FLOAT_NOISE = Decimal("1e-9")
+
+
 def _money(value: Optional[float], field: str) -> Optional[Decimal]:
     """A total, or a 4xx. Never a silently-coerced number.
 
-    An amount that cannot be represented exactly is refused rather than rounded: this table's
-    whole point is measuring the gap between what we quoted and what was charged, and a rounding
-    we introduce ourselves would be indistinguishable from the merchant's error.
+    Float noise is absorbed; genuine sub-cent precision is refused rather than rounded. The
+    distinction matters because this table measures the gap between what we quoted and what was
+    charged — a rounding WE introduce would be indistinguishable from the merchant's error.
     """
     if value is None:
         return None
@@ -93,12 +108,35 @@ def _money(value: Optional[float], field: str) -> Optional[Decimal]:
     except (InvalidOperation, ValueError):
         raise HTTPException(status_code=422, detail=f"{field} is not a number")
     if not dec.is_finite():
-        raise HTTPException(status_code=422, detail=f"{field} must be finite")
+        raise HTTPException(status_code=422, detail=f"{field} must be a finite number")
     if dec < 0:
         raise HTTPException(status_code=422, detail=f"{field} must not be negative")
-    if abs(dec.as_tuple().exponent) > 4:
-        raise HTTPException(status_code=422, detail=f"{field} has more than 4 decimal places")
-    return dec
+    if dec >= _MAX_TOTAL:
+        raise HTTPException(
+            status_code=422, detail=f"{field} is too large to store (max 10^14)"
+        )
+
+    quantized = dec.quantize(Decimal("0.0001"))
+    if abs(dec - quantized) > _FLOAT_NOISE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} has more precision than 4 decimal places can represent",
+        )
+    return quantized
+
+
+def _utc(value: Optional[datetime]) -> datetime:
+    """Now, or the caller's instant — never a naive datetime.
+
+    asyncpg converts a naive value client-side using the CONTAINER's local zone, so the same
+    `2026-08-25T10:00:00` stores as 10:00Z, 14:00Z or 01:00Z depending on where the process runs.
+    An offset-less timestamp is read as UTC, which is the only reading that is stable.
+    """
+    if value is None:
+        return datetime.now(tz=timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _classify_reason(raw: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -133,7 +171,7 @@ def _latency(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         name = str(key)[:32]
         if isinstance(value, bool):
             continue
-        if isinstance(value, (int, float)) and float(value) == float(value) and value >= 0:
+        if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
             out[name] = float(value)
     return out
 
@@ -149,6 +187,12 @@ async def report_card_rail_outcome(
     question this table exists to answer ("of what we recommended, what completed") stays a single
     scan instead of a windowing query.
     """
+    # `Field(min_length=1)` accepts "   ", which `.strip()` below turns into an EMPTY-STRING
+    # primary key — one global row every agent would clobber in turn.
+    recommendation_id = (body.recommendation_id or "").strip()
+    if not recommendation_id:
+        raise HTTPException(status_code=422, detail="recommendation_id must not be blank")
+
     outcome = (body.outcome or "").strip().lower()
     if outcome not in OUTCOMES:
         raise HTTPException(
@@ -175,8 +219,24 @@ async def report_card_rail_outcome(
             ),
         )
 
+    # Mirrors ck_card_rail_quoted_pair / ck_card_rail_actual_pair. Without this the CHECK fires
+    # as a 500 and the outcome is lost — the exact shape this route's error handling exists to
+    # avoid. An amount without a currency is not a price.
+    for prefix in ("quoted", "actual"):
+        amounts = (
+            getattr(body, f"{prefix}_grand_total", None),
+            getattr(body, f"{prefix}_item_total", None),
+        )
+        if any(a is not None for a in amounts) and not (
+            getattr(body, f"{prefix}_currency", None) or ""
+        ).strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"{prefix}_currency is required when a {prefix} total is given",
+            )
+
     values = {
-        "recommendation_id": body.recommendation_id.strip(),
+        "recommendation_id": recommendation_id,
         "recommendation_set_id": (body.recommendation_set_id or None),
         "trace_id": (body.trace_id or None),
         "click_id": (body.click_id or None),
@@ -202,7 +262,7 @@ async def report_card_rail_outcome(
         "reported_by": reported_by,
         # The agent's clock is not trusted for ordering, but its own timestamp is worth keeping
         # when offered; absent one, the moment we received it is the honest answer.
-        "occurred_at": body.occurred_at or datetime.now(tz=timezone.utc),
+        "occurred_at": _utc(body.occurred_at),
     }
 
     import json as _json
@@ -211,9 +271,15 @@ async def report_card_rail_outcome(
 
     stored = await record_outcome(values)
     if not stored:
-        # The write did not land. Say so — this endpoint exists because a transport that cannot
-        # distinguish delivered from rejected is what made the outbox fail silently.
-        raise HTTPException(status_code=500, detail="outcome was not recorded")
+        # The upsert is scoped to the owning agent, so returning no row means exactly one thing:
+        # this recommendation_id exists and belongs to somebody else. A genuine write failure
+        # raises instead of returning None. 409 says which of those happened — this endpoint
+        # exists because a transport that cannot distinguish delivered from rejected from never
+        # attempted is what made the pivota-acp outbox fail silently.
+        raise HTTPException(
+            status_code=409,
+            detail="recommendation_id was reported by a different agent",
+        )
 
     return {
         "ok": True,

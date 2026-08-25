@@ -81,6 +81,15 @@ UPSERT_SQL = """
         reported_by           = EXCLUDED.reported_by,
         occurred_at           = EXCLUDED.occurred_at,
         updated_at            = CURRENT_TIMESTAMP
+    -- ATTRIBUTION IS PART OF THE CONFLICT TARGET, not just the insert. `recommendation_id` is a
+    -- caller-supplied string with no foreign key, so without this any authenticated agent can
+    -- post another agent's id and rewrite its row — the outcome, the failure reason, even
+    -- `reported_by`, while `agent_id` keeps naming the victim. Removing `agent_id` from the
+    -- request body closes the body lane; this closes the id lane, which is the wider one.
+    --
+    -- No row matches when the ids differ, so `record_outcome` returns None and the route answers
+    -- 409 rather than silently doing nothing.
+    WHERE card_rail_outcomes.agent_id = EXCLUDED.agent_id
     RETURNING recommendation_id, (xmax = 0) AS inserted
 """
 

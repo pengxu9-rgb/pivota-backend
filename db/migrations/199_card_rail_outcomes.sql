@@ -92,12 +92,24 @@ CREATE TABLE IF NOT EXISTS card_rail_outcomes (
     CONSTRAINT ck_card_rail_failure_has_reason CHECK (
         outcome <> 'failed' OR failure_reason IS NOT NULL OR failure_reason_raw IS NOT NULL
     ),
+    -- AN AMOUNT WITHOUT A CURRENCY IS NOT A PRICE. This repo has been burned by exactly that
+    -- class before — a currency-less price that stayed quotable — so every amount column is
+    -- covered, not just one. The first cut guarded `quoted_grand_total` alone, which left
+    -- `actual_grand_total` (the CHARGED amount, half the comparison this table exists for),
+    -- `actual_item_total` and `quoted_item_total` free to be stored with no currency anywhere on
+    -- the row.
+    --
+    -- A currency WITHOUT an amount is allowed: knowing which currency a merchant quotes in is a
+    -- fact worth keeping on its own, and it asserts no price.
+    --
     -- Currencies are compared, never converted, when deciding whether a quote held. A quote in
     -- one currency and an actual in another is not a price mismatch, it is a different question —
     -- so both are recorded and the comparison is left to the reader.
     CONSTRAINT ck_card_rail_quoted_pair CHECK (
-        (quoted_grand_total IS NULL) = (quoted_currency IS NULL)
-        OR quoted_grand_total IS NULL
+        (quoted_grand_total IS NULL AND quoted_item_total IS NULL) OR quoted_currency IS NOT NULL
+    ),
+    CONSTRAINT ck_card_rail_actual_pair CHECK (
+        (actual_grand_total IS NULL AND actual_item_total IS NULL) OR actual_currency IS NOT NULL
     )
 );
 
