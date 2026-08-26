@@ -50,9 +50,28 @@ logger = logging.getLogger("auth_routes")
 EMPLOYEE_AUTH_ROLES = {"super_admin", "admin", "employee", "outsourced"}
 SUPPORTED_LOGIN_PORTALS = set(PORTAL_TO_MEMBERSHIP_TYPE)
 
-DEMO_MERCHANT_IDS = {
-    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
-} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
+# Backfills merchant_id onto a real, password-verified users-table row that
+# has none set. Gated like _demo_employee_accounts() below: both conjuncts
+# are re-checked on every call rather than baked into a module-level dict at
+# import time, so a managed host that only resolves to production after
+# `is_production()` re-reads the environment (or a DEMO_MERCHANT_ID set after
+# import) still takes effect immediately. Note settings.enable_internal_demo_fixtures
+# itself does NOT re-read the environment per call — it's a field on the
+# process-wide `settings` singleton, resolved once at import — so flipping
+# ENABLE_INTERNAL_DEMO_FIXTURES on a running process still requires a restart.
+def _demo_merchant_ids() -> Dict[str, str]:
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo merchant_id backfill stays disabled"
+        )
+        return {}
+    demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
+    if not demo_merchant_id:
+        return {}
+    return {"merchant@test.com": demo_merchant_id}
 
 # Backward-compat shim for tests and historical imports.
 # Some code/tests patch `routes.auth.require_admin_user`.
@@ -446,7 +465,7 @@ async def _resolve_merchant_id_for_user(user: Optional[dict], email: str) -> Opt
         merchant_record = None
     if merchant_record:
         return str(merchant_record["merchant_id"])
-    return DEMO_MERCHANT_IDS.get(email)
+    return _demo_merchant_ids().get(email)
 
 
 def _fallback_membership(
