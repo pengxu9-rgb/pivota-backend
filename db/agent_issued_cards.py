@@ -30,11 +30,14 @@ _INSERT_GUARDED_SQL = """
         :quote_total_minor, :amount_cap_minor, :currency, CAST(:quote_snapshot AS jsonb),
         :issuer, 'requested', :single_use, :expires_at
     WHERE
+        -- CAST: :agent_id also feeds the varchar INSERT column above; without the cast Postgres
+        -- PREPARE deduces text-vs-varchar for the same parameter and refuses the statement
+        -- (AmbiguousParameter — the dialect gate catches exactly this).
         (SELECT COUNT(*) FROM agent_issued_cards
-          WHERE agent_id = :agent_id AND status IN ('requested', 'issued')) < :max_outstanding
+          WHERE agent_id = CAST(:agent_id AS varchar) AND status IN ('requested', 'issued')) < :max_outstanding
     AND
         (SELECT COALESCE(SUM(amount_cap_minor), 0) FROM agent_issued_cards
-          WHERE agent_id = :agent_id
+          WHERE agent_id = CAST(:agent_id AS varchar)
             AND created_at >= date_trunc('day', now())
             AND status <> 'failed') + :amount_cap_minor <= :daily_cap_minor
     RETURNING card_id
