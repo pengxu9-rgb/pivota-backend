@@ -30,6 +30,8 @@ def _clean_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("CRAWL_ROBOTS_ENABLED", raising=False)
     monkeypatch.delenv("CRAWL_MAX_BACKOFF_SECONDS", raising=False)
     monkeypatch.delenv("CRAWL_BACKOFF_BASE_SECONDS", raising=False)
+    monkeypatch.delenv("CRAWL_MAX_WAIT_SECONDS", raising=False)
+    monkeypatch.delenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", raising=False)
     yield
     cp.reset_for_tests()
 
@@ -532,6 +534,10 @@ def test_pacing_refuses_rather_than_stalling_a_request_indefinitely(
     _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 600\n"})
     _patch_sleep(monkeypatch)
     monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+    # 600 is over the default CRAWL_MAX_ROBOTS_DELAY_SECONDS (300), which would make this a
+    # `CrawlDelayTooLong` skip instead of the queue behaviour under test. Raised explicitly
+    # so the row keeps pinning what it was written to pin.
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "900")
 
     async def go() -> None:
         # First caller is free — nothing is queued yet.
@@ -553,6 +559,10 @@ def test_a_refused_caller_does_not_reserve_the_slot_it_abandoned(
     _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 600\n"})
     _patch_sleep(monkeypatch)
     monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+    # 600 is over the default CRAWL_MAX_ROBOTS_DELAY_SECONDS (300), which would make this a
+    # `CrawlDelayTooLong` skip instead of the queue behaviour under test. Raised explicitly
+    # so the row keeps pinning what it was written to pin.
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "900")
 
     async def go() -> float:
         await cp.await_slot("https://slow.com/a", user_agent="PivotaBot")
@@ -571,6 +581,10 @@ def test_a_batch_job_can_opt_into_waiting(monkeypatch: pytest.MonkeyPatch) -> No
     _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 600\n"})
     slept = _patch_sleep(monkeypatch)
     monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+    # 600 is over the default CRAWL_MAX_ROBOTS_DELAY_SECONDS (300), which would make this a
+    # `CrawlDelayTooLong` skip instead of the queue behaviour under test. Raised explicitly
+    # so the row keeps pinning what it was written to pin.
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "900")
 
     async def go() -> None:
         await cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0)
@@ -1305,3 +1319,196 @@ def test_fetch_html_raises_on_a_3xx_that_was_not_followed(
         assert caught.value.status_code == 302
 
     asyncio.run(go())
+
+
+# --- a host-stated Crawl-delay is bounded, and bounding it must not mean crawling faster -------
+#
+# THE DEFECT THESE PIN, reproduced by construction during review of #1898/#1899: `await_slot`
+# folded `robots_delay` into the effective interval with no ceiling, and `max_wait=0`
+# ("unbounded", which ten call sites pass) removed the only thing that had ever clamped
+# it. Measured against ff589e4e on a host serving `Crawl-delay: 86400`: row 2 slept
+# 86399.99998s and row 3 slept 172799.99999s, because every row also wrote `start + 86400` into
+# `next_allowed`. The sleep is the symptom; the INTERVAL is the defect.
+
+_ONE_DAY_ROBOTS = "User-agent: *\nCrawl-delay: 86400\n"
+
+
+def test_an_unbounded_caller_still_refuses_an_absurd_crawl_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_wait=0` buys patience for a BACKOFF, not a 24-hour standing rate limit."""
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    slept = _patch_sleep(monkeypatch)
+
+    with pytest.raises(cp.CrawlDelayTooLong):
+        asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0))
+
+    assert slept == [], f"the refusal must happen instead of the sleep, slept {slept}"
+
+
+def test_the_cap_bounds_the_interval_not_merely_the_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE ROW THAT MATTERS, and the one a sleep-only cap would leave failing.
+
+    Clamping the SLEEP would still leave `next_allowed` a full day out, because the reservation
+    is written from `interval`, not from the sleep. Every later row on the host would then be
+    refused for 24h — the same starvation, now silent. So the refusal has to come BEFORE the
+    reservation, and the host's state must be untouched afterwards.
+    """
+    import time as _time
+
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        for _ in range(3):
+            with pytest.raises(cp.CrawlDelayTooLong):
+                await cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+
+    state = cp._STATE.get("slow.com")
+    reserved = getattr(state, "next_allowed", 0.0)
+    assert reserved - _time.monotonic() <= 0, (
+        f"a refused row must not reserve the slot it abandoned; next_allowed is "
+        f"{reserved - _time.monotonic():.0f}s out"
+    )
+
+
+def test_the_cap_bites_on_the_bounded_live_route_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`max_wait` never protected the FIRST row on a host, which is how the state got poisoned.
+
+    On a fresh host `start == now`, so `start - now` is 0 and the `CrawlPaced` ceiling never
+    fires — the caller sails through, sleeps nothing, and writes `now + 86400` into
+    `next_allowed`. The unauthenticated `POST /api/offers/external/resolve` would then be refused
+    for that host for a day, on the strength of one line of someone else's robots.txt.
+    """
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+
+    with pytest.raises(cp.CrawlDelayTooLong):
+        asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot"))
+
+    assert "slow.com" not in cp._STATE, "the refused host must leave no reservation behind"
+
+
+def test_the_cap_never_makes_us_crawl_a_host_faster_than_it_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap that CLAMPED would be the wrong fix and would look identical in every row above.
+
+    Under the cap the host's own delay is still honoured in full — 200s stays 200s, it does not
+    become `min(200, cap)` or the 1s floor. The cap decides WHETHER we crawl this host, never
+    HOW FAST.
+    """
+    _serve_robots(monkeypatch, {"polite.com": "User-agent: *\nCrawl-delay: 200\n"})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "300")
+
+    async def go() -> None:
+        await cp.await_slot("https://polite.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://polite.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+
+    assert slept and slept[-1] > 199, (
+        f"the host asked for 200s between requests and must get it, slept {slept}"
+    )
+
+
+def test_a_capped_refusal_is_catchable_as_an_ordinary_pacing_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every existing caller handles `CrawlPaced` as "skip the row, record nothing about the
+    product". That is the correct handling here too, so the new type must not slip past those
+    handlers as a bare `RuntimeError` — while still being distinguishable for logging."""
+    assert issubclass(cp.CrawlDelayTooLong, cp.CrawlPaced)
+    assert cp.CrawlDelayTooLong is not cp.CrawlPaced
+
+    _serve_robots(monkeypatch, {"slow.com": _ONE_DAY_ROBOTS})
+    _patch_sleep(monkeypatch)
+    with pytest.raises(cp.CrawlPaced) as caught:
+        asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0))
+    assert "Crawl-delay" in str(caught.value), (
+        f"the refusal has to say WHY the host was skipped, got {caught.value!r}"
+    )
+
+
+def test_an_operator_can_raise_or_disable_the_crawl_delay_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is policy, so it has to be tunable — including all the way off, for an operator
+    who knowingly wants a lane to sit out a very long delay."""
+    _serve_robots(monkeypatch, {"slow.com": "User-agent: *\nCrawl-delay: 3600\n"})
+    slept = _patch_sleep(monkeypatch)
+
+    monkeypatch.setenv("CRAWL_MAX_ROBOTS_DELAY_SECONDS", "0")
+
+    async def go() -> None:
+        await cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://slow.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+    assert any(d > 3500 for d in slept), f"cap=0 must disable the ceiling, slept {slept}"
+
+
+def test_a_delay_exactly_at_the_cap_is_still_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`>` not `>=`. A boundary flipped the other way silently narrows the policy by one
+    second and no other row here would notice."""
+    _serve_robots(monkeypatch, {"edge.com": "User-agent: *\nCrawl-delay: 300\n"})
+    slept = _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        await cp.await_slot("https://edge.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://edge.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+    assert any(d > 299 for d in slept), f"300s is AT the 300s cap, not over it: {slept}"
+
+
+# --- CRAWL_MAX_WAIT_SECONDS=0 means "never wait", not "wait forever" ---------------------------
+
+def test_an_env_ceiling_of_zero_does_not_silently_unbound_the_live_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_wait=0` is the CALLER'S sentinel for unbounded, and the env used to be read through
+    the same `> 0` test. So an operator setting `CRAWL_MAX_WAIT_SECONDS=0` — which can only mean
+    "do not stall my request path" — got the exact opposite, on the unauthenticated
+    `POST /api/offers/external/resolve`. The sentinel's polarity is pre-existing and untouched;
+    the env reading, which no caller opted into, is not.
+    """
+    _serve_robots(monkeypatch, {"queue.com": 404})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "0")
+
+    async def go() -> None:
+        # First row is free: "never wait" still allows a slot that is available right now.
+        await cp.await_slot("https://queue.com/a", user_agent="PivotaBot")
+        # The second is 5s out, and the operator said not to wait at all.
+        with pytest.raises(cp.CrawlPaced):
+            await cp.await_slot("https://queue.com/b", user_agent="PivotaBot")
+
+    asyncio.run(go())
+    assert slept == [], f"an env ceiling of 0 must never produce a wait, slept {slept}"
+
+
+def test_an_explicit_max_wait_of_zero_is_still_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the row above: fixing the ENV reading must not disarm the SENTINEL that
+    eight batch call sites pass. If this flipped, every batch lane would silently revert to
+    refusing anything past its default ceiling."""
+    _serve_robots(monkeypatch, {"queue.com": 404})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "120")
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "10")
+
+    async def go() -> None:
+        await cp.await_slot("https://queue.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://queue.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+    assert any(d > 119 for d in slept), f"max_wait=0 must still mean unbounded, slept {slept}"

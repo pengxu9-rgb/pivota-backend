@@ -208,6 +208,18 @@ and CLI-only:
   `merchant_stores` domain) matches **0** rows in prod and is dead weight.
 * Even at full reach it would not help, because of §4.2: a dead destination produces
   `degraded` and changes nothing.
+* **Its patience had no ceiling, and that is a prerequisite, not a nicety.** #1898 gave
+  `_refresh_unbounded` `max_wait=0`, which is right for a batch — but `max_wait` was the only
+  thing that had ever clamped a host's robots.txt `Crawl-delay`. Reproduced by construction on
+  `ff589e4e`: a host serving `Crawl-delay: 86400` made row 2 on that host sleep **86,399.99998s**
+  and row 3 **172,799.99999s**, because each row also pushed `next_allowed` a further day out.
+  Nor was there any wall-clock ceiling on the run: with `CRAWL_MAX_BACKOFF_SECONDS` at 300s,
+  `--limit 500` against a persistently-429ing host is ~41h with no hostile robots.txt involved.
+  Both are now bounded — `CRAWL_MAX_ROBOTS_DELAY_SECONDS` (default 300s, skips the host and
+  records `CrawlDelayTooLong` rather than crawling it faster than it asked) and
+  `--budget-seconds` / `EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS` (default 3300s, under the
+  3600s Cloud Run task timeout, and reported as `stopped_early` + `skipped_for_budget`).
+  **Any scheduler entry for this job must come after those, not before.**
 
 ### 4.4 …and two publishers bypass the gate entirely
 

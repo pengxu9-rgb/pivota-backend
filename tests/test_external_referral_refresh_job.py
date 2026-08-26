@@ -50,7 +50,7 @@ def _instrument(monkeypatch, *, batch_raises: bool = False) -> List[str]:
     async def fake_disconnect() -> None:
         events.append("disconnect")
 
-    async def fake_batch(*, refresh_seed_by_id, limit) -> Dict[str, Any]:
+    async def fake_batch(*, refresh_seed_by_id, limit, **kwargs) -> Dict[str, Any]:
         events.append("batch")
         if batch_raises:
             raise RuntimeError("boom")
@@ -101,18 +101,28 @@ def test_main_passes_the_parsed_limit_through(monkeypatch, capsys) -> None:
     async def fake_connect() -> None:
         return None
 
-    async def fake_batch(*, refresh_seed_by_id, limit) -> Dict[str, Any]:
+    async def fake_batch(*, refresh_seed_by_id, limit, **kwargs) -> Dict[str, Any]:
         seen["limit"] = limit
         seen["refresh_seed_by_id"] = refresh_seed_by_id
+        seen.update(kwargs)
         return dict(_SUMMARY)
 
     monkeypatch.setattr(db_singleton, "connect", fake_connect)
     monkeypatch.setattr(db_singleton, "disconnect", fake_connect)
     monkeypatch.setattr(job_module, "run_external_referral_refresh_batch", fake_batch)
-    monkeypatch.setattr(sys, "argv", ["external_referral_refresh", "--limit", "7"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["external_referral_refresh", "--limit", "7", "--budget-seconds", "42"],
+    )
 
     assert job_module.main() == 0
     assert seen["limit"] == 7
+    # The wall-clock budget is what keeps `max_wait=0` safe to put on a schedule; a flag the
+    # CLI parses and then drops would leave the run unbounded while looking configured.
+    assert seen.get("budget_seconds") == 42.0, (
+        f"--budget-seconds must reach the batch, got {seen.get('budget_seconds')!r}"
+    )
     capsys.readouterr()
 
 
