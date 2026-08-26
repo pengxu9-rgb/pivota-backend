@@ -19,7 +19,11 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '17 * * * *'
+    # Every 4h, not hourly. One undeployed gap is ONE fact; re-reporting it every hour turns a
+    # true alarm into a mailing list. On 2026-08-25 a single 8-hour gap produced 7 scheduled
+    # failure notifications here and 10 more on the gateway - the volume, not the verdict, is
+    # what makes an alarm get muted. :17 still, to stay out of the gateway's :37 slot.
+    - cron: '17 */4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -29,7 +33,19 @@ env:
   # How long production may lag main before this job goes red. Long enough that a normal
   # merge-then-deploy never trips it; short enough that a forgotten deploy is caught the same
   # morning. Only applies when production is BEHIND main, never when it has diverged.
-  GRACE_MINUTES: '120' 
+  #
+  # 120 was too twitchy for how this repo actually merges. Measured over the 14 days to
+  # 2026-08-25, the span from a day's first merge to its last was a MEDIAN of 13.7h (p75 17.4h,
+  # max 23.2h) - work lands across the whole day and ships in batches, so a 2h window went red
+  # during ordinary afternoons.
+  #
+  # WHY NOT MUCH LONGER, which is the tempting fix. Sizing the window so a normal day never
+  # trips it means ~14h, and that is not a weaker alarm - it is an off one. Replayed against
+  # 2026-08-25: at 480m this job would have gone red ZERO times, and the 8-hour gap holding
+  # #1865 (an anonymous admin-JWT escalation fix) would have gone entirely unreported. The
+  # alarm is the only reason anyone looked. 240 still catches that gap; it just stops shouting
+  # about a merge from ninety minutes ago.
+  GRACE_MINUTES: '240'
 
 jobs:
   drift:
