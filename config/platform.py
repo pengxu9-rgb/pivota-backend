@@ -325,6 +325,35 @@ def is_production(env: Optional[Mapping[str, str]] = None) -> bool:
     return platform_env(env) == PRODUCTION
 
 
+def pytest_bypass_allowed(
+    env: Optional[Mapping[str, str]] = None, *, bypass_name: str = "a test-only bypass"
+) -> bool:
+    """True only inside an actual pytest run outside production.
+
+    Several call sites short-circuit auth/durability checks whenever
+    ``PYTEST_CURRENT_TEST`` is set, to let the unit-test suite run without
+    real credentials or a real database. ``PYTEST_CURRENT_TEST`` is only ever
+    set by pytest itself, but it is just an environment variable — a debug
+    image built from a test stage, a copied ``.env``, or a misconfigured
+    smoke harness could still leak it into a real server process. A bypass
+    gated on this variable alone would then be live in production.
+
+    Centralizing the check here means the ``not is_production()`` conjunct
+    can't be forgotten at a new call site the way it was for the bypasses
+    fixed in PR #1893 (see also the demo login lanes fixed in PR #1889).
+    """
+    if not _get(env, "PYTEST_CURRENT_TEST"):
+        return False
+    if is_production(env):
+        logger.warning(
+            "[Platform] PYTEST_CURRENT_TEST is set but the environment "
+            "resolves to production; %s stays disabled",
+            bypass_name,
+        )
+        return False
+    return True
+
+
 def is_staging(env: Optional[Mapping[str, str]] = None) -> bool:
     return platform_env(env) == STAGING
 

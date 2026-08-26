@@ -372,6 +372,90 @@ mkjob content-canonical-election "$BACKEND_IMAGE" "$SA" \
   --command python \
   --args "scripts/elect_content_canonicals.py,--apply,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml"
 
+echo "== job: derive-offer-market-currency (GH Actions cron 11 9 * * 1)"
+# Migrated from .github/workflows/derive-offer-market-currency.yml, deleted in
+# the same commit. Same forced move as content-canonical-election above: Cloud
+# SQL `pivota-pg` has NO public IP (ipv4Enabled=false, private 10.25.0.2 only),
+# so a GitHub-hosted runner has no route to it. The workflow's DATABASE_URL repo
+# secret held Railway's PUBLIC proxy URL, which is the only reason it ever
+# worked; Railway was decommissioned 2026-08-25. This lane last ran 08-24 while
+# Railway was still up, so unlike the reaper it is still GREEN and LATENT — it
+# would have died on its next firing, Monday 2026-08-31.
+#
+# NO `--apply`, and that omission is the whole safety property of this lane.
+# `base currency != a US Markets buyer's price`: currency-mismatch cannot tell a
+# genuinely US-converted USD price apart from a mislabelled foreign one, so the
+# WEEKLY run only ever detected drift (new mispriced-ingest domains) and printed
+# the by-domain report — the workflow's scheduled path passed no --apply either,
+# and writes required a human dispatching with apply=true after reading it.
+# Baking --apply into these args would convert a report into an unattended
+# relabel of live offer currencies. The manual apply path is now
+#   gcloud run jobs execute derive-offer-market-currency --region "$REGION" \
+#     --project "$PROJECT" --wait --args '-m,scripts.backfill_offer_market_currency,...,--apply'
+# which OVERRIDES these args; see docs/runbooks/derive_offer_market_currency.md
+# for the reviewed-subset form (`--only-domain`) the workflow's `only_domains`
+# input used to build.
+#
+# --min-offers 3 / --max-domains 25 are the workflow input DEFAULTS, pinned here
+# so the scheduled report keeps the shape the operator learned to read. They are
+# not safety limits on this Job (--max-domains only ever refuses an --apply);
+# they are what decides which domains appear in the report at all.
+#
+# `mkjob`, NOT `mkcrawljob`, and this one is a judgement rather than a rule.
+# scripts/backfill_offer_market_currency.py DOES fetch merchant storefronts
+# (`https://{domain}/meta.json` via services/storefront_currency.py), which is
+# the trigger the external-seed sweep below cites for using the reserved
+# pivota-crawl egress IP. Two reasons it stays on `default`/pivota-nat anyway:
+# a migration should preserve behaviour, and a GitHub runner was never on the
+# reserved IP either — so `default` is at worst neutral and probably better
+# (one stable NAT address instead of shared GitHub ranges); and the crawl IP is
+# a shared reputational resource that the destination sweep and the Store Audit
+# probes already depend on, so adding an 8-way-concurrent /meta.json fetcher to
+# it is its own measured decision, not a side effect of this migration. The
+# failure mode if some hosts do challenge us is a SHORTER report (an
+# unresolvable storefront is counted and left alone), never a wrong write.
+#
+# The workflow uploaded reports/workflow_ops/.../run.log as an artifact. Cloud
+# Run Jobs have no artifact store; both scripts already print the whole report
+# to stdout, so it lands in Cloud Logging instead — see the runbook for the read.
+mkjob derive-offer-market-currency "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=derive-offer-market-currency,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
+  --task-timeout 1800s \
+  --command python \
+  --args "-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25"
+
+echo "== job: audit-domainless-offer-currency (companion report of the same GH lane)"
+# The SECOND step of the same deleted workflow, and a separate Job because a
+# Cloud Run Job runs one command. Dropping it would have silently deleted half
+# the weekly signal: the domain-keyed scan above cannot see offers with
+# NULL/empty source_domain (the external-seed mirror lane never wrote it), and
+# this companion derives each such offer's storefront from seed provenance and
+# reports stamped-vs-actual currency for exactly that blind spot.
+#
+# ALWAYS a dry-run, structurally: scripts/audit_domainless_offer_currency.py
+# refuses --apply without --confirm AUDIT_DOMAINLESS_OFFER_CURRENCY, and
+# backfilling source_domain is a reviewed manual step that was never scheduled.
+#
+# Sequencing. In the workflow this step ran only if the first one succeeded
+# (plain step order, no `if: always()`), because a failed checkout / pip install
+# / DATABASE_URL guard would make it fail identically and add noise. None of
+# those three prerequisites exist here — the image is prebuilt and a secret that
+# will not mount stops the Job before the container starts — so two independent
+# Jobs lose nothing that reasoning was protecting. They are staggered rather
+# than co-scheduled (see the trigger below) so they cannot hit the same
+# storefronts concurrently from the same egress address.
+#
+# It also gets its own 1800s rather than the remainder of one shared budget. In
+# the workflow both steps shared `timeout-minutes: 30`, so a slow first step
+# could leave this one to be killed mid-report; that was a defect of the
+# packaging, not a limit worth reproducing.
+mkjob audit-domainless-offer-currency "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=audit-domainless-offer-currency,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
+  --task-timeout 1800s \
+  --command python \
+  --args "-m,scripts.audit_domainless_offer_currency"
 echo "== job: agent-pdp-orphan-reaper (GH Actions cron 37 4 * * *)"
 # Migrated from .github/workflows/agent-pdp-orphan-reaper.yml, deleted in the
 # same commit, for the same reason as content-canonical-election above: Cloud SQL
@@ -528,6 +612,15 @@ sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
 # than one 5h35m old. Moving this without moving that one silently inverts the
 # order.
 sched content-canonical-election-cron "52 */6 * * *" content-canonical-election
+# 09:11 UTC every Monday. The exact cron the GH workflow carried, preserved
+# rather than re-picked so the report keeps arriving where the operator already
+# looks for it. DRY-RUN: the Job's baked args carry no --apply (see above).
+sched derive-offer-market-currency-cron "11 9 * * 1" derive-offer-market-currency
+# 09:41, the same Monday, +30 min. Deliberately NOT the same 11 9 minute: the
+# two Jobs fetch overlapping storefronts, and 30 min is the first Job's own
+# --task-timeout, so the offset is what guarantees they cannot be in flight at
+# once no matter how long the first one runs.
+sched audit-domainless-offer-currency-cron "41 9 * * 1" audit-domainless-offer-currency
 # 04:37 UTC daily. The exact cron the GH workflow carried, preserved because its
 # own comment named the minute as chosen rather than arbitrary: "off-peak, offset
 # from the PDP production smoke (08:17)" — that smoke is still a GitHub workflow
