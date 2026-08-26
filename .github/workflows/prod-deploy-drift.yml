@@ -19,7 +19,19 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '17 * * * *'
+    # Every 4h, not hourly. One undeployed gap is ONE fact; re-reporting it every hour turns a
+    # true alarm into a mailing list. On 2026-08-25, a day that held two separate undeployed
+    # gaps, this workflow sent 7 scheduled failure notifications and the gateway sent 10 - the
+    # volume, not the verdict, is what makes an alarm get muted. :17 still, to stay out of the
+    # gateway's :37 slot.
+    #
+    # WHY THESE HOURS AND NOT `*/4`. GitHub drops scheduled runs under load, and it drops the
+    # midnight one hardest: across 08-23..08-26, 5 of 59 nominal hourly slots never ran and
+    # THREE of the five were 00:17 - every midnight slot sampled. Losing one slot out of 24
+    # costs an hour; losing one out of six leaves a 20:17-04:17 blind window and pushes
+    # worst-case detection past the "same morning" this file promises. Starting at 02:17 keeps
+    # the 4h cadence and skips the slot GitHub is least likely to deliver.
+    - cron: '17 2,6,10,14,18,22 * * *'
   workflow_dispatch:
 
 permissions:
@@ -28,8 +40,25 @@ permissions:
 env:
   # How long production may lag main before this job goes red. Long enough that a normal
   # merge-then-deploy never trips it; short enough that a forgotten deploy is caught the same
-  # morning. Only applies when production is BEHIND main, never when it has diverged.
-  GRACE_MINUTES: '120' 
+  # working day - not the same morning, since grace plus a cron interval can now reach ~9h.
+  # Only applies when production is BEHIND main, never when it has diverged.
+  #
+  # 120 was too twitchy for how this repo actually merges. Measured over the 14 days to
+  # 2026-08-25, the span from a day's first merge to its last was a MEDIAN of 13.7h (p75 17.4h,
+  # max 23.2h) - work lands across the whole day and ships in batches, so a 2h window went red
+  # during ordinary afternoons.
+  #
+  # WHY NOT MUCH LONGER, which is the tempting fix. Sizing the window so a normal day never
+  # trips it means ~14h, and that is not a weaker alarm - it is an off one. Replayed against
+  # 2026-08-25: at 480m this job would have gone red ZERO times, and the 8-hour gap holding
+  # #1865 (an anonymous admin-JWT escalation fix) would have gone entirely unreported. The
+  # alarm is the only reason anyone looked. 240 still catches that gap; it just stops shouting
+  # about a merge from ninety minutes ago.
+  #
+  # Worst case to detection is grace + one cron interval = 8h, plus however late GitHub actually
+  # runs the job: measured on this workflow the schedule arrives a median of 36 minutes past the
+  # nominal minute (p90 51m), so the real ceiling is ~9h, not 8.
+  GRACE_MINUTES: '240'
 
 jobs:
   drift:
@@ -134,7 +163,7 @@ jobs:
             if [ -n "$LANDED" ]; then
               AGE_MIN=$(( ( $(date -u +%s) - LANDED ) / 60 ))
               if [ "$AGE_MIN" -lt "$GRACE_MINUTES" ]; then
-                echo "::notice::undeployed runtime code landed on main ${AGE_MIN}m ago, inside the ${GRACE_MINUTES}m deploy window - not alarming yet. The hourly run will."
+                echo "::notice::undeployed runtime code landed on main ${AGE_MIN}m ago, inside the ${GRACE_MINUTES}m deploy window - not alarming yet. A later scheduled run will."
                 exit 0
               fi
               echo "this gap has been on main for ${AGE_MIN} minutes (window is ${GRACE_MINUTES})."
