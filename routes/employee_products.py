@@ -344,6 +344,19 @@ async def _ensure_external_seeds_table() -> None:
     await database.execute(
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;"
     )
+    # Content freshness (migration 202 / schema_guard). THIS FUNCTION IS THE ONLY THING THAT
+    # CREATES THIS TABLE -- it is absent from SQLAlchemy metadata -- so a column declared in the
+    # migration and in schema_guard but NOT here does not exist on any database bootstrapped
+    # through this path. `ALTER TABLE IF EXISTS ... ADD COLUMN` in the guard is a silent no-op
+    # when the table is missing, and the selector references `last_crawl_attempt_at`
+    # unconditionally, so omitting it here is a hard error on first boot, not a degraded sort.
+    # Migration 200's columns were added here for exactly this reason; 202's belong here too.
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;"
+    )
     # Destination liveness (migration 200 / schema_guard). The refresh below writes
     # these on every completed fetch, so this table cannot be usable without them.
     await database.execute(
@@ -4412,6 +4425,29 @@ def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
     return bool(a) and a == b
 
 
+async def _stamp_crawl_attempt(seed_id: str) -> None:
+    """Record that we TRIED to re-read this seed, whatever the outcome.
+
+    THIS IS NOT A FRESHNESS SIGNAL and must never be read as one -- that is `last_crawled_at`,
+    which only a fetch that reached the origin may set. This column exists solely to order the
+    refresh QUEUE, and the two questions genuinely differ for the rows that matter most.
+
+    Without it the queue deadlocks on its own failures. `get_external_referral_refresh_candidate_seed_ids`
+    orders `last_crawled_at ASC NULLS FIRST`, and a seed that 404s, is bot-challenged, or is
+    disallowed by robots never gets stamped -- so it stays NULL, stays first, and is retried
+    every single run, forever, in front of the rows that could actually be corrected. On the
+    dead-PDP audit's own numbers (10.4% of measurable seeds already broken) that is most of a
+    nightly batch spent re-fetching URLs we have already proven are gone.
+
+    Advancing the attempt clock on a failure does NOT claim the price is fresh. It claims only
+    that we have already spent this round's request on this row, which is true.
+    """
+    await _execute_seed_data_stmt(
+        "UPDATE external_product_seeds SET last_crawl_attempt_at = NOW() WHERE id = :id",
+        {"id": seed_id},
+    )
+
+
 async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
@@ -4443,6 +4479,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         if not _same_destination(dest, destination_liveness.destination_of(row)):
             # See the note at the success path: a verdict about a URL we do not serve is worse
             # than no verdict at all.
+            await _stamp_crawl_attempt(seed_id)
             return {
                 "status": "degraded",
                 "error": f"destination_unavailable: http {exc.status_code}",
@@ -4464,6 +4501,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         # is deliberately absent here rather than left in behind a condition that cannot fire
         # — an unreachable retirement reads like a live one to the next person.
         # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+        await _stamp_crawl_attempt(seed_id)
         return {
             "status": "degraded",
             "error": f"destination_unavailable: http {exc.status_code}",
@@ -4472,6 +4510,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     except Exception as exc:
         # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
         # the product, so no observation is recorded and the failure streak does not move.
+        await _stamp_crawl_attempt(seed_id)
         return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}"}
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
@@ -4697,6 +4736,22 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "currency": next_currency,
     }
 
+    # HOISTED so the stamp and the liveness observation below are gated on ONE decision.
+    # Deriving "did we reach the origin" twice is the twin-implementation drift this file
+    # keeps paying for, and here the two copies would disagree about whether a row is fresh.
+    #
+    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
+    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
+    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
+    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
+    # The success path then runs normally. `observed["status_code"]` is the only proof that
+    # anything actually left the process -- and `_same_destination` is the only proof it went
+    # to the URL we serve rather than a legacy `destination_url` we do not.
+    served_url = destination_liveness.destination_of(row)
+    reached_served_origin = observed.get("status_code") is not None and _same_destination(
+        dest, served_url
+    )
+
     await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
@@ -4709,19 +4764,25 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             availability = :availability,
             seed_data = :seed_data,
             updated_at = NOW(),
-            -- CRAWL RECENCY, NOT WRITE RECENCY. This statement is reached only after a
-            -- fetch that reached the origin (`raise_on_unavailable=True`) for the URL we
-            -- actually serve (`_same_destination`), so it is the one place entitled to
-            -- say "we looked". The refresh queue orders on this; `updated_at` beside it
-            -- is bumped by attaches and governance writes that never left the process.
-            -- See migration 202. Every early `return` above this line deliberately
-            -- leaves it alone -- a degraded refresh must not buy freshness, which is the
-            -- same trap the `raise_on_unavailable` note describes for a 404.
-            last_crawled_at = NOW()
+            -- WE SPENT THIS ROUND'S REQUEST ON THIS ROW. Advances on every terminal outcome
+            -- (see _stamp_crawl_attempt), which is what keeps a permanently-dead seed from
+            -- sitting at the head of the queue forever. Orders the queue; proves nothing.
+            last_crawl_attempt_at = NOW(),
+            -- WE ACTUALLY READ THE PRICE, FROM THE URL WE SERVE. Gated on exactly the
+            -- predicate `destination_checked_at` is gated on, because it is the same claim
+            -- about the same fetch. A cached-snapshot fallback keeps the OLD value rather
+            -- than taking NOW() -- if it took NOW(), the hosts we can never read would be
+            -- stamped fresh on every run and sorted to the BACK of the queue permanently,
+            -- which is the starvation this column exists to remove, wearing a new hat.
+            last_crawled_at = CASE
+                WHEN CAST(:reached_served_origin AS BOOLEAN) THEN NOW()
+                ELSE last_crawled_at
+            END
         WHERE id = :id
         """,
         {
             "id": seed_id,
+            "reached_served_origin": bool(reached_served_origin),
             "canonical_url": canonical_url,
             "domain": domain,
             "title": snap_title,
@@ -4748,7 +4809,8 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     # the two drift apart by design. Recording a verdict from the wrong one is how a seed whose
     # served link is healthy gets marked dead because a legacy `destination_url` 404s.
     # When they differ, the sweep observes the served URL; saying nothing here is correct.
-    served_url = destination_liveness.destination_of(row)
+    # `served_url` and `reached_served_origin` are the HOISTED values from above; recomputing
+    # them here is what would let the stamp and the verdict disagree.
     if observed.get("status_code") is None:
         # The fetch never reached the origin (or came from the snapshot cache), so there is
         # nothing to record. Distinct from the case below, and the drift report says which.

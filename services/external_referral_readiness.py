@@ -1455,9 +1455,9 @@ async def should_block_external_referral_runtime(
 
 
 async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> List[str]:
-    """Pick the seeds whose price/availability we last READ longest ago.
+    """Pick the seeds we have spent a request on least recently.
 
-    ORDERED ON `last_crawled_at`, NOT `updated_at`. The two are not the same question and
+    ORDERED ON `last_crawl_attempt_at`, NOT `updated_at` and NOT `last_crawled_at`. The two are not the same question and
     this function asked the wrong one until migration 202. `updated_at` answers "when was
     this row last WRITTEN", and it is bumped by writers that never contact the origin:
     `external_seed_servability` on attach, `identity_resolution` on a status flip,
@@ -1479,7 +1479,7 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
         FROM external_product_seeds
         WHERE status = 'active'
           AND attached_product_key IS NOT NULL
-        ORDER BY last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
         LIMIT :limit
         """,
         {"limit": normalized_limit},
@@ -1515,7 +1515,7 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
           AND attached_product_key IS NULL
           AND domain IS NOT NULL
           AND TRIM(domain) != ''
-        ORDER BY last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
         LIMIT :limit
         """,
         {"limit": normalized_limit * 4},
