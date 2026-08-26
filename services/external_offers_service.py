@@ -1520,6 +1520,7 @@ async def resolve_external_offer(
     force_refresh: bool = False,
     raise_on_unavailable: bool = False,
     observed: Optional[Dict[str, Any]] = None,
+    max_wait: Optional[float] = None,
 ) -> ExternalOfferSnapshot:
     """Resolve (and opportunistically refresh) the offer snapshot for a third-party URL.
 
@@ -1541,7 +1542,15 @@ async def resolve_external_offer(
 
     # Try to refresh (best-effort). If refresh fails, return existing cached value.
     try:
-        html, _ct = await _fetch_html(url_norm, observed=observed)
+        # `max_wait` IS THE CALLER'S PATIENCE, and this function had no way to express it.
+        # `_fetch_html` documents the rule: the default ceiling exists for the LIVE route, and
+        # a BATCH job must pass 0 (unbounded) or the backoff curve above ~16s becomes
+        # unreachable -- `await_slot` refuses instead of waiting, the refusal is swallowed as
+        # a generic failure, and one throttled host voids the rest of its own rows in
+        # milliseconds while looking like the host was down. The sibling destination sweep
+        # passes 0 explicitly; until now the content refresh could not, because there was no
+        # parameter between it and here. Default None keeps the live route exactly as it was.
+        html, _ct = await _fetch_html(url_norm, observed=observed, max_wait=max_wait)
         extracted = _extract_from_html(url_norm, html)
 
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)

@@ -4457,7 +4457,19 @@ async def _stamp_crawl_attempt(seed_id: str) -> None:
     )
 
 
-async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
+async def _refresh_external_seed_by_id(
+    seed_id: str, *, max_wait: Optional[float] = None
+) -> Dict[str, Any]:
+    """Re-read one seed's price/availability from the origin.
+
+    `max_wait` is the CALLER'S PATIENCE and the two callers want opposite things. The employee
+    route behind this is interactive: a human is waiting, so the default ceiling
+    (CRAWL_MAX_WAIT_SECONDS) is right and a throttled host should fail fast. The nightly batch
+    is not: it must pass 0 (unbounded) or `crawl_politeness` refuses any slot beyond ~10s,
+    which is most of the backoff curve, and every remaining row on that host burns in
+    milliseconds looking like the host was down. Passing it per-call rather than reading an
+    env var keeps one function honest for both.
+    """
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
     if not row:
@@ -4482,7 +4494,12 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     observed: Dict[str, Any] = {}
     try:
         snapshot = await resolve_external_offer(
-            market=market, url=dest, force_refresh=True, raise_on_unavailable=True, observed=observed
+            market=market,
+            url=dest,
+            force_refresh=True,
+            raise_on_unavailable=True,
+            observed=observed,
+            max_wait=max_wait,
         )
     except ExternalOfferUnavailable as exc:
         if not _same_destination(dest, destination_liveness.destination_of(row)):
