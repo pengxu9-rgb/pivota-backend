@@ -101,6 +101,7 @@ def test_disabled_flag_is_a_404_on_both_endpoints(monkeypatch, db):
     ("www.shop.example.com", "shop.example.com"),
     ("http://shop.example.com", "shop.example.com"),
     ("xn--bcher-kva.example.com", "xn--bcher-kva.example.com"),
+    ("example.xn--p1ai", "example.xn--p1ai"),
 ])
 def test_normalize_accepts_public_hosts(raw, expected):
     assert intake_module.normalize_store_domain(raw) == expected
@@ -112,6 +113,10 @@ def test_normalize_accepts_public_hosts(raw, expected):
     "https://user:pw@shop.example.com", "ftp://shop.example.com",
     "internal.corp", "printer.local", "db.internal", "unit.test",
     "svc.home.arpa", "a..b.com", "-bad.example.com", "x" * 600,
+    # inet_aton-style IP literals that ipaddress.ip_address does not parse
+    # but resolvers happily read as loopback/private addresses.
+    "127.1", "0x7f.0.0.1", "127.0.0.0x1", "010.010.010.010",
+    "192.168.000.001", "0177.0.0.1",
 ])
 def test_normalize_rejects_junk_and_internal_hosts(raw):
     assert intake_module.normalize_store_domain(raw) is None

@@ -133,6 +133,13 @@ def normalize_store_domain(value: str) -> Optional[str]:
         return None
     if any(not _HOST_LABEL.fullmatch(label) for label in labels):
         return None
+    # ipaddress.ip_address misses inet_aton-style literals ("127.1",
+    # "0x7f.0.0.1", "010.010.010.010") which resolvers still read as IPs.
+    # Every real public TLD is alphabetic (or punycode "xn--"), so a final
+    # label that is anything else is an IP form or junk, never a storefront.
+    tld = labels[-1]
+    if not (tld.isalpha() or tld.startswith("xn--")):
+        return None
     if any(host.endswith(suffix) for suffix in _BLOCKED_HOST_SUFFIXES):
         return None
     return host
