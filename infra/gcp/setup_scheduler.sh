@@ -239,6 +239,34 @@ mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
   --command npm --args "run,relgraph:sync-routine:cron"
 
+echo "== job: external-seed-sentinel-nongrowth (GH Actions cron 23 10 * * *)"
+# ADR-009 data-side ratchet, migrated from PIVOTA-Agent's scheduled GitHub workflow
+# when the Railway DATABASE_URL secret it ran on was decommissioned (2026-08-25).
+# Read-only audit; exits non-zero on any enforce-lane breach, which fails the
+# execution and pages via the "prod: Cloud Run job failing" alert policy — the
+# replacement for the GH scheduled-run failure email. The script reads its
+# watermarks from tests/fixtures/external_seed_sentinel_watermarks.json INSIDE
+# the image, so GATEWAY_TAG must be at or after PIVOTA-Agent #2110 (which
+# re-included that fixture in .dockerignore) — and a watermark ratchet only
+# takes effect once a gateway image carrying it is rolled onto this job.
+mkjob external-seed-sentinel-nongrowth "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-sentinel-nongrowth,PIVOTA_COMMIT_SHA=$GATEWAY_TAG" \
+  --task-timeout 600s \
+  --command node --args "scripts/audit-external-seed-sentinel-nongrowth.cjs"
+
+echo "== job: pdp-identity-graph-backfill (GH Actions cron 40 3 * * 1, weekly catch-up)"
+# Weekly identity-listing catch-up for external seeds, migrated from the same
+# decommissioned GH lane. Always --only-uncovered: it mints listings ONLY for
+# seeds with no listing yet, so an unattended run structurally cannot rewrite an
+# existing row (that is what made the GH schedule safe, and it carries over
+# unchanged). The GH artifact upload is replaced by the result JSON on stdout,
+# which lands in Cloud Logging.
+mkjob pdp-identity-graph-backfill "$GATEWAY_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=pdp-identity-graph-backfill,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3" \
+  --command node --args "scripts/backfill-pdp-identity-graph.js,--limit,2000,--only-uncovered"
+
 echo "== job: commerce-index-relgraph (v2 targeted graph publication)"
 # This worker is independently opt-in. It is safe to create while inert, but it
 # must not consume queue rows until migration 194 is applied, v2 fact emission is
@@ -385,6 +413,8 @@ fi
 
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
+sched external-seed-sentinel-nongrowth-cron "23 10 * * *" external-seed-sentinel-nongrowth
+sched pdp-identity-graph-backfill-cron "40 3 * * 1" pdp-identity-graph-backfill
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
   sched external-seed-destination-sweep-cron "20 2 * * *" external-seed-destination-sweep
 else
