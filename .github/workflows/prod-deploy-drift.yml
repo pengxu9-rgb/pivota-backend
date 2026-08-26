@@ -1,18 +1,19 @@
 # Does production actually run what `main` says it runs?
 #
 # Before the 2026-08-22 cutover, a merge to main auto-deployed to Railway prod, so "merged"
-# and "shipped" were the same event. They are not any more. Railway is now the ROLLBACK, and
-# GCP Cloud Run - which serves every user - only moves when somebody runs
-# infra/gcp/deploy_backend.sh by hand. Nothing else reports the gap.
+# and "shipped" were the same event. Between the cutover and 2026-08-26 they were not: GCP
+# Cloud Run only moved when a human ran infra/gcp/deploy_backend.sh (later, the deploy-prod
+# dispatch), and nothing else reported the gap.
 #
-# It has already bitten once: #1812 (a seed refresh that could never correct a stale price)
+# It bit once in that window: #1812 (a seed refresh that could never correct a stale price)
 # merged 78 minutes after the flip, deployed itself to the rollback, and left production on
 # the previous commit. Nobody was told, and the Railway host still answered /__build with a
 # newer, confidently-green commit than production.
 #
-# This job exists to make that silence impossible. It does not deploy - deploying to a
-# payments platform on merge is a bigger decision than this file should make - it only says
-# out loud when live != main.
+# Since 2026-08-26, deploy-prod.yml deploys `web` on every push to main again. This job STAYS:
+# it is now the independent check on that pipeline - a deploy workflow that silently fails,
+# skips, or is dropped by GitHub re-creates exactly the gap it was built to close, and this is
+# the only thing that would say so. It does not deploy; it only says out loud when live != main.
 name: prod deploy drift
 
 on:
