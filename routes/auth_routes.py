@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 import os
 
 # Database import for employee authentication
+from config.platform import is_production
 from db.database import database
 from utils.auth import verify_password as verify_bcrypt_password
 
@@ -121,6 +122,7 @@ async def signin(login_data: UserLogin):
     - Legacy `employees` table auth (SHA256 + static salt)
     - Canonical `users` table auth (bcrypt) as a fallback
     - Hardcoded demo accounts, only when `ENABLE_INTERNAL_DEMO_FIXTURES=true`
+      AND the platform environment does not resolve to production
 
     Every lane resolves the role from a datastore or a flag-gated fixture; no
     lane ever honours a role supplied by the caller.
@@ -130,7 +132,11 @@ async def signin(login_data: UserLogin):
     try:
         normalized_email = normalize_email(login_data.email)
         demo_accounts = {}
-        if settings.enable_internal_demo_fixtures:
+        # Demo fixtures mint role=admin JWTs, so the flag alone is not enough:
+        # the lane also refuses whenever the platform resolves to production
+        # (config.platform fails CLOSED to production on unlabeled managed
+        # hosts). Mirrors routes.auth._demo_employee_accounts().
+        if settings.enable_internal_demo_fixtures and not is_production():
             demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
             demo_accounts = {
                 **(
