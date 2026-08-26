@@ -290,6 +290,39 @@ mkjob reviews-invitation-send "$BACKEND_IMAGE" "$SA" \
   --task-timeout 300s \
   --command python --args "scripts/process_due_reviews_invitation_send_jobs.py"
 
+echo "== job: content-canonical-election (GH Actions cron 52 */6 * * *)"
+# Migrated from .github/workflows/content-canonical-election.yml, deleted in the
+# same commit. Not a preference: Cloud SQL `pivota-pg` has NO public IP
+# (ipv4Enabled=false, private 10.25.0.2 only), so a GitHub-hosted runner cannot
+# reach the database from anywhere on the internet. The workflow held a
+# DATABASE_URL repo secret pointing at the Railway public proxy; Railway was
+# decommissioned 2026-08-25 and every scheduled run since has died in
+# `database.connect()` with ConnectionResetError. There is no secret value that
+# fixes it — the lane has to run inside the VPC.
+#
+# NOT a `mkcrawljob`: it fetches ONE URL, our own agent.pivota.cc sitemap, which
+# is public-internet egress out of the `default` subnet through pivota-nat. The
+# crawl subnet's reserved IP is for merchant storefronts and this is not one.
+#
+# `--apply` unconditionally, matching the workflow it replaces: a scheduled
+# election auto-applied there too (the dispatch-only checkbox was for manual
+# runs, and manual runs are now `gcloud run jobs execute`). --seed-from-sitemap
+# every time is also deliberate and NOT a seed-once flag — stored winners
+# outrank incumbency, so it changes nothing for settled content_keys and only
+# supplies the tiebreak for groups being elected for the first time.
+#
+# The workflow also set DB_POOL_ACQUIRE_TIMEOUT_SECONDS=45. Deliberately NOT
+# carried over: it existed because a GitHub runner reached Postgres over the
+# public proxy, where the TLS+auth handshake regularly exceeded the 5s default.
+# In-VPC to a private IP that reason is gone, and keeping it would only delay
+# the failure signal on a genuinely wedged pool.
+mkjob content-canonical-election "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=content-canonical-election,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
+  --task-timeout 900s \
+  --command python \
+  --args "scripts/elect_content_canonicals.py,--apply,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml"
+
 # Store Audit UCP work has a dedicated, explicitly armed pair of Jobs. The
 # selector only writes bounded verification rows; the probe Job is the sole
 # workload placed on the crawl subnet. Do not create either Job until its
@@ -396,6 +429,12 @@ else
   fi
 fi
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
+# 00:52/06:52/12:52/18:52 UTC. The exact cron the GH workflow carried, and the
+# offset is load-bearing: it LEADS pivota-agent-ui's sitemap cron (17 1,7,13,19)
+# by 25 minutes, so the sitemap regenerating next reads a fresh election rather
+# than one 5h35m old. Moving this without moving that one silently inverts the
+# order.
+sched content-canonical-election-cron "52 */6 * * *" content-canonical-election
 sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
 sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
 sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation

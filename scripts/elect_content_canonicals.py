@@ -291,6 +291,30 @@ async def main() -> int:
         await database.disconnect()
 
     print(json.dumps(report, indent=2, sort_keys=True))
+
+    # Emitted at WARNING so it carries a severity into Cloud Logging, where this
+    # sweep now runs. The GitHub workflow had a dedicated step that turned a
+    # non-zero `replacements` into a `::warning` in the run summary; deleting the
+    # workflow would otherwise have dropped that signal onto the floor, leaving
+    # it visible only to whoever thought to read a JSON blob at INFO.
+    #
+    # Every replacement is a LIVE URL moving. On a healthy corpus this is zero;
+    # non-zero means either a winner genuinely stopped being a candidate or
+    # something upstream is flapping `renderable`, and both want a human.
+    if report["replacements"]:
+        logger.warning(
+            "%d elected canonical URL(s) MOVED - each is a live URL changing",
+            report["replacements"],
+        )
+        for moved in report["replaced"]:
+            logger.warning(
+                "  %s: %s -> %s (%s)",
+                moved["content_key"],
+                moved["from"],
+                moved["to"],
+                moved["reason"],
+            )
+
     return 0
 
 

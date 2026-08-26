@@ -134,10 +134,32 @@ Must report `"replacements": 0` and `"new_elections": 0`. A steady-state sweep
 over an unchanged corpus writes nothing; if it does not, something upstream is
 flapping `renderable` and that is the bug to chase, not this.
 
-From here on the sweep runs itself: `.github/workflows/content-canonical-election.yml`,
-every 6h, auto-applying on the schedule and warning in the job summary whenever a
-live URL moves. It elects newly-arrived content_keys and re-elects only where the
-stored winner has stopped being a candidate.
+From here on the sweep runs itself: the `content-canonical-election` **Cloud Run
+Job**, triggered by the `content-canonical-election-cron` Cloud Scheduler entry
+every 6h at :52 UTC, auto-applying and logging a WARNING whenever a live URL
+moves. It elects newly-arrived content_keys and re-elects only where the stored
+winner has stopped being a candidate.
+
+It ran as `.github/workflows/content-canonical-election.yml` until 2026-08-26.
+That lane is gone and cannot come back: Cloud SQL `pivota-pg` has no public IP,
+so a GitHub-hosted runner has no route to it. The workflow only ever worked
+because its `DATABASE_URL` repo secret pointed at Railway's public proxy, and
+it began failing the moment Railway was decommissioned (2026-08-25).
+
+To read a run:
+
+```bash
+gcloud logging read \
+  'resource.type=cloud_run_job AND resource.labels.job_name=content-canonical-election' \
+  --project pivota-prod --limit 200 --freshness 7d
+```
+
+To run one by hand — dry-run first, since the Job's baked args include `--apply`:
+
+```bash
+gcloud run jobs execute content-canonical-election --region us-west1 --project pivota-prod --wait \
+  --args 'scripts/elect_content_canonicals.py,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml'
+```
 
 **A stale election is guarded, not harmless.** Both readers — the feed
 (`_elected_canonical_sig_column`) and `get_pdp_v2`'s `cce_valid` lateral —
