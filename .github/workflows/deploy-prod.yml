@@ -5,9 +5,13 @@
 # 3 commits behind main on cutover day with nobody aware: merging stopped meaning shipping, and
 # nothing replaced the half that went missing.
 #
-# This does NOT deploy on merge. A payments backend going live because a PR got approved is a
-# bigger decision than a workflow file should make, so the trigger is a human choosing a SHA.
-# What it removes is the laptop, the credentials, and the chance of getting the sequence wrong.
+# This DOES deploy on merge, as of 2026-08-26 (owner decision). It launched dispatch-only on the
+# argument that a payments backend going live on PR approval is a bigger decision than a workflow
+# file should make - and then main sat 10 commits ahead of production within four days, with the
+# drift alarm as the only thing saying so. The gate that matters is the required PR check before
+# merge; after merge, an undeployed main IS the hazard the 08-22 cutover already demonstrated
+# (#1812). The dispatch trigger stays for rollbacks (any merged SHA) and 0%-traffic candidates,
+# and the drift alarm stays as the independent check on this pipeline itself.
 #
 # Scope is `web` only. `worker` is the single-instance drainer and rolling it has queue semantics
 # this does not model; `proof-issuer` runs a different ASGI app from the same image; the gateway
@@ -15,6 +19,10 @@
 name: deploy prod
 
 on:
+  # No paths filter, deliberately: a filtered deploy that silently does not run reads as "shipped"
+  # (the exact trap ci-entrypoint.yml documents), and a docs-only deploy is merely a no-op roll.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       sha:
@@ -56,8 +64,9 @@ jobs:
     # reject it - the validation would be running on a string that had already had its way.
     # An `env:` block is an expression context: the value is passed, never pasted.
     env:
-      SHA: ${{ inputs.sha }}
-      PROMOTE_FLAG: ${{ inputs.promote && 1 || 0 }}
+      # push: the pushed merge commit, always promoted. dispatch: the operator's choice of both.
+      SHA: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
+      PROMOTE_FLAG: ${{ (github.event_name == 'push' || inputs.promote) && 1 || 0 }}
     steps:
       # TWO checkouts, and the split is deliberate.
       #
@@ -88,7 +97,7 @@ jobs:
       # today with the SHA the operator asked for - an image whose name lies about its contents.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha }}
+          ref: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
           path: src
           fetch-depth: 1
 
@@ -145,7 +154,7 @@ jobs:
             infra/gcp/deploy_backend.sh prod "$SHA"
 
       - name: Confirm production is serving the new commit
-        if: ${{ inputs.promote }}
+        if: ${{ github.event_name == 'push' || inputs.promote }}
         run: |
           set -euo pipefail
           # Cloud Run reports the traffic split as updated before every instance has rolled, so a
@@ -161,7 +170,7 @@ jobs:
           exit 1
 
       - name: Candidate summary
-        if: ${{ !inputs.promote }}
+        if: ${{ github.event_name != 'push' && !inputs.promote }}
         run: |
           echo "::notice::Candidate for $SHA passed its health check and is at 0% traffic."
           echo "Re-run with promote checked to shift traffic."
