@@ -53,7 +53,7 @@ Effort: **S** ≤ 1 week · **M** 2–4 weeks · **L** > 4 weeks (one engineer).
 | **B3. Bot-management vendor** | **Does not exist.** No vendor detection anywhere. `external_offer_snapshots.evidence` stores only `{provider, fetchedAt, snapshotId, description, variants, image_urls}` — **no HTTP status, no response headers, no CDN identity**. Nothing is derivable without new probing. | Per-domain vendor + current block state | **Measured live: 90/90 cohort domains and 69/70 top index domains are Cloudflare-fronted; 1 is Akamai.** More important than the label: **~50 requests spread over 37 Cloudflare domains in about one minute tripped a *cross-domain* IP-level 429 that persisted ~15 minutes** — including on domains that had answered 200 moments earlier. A naive verification hop from one egress IP will throttle itself out of service — **and on GCP that one egress IP is the partner-allowlisted payment address** (§3.2). | S (probe) / M (egress isolation) | **Yes** |
 | **B4. Guest checkout** | **Does not exist**, and is **not derivable without executing a checkout** — Shopify exposes no public signal for it. | Known per domain | Only two honest paths: (a) resolve it via UCP `create_checkout` (which succeeds or fails on the merchant's real rules), or (b) accept it as unknown and let the outcome graph learn it. Recommend (a). | S via UCP | No |
 | **B5. Checkout field inventory / field-name map** | **Does not exist.** | A fill map per domain | Only needed if Key Entry is the pilot mode. **If the pilot uses the UCP lane instead, this whole row disappears** — the merchant prices and collects. Flagged per the brief: this is the single row where Key Entry vs API-based changes the answer most. | L (Key Entry) / — (UCP) | Only under Key Entry |
-| **B6. Promo/coupon field presence** | `services/promo_terms.py` + `catalog_payment_incentives` (incl. `card_network`, `issuer_name`, `wallet_type` — a card-network-aware incentive model, unexpectedly relevant here). No per-domain coupon-field detection. | Codes + application order | UCP advertises `dev.ucp.shopping.discount` as a first-class capability on 66/70 domains — apply codes through the protocol, don't scrape a field. | S via UCP | No |
+| **B6. Promo/coupon field presence** | `services/promo_terms.py` + `catalog_payment_incentives` (incl. `card_network`, `issuer_name`, `wallet_type` — a card-network-aware incentive model, unexpectedly relevant here). No per-domain coupon-field detection. | Codes + application order | ~~UCP advertises `dev.ucp.shopping.discount` as a first-class capability on 66/70 domains — apply codes through the protocol, don't scrape a field.~~ **CORRECTED 2026-08-26 — this row was wrong twice over, in the same shape as B7.** (a) The `services/promo_terms.py` citation is a FALSE POSITIVE: that module is a denylist of marketing *words* (`"sale"`, `"coupon"`, `"20% off"`) used to keep promo noise out of generated query axes and the SKU attribute graph. It stores no codes and never has. `catalog_payment_incentives` has no code column either — it models card/wallet-linked benefits (`card_network`, `issuer_name`, `wallet_type`) applied at PAYMENT, which need no code. **No migration in this repo defines a discount/promo/coupon code column anywhere.** (b) "Apply codes through the protocol" is right about the vehicle and wrong about what it buys: UCP APPLIES codes you already hold, it cannot DISCOVER them — the merchant's own schema says *"Only prompt if customer mentions having a discount code."* Advertising the capability does not mean the merchant will tell you what its codes are, exactly as advertising `dev.ucp.shopping.fulfillment` did not mean a quote comes back before an address. | S via UCP | No |
 | **B7. Shipping + tax computable pre-checkout** | **Does not exist for crawled merchants.** A real landed-price engine *does* exist (`services/shopify_pricing_service.py` → `subtotal / discount_total / shipping_fee / tax / total` + `discount_evidence`), but it calls `POST /admin/api/{v}/checkouts.json` with `resolve_shopify_admin_access_token` — i.e. **it requires the merchant's OAuth token** and returns `"Shopify credentials missing"` for every crawled domain. | Landed total before handoff | ~~The capability exists but is bound to the wrong precondition. **UCP `create_checkout` returns the same numbers anonymously**~~ — **CORRECTED 2026-08-26, and this was the load-bearing error in this row.** UCP `create_checkout` does **NOT** return shipping or tax. The live schema has no `shipping_address` field: Shopify collects the delivery address on the **storefront**, so quotes are not produced at this step at all (`PIVOTA-Agent/src/services/ucpBuyerAgentClient.js:1017,1253`, live-verified against cosrx 2026-07-13). On the real path `total === subtotal`, `shipping_options` is `[]`, `tax` is `null`, and the checkout returns `requires_escalation` **every time**. `dev.ucp.shopping.fulfillment` being advertised says the capability exists; it does not mean a quote is returned before an address. **A landed total is therefore NOT obtainable anonymously before the buyer supplies an address** — not from UCP, and not from the storefront `.js` endpoint either. What UCP *does* give, and `.js` does not, is a merchant-asserted **pre-shipping subtotal that names its currency** (in MINOR units). That is worth having — it is what unlocks the price verification item 6 had to defer — but it is not the thing this row promised. | M | **Yes** |
 | **B8. TAP support signals** | **Does not exist**, and the repo says so plainly: `docs/TARGET_ARCHITECTURE.md` — "x402 / Visa TAP / Mastercard Agent Pay: **Not implemented anywhere.** No placeholder code pretends otherwise." | Detect + record | But the adjacent signal is live and strong: `/.well-known/ucp` on **66/70 (94.3%)** of top index domains, all advertising `checkout`, `cart`, `discount`, `fulfillment`, `order`, `catalog.search`, `catalog.lookup` over `https://{shop}.myshopify.com/api/ucp/mcp`. Store the profile + capability set per domain. | S | No |
 | **B9. Cart-prefill URL** | **Exists and is production-proven.** `services/outbound_links_service.py` builds `https://{host}/cart/{numeric_variant}:{qty}` with `attributes[pivota_click_id]` (survives into Shopify `note_attributes`). Separately the **warm-handoff lane** (`services/outbound_warm_handoff.py` + gateway `src/services/ucpWarmHandoff.js`) turns a crawled product into a **pre-built cart on the brand's own checkout** via anonymous UCP `create_cart`, returning `continue_url`. **`OUTBOUND_WARM_HANDOFF_ENABLED=true` in prod**, allowlisted to `cosrx.com, beautyofjoseon.com, skin1004.com, anua.us, medicube.us, mixsoon.us`. | Cart-prefill for the pilot cohort | The mechanism works. The gap is **reach** (6 brands of ~200) and **the numeric variant id**, which we hold for only 28% of rows (A6). | S (widen allowlist) | No |
@@ -328,10 +328,62 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 | # | Item | Effort | Where | Why |
 |---|---|---|---|---|
 | 9 | ~~**Landed total via UCP `create_checkout`**~~ → **RESCOPED 2026-08-26: a merchant-asserted PRE-SHIPPING SUBTOTAL, not a landed total** (see the correction in B7 — shipping and tax are not returned before an address). Gateway half **MERGED** (PIVOTA-Agent #2107): the priced preview the warm-handoff lane already computed is surfaced as `{subtotal_minor, currency, tax_minor, includes_shipping, includes_tax, requires_escalation}` — minor units, named in the key, exclusions stated rather than inferred. **Backend half NOT BUILT — the obvious vehicle does not work.** A first attempt reused `resolve_warm_handoff` and was measured 100% inert: that lane sends NO variant hint and *cannot* (`services/outbound_warm_handoff.py:457` — a prior review removed the read deliberately, because stamping a variant id into the token ctx cross-fills product↔variant grain in `surface_click_events`), so the gateway answered `no_variant_input` without a network call. Two further blockers stand behind that one: the click lane's 2000ms budget leaves ~46ms after a cart build, under the preview's 400ms floor, while the backend's own 2.5s `wait_for` caps any attempt to widen it — the two ceilings are mutually incompatible for a background price warm; and `toExecutionSpec` in PIVOTA-Agent is an allowlist that does not carry the new keys, so the payload would be dropped at the agent surface regardless. **A price warm needs its own gateway entry point taking `variant_id` as a top-level field, with its own budget — not the click lane.** | M | Request path, 3a subnet | **An agent still has nothing to abort a TOTAL against.** It can now abort on a subtotal mismatch, which catches the audit's 12.3% price-mismatch finding; shipping and tax remain unquotable pre-address by any anonymous source we have. |
-| 11 | **Promo/discount codes in the spec**, in application order, via `dev.ucp.shopping.discount`. | M | Request path | 43% of live PDPs are running a markdown; ignoring this systematically overquotes. |
+| 11 | ~~**Promo/discount codes in the spec**, in application order, via `dev.ucp.shopping.discount`.~~ → **NOT BUILDABLE AS SPECIFIED — verified live 2026-08-26. All three premises fail; see the note under this table before building anything here.** The remaining buildable work is a *request-contract* change (let a caller supply a code), not a spec-emission change. | M | Request path | ~~43% of live PDPs are running a markdown; ignoring this systematically overquotes.~~ **The motivation is FALSE: a markdown is already IN the price we read.** | 
 | 13 | **`p_complete` into ranking**: set `w_business > 0`, feed the B-profile prior, then swap in measured outcomes. | S + M | App code | Turns the outcome graph into ranking lift. |
 | 15 | **Bring the reco lane under ~3 s.** | M | App code | 7.65 s + verification is not a shippable turn. Note the migration already bought some of this for free — staging Cloud Run answered `/__catalog_health` in **1.8 s vs 5.8 s on Railway**; re-measure the reco lane post-cutover before optimising. |
 | 16 | **3C / electronics cohort seeding.** | M–L | Pipeline | The milestone names beauty *and* 3C; today the corpus is beauty-dominant. |
+
+#### Item 11 — why it is not buildable as written (live-verified 2026-08-26)
+
+Item 11 asked for three things. Probed against a live merchant before writing any code — the same
+discipline that should have been applied to B7 and to item 9's backend half — **one holds and two
+do not.**
+
+**1. The vehicle is REAL** ✅ — but it is not the capability the row named. There is no
+`dev.ucp.shopping.discount` *tool*. `tools/list` on `https://cosrx-renewal.myshopify.com/api/ucp/mcp`
+returns 13 tools and none is a discount operation; the field is a nested input,
+`checkout.discounts.codes: string[]`, carried on `create_checkout`, `update_checkout`, `create_cart`
+and `update_cart`. The storefront has a second, independent channel: a cart permalink accepts
+`?discount=CODE` and Shopify rewrites it to `discount_code=` on the checkout redirect **while
+preserving `attributes[pivota_click_id]`** — so a code and our attribution can ride the same link.
+Both channels verified live.
+
+**2. We have no codes to put in the spec** ❌ — and this is the blocker. There is **no discount-code
+inventory anywhere in this repo**: no migration defines a `discount_code` / `promo_code` /
+`coupon_code` column, `services/promo_terms.py` is a marketing-*word* denylist for query hygiene, and
+`catalog_payment_incentives` models card/wallet-linked benefits with no code column. Nor can the
+protocol supply them: UCP **applies** codes, it cannot **enumerate** them — the merchant's own schema
+says *"Only prompt if customer mentions having a discount code."* A code can therefore only come from
+the buyer, and **no card-rail request accepts one today.** (`discount_codes` does exist on
+`preview_quote` and on the order path — `routes/order_routes.py`, with `normalize_discount_codes`,
+quote→order drift detection and a `multiple_applicable_discount_codes` blocker — but that is the
+**credentialed PSP rail**, the same rail B7 found returns *"Shopify credentials missing"* for every
+crawled domain. None of it is reachable from the card rail.)
+
+**3. "In application order" is not expressible** ❌ — `codes` is an unordered array with REPLACE
+semantics (*"Replaces previously submitted codes. Send empty array to clear."*). Shopify decides
+combination by its own product/order/shipping class rules, not by array position, and the tools
+publish **no `outputSchema`**, so what actually applied is undeclared. Note the failure mode this
+invites: the storefront **silently ignores an invalid code** (verified — a bogus `TESTCODE123` was
+carried to checkout without error), so an implementation that echoes back "applied" because it sent a
+code would be fabricating a discount.
+
+**The stated motivation is also false.** "43% of live PDPs are running a markdown; ignoring this
+systematically overquotes" does not follow: on Shopify, `.js` `price` **is** the marked-down price and
+`compare_at_price` is the strikethrough reference. Verified end-to-end on cosrx — variant `price`
+4250, `compare_at_price` 5000, and the real cart returns `total_price` 4250 with `total_discount` 0
+and no cart-level discount applications. **Reading the PDP price already captures the markdown.** A
+markdown needs no code, so codes were never the fix for it. (Scope of evidence: one merchant verified
+PDP→cart plus the platform contract; a wider sample was attempted and abandoned when the sampled
+domains returned 429 — *cannot verify* is not evidence either way.)
+
+**What is actually left.** The only real gap is a **request-contract** change, not a spec-emission
+one: decide whether the card rail should accept a buyer-supplied code, and if so (a) add it to the
+card-rail request, (b) teach `ucpBuyerAgentClient` to send `checkout.discounts.codes` — it currently
+has no discount support at all, so a code handed to it today is silently dropped — and (c) report
+what the merchant said applied rather than what we sent. Note that both ends are missing: building
+either half alone is inert, which is precisely how item 9's backend half was lost. That is a product
+decision about the request contract, so it is **not** taken here.
 
 ### Explicitly deferred
 

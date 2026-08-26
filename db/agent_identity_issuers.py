@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_ALG_PATTERN = re.compile(r"^(?:RS|PS|ES)\d{3}$|^EdDSA$")
 DEFAULT_ALGS = ["RS256", "ES256"]
+DEFAULT_REQUIRED_SCOPES = ["pivota.checkout"]
 JWKS_FETCH_TIMEOUT_SECONDS = 5.0
 JWKS_OPAQUE_FAILURE = "JWKS could not be fetched as a usable key set (https, 2xx, {keys:[…]} with an RSA/EC/OKP key)"
 ASYMMETRIC_KTYS = {"RSA", "EC", "OKP"}
@@ -241,6 +242,14 @@ def normalize_registration(body: Dict[str, Any]) -> IssuerRegistration:
 
     authorized_party = _clean_str(body.get("authorized_party"), "authorized_party", required=False)
 
+    # Scope enforcement is fail-closed by default: without required_scopes, ANY token the issuer
+    # mints for the registered audience is checkout-grade identity (a plain session token, not a
+    # checkout grant). Opting out must be the explicit, named act below — an empty array alone is
+    # refused so a form serializing an empty multi-select can never silently disable the check.
+    allow_unscoped = body.get("allow_unscoped_tokens")
+    if allow_unscoped is not None and not isinstance(allow_unscoped, bool):
+        raise IssuerValidationError("allow_unscoped_tokens", "allow_unscoped_tokens must be a boolean")
+
     raw_scopes = body.get("required_scopes")
     required_scopes: Optional[List[str]] = None
     if raw_scopes is not None:
@@ -254,6 +263,24 @@ def normalize_registration(body: Dict[str, Any]) -> IssuerRegistration:
                 required_scopes.append(s.strip())
         if not required_scopes:
             required_scopes = None
+
+    if required_scopes:
+        if allow_unscoped is True:
+            raise IssuerValidationError(
+                "allow_unscoped_tokens",
+                "allow_unscoped_tokens cannot be combined with required_scopes; drop one",
+            )
+    elif allow_unscoped is True:
+        required_scopes = None
+    elif raw_scopes is None:
+        # Omitted (or JSON null) → the default. IdPs that cannot mint a scope claim (e.g. plain
+        # OIDC ID tokens) must opt out explicitly with allow_unscoped_tokens: true.
+        required_scopes = list(DEFAULT_REQUIRED_SCOPES)
+    else:
+        raise IssuerValidationError(
+            "required_scopes",
+            "an empty required_scopes disables scope checks; set allow_unscoped_tokens: true to confirm, or provide scopes",
+        )
 
     return IssuerRegistration(
         issuer=issuer, jwks_uri=jwks_uri, audience=audience, algs=algs,
@@ -295,6 +322,7 @@ async def dereference_jwks(jwks_uri: str) -> Dict[str, Any]:
 
 def _row_to_public(row: Any) -> Dict[str, Any]:
     d = dict(row)
+    required_scopes = _as_list(d.get("required_scopes")) or None
     return {
         "id": d.get("id"),
         "agent_id": d.get("agent_id"),
@@ -303,7 +331,10 @@ def _row_to_public(row: Any) -> Dict[str, Any]:
         "audience": d.get("audience"),
         "algs": _as_list(d.get("algs")),
         "authorized_party": d.get("authorized_party"),
-        "required_scopes": _as_list(d.get("required_scopes")) or None,
+        "required_scopes": required_scopes,
+        # A binding with no scope check accepts ANY of the issuer's tokens for the audience;
+        # surface that loudly rather than leaving a null to be read as "default applies".
+        "unscoped_tokens_allowed": required_scopes is None,
         "status": d.get("status"),
         "last_jwks_ok_at": d.get("last_jwks_ok_at"),
         "created_at": d.get("created_at"),

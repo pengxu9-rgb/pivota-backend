@@ -242,8 +242,10 @@ def test_registration_happy_path_dereferences_then_upserts(monkeypatch):
 
     async def upsert(agent_id, reg, *, jwks_ok):
         assert agent_id == "agent_minds" and jwks_ok is True
+        # Scope enforcement defaults ON when the registration omits required_scopes.
+        assert reg.required_scopes == ["pivota.checkout"]
         return {"id": 1, "agent_id": agent_id, "issuer": reg.issuer, "jwks_uri": reg.jwks_uri, "audience": reg.audience,
-                "algs": reg.algs, "authorized_party": None, "required_scopes": None, "status": "active",
+                "algs": reg.algs, "authorized_party": None, "required_scopes": reg.required_scopes, "status": "active",
                 "last_jwks_ok_at": None, "created_at": None, "updated_at": None}
 
     monkeypatch.setattr(store, "find_active_owner", no_owner)
@@ -254,6 +256,90 @@ def test_registration_happy_path_dereferences_then_upserts(monkeypatch):
     assert resp.status_code == 200, resp.text
     assert calls["deref"] == 1
     assert resp.json()["issuer"]["algs"] == ["RS256", "ES256"]
+    assert resp.json()["issuer"]["required_scopes"] == ["pivota.checkout"]
+
+
+# ── 3b: required_scopes defaults fail-closed ──────────────────────────────────
+
+def test_required_scopes_default_and_explicit_values(monkeypatch):
+    import db.agent_identity_issuers as store
+
+    monkeypatch.setattr(store, "host_resolves_public_only", lambda host: True)
+    base = {"issuer": "https://idp.example", "jwks_uri": "https://idp.example/jwks", "audience": "p"}
+
+    # Omitted and explicit null both take the default — neither is a conscious opt-out.
+    assert store.normalize_registration(dict(base)).required_scopes == ["pivota.checkout"]
+    assert store.normalize_registration({**base, "required_scopes": None}).required_scopes == ["pivota.checkout"]
+    # Explicit scopes are preserved (deduped, stripped), NOT merged with the default.
+    assert store.normalize_registration({**base, "required_scopes": ["a.b", " a.b ", "c"]}).required_scopes == ["a.b", "c"]
+    # The explicit opt-out stores no scope check at all.
+    assert store.normalize_registration({**base, "allow_unscoped_tokens": True}).required_scopes is None
+    assert store.normalize_registration({**base, "allow_unscoped_tokens": True, "required_scopes": []}).required_scopes is None
+    # allow_unscoped_tokens: false behaves like the flag being absent.
+    assert store.normalize_registration({**base, "allow_unscoped_tokens": False}).required_scopes == ["pivota.checkout"]
+
+
+def test_required_scopes_refusals_name_the_field(monkeypatch):
+    import db.agent_identity_issuers as store
+
+    monkeypatch.setattr(store, "host_resolves_public_only", lambda host: True)
+    base = {"issuer": "https://idp.example", "jwks_uri": "https://idp.example/jwks", "audience": "p"}
+    cases = [
+        # An empty array alone must not silently disable the check (empty multi-select hazard).
+        ({**base, "required_scopes": []}, "required_scopes"),
+        ({**base, "required_scopes": ["  "]}, "required_scopes"),
+        # Opting out while also requiring scopes is a contradiction, not a merge.
+        ({**base, "allow_unscoped_tokens": True, "required_scopes": ["pivota.checkout"]}, "allow_unscoped_tokens"),
+        ({**base, "allow_unscoped_tokens": "true"}, "allow_unscoped_tokens"),
+    ]
+    for body, field in cases:
+        with pytest.raises(store.IssuerValidationError) as ei:
+            store.normalize_registration(body)
+        assert ei.value.field == field, body
+
+
+def test_registration_route_empty_scopes_is_422_and_opt_out_stores_none(monkeypatch):
+    client, module = _portal_client(monkeypatch)
+    import db.agent_identity_issuers as store
+
+    stored = []
+
+    async def no_owner(_iss):
+        return None
+
+    async def ok_jwks(_uri):
+        return {"keys": [{"kty": "RSA", "kid": "a"}]}
+
+    async def upsert(agent_id, reg, *, jwks_ok):
+        stored.append(reg.required_scopes)
+        return {"id": 1, "agent_id": agent_id, "issuer": reg.issuer, "jwks_uri": reg.jwks_uri, "audience": reg.audience,
+                "algs": reg.algs, "authorized_party": None, "required_scopes": reg.required_scopes, "status": "active",
+                "last_jwks_ok_at": None, "created_at": None, "updated_at": None}
+
+    monkeypatch.setattr(store, "find_active_owner", no_owner)
+    monkeypatch.setattr(store, "dereference_jwks", ok_jwks)
+    monkeypatch.setattr(store, "upsert_issuer", upsert)
+
+    base = {"issuer": "https://id.minds.example", "jwks_uri": "https://id.minds.example/jwks", "audience": "p"}
+    resp = client.put("/agents/agent_minds/identity-issuers", json={**base, "required_scopes": []})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["field"] == "required_scopes"
+    assert stored == []
+
+    resp = client.put("/agents/agent_minds/identity-issuers", json={**base, "allow_unscoped_tokens": True})
+    assert resp.status_code == 200, resp.text
+    assert stored == [None]
+
+
+def test_row_to_public_surfaces_unscoped_bindings():
+    import db.agent_identity_issuers as store
+
+    scoped = store._row_to_public({"required_scopes": ["pivota.checkout"]})
+    assert scoped["required_scopes"] == ["pivota.checkout"]
+    assert scoped["unscoped_tokens_allowed"] is False
+    unscoped = store._row_to_public({"required_scopes": None})
+    assert unscoped["required_scopes"] is None
+    assert unscoped["unscoped_tokens_allowed"] is True
 
 
 # ── 4: internal registry ──────────────────────────────────────────────────────

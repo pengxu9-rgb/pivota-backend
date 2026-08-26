@@ -41,7 +41,11 @@ class IssuerRegistrationBody(BaseModel):
     audience: str
     algs: Optional[List[str]] = None
     authorized_party: Optional[str] = None
+    # Omitted → defaults to DEFAULT_REQUIRED_SCOPES (pivota.checkout). Disabling the scope check
+    # requires the explicit allow_unscoped_tokens opt-out (for IdPs that cannot mint a scope
+    # claim, e.g. plain OIDC ID tokens); an empty array alone is refused.
     required_scopes: Optional[List[str]] = None
+    allow_unscoped_tokens: Optional[bool] = None
 
 
 def _require_owner_or_admin(current_user: Dict[str, Any], agent_id: str) -> None:
@@ -80,6 +84,8 @@ async def list_identity_issuers(agent_id: str, current_user: dict = Depends(get_
                 "alg": "one of the registered algs (asymmetric)",
                 "claims": ["iss", "sub", "aud", "exp", "iat"],
                 "kid": "present and resolvable in the registered JWKS",
+                "scope": "must include every registered required scope (default: pivota.checkout; "
+                         "absent only for bindings registered with allow_unscoped_tokens)",
             },
         },
     }
