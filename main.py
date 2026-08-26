@@ -28,7 +28,7 @@ from middleware.error_handler import ErrorHandlerMiddleware
 from middleware.ap2_security import AP2SecurityMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # Database
 from db.database import database, metadata, engine
@@ -429,7 +429,8 @@ app = FastAPI(
     # The built-ins are OFF so the same three paths can be re-mounted below behind a guard. They
     # are not removed: /openapi.json is the full internal path list - 1,019 of them as measured on
     # 2026-08-22 - and serving that anonymously hands an attacker the map. The curated,
-    # partner-facing spec is a different surface and stays public at /agent/docs/openapi.json.
+    # partner-facing spec is a different surface and stays public at /agent/docs/openapi.json;
+    # anonymous GET /openapi.json redirects there rather than 404ing (it is the published URL).
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -709,10 +710,8 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 
-async def require_docs_viewer(
-    x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
-) -> None:
-    """Gate /docs, /redoc and /openapi.json in production; leave them open elsewhere.
+def docs_viewer_allowed(x_admin_key: Optional[str]) -> bool:
+    """Whether this caller may read the FULL internal spec; True everywhere outside production.
 
     The spec is the full internal route list. Anonymously readable, it is a map of every path an
     attacker might probe, which is worth more to them than any single one of those paths.
@@ -737,17 +736,13 @@ async def require_docs_viewer(
     an empty header.
     """
     if not is_production():
-        return
+        return True
     expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
     supplied = (x_admin_key or "").strip()
-    if expected and supplied and hmac.compare_digest(
+    return bool(expected and supplied and hmac.compare_digest(
         supplied.encode("utf-8", "surrogateescape"),
         expected.encode("utf-8", "surrogateescape"),
-    ):
-        return
-    # 404, not 401. A 401 confirms the endpoint exists and is merely guarded, which re-leaks the
-    # fact worth hiding; anonymous callers should see what they would see if it were not mounted.
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    ))
 
 
 async def require_docs_ui_enabled() -> None:
@@ -773,12 +768,21 @@ _DOC_ROUTE_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
     "/openapi.json",
     methods=_DOC_ROUTE_METHODS,
     include_in_schema=False,
-    dependencies=[Depends(require_docs_viewer)],
 )
-async def _guarded_openapi_spec(request: Request) -> JSONResponse:
+async def _guarded_openapi_spec(request: Request) -> Response:
     if request.method not in ("GET", "HEAD"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
-    return JSONResponse(app.openapi())
+    if docs_viewer_allowed(request.headers.get("X-ADMIN-KEY")):
+        return JSONResponse(app.openapi())
+    # Everyone else is sent to the CURATED partner spec, which is public by design. /openapi.json
+    # is the URL the marketing site publishes and the conventional path agents probe first; a 404
+    # here read as "no public spec" when /agent/docs/openapi.json has been public all along. The
+    # redirect must be byte-identical for a missing, empty, and wrong key - any difference is an
+    # oracle for whether an admin key is mounted.
+    return RedirectResponse(
+        url="/agent/docs/openapi.json",
+        status_code=status.HTTP_308_PERMANENT_REDIRECT,
+    )
 
 
 @app.api_route(
@@ -2332,14 +2336,28 @@ async def build_info():
 @app.get("/robots.txt", include_in_schema=False)
 async def robots_txt():
     """
-    Serve an explicit robots.txt. This is an API host with no indexable
-    content, so disallow all crawling. Without this, GET /robots.txt would 404
-    (which crawlers tolerate), but a real disallow-all response is cleaner and
-    stops crawlers from probing further. See cors_preflight_passthrough for why
-    we no longer 405 on unknown paths.
+    Serve an explicit robots.txt. Most of this host is keyed API surface with no
+    indexable content, so crawling stays disallowed - EXCEPT the discovery surface
+    this host deliberately publishes anonymously: the curated partner docs and
+    OpenAPI spec under /agent/docs/, the /openapi.json alias that redirects there,
+    and the OAuth/JWKS metadata under /.well-known/. The old blanket Disallow made
+    robots-respecting agent fetchers (Claude, GPTBot, Perplexity) refuse to read
+    the exact artifacts the marketing site advertises as proof the surface is
+    agent-readable. Keyed SDK clients never consult robots.txt, so nothing here
+    affects real integrations either way.
+
+    Allow lines come FIRST: Google resolves by longest-match (Allow wins), but
+    Python's urllib.robotparser is first-match-in-order - this ordering satisfies
+    both. See cors_preflight_passthrough for why unknown paths 404, not 405.
     """
     return Response(
-        content="User-agent: *\nDisallow: /\n",
+        content=(
+            "User-agent: *\n"
+            "Allow: /agent/docs/\n"
+            "Allow: /openapi.json\n"
+            "Allow: /.well-known/\n"
+            "Disallow: /\n"
+        ),
         media_type="text/plain",
     )
 
