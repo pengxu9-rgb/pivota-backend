@@ -25,6 +25,16 @@ import httpx
 
 from utils.logger import logger
 
+
+class MerchantQuoteError(ValueError):
+    """A quote could not be resolved. `caller_fault` decides the route's 4xx-vs-502 split —
+    typed here so the route never string-matches an error message (that mapping broke the
+    moment anyone reworded an error)."""
+
+    def __init__(self, message: str, *, caller_fault: bool = False):
+        super().__init__(message)
+        self.caller_fault = caller_fault
+
 _QUOTE_TIMEOUT_SECONDS = 12.0
 
 # Hostname allowed to receive our server-side quote request. merchant_domain is CALLER INPUT and
@@ -33,6 +43,11 @@ _QUOTE_TIMEOUT_SECONDS = 12.0
 # caller controls nothing but the host label.
 _DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$")
 _FORBIDDEN_SUFFIXES = (".local", ".internal", ".localhost", ".lan", ".home.arpa")
+
+# Hard ceiling on a derived cap, in minor units (10^15 ≈ $10T). Not a plausibility judgment —
+# a bound that keeps a hostile or broken merchant total inside BIGINT so it surfaces as a clean
+# refusal instead of a Postgres 22003 overflow raised as a 500.
+_MAX_CAP_MINOR = 10 ** 15
 
 # Currencies whose minor unit IS the major unit. When a merchant returns a decimal string
 # ("23.00") instead of integer minor units, the exponent decides the conversion.
@@ -60,6 +75,37 @@ def validate_merchant_domain(domain: str) -> Optional[str]:
     return d
 
 
+def resolves_only_public(domain: str) -> bool:
+    """Resolve the host and refuse if ANY answer is non-public.
+
+    This closes both bypass classes the review demonstrated with one mechanism: exotic IPv4
+    literals the regex passes but getaddrinfo still parses (0x7f.0.0.1, 127.1), and public DNS
+    names whose A record points inside (localtest.me, *.nip.io, an attacker's own zone). ANY
+    non-public answer disqualifies — a name that round-robins one public and one private
+    address is exactly the rebinding shape this exists to refuse. TOCTOU residual (re-resolve
+    between check and connect) is accepted for now: scheme and path are pinned and the request
+    carries no credentials, so the remaining exposure is a blind probe; pinning the checked IP
+    for the actual connection is the follow-up if this rail's threat model hardens.
+    """
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False  # unresolvable is unfetchable — refuse
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        return False
+    for raw in addresses:
+        try:
+            ip = ipaddress.ip_address(raw.split("%")[0])
+        except ValueError:
+            return False
+        if not ip.is_global or ip.is_multicast:
+            return False
+    return True
+
+
 def to_minor_units(amount: Any, currency: str) -> Optional[int]:
     """Normalize a merchant-reported amount to integer minor units.
 
@@ -71,7 +117,7 @@ def to_minor_units(amount: Any, currency: str) -> Optional[int]:
     if isinstance(amount, bool):
         return None
     if isinstance(amount, int):
-        return amount if amount > 0 else None
+        return amount if 0 < amount <= _MAX_CAP_MINOR else None
     if isinstance(amount, float):
         amount = f"{amount:.6f}"
     if isinstance(amount, str):
@@ -87,8 +133,14 @@ def to_minor_units(amount: Any, currency: str) -> Optional[int]:
         if d <= 0:
             return None
         exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
-        minor = (d * (10 ** exponent)).to_integral_value()
-        return int(minor) if int(minor) > 0 else None
+        # ROUND_CEILING, not the Decimal default (banker's): this number becomes a spending CAP.
+        # Rounding a half-cent DOWN mints a card the merchant's real charge then declines;
+        # rounding up mints at most one extra minor unit of headroom. For a cap, up is safe.
+        from decimal import ROUND_CEILING
+
+        minor = (d * (10 ** exponent)).to_integral_value(rounding=ROUND_CEILING)
+        value = int(minor)
+        return value if 0 < value <= _MAX_CAP_MINOR else None
     return None
 
 
@@ -114,14 +166,20 @@ def _pick_total(payload: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
 async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict[str, Any]:
     """Fetch the checkout's landed total from the merchant's own UCP door.
 
-    Raises ValueError with a caller-safe message on anything that prevents deriving a cap; the
+    Raises MerchantQuoteError with a caller-safe message on anything that prevents deriving a cap; the
     route maps that to a 4xx/502. Deliberately get_checkout, not create_checkout: minting must
     price the cart the agent actually built, not a fresh one-item cart that would quietly drop
     quantities and multi-line carts from the cap.
     """
     domain = validate_merchant_domain(merchant_domain)
     if not domain:
-        raise ValueError("merchant_domain is not a fetchable public hostname")
+        raise MerchantQuoteError(
+            "merchant_domain is not a fetchable public hostname", caller_fault=True
+        )
+    if not resolves_only_public(domain):
+        raise MerchantQuoteError(
+            "merchant_domain does not resolve to a public address", caller_fault=True
+        )
     body = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -134,13 +192,13 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
             resp = await client.post(url, json=body)
     except httpx.HTTPError as err:
         logger.warning(f"card-rail quote fetch failed domain={domain}: {type(err).__name__}")
-        raise ValueError("merchant quote endpoint unreachable") from err
+        raise MerchantQuoteError("merchant quote endpoint unreachable") from err
     if resp.status_code >= 300:
-        raise ValueError(f"merchant quote endpoint returned HTTP {resp.status_code}")
+        raise MerchantQuoteError(f"merchant quote endpoint returned HTTP {resp.status_code}")
     try:
         rpc = resp.json()
     except Exception as err:
-        raise ValueError("merchant quote response was not JSON") from err
+        raise MerchantQuoteError("merchant quote response was not JSON") from err
 
     result = rpc.get("result") if isinstance(rpc, dict) else None
     payload: Optional[Dict[str, Any]] = None
@@ -160,14 +218,14 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
                             payload = parsed
                             break
     if payload is None:
-        raise ValueError("merchant quote response carried no checkout payload")
+        raise MerchantQuoteError("merchant quote response carried no checkout payload")
 
     raw_total, currency = _pick_total(payload)
     if raw_total is None or not currency:
-        raise ValueError("merchant quote carried no landed total or no currency")
+        raise MerchantQuoteError("merchant quote carried no landed total or no currency")
     total_minor = to_minor_units(raw_total, currency)
     if total_minor is None:
-        raise ValueError("merchant quote total was not a positive amount")
+        raise MerchantQuoteError("merchant quote total was not a positive amount")
     return {
         "total_minor": total_minor,
         "currency": currency,

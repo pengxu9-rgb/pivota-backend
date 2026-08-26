@@ -1,10 +1,13 @@
 """Persistence for `agent_issued_cards` — one row per minted (or refused) card instrument.
 
-The caps are enforced HERE, in one guarded INSERT, not by a check-then-insert in the service:
-two concurrent mints that each read "4 outstanding of 5" and both insert is exactly the race a
-spending cap exists to prevent. A single statement whose WHERE clause re-counts inside the
-INSERT makes the database the arbiter; the caller learns "minted or refused" from whether a row
-came back.
+The caps are enforced HERE, under a per-agent advisory lock, in one guarded INSERT. The
+single-statement form alone is NOT race-free — review of this PR proved it empirically: at READ
+COMMITTED, two concurrent INSERT..SELECTs each snapshot the COUNT before either commits, and
+both insert, breaching the cap by one (by N-1 at concurrency N). So the guard runs inside a
+transaction that first takes pg_advisory_xact_lock keyed on the agent: mints for ONE agent
+serialize (different agents stay concurrent), the lock releases at commit/rollback, and the
+re-count inside the INSERT then really is the arbiter. The caller learns "minted or refused"
+from whether a row came back.
 """
 
 from __future__ import annotations
@@ -55,7 +58,14 @@ async def create_card_guarded(params: Dict[str, Any]) -> Optional[str]:
     every non-failed row counts, including revoked/expired ones minted today: the daily cap is a
     bound on how much spending power an agent can CREATE in a day, not on what survived.
     """
-    row = await database.fetch_one(_INSERT_GUARDED_SQL, params)
+    async with database.transaction():
+        # hashtext is int4; the bigint overload of pg_advisory_xact_lock needs the cast. The
+        # text CAST is the dialect-gate rule: this bind must not be typed two ways.
+        await database.execute(
+            "SELECT pg_advisory_xact_lock(CAST(hashtext(CAST(:agent_id AS text)) AS bigint))",
+            {"agent_id": params["agent_id"]},
+        )
+        row = await database.fetch_one(_INSERT_GUARDED_SQL, params)
     return row["card_id"] if row else None
 
 

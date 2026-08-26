@@ -15,7 +15,12 @@ from fastapi.testclient import TestClient
 
 from main import app
 from routes.agent_auth import get_agent_context
-from services.agent_card_issuance import to_minor_units, validate_merchant_domain
+from services.agent_card_issuance import (
+    MerchantQuoteError,
+    resolves_only_public,
+    to_minor_units,
+    validate_merchant_domain,
+)
 from services.card_issuers import CardIssuerError, IssuedCard
 
 # 422s leave the app as 400 (middleware/error_handler.py) — house convention.
@@ -48,7 +53,9 @@ def rig(monkeypatch: pytest.MonkeyPatch):
     import routes.agent_cards as mod
 
     state: Dict[str, Any] = {
-        "quote": {"total_minor": 2300, "currency": "USD", "quote_snapshot": {"totals": []}},
+        # 2317 is deliberately odd and appears nowhere else: a mutant hardcoding the cap,
+        # doubling it, or reading it from anything but the quote cannot echo it by accident.
+        "quote": {"total_minor": 2317, "currency": "USD", "quote_snapshot": {"totals": []}},
         "issuer": _Issuer(),
         "creates": [],
         "created_id": "will-be-set",
@@ -130,6 +137,21 @@ def test_disabled_rail_returns_503(rig, monkeypatch):
     assert state["creates"] == []
 
 
+def test_misconfigured_issuer_is_503_not_500(rig, monkeypatch):
+    """Review F1: ReapIssuer/MockIssuer __init__ RAISE on bad config; that must present
+    exactly like no issuer at all, not escape as a 500."""
+    client, state = rig
+    import routes.agent_cards as mod
+
+    def raising_resolver():
+        raise CardIssuerError("REAP_UNCONFIGURED", "missing keys")
+
+    monkeypatch.setattr(mod, "resolve_issuer", raising_resolver)
+    r = _post(client)
+    assert r.status_code == 503
+    assert state["creates"] == []
+
+
 def test_no_issuer_configured_returns_503(rig, monkeypatch):
     client, state = rig
     import routes.agent_cards as mod
@@ -159,10 +181,11 @@ def test_cap_equals_merchant_quote_exactly(rig):
     p = state["creates"][-1]
     # Mutants killed: cap from anywhere but the quote; a *100 in the conversion path; a
     # headroom multiplier smuggled into v1.
-    assert p["amount_cap_minor"] == 2300
-    assert p["quote_total_minor"] == 2300
+    assert p["amount_cap_minor"] == 2317
+    assert p["quote_total_minor"] == 2317
     assert p["currency"] == "USD"
-    assert r.json()["card"]["amount_cap"] == {"amount_minor": 2300, "currency": "USD"}
+    assert p["single_use"] is True  # mutant: flipping the INSERT param while IssueRequest stays True
+    assert r.json()["card"]["amount_cap"] == {"amount_minor": 2317, "currency": "USD"}
 
 
 def test_agent_id_stamped_from_token(rig):
@@ -175,7 +198,7 @@ def test_issuer_receives_the_same_constraints(rig):
     client, state = rig
     _post(client)
     req = state["issuer"].requests[-1]
-    assert req.amount_cap_minor == 2300
+    assert req.amount_cap_minor == 2317
     assert req.currency == "USD"
     assert req.merchant_domain == "shop.example.com"
     assert req.single_use is True
@@ -202,11 +225,13 @@ def test_issuer_failure_marks_row_failed_and_502(rig):
     assert state["issued"] == []
 
 
-def test_unreachable_merchant_is_502_bad_hostname_is_4xx(rig):
+def test_quote_error_maps_by_fault_flag_not_message(rig):
     client, state = rig
-    state["quote"] = ValueError("merchant quote endpoint unreachable")
+    # The flag decides, not the wording — the messages here are deliberately swapped relative
+    # to what production raises, so a revival of substring matching fails loudly.
+    state["quote"] = MerchantQuoteError("anything at all", caller_fault=False)
     assert _post(client).status_code == 502
-    state["quote"] = ValueError("merchant_domain is not a fetchable public hostname")
+    state["quote"] = MerchantQuoteError("also anything", caller_fault=True)
     assert _post(client).status_code == INVALID
 
 
@@ -240,11 +265,49 @@ def test_hostname_guard_accepts_and_normalizes():
     assert validate_merchant_domain("Shop.Example.COM.") == "shop.example.com"
 
 
+def _fake_getaddrinfo(answers):
+    def fake(host, port, **kw):
+        return [(2, 1, 6, "", (a, 443)) for a in answers]
+
+    return fake
+
+
+@pytest.mark.parametrize("answers,ok", [
+    (["93.184.216.34"], True),                      # plain public
+    (["127.0.0.1"], False),                          # 0x7f.0.0.1 / 127.1 / localtest.me all land here
+    (["10.1.2.3"], False),
+    (["169.254.169.254"], False),                    # link-local metadata
+    (["93.184.216.34", "192.168.1.1"], False),       # rebinding round-robin: ANY private answer refuses
+    (["fd00::1"], False),
+    ([], False),
+])
+def test_resolves_only_public(monkeypatch, answers, ok):
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo(answers))
+    assert resolves_only_public("whatever.example.com") is ok
+
+
+def test_unresolvable_hostname_is_refused(monkeypatch):
+    import socket
+
+    def boom(host, port, **kw):
+        raise socket.gaierror("nope")
+
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+    assert resolves_only_public("whatever.example.com") is False
+
+
 @pytest.mark.parametrize("amount,currency,expected", [
     (2300, "USD", 2300),        # live-verified wire shape: already minor units — passthrough
     ("23.00", "USD", 2300),     # decimal string: convert by exponent
     ("23.00", "JPY", 23),       # zero-decimal currency
     (2300, "JPY", 2300),
+    ("23.005", "USD", 2301),    # ROUND_CEILING: a cap rounds UP — down would decline the real charge
+    ("23.004", "USD", 2301),
+    (10**15, "USD", 10**15),    # at the ceiling: allowed
+    (10**15 + 1, "USD", None),  # beyond: refused, never a BIGINT overflow 500
+    ("1e20", "USD", None),
     ("0", "USD", None),
     (-5, "USD", None),
     (0, "USD", None),

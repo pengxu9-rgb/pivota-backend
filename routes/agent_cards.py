@@ -31,6 +31,7 @@ from db.agent_issued_cards import (
 )
 from routes.agent_auth import AgentContext, get_agent_context
 from services.agent_card_issuance import (
+    MerchantQuoteError,
     card_expiry,
     is_enabled,
     issuance_policy,
@@ -75,17 +76,23 @@ async def issue_card(
         # not conclude it is talking to the wrong host.
         raise HTTPException(status_code=503, detail="card issuance is not enabled")
 
-    issuer = resolve_issuer()
+    try:
+        issuer = resolve_issuer()
+    except CardIssuerError:
+        # A MISCONFIGURED issuer (reap without keys, mock in production) must present exactly
+        # like an absent one: 503, rail unavailable. Letting the constructor's raise escape
+        # turned fail-closed into a 500 — the review's F1.
+        issuer = None
     if issuer is None:
         raise HTTPException(status_code=503, detail="no card issuer is configured")
 
     try:
         quote = await resolve_merchant_quote(body.merchant_domain, body.checkout_id)
-    except ValueError as err:
+    except MerchantQuoteError as err:
         # The distinction the caller needs: their input was bad (422->400 house mapping) vs the
-        # merchant was unreachable (502). "not a fetchable public hostname" is the former.
-        status = 422 if "hostname" in str(err) else 502
-        raise HTTPException(status_code=status, detail=str(err))
+        # merchant was unreachable (502). The exception carries the verdict — no string
+        # matching on messages.
+        raise HTTPException(status_code=422 if err.caller_fault else 502, detail=str(err))
 
     policy = issuance_policy()
     card_id = mint_card_id()
