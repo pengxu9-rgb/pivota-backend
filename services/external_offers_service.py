@@ -1200,6 +1200,19 @@ def _extract_long_description_from_html(html: str) -> Optional[str]:
     return None
 
 
+def _mark_from_cache(observed: Optional[Dict[str, Any]]) -> None:
+    """Record that the snapshot being returned came from the CACHE, not from this request.
+
+    `observed` is an out-parameter, and its `status_code` says only that a response arrived —
+    not that the snapshot the caller receives was built from it. Anything that needs to know
+    "did we actually re-read this page" (a freshness stamp, a gate that clears a serving
+    blocker) must consult this, because a post-response failure leaves `status_code` set and
+    still hands back the previous row.
+    """
+    if observed is not None:
+        observed["from_cache"] = True
+
+
 class ExternalOfferUnavailable(RuntimeError):
     """The ORIGIN answered, and its answer was "not here".
 
@@ -1607,14 +1620,24 @@ async def resolve_external_offer(
         if raise_on_unavailable:
             raise
         if existing:
+            _mark_from_cache(observed)
             return _row_to_snapshot(existing)
         raise
     except Exception:
         if existing:
+            # A CACHED ROW IS NOT A READING, AND `observed` CANNOT SHOW THAT ON ITS OWN.
+            # `_fetch_html` stamps `observed["status_code"]` BEFORE it returns, so every
+            # failure AFTER the response — the extractor, the snapshot upsert, the post-write
+            # re-read — lands here with `observed` already populated and the CACHED snapshot
+            # going back to the caller. A caller checking only `status_code` would conclude it
+            # had just re-read a page it never parsed. Say so explicitly instead.
+            _mark_from_cache(observed)
             return _row_to_snapshot(existing)
         raise
 
-    # Fallback: should never happen, but keep function total.
+    # Fallback: should never happen, but keep function total. Same reasoning as above: the
+    # post-write re-read returning None reaches here with a populated `observed`.
     if existing:
+        _mark_from_cache(observed)
         return _row_to_snapshot(existing)
     raise ValueError("FETCH_FAILED")

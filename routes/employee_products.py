@@ -4425,6 +4425,15 @@ def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
     return bool(a) and a == b
 
 
+# A price reading that we actually STORED. `unavailable` means we read no price at all, and
+# each `skipped_*` means we read something and REFUSED it (a 0-price broken-offer shape, an
+# amount with no currency, a currency that disagrees with the stored one). In every refused
+# case the row keeps its PREVIOUS amount, so the number we quote was not re-read and must not
+# be described as freshly extracted. `unchanged` counts: we read the page and it still says
+# what we store.
+_PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE = frozenset({"applied", "filled", "unchanged"})
+
+
 async def _stamp_crawl_attempt(seed_id: str) -> None:
     """Record that we TRIED to re-read this seed, whatever the outcome.
 
@@ -4550,7 +4559,13 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
-            "refreshed_at": _to_iso(getattr(snapshot, "fetched_at", None)) or None,
+            # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
+            # (..., last_checked_at, evidence, override_*) -- so this getattr has always
+            # returned None and this key has always been written as null. Nothing read it,
+            # which is why it went unnoticed; `extracted_at` below is the field the
+            # `stale_snapshot` gate actually reads. Use the real field, falling back to now.
+            "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+            or _to_iso(datetime.now(timezone.utc)),
         }
     )
     # Only overwrite curated fields if they are missing.
@@ -4748,9 +4763,57 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     # anything actually left the process -- and `_same_destination` is the only proof it went
     # to the URL we serve rather than a legacy `destination_url` we do not.
     served_url = destination_liveness.destination_of(row)
-    reached_served_origin = observed.get("status_code") is not None and _same_destination(
-        dest, served_url
+    # ONE CLASSIFICATION, read three times: the freshness stamp, the staleness gate, and the
+    # liveness verdict below all derive from THIS. `classify_destination` is pure, so hoisting
+    # it costs nothing and removes the twin-implementation drift this file keeps paying for.
+    #
+    # `status_code is not None` ALONE IS NOT A READING, and three separate cases prove it:
+    #   * `from_cache` -- `_fetch_html` stamps `observed` BEFORE returning, so a failure after
+    #     the response (extractor, snapshot upsert, post-write re-read) hands back the CACHED
+    #     row with `status_code` set. `resolve_external_offer` now says so explicitly.
+    #   * `final_url` -- a 301 onto a collection, or onto a DIFFERENT product handle, answers
+    #     200 for a page that is not the one we serve. Only the verdict looks at where the
+    #     request ended; `_same_destination` compares two STORED urls and cannot see it.
+    #   * `bot_challenged` -- a cf-mitigated 200 is `unverifiable`, and the liveness writer
+    #     already refuses to stamp `destination_checked_at` for it. Anything claiming parity
+    #     with that column has to refuse for the same reason.
+    served_url = destination_liveness.destination_of(row)
+    observation = None
+    if observed.get("status_code") is not None and _same_destination(dest, served_url):
+        observation = destination_liveness.classify_destination(
+            requested_url=dest,
+            status_code=int(observed["status_code"]),
+            final_url=observed.get("final_url"),
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+    read_the_served_product = (
+        observation is not None
+        and observation.verdict == destination_liveness.VERDICT_LIVE
+        and not observed.get("from_cache")
     )
+
+    # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
+    #
+    # `stale_snapshot` (services/external_referral_readiness) is raised when the CONTENT is
+    # older than EXTERNAL_REFERRAL_STALE_DAYS, it is marked `auto_fixable: True`, and its
+    # `recommended_action` is literally "Refresh the seed snapshot". It reads
+    # `snapshot.extracted_at` via `get_content_extracted_at`, which has NO fallback by
+    # design -- and until now this function wrote only `snapshot.refreshed_at`. So the gate
+    # recommended an action that could not clear it, and `auto_fixable` was untrue: a seed
+    # could be refreshed successfully every night and stay blocked forever.
+    #
+    # GATED TWICE, because the failure mode of getting this wrong is the one this whole lane
+    # exists to prevent -- a stale price presented as freshly verified:
+    #   * `reached_served_origin` -- a cached-snapshot fallback (timeout, TLS, robots) runs
+    #     this same success path without contacting anyone, and must never clear a blocker;
+    #   * the price status -- we only claim an extraction when the amount we now STORE came
+    #     off the page. Refusing to write a reading and then calling the row fresh would
+    #     vouch for the previous price.
+    # A row we can never read a price from therefore stays blocked, which is the correct
+    # direction to be wrong in: it withholds a row rather than quoting a number we did not
+    # re-read.
+    if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+        seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
 
     await _execute_seed_data_stmt(
         """
@@ -4775,14 +4838,14 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             -- stamped fresh on every run and sorted to the BACK of the queue permanently,
             -- which is the starvation this column exists to remove, wearing a new hat.
             last_crawled_at = CASE
-                WHEN CAST(:reached_served_origin AS BOOLEAN) THEN NOW()
+                WHEN CAST(:read_the_served_product AS BOOLEAN) THEN NOW()
                 ELSE last_crawled_at
             END
         WHERE id = :id
         """,
         {
             "id": seed_id,
-            "reached_served_origin": bool(reached_served_origin),
+            "read_the_served_product": bool(read_the_served_product),
             "canonical_url": canonical_url,
             "domain": domain,
             "title": snap_title,
@@ -4809,8 +4872,8 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     # the two drift apart by design. Recording a verdict from the wrong one is how a seed whose
     # served link is healthy gets marked dead because a legacy `destination_url` 404s.
     # When they differ, the sweep observes the served URL; saying nothing here is correct.
-    # `served_url` and `reached_served_origin` are the HOISTED values from above; recomputing
-    # them here is what would let the stamp and the verdict disagree.
+    # `served_url` and `observation` are the HOISTED values from above; recomputing them here
+    # is what would let the stamp and the verdict disagree.
     if observed.get("status_code") is None:
         # The fetch never reached the origin (or came from the snapshot cache), so there is
         # nothing to record. Distinct from the case below, and the drift report says which.
@@ -4818,12 +4881,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     elif not _same_destination(dest, served_url):
         destination_refresh = {"status": "not_observed", "reason": "not_the_served_url"}
     else:
-        observation = destination_liveness.classify_destination(
-            requested_url=dest,
-            status_code=int(observed["status_code"]),
-            final_url=observed.get("final_url"),
-            bot_challenged=bool(observed.get("bot_challenged")),
-        )
+        assert observation is not None  # same branch conditions as the hoist above
         destination_refresh = await destination_liveness.record_destination_observation(
             seed_id, observation
         )
