@@ -28,10 +28,21 @@ testing the production branch instead.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from config import platform as P
 from tests.test_platform_shim import _ALL_KEYS
+
+#: The real process environment, captured at IMPORT time.
+#:
+#: This must not be read inside a test body. The autouse ``_clean_env`` fixture
+#: below deletes every key in ``_ALL_KEYS`` — which now includes the Cloud Run
+#: Jobs markers — before any test runs, so a test that asks ``os.environ`` at
+#: call time is asking a mapping the fixture has already sanitised and can
+#: never fail. Module import happens before collection, hence before fixtures.
+_REAL_ENV_AT_IMPORT = dict(os.environ)
 
 
 @pytest.fixture(autouse=True)
@@ -276,13 +287,31 @@ def test_platform_metadata_reports_a_job_as_deployed(monkeypatch):
 def test_the_suite_itself_is_not_a_cloud_run_job():
     """If CI ever starts exporting CLOUD_RUN_JOB, every `test-token` test dies.
 
-    This fails first and says why, the same way
-    ``test_ci_and_local_are_unmanaged_so_the_suite_is_unaffected`` does for the
-    service markers.
-    """
-    import os
+    This fails first and says why.
 
-    for key in ("CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION"):
-        assert not os.environ.get(key), f"{key} is set in the test environment"
-    assert P.platform_name() == "local"
-    assert P.is_deployed() is False
+    ⚠️ It reads ``_REAL_ENV_AT_IMPORT``, NOT ``os.environ``. The autouse
+    ``_clean_env`` fixture strips these keys before every test body, so the
+    obvious spelling —
+
+        assert not os.environ.get("CLOUD_RUN_JOB")
+
+    — is an assertion that CANNOT FAIL: it passes under
+    ``CLOUD_RUN_JOB=evil pytest``, which is precisely the condition it claims
+    to detect. ``test_ci_and_local_are_unmanaged_so_the_suite_is_unaffected``
+    in ``tests/test_platform_pytest_bypass_allowed.py`` has that defect for the
+    K_* markers; do not copy it here.
+    """
+    for key in ("CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION", "K_SERVICE", "RAILWAY_ENVIRONMENT"):
+        assert not (_REAL_ENV_AT_IMPORT.get(key) or "").strip(), (
+            f"{key} is set in the real test environment. Every test that "
+            f"authenticates with test-token / test-agent-key is now refused by "
+            f"config.platform.pytest_bypass_allowed()."
+        )
+    # And the shim agrees, given that environment. PYTEST_CURRENT_TEST is
+    # overlaid because pytest sets it per-test, i.e. after this snapshot was
+    # taken — the gate at a real call site always sees it set.
+    assert P.platform_name(_REAL_ENV_AT_IMPORT) == "local"
+    assert P.is_deployed(_REAL_ENV_AT_IMPORT) is False
+    live = dict(_REAL_ENV_AT_IMPORT)
+    live["PYTEST_CURRENT_TEST"] = "tests/test_x.py::test_y (call)"
+    assert P.pytest_bypass_allowed(live) is True

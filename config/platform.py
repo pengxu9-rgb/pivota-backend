@@ -363,7 +363,10 @@ def _resolve_env(env: Optional[Mapping[str, str]] = None) -> tuple:
             railway_raw,
             # NOT K_SERVICE: a Cloud Run *Job* has no K_* at all, so naming it
             # here printed None on exactly the hosts this line is diagnosing.
-            _first(env, *_CLOUD_RUN_KEYS),
+            # Report KEY=value, not a bare value: "content-canonical-election"
+            # alone does not say whether a Service or a Job produced it, which
+            # is the single most useful bit when reading this line.
+            _cloud_run_marker(env),
         )
         return PRODUCTION, "fail_closed", explicit_raw or railway_raw
 
@@ -484,11 +487,27 @@ def raw_environment_label(env: Optional[Mapping[str, str]] = None) -> Optional[s
     )
 
 
+def _cloud_run_marker(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """``KEY=value`` for whichever Cloud Run marker is present, for diagnostics.
+
+    Purely a log/diagnostic helper — nothing gates on it.
+    """
+    for key in _CLOUD_RUN_KEYS:
+        value = _get(env, key)
+        if value:
+            return "%s=%s" % (key, value)
+    return None
+
+
 def service_name(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     """Human name of this workload.  ``CLOUD_RUN_JOB`` is the Jobs analogue of
     ``K_SERVICE`` and is read here as a VALUE — every job also sets
-    ``PIVOTA_SERVICE_NAME``, so this only matters for a job created without it,
-    where the alternative is ``None`` in health payloads and audit metadata."""
+    ``PIVOTA_SERVICE_NAME``, so today this fallback is INERT in every live job:
+    no job entrypoint reaches this function at all (they touch ``config.platform``
+    only through ``db.database``, which imports ``is_deployed`` alone). It is here
+    so that a future job which does call it — or one created without
+    ``PIVOTA_SERVICE_NAME`` — gets its name rather than ``None``. Do not justify
+    it with health payloads or audit metadata: no job process serves either."""
     return _first(
         env,
         "PIVOTA_SERVICE_NAME",
@@ -586,10 +605,19 @@ def require_platform_env(env: Optional[Mapping[str, str]] = None) -> PlatformEnv
     if source == "fail_closed":
         raise RuntimeError(
             "platform: cannot resolve the deployment environment on a managed "
-            "host (platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r). Set "
-            "PIVOTA_ENV=production|staging|development on this revision. "
+            "host (platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r "
+            "cloud_run_marker=%s). Set "
+            "PIVOTA_ENV=production|staging|development on this revision or job. "
             "Refusing to boot: every prod guard would otherwise run on a "
             "fail-closed guess."
-            % (platform_name(env), raw, _get(env, "RAILWAY_ENVIRONMENT") or None)
+            % (
+                platform_name(env),
+                raw,
+                _get(env, "RAILWAY_ENVIRONMENT") or None,
+                # This message is the twin of the _resolve_env warning above and
+                # had the same Cloud Run blindness: it named only RAILWAY_*, so
+                # on the Jobs host it was diagnosing it printed nothing useful.
+                _cloud_run_marker(env),
+            )
         )
     return resolved  # type: ignore[return-value]
