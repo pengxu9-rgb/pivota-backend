@@ -171,6 +171,15 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "destination_http_status",
             "destination_verdict",
             "destination_failure_streak",
+            # Content freshness (migration 202). Written ONLY by the success path of
+            # _refresh_external_seed_by_id, so the refresh queue can order by "when did
+            # we last re-read this PRICE" instead of `updated_at`, which an attach, a
+            # status flip or a governance write bumps without going near the origin.
+            # Two clocks: `last_crawl_attempt_at` orders the QUEUE (advances on every terminal
+            # outcome, so a dead seed cannot pin the head of it); `last_crawled_at` is the
+            # FRESHNESS signal (advances only on a fetch that reached the origin).
+            "last_crawled_at",
+            "last_crawl_attempt_at",
         },
     ),
     RequiredTableColumns(
@@ -1106,6 +1115,29 @@ async def ensure_required_schema_light() -> None:
                     """
                     CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked
                       ON external_product_seeds (destination_checked_at NULLS FIRST)
+                      WHERE status = 'active';
+                    """
+                )
+            )
+            # Content freshness (migration 202). Railway deploys skip db/migrations/,
+            # so self-heal here. The refresh queue orders on this column, and until it
+            # exists that ORDER BY is a hard error rather than a degraded ordering --
+            # `last_crawled_at` is referenced unconditionally by
+            # get_external_referral_refresh_candidate_seed_ids.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS external_product_seeds
+                      ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;
+                    """
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_external_product_seeds_last_crawl_attempt
+                      ON external_product_seeds (last_crawl_attempt_at NULLS FIRST)
                       WHERE status = 'active';
                     """
                 )
