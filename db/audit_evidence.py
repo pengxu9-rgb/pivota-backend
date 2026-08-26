@@ -30,13 +30,14 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import (
     ARRAY,
     Boolean, Column, DateTime, Index, Integer, Table, Text,
-    UniqueConstraint,
+    UniqueConstraint, func,
+    select as sa_select,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -156,6 +157,13 @@ VERIFIER_FRONTEND_AGENT_CITE = "frontend_agent_cite"
 VERIFIER_PUBLIC_LLM_CITATION = "public_llm_citation_movement"
 VERIFIER_UCP_PROBE = "ucp_probe"
 VERIFIER_COMMERCE_CHECKOUT_PROBE = "commerce_checkout_probe"
+
+# Route kinds for the Store Audit UCP lane. "ucp_discovery" is the public
+# intake's placeholder for a domain whose real MCP endpoint is not yet known;
+# the receipt path transitions it into a real "ucp" route and the reprobe
+# selector deliberately never picks placeholders up.
+ROUTE_KIND_UCP = "ucp"
+ROUTE_KIND_UCP_DISCOVERY = "ucp_discovery"
 
 VALID_VERIFIERS = frozenset({
     VERIFIER_PDP_RENDERS, VERIFIER_PDP_IN_SITEMAP,
@@ -1031,6 +1039,157 @@ async def deactivate_execution_route(
             execution_route_id, str(exc)[:200],
         )
         return False
+
+
+def _clean_domain_kinds(
+    normalized_domain: str, route_kinds: Sequence[str],
+) -> Tuple[str, List[str]]:
+    domain = (normalized_domain or "").strip().lower().rstrip(".")
+    kinds = [k.strip().lower() for k in route_kinds if k and k.strip()]
+    return domain, kinds
+
+
+async def fetch_route_for_domain(
+    *,
+    normalized_domain: str,
+    route_kinds: Sequence[str],
+    include_inactive: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the freshest route for one domain across the given kinds.
+
+    Domain-keyed on purpose: the public intake and teaser lanes operate before
+    any merchant association exists, so merchant_id must play no part here.
+    include_inactive lets the teaser see a route that a clean "no UCP" probe
+    deactivated — that deactivation IS the negative result.
+    """
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return None
+    await ensure_audit_evidence_tables()
+    conditions = [
+        execution_routes.c.normalized_domain == domain,
+        execution_routes.c.route_kind.in_(kinds),
+    ]
+    if not include_inactive:
+        conditions.append(execution_routes.c.is_active.is_(True))
+    try:
+        row = await database.fetch_one(
+            execution_routes.select()
+            .where(*conditions)
+            .order_by(
+                execution_routes.c.last_verified_at.desc().nullslast(),
+                execution_routes.c.created_at.desc(),
+            )
+            .limit(1)
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_route_for_domain failed domain=%s: %s",
+            domain, str(exc)[:200],
+        )
+        return None
+
+
+async def fetch_latest_route_evidence_for_domain(
+    *, normalized_domain: str, evidence_type: str, route_kinds: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """Latest evidence row of one type across a domain's routes, expired or
+    not, active or not.
+
+    Expiry stays a read-time decision (see migration 196); the caller compares
+    expires_at itself so stale-positive can be told apart from never-probed."""
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        joined = evidence_items.join(
+            execution_routes,
+            evidence_items.c.execution_route_id
+            == execution_routes.c.execution_route_id,
+        )
+        row = await database.fetch_one(
+            sa_select(evidence_items)
+            .select_from(joined)
+            .where(
+                execution_routes.c.normalized_domain == domain,
+                execution_routes.c.route_kind.in_(kinds),
+                evidence_items.c.evidence_type
+                == _coerce_evidence_type(evidence_type),
+            )
+            .order_by(evidence_items.c.created_at.desc())
+            .limit(1)
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_latest_route_evidence_for_domain failed domain=%s: %s",
+            domain, str(exc)[:200],
+        )
+        return None
+
+
+async def fetch_latest_verification_for_domain(
+    *, normalized_domain: str, verifier_id: str, route_kinds: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """Latest verification run (any status) across a domain's routes."""
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return None
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    try:
+        joined = verification_runs.join(
+            execution_routes,
+            verification_runs.c.execution_route_id
+            == execution_routes.c.execution_route_id,
+        )
+        row = await database.fetch_one(
+            sa_select(verification_runs)
+            .select_from(joined)
+            .where(
+                execution_routes.c.normalized_domain == domain,
+                execution_routes.c.route_kind.in_(kinds),
+                verification_runs.c.verifier_id == verifier_id,
+            )
+            .order_by(verification_runs.c.created_at.desc())
+            .limit(1)
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_latest_verification_for_domain failed domain=%s: %s",
+            domain, str(exc)[:200],
+        )
+        return None
+
+
+async def count_recent_intake_verifications(
+    *, idempotency_prefix: str, since: datetime,
+) -> int:
+    """Count verification runs minted by the public intake since a cutoff.
+
+    Used as a global daily budget: a prefixed idempotency key marks intake-born
+    runs. Fails closed (max int) so a broken count cannot unbound the lane."""
+    if not idempotency_prefix:
+        return 2**31
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            sa_select(func.count())
+            .select_from(verification_runs)
+            .where(
+                verification_runs.c.idempotency_key.like(f"{idempotency_prefix}%"),
+                verification_runs.c.created_at >= since,
+            )
+        )
+        return int(row[0]) if row else 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "count_recent_intake_verifications failed: %s", str(exc)[:200],
+        )
+        return 2**31
 
 
 def _coerce_severity(s: Optional[str]) -> str:

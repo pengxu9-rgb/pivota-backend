@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from db.audit_evidence import (
     EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+    ROUTE_KIND_UCP_DISCOVERY,
     VERIFICATION_STATUS_BLOCKED,
     VERIFICATION_STATUS_SUCCEEDED,
     VERIFIER_UCP_PROBE,
@@ -328,7 +329,22 @@ async def _persist_ucp_probe_receipt(
         # rotations must use an explicit route-transition workflow; allowing a
         # result to switch identity here would let a stale/compromised worker
         # rewrite another endpoint's evidence association.
-        if (
+        #
+        # The one sanctioned transition is a public-intake discovery
+        # placeholder (route_kind=ucp_discovery): its endpoint is a synthetic
+        # stand-in because the real MCP endpoint was unknowable at intake.
+        # The transition is bounded to the SAME normalized domain and may only
+        # establish a "ucp" route; the placeholder is retired afterwards.
+        claimed_is_discovery = (
+            str(claimed_route.get("route_kind") or "") == ROUTE_KIND_UCP_DISCOVERY
+        )
+        if claimed_is_discovery:
+            if receipt.route.normalized_domain != claimed_route["normalized_domain"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"error": "CLAIMED_ROUTE_IDENTITY_MISMATCH"},
+                )
+        elif (
             receipt.route.normalized_domain != claimed_route["normalized_domain"]
             or receipt.route.endpoint != claimed_route["endpoint_normalized"]
         ):
@@ -352,7 +368,10 @@ async def _persist_ucp_probe_receipt(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"error": "ROUTE_PERSIST_FAILED"},
             )
-        if str(route["execution_route_id"]) != execution_route_id:
+        if claimed_is_discovery:
+            placeholder_route_id = execution_route_id
+            execution_route_id = str(route["execution_route_id"])
+        elif str(route["execution_route_id"]) != execution_route_id:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"error": "CLAIMED_ROUTE_IDENTITY_MISMATCH"},
@@ -367,6 +386,18 @@ async def _persist_ucp_probe_receipt(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"error": "VERIFICATION_NOT_CLAIMED"},
             )
+        if claimed_is_discovery and placeholder_route_id != execution_route_id:
+            # The placeholder served its one purpose. Retiring it keeps the
+            # domain's active route unique and the teaser unambiguous.
+            deactivated = await deactivate_execution_route(
+                execution_route_id=placeholder_route_id or "",
+                last_verified_at=receipt.observed_at,
+            )
+            if not deactivated:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"error": "ROUTE_DEACTIVATE_FAILED"},
+                )
     elif (
         receipt.verification_status == VERIFICATION_STATUS_SUCCEEDED
         and receipt.reason == "not_ucp_reachable"
