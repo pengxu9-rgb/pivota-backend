@@ -170,7 +170,19 @@ if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   WEB_ACTIVE_REVISION="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c '
 import json,sys
 o=json.load(sys.stdin)
-active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if not t.get("tag") and t.get("percent") == 100]
+# percent==100 ONLY. The `not t.get("tag")` conjunct that used to be here refused the
+# normal post-deploy state: deploy_backend.sh ships every candidate with `--tag c-<sha>`
+# and then promotes it, so the SERVING revision keeps its own candidate tag until a later
+# deploy retires it. Verified in prod 2026-08-26 — web-00098-kax held 100% traffic AND
+# tag c-6f8b201ba7dc, and this guard refused, making setup_scheduler.sh unrunnable
+# whenever Store Audit is armed.
+#
+# A tag is an ADDITIONAL address for a revision, not a replacement for the plain service
+# URL, so it says nothing about whether that revision serves the untagged URL. What the
+# guard is actually for is unchanged and still enforced: exactly one revision at 100%.
+# A split (50/50) yields no 100% entry and is still refused; a 0%-traffic candidate is
+# still excluded, because it has no percent.
+active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if t.get("percent") == 100]
 print(active[0] if len(active) == 1 else "")
 ')"
   [ -n "$WEB_ACTIVE_REVISION" ] \
@@ -202,7 +214,19 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   WEB_COMMERCE_ACTIVE_REVISION="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c '
 import json,sys
 o=json.load(sys.stdin)
-active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if not t.get("tag") and t.get("percent") == 100]
+# percent==100 ONLY. The `not t.get("tag")` conjunct that used to be here refused the
+# normal post-deploy state: deploy_backend.sh ships every candidate with `--tag c-<sha>`
+# and then promotes it, so the SERVING revision keeps its own candidate tag until a later
+# deploy retires it. Verified in prod 2026-08-26 — web-00098-kax held 100% traffic AND
+# tag c-6f8b201ba7dc, and this guard refused, making setup_scheduler.sh unrunnable
+# whenever Store Audit is armed.
+#
+# A tag is an ADDITIONAL address for a revision, not a replacement for the plain service
+# URL, so it says nothing about whether that revision serves the untagged URL. What the
+# guard is actually for is unchanged and still enforced: exactly one revision at 100%.
+# A split (50/50) yields no 100% entry and is still refused; a 0%-traffic candidate is
+# still excluded, because it has no percent.
+active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if t.get("percent") == 100]
 print(active[0] if len(active) == 1 else "")
 ')"
   [ -n "$WEB_COMMERCE_ACTIVE_REVISION" ] \
