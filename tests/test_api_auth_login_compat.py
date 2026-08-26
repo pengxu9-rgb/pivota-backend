@@ -211,9 +211,23 @@ def _stub_merchant_login(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_execute(_query: str, _values: dict):
         return None
 
+    async def no_membership(*_args, **_kwargs):
+        return None
+
     _stub_db(monkeypatch, fetch_one=fake_fetch_one)
     monkeypatch.setattr(auth, "_auth_execute", fake_execute)
     monkeypatch.setattr(auth, "verify_password", lambda _password, _password_hash: True)
+    # The canonical-identity membership system talks to the real (shared,
+    # file-backed) test database directly, bypassing `_auth_fetch_one`. Left
+    # unstubbed, a successful login here would upsert a real membership row
+    # for merchant@test.com that outlives this test and leaks into whichever
+    # test in the full suite happens to run next against the same email —
+    # exactly the kind of cross-test DB pollution that makes the reject-path
+    # tests below pass in isolation but fail once other tests have seeded
+    # real schema/rows into pivota_test.db.
+    monkeypatch.setattr(auth, "_safe_get_active_membership", no_membership)
+    monkeypatch.setattr(auth, "_safe_upsert_membership", no_membership)
+    monkeypatch.setattr(auth, "_safe_verify_identity_password", no_membership)
 
 
 @pytest.mark.asyncio

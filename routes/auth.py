@@ -52,9 +52,13 @@ SUPPORTED_LOGIN_PORTALS = set(PORTAL_TO_MEMBERSHIP_TYPE)
 
 # Backfills merchant_id onto a real, password-verified users-table row that
 # has none set. Gated like _demo_employee_accounts() below: both conjuncts
-# checked at request time, not import time, so an env var flipped after
-# startup (or a managed host that fails closed to production) still takes
-# effect immediately.
+# are re-checked on every call rather than baked into a module-level dict at
+# import time, so a managed host that only resolves to production after
+# `is_production()` re-reads the environment (or a DEMO_MERCHANT_ID set after
+# import) still takes effect immediately. Note settings.enable_internal_demo_fixtures
+# itself does NOT re-read the environment per call — it's a field on the
+# process-wide `settings` singleton, resolved once at import — so flipping
+# ENABLE_INTERNAL_DEMO_FIXTURES on a running process still requires a restart.
 def _demo_merchant_ids() -> Dict[str, str]:
     if not settings.enable_internal_demo_fixtures:
         return {}

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from typing import Any, Dict, Optional
 import jwt
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta
 import os
@@ -30,6 +31,7 @@ from utils.auth import verify_password as verify_bcrypt_password
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
+logger = logging.getLogger("auth_routes")
 
 # JWT Configuration - Import from config for consistency
 from config.settings import settings
@@ -39,11 +41,21 @@ JWT_EXPIRATION_HOURS = 24
 
 def _demo_merchant_ids() -> Dict[str, str]:
     """Backfills merchant_id onto a real, password-verified users-table row
-    that has none set. Same two conjuncts as the demo_accounts lane above,
-    checked at request time: ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly
-    true, and the platform must not resolve to production (config.platform
-    fails CLOSED to production on unlabeled managed hosts)."""
-    if not settings.enable_internal_demo_fixtures or is_production():
+    that has none set. Same two conjuncts as the demo_accounts lane above:
+    ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly true, and the platform
+    must not resolve to production (config.platform fails CLOSED to
+    production on unlabeled managed hosts, and re-reads the environment on
+    every call). Note settings.enable_internal_demo_fixtures itself is a
+    field on the process-wide `settings` singleton resolved once at import,
+    so flipping ENABLE_INTERNAL_DEMO_FIXTURES on a running process still
+    requires a restart to take effect."""
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo merchant_id backfill stays disabled"
+        )
         return {}
     demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
     if not demo_merchant_id:
