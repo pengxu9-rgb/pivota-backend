@@ -50,6 +50,7 @@ _DDL_STATEMENTS = [
         created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT payment_grant_issuers_status_check CHECK (status IN ('active', 'disabled')),
+        CONSTRAINT payment_grant_issuers_issuer_no_pipe CHECK (position('|' in issuer) = 0),
         CONSTRAINT payment_grant_issuers_jwks_https CHECK (jwks_uri LIKE 'https://%'),
         CONSTRAINT payment_grant_issuers_methods_check CHECK (
             methods <@ ARRAY['signed_grant', 'ap2_mandate']::TEXT[]
@@ -113,6 +114,10 @@ def normalize_registration(body: Dict[str, Any]) -> PaymentIssuerRegistration:
         raise IssuerValidationError("body", "body must be a JSON object")
 
     issuer = _clean(body.get("issuer"), "issuer", required=True)
+    if "|" in issuer:
+        # The gateway derives user_ref as `${iss}|${sub}` and its registry builder throws on a
+        # piped iss — for the WHOLE registry, so this typo would take the Antom lane down.
+        raise IssuerValidationError("issuer", "issuer must not contain '|'")
     if any(ch.isspace() for ch in issuer):
         raise IssuerValidationError("issuer", "issuer must not contain whitespace")
 
@@ -265,7 +270,23 @@ async def upsert_issuer(reg: PaymentIssuerRegistration, *, registered_by: str, j
             )} | {"id": dict(existing)["id"]},
         )
     else:
-        await database.execute(
+        try:
+            await _insert_new(params)
+        except Exception as err:  # noqa: BLE001 — narrowed by name below
+            # Two admins registering the same NEW issuer concurrently: the partial unique
+            # index arbitrates, the loser lands here. The winner's row is the desired state,
+            # so serve it rather than a raw 500; anything that is NOT that race re-raises.
+            if "payment_grant_issuers_active_issuer_uidx" not in str(err):
+                raise
+    row = await database.fetch_one(
+        "SELECT * FROM payment_grant_issuers WHERE issuer = :issuer AND status = 'active' LIMIT 1",
+        {"issuer": reg.issuer},
+    )
+    return _row_public(row)
+
+
+async def _insert_new(params):
+    await database.execute(
             """
             INSERT INTO payment_grant_issuers (
                 issuer, jwks_uri, audience, algs, authorized_party, methods, expected_vct,
@@ -278,11 +299,6 @@ async def upsert_issuer(reg: PaymentIssuerRegistration, *, registered_by: str, j
             """,
             params,
         )
-    row = await database.fetch_one(
-        "SELECT * FROM payment_grant_issuers WHERE issuer = :issuer AND status = 'active' LIMIT 1",
-        {"issuer": reg.issuer},
-    )
-    return _row_public(row)
 
 
 async def disable_issuer(issuer_id: int) -> bool:

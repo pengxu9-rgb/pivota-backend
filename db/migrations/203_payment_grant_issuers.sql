@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS payment_grant_issuers (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT payment_grant_issuers_status_check CHECK (status IN ('active', 'disabled')),
+    -- The gateway derives user_ref as `${iss}|${sub}` on the signed-grant path, and its
+    -- buildIssuerRegistry HARD-THROWS on any configured iss containing '|' — while building
+    -- the WHOLE registry, so one piped row would poison every payment issuer at gateway
+    -- config-build time. Same rule, same reason, same two layers as the identity table.
+    CONSTRAINT payment_grant_issuers_issuer_no_pipe CHECK (position('|' in issuer) = 0),
     CONSTRAINT payment_grant_issuers_jwks_https CHECK (jwks_uri LIKE 'https://%'),
     CONSTRAINT payment_grant_issuers_methods_check CHECK (
         methods <@ ARRAY['signed_grant', 'ap2_mandate']::TEXT[]

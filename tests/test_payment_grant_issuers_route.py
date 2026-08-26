@@ -78,7 +78,7 @@ def _body(**over) -> Dict[str, Any]:
 # --- the admin gate --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("role", ["agent", "merchant", "user", "viewer"])
+@pytest.mark.parametrize("role", ["agent", "merchant", "user", "viewer", "employee"])
 def test_every_route_refuses_non_admin(rig, role):
     client, state = rig
     app.dependency_overrides[get_current_user] = lambda: _user(role)
@@ -88,13 +88,16 @@ def test_every_route_refuses_non_admin(rig, role):
     assert state["upserts"] == [] and state["disabled"] == []
 
 
-def test_employee_may_register_and_registered_by_is_recorded(rig):
+def test_super_admin_may_register_and_registered_by_is_recorded(rig):
+    """The role set is the MONEY-admin norm (admin/super_admin), not the identity registry's
+    (admin/employee): an employee JWT cannot even read settlements, so it must not be able to
+    grant a PSP charge authority."""
     client, state = rig
-    app.dependency_overrides[get_current_user] = lambda: _user("employee")
+    app.dependency_overrides[get_current_user] = lambda: _user("super_admin")
     r = client.put("/admin/payment-issuers", json=_body())
     assert r.status_code == 200
     (_, registered_by, jwks_ok) = state["upserts"][0]
-    assert registered_by == "employee@pivota.cc" and jwks_ok is True
+    assert registered_by == "super_admin@pivota.cc" and jwks_ok is True
 
 
 # --- the validation wall ---------------------------------------------------------------------
@@ -118,6 +121,8 @@ def test_unknown_field_is_refused_not_dropped(rig):
     {"methods": []},
     {"expected_vct": "PaymentMandate"},        # vct without ap2_mandate = fake AP2 trust
     {"issuer": "https://x.example/a b"},       # whitespace
+    {"issuer": "https://x.example|evil"},      # gateway derives ${iss}|${sub}; its registry
+                                               # builder THROWS on a piped iss — for ALL rows
 ])
 def test_bad_registrations_are_422(rig, bad):
     client, state = rig
@@ -179,6 +184,18 @@ def test_internal_registry_requires_the_key(rig, monkeypatch):
     assert client.get(
         "/agent/internal/payment-issuers", headers={"X-Internal-Key": "ik_test_123"}
     ).status_code == 500  # unconfigured is a server bug, never an open registry
+
+
+def test_non_ascii_internal_key_is_403_not_500(rig):
+    """Starlette decodes headers latin-1; hmac.compare_digest on str raises on non-ASCII —
+    the #1883 class: an unauthenticated request must never be able to pick a 500. Pinned at
+    the helper seam because httpx refuses to send a non-ASCII header at all."""
+    from routes.payment_grant_issuers import _require_internal_key
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as err:
+        _require_internal_key(b"ik_caf\xe9".decode("latin-1"))
+    assert err.value.status_code == 403
 
 
 def test_internal_registry_serves_the_verifier_entry_shape(rig):

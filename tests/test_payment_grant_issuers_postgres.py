@@ -101,6 +101,19 @@ async def test_reregister_updates_in_place_and_reactivates():
     assert len(await list_all()) == 1
 
 
+async def test_pipe_in_issuer_is_refused_by_the_table_itself():
+    from db.database import database
+
+    with pytest.raises(Exception) as err:
+        await database.execute(
+            """
+            INSERT INTO payment_grant_issuers (issuer, jwks_uri, audience, registered_by)
+            VALUES ('https://x.example|sub', 'https://x.example/jwks', 'aud', 'test')
+            """
+        )
+    assert "payment_grant_issuers_issuer_no_pipe" in str(err.value)
+
+
 async def test_methods_check_constraint_holds():
     from db.database import database
 
@@ -149,7 +162,17 @@ async def test_ddl_backstop_matches_the_migration():
             ORDER BY ordinal_position
             """
         )
-        return [tuple(r) for r in rows]
+        # Indexes too: the review ran the mutant — backstop minus the unique index — and the
+        # columns-only compare passed. Deploys skip db/migrations/, so the backstop IS the
+        # prod path, and prod without the partial unique index has no one-active-row arbiter.
+        idx = await database.fetch_all(
+            """
+            SELECT indexname, indexdef FROM pg_indexes
+            WHERE tablename = 'payment_grant_issuers'
+            ORDER BY indexname
+            """
+        )
+        return [tuple(r) for r in rows] + [tuple(r) for r in idx]
 
     from_migration = await snapshot()
     await database.execute("DROP TABLE payment_grant_issuers")

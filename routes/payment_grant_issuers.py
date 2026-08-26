@@ -54,10 +54,15 @@ class PaymentIssuerBody(BaseModel):
 
 
 def _require_admin(current_user: Dict[str, Any]) -> str:
-    """Admin or employee only, and returns WHO for the registered_by audit column."""
-    if current_user.get("role") not in ("admin", "employee"):
+    """The MONEY-admin role set — admin/super_admin, matching require_admin and the
+    payout/settlement routes — not the identity registry's (admin, employee). Review
+    comparison: employees cannot even read settlements here, so they must not be able to
+    grant a PSP charge authority. Returns WHO for the registered_by audit column;
+    get_current_user guarantees email and sub are present, so there is no anonymous
+    fallback to dead-end the audit trail on."""
+    if current_user.get("role") not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="payment issuer registration is admin-only")
-    return str(current_user.get("email") or current_user.get("user_id") or "admin")
+    return str(current_user.get("email") or current_user.get("sub"))
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -126,7 +131,11 @@ def _require_internal_key(x_internal_key: Optional[str]) -> None:
             detail={"error": "CONFIG_MISSING", "message": "AGENT_AUTH_INTROSPECT_INTERNAL_KEY is not configured"},
         )
     provided = str(x_internal_key or "").strip()
-    if not provided or not hmac.compare_digest(provided, expected):
+    # Compare as BYTES: Starlette decodes headers latin-1, and hmac.compare_digest on str
+    # RAISES on non-ASCII — an unauthenticated request could pick a 500 (the #1883 class).
+    if not provided or not hmac.compare_digest(
+        provided.encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "FORBIDDEN", "message": "Missing or invalid X-Internal-Key"},
