@@ -37,9 +37,18 @@ JWT_SECRET = settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
-DEMO_MERCHANT_IDS = {
-    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
-} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
+def _demo_merchant_ids() -> Dict[str, str]:
+    """Backfills merchant_id onto a real, password-verified users-table row
+    that has none set. Same two conjuncts as the demo_accounts lane above,
+    checked at request time: ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly
+    true, and the platform must not resolve to production (config.platform
+    fails CLOSED to production on unlabeled managed hosts)."""
+    if not settings.enable_internal_demo_fixtures or is_production():
+        return {}
+    demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
+    if not demo_merchant_id:
+        return {}
+    return {"merchant@test.com": demo_merchant_id}
 
 # Pydantic Models
 class UserLogin(BaseModel):
@@ -224,7 +233,7 @@ async def signin(login_data: UserLogin):
 
             merchant_id = user_row.get("merchant_id")
             if user_row.get("role") == "merchant" and not merchant_id:
-                merchant_id = DEMO_MERCHANT_IDS.get(normalized_email)
+                merchant_id = _demo_merchant_ids().get(normalized_email)
             token = create_jwt_token(
                 user_row["email"],
                 user_row["role"],
