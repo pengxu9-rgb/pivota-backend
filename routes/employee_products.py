@@ -4708,7 +4708,16 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             price_currency = :price_currency,
             availability = :availability,
             seed_data = :seed_data,
-            updated_at = NOW()
+            updated_at = NOW(),
+            -- CRAWL RECENCY, NOT WRITE RECENCY. This statement is reached only after a
+            -- fetch that reached the origin (`raise_on_unavailable=True`) for the URL we
+            -- actually serve (`_same_destination`), so it is the one place entitled to
+            -- say "we looked". The refresh queue orders on this; `updated_at` beside it
+            -- is bumped by attaches and governance writes that never left the process.
+            -- See migration 202. Every early `return` above this line deliberately
+            -- leaves it alone -- a degraded refresh must not buy freshness, which is the
+            -- same trap the `raise_on_unavailable` note describes for a 404.
+            last_crawled_at = NOW()
         WHERE id = :id
         """,
         {

@@ -1455,6 +1455,23 @@ async def should_block_external_referral_runtime(
 
 
 async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> List[str]:
+    """Pick the seeds whose price/availability we last READ longest ago.
+
+    ORDERED ON `last_crawled_at`, NOT `updated_at`. The two are not the same question and
+    this function asked the wrong one until migration 202. `updated_at` answers "when was
+    this row last WRITTEN", and it is bumped by writers that never contact the origin:
+    `external_seed_servability` on attach, `identity_resolution` on a status flip,
+    `pdp_governance_service`, and any operator PATCH. Ordering the refresh queue by it
+    starves rows in proportion to how much OTHER attention they get — and the sharpest
+    case is the first query below, which selects `attached_product_key IS NOT NULL` while
+    the act of attaching is itself an `updated_at` bump. A seed becoming servable, the
+    moment its price starts being quoted, went to the back of the queue that keeps its
+    price honest.
+
+    `updated_at` is kept only as a tiebreak beneath the real signal, so rows that share a
+    `last_crawled_at` (notably the NULL cohort — today, all of them) still come out in a
+    stable, sensible order rather than whatever the index happens to return.
+    """
     normalized_limit = max(1, min(int(limit or 500), 5000))
     attached_rows = await database.fetch_all(
         """
@@ -1462,7 +1479,7 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
         FROM external_product_seeds
         WHERE status = 'active'
           AND attached_product_key IS NOT NULL
-        ORDER BY updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
         LIMIT :limit
         """,
         {"limit": normalized_limit},
@@ -1498,7 +1515,7 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
           AND attached_product_key IS NULL
           AND domain IS NOT NULL
           AND TRIM(domain) != ''
-        ORDER BY updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
+        ORDER BY last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST, created_at ASC NULLS FIRST
         LIMIT :limit
         """,
         {"limit": normalized_limit * 4},
