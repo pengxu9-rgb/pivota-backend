@@ -46,7 +46,6 @@ SWEEP_WORKFLOW = WORKFLOWS / "backend-test-sweep.yml"
 #                                       next firing.
 KNOWN_UNMIGRATED = {
     "agent-pdp-orphan-reaper.yml",
-    "derive-offer-market-currency.yml",
 }
 
 # Both the dotted and the bracket-index forms, because `${{ secrets['DATABASE_URL'] }}`

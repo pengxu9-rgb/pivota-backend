@@ -8,7 +8,10 @@ theorised: `derive-offer-market-currency.yml` with `only_domains` set to
     "; echo PWNED; :; "
 
 rendered as `only_raw=""; echo PWNED; :; ""` and executed — in a job whose `env:`
-carries the production `DATABASE_URL`.
+carries the production `DATABASE_URL`. (That workflow was deleted 2026-08-26 when
+its lane moved to a Cloud Run Job. The finding is restated here rather than left
+as a pointer to a file that no longer exists; the rule it produced is what this
+test enforces, and it outlives the workflow that taught it.)
 
 The rule was ALREADY written down, verbatim, in
 `.github/workflows/postgres-dialect-gate.yml` ("`${{ }}` in a `run:` body is
