@@ -146,7 +146,7 @@ def _set_clause(query: str) -> str:
 def _stamped(queries) -> bool:
     """Did the freshness clock ACTUALLY advance?
 
-    The statement writes `last_crawled_at = CASE WHEN :reached_served_origin ...`, so the SET
+    The statement writes `last_crawled_at = CASE WHEN :read_the_served_product ...`, so the SET
     clause mentions the column on every run and the query TEXT cannot answer this. The bound
     flag is the decision -- asserting on text alone would pass for a refresh that never
     reached the origin, which is the precise bug this file exists to prevent.
@@ -157,10 +157,10 @@ def _stamped(queries) -> bool:
             continue
         # THE SQL MUST ACTUALLY CONSULT THE FLAG. Reading `values` alone is not enough: a
         # mutant that replaced the CASE with a bare `= NOW()` still BOUND
-        # `reached_served_origin`, so a helper trusting the parameter reported "not stamped"
+        # `read_the_served_product`, so a helper trusting the parameter reported "not stamped"
         # for a statement that stamps every time -- and survived.
-        if ":reached_served_origin" in assignment:
-            return bool(values.get("reached_served_origin"))
+        if ":read_the_served_product" in assignment:
+            return bool(values.get("read_the_served_product"))
         return True
     return False
 

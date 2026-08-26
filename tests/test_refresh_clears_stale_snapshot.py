@@ -20,6 +20,7 @@ Being too strict merely leaves a row blocked; being too lax quotes a wrong price
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,6 +65,14 @@ def _seed_row(**overrides: Any) -> Dict[str, Any]:
 
 
 def _snapshot(**overrides: Any) -> SimpleNamespace:
+    """A stand-in for ExternalOfferSnapshot, PINNED to its real field set.
+
+    The first version of this fixture invented `fetched_at`. The real dataclass has no such
+    field -- it has `last_checked_at` -- so production code reading `getattr(snapshot,
+    "fetched_at", None)` got None forever while every test saw a value. A mutant rewriting
+    the new stamp to use that attribute passed the whole suite and would have been a silent
+    no-op in prod. `test_the_double_cannot_invent_fields` below is what keeps this honest.
+    """
     base = {
         "canonical_url": DEST,
         "domain": "brand.com",
@@ -72,10 +81,21 @@ def _snapshot(**overrides: Any) -> SimpleNamespace:
         "price_amount": 28.0,
         "price_currency": "USD",
         "availability": "in_stock",
-        "fetched_at": datetime.now(timezone.utc),
+        "last_checked_at": datetime.now(timezone.utc),
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_the_double_cannot_invent_fields() -> None:
+    """A test double that carries attributes the real class lacks validates a fiction."""
+    import dataclasses
+
+    from services.external_offers_service import ExternalOfferSnapshot
+
+    real = {f.name for f in dataclasses.fields(ExternalOfferSnapshot)}
+    fake = {k for k in vars(_snapshot()) if not k.startswith("_")}
+    assert fake <= real, f"the double invents fields the real snapshot lacks: {sorted(fake - real)}"
 
 
 class _Recorder:
@@ -99,7 +119,11 @@ def _run(monkeypatch, row, *, resolve) -> Tuple[Dict[str, Any], List[Dict[str, A
         return row if values and values.get("id") == row["id"] else None
 
     async def fake_exec(query: str, values):
-        written.append(dict(values or {}))
+        # DEEP copy. `_seed_data_payload` returns a shallow `dict(seed_data)`, so a shallow
+        # record here ALIASES the same nested `snapshot` dict -- and a mutant that moved the
+        # write to AFTER this statement still showed up in the recorded payload. The suite
+        # then proved nothing about whether anything was ever persisted.
+        written.append(json.loads(json.dumps(values or {}, default=str)))
         row.update(values)
 
     rec = _Recorder()
@@ -245,4 +269,76 @@ def test_a_dead_link_never_clears_the_blocker(monkeypatch: pytest.MonkeyPatch) -
     result, written = _run(monkeypatch, _seed_row(), resolve=resolve)
 
     assert result["status"] != "success"
+    assert _extracted_at(written) is None
+
+
+# --------------------------------------------- a 200 is not by itself a reading of THIS page
+
+def test_a_post_response_failure_hands_back_the_cache_and_must_not_clear_the_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_fetch_html` stamps `observed["status_code"]` BEFORE it returns.
+
+    So every failure AFTER the response -- the extractor, the `external_offer_snapshots`
+    upsert, the post-write re-read -- lands in `resolve_external_offer`'s generic
+    `except Exception` and hands back the CACHED snapshot with `observed` already populated.
+    A gate reading only `status_code` concludes it just re-read a page it never parsed, and
+    since the cached price equals the stored price the status is `unchanged` -- so the
+    blocker would be cleared for a number nobody looked at. `from_cache` is the signal that
+    makes this visible.
+    """
+    async def resolve(*, observed=None, **kwargs):
+        if observed is not None:
+            observed["status_code"] = 200
+            observed["final_url"] = DEST
+            observed["from_cache"] = True  # the snapshot upsert blew up after the response
+        return _snapshot(price_amount=28.0)
+
+    result, written = _run(monkeypatch, _seed_row(), resolve=resolve)
+
+    assert result["status"] == "success"
+    assert _extracted_at(written) is None
+
+
+@pytest.mark.parametrize(
+    "final_url,label",
+    [
+        ("https://brand.com/collections/all", "301 onto a collection"),
+        ("https://brand.com/products/a-different-toner", "301 onto another product"),
+    ],
+)
+def test_a_redirect_away_from_the_product_must_not_clear_the_blocker(
+    monkeypatch: pytest.MonkeyPatch, final_url: str, label: str
+) -> None:
+    """200 for a page that is not the one we serve.
+
+    `_same_destination` compares two STORED urls and cannot see this; only `final_url` can,
+    which is why the gate now derives from the liveness verdict. The second case is the
+    quieter one: `redirected_to_product` raises NO blocker at all, so nothing else would have
+    stopped us storing another product's price and calling this row freshly extracted.
+    """
+    async def resolve(*, observed=None, **kwargs):
+        if observed is not None:
+            observed["status_code"] = 200
+            observed["final_url"] = final_url
+        return _snapshot(price_amount=9.0)
+
+    _, written = _run(monkeypatch, _seed_row(), resolve=resolve)
+
+    assert _extracted_at(written) is None, label
+
+
+def test_a_bot_challenge_must_not_clear_the_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cf-mitigated 200 classifies as `unverifiable`, and the liveness writer already
+    refuses to stamp `destination_checked_at` for it. Anything claiming parity with that
+    column has to refuse for the same reason -- "cannot verify" must never buy a pass."""
+    async def resolve(*, observed=None, **kwargs):
+        if observed is not None:
+            observed["status_code"] = 200
+            observed["final_url"] = DEST
+            observed["bot_challenged"] = True
+        return _snapshot(price_amount=31.0)
+
+    _, written = _run(monkeypatch, _seed_row(), resolve=resolve)
+
     assert _extracted_at(written) is None
