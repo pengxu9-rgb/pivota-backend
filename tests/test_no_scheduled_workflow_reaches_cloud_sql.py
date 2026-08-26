@@ -24,6 +24,7 @@ which is a different (and self-correcting) problem from an unattended cron.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -39,25 +40,39 @@ SWEEP_WORKFLOW = WORKFLOWS / "backend-test-sweep.yml"
 #
 #   agent-pdp-orphan-reaper.yml         daily 04:37 UTC. Confirmed failing since
 #                                       2026-08-26 05:07 (last green 08-25).
-#
-# derive-offer-market-currency.yml was the second entry and is GONE — migrated to
-# the `derive-offer-market-currency` / `audit-domainless-offer-currency` Cloud Run
-# Jobs. It was the latent case: it last ran 2026-08-24 while Railway was still up,
-# so it was still green and would have failed first on 2026-08-31. Removed here
-# rather than left behind, because a name that outlives its file silently
-# pre-approves any future workflow that reuses it.
+#   derive-offer-market-currency.yml    weekly Mon 09:11 UTC. Last ran 08-24,
+#                                       while Railway was still up, so it is
+#                                       latent rather than red — it fails on its
+#                                       next firing.
 KNOWN_UNMIGRATED = {
     "agent-pdp-orphan-reaper.yml",
 }
 
-DSN_SECRETS = ("secrets.DATABASE_URL", "secrets.DATABASE_URL_NOVERIFY")
+# Both the dotted and the bracket-index forms, because `${{ secrets['DATABASE_URL'] }}`
+# is valid Actions syntax and a plain `secrets.DATABASE_URL` substring match walks
+# straight past it. This cannot see a DSN held under a differently-named secret —
+# a ratchet, not a proof — but it should at least cover the two spellings of the
+# names we actually use.
+DSN_SECRET_NAMES = ("DATABASE_URL", "DATABASE_URL_NOVERIFY")
+DSN_PATTERN = re.compile(
+    r"secrets\s*(?:\.\s*(?:%s)\b|\[\s*['\"](?:%s)['\"]\s*\])"
+    % ("|".join(DSN_SECRET_NAMES), "|".join(DSN_SECRET_NAMES))
+)
+
+
+def _workflow_files() -> list[Path]:
+    # GitHub honours BOTH extensions. Globbing only *.yml let a scheduled DSN
+    # workflow named *.yaml through every assertion in this file — verified by
+    # mutant. The sibling guard tests/test_workflow_no_run_body_interpolation.py
+    # already globs both; match it.
+    return sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
 
 
 def _scheduled_db_workflows() -> set[str]:
     found = set()
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+    for path in _workflow_files():
         text = path.read_text(encoding="utf-8")
-        if not any(secret in text for secret in DSN_SECRETS):
+        if not DSN_PATTERN.search(text):
             continue
         workflow = yaml.safe_load(text) or {}
         # `on` parses to the YAML 1.1 boolean True. Accept either key rather
@@ -96,13 +111,15 @@ def test_this_gate_runs_when_a_workflow_changes():
 
 def test_the_scan_finds_something_to_scan():
     """Guard the guard: a glob typo would make every assertion below vacuous."""
-    workflows = list(WORKFLOWS.glob("*.yml"))
+    workflows = _workflow_files()
     assert len(workflows) > 5, f"only {len(workflows)} workflows found under {WORKFLOWS}"
     assert any(
-        secret in p.read_text(encoding="utf-8")
-        for p in workflows
-        for secret in DSN_SECRETS
+        DSN_PATTERN.search(p.read_text(encoding="utf-8")) for p in workflows
     ), "no workflow mentions a DSN secret at all — the matcher is wrong, not the repo"
+    # The bracket form must actually match, or the widening above is decorative.
+    assert DSN_PATTERN.search("${{ secrets['DATABASE_URL'] }}")
+    assert DSN_PATTERN.search('${{ secrets.DATABASE_URL_NOVERIFY }}')
+    assert not DSN_PATTERN.search("${{ secrets.DATABASE_URL_SOMETHING_ELSE }}")
 
 
 def test_no_new_scheduled_workflow_carries_a_database_dsn():

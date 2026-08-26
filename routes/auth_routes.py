@@ -19,16 +19,19 @@ from pydantic import BaseModel
 from typing import Any, Dict, Optional
 import jwt
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta
 import os
 
 # Database import for employee authentication
+from config.platform import is_production
 from db.database import database
 from utils.auth import verify_password as verify_bcrypt_password
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
+logger = logging.getLogger("auth_routes")
 
 # JWT Configuration - Import from config for consistency
 from config.settings import settings
@@ -36,9 +39,28 @@ JWT_SECRET = settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
-DEMO_MERCHANT_IDS = {
-    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
-} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
+def _demo_merchant_ids() -> Dict[str, str]:
+    """Backfills merchant_id onto a real, password-verified users-table row
+    that has none set. Same two conjuncts as the demo_accounts lane above:
+    ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly true, and the platform
+    must not resolve to production (config.platform fails CLOSED to
+    production on unlabeled managed hosts, and re-reads the environment on
+    every call). Note settings.enable_internal_demo_fixtures itself is a
+    field on the process-wide `settings` singleton resolved once at import,
+    so flipping ENABLE_INTERNAL_DEMO_FIXTURES on a running process still
+    requires a restart to take effect."""
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo merchant_id backfill stays disabled"
+        )
+        return {}
+    demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
+    if not demo_merchant_id:
+        return {}
+    return {"merchant@test.com": demo_merchant_id}
 
 # Pydantic Models
 class UserLogin(BaseModel):
@@ -121,6 +143,7 @@ async def signin(login_data: UserLogin):
     - Legacy `employees` table auth (SHA256 + static salt)
     - Canonical `users` table auth (bcrypt) as a fallback
     - Hardcoded demo accounts, only when `ENABLE_INTERNAL_DEMO_FIXTURES=true`
+      AND the platform environment does not resolve to production
 
     Every lane resolves the role from a datastore or a flag-gated fixture; no
     lane ever honours a role supplied by the caller.
@@ -130,7 +153,11 @@ async def signin(login_data: UserLogin):
     try:
         normalized_email = normalize_email(login_data.email)
         demo_accounts = {}
-        if settings.enable_internal_demo_fixtures:
+        # Demo fixtures mint role=admin JWTs, so the flag alone is not enough:
+        # the lane also refuses whenever the platform resolves to production
+        # (config.platform fails CLOSED to production on unlabeled managed
+        # hosts). Mirrors routes.auth._demo_employee_accounts().
+        if settings.enable_internal_demo_fixtures and not is_production():
             demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
             demo_accounts = {
                 **(
@@ -218,7 +245,7 @@ async def signin(login_data: UserLogin):
 
             merchant_id = user_row.get("merchant_id")
             if user_row.get("role") == "merchant" and not merchant_id:
-                merchant_id = DEMO_MERCHANT_IDS.get(normalized_email)
+                merchant_id = _demo_merchant_ids().get(normalized_email)
             token = create_jwt_token(
                 user_row["email"],
                 user_row["role"],
