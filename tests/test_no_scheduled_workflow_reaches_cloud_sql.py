@@ -37,14 +37,17 @@ SWEEP_WORKFLOW = WORKFLOWS / "backend-test-sweep.yml"
 # list may only ever SHRINK. Each entry is a migration owed, not an exemption
 # granted — do not add to it to make a new workflow pass.
 #
-#   agent-pdp-orphan-reaper.yml         daily 04:37 UTC. Confirmed failing since
-#                                       2026-08-26 05:07 (last green 08-25).
 #   derive-offer-market-currency.yml    weekly Mon 09:11 UTC. Last ran 08-24,
 #                                       while Railway was still up, so it is
 #                                       latent rather than red — it fails on its
 #                                       next firing.
+#
+# agent-pdp-orphan-reaper.yml was here until 2026-08-26 and is now the
+# `agent-pdp-orphan-reaper` Cloud Run Job (infra/gcp/setup_scheduler.sh). Removed
+# from this set rather than left behind: test_known_unmigrated_lane_still_exists
+# makes a stale name a failure precisely so a migrated lane cannot leave an entry
+# that pre-approves the next workflow to reuse the filename.
 KNOWN_UNMIGRATED = {
-    "agent-pdp-orphan-reaper.yml",
     "derive-offer-market-currency.yml",
 }
 

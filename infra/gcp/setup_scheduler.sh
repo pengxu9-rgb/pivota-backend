@@ -323,6 +323,48 @@ mkjob content-canonical-election "$BACKEND_IMAGE" "$SA" \
   --command python \
   --args "scripts/elect_content_canonicals.py,--apply,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml"
 
+echo "== job: agent-pdp-orphan-reaper (GH Actions cron 37 4 * * *)"
+# Migrated from .github/workflows/agent-pdp-orphan-reaper.yml, deleted in the
+# same commit, for the same reason as content-canonical-election above: Cloud SQL
+# `pivota-pg` has NO public IP (ipv4Enabled=false, private 10.25.0.2 only), so a
+# GitHub-hosted runner cannot reach the database from anywhere on the internet.
+# The workflow's DATABASE_URL repo secret held Railway's public proxy URL;
+# Railway was decommissioned 2026-08-25 and the lane has failed every run since
+# (confirmed 2026-08-26 05:07, last green 08-25 05:07). No secret value fixes it.
+#
+# `--apply` unconditionally, matching the workflow: its apply step was gated
+# `github.event_name == 'schedule' || inputs.apply`, so a SCHEDULED run always
+# applied — that is the whole point of a backstop. The dispatch checkbox was for
+# manual runs, which are now `gcloud run jobs execute` with overriding --args
+# (recipe in the script's module docstring).
+#
+# `--limit 0` (= all) is what the workflow passed on the schedule: its REAP_LIMIT
+# fell back to '0' for every non-dispatch event. Passed explicitly rather than
+# leaning on the argparse default, so the scheduled contract is readable here and
+# an override is obviously a --args replacement.
+#
+# NOT CARRIED OVER: the separate dry-run pass that ran before the apply step. It
+# existed to put a report in the uploaded artifact; the apply report is a strict
+# superset of it (same orphans/with_evidence/sample keys, plus deleted), so a
+# second full table scan would buy nothing. A non-zero result now logs at WARNING
+# from the script itself, which is where that artifact's signal went.
+#
+# `--set-secrets` is DATABASE_URL alone, not `$SECRETS_FILE`: the whole import
+# chain (db.database, services.agent_pdp_view_assembler and its
+# catalog_identity/claim_safety/source_quarantine/title_normalization imports)
+# resolves with only DATABASE_URL and DB_POOL_* in scope, and
+# reap_orphaned_agent_pdp_view_rows touches no second datastore — it is one
+# SELECT plus per-row guarded DELETEs against the primary.
+#
+# DB_POOL_* pinned because a Job inherits no pool sizing from the deploy scripts;
+# 1/2 are the values the workflow itself set.
+mkjob agent-pdp-orphan-reaper "$BACKEND_IMAGE" "$SA" \
+  --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=agent-pdp-orphan-reaper,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
+  --task-timeout 900s \
+  --command python \
+  --args "scripts/reap_orphaned_agent_pdp_view.py,--apply,--limit,0"
+
 # Store Audit UCP work has a dedicated, explicitly armed pair of Jobs. The
 # selector only writes bounded verification rows; the probe Job is the sole
 # workload placed on the crawl subnet. Do not create either Job until its
@@ -435,6 +477,13 @@ sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
 # than one 5h35m old. Moving this without moving that one silently inverts the
 # order.
 sched content-canonical-election-cron "52 */6 * * *" content-canonical-election
+# 04:37 UTC daily. The exact cron the GH workflow carried, preserved because its
+# own comment named the minute as chosen rather than arbitrary: "off-peak, offset
+# from the PDP production smoke (08:17)" — that smoke is still a GitHub workflow
+# (.github/workflows/pdp-production-smoke.yml, cron 17 8 * * *) and still reads
+# PDPs over HTTP, so the 3h40m gap it was given is a live constraint, not a
+# leftover. Rounding this to :00 or nudging it toward 08:00 gives it back.
+sched agent-pdp-orphan-reaper-cron "37 4 * * *" agent-pdp-orphan-reaper
 sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
 sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
 sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
