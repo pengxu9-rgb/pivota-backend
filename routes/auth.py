@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, field_validator
 
+from config.platform import is_production
 from config.settings import settings
 from db.auth_identity import (
     PORTAL_TO_AUDIENCE,
@@ -171,7 +172,17 @@ def _normalize_email(raw_email: str) -> str:
     return (raw_email or "").strip().lower()
 
 
-DEMO_EMPLOYEE_ACCOUNTS = {
+# Hardcoded demo employee logins for LOCAL DEVELOPMENT ONLY. These mint
+# role=admin JWTs, and an admin JWT now reaches /admin/payment-issuers (PSP
+# charge authority), so this lane must never be satisfiable in production.
+# Two independent gates, both checked at request time:
+#   1. ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly true (off by default),
+#      the same flag that gates the /auth/signin demo lane.
+#   2. The resolved platform environment must not be production.
+#      config.platform fails CLOSED to production on a managed host it cannot
+#      classify, so an unlabeled deployment keeps this lane dark even with
+#      the flag set.
+_DEMO_EMPLOYEE_FIXTURES = {
     "employee@pivota.com": {
         "password": "Admin123!",
         "role": "admin",
@@ -183,6 +194,18 @@ DEMO_EMPLOYEE_ACCOUNTS = {
         "full_name": "Pivota Super Admin",
     },
 }
+
+
+def _demo_employee_accounts() -> Dict[str, Dict[str, str]]:
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo employee logins stay disabled"
+        )
+        return {}
+    return _DEMO_EMPLOYEE_FIXTURES
 
 _AUTH_DB_TIMEOUT_SECONDS = 5.0
 
@@ -597,7 +620,7 @@ async def _legacy_employee_login_response(normalized_email: str, password: str) 
                 role=str(employee_row["role"]),
             )
 
-    demo = DEMO_EMPLOYEE_ACCOUNTS.get(normalized_email)
+    demo = _demo_employee_accounts().get(normalized_email)
     if demo and password == demo["password"]:
         return _build_employee_login_response(
             user_id=normalized_email,
