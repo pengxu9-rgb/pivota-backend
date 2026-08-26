@@ -11,6 +11,7 @@ import asyncio
 import time
 from datetime import datetime
 
+from config.platform import pytest_bypass_allowed
 from db.agents import (
     get_agent_by_key,
     AgentAuthLookupTransientError,
@@ -223,8 +224,13 @@ async def get_agent_context(
         )
 
     # Test-only bypass: allow unit tests to use a placeholder API key without
-    # hitting the database or enforcing rate/quota logic.
-    if os.getenv("PYTEST_CURRENT_TEST") and api_key in {"test-agent-key", "test-api-key"}:
+    # hitting the database or enforcing rate/quota logic. Fails closed in
+    # production the same way the demo admin login lanes do (#1889) — see
+    # config.platform.pytest_bypass_allowed.
+    if (
+        api_key in {"test-agent-key", "test-api-key"}
+        and pytest_bypass_allowed(bypass_name="the agent test-key bypass")
+    ):
         agent = {
             "agent_id": "agent_test",
             "agent_name": "Test Agent",
