@@ -9,6 +9,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
+from config.platform import is_production
 from config.settings import settings
 import os
 
@@ -135,8 +136,17 @@ async def get_current_user(
         token = credentials.credentials
 
         # Test-only bypass: allow unit tests to use a stable placeholder token
-        # without requiring JWT signing/secrets.
-        if os.getenv("PYTEST_CURRENT_TEST") and token == "test-token":
+        # without requiring JWT signing/secrets. PYTEST_CURRENT_TEST is only
+        # ever set by pytest itself, but a debug image built from a test
+        # stage or a copied .env could still leak it into a real server
+        # process, so this also fails closed to production the same way the
+        # demo admin login lanes do (#1889) — a deployment that cannot
+        # resolve its environment is treated as production.
+        if (
+            os.getenv("PYTEST_CURRENT_TEST")
+            and token == "test-token"
+            and not is_production()
+        ):
             return {
                 "sub": "test-user",
                 "email": "test@example.com",

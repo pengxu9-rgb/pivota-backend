@@ -1172,38 +1172,6 @@ async def test_auth():
             "me": "GET /api/auth/me (requires Authorization header)",
             "logout": "POST /api/auth/logout (requires Authorization header)"
         },
-        "test_credentials": {
-            "super_admin": {
-                "email": "superadmin@pivota.com",
-                "password": "Admin123!",
-                "role": "super_admin"
-            },
-            "admin": {
-                "email": "admin@pivota.com",
-                "password": "Admin123!",
-                "role": "admin"
-            },
-            "employee": {
-                "email": "employee@pivota.com",
-                "password": "Admin123!",
-                "role": "employee"
-            },
-            "outsourced": {
-                "email": "outsourced@pivota.com",
-                "password": "Admin123!",
-                "role": "outsourced"
-            },
-            "merchant": {
-                "email": "merchant@test.com",
-                "password": "Admin123!",
-                "role": "merchant"
-            },
-            "agent": {
-                "email": "agent@test.com",
-                "password": "Admin123!",
-                "role": "agent"
-            }
-        },
         "employee_roles": {
             "super_admin": "Complete control over the system",
             "admin": "Manage merchants, agents, and most settings",
