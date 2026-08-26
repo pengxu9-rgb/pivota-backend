@@ -181,3 +181,56 @@ def test_the_job_hands_the_batch_its_unbounded_callback(monkeypatch: pytest.Monk
     assert captured["callback"] is job._refresh_unbounded, (
         "the batch must get the unbounded callback, not the raw refresh"
     )
+
+
+def test_the_patience_reaches_crawl_politeness_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the LAST hop, which is the one that actually delivers the fix.
+
+    The test above stops at `_fetch_html`, so it proves the patience crosses
+    resolve_external_offer -> _fetch_html and nothing further. But `_fetch_html`
+    is not the pacer; `crawl_politeness.before_request` is, and it is the only
+    line whose `max_wait` decides whether `await_slot` waits or raises
+    `CrawlPaced`. Dropping `max_wait=max_wait` from
+    services/external_offers_service.py's `before_request` call survived the
+    ENTIRE 12,557-test suite: every hop this change threads would become dead
+    plumbing, the nightly batch would silently revert to the 10s ceiling, and
+    all of the other tests here would stay green.
+
+    So this asserts against the real module-global `crawl_politeness`, one hop
+    past where the coverage previously stopped.
+    """
+    import services.external_offers_service as svc
+    from services import crawl_politeness
+
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_before_request(url, **kwargs):
+        seen.append(kwargs)
+        raise RuntimeError("stop at the pacer")
+
+    async def no_existing(*a, **k):
+        return None
+
+    monkeypatch.setattr(crawl_politeness, "before_request", fake_before_request)
+    monkeypatch.setattr(svc, "_get_snapshot_row", no_existing)
+
+    # 0 is the batch's "unbounded"; None is the interactive default ceiling. Both must arrive
+    # verbatim — collapsing None to 0 would make the UNAUTHENTICATED live route unbounded too.
+    for patience in (0, 30.0, None):
+        seen.clear()
+        with pytest.raises(RuntimeError, match="stop at the pacer"):
+            asyncio.run(
+                svc.resolve_external_offer(
+                    market="US",
+                    url="https://brand.com/products/toner",
+                    force_refresh=True,
+                    max_wait=patience,
+                )
+            )
+        assert seen, "before_request was never reached"
+        assert seen[-1].get("max_wait") == patience, (
+            f"expected max_wait={patience!r} to reach crawl_politeness.before_request, "
+            f"got {seen[-1].get('max_wait')!r}"
+        )
