@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -1549,19 +1550,29 @@ EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS = 3300.0
 
 
 def _refresh_budget_seconds(explicit: Optional[float]) -> float:
-    """Resolve the run's wall-clock budget. `<= 0` disables it (and says so in the summary)."""
-    if explicit is not None:
+    """Resolve the run's wall-clock budget. `<= 0` disables it (and says so in the summary).
+
+    NON-FINITE FALLS BACK TO THE DEFAULT rather than through. `argparse type=float` accepts
+    `nan` and `inf`, and either would (a) silently disable the budget, since `budget > 0` is
+    False for NaN, while the summary still reported `stopped_early: false`, and (b) reach
+    `json.dumps` in `jobs/external_referral_refresh.main`, which emits a bare `NaN` that is
+    not valid JSON for any downstream parser.
+    """
+    def _finite(value: Any) -> Optional[float]:
         try:
-            return float(explicit)
+            out = float(value)
         except (TypeError, ValueError):
-            return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+            return None
+        return out if math.isfinite(out) else None
+
+    if explicit is not None:
+        resolved = _finite(explicit)
+        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
     raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS")
     if raw is None or not str(raw).strip():
         return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    resolved = _finite(raw)
+    return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
 
 
 async def run_external_referral_refresh_batch(
@@ -1575,6 +1586,13 @@ async def run_external_referral_refresh_batch(
     started = time.monotonic()
     skipped_for_budget = 0
     stopped_early = False
+    # A "success" that never contacted the origin. `resolve_external_offer` honours
+    # `raise_on_unavailable` only for `ExternalOfferUnavailable`; a timeout, TLS error,
+    # `RobotsDisallowed`, or a `CrawlDelayTooLong` skip returns the CACHED snapshot instead,
+    # and this loop counts that row as `refreshed`. Without this counter a run in which a
+    # hostile robots.txt voided every row is indistinguishable from a complete one — the same
+    # failure mode `stopped_early` exists to prevent.
+    refreshed_from_cache = 0
     refreshed = 0
     degraded = 0
     failed = 0
@@ -1623,6 +1641,8 @@ async def run_external_referral_refresh_batch(
             status = str(result.get("status") or "success")
             if status == "success":
                 refreshed += 1
+                if result.get("snapshot_from_cache"):
+                    refreshed_from_cache += 1
                 # isinstance, not truthiness: a truthy non-dict here used to raise
                 # INSIDE the try and land the same seed in BOTH `refreshed` and
                 # `failed`, which is a worse outcome than an uncounted drift report.
@@ -1653,6 +1673,12 @@ async def run_external_referral_refresh_batch(
         except Exception as exc:
             failed += 1
             errors.append({"seed_id": seed_id, "status": "failed", "error": str(exc)[:300]})
+    if refreshed_from_cache:
+        logger.warning(
+            "external referral refresh: %d/%d rows counted as refreshed came from the cached "
+            "snapshot without reaching the origin (paced-out host, robots, timeout or TLS)",
+            refreshed_from_cache, refreshed,
+        )
     return {
         "status": "success" if failed == 0 else "degraded",
         "gating_policy_version": EXTERNAL_REFERRAL_GATING_POLICY_VERSION,
@@ -1665,6 +1691,10 @@ async def run_external_referral_refresh_batch(
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "skipped_for_budget": skipped_for_budget,
         "refreshed": refreshed,
+        # SUBSET of `refreshed`, not a separate bucket: these rows took the success path on a
+        # cached snapshot without reaching the origin. `refreshed - refreshed_from_cache` is
+        # the number of seeds this run actually re-read.
+        "refreshed_from_cache": refreshed_from_cache,
         "degraded": degraded,
         "failed": failed,
         "price_changed": price_changed,

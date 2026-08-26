@@ -216,10 +216,24 @@ and CLI-only:
   Nor was there any wall-clock ceiling on the run: with `CRAWL_MAX_BACKOFF_SECONDS` at 300s,
   `--limit 500` against a persistently-429ing host is ~41h with no hostile robots.txt involved.
   Both are now bounded — `CRAWL_MAX_ROBOTS_DELAY_SECONDS` (default 300s, skips the host and
-  records `CrawlDelayTooLong` rather than crawling it faster than it asked) and
+  raises `CrawlDelayTooLong` rather than crawling it faster than it asked) and
   `--budget-seconds` / `EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS` (default 3300s, under the
   3600s Cloud Run task timeout, and reported as `stopped_early` + `skipped_for_budget`).
   **Any scheduler entry for this job must come after those, not before.**
+* **A skipped row is still counted as `refreshed`, and that is §4.2 wearing a different hat.**
+  `resolve_external_offer` honours `raise_on_unavailable` **only** in its
+  `except ExternalOfferUnavailable` arm; a timeout, a TLS error, `RobotsDisallowed` and the new
+  `CrawlDelayTooLong` all land in its generic `except Exception`, which returns the **cached**
+  snapshot. `_refresh_external_seed_by_id` then runs its entire success path having contacted
+  nobody, returns `"status": "success"`, and the batch counts the row as `refreshed`.
+  Nothing is fabricated — `observed["status_code"]` is never set, so `last_crawled_at`,
+  `destination_checked_at` and the verdict are all withheld and the failure streak does not
+  move — but `updated_at` and `last_crawl_attempt_at` DO advance for a host we never reached.
+  The refresh now returns `snapshot_from_cache` and the batch reports `refreshed_from_cache`
+  (a subset of `refreshed`) plus a `logger.warning`, so `refreshed - refreshed_from_cache` is
+  the number of seeds a run actually re-read. **Read that field before believing a run's
+  coverage.** Making `raise_on_unavailable` cover the generic arm is the real fix and is NOT
+  done here: it would change the live resolve route's deliberate cached-snapshot fallback.
 
 ### 4.4 …and two publishers bypass the gate entirely
 

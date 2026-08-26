@@ -652,8 +652,10 @@ def test_a_negative_env_value_cannot_disable_pacing_or_the_wait_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`_f` clamps at 0. Without the clamp a negative `CRAWL_MIN_INTERVAL_SECONDS` walks
-    `next_allowed` BACKWARDS — pacing off entirely — and a negative `CRAWL_MAX_WAIT_SECONDS`
-    makes `ceiling > 0` false, restoring the unbounded stall on the live route. Operator error
+    `next_allowed` BACKWARDS — pacing off entirely. A negative `CRAWL_MAX_WAIT_SECONDS` also
+    clamps to 0, which now means "never wait" rather than the unbounded stall it used to mean
+    (see `test_an_env_ceiling_of_zero_does_not_silently_unbound_the_live_route`) — the clamp
+    still matters, but it now fails toward refusing rather than toward stalling. Operator error
     should not silently switch the gate off."""
     monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "-1")
     assert cp._min_interval() == 0.0
@@ -1368,12 +1370,15 @@ def test_the_cap_bounds_the_interval_not_merely_the_sleep(
 
     asyncio.run(go())
 
-    state = cp._STATE.get("slow.com")
-    reserved = getattr(state, "next_allowed", 0.0)
-    assert reserved - _time.monotonic() <= 0, (
-        f"a refused row must not reserve the slot it abandoned; next_allowed is "
-        f"{reserved - _time.monotonic():.0f}s out"
+    assert "slow.com" not in cp._STATE, (
+        "a refused row must not reserve the slot it abandoned — asserting the host has NO "
+        "state entry rather than a past `next_allowed`, so this cannot be satisfied by a "
+        "stale reservation that merely happens to have expired"
     )
+    # Belt and braces: if a future change legitimately creates state here, it still must not
+    # be a reservation pushed into the future.
+    reserved = getattr(cp._STATE.get("slow.com"), "next_allowed", 0.0)
+    assert reserved - _time.monotonic() <= 0, f"next_allowed is {reserved:.0f}"
 
 
 def test_the_cap_bites_on_the_bounded_live_route_too(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1431,8 +1436,15 @@ def test_a_capped_refusal_is_catchable_as_an_ordinary_pacing_refusal(
     _patch_sleep(monkeypatch)
     with pytest.raises(cp.CrawlPaced) as caught:
         asyncio.run(cp.await_slot("https://slow.com/a", user_agent="PivotaBot", max_wait=0))
-    assert "Crawl-delay" in str(caught.value), (
+    text = str(caught.value)
+    assert "Crawl-delay" in text, (
         f"the refusal has to say WHY the host was skipped, got {caught.value!r}"
+    )
+    # This string is returned verbatim as `reason` to an ANONYMOUS caller by
+    # routes/external_offers.py's resolve endpoint. It may name the host and the delay the
+    # host itself published; it must not name our internal config knobs.
+    assert "CRAWL_MAX_ROBOTS_DELAY_SECONDS" not in text, (
+        f"the anonymous resolve route echoes this string; it must not leak env var names: {text!r}"
     )
 
 
@@ -1499,7 +1511,7 @@ def test_an_explicit_max_wait_of_zero_is_still_unbounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The other half of the row above: fixing the ENV reading must not disarm the SENTINEL that
-    eight batch call sites pass. If this flipped, every batch lane would silently revert to
+    ten call sites pass. If this flipped, every batch lane would silently revert to
     refusing anything past its default ceiling."""
     _serve_robots(monkeypatch, {"queue.com": 404})
     slept = _patch_sleep(monkeypatch)
@@ -1512,3 +1524,35 @@ def test_an_explicit_max_wait_of_zero_is_still_unbounded(
 
     asyncio.run(go())
     assert any(d > 119 for d in slept), f"max_wait=0 must still mean unbounded, slept {slept}"
+
+
+def test_a_non_numeric_crawl_delay_cannot_slip_past_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `math.isnan` guard in `_load_robots`, which nothing else reaches.
+
+    A NaN delay defeats the cap SILENTLY — every comparison against NaN is False, so
+    `robots_delay > cap` never fires — and then poisons the host permanently, because
+    `start + nan` is nan and `max(now, nan)` is nan for every later caller.
+
+    Today's stdlib `RobotFileParser` gates `Crawl-delay` on `isdigit()`, so this is
+    unreachable through the parser and the guard is insurance on a value we do not own. That
+    is exactly why it needs a row: an unreachable guard with no test is indistinguishable from
+    a guard that does not work. Driven by stubbing `crawl_delay` directly.
+    """
+    _serve_robots(monkeypatch, {"nan.com": "User-agent: *\nCrawl-delay: 5\n"})
+    slept = _patch_sleep(monkeypatch)
+    monkeypatch.setattr(cp.RobotFileParser, "crawl_delay", lambda self, ua: float("nan"))
+
+    async def go() -> None:
+        await cp.await_slot("https://nan.com/a", user_agent="PivotaBot", max_wait=0)
+        await cp.await_slot("https://nan.com/b", user_agent="PivotaBot", max_wait=0)
+
+    asyncio.run(go())
+
+    _parser, delay = asyncio.run(cp._load_robots("nan.com", "PivotaBot"))
+    assert delay is None, f"a NaN Crawl-delay must be dropped, got {delay!r}"
+    # `x == x` is False only for NaN.
+    assert all(d == d for d in slept), f"a NaN must never reach a sleep: {slept}"
+    reserved = cp._STATE["nan.com"].next_allowed
+    assert reserved == reserved, "next_allowed is NaN — the host is now permanently unschedulable"

@@ -341,10 +341,18 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
             #
             # We refuse rather than clamp. See `CrawlDelayTooLong` — crawling a host at a rate
             # it explicitly asked us not to use is not the fix for our own batch being slow.
+            # The message reaches an ANONYMOUS caller: `routes/external_offers.py:65` returns
+            # `str(exc.args[0])` as `reason` on the unauthenticated resolve route when there is
+            # no cached row to fall back to. Says what happened, and names no internal config
+            # knob — the env var is documented on `_robots_delay_cap` and in the log below.
+            logger.info(
+                "crawl skip: %s asks for Crawl-delay %.1fs, over the %.1fs "
+                "CRAWL_MAX_ROBOTS_DELAY_SECONDS cap", host, robots_delay, cap,
+            )
             raise CrawlDelayTooLong(
-                f"{host} asks for Crawl-delay {robots_delay:.1f}s, over the {cap:.1f}s cap "
-                f"(CRAWL_MAX_ROBOTS_DELAY_SECONDS); skipping this host rather than crawling it "
-                f"faster than it asked"
+                f"{host} asks for a Crawl-delay of {robots_delay:.1f}s, longer than this lane "
+                f"will wait ({cap:.1f}s); skipping this host rather than crawling it faster "
+                f"than it asked"
             )
         # The host's own stated delay wins whenever it is SLOWER. Taking min() here would let a
         # site asking for 10s be hit every second while technically "having a robots check".
