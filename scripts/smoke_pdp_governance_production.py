@@ -507,10 +507,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--api-base", default=env_or_default("PIVOTA_API_BASE_URL", "https://api.pivota.cc"))
     parser.add_argument("--employee-base", default=env_or_default("PIVOTA_EMPLOYEE_BASE_URL", "https://employee.pivota.cc"))
     parser.add_argument("--merchant-base", default=env_or_default("PIVOTA_MERCHANT_BASE_URL", "https://merchant.pivota.cc"))
-    parser.add_argument("--employee-email", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_EMAIL", "employee@pivota.com"))
-    parser.add_argument("--employee-password", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_PASSWORD", "Admin123!"))
-    parser.add_argument("--merchant-email", default=env_or_default("PIVOTA_SMOKE_MERCHANT_EMAIL", "merchant@test.com"))
-    parser.add_argument("--merchant-password", default=env_or_default("PIVOTA_SMOKE_MERCHANT_PASSWORD", "Admin123!"))
+    # Credentials have NO baked-in defaults: the demo login lane (employee@pivota.com /
+    # Admin123!) is gated off in production, and this script must never silently
+    # probe prod with demo creds. Each value must come from the flag or its env var.
+    parser.add_argument("--employee-email", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_EMAIL", ""))
+    parser.add_argument("--employee-password", default=env_or_default("PIVOTA_SMOKE_EMPLOYEE_PASSWORD", ""))
+    parser.add_argument("--merchant-email", default=env_or_default("PIVOTA_SMOKE_MERCHANT_EMAIL", ""))
+    parser.add_argument("--merchant-password", default=env_or_default("PIVOTA_SMOKE_MERCHANT_PASSWORD", ""))
     parser.add_argument(
         "--merchant-id",
         default=env_or_default("PIVOTA_SMOKE_MERCHANT_ID", ""),
@@ -527,7 +530,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--merchant-product-id",
         default=env_or_default("PDP_SMOKE_MERCHANT_PRODUCT_ID", "live_acceptance_merchant_pdp_1776996856"),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    missing = [
+        f"--{flag} (or {env})"
+        for flag, env, value in (
+            ("employee-email", "PIVOTA_SMOKE_EMPLOYEE_EMAIL", args.employee_email),
+            ("employee-password", "PIVOTA_SMOKE_EMPLOYEE_PASSWORD", args.employee_password),
+            ("merchant-email", "PIVOTA_SMOKE_MERCHANT_EMAIL", args.merchant_email),
+            ("merchant-password", "PIVOTA_SMOKE_MERCHANT_PASSWORD", args.merchant_password),
+        )
+        if not value.strip()
+    ]
+    if missing:
+        parser.error(
+            "missing smoke credentials: "
+            + ", ".join(missing)
+            + ". The demo login lane is gated off in production, so this script has no "
+            "credential defaults; provide a real smoke account explicitly."
+        )
+    return args
 
 
 if __name__ == "__main__":
