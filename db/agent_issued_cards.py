@@ -39,7 +39,7 @@ _INSERT_GUARDED_SQL = """
         (SELECT COALESCE(SUM(amount_cap_minor), 0) FROM agent_issued_cards
           WHERE agent_id = CAST(:agent_id AS varchar)
             AND created_at >= date_trunc('day', now())
-            AND status <> 'failed') + :amount_cap_minor <= :daily_cap_minor
+            AND status <> 'failed') + CAST(:amount_cap_minor AS bigint) <= :daily_cap_minor
     RETURNING card_id
 """
 
