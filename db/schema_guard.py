@@ -1754,6 +1754,22 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # mig 202: Reap webhook reconciliation columns on agent_issued_cards. The
+            # webhook path UPDATEs these at runtime; a deploy that skipped migrations
+            # would 500 on the first issuer report. reap_webhook_events itself is
+            # CREATE TABLE IF NOT EXISTS in the migration and the table is only
+            # touched via explicit SQL here, but the COLUMNS ride on a table born in
+            # mig 201, so self-heal them the same way.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS agent_issued_cards
+                      ADD COLUMN IF NOT EXISTS last_auth_at TIMESTAMPTZ,
+                      ADD COLUMN IF NOT EXISTS auth_count INTEGER NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS settled_amount_minor BIGINT;
+                    """
+                )
+            )
             # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
             # (derived from refund_amount_cents, added above). Emitted LAST so this
             # lone potential table-rewrite can't block the lightweight self-heals;

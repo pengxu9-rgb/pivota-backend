@@ -107,3 +107,97 @@ async def get_card(card_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
         {"card_id": card_id, "agent_id": agent_id},
     )
     return dict(row) if row else None
+
+
+# ── webhook-side reads and transitions (migration 202) ───────────────────────────────────────
+
+
+async def find_by_issuer_ref(issuer_card_ref: str) -> Optional[Dict[str, Any]]:
+    row = await database.fetch_one(
+        """
+        SELECT card_id, agent_id, recommendation_id, merchant_domain, checkout_id,
+               quote_total_minor, amount_cap_minor, currency, issuer, issuer_card_ref,
+               status, single_use, expires_at, auth_count
+          FROM agent_issued_cards
+         WHERE issuer_card_ref = :ref
+        """,
+        {"ref": issuer_card_ref},
+    )
+    return dict(row) if row else None
+
+
+async def record_event_once(event_id: str, event_type: str, card_id: Optional[str]) -> bool:
+    """True if this event is NEW; False if we have already processed it (redelivery).
+
+    ON CONFLICT DO NOTHING + RETURNING is the same was-it-mine idiom as the guarded mint: the
+    row coming back IS the claim. Every redelivered event after the first gets False and the
+    handler body never runs.
+    """
+    row = await database.fetch_one(
+        """
+        INSERT INTO reap_webhook_events (event_id, event_type, card_id)
+        VALUES (:event_id, :event_type, :card_id)
+        ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_id
+        """,
+        {"event_id": event_id, "event_type": event_type, "card_id": card_id},
+    )
+    return row is not None
+
+
+async def apply_auth_approved(card_id: str, single_use: bool) -> bool:
+    """Record an approved authorization; a single-use card exhausts on its first approval.
+
+    Guarded on status='issued' so a redelivery that slipped past dedup, or an auth racing a
+    revoke, cannot resurrect a terminal state. Returns whether the transition applied.
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE agent_issued_cards
+           SET last_auth_at = now(),
+               auth_count = auth_count + 1,
+               status = CASE WHEN CAST(:single_use AS boolean) THEN 'exhausted' ELSE status END,
+               updated_at = now()
+         WHERE card_id = :card_id AND status = 'issued'
+        RETURNING card_id
+        """,
+        {"card_id": card_id, "single_use": single_use},
+    )
+    return row is not None
+
+
+async def apply_auth_declined(card_id: str) -> bool:
+    """A decline still counts the attempt but never changes status: the card remains usable
+    (the agent may retry at the merchant), and a declined-into-'failed' transition would let
+    the ISSUER's verdict overwrite OUR lifecycle vocabulary."""
+    row = await database.fetch_one(
+        """
+        UPDATE agent_issued_cards
+           SET last_auth_at = now(), auth_count = auth_count + 1, updated_at = now()
+         WHERE card_id = :card_id AND status IN ('issued', 'exhausted')
+        RETURNING card_id
+        """,
+        {"card_id": card_id},
+    )
+    return row is not None
+
+
+async def apply_settlement(card_id: str, settled_amount_minor: int) -> bool:
+    """Settlement can trail authorization by days and can land after expiry — so unlike the
+    auth transitions it is NOT gated on a live status. It records money movement on whatever
+    the row has become.
+
+    LAST-WRITE-WINS on purpose, stated so multi-capture doesn't silently under-report later:
+    two partial captures (distinct event_ids, so dedup keeps both) leave the LAST amount, not
+    the sum. Correct for v1's single-use cards; a multi-capture future needs a settlements
+    child table, not a SUM here."""
+    row = await database.fetch_one(
+        """
+        UPDATE agent_issued_cards
+           SET settled_amount_minor = :amount, updated_at = now()
+         WHERE card_id = :card_id
+        RETURNING card_id
+        """,
+        {"card_id": card_id, "amount": settled_amount_minor},
+    )
+    return row is not None
