@@ -421,3 +421,34 @@ def test_no_import_time_caching(monkeypatch):
     assert P.platform_env() == "staging"
     monkeypatch.delenv("RAILWAY_ENVIRONMENT")
     assert P.platform_env() == "development"
+
+
+# ---------------------------------------------------------------------------
+# module surface
+# ---------------------------------------------------------------------------
+
+
+def test_all_lists_every_public_callable():
+    """`__all__` must not drift from the module's actual public surface.
+
+    `pytest_bypass_allowed` was added in PR #1897 and left out of `__all__`
+    while every other accessor was listed, so `from config.platform import *`
+    silently did not import the one function that gates three auth bypasses.
+    Enumerating rather than hand-listing means the next accessor cannot be
+    forgotten the same way.
+    """
+    import inspect
+
+    public = {
+        name
+        for name, obj in vars(P).items()
+        if not name.startswith("_")
+        and callable(obj)
+        and getattr(obj, "__module__", None) == P.__name__
+        and not inspect.isclass(obj)
+    }
+    missing = sorted(public - set(P.__all__))
+    assert not missing, f"public callables absent from __all__: {missing}"
+
+    stale = sorted(name for name in P.__all__ if not hasattr(P, name))
+    assert not stale, f"__all__ names nothing: {stale}"
