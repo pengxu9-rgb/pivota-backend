@@ -42,7 +42,15 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def test_offers_resolve_prefers_external_outbound(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+# Parametrized over the surface because the two cases used to behave differently: an explicit
+# commerce_surface flipped strict mode, and strict mode silently disabled the external lane
+# entirely. External offers are first-class on every surface now (founder directive 2026-08-26) —
+# the agent/MCP door pins commerce_surface=agent_api on every get_offers call, so the explicit
+# row is exactly the door that served zero offers in prod on a 100%-external corpus.
+@pytest.mark.parametrize("commerce_surface", [None, "agent_api"])
+def test_offers_resolve_prefers_external_outbound(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface
+) -> None:
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
@@ -103,7 +111,13 @@ def test_offers_resolve_prefers_external_outbound(monkeypatch: pytest.MonkeyPatc
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "SKU_FENTY_001"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {
+                "product": {"sku_id": "SKU_FENTY_001"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+                **({"commerce_surface": commerce_surface} if commerce_surface else {}),
+            },
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -346,8 +360,12 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
     )
 
 
+# The agent_api row pins the identity-retry lane specifically under an explicit surface: the
+# retry used to be conjunct-gated on `allow_external_fallback`, so a strict caller lost it even
+# after the primary external lane was made unconditional.
+@pytest.mark.parametrize("commerce_surface", [None, "agent_api"])
 def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_rebind(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface
 ) -> None:
     import routes.agent_shop_gateway as gateway
 
@@ -422,7 +440,13 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"product_id": "prod_new_gbr"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {
+                "product": {"product_id": "prod_new_gbr"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+                **({"commerce_surface": commerce_surface} if commerce_surface else {}),
+            },
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -443,6 +467,198 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
     )
 
 
+def test_offers_resolve_external_only_product_serves_on_explicit_surface(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The prod symptom this contract exists for (2026-08-26): a product with NO internal
+    offer at all — the whole external_seed corpus — asked for on the agent/MCP door, which
+    pins commerce_surface=agent_api. With no internal match there is no canonical product and
+    no internal identity, so neither retry lane can recover: the PRIMARY external lane must
+    itself run under an explicit surface, or the caller gets zero offers for every seed row."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return [
+                {
+                    "id": "eps_only_1",
+                    "external_product_id": "ext_only_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://seedbrand.example/products/serum",
+                    "canonical_url": "https://seedbrand.example/products/serum",
+                    "domain": "seedbrand.example",
+                    "title": "Seed Brand Serum",
+                    "price_amount": 18.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
+                        "brand": "Seed Brand",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_SEED_1",
+                                "title": "Seed Brand Serum 30ml",
+                                "price_amount": 18.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                    **_VERIFIED_DESTINATION,
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=seedonly"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"sku_id": "SKU_SEED_1"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+                "commerce_surface": "agent_api",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    offers = body.get("offers") or []
+    assert offers, "an external-only product must still yield its outbound offer on the agent surface"
+    assert offers[0]["purchase_route"] == "affiliate_outbound"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("commerce_surface") == "agent_api"
+    assert metadata.get("has_external") is True
+    assert metadata.get("has_internal") is False
+    assert metadata.get("reason_code") == "OK"
+
+
+def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The attached-retry lane (canonical product from the internal offer → attached seeds)
+    must run under an explicit commerce_surface. It carried its own `allow_external_fallback`
+    conjunct, so reverting only that conjunct would pass the primary-lane tests while a strict
+    caller still lost every external offer whose seed is findable only via the internal match."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "attached_product_key IS NOT NULL" in q:
+            return [
+                {
+                    "id": "eps_arm_1",
+                    "external_product_id": "ext_arm_1",
+                    "market": "US",
+                    "tool": "*",
+                    "destination_url": "https://armbrand.example/products/prod-arm-1",
+                    "canonical_url": "https://armbrand.example/products/prod-arm-1",
+                    "domain": "armbrand.example",
+                    "title": "Arm Brand Serum",
+                    "price_amount": 24.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                    "utm_template": None,
+                    "attached_product_key": "merch_arm|shopify|prod_arm_1",
+                    "attached_variant_id": "SKU_ARM_1",
+                    "seed_data": {
+                        "snapshot": dict(_VERIFIED_CONTENT),
+                        "brand": "Arm Brand",
+                        "variants": [
+                            {
+                                "variant_id": "SKU_ARM_1",
+                                "title": "Arm Brand Serum 30ml",
+                                "price_amount": 24.0,
+                                "price_currency": "USD",
+                                "availability": "in_stock",
+                            }
+                        ],
+                    },
+                    "status": "active",
+                    **_VERIFIED_DESTINATION,
+                }
+            ]
+        if "FROM external_product_seeds" in q:
+            # The broad fuzzy lane misses: this seed is only reachable via the attached ref.
+            return []
+        if "FROM product_group_members" in q:
+            return []
+        if "FROM products_cache" in q and "LIMIT 20" in q:
+            # The canonical-context prefetch misses too, so lane 1 has no attached ref to try —
+            # only the post-internal attached retry can surface the seed.
+            return []
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_arm",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_arm_1",
+                    "product_data": {
+                        "id": "prod_arm_1",
+                        "title": "Arm Brand Serum",
+                        "brand": "Arm Brand",
+                        "currency": "USD",
+                        "price": 26.0,
+                        "inventory_quantity": 5,
+                        "variants": [{"id": "SKU_ARM_1", "price": 26.0, "inventory_quantity": 5}],
+                        "merchant_name": "Arm Brand",
+                    },
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=arm"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"product_id": "prod_arm_1"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+                "commerce_surface": "agent_api",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    offers = body.get("offers") or []
+    assert any(offer.get("purchase_route") == "affiliate_outbound" for offer in offers)
+    assert any(offer.get("purchase_route") == "internal_checkout" for offer in offers)
+    metadata = body.get("metadata") or {}
+    assert metadata.get("commerce_surface") == "agent_api"
+    assert metadata.get("has_external") is True
+    assert any(
+        str(source.get("source")) == "external_product_seeds_attached_retry"
+        and str(source.get("status")) == "ok"
+        and str(source.get("query")) == "external_seed_by_canonical_attached_ref"
+        for source in (metadata.get("sources") or [])
+    )
+
+
 def test_offers_resolve_strict_surface_substitutes_same_product_variant(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
@@ -451,7 +667,10 @@ def test_offers_resolve_strict_surface_substitutes_same_product_variant(
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
         if "FROM external_product_seeds" in q:
-            raise AssertionError("strict serving should not query external seeds")
+            # External offers are a first-class source on every surface (founder directive
+            # 2026-08-26): strict mode tightens internal servability, never sourcing. No
+            # seeds exist for this product, so the lane comes back empty — but it must ask.
+            return []
         if "FROM product_group_members" in q:
             return []
         if "FROM products_cache" in q:
@@ -514,7 +733,9 @@ def test_offers_resolve_strict_surface_fails_closed_without_eligible_variant(
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
         if "FROM external_product_seeds" in q:
-            raise AssertionError("strict serving should not query external seeds")
+            # Queried on every surface; empty here so the strict fail-closed path is what
+            # this test still exercises.
+            return []
         if "FROM product_group_members" in q:
             return []
         if "FROM products_cache" in q:
