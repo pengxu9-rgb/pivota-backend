@@ -318,8 +318,16 @@ the sweep observes the served URL.
 The mirrored `catalog_products` rows are withdrawn through the **existing** `suppressed_at`
 control that `routes/pivota_canonical_routes` already honours, not a new serving flag. The
 reason `external_seed_destination_dead` is deliberately **not** added to
-`_TERMINAL_SUPPRESSION_REASONS`: a brand can republish a product, so this is reversible
-containment and must answer 404, never a permanent 410.
+`_TERMINAL_SUPPRESSION_REASONS`: a brand can republish a product, so this containment must
+answer 404, never a permanent 410.
+
+That is a claim about the **status we serve**, not a claim that the lane undoes itself — and
+the first draft of this document elided the difference. **Retirement is one-way today.**
+`get_sweep_candidates` selects `WHERE status = 'active'`, so a retired seed is never observed
+again, and nothing clears `suppressed_at` for this reason (compare
+`services/identity_resolution.REVERT_ROWS_SQL`, which exists to lift a suppression). Reversal
+is an operator action. An automatic un-retire is a resurrection primitive running on evidence a
+bot challenge can forge, so it is a deliberate follow-up rather than an oversight.
 
 **Everything else must be inert.** `unverifiable` — bot challenge, 429, 5xx, DNS, TLS, timeout,
 `robots.txt` — increments a *coverage* metric and **writes no destination fact at all**: not the

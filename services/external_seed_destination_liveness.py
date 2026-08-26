@@ -464,8 +464,25 @@ async def retire_seed_for_dead_destination(
     The mirror is withdrawn through the EXISTING `suppressed_at` control that
     `routes/pivota_canonical_routes` already honours, rather than a new serving flag — the row
     stops being served and the sig answers 404. Deliberately NOT added to
-    `_TERMINAL_SUPPRESSION_REASONS`: a brand can republish a product, so this suppression is
-    reversible and must not be announced as a permanent 410.
+    `_TERMINAL_SUPPRESSION_REASONS`, because a brand can republish a product and this must not
+    be announced to the world as a permanent 410.
+
+    ⚠️ THAT IS A STATEMENT ABOUT THE HTTP STATUS WE SERVE, NOT A CLAIM THAT THE LANE UNDOES
+    ITSELF. Today it does not, and calling it "reversible" without saying so reads as a safety
+    property that is not implemented:
+
+      * `get_sweep_candidates` selects `WHERE status = 'active'`, so a retired seed is never
+        looked at again — if the brand puts the product back, nothing here notices;
+      * nothing clears `suppressed_at` / `suppression_reason` for `SUPPRESSION_REASON`.
+        Compare `services/identity_resolution.REVERT_ROWS_SQL`, which exists precisely so a
+        suppression can be lifted.
+
+    So reversal is an operator action (reactivate the seed, clear the mirror suppression), and
+    the arithmetic that makes that acceptable is the same one that governs the retirement
+    itself: two corroborated confirmed-dead observations a day apart are wrong far less often
+    than a resurrection is common. Giving this lane its own un-retire path is a follow-up, and
+    it needs care — an automatic un-retire is a resurrection primitive, and it would run on the
+    same evidence that a bot challenge can forge.
     """
     stamp = now or _now()
     note = (
