@@ -20,10 +20,18 @@ on:
     branches: [main]
   schedule:
     # Every 4h, not hourly. One undeployed gap is ONE fact; re-reporting it every hour turns a
-    # true alarm into a mailing list. On 2026-08-25 a single 8-hour gap produced 7 scheduled
-    # failure notifications here and 10 more on the gateway - the volume, not the verdict, is
-    # what makes an alarm get muted. :17 still, to stay out of the gateway's :37 slot.
-    - cron: '17 */4 * * *'
+    # true alarm into a mailing list. On 2026-08-25, a day that held two separate undeployed
+    # gaps, this workflow sent 7 scheduled failure notifications and the gateway sent 10 - the
+    # volume, not the verdict, is what makes an alarm get muted. :17 still, to stay out of the
+    # gateway's :37 slot.
+    #
+    # WHY THESE HOURS AND NOT `*/4`. GitHub drops scheduled runs under load, and it drops the
+    # midnight one hardest: across 08-23..08-26, 5 of 59 nominal hourly slots never ran and
+    # THREE of the five were 00:17 - every midnight slot sampled. Losing one slot out of 24
+    # costs an hour; losing one out of six leaves a 20:17-04:17 blind window and pushes
+    # worst-case detection past the "same morning" this file promises. Starting at 02:17 keeps
+    # the 4h cadence and skips the slot GitHub is least likely to deliver.
+    - cron: '17 2,6,10,14,18,22 * * *'
   workflow_dispatch:
 
 permissions:
@@ -32,7 +40,8 @@ permissions:
 env:
   # How long production may lag main before this job goes red. Long enough that a normal
   # merge-then-deploy never trips it; short enough that a forgotten deploy is caught the same
-  # morning. Only applies when production is BEHIND main, never when it has diverged.
+  # working day - not the same morning, since grace plus a cron interval can now reach ~9h.
+  # Only applies when production is BEHIND main, never when it has diverged.
   #
   # 120 was too twitchy for how this repo actually merges. Measured over the 14 days to
   # 2026-08-25, the span from a day's first merge to its last was a MEDIAN of 13.7h (p75 17.4h,
@@ -45,6 +54,10 @@ env:
   # #1865 (an anonymous admin-JWT escalation fix) would have gone entirely unreported. The
   # alarm is the only reason anyone looked. 240 still catches that gap; it just stops shouting
   # about a merge from ninety minutes ago.
+  #
+  # Worst case to detection is grace + one cron interval = 8h, plus however late GitHub actually
+  # runs the job: measured on this workflow the schedule arrives a median of 36 minutes past the
+  # nominal minute (p90 51m), so the real ceiling is ~9h, not 8.
   GRACE_MINUTES: '240'
 
 jobs:
