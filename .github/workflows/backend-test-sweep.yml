@@ -67,6 +67,14 @@ on:
       - 'infra/**'
       - 'main.py'
       - 'requirements*.txt'
+      # Same shape, one directory over: tests/test_no_scheduled_workflow_reaches_cloud_sql.py
+      # parses EVERY workflow off disk to stop a new scheduled lane from being
+      # given a production DSN a GitHub runner cannot route to. Adding such a
+      # workflow is by nature a .github-only diff, so without this the ratchet
+      # is collected and never runs for the one change class it guards.
+      # A superset of the line below; both are kept because the narrow one
+      # states its own reason and the two are read separately.
+      - '.github/workflows/**'
       - '.github/workflows/backend-test-sweep.yml'
   push:
     branches: [main]
