@@ -292,11 +292,17 @@ async def main() -> int:
 
     print(json.dumps(report, indent=2, sort_keys=True))
 
-    # Emitted at WARNING so it carries a severity into Cloud Logging, where this
-    # sweep now runs. The GitHub workflow had a dedicated step that turned a
-    # non-zero `replacements` into a `::warning` in the run summary; deleting the
-    # workflow would otherwise have dropped that signal onto the floor, leaving
-    # it visible only to whoever thought to read a JSON blob at INFO.
+    # The GitHub workflow had a dedicated step turning a non-zero `replacements`
+    # into a `::warning` in the run summary; deleting the workflow would have
+    # dropped that signal onto the floor, leaving it visible only to whoever
+    # thought to read a JSON blob.
+    #
+    # On the SEVERITY this actually lands at, because it is not the one the
+    # level name suggests: logging.basicConfig installs a StreamHandler on
+    # STDERR, and Cloud Run maps unstructured stderr to ERROR. So these lines
+    # arrive as ERROR while the JSON report printed to stdout arrives as INFO.
+    # Louder than intended and harmless, but a log-based alert keyed on
+    # severity=WARNING for this job would match nothing — alert on ERROR.
     #
     # Every replacement is a LIVE URL moving. On a healthy corpus this is zero;
     # non-zero means either a winner genuinely stopped being a candidate or

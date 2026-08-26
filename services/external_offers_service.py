@@ -1200,6 +1200,19 @@ def _extract_long_description_from_html(html: str) -> Optional[str]:
     return None
 
 
+def _mark_from_cache(observed: Optional[Dict[str, Any]]) -> None:
+    """Record that the snapshot being returned came from the CACHE, not from this request.
+
+    `observed` is an out-parameter, and its `status_code` says only that a response arrived —
+    not that the snapshot the caller receives was built from it. Anything that needs to know
+    "did we actually re-read this page" (a freshness stamp, a gate that clears a serving
+    blocker) must consult this, because a post-response failure leaves `status_code` set and
+    still hands back the previous row.
+    """
+    if observed is not None:
+        observed["from_cache"] = True
+
+
 class ExternalOfferUnavailable(RuntimeError):
     """The ORIGIN answered, and its answer was "not here".
 
@@ -1507,6 +1520,7 @@ async def resolve_external_offer(
     force_refresh: bool = False,
     raise_on_unavailable: bool = False,
     observed: Optional[Dict[str, Any]] = None,
+    max_wait: Optional[float] = None,
 ) -> ExternalOfferSnapshot:
     """Resolve (and opportunistically refresh) the offer snapshot for a third-party URL.
 
@@ -1528,7 +1542,15 @@ async def resolve_external_offer(
 
     # Try to refresh (best-effort). If refresh fails, return existing cached value.
     try:
-        html, _ct = await _fetch_html(url_norm, observed=observed)
+        # `max_wait` IS THE CALLER'S PATIENCE, and this function had no way to express it.
+        # `_fetch_html` documents the rule: the default ceiling exists for the LIVE route, and
+        # a BATCH job must pass 0 (unbounded) or the backoff curve above ~16s becomes
+        # unreachable -- `await_slot` refuses instead of waiting, the refusal is swallowed as
+        # a generic failure, and one throttled host voids the rest of its own rows in
+        # milliseconds while looking like the host was down. The sibling destination sweep
+        # passes 0 explicitly; until now the content refresh could not, because there was no
+        # parameter between it and here. Default None keeps the live route exactly as it was.
+        html, _ct = await _fetch_html(url_norm, observed=observed, max_wait=max_wait)
         extracted = _extract_from_html(url_norm, html)
 
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)
@@ -1607,14 +1629,24 @@ async def resolve_external_offer(
         if raise_on_unavailable:
             raise
         if existing:
+            _mark_from_cache(observed)
             return _row_to_snapshot(existing)
         raise
     except Exception:
         if existing:
+            # A CACHED ROW IS NOT A READING, AND `observed` CANNOT SHOW THAT ON ITS OWN.
+            # `_fetch_html` stamps `observed["status_code"]` BEFORE it returns, so every
+            # failure AFTER the response — the extractor, the snapshot upsert, the post-write
+            # re-read — lands here with `observed` already populated and the CACHED snapshot
+            # going back to the caller. A caller checking only `status_code` would conclude it
+            # had just re-read a page it never parsed. Say so explicitly instead.
+            _mark_from_cache(observed)
             return _row_to_snapshot(existing)
         raise
 
-    # Fallback: should never happen, but keep function total.
+    # Fallback: should never happen, but keep function total. Same reasoning as above: the
+    # post-write re-read returning None reaches here with a populated `observed`.
     if existing:
+        _mark_from_cache(observed)
         return _row_to_snapshot(existing)
     raise ValueError("FETCH_FAILED")

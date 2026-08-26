@@ -134,11 +134,68 @@ Must report `"replacements": 0` and `"new_elections": 0`. A steady-state sweep
 over an unchanged corpus writes nothing; if it does not, something upstream is
 flapping `renderable` and that is the bug to chase, not this.
 
-From here on the sweep runs itself: the `content-canonical-election` **Cloud Run
-Job**, triggered by the `content-canonical-election-cron` Cloud Scheduler entry
-every 6h at :52 UTC, auto-applying and logging a WARNING whenever a live URL
-moves. It elects newly-arrived content_keys and re-elects only where the stored
-winner has stopped being a candidate.
+Once provisioned (below), the sweep runs itself: the `content-canonical-election`
+**Cloud Run Job**, triggered by the `content-canonical-election-cron` Cloud
+Scheduler entry every 6h at :52 UTC, auto-applying and logging every moved URL
+individually. It elects newly-arrived content_keys and re-elects only where the
+stored winner has stopped being a candidate.
+
+**Provisioning — do NOT just run `setup_scheduler.sh` against prod.**
+
+`infra/gcp/setup_scheduler.sh` is the source of truth for what this Job SHOULD
+look like, but as of 2026-08-26 there is no invocation of it that is safe against
+live prod. Verified against the running project:
+
+- `PAUSED=0` is **refused outright** (`exit 2`, lines 83-91) whenever
+  `STORE_AUDIT_UCP_REPROBE_WORKER` or `STORE_AUDIT_COMMERCE_REPROBE_WORKER` is
+  `true` — and both must be `true`, because their `else` branches are *idempotent
+  disarms* that pause the four live `store-audit-*` triggers.
+- `PAUSED=1` (the default) makes `sched()` pause every trigger it touches, which
+  includes the currently-ENABLED `relgraph-sync-cron` and the per-minute
+  `reviews-invitation-send-cron`.
+- Omitting `WORKERS=true` redeploys `worker` with `AUDIT_WORKER_ENABLED=false`.
+
+So the bare command in the drift alarm's output is a prod outage of every
+scheduled lane, and the "correct" flag set is refused. Until the script grows a
+way to reconcile ONE entry, provision by hand from the block in
+`setup_scheduler.sh` — the same way the #1887 jobs were created — and keep the
+script as the written record:
+
+```bash
+gcloud run jobs create content-canonical-election \
+  --region us-west1 --project pivota-prod \
+  --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:<backend-sha> \
+  --service-account sa-worker@pivota-prod.iam.gserviceaccount.com \
+  --network default --subnet default --vpc-egress all-traffic \
+  --max-retries 1 --task-timeout 900s --cpu 1 --memory 2Gi \
+  --labels env=prod,managed-by=infra-gcp \
+  --set-secrets DATABASE_URL=DATABASE_URL:latest \
+  --set-env-vars PIVOTA_ENV=production,PIVOTA_SERVICE_NAME=content-canonical-election,PIVOTA_COMMIT_SHA=<backend-sha>,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2,INDEX_ELIGIBLE_SITEMAP=1 \
+  --command python \
+  --args scripts/elect_content_canonicals.py,--apply,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml
+```
+
+**Execute it once by hand as a DRY RUN and read the report before creating the
+trigger** — the baked args include `--apply`, so the override is what makes it dry:
+
+```bash
+gcloud run jobs execute content-canonical-election --region us-west1 --project pivota-prod --wait \
+  --args 'scripts/elect_content_canonicals.py,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml'
+```
+
+Expect `replacements: 0` and `moved_from_sitemap: 0` on a converged corpus. A
+large `moved_from_sitemap` means the stored election disagrees with what the
+sitemap advertises today — stop and read it, because every one of those is a live
+URL that will move on the first applied run. Then:
+
+```bash
+gcloud scheduler jobs create http content-canonical-election-cron \
+  --location us-west1 --project pivota-prod \
+  --schedule '52 */6 * * *' --time-zone Etc/UTC --http-method POST \
+  --uri 'https://us-west1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/pivota-prod/jobs/content-canonical-election:run' \
+  --oauth-service-account-email sa-worker@pivota-prod.iam.gserviceaccount.com \
+  --attempt-deadline 1800s
+```
 
 It ran as `.github/workflows/content-canonical-election.yml` until 2026-08-26.
 That lane is gone and cannot come back: Cloud SQL `pivota-pg` has no public IP,
@@ -150,9 +207,20 @@ To read a run:
 
 ```bash
 gcloud logging read \
-  'resource.type=cloud_run_job AND resource.labels.job_name=content-canonical-election' \
-  --project pivota-prod --limit 200 --freshness 7d
+  'resource.type=cloud_run_job AND resource.labels.job_name=content-canonical-election
+   AND textPayload:*' \
+  --project pivota-prod --limit 1000 --freshness 7d
 ```
+
+The report is `json.dumps(indent=2)` and Cloud Logging makes one entry per LINE, so
+a seeded run with a full `moved_from_sitemap_detail` can exceed 250 entries on its
+own — a smaller `--limit` silently truncates the run you are trying to read.
+
+Note the severity: `elect_content_canonicals.py` logs via `logging.basicConfig`,
+whose handler writes to **stderr**, and Cloud Run maps unstructured stderr to
+**ERROR**. So the moved-URL lines land at ERROR (louder than the WARNING they are
+emitted at) while the JSON report on stdout lands at INFO. Alert on ERROR for this
+job; a log-based alert keyed on `severity=WARNING` matches nothing.
 
 To run one by hand — dry-run first, since the Job's baked args include `--apply`:
 
