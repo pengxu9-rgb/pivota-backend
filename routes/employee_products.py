@@ -4919,6 +4919,19 @@ async def _refresh_external_seed_by_id(
         "canonical_url": canonical_url,
         "domain": domain,
         "seed_data": seed_data,
+        # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
+        # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
+        # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and
+        # now a `CrawlDelayTooLong` skip — falls into its generic `except Exception`, which
+        # hands back the CACHED snapshot. This whole success path then runs having contacted
+        # nobody, and the batch counts the row as `refreshed`.
+        #
+        # The freshness guards already hold (`observed["status_code"] is None` withholds
+        # `last_crawled_at`, `destination_checked_at` and the verdict), so nothing is
+        # fabricated. What was missing is any signal an OPERATOR can see: a run in which a
+        # hostile robots.txt voided every row reported exactly like a complete one. Same
+        # reasoning as `stopped_early`/`skipped_for_budget` on the batch summary.
+        "snapshot_from_cache": bool(observed.get("from_cache")),
         # Drift report. The batch runner sums these so "we re-crawled N seeds" can
         # be stated as "N re-crawled, M prices actually moved" — the difference is
         # the whole point of the refresh existing.

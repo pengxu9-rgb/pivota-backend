@@ -22,6 +22,7 @@ both callers unbounded would be a regression on the interactive route, not a fix
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -169,17 +170,24 @@ def test_the_job_hands_the_batch_its_unbounded_callback(monkeypatch: pytest.Monk
 
     captured: Dict[str, Any] = {}
 
-    async def fake_batch(*, refresh_seed_by_id, limit):
+    async def fake_batch(*, refresh_seed_by_id, limit, **kwargs):
         captured["callback"] = refresh_seed_by_id
         captured["limit"] = limit
+        captured.update(kwargs)
         return {"status": "success"}
 
     monkeypatch.setattr(job, "run_external_referral_refresh_batch", fake_batch)
-    asyncio.run(job.run_daily_external_referral_refresh(limit=7))
+    asyncio.run(job.run_daily_external_referral_refresh(limit=7, budget_seconds=123.0))
 
     assert captured["limit"] == 7
     assert captured["callback"] is job._refresh_unbounded, (
         "the batch must get the unbounded callback, not the raw refresh"
+    )
+    # The wall-clock budget is the OTHER half of what makes unbounded patience safe to schedule;
+    # a job that accepts `--budget-seconds` and then drops it on the floor is worse than one
+    # that never offered the flag.
+    assert captured.get("budget_seconds") == 123.0, (
+        f"the run's wall-clock budget must reach the batch, got {captured.get('budget_seconds')!r}"
     )
 
 
@@ -234,3 +242,282 @@ def test_the_patience_reaches_crawl_politeness_itself(
             f"expected max_wait={patience!r} to reach crawl_politeness.before_request, "
             f"got {seen[-1].get('max_wait')!r}"
         )
+
+
+# ------------------------------------------------------- the OTHER half: bounding the RUN
+#
+# `max_wait=0` makes every row willing to wait; nothing made the RUN willing to stop. With
+# `CRAWL_MAX_BACKOFF_SECONDS` at 300s, `limit=500` rows against a persistently-429ing host is a
+# worst case near 41 hours — no hostile robots.txt required. `crawl_politeness`'s
+# `CRAWL_MAX_ROBOTS_DELAY_SECONDS` bounds what one ROW can cost; only this bounds the run.
+
+
+class _FakeClock:
+    """A monotonic clock the test advances, so the budget is exercised without sleeping."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+def _run_batch_with_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candidates: List[str],
+    seconds_per_row: float,
+    budget_seconds: Optional[float],
+) -> Dict[str, Any]:
+    from services import external_referral_readiness as module
+
+    clock = _FakeClock()
+    refreshed: List[str] = []
+
+    async def fake_candidates(*, limit: int) -> List[str]:
+        return list(candidates)
+
+    async def fake_refresh(seed_id: str) -> Dict[str, Any]:
+        refreshed.append(seed_id)
+        clock.t += seconds_per_row
+        return {"status": "success", "seed_id": seed_id}
+
+    monkeypatch.setattr(
+        module, "get_external_referral_refresh_candidate_seed_ids", fake_candidates
+    )
+    # SWAP THE MODULE REFERENCE, NEVER `module.time.monotonic`. `module.time` IS the stdlib
+    # `time` module object, so `setattr(module.time, "monotonic", ...)` freezes
+    # `time.monotonic` PROCESS-WIDE — and `asyncio.BaseEventLoop.time()` returns
+    # `time.monotonic()`, so the event loop's timer clock freezes with it. These rows arm no
+    # timer today and so pass either way; the first `await` with a timeout added anywhere
+    # inside `run_external_referral_refresh_batch` would then HANG FOREVER instead of failing,
+    # and pytest.ini has no `pytest-timeout` to cut it off. Same hazard, same fix, as
+    # `_patch_sleep` in tests/test_crawl_politeness.py.
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+    summary = asyncio.run(
+        module.run_external_referral_refresh_batch(
+            refresh_seed_by_id=fake_refresh,
+            limit=len(candidates),
+            budget_seconds=budget_seconds,
+        )
+    )
+    summary["_refreshed"] = refreshed
+    return summary
+
+
+def test_the_batch_stops_starting_rows_once_its_budget_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _run_batch_with_clock(
+        monkeypatch,
+        candidates=[f"eps_{i}" for i in range(10)],
+        seconds_per_row=100.0,
+        budget_seconds=250.0,
+    )
+
+    # Rows 1 and 2 start inside the budget (elapsed 0 and 100); row 3 starts at 200, still
+    # inside; row 4 would start at 300 and does not.
+    assert summary["_refreshed"] == ["eps_0", "eps_1", "eps_2"], summary["_refreshed"]
+    assert summary["stopped_early"] is True
+    assert summary["skipped_for_budget"] == 7
+
+
+def test_a_run_that_fits_its_budget_is_not_reported_as_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative case. A `stopped_early` that is always True would pass the row above and
+    make the flag meaningless."""
+    summary = _run_batch_with_clock(
+        monkeypatch,
+        candidates=["eps_0", "eps_1"],
+        seconds_per_row=1.0,
+        budget_seconds=3600.0,
+    )
+    assert summary["_refreshed"] == ["eps_0", "eps_1"]
+    assert summary["stopped_early"] is False
+    assert summary["skipped_for_budget"] == 0
+
+
+def test_a_budget_stop_is_visible_in_the_summary_not_just_a_shorter_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent truncation reads EXACTLY like a completed sweep: `candidate_count` 10,
+    `refreshed` 3, and nothing to say the other 7 were never attempted. Whoever arms the
+    scheduler reads this summary, so the shortfall has to be in it."""
+    summary = _run_batch_with_clock(
+        monkeypatch,
+        candidates=[f"eps_{i}" for i in range(10)],
+        seconds_per_row=100.0,
+        budget_seconds=250.0,
+    )
+    assert summary["candidate_count"] == 10
+    assert summary["refreshed"] == 3
+    assert summary["budget_seconds"] == 250.0
+    assert summary["refreshed"] + summary["skipped_for_budget"] == summary["candidate_count"]
+
+
+def test_the_budget_can_be_disabled_and_falls_back_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`0` disables it outright; an unset `budget_seconds` reads the env, so an operator can
+    retune a scheduled run without a deploy."""
+    summary = _run_batch_with_clock(
+        monkeypatch,
+        candidates=[f"eps_{i}" for i in range(5)],
+        seconds_per_row=10_000.0,
+        budget_seconds=0,
+    )
+    assert summary["_refreshed"] == [f"eps_{i}" for i in range(5)]
+    assert summary["stopped_early"] is False
+
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS", "150")
+    summary = _run_batch_with_clock(
+        monkeypatch,
+        candidates=[f"eps_{i}" for i in range(5)],
+        seconds_per_row=100.0,
+        budget_seconds=None,
+    )
+    assert summary["budget_seconds"] == 150.0
+    assert summary["_refreshed"] == ["eps_0", "eps_1"], summary["_refreshed"]
+
+
+# --------------------------------- a "success" that never contacted the origin must SAY so
+#
+# `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
+# `except ExternalOfferUnavailable` arm (services/external_offers_service.py). A timeout, a TLS
+# error, `RobotsDisallowed`, and now a `CrawlDelayTooLong` skip all land in its generic
+# `except Exception`, which returns the CACHED snapshot — so `_refresh_external_seed_by_id`
+# runs its whole success path having contacted nobody and the batch counts the row as
+# `refreshed`. The freshness guards hold (nothing is fabricated), but without a counter a run
+# in which a hostile robots.txt voided every row reads exactly like a complete one.
+
+
+def test_rows_served_from_cache_are_counted_separately_from_real_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services import external_referral_readiness as module
+
+    async def fake_candidates(*, limit: int) -> List[str]:
+        return ["eps_read", "eps_cached", "eps_read_2"]
+
+    async def fake_refresh(seed_id: str) -> Dict[str, Any]:
+        return {
+            "status": "success",
+            "seed_id": seed_id,
+            "snapshot_from_cache": seed_id == "eps_cached",
+        }
+
+    monkeypatch.setattr(
+        module, "get_external_referral_refresh_candidate_seed_ids", fake_candidates
+    )
+    summary = asyncio.run(
+        module.run_external_referral_refresh_batch(refresh_seed_by_id=fake_refresh, limit=3)
+    )
+
+    assert summary["refreshed"] == 3
+    assert summary["refreshed_from_cache"] == 1, (
+        "a paced-out/robots/timeout row takes the success path on cached data; the summary "
+        "must say how many, or the run is indistinguishable from a complete one"
+    )
+
+
+def test_the_cache_counter_stays_zero_when_every_row_really_was_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative case. A counter that always fires is as useless as one that never does."""
+    from services import external_referral_readiness as module
+
+    async def fake_candidates(*, limit: int) -> List[str]:
+        return ["eps_a", "eps_b"]
+
+    async def fake_refresh(seed_id: str) -> Dict[str, Any]:
+        return {"status": "success", "seed_id": seed_id, "snapshot_from_cache": False}
+
+    monkeypatch.setattr(
+        module, "get_external_referral_refresh_candidate_seed_ids", fake_candidates
+    )
+    summary = asyncio.run(
+        module.run_external_referral_refresh_batch(refresh_seed_by_id=fake_refresh, limit=2)
+    )
+    assert summary["refreshed"] == 2
+    assert summary["refreshed_from_cache"] == 0
+
+
+def test_the_refresh_reports_whether_the_snapshot_came_from_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE DELIVERING HOP. The counter above is only as good as the flag feeding it, and that
+    flag is set in `routes/employee_products._refresh_external_seed_by_id` from the `observed`
+    out-parameter `resolve_external_offer` stamps. Dropping it there leaves the batch counting
+    every skipped row as a real refresh while every test above stays green."""
+    import routes.employee_products as mod
+
+    async def fake_fetch_one(_q, values=None):
+        return {
+            "id": "eps_pace_1",
+            "market": "US",
+            "tool": "*",
+            "destination_url": "https://brand.com/products/toner",
+            "canonical_url": "https://brand.com/products/toner",
+            "domain": "brand.com",
+            "seed_data": {"snapshot": {}},
+            "status": "active",
+            "price_amount": 28.0,
+            "price_currency": "USD",
+        }
+
+    async def fake_resolve(*, observed=None, **kwargs):
+        # Exactly what resolve_external_offer does when the gate refuses and a cached row
+        # exists: mark the out-parameter and hand back the previous snapshot.
+        if observed is not None:
+            observed["from_cache"] = True
+        return SimpleNamespace(
+            canonical_url="https://brand.com/products/toner",
+            domain="brand.com",
+            title="cached",
+            image_url=None,
+            price_amount=28.0,
+            price_currency="USD",
+            availability="in_stock",
+            evidence={},
+        )
+
+    monkeypatch.setattr(mod, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(mod.database, "execute", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "_execute_seed_data_stmt", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "_stamp_crawl_attempt", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "resolve_external_offer", fake_resolve)
+
+    result = asyncio.run(mod._refresh_external_seed_by_id("eps_pace_1", max_wait=0))
+
+    assert result["status"] == "success", "pre-existing behaviour, pinned so the change is visible"
+    assert result["snapshot_from_cache"] is True, (
+        "this row never contacted the origin and must say so"
+    )
+    assert result["destination_refresh"]["reason"] == "no_origin_response"
+
+
+def test_a_non_finite_budget_falls_back_instead_of_poisoning_the_json_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`argparse type=float` accepts `nan` and `inf`. NaN silently disables the budget
+    (`budget > 0` is False) while `stopped_early` still reports False, and it reaches
+    `json.dumps` in the job's `main`, which emits a bare `NaN` — not valid JSON."""
+    import json
+
+    from services import external_referral_readiness as module
+
+    for bad in (float("nan"), float("inf"), float("-inf"), "nan", "abc", None):
+        resolved = module._refresh_budget_seconds(bad)
+        assert resolved == module.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS, (
+            f"{bad!r} resolved to {resolved!r}"
+        )
+        json.dumps({"budget_seconds": resolved}, allow_nan=False)
+
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS", "nan")
+    assert (
+        module._refresh_budget_seconds(None)
+        == module.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    )

@@ -12,7 +12,7 @@ private-IP only, so a runner has no route to the database (`tests/test_run_oneof
 
 Usage:
 
-    python3 -m jobs.external_referral_refresh --limit 500
+    python3 -m jobs.external_referral_refresh --limit 500 [--budget-seconds 3300]
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import argparse
 import asyncio
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
@@ -43,20 +43,41 @@ async def _refresh_unbounded(seed_id: str) -> Dict[str, Any]:
     `max_wait=0` disables the ceiling (`crawl_politeness.before_request`: the refusal is
     guarded on `ceiling > 0`). The pacing itself is unchanged — we still wait our turn; we
     simply stop giving up on the turn. The sibling destination sweep already does this.
+
+    UNBOUNDED PATIENCE IS NOT UNBOUNDED TIME, and it used to be. `max_wait=0` removed the only
+    ceiling that ever clamped a host's `Crawl-delay`, so one host serving `Crawl-delay: 86400`
+    made a single row sleep 24h and pushed every remaining row on that host a day out.
+    `CRAWL_MAX_ROBOTS_DELAY_SECONDS` now bounds what any ONE row here can cost, and
+    `--budget-seconds` bounds the run. Both are prerequisites for ever putting this job on a
+    schedule.
     """
     return await _refresh_external_seed_by_id(seed_id, max_wait=0)
 
 
-async def run_daily_external_referral_refresh(*, limit: int = 500) -> Dict[str, Any]:
+async def run_daily_external_referral_refresh(
+    *, limit: int = 500, budget_seconds: Optional[float] = None
+) -> Dict[str, Any]:
     return await run_external_referral_refresh_batch(
         refresh_seed_by_id=_refresh_unbounded,
         limit=limit,
+        budget_seconds=budget_seconds,
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh active external referral seeds for runtime gating.")
     parser.add_argument("--limit", type=int, default=500, help="Maximum number of referral seeds to refresh")
+    parser.add_argument(
+        "--budget-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Wall-clock ceiling for the run; stop starting rows once it is spent. "
+            "Defaults to EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS, then to "
+            "services.external_referral_readiness.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS. "
+            "0 disables it."
+        ),
+    )
     args = parser.parse_args()
 
     # THE POOL DOES NOT EXIST UNTIL SOMEONE OPENS IT. Inside the API process the lifespan hook
@@ -69,7 +90,9 @@ def main() -> int:
     async def _run() -> Dict[str, Any]:
         await database.connect()
         try:
-            return await run_daily_external_referral_refresh(limit=args.limit)
+            return await run_daily_external_referral_refresh(
+                limit=args.limit, budget_seconds=args.budget_seconds
+            )
         finally:
             await database.disconnect()
 

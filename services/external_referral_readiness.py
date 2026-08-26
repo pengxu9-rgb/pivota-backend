@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -1533,12 +1536,63 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
     return (attached_ids + domain_unattached_ids)[:normalized_limit]
 
 
+# The wall-clock ceiling for one refresh run, and it is not a nicety. Every row here is a
+# politeness-gated fetch of a third-party storefront, and the gate can legitimately sleep for
+# minutes: `CRAWL_MAX_BACKOFF_SECONDS` alone is 300s, so `limit=500` rows against a
+# persistently-429ing host is a worst case near 41 hours WITHOUT any hostile robots.txt in the
+# picture. `crawl_politeness`'s `CRAWL_MAX_ROBOTS_DELAY_SECONDS` bounds what any ONE row can
+# cost; only a budget bounds what the RUN costs.
+#
+# Default sits under the 3600s Cloud Run task timeout its sibling sweep documents
+# (`services/external_seed_destination_liveness.SWEEP_HOST_CONCURRENCY`) so the run prints its
+# own summary instead of being killed mid-row with nothing to show for it.
+EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS = 3300.0
+
+
+def _refresh_budget_seconds(explicit: Optional[float]) -> float:
+    """Resolve the run's wall-clock budget. `<= 0` disables it (and says so in the summary).
+
+    NON-FINITE FALLS BACK TO THE DEFAULT rather than through. `argparse type=float` accepts
+    `nan` and `inf`, and either would (a) silently disable the budget, since `budget > 0` is
+    False for NaN, while the summary still reported `stopped_early: false`, and (b) reach
+    `json.dumps` in `jobs/external_referral_refresh.main`, which emits a bare `NaN` that is
+    not valid JSON for any downstream parser.
+    """
+    def _finite(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    if explicit is not None:
+        resolved = _finite(explicit)
+        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS")
+    if raw is None or not str(raw).strip():
+        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    resolved = _finite(raw)
+    return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
+
+
 async def run_external_referral_refresh_batch(
     *,
     refresh_seed_by_id: Callable[[str], Awaitable[Dict[str, Any]]],
     limit: int = 500,
+    budget_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(limit=limit)
+    budget = _refresh_budget_seconds(budget_seconds)
+    started = time.monotonic()
+    skipped_for_budget = 0
+    stopped_early = False
+    # A "success" that never contacted the origin. `resolve_external_offer` honours
+    # `raise_on_unavailable` only for `ExternalOfferUnavailable`; a timeout, TLS error,
+    # `RobotsDisallowed`, or a `CrawlDelayTooLong` skip returns the CACHED snapshot instead,
+    # and this loop counts that row as `refreshed`. Without this counter a run in which a
+    # hostile robots.txt voided every row is indistinguishable from a complete one — the same
+    # failure mode `stopped_early` exists to prevent.
+    refreshed_from_cache = 0
     refreshed = 0
     degraded = 0
     failed = 0
@@ -1566,12 +1620,29 @@ async def run_external_referral_refresh_batch(
     # offer shape — a different problem with a different fix.
     price_skipped_non_positive = 0
     availability_changed = 0
-    for seed_id in candidate_seed_ids:
+    for index, seed_id in enumerate(candidate_seed_ids):
+        # CHECKED BEFORE THE ROW, not after: the point is to stop STARTING work, and a check
+        # after the call would still pay one more full row past the budget. It cannot interrupt
+        # a row already in flight either, so the true ceiling is `budget` plus the cost of the
+        # single slowest row — bounded, since `crawl_politeness` now caps what one row can cost.
+        if budget > 0 and (time.monotonic() - started) >= budget:
+            stopped_early = True
+            skipped_for_budget = len(candidate_seed_ids) - index
+            # LOUD, because a silent truncation reads exactly like a completed sweep: the
+            # summary would otherwise show a smaller `refreshed` with no reason attached.
+            logger.warning(
+                "external referral refresh hit its %.0fs wall-clock budget after %d/%d rows; "
+                "%d candidates left unrefreshed this run",
+                budget, index, len(candidate_seed_ids), skipped_for_budget,
+            )
+            break
         try:
             result = await refresh_seed_by_id(seed_id)
             status = str(result.get("status") or "success")
             if status == "success":
                 refreshed += 1
+                if result.get("snapshot_from_cache"):
+                    refreshed_from_cache += 1
                 # isinstance, not truthiness: a truthy non-dict here used to raise
                 # INSIDE the try and land the same seed in BOTH `refreshed` and
                 # `failed`, which is a worse outcome than an uncounted drift report.
@@ -1602,11 +1673,28 @@ async def run_external_referral_refresh_batch(
         except Exception as exc:
             failed += 1
             errors.append({"seed_id": seed_id, "status": "failed", "error": str(exc)[:300]})
+    if refreshed_from_cache:
+        logger.warning(
+            "external referral refresh: %d/%d rows counted as refreshed came from the cached "
+            "snapshot without reaching the origin (paced-out host, robots, timeout or TLS)",
+            refreshed_from_cache, refreshed,
+        )
     return {
         "status": "success" if failed == 0 else "degraded",
         "gating_policy_version": EXTERNAL_REFERRAL_GATING_POLICY_VERSION,
         "candidate_count": len(candidate_seed_ids),
+        # `candidate_count` is what we INTENDED to refresh, so on a budget stop it and
+        # `refreshed + degraded + failed` no longer agree. These three say why, rather than
+        # leaving a short run looking like a complete one.
+        "stopped_early": stopped_early,
+        "budget_seconds": budget,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "skipped_for_budget": skipped_for_budget,
         "refreshed": refreshed,
+        # SUBSET of `refreshed`, not a separate bucket: these rows took the success path on a
+        # cached snapshot without reaching the origin. `refreshed - refreshed_from_cache` is
+        # the number of seeds this run actually re-read.
+        "refreshed_from_cache": refreshed_from_cache,
         "degraded": degraded,
         "failed": failed,
         "price_changed": price_changed,

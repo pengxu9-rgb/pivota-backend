@@ -10,6 +10,8 @@ before any job is deployed onto that subnet.
 WHAT IT GUARANTEES, per host:
   * at most one request every `CRAWL_MIN_INTERVAL_SECONDS` (default 1.0), or the host's own
     robots.txt `Crawl-delay` if that is longer — we take the more generous of the two, never ours;
+  * no request AT ALL to a host asking for more than `CRAWL_MAX_ROBOTS_DELAY_SECONDS`
+    (default 300) between requests — that host is skipped for the run, never crawled faster;
   * no request at all to a path the host's robots.txt disallows for our User-Agent;
   * exponential backoff after 429/503, honouring `Retry-After` when the host sends one.
 
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -48,6 +51,18 @@ _ROBOTS_TTL_DEFAULT = 3600.0
 _ROBOTS_TIMEOUT_DEFAULT = 5.0
 _BACKOFF_BASE_DEFAULT = 2.0
 _MAX_BACKOFF_DEFAULT = 300.0
+_MAX_WAIT_DEFAULT = 10.0
+# The longest `Crawl-delay` we will honour by WAITING. Deliberately the same number as
+# `_MAX_BACKOFF_DEFAULT`, because it is the same policy: `note_response` already clamps a host's
+# stated `Retry-After` at `CRAWL_MAX_BACKOFF_SECONDS` so a host cannot stall the lane
+# indefinitely, and `Crawl-delay` was the one host-stated wait with no ceiling at all.
+#
+# THE TWO CLAMPS RESOLVE OPPOSITE WAYS, and that asymmetry is the point. An over-long
+# `Retry-After` is clamped and we then crawl at the clamped rate — defensible, because
+# `Retry-After` is a transient "not right now". An over-long `Crawl-delay` is a STANDING request
+# about our crawl rate, so clamping it and crawling anyway would be crawling faster than the host
+# asked. We skip the host for this run instead (`CrawlDelayTooLong`) and record why.
+_MAX_ROBOTS_DELAY_DEFAULT = 300.0
 _MAX_ROBOTS_REDIRECTS = 3
 _MAX_ROBOTS_BYTES = 512 * 1024
 # Both caches are keyed by a hostname that reaches us from an UNAUTHENTICATED body
@@ -67,6 +82,25 @@ class CrawlPaced(RuntimeError):
     the host still never sees a request faster than its stated rate.
 
     A batch job that genuinely wants to wait passes `max_wait=0` (unbounded).
+    """
+
+
+class CrawlDelayTooLong(CrawlPaced):
+    """This host asks for a `Crawl-delay` longer than we are willing to serialise a batch on.
+
+    A SUBCLASS OF `CrawlPaced` ON PURPOSE: every caller already treats "we did not get a slot"
+    as "skip this row, keep the cached data, record nothing about the product", which is exactly
+    the right handling here too. The distinct type exists so a caller that wants to log the
+    REASON — or a future scheduler that wants to drop the host from the run entirely rather than
+    re-deciding per row — can tell it apart from an ordinary queue-too-long refusal.
+
+    Raised BEFORE the slot reservation in `await_slot`. Capping the sleep alone would be a
+    non-fix: the reservation is what writes `next_allowed`, so a host advertising
+    `Crawl-delay: 86400` would still push every remaining row on that host a full day out even
+    if this one row declined to sleep.
+
+    NOT a licence to crawl faster. The host asked for a rate we will not sustain, so we do not
+    fetch it at all this run.
     """
 
 
@@ -217,6 +251,16 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
             try:
                 raw_delay = parser.crawl_delay(user_agent)
                 delay = float(raw_delay) if raw_delay is not None else None
+                # NaN would defeat the `Crawl-delay` cap in `await_slot` silently: every
+                # comparison against it is False, so it would slip past the ceiling check and
+                # then poison `next_allowed` (`start + nan` is nan, and `max(now, nan)` is nan
+                # forever after) for every later caller on this host. `inf` deliberately does
+                # NOT get this treatment — it is a finite question with an answer, and the cap
+                # refuses it. Today's stdlib parser gates on `isdigit()` so neither value can
+                # actually reach here; this is a guard on a value that is not ours, not a fix
+                # for an observed bug.
+                if delay is not None and math.isnan(delay):
+                    delay = None
             except Exception:  # noqa: BLE001 - a malformed Crawl-delay is not a reason to stop
                 delay = None
         # Any non-200 (404 = no robots, 5xx = could not ask) caches as "nothing to obey".
@@ -262,12 +306,23 @@ async def robots_allows(url: str, *, user_agent: str) -> bool:
         return True
 
 
+def _robots_delay_cap() -> float:
+    """Longest `Crawl-delay` we will wait out. `<= 0` disables the cap entirely."""
+    return _f("CRAWL_MAX_ROBOTS_DELAY_SECONDS", _MAX_ROBOTS_DELAY_DEFAULT)
+
+
 async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = None) -> None:
     """Sleep until this host may be hit again, then reserve the slot.
 
-    `max_wait` bounds the stall; `None` uses `CRAWL_MAX_WAIT_SECONDS`, and `0` means unbounded.
-    Exceeding it raises `CrawlPaced` WITHOUT reserving — reserving a slot we then abandon would
-    push every later caller out for a request that never happened.
+    `max_wait` bounds the stall; `None` uses `CRAWL_MAX_WAIT_SECONDS`, and an explicit `0` (or
+    any non-positive value) means unbounded. Exceeding it raises `CrawlPaced` WITHOUT reserving
+    — reserving a slot we then abandon would push every later caller out for a request that
+    never happened.
+
+    A host asking for a `Crawl-delay` longer than `CRAWL_MAX_ROBOTS_DELAY_SECONDS` raises
+    `CrawlDelayTooLong` regardless of `max_wait`, because the damage is not the sleep — it is
+    the INTERVAL, which is written into `next_allowed` and paid again by every later row on
+    that host.
     """
     host = host_of(url)
     if not host:
@@ -275,6 +330,30 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
     interval = _min_interval()
     _parser, robots_delay = await _load_robots(host, user_agent) if _robots_enabled() else (None, None)
     if robots_delay is not None:
+        cap = _robots_delay_cap()
+        if cap > 0 and robots_delay > cap:
+            # BEFORE the reservation, and independent of `max_wait`. `max_wait=0` (the ten
+            # `max_wait=0` call sites) removed the only ceiling this value ever had, and the
+            # cost COMPOUNDS: each row reserves `next_allowed = start + interval`, so on a host
+            # serving `Crawl-delay: 86400` row 2 slept 86399.99998s, row 3 slept 172799.99999s,
+            # and row N waits N-1 days. Reproduced by construction against ff589e4e during
+            # review of #1898/#1899.
+            #
+            # We refuse rather than clamp. See `CrawlDelayTooLong` — crawling a host at a rate
+            # it explicitly asked us not to use is not the fix for our own batch being slow.
+            # The message reaches an ANONYMOUS caller: `routes/external_offers.py:65` returns
+            # `str(exc.args[0])` as `reason` on the unauthenticated resolve route when there is
+            # no cached row to fall back to. Says what happened, and names no internal config
+            # knob — the env var is documented on `_robots_delay_cap` and in the log below.
+            logger.info(
+                "crawl skip: %s asks for Crawl-delay %.1fs, over the %.1fs "
+                "CRAWL_MAX_ROBOTS_DELAY_SECONDS cap", host, robots_delay, cap,
+            )
+            raise CrawlDelayTooLong(
+                f"{host} asks for a Crawl-delay of {robots_delay:.1f}s, longer than this lane "
+                f"will wait ({cap:.1f}s); skipping this host rather than crawling it faster "
+                f"than it asked"
+            )
         # The host's own stated delay wins whenever it is SLOWER. Taking min() here would let a
         # site asking for 10s be hit every second while technically "having a robots check".
         interval = max(interval, robots_delay)
@@ -284,8 +363,19 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
     now = time.monotonic()
     start = max(now, state.next_allowed, state.backoff_until)
 
-    ceiling = _f("CRAWL_MAX_WAIT_SECONDS", 10.0) if max_wait is None else float(max_wait)
-    if ceiling > 0 and (start - now) > ceiling:
+    if max_wait is None:
+        # AN ENV CEILING OF 0 MEANS "NEVER WAIT", NOT "WAIT FOREVER". `max_wait=0` is the
+        # caller-side sentinel for unbounded, and reading the env through the same `> 0` test
+        # gave `CRAWL_MAX_WAIT_SECONDS=0` — which an operator would set meaning "do not stall my
+        # request path" — the exact opposite effect, on the UNAUTHENTICATED
+        # `POST /api/offers/external/resolve` of all places. The sentinel's inverted polarity is
+        # pre-existing and left alone (it is load-bearing at ten call sites); only the env
+        # reading, which no caller opted into, is corrected here.
+        ceiling, unbounded = _f("CRAWL_MAX_WAIT_SECONDS", _MAX_WAIT_DEFAULT), False
+    else:
+        ceiling = float(max_wait)
+        unbounded = ceiling <= 0
+    if not unbounded and (start - now) > ceiling:
         # Checked BEFORE the reservation below, deliberately.
         raise CrawlPaced(
             f"{host} next free in {start - now:.1f}s, over the {ceiling:.1f}s the caller allows"
