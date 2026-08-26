@@ -35,18 +35,23 @@ WORKFLOWS = REPO / ".github" / "workflows"
 SWEEP_WORKFLOW = WORKFLOWS / "backend-test-sweep.yml"
 
 # Scheduled lanes that still hold a DSN and are therefore ALREADY BROKEN. This
-# list may only ever SHRINK. Each entry is a migration owed, not an exemption
-# granted — do not add to it to make a new workflow pass.
+# set may only ever SHRINK, and it shrinks by MIGRATION — an entry is a debt
+# owed, never an exemption granted. Do not add to it to make a new workflow
+# pass; that is precisely the escape hatch this file exists to deny.
 #
-#   agent-pdp-orphan-reaper.yml         daily 04:37 UTC. Confirmed failing since
-#                                       2026-08-26 05:07 (last green 08-25).
-#   derive-offer-market-currency.yml    weekly Mon 09:11 UTC. Last ran 08-24,
-#                                       while Railway was still up, so it is
-#                                       latent rather than red — it fails on its
-#                                       next firing.
-KNOWN_UNMIGRATED = {
-    "agent-pdp-orphan-reaper.yml",
-}
+# EMPTY as of 2026-08-26, and it took three PRs to get here:
+#   content-canonical-election.yml    (6-hourly)      -> #1892
+#   derive-offer-market-currency.yml  (weekly Mon)    -> #1894
+#   agent-pdp-orphan-reaper.yml       (daily 04:37)   -> #1895
+# all now Cloud Run Jobs in infra/gcp/setup_scheduler.sh. Empty is the intended
+# steady state: no GitHub-scheduled workflow can reach Cloud SQL at all, so any
+# future entry here is a lane that will fail its very first run.
+#
+# `set()`, deliberately NOT `{}` — that is a DICT literal, and the difference
+# below would raise `TypeError: unsupported operand type(s) for -: 'set' and
+# 'dict'`. The parametrized companion test skips on an empty set rather than
+# erroring, which is pytest's documented `empty_parameter_set_mark=skip`.
+KNOWN_UNMIGRATED: set[str] = set()
 
 # Both the dotted and the bracket-index forms, because `${{ secrets['DATABASE_URL'] }}`
 # is valid Actions syntax and a plain `secrets.DATABASE_URL` substring match walks

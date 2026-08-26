@@ -13,10 +13,20 @@ re-key time; this script is the catch-all sweep for every OTHER re-key site and
 the periodic backstop. Safe + idempotent: only deletes view rows whose content_key
 has NO catalog_products row (NOT-EXISTS guard, re-checked at delete time).
 
+Scheduled as the `agent-pdp-orphan-reaper` Cloud Run Job, daily at 04:37 UTC via
+the `agent-pdp-orphan-reaper-cron` Cloud Scheduler entry (infra/gcp/setup_scheduler.sh).
+It ran as .github/workflows/agent-pdp-orphan-reaper.yml until 2026-08-26; that
+lane is gone and cannot come back, because Cloud SQL `pivota-pg` has no public IP
+and a GitHub-hosted runner has no route into the VPC.
+
 Usage:
   python -m scripts.reap_orphaned_agent_pdp_view                 # dry-run (default)
   python -m scripts.reap_orphaned_agent_pdp_view --apply         # delete orphans
   python -m scripts.reap_orphaned_agent_pdp_view --apply --limit 500
+
+  # by hand against prod — dry-run first, since the Job's baked args include --apply
+  gcloud run jobs execute agent-pdp-orphan-reaper --region us-west1 --project pivota-prod --wait \
+    --args 'scripts/reap_orphaned_agent_pdp_view.py,--limit,0'
 """
 
 from __future__ import annotations
@@ -24,10 +34,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import os
+import sys
 from typing import Any, Dict
 
-from db.database import database
-from services.agent_pdp_view_assembler import reap_orphaned_agent_pdp_view_rows
+# The Cloud Run Job invokes this BY PATH (`--args scripts/reap_orphaned_agent_pdp_view.py`),
+# which puts scripts/ on sys.path rather than the repo root, so `from db.database
+# import ...` would raise ModuleNotFoundError. `python -m scripts.…` — how the
+# deleted workflow ran it — happens to work because -m prepends the cwd. Making
+# the file work either way is what lets the Job line read like every other python
+# job in setup_scheduler.sh. Same bootstrap as scripts/elect_content_canonicals.py.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from db.database import database  # noqa: E402
+from services.agent_pdp_view_assembler import (  # noqa: E402
+    reap_orphaned_agent_pdp_view_rows,
+)
+
+logger = logging.getLogger("reap_orphaned_agent_pdp_view")
 
 
 async def _connect_if_needed(db: Any) -> bool:
@@ -66,8 +91,42 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    report = asyncio.run(_drive(_parse_args()))
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    args = _parse_args()
+    report = asyncio.run(_drive(args))
     print(json.dumps(report, indent=2, default=str))
+
+    # Emitted at WARNING so it carries a severity into Cloud Logging, where this
+    # sweep now runs. The GitHub workflow it replaces uploaded both reports as a
+    # 14-day build artifact, which was the only place a non-zero result was
+    # visible at all; deleting the workflow would otherwise have left this
+    # readable only by whoever thought to open a JSON blob logged at INFO.
+    #
+    # On a clean database this sweep is a no-op (see the module docstring), so a
+    # non-zero count is by definition not steady state: either a re-key site is
+    # skipping its inline reap, or catalog rows are vanishing. Both want a human.
+    if report["orphans"]:
+        logger.warning(
+            "%d orphaned agent_pdp_view row(s) found, %d deleted%s",
+            report["orphans"],
+            report["deleted"],
+            "" if args.apply else " (dry-run: pass --apply to delete)",
+        )
+        # Called out separately because reap_orphaned_agent_pdp_view_rows'
+        # docstring names it as the unusual case: an orphan that still carries an
+        # evidence_profile is evidence built for a content_key nothing resolves to.
+        if report["with_evidence"]:
+            logger.warning(
+                "  %d of them still carried an evidence_profile - unusual, worth chasing",
+                report["with_evidence"],
+            )
+        for row in report["sample"]:
+            logger.warning(
+                "  %s -> %s (%s)",
+                row.get("content_key"),
+                row.get("pivota_signature_id"),
+                row.get("refresh_source"),
+            )
     return 0
 
 
