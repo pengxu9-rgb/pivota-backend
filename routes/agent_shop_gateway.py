@@ -3695,7 +3695,10 @@ async def _handle_offers_resolve(
     """
     Resolve purchasable offers for a given sku_id/product_id.
 
-    Contract goal: internal checkout offers are primary; external outbound links are fallback.
+    Contract goal: internal checkout offers and external outbound offers are BOTH first-class
+    sources on every commerce surface, ranked merit-first together (T2-4 index neutrality).
+    External offers are never a "fallback" a caller's surface choice can switch off — an
+    explicit commerce_surface tightens internal-offer servability (strict mode), not sourcing.
     """
     from db.database import database
 
@@ -3716,7 +3719,6 @@ async def _handle_offers_resolve(
         request_metadata=request_metadata,
     )
     strict_serving_mode = bool(commerce_surface_explicit)
-    allow_external_fallback = not strict_serving_mode
     product_id_aliases = _expand_ref_aliases(product_id)
     sku_id_aliases = _expand_ref_aliases(sku_id)
 
@@ -4386,165 +4388,164 @@ async def _handle_offers_resolve(
 
     # 1) External offers from external seeds (affiliate outbound)
     external_offers: List[Dict[str, Any]] = []
-    if allow_external_fallback:
-        external_started = time.perf_counter()
-        try:
-            # Fuzzy (external_product_id/title/url LIKE) is the default label; the
-            # attached-ref mainline overwrites it on success so telemetry can alarm on
-            # the fuzzy:attached ratio (founder directive: fuzzy must not be a silent
-            # fallback for attached seeds). See IDENTITY_REFERENCE Trap T1 / ADR-009.
-            query_label = "external_seed_by_fuzzy_ref"
-            where_clauses = ["status = 'active'"]
-            params: Dict[str, Any] = {"limit": attached_seed_limit}
-            seed_rows: List[Any] = []
-            # (merchant, pid) pairs the attached-ref mainline actually searched — used to
-            # tell a genuine mainline miss (fuzzy surfaced a seed the mainline SHOULD have
-            # matched) from a legitimate cross-merchant / rebound-store fuzzy match.
-            searched_attached_merchants: set[str] = set()
-            searched_attached_pids: set[str] = {a for a in product_id_aliases if a}
+    external_started = time.perf_counter()
+    try:
+        # Fuzzy (external_product_id/title/url LIKE) is the default label; the
+        # attached-ref mainline overwrites it on success so telemetry can alarm on
+        # the fuzzy:attached ratio (founder directive: fuzzy must not be a silent
+        # fallback for attached seeds). See IDENTITY_REFERENCE Trap T1 / ADR-009.
+        query_label = "external_seed_by_fuzzy_ref"
+        where_clauses = ["status = 'active'"]
+        params: Dict[str, Any] = {"limit": attached_seed_limit}
+        seed_rows: List[Any] = []
+        # (merchant, pid) pairs the attached-ref mainline actually searched — used to
+        # tell a genuine mainline miss (fuzzy surfaced a seed the mainline SHOULD have
+        # matched) from a legitimate cross-merchant / rebound-store fuzzy match.
+        searched_attached_merchants: set[str] = set()
+        searched_attached_pids: set[str] = {a for a in product_id_aliases if a}
 
-            if merchant_scope and (product_id_aliases or sku_id_aliases):
-                searched_attached_merchants.add(merchant_scope)
+        if merchant_scope and (product_id_aliases or sku_id_aliases):
+            searched_attached_merchants.add(merchant_scope)
+            seed_rows = await _fetch_attached_seed_rows(
+                merchant_id=merchant_scope,
+                product_aliases=product_id_aliases,
+                variant_aliases=sku_id_aliases,
+            )
+            if seed_rows:
+                query_label = "external_seed_by_attached_ref"
+
+        if not seed_rows:
+            prefetched_internal = await _prefetch_canonical_internal_context()
+            if prefetched_internal:
+                retry_variant_aliases = [
+                    str(alias or "").strip()
+                    for alias in (
+                        [sku_id]
+                        + list(prefetched_internal.get("variant_aliases") or [])
+                        + sku_id_aliases
+                    )
+                    if str(alias or "").strip()
+                ]
+                prefetched_merchant = str(prefetched_internal.get("merchant_id") or "").strip() or None
+                prefetched_pid = str(prefetched_internal.get("product_id") or "").strip() or None
+                if prefetched_merchant:
+                    searched_attached_merchants.add(prefetched_merchant)
+                if prefetched_pid:
+                    searched_attached_pids.add(prefetched_pid)
                 seed_rows = await _fetch_attached_seed_rows(
-                    merchant_id=merchant_scope,
-                    product_aliases=product_id_aliases,
-                    variant_aliases=sku_id_aliases,
+                    merchant_id=prefetched_merchant,
+                    platform=str(prefetched_internal.get("platform") or "").strip() or None,
+                    product_aliases=[prefetched_pid] + product_id_aliases,
+                    variant_aliases=retry_variant_aliases,
                 )
                 if seed_rows:
-                    query_label = "external_seed_by_attached_ref"
+                    query_label = "external_seed_by_canonical_attached_prefetch"
 
-            if not seed_rows:
-                prefetched_internal = await _prefetch_canonical_internal_context()
-                if prefetched_internal:
-                    retry_variant_aliases = [
-                        str(alias or "").strip()
-                        for alias in (
-                            [sku_id]
-                            + list(prefetched_internal.get("variant_aliases") or [])
-                            + sku_id_aliases
-                        )
-                        if str(alias or "").strip()
-                    ]
-                    prefetched_merchant = str(prefetched_internal.get("merchant_id") or "").strip() or None
-                    prefetched_pid = str(prefetched_internal.get("product_id") or "").strip() or None
-                    if prefetched_merchant:
-                        searched_attached_merchants.add(prefetched_merchant)
-                    if prefetched_pid:
-                        searched_attached_pids.add(prefetched_pid)
-                    seed_rows = await _fetch_attached_seed_rows(
-                        merchant_id=prefetched_merchant,
-                        platform=str(prefetched_internal.get("platform") or "").strip() or None,
-                        product_aliases=[prefetched_pid] + product_id_aliases,
-                        variant_aliases=retry_variant_aliases,
-                    )
-                    if seed_rows:
-                        query_label = "external_seed_by_canonical_attached_prefetch"
-
-            if not seed_rows and product_id_aliases:
-                pid_clause: List[str] = []
-                for idx, pid_alias in enumerate(product_id_aliases[:8]):
-                    pid_key = f"pid_{idx}"
-                    like_key = f"pid_like_{idx}"
-                    params[pid_key] = pid_alias
-                    params[like_key] = f"%{_safe_lower(pid_alias)}%"
-                    pid_clause.append(
-                        "("
-                        f"external_product_id = :{pid_key}"
-                        f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
-                        f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
-                        f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
-                        f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
-                        ")"
-                    )
-                where_clauses.append("(" + " OR ".join(pid_clause) + ")")
-
-            if not seed_rows and sku_id_aliases:
-                sku_clause: List[str] = []
-                for idx, sku_alias in enumerate(sku_id_aliases[:8]):
-                    key = f"sku_like_{idx}"
-                    params[key] = f"%{_safe_lower(sku_alias)}%"
-                    sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
-                where_clauses.append("(" + " OR ".join(sku_clause) + ")")
-
-            if not seed_rows and len(where_clauses) == 1:
-                return {
-                    "status": "error",
-                    "error": {
-                        "code": "MISSING_PRODUCT_REF",
-                        "message": "offers.resolve requires product.sku_id or product.product_id",
-                    },
-                }
-
-            if not seed_rows:
-                seed_rows = await asyncio.wait_for(
-                    database.fetch_all(
-                        f"""
-                        SELECT *
-                        FROM external_product_seeds
-                        WHERE {" AND ".join(where_clauses)}
-                        {_seed_quarantine_clause()}
-                        ORDER BY updated_at DESC, created_at DESC
-                        LIMIT :limit
-                        """,
-                        params,
-                    ),
-                    timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+        if not seed_rows and product_id_aliases:
+            pid_clause: List[str] = []
+            for idx, pid_alias in enumerate(product_id_aliases[:8]):
+                pid_key = f"pid_{idx}"
+                like_key = f"pid_like_{idx}"
+                params[pid_key] = pid_alias
+                params[like_key] = f"%{_safe_lower(pid_alias)}%"
+                pid_clause.append(
+                    "("
+                    f"external_product_id = :{pid_key}"
+                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
+                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
+                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
+                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
+                    ")"
                 )
+            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
 
-            # T1 mainline-miss telemetry (founder directive: no silent fuzzy fallback for
-            # attached seeds). The fuzzy query legitimately surfaces STANDALONE seeds
-            # (attached_product_key NULL) and rebound-store / cross-merchant matches. But
-            # if it surfaces a seed whose STORAGE-format attached key names a (merchant, pid)
-            # the attached-ref mainline actually searched, the mainline SHOULD have matched
-            # it and didn't — that is OBSERVABLE breakage, not a pass. Deliver the offer
-            # anyway (honest delivery); just make the miss alarmable. See IDENTITY_REFERENCE
-            # Trap T1 / ADR-009 §Prerequisite fix.
-            mainline_miss_seed_ids: List[str] = []
-            if query_label == "external_seed_by_fuzzy_ref":
-                for row in seed_rows or []:
-                    row_dict = _row_to_dict(row)
-                    parsed = _parse_catalog_product_key(row_dict.get("attached_product_key"))
-                    if not parsed:
-                        continue
-                    seed_merchant, _seed_platform, seed_pid = parsed
-                    if seed_merchant in searched_attached_merchants and seed_pid in searched_attached_pids:
-                        mainline_miss_seed_ids.append(str(row_dict.get("id") or ""))
-            if mainline_miss_seed_ids:
-                logger.warning(
-                    "attached_seed_mainline_miss",
-                    extra={
-                        "event": "attached_seed_mainline_miss",
-                        "seed_ids": mainline_miss_seed_ids,
-                        "product_aliases": product_id_aliases,
-                        "sku_aliases": sku_id_aliases,
-                        "searched_merchants": sorted(searched_attached_merchants),
-                    },
-                )
+        if not seed_rows and sku_id_aliases:
+            sku_clause: List[str] = []
+            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+                key = f"sku_like_{idx}"
+                params[key] = f"%{_safe_lower(sku_alias)}%"
+                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
+            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
 
-            await _append_external_offers_from_seed_rows(list(seed_rows or []))
-            _record_source(
-                source="external_product_seeds",
-                status="ok",
-                reason_code="ok",
-                source_started=external_started,
-                row_count=len(seed_rows or []),
-                query=query_label,
-                extra=(
-                    {"mainline_miss_seed_ids": mainline_miss_seed_ids}
-                    if mainline_miss_seed_ids
-                    else None
+        if not seed_rows and len(where_clauses) == 1:
+            return {
+                "status": "error",
+                "error": {
+                    "code": "MISSING_PRODUCT_REF",
+                    "message": "offers.resolve requires product.sku_id or product.product_id",
+                },
+            }
+
+        if not seed_rows:
+            seed_rows = await asyncio.wait_for(
+                database.fetch_all(
+                    f"""
+                    SELECT *
+                    FROM external_product_seeds
+                    WHERE {" AND ".join(where_clauses)}
+                    {_seed_quarantine_clause()}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT :limit
+                    """,
+                    params,
                 ),
+                timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
             )
-        except Exception as e:
-            logger.info("offers.resolve.external.failed", extra={"error": str(e)})
-            _record_source(
-                source="external_product_seeds",
-                status="error",
-                reason_code=_classify_db_reason_code(e),
-                source_started=external_started,
-                error=type(e).__name__,
-                query=query_label,
+
+        # T1 mainline-miss telemetry (founder directive: no silent fuzzy fallback for
+        # attached seeds). The fuzzy query legitimately surfaces STANDALONE seeds
+        # (attached_product_key NULL) and rebound-store / cross-merchant matches. But
+        # if it surfaces a seed whose STORAGE-format attached key names a (merchant, pid)
+        # the attached-ref mainline actually searched, the mainline SHOULD have matched
+        # it and didn't — that is OBSERVABLE breakage, not a pass. Deliver the offer
+        # anyway (honest delivery); just make the miss alarmable. See IDENTITY_REFERENCE
+        # Trap T1 / ADR-009 §Prerequisite fix.
+        mainline_miss_seed_ids: List[str] = []
+        if query_label == "external_seed_by_fuzzy_ref":
+            for row in seed_rows or []:
+                row_dict = _row_to_dict(row)
+                parsed = _parse_catalog_product_key(row_dict.get("attached_product_key"))
+                if not parsed:
+                    continue
+                seed_merchant, _seed_platform, seed_pid = parsed
+                if seed_merchant in searched_attached_merchants and seed_pid in searched_attached_pids:
+                    mainline_miss_seed_ids.append(str(row_dict.get("id") or ""))
+        if mainline_miss_seed_ids:
+            logger.warning(
+                "attached_seed_mainline_miss",
+                extra={
+                    "event": "attached_seed_mainline_miss",
+                    "seed_ids": mainline_miss_seed_ids,
+                    "product_aliases": product_id_aliases,
+                    "sku_aliases": sku_id_aliases,
+                    "searched_merchants": sorted(searched_attached_merchants),
+                },
             )
+
+        await _append_external_offers_from_seed_rows(list(seed_rows or []))
+        _record_source(
+            source="external_product_seeds",
+            status="ok",
+            reason_code="ok",
+            source_started=external_started,
+            row_count=len(seed_rows or []),
+            query=query_label,
+            extra=(
+                {"mainline_miss_seed_ids": mainline_miss_seed_ids}
+                if mainline_miss_seed_ids
+                else None
+            ),
+        )
+    except Exception as e:
+        logger.info("offers.resolve.external.failed", extra={"error": str(e)})
+        _record_source(
+            source="external_product_seeds",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=external_started,
+            error=type(e).__name__,
+            query=query_label,
+        )
 
     # 2) Internal checkout offers (primary)
     internal_offers: List[Dict[str, Any]] = []
@@ -4992,7 +4993,7 @@ async def _handle_offers_resolve(
                 "product_group_id": canonical_group_id,
             }
 
-    if allow_external_fallback and not external_offers and canonical_product:
+    if not external_offers and canonical_product:
         attached_retry_started = time.perf_counter()
         try:
             retry_variant_aliases = [
@@ -5033,7 +5034,7 @@ async def _handle_offers_resolve(
                 query="external_seed_by_canonical_attached_ref",
             )
 
-    if allow_external_fallback and not external_offers and internal_identity_payloads:
+    if not external_offers and internal_identity_payloads:
         identity_retry_started = time.perf_counter()
         try:
             identity_rows = await _fetch_external_seed_rows_by_internal_identity(internal_identity_payloads)

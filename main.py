@@ -72,7 +72,9 @@ def _guard_single_order_routes_py() -> None:
     on deploy if a second copy is added.
     """
     repo_root = Path(__file__).resolve().parent
-    ignored_dirs = {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache"}
+    # `.claude` holds harness-managed worktrees (full repo copies) on dev machines only —
+    # scanning them makes every copy of order_routes.py look like a duplicate.
+    ignored_dirs = {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".claude"}
     matches: list[str] = []
 
     for dirpath, dirnames, filenames in os.walk(repo_root):
