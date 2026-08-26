@@ -51,7 +51,13 @@ def verify_signature(raw_body: bytes, provided: Optional[str], secret: str) -> b
     if candidate.lower().startswith("sha256="):
         candidate = candidate[7:]
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(candidate.lower(), expected.lower())
+    # Compare as BYTES: hmac.compare_digest raises TypeError on non-ASCII str, and Starlette
+    # decodes headers latin-1, so any byte >= 0x80 in the header was an unauthenticated 500.
+    try:
+        provided_bytes = candidate.lower().encode("utf-8")
+    except Exception:
+        return False
+    return hmac.compare_digest(provided_bytes, expected.lower().encode("ascii"))
 
 
 @dataclass(frozen=True)
@@ -74,15 +80,22 @@ _TYPE_MAP = {
 
 
 def _as_minor(value: Any) -> Optional[int]:
+    """Minor units are INTEGERS. A decimal string like "23.00" is a MAJOR-unit amount that would
+    be recorded 100x wrong if coerced (23 minor = $0.23) — review proved this path live. So:
+    ints and digit-only strings only; anything with a '.' is refused, and the handler treats a
+    refused amount as absent, which skips the write. A skipped amount is a gap we can see; a
+    silently wrong one poisons reconciliation."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, int):
         return value if value >= 0 else None
-    try:
-        d = Decimal(str(value).strip())
-    except Exception:
-        return None
-    return int(d) if d >= 0 and d == d.to_integral_value() else None
+    if isinstance(value, str):
+        s = value.strip()
+        if s.isdigit():
+            return int(s)
+        if s and "." in s:
+            logger.warning("reap webhook: decimal-shaped amount refused (expected minor units)")
+    return None
 
 
 def parse_event(body: Dict[str, Any]) -> Optional[ReapEvent]:
@@ -138,7 +151,7 @@ def check_card_consistency(event: ReapEvent, card: Dict[str, Any]) -> Optional[s
     if event.currency and event.currency != card["currency"]:
         return "CARD_CURRENCY_MISMATCH"
     if (
-        event.event_type == "auth_approved"
+        event.event_type in ("auth_approved", "settlement")
         and event.amount_minor is not None
         and event.amount_minor > card["amount_cap_minor"]
     ):

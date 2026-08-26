@@ -79,8 +79,22 @@ def rig(monkeypatch: pytest.MonkeyPatch):
         "lookups": [],
     }
 
+    class _FakeTx:
+        async def __aenter__(self):
+            state["tx_entered"] = state.get("tx_entered", 0) + 1
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _FakeDB:
+        def transaction(self):
+            return _FakeTx()
+
+    monkeypatch.setattr(mod, "database", _FakeDB())
+
     async def fake_record_event_once(event_id, event_type, card_id):
-        state["events"].append((event_id, event_type))
+        state["events"].append((event_id, event_type, card_id))
         return state["event_is_new"]
 
     async def fake_find(ref):
@@ -180,12 +194,14 @@ def test_unusable_event_shape_is_200_ignored(rig):
 # --- dedup and lookup -----------------------------------------------------------------------
 
 
-def test_duplicate_event_short_circuits_before_any_lookup(rig):
+def test_duplicate_event_applies_nothing(rig):
     client, state = rig
     state["event_is_new"] = False
     r = _post(client, _event())
     assert r.json()["handled"] == "duplicate"
-    assert state["lookups"] == [] and state["approved"] == [] and state["outcomes"] == []
+    # The lookup now precedes dedup (the dedup row carries the card), but a duplicate must
+    # still touch NO state.
+    assert state["approved"] == [] and state["outcomes"] == [] and state["alarms"] == []
 
 
 def test_unknown_card_is_200_and_touches_nothing(rig, monkeypatch):
@@ -199,6 +215,9 @@ def test_unknown_card_is_200_and_touches_nothing(rig, monkeypatch):
     r = _post(client, _event())
     assert r.json()["handled"] == "ignored_unknown_card"
     assert state["approved"] == [] and state["outcomes"] == []
+    # Deliberately NO dedup row for an unknown card: if our issuance write shows up late, a
+    # redelivery must still be able to land the event.
+    assert state["events"] == []
 
 
 # --- transitions and outcomes ---------------------------------------------------------------
@@ -209,6 +228,8 @@ def test_auth_approved_applies_and_records_outcome(rig):
     r = _post(client, _event())
     assert r.json() == {"status": "ok", "handled": "auth_approved", "applied": True}
     assert state["approved"] == [("crd_test1", True)]
+    assert state["events"] == [("evt_1", "auth_approved", "crd_test1")]  # dedup row names the card
+    assert state.get("tx_entered") == 1  # dedup + transitions + outcome share one transaction
     (o,) = state["outcomes"]
     assert o["outcome"] == "completed"
     assert o["reported_by"] == "reap"
@@ -303,6 +324,46 @@ def test_cap_breach_alarms_AND_applies(rig):
     assert o["actual_grand_total"] == Decimal("50.00")  # what really happened, not the cap
 
 
+def test_settlement_above_cap_alarms_and_still_applies(rig):
+    client, state = rig
+    body = _event(type="transaction.settled")
+    body["data"]["amount"]["amount"] = 5000  # cap is 2317; settled money PAST the cap
+    r = _post(client, body)
+    assert r.status_code == 200 and r.json()["handled"] == "settlement"
+    assert ("CARD_CAP_BREACH", "crd_test1") in state["alarms"]
+    assert state["settled"] == [("crd_test1", 5000)]
+
+
+def test_non_ascii_signature_header_is_rejected_not_raised():
+    """Starlette decodes headers latin-1, so any byte >= 0x80 reaches verify_signature as a
+    non-ASCII str — where hmac.compare_digest on str raises TypeError (an unauthenticated 500,
+    review finding 3). httpx refuses to even send such a header, so this is pinned at the unit
+    seam with exactly the string Starlette would produce."""
+    raw = b'{"a":1}'
+    header_value = b"caf\xe9-sha".decode("latin-1")
+    assert verify_signature(raw, header_value, SECRET) is False  # False, never a raise
+
+
+def test_outcome_values_carries_every_bind_and_no_forbidden_nulls():
+    """The blocker this PR review found, pinned: (a) the dict must name every bind in the
+    UPSERT (a missing key is an immediate error, fine) and (b) the NOT NULL columns must never
+    be bound None — an explicit NULL DEFEATS a column default, so faked-DB route tests can
+    never catch it."""
+    import re
+
+    from db.card_rail_outcomes import UPSERT_SQL
+    from routes.reap_webhooks import _outcome_values
+    from services.reap_webhooks import parse_event
+
+    event = parse_event(_event())
+    values = _outcome_values(_card(), event, "completed", None, "approved")
+    binds = set(re.findall(r":([a-z_]+)", UPSERT_SQL.split("ON CONFLICT")[0]))
+    assert binds == set(values), (binds ^ set(values))
+    for must_not_be_null in ("recommendation_id", "agent_id", "outcome", "reported_by",
+                             "latency_ms", "occurred_at"):
+        assert values[must_not_be_null] is not None, must_not_be_null
+
+
 # --- unit: parsing and helpers --------------------------------------------------------------
 
 
@@ -321,6 +382,17 @@ def test_verify_signature_rejects_empty_secret_and_body_reuse():
 ])
 def test_minor_to_major(minor, currency, expect):
     assert minor_to_major(minor, currency) == expect
+
+
+def test_decimal_shaped_amount_is_refused_not_100x_wrong():
+    """"23.00" as minor units would record $0.23 for a $23.00 settlement. Refused instead:
+    a visible gap beats silent 100x corruption."""
+    body = _event(type="transaction.settled")
+    body["data"]["amount"]["amount"] = "23.00"
+    e = parse_event(body)
+    assert e is not None and e.amount_minor is None
+    ok = parse_event(_event())
+    assert ok.amount_minor == 2317  # integer minor units still pass untouched
 
 
 def test_parse_event_flat_shape_and_missing_pieces():

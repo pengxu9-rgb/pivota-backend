@@ -185,7 +185,12 @@ async def apply_auth_declined(card_id: str) -> bool:
 async def apply_settlement(card_id: str, settled_amount_minor: int) -> bool:
     """Settlement can trail authorization by days and can land after expiry — so unlike the
     auth transitions it is NOT gated on a live status. It records money movement on whatever
-    the row has become."""
+    the row has become.
+
+    LAST-WRITE-WINS on purpose, stated so multi-capture doesn't silently under-report later:
+    two partial captures (distinct event_ids, so dedup keeps both) leave the LAST amount, not
+    the sum. Correct for v1's single-use cards; a multi-capture future needs a settlements
+    child table, not a SUM here."""
     row = await database.fetch_one(
         """
         UPDATE agent_issued_cards

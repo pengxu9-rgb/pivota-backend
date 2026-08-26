@@ -21,6 +21,7 @@ receiver exists for.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -33,6 +34,7 @@ from db.agent_issued_cards import (
     record_event_once,
 )
 from db.card_rail_outcomes import record_outcome
+from db.database import database
 from services.reap_webhooks import (
     ReapEvent,
     alarm,
@@ -81,10 +83,13 @@ def _outcome_values(
         "outcome": outcome,
         "failure_reason": failure_reason,
         "failure_reason_raw": None,
-        "latency_ms": None,
+        # Both columns are NOT NULL in migration 199, and an explicit NULL bind DEFEATS a
+        # column default — review proved every real write died here while 22 faked-DB tests
+        # passed. Same values the agent route sends when the caller omits them.
+        "latency_ms": "{}",
         "auth_outcome": auth_outcome,
         "reported_by": "reap",
-        "occurred_at": None,
+        "occurred_at": datetime.now(timezone.utc),
     }
 
 
@@ -108,46 +113,57 @@ async def receive_reap_webhook(request: Request) -> Dict[str, Any]:
         logger.warning("reap webhook: signed event with no usable identity — ignored")
         return {"status": "ok", "handled": "ignored_unparseable"}
 
-    if not await record_event_once(event.event_id, event.event_type, None):
-        return {"status": "ok", "handled": "duplicate"}
+    # ONE transaction around dedup + transitions + outcome, and the reason is the delivery
+    # contract. Dedup-first-and-autocommitted made this receiver at-most-once: a failure after
+    # the dedup claim answered Reap's retry "duplicate" and the event's effects were lost with
+    # only a log line. Inside a transaction, a mid-flight failure rolls the dedup claim back,
+    # the 500 makes Reap redeliver, and the redelivery reprocesses — at-least-once, made safe
+    # by the status-guarded transitions and the keyed outcome upsert. A concurrent duplicate's
+    # ON CONFLICT insert blocks on ours and resolves "duplicate" only after we commit. The
+    # span is DB-and-logging only (the no-network-IO-in-transaction gate holds), and the flow
+    # is sequential in one request task, which is the safe shape for databases==0.7.0.
+    async with database.transaction():
+        card = await find_by_issuer_ref(event.issuer_card_ref)
+        if card is None:
+            # 200, and deliberately NO dedup row: there is nothing to protect from replay, and
+            # if our issuance write shows up late, a redelivery can still land the event.
+            logger.warning(f"reap webhook: unknown issuer_card_ref for event_id={event.event_id}")
+            return {"status": "ok", "handled": "ignored_unknown_card"}
 
-    card = await find_by_issuer_ref(event.issuer_card_ref)
-    if card is None:
-        # Not an error to Reap (200), but worth a line: either an event for a card minted
-        # outside this system, or our issuance write was lost.
-        logger.warning(f"reap webhook: unknown issuer_card_ref for event_id={event.event_id}")
-        return {"status": "ok", "handled": "ignored_unknown_card"}
+        if not await record_event_once(event.event_id, event.event_type, card["card_id"]):
+            return {"status": "ok", "handled": "duplicate"}
 
-    inconsistency = check_card_consistency(event, card)
-    if inconsistency is not None:
-        alarm(inconsistency, card["card_id"], event)
-        if inconsistency != "CARD_CAP_BREACH":
-            return {"status": "ok", "handled": f"alarmed_{inconsistency.lower()}"}
-        # cap breach falls through: record what actually happened, loudly.
+        inconsistency = check_card_consistency(event, card)
+        if inconsistency is not None:
+            alarm(inconsistency, card["card_id"], event)
+            if inconsistency != "CARD_CAP_BREACH":
+                return {"status": "ok", "handled": f"alarmed_{inconsistency.lower()}"}
+            # cap breach falls through: record what actually happened, loudly.
 
-    applied = False
-    if event.event_type == "auth_approved":
-        applied = await apply_auth_approved(card["card_id"], bool(card["single_use"]))
-        if not applied:
-            # An approval that found the card outside 'issued' is itself an alarm: the issuer
-            # authorized an instrument we consider spent, revoked, or expired.
-            alarm("AUTH_ON_NON_ISSUED_CARD", card["card_id"], event)
-        if card["recommendation_id"]:
-            await record_outcome(_outcome_values(card, event, "completed", None, "approved"))
-    elif event.event_type == "auth_declined":
-        applied = await apply_auth_declined(card["card_id"])
-        if card["recommendation_id"]:
-            await record_outcome(
-                _outcome_values(
-                    card, event, "failed", "payment_declined", event.decline_reason or "declined"
+        applied = False
+        if event.event_type == "auth_approved":
+            applied = await apply_auth_approved(card["card_id"], bool(card["single_use"]))
+            if not applied:
+                # An approval that found the card outside 'issued' is itself an alarm: the
+                # issuer authorized an instrument we consider spent, revoked, or expired.
+                alarm("AUTH_ON_NON_ISSUED_CARD", card["card_id"], event)
+            if card["recommendation_id"]:
+                await record_outcome(_outcome_values(card, event, "completed", None, "approved"))
+        elif event.event_type == "auth_declined":
+            applied = await apply_auth_declined(card["card_id"])
+            if card["recommendation_id"]:
+                await record_outcome(
+                    _outcome_values(
+                        card, event, "failed", "payment_declined",
+                        event.decline_reason or "declined",
+                    )
                 )
-            )
-    elif event.event_type == "settlement":
-        if event.amount_minor is not None:
-            applied = await apply_settlement(card["card_id"], event.amount_minor)
-        if card["recommendation_id"]:
-            await record_outcome(_outcome_values(card, event, "completed", None, None))
-    else:
-        return {"status": "ok", "handled": "ignored_event_type"}
+        elif event.event_type == "settlement":
+            if event.amount_minor is not None:
+                applied = await apply_settlement(card["card_id"], event.amount_minor)
+            if card["recommendation_id"]:
+                await record_outcome(_outcome_values(card, event, "completed", None, None))
+        else:
+            return {"status": "ok", "handled": "ignored_event_type"}
 
     return {"status": "ok", "handled": event.event_type, "applied": applied}
