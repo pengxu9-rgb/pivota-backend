@@ -150,7 +150,7 @@ jobs:
             if [ -n "$LANDED" ]; then
               AGE_MIN=$(( ( $(date -u +%s) - LANDED ) / 60 ))
               if [ "$AGE_MIN" -lt "$GRACE_MINUTES" ]; then
-                echo "::notice::undeployed runtime code landed on main ${AGE_MIN}m ago, inside the ${GRACE_MINUTES}m deploy window - not alarming yet. The hourly run will."
+                echo "::notice::undeployed runtime code landed on main ${AGE_MIN}m ago, inside the ${GRACE_MINUTES}m deploy window - not alarming yet. A later scheduled run will."
                 exit 0
               fi
               echo "this gap has been on main for ${AGE_MIN} minutes (window is ${GRACE_MINUTES})."
