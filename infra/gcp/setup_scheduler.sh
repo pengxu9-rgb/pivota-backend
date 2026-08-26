@@ -58,6 +58,7 @@ esac
 # run before the external lane can serve at all. Retiring writes status=inactive and suppresses
 # the mirrored catalog rows, which is a different blast radius and gets its own switch.
 : "${EXTERNAL_SEED_DESTINATION_SWEEP:=false}"
+: "${EXTERNAL_SEED_CONTENT_REFRESH:=false}"
 : "${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
@@ -70,6 +71,7 @@ case "$STORE_AUDIT_UCP_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_UCP
 case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_WORKER must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_WORKER')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
+case "$EXTERNAL_SEED_CONTENT_REFRESH" in true|false) ;; *) echo "EXTERNAL_SEED_CONTENT_REFRESH must be exactly true or false (got '$EXTERNAL_SEED_CONTENT_REFRESH')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE')" >&2; exit 2 ;; esac
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP" != true ]; then
   echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true requires EXTERNAL_SEED_DESTINATION_SWEEP=true" >&2; exit 2
@@ -383,6 +385,29 @@ else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
 fi
 
+# ---- external-seed CONTENT refresh ---------------------------------------------------------
+# Re-reads the PRICE and AVAILABILITY of the seeds we serve, and corrects the row.
+# Sibling of the destination sweep above and easily confused with it: that one asks "is this
+# link still there", this one asks "is the number we are quoting still true". A9-4/A5 measured
+# 10/81 = 12.3% of live PDPs disagreeing with the index on price.
+# `mkcrawljob`, not `mkjob`, for the same reason the sweep gives: it fetches merchant
+# storefronts, so it must leave from the reserved pivota-crawl egress IP or brand hosts answer
+# with a bot challenge -- and this job's failure mode under a challenge is worse than the
+# sweep's, because "could not read a price" is recorded as `price_unavailable` and a run that
+# saw nothing still reports success.
+# task-timeout is raised over the crawl default for the same reason: per-host pacing
+# (services/crawl_politeness) is the point, so the wall clock is set by politeness, not by work.
+if [ "$EXTERNAL_SEED_CONTENT_REFRESH" = true ]; then
+  echo "== job: external-seed-content-refresh"
+  mkcrawljob external-seed-content-refresh "$BACKEND_IMAGE" "$SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-content-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 3600s \
+    --command python --args "-m,jobs.external_referral_refresh,--limit,1700"
+else
+  echo "== external-seed content refresh not created (EXTERNAL_SEED_CONTENT_REFRESH=false)"
+fi
+
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
@@ -393,6 +418,20 @@ else
   if have "$GCLOUD" scheduler jobs describe external-seed-destination-sweep-cron --location "$REGION"; then
     "$GCLOUD" scheduler jobs pause external-seed-destination-sweep-cron --location "$REGION" --quiet
     echo "   (paused: external-seed-destination-sweep-cron; EXTERNAL_SEED_DESTINATION_SWEEP=false)"
+  fi
+fi
+# 04:40, deliberately clear of the destination sweep's 02:20 + 3600s window. Both jobs crawl the
+# SAME brand hosts from the SAME egress IP, and `crawl_politeness` keeps its per-host schedule in
+# process memory -- so two overlapping crawl jobs do not share a token bucket, they each pace
+# independently and double the request rate every host actually sees. The pacing is only honest
+# while one crawl job runs at a time.
+if [ "$EXTERNAL_SEED_CONTENT_REFRESH" = true ]; then
+  sched external-seed-content-refresh-cron "40 4 * * *" external-seed-content-refresh
+else
+  # An idempotent disarm, not merely a creation skip (same rule as the sweep above).
+  if have "$GCLOUD" scheduler jobs describe external-seed-content-refresh-cron --location "$REGION"; then
+    "$GCLOUD" scheduler jobs pause external-seed-content-refresh-cron --location "$REGION" --quiet
+    echo "   (paused: external-seed-content-refresh-cron; EXTERNAL_SEED_CONTENT_REFRESH=false)"
   fi
 fi
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
