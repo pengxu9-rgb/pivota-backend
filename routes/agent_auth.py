@@ -224,9 +224,11 @@ async def get_agent_context(
         )
 
     # Test-only bypass: allow unit tests to use a placeholder API key without
-    # hitting the database or enforcing rate/quota logic. Fails closed in
-    # production the same way the demo admin login lanes do (#1889) — see
-    # config.platform.pytest_bypass_allowed.
+    # hitting the database or enforcing rate/quota logic. Fails closed on ANY
+    # DEPLOYED host — staging included — as well as anything resolving to
+    # production; since #1900 the gate is `not (is_deployed() or
+    # is_production())`, and since the Cloud Run **Jobs** markers were added it
+    # covers job containers too. See config.platform.pytest_bypass_allowed.
     if (
         api_key in {"test-agent-key", "test-api-key"}
         and pytest_bypass_allowed(bypass_name="the agent test-key bypass")

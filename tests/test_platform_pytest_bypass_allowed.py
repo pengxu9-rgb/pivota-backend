@@ -85,6 +85,18 @@ _DEPLOYED_NON_PROD_ENVS = {
         "PIVOTA_PLATFORM": "cloud_run",
         "PIVOTA_ENV": "development",
     },
+    # A Cloud Run **Job**, not a service. Jobs get no K_* at all — they get
+    # CLOUD_RUN_JOB / CLOUD_RUN_EXECUTION — so until those were added to
+    # `_CLOUD_RUN_JOB_KEYS` this row answered `is_deployed()` False AND
+    # `is_production()` False and the bypass stayed ARMED here: the one case
+    # #1900 did not actually close. Live-confirmed inside the prod
+    # `content-canonical-election` job on 2026-08-26. See
+    # tests/test_platform_cloud_run_jobs.py for the full resolution table.
+    "cloud_run_job_staging": {
+        "CLOUD_RUN_JOB": "content-canonical-election",
+        "CLOUD_RUN_EXECUTION": "content-canonical-election-abc12",
+        "PIVOTA_ENV": "staging",
+    },
 }
 
 

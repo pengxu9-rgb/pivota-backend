@@ -136,8 +136,11 @@ async def get_current_user(
         token = credentials.credentials
 
         # Test-only bypass: allow unit tests to use a stable placeholder token
-        # without requiring JWT signing/secrets. Fails closed in production
-        # the same way the demo admin login lanes do (#1889) — see
+        # without requiring JWT signing/secrets. Fails closed on ANY DEPLOYED
+        # host — staging included — as well as anything resolving to
+        # production; since #1900 the gate is `not (is_deployed() or
+        # is_production())`, and since the Cloud Run **Jobs** markers were
+        # added it covers job containers too. See
         # config.platform.pytest_bypass_allowed.
         if token == "test-token" and pytest_bypass_allowed(bypass_name="the test-token bypass"):
             return {

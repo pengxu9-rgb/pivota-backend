@@ -38,6 +38,15 @@ _ALL_KEYS = (
     "K_SERVICE",
     "K_REVISION",
     "K_CONFIGURATION",
+    # Cloud Run *Jobs* inject none of the K_* above; these are their analogues.
+    # The TASK_* trio is deliberately NOT a deployment marker (see
+    # config.platform._CLOUD_RUN_JOB_KEYS) but is still stripped here, so a case
+    # that asserts "local" cannot pass merely because they happened to be unset.
+    "CLOUD_RUN_JOB",
+    "CLOUD_RUN_EXECUTION",
+    "CLOUD_RUN_TASK_INDEX",
+    "CLOUD_RUN_TASK_COUNT",
+    "CLOUD_RUN_TASK_ATTEMPT",
     "COMMIT_SHA",
     "SOURCE_VERSION",
     "GIT_COMMIT_SHA",
