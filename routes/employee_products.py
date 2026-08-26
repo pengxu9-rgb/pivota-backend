@@ -4425,6 +4425,15 @@ def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
     return bool(a) and a == b
 
 
+# A price reading that we actually STORED. `unavailable` means we read no price at all, and
+# each `skipped_*` means we read something and REFUSED it (a 0-price broken-offer shape, an
+# amount with no currency, a currency that disagrees with the stored one). In every refused
+# case the row keeps its PREVIOUS amount, so the number we quote was not re-read and must not
+# be described as freshly extracted. `unchanged` counts: we read the page and it still says
+# what we store.
+_PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE = frozenset({"applied", "filled", "unchanged"})
+
+
 async def _stamp_crawl_attempt(seed_id: str) -> None:
     """Record that we TRIED to re-read this seed, whatever the outcome.
 
@@ -4751,6 +4760,29 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     reached_served_origin = observed.get("status_code") is not None and _same_destination(
         dest, served_url
     )
+
+    # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
+    #
+    # `stale_snapshot` (services/external_referral_readiness) is raised when the CONTENT is
+    # older than EXTERNAL_REFERRAL_STALE_DAYS, it is marked `auto_fixable: True`, and its
+    # `recommended_action` is literally "Refresh the seed snapshot". It reads
+    # `snapshot.extracted_at` via `get_content_extracted_at`, which has NO fallback by
+    # design -- and until now this function wrote only `snapshot.refreshed_at`. So the gate
+    # recommended an action that could not clear it, and `auto_fixable` was untrue: a seed
+    # could be refreshed successfully every night and stay blocked forever.
+    #
+    # GATED TWICE, because the failure mode of getting this wrong is the one this whole lane
+    # exists to prevent -- a stale price presented as freshly verified:
+    #   * `reached_served_origin` -- a cached-snapshot fallback (timeout, TLS, robots) runs
+    #     this same success path without contacting anyone, and must never clear a blocker;
+    #   * the price status -- we only claim an extraction when the amount we now STORE came
+    #     off the page. Refusing to write a reading and then calling the row fresh would
+    #     vouch for the previous price.
+    # A row we can never read a price from therefore stays blocked, which is the correct
+    # direction to be wrong in: it withholds a row rather than quoting a number we did not
+    # re-read.
+    if reached_served_origin and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+        seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
 
     await _execute_seed_data_stmt(
         """
