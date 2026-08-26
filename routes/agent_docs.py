@@ -123,7 +123,19 @@ async def sdks_info() -> Dict[str, Any]:
 
 @router.get("/openapi.json")
 async def agent_openapi_spec(request: Request) -> Dict[str, Any]:
-    return build_agent_openapi_schema(request.app, base_url=str(request.base_url))
+    # Memoized on app.state: this is the public front door for agent cold discovery (robots.txt
+    # invites crawlers here and /openapi.json redirects here), and rebuilding walks every
+    # app.route plus regenerates all pydantic JSON schemas per hit. Only the servers entry varies
+    # per request, so it is overlaid on a shallow copy of the cached schema.
+    app = request.app
+    schema = getattr(app.state, "agent_openapi_schema_cache", None)
+    if schema is None:
+        schema = build_agent_openapi_schema(app)
+        app.state.agent_openapi_schema_cache = schema
+    server_url = str(request.base_url).rstrip("/")
+    if server_url:
+        return {**schema, "servers": [{"url": server_url}]}
+    return schema
 
 
 @router.get("/examples/python", response_class=PlainTextResponse)
