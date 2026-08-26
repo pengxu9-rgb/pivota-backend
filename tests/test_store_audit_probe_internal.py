@@ -291,3 +291,126 @@ def test_idle_claim_returns_204_through_the_http_layer(monkeypatch):
     )
     assert response.status_code == 204
     assert response.content == b""
+
+
+def _discovery_env(monkeypatch):
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED", "true")
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_INTERNAL_KEY", "test-key")
+
+
+def _discovery_claim_stubs(monkeypatch, observed, claimed_domain="shop.example"):
+    async def fake_claimed(**_kwargs):
+        return {
+            "audit_run_id": "audit-1",
+            "merchant_id": None,
+            "execution_route_id": "route-placeholder",
+        }
+
+    async def fake_fetch_route(**_kwargs):
+        return {
+            "execution_route_id": "route-placeholder",
+            "normalized_domain": claimed_domain,
+            "route_kind": "ucp_discovery",
+            "endpoint_normalized": f"https://{claimed_domain}/",
+        }
+
+    async def fake_upsert(**kwargs):
+        observed["upsert"] = kwargs
+        return {"execution_route_id": "route-real"}
+
+    async def fake_attach(**kwargs):
+        observed["attach"] = kwargs
+        return True
+
+    async def fake_deactivate(**kwargs):
+        observed["deactivate"] = kwargs
+        return True
+
+    async def fake_evidence(**kwargs):
+        observed["evidence"] = kwargs
+        return "evidence-1"
+
+    async def fake_succeeded(**_kwargs):
+        return True
+
+    monkeypatch.setattr(receipt_module, "get_claimed_verification_run", fake_claimed)
+    monkeypatch.setattr(receipt_module, "fetch_execution_route", fake_fetch_route)
+    monkeypatch.setattr(receipt_module, "upsert_execution_route", fake_upsert)
+    monkeypatch.setattr(receipt_module, "attach_execution_route_to_claimed_verification", fake_attach)
+    monkeypatch.setattr(receipt_module, "deactivate_execution_route", fake_deactivate)
+    monkeypatch.setattr(receipt_module, "insert_evidence_item", fake_evidence)
+    monkeypatch.setattr(receipt_module, "mark_verification_succeeded", fake_succeeded)
+
+
+def test_discovery_placeholder_receipt_establishes_real_route(monkeypatch):
+    # The public intake seeds a ucp_discovery placeholder whose endpoint is a
+    # synthetic stand-in. The receipt may establish the discovered endpoint,
+    # must re-point attach + evidence at the NEW route, and must retire the
+    # placeholder.
+    _discovery_env(monkeypatch)
+    observed = {}
+    _discovery_claim_stubs(monkeypatch, observed)
+
+    result = asyncio.run(
+        receipt_module.receive_ucp_probe_receipt(_receipt(), x_internal_key="test-key")
+    )
+
+    assert result.verification_status == "succeeded"
+    assert result.execution_route_id == "route-real"
+    assert observed["upsert"]["endpoint"] == "https://shop.example/api/ucp/mcp"
+    assert observed["attach"]["execution_route_id"] == "route-real"
+    assert observed["evidence"]["execution_route_id"] == "route-real"
+    assert observed["deactivate"]["execution_route_id"] == "route-placeholder"
+
+
+def test_discovery_transition_still_refuses_domain_switch(monkeypatch):
+    # Discovery mode relaxes ONLY the endpoint, never the domain. A worker
+    # leased for other.example must not write shop.example evidence.
+    _discovery_env(monkeypatch)
+    observed = {}
+    _discovery_claim_stubs(monkeypatch, observed, claimed_domain="other.example")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            receipt_module.receive_ucp_probe_receipt(_receipt(), x_internal_key="test-key")
+        )
+    assert exc_info.value.status_code == 409
+    assert "upsert" not in observed
+
+
+def test_non_discovery_claim_keeps_strict_endpoint_identity(monkeypatch):
+    # Mutant guard: making every claim behave like discovery would let any
+    # worker rotate a real route's endpoint. A plain "ucp" claim with a
+    # different endpoint must still 409.
+    _discovery_env(monkeypatch)
+    observed = {}
+
+    async def fake_claimed(**_kwargs):
+        return {
+            "audit_run_id": "audit-1",
+            "merchant_id": None,
+            "execution_route_id": "route-1",
+        }
+
+    async def fake_fetch_route(**_kwargs):
+        return {
+            "execution_route_id": "route-1",
+            "normalized_domain": "shop.example",
+            "route_kind": "ucp",
+            "endpoint_normalized": "https://shop.example/api/other/endpoint",
+        }
+
+    async def fake_upsert(**kwargs):
+        observed["upsert"] = kwargs
+        return {"execution_route_id": "route-1"}
+
+    monkeypatch.setattr(receipt_module, "get_claimed_verification_run", fake_claimed)
+    monkeypatch.setattr(receipt_module, "fetch_execution_route", fake_fetch_route)
+    monkeypatch.setattr(receipt_module, "upsert_execution_route", fake_upsert)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            receipt_module.receive_ucp_probe_receipt(_receipt(), x_internal_key="test-key")
+        )
+    assert exc_info.value.status_code == 409
+    assert "upsert" not in observed
