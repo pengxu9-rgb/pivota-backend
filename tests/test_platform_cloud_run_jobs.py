@@ -231,12 +231,29 @@ def test_a_staging_job_can_no_longer_use_a_test_credential(monkeypatch):
 
 
 def test_require_platform_env_raises_on_a_job_without_pivota_env(monkeypatch):
+    """A job that named no environment is a managed host we cannot resolve.
+
+    Before this change it resolved to ``development`` and booted happily.
+    """
     _apply(monkeypatch, {"CLOUD_RUN_JOB": "audit-domainless-offer-currency"})
-    with pytest.raises(RuntimeError, match="cannot resolve the deployment environment"):
+    with pytest.raises(RuntimeError, match="cannot resolve the deployment environment") as excinfo:
         P.require_platform_env()
+    # The refusal must name the marker that proved this is a managed host, or
+    # the operator cannot tell why their container refused to boot. This
+    # message is the twin of the _resolve_env warning and had the same Cloud
+    # Run blindness: it named only RAILWAY_ENVIRONMENT.
+    assert "CLOUD_RUN_JOB=audit-domainless-offer-currency" in str(excinfo.value)
 
 
 def test_require_platform_env_accepts_a_job_with_pivota_env(monkeypatch):
+    """Positive control ONLY — it does not exercise platform detection.
+
+    ``PIVOTA_ENV`` is set, so resolution short-circuits before the Cloud Run
+    markers are ever consulted: this passes identically with the whole change
+    reverted, and it kills no mutant. Its sibling above is the row that pins
+    detection. Kept because a guard that refuses a correctly-configured job
+    would be worse than the bug, but do not read it as coverage.
+    """
     _apply(monkeypatch, _LIVE_PROD_JOB)
     assert P.require_platform_env() == "production"
 
@@ -252,15 +269,34 @@ def test_fail_closed_log_names_the_job_marker_not_k_service(monkeypatch, caplog)
         assert P.platform_env() == "production"
     messages = [rec.getMessage() for rec in caplog.records if "FAILING CLOSED" in rec.getMessage()]
     assert messages, "expected the fail-closed line"
-    assert "audit-domainless-offer-currency" in messages[0]
+    # KEY=value, not a bare value: "audit-domainless-offer-currency" alone does
+    # not say whether a Service or a Job produced it.
+    assert "CLOUD_RUN_JOB=audit-domainless-offer-currency" in messages[0]
+
+
+def test_fail_closed_log_still_names_k_service_for_a_service(monkeypatch, caplog):
+    """The Jobs fix must not cost the Services diagnostic.
+
+    Teaching the marker helper about Jobs makes it easy to narrow it to the Jobs
+    family alone — a mutant that does exactly that survives every other test in
+    this file, because nothing else asserts the SERVICE side of this log line.
+    This is that assertion.
+    """
+    _apply(monkeypatch, {"K_SERVICE": "pivota-web", "K_REVISION": "pivota-web-00042-abc"})
+    with caplog.at_level("ERROR"):
+        assert P.platform_env() == "production"
+    messages = [rec.getMessage() for rec in caplog.records if "FAILING CLOSED" in rec.getMessage()]
+    assert messages, "expected the fail-closed line"
+    assert "K_SERVICE=pivota-web" in messages[0]
 
 
 def test_job_metadata_falls_back_to_the_job_and_execution_names(monkeypatch):
     """Read as VALUES, not as host proof — the same split as RAILWAY_GIT_*.
 
-    Every job we deploy sets ``PIVOTA_SERVICE_NAME``, so this only decides what
-    a job created without it publishes to health payloads and audit metadata:
-    the job name beats ``None``.
+    Every job we deploy sets ``PIVOTA_SERVICE_NAME``, so this fallback is inert
+    in every live job today — no job entrypoint reaches ``service_name()`` at
+    all. It decides only what a FUTURE caller, or a job created without
+    ``PIVOTA_SERVICE_NAME``, reports: the job name beats ``None``.
     """
     _apply(
         monkeypatch,
