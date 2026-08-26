@@ -31,7 +31,8 @@ from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
-from services.external_offers_service import resolve_external_offer
+from services import external_seed_destination_liveness as destination_liveness
+from services.external_offers_service import ExternalOfferUnavailable, resolve_external_offer
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
@@ -342,6 +343,63 @@ async def _ensure_external_seeds_table() -> None:
     )
     await database.execute(
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;"
+    )
+    # Destination liveness (migration 200 / schema_guard). The refresh below writes
+    # these on every completed fetch, so this table cannot be usable without them.
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_http_status INTEGER;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_verdict TEXT;"
+    )
+    await database.execute(
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;"
+    )
+    # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
+    # db/schema_guard.py both create all four things; a table bootstrapped only through this
+    # runtime path used to get the columns and neither, which is a third and quietly different
+    # declaration of the same schema — and the one that decides whether an unknown verdict is
+    # rejected or silently stored.
+    try:
+        await database.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_external_product_seeds_destination_verdict'
+                ) THEN
+                    ALTER TABLE external_product_seeds
+                        ADD CONSTRAINT ck_external_product_seeds_destination_verdict
+                        CHECK (
+                            destination_verdict IS NULL
+                            OR destination_verdict IN (
+                                'live',
+                                'live_delisted',
+                                'redirected_to_product',
+                                'redirected_off_product',
+                                'dead_404',
+                                'unverifiable'
+                            )
+                        );
+                END IF;
+            END $$;
+            """
+        )
+    except Exception:
+        # SQLite (the test harness) has no DO blocks and no pg_constraint. The vocabulary is
+        # additionally enforced in Python by `classify_destination`, which is the only producer.
+        pass
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked "
+        "ON external_product_seeds(destination_checked_at);"
+    )
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict "
+        "ON external_product_seeds(destination_verdict);"
     )
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);"
@@ -4340,6 +4398,20 @@ async def update_external_seed(
     return {"status": "success"}
 
 
+def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
+    """Is the URL this refresh fetched the same one the serving lane hands out?
+
+    Compared after trimming and dropping a trailing slash — the two columns are written by
+    different code paths and differ cosmetically far more often than they differ in substance.
+    Anything beyond that (query-string order, case) is deliberately NOT normalised: on a
+    storefront a differing query string can select a different variant, so treating those as
+    the same URL would reintroduce exactly the mis-attribution this guard exists to prevent.
+    """
+    a = str(fetched or "").strip().rstrip("/")
+    b = str(served or "").strip().rstrip("/")
+    return bool(a) and a == b
+
+
 async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
@@ -4354,10 +4426,52 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     if not dest:
         raise HTTPException(status_code=400, detail="INVALID_URL")
 
+    # THE REFRESH USED TO BE BLIND TO A DEAD LINK, and worse than blind: `raise_for_status()`
+    # threw, `resolve_external_offer` caught it and returned the CACHED snapshot, this function
+    # wrote that snapshot and set `updated_at = NOW()` — so fetching a 404 made the row look
+    # FRESHER to the `stale_snapshot` gate. `raise_on_unavailable=True` is what stops that.
+    # `observed` carries the status and the FINAL url of the request that actually left, which
+    # is the only way to tell a product page from a 301 onto a collection.
+    # See docs/external-seed-dead-pdp-link-audit.md §4.2 and §5.2.
     snapshot = None
+    observed: Dict[str, Any] = {}
     try:
-        snapshot = await resolve_external_offer(market=market, url=dest, force_refresh=True)
+        snapshot = await resolve_external_offer(
+            market=market, url=dest, force_refresh=True, raise_on_unavailable=True, observed=observed
+        )
+    except ExternalOfferUnavailable as exc:
+        if not _same_destination(dest, destination_liveness.destination_of(row)):
+            # See the note at the success path: a verdict about a URL we do not serve is worse
+            # than no verdict at all.
+            return {
+                "status": "degraded",
+                "error": f"destination_unavailable: http {exc.status_code}",
+                "destination_refresh": {"status": "not_observed", "reason": "not_the_served_url"},
+            }
+        observation = destination_liveness.classify_destination(
+            requested_url=dest,
+            status_code=exc.status_code,
+            final_url=exc.final_url,
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+        destination_refresh = await destination_liveness.record_destination_observation(
+            seed_id, observation
+        )
+        # THIS PATH RECORDS, IT NEVER RETIRES. A refresh sees one URL and one status code;
+        # it has not read the brand's catalogue, so it cannot tell a deleted product from a
+        # WAF that answers 404 to an unfamiliar client. `record_destination_observation`
+        # enforces that (an uncorroborated verdict holds the streak), and the retirement call
+        # is deliberately absent here rather than left in behind a condition that cannot fire
+        # — an unreachable retirement reads like a live one to the next person.
+        # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+        return {
+            "status": "degraded",
+            "error": f"destination_unavailable: http {exc.status_code}",
+            "destination_refresh": destination_refresh,
+        }
     except Exception as exc:
+        # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
+        # the product, so no observation is recorded and the failure streak does not move.
         return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}"}
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
@@ -4609,6 +4723,47 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "seed_data": _seed_data_payload(seed_data),
         },
     )
+
+    # THE FETCH REACHED THE ORIGIN, so it is an observation and it may stamp the liveness
+    # columns — the ONLY writer allowed to, which is what makes `destination_checked_at`
+    # answerable ("when did we last see this URL") where `updated_at` never was.
+    #
+    # Classified from `observed`, the real HTTP status and FINAL url, NOT from
+    # `snapshot.canonical_url`: the page's self-declared canonical can point at a sibling
+    # handle for perfectly live products, and a `redirected_off_product` verdict is one of the
+    # two that can eventually retire a seed. A guess must never be able to do that.
+    destination_refresh: Dict[str, Any] = {"status": "not_observed"}
+    # ONLY JUDGE THE URL WE ACTUALLY SERVE. This function fetches `destination_url`, but the
+    # readiness gate and the sweep both resolve a seed to `canonical_url or destination_url`
+    # — and this very function writes `canonical_url` from the fetched page a few lines up, so
+    # the two drift apart by design. Recording a verdict from the wrong one is how a seed whose
+    # served link is healthy gets marked dead because a legacy `destination_url` 404s.
+    # When they differ, the sweep observes the served URL; saying nothing here is correct.
+    served_url = destination_liveness.destination_of(row)
+    if observed.get("status_code") is None:
+        # The fetch never reached the origin (or came from the snapshot cache), so there is
+        # nothing to record. Distinct from the case below, and the drift report says which.
+        destination_refresh = {"status": "not_observed", "reason": "no_origin_response"}
+    elif not _same_destination(dest, served_url):
+        destination_refresh = {"status": "not_observed", "reason": "not_the_served_url"}
+    else:
+        observation = destination_liveness.classify_destination(
+            requested_url=dest,
+            status_code=int(observed["status_code"]),
+            final_url=observed.get("final_url"),
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+        destination_refresh = await destination_liveness.record_destination_observation(
+            seed_id, observation
+        )
+        # THIS PATH RECORDS, IT NEVER RETIRES. A refresh sees one URL and one status code;
+        # it has not read the brand's catalogue, so it cannot tell a deleted product from a
+        # WAF that answers 404 to an unfamiliar client. `record_destination_observation`
+        # enforces that (an uncorroborated verdict holds the streak), and the retirement call
+        # is deliberately absent here rather than left in behind a condition that cannot fire
+        # — an unreachable retirement reads like a live one to the next person.
+        # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+
     return {
         "status": "success",
         "seed_id": seed_id,
@@ -4623,6 +4778,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         # the whole point of the refresh existing.
         "price_refresh": price_refresh,
         "availability_refresh": availability_refresh,
+        "destination_refresh": destination_refresh,
         "attached_product_key": row.get("attached_product_key"),
         "attached_variant_id": row.get("attached_variant_id"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,

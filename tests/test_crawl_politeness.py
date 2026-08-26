@@ -449,9 +449,7 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
         headers = {"content-type": "text/html", "retry-after": "77"}
         encoding = "utf-8"
         content = b"<html></html>"
-
-        def raise_for_status(self) -> None:
-            raise _httpx.HTTPStatusError("429", request=None, response=None)  # type: ignore[arg-type]
+        url = "https://brand.com/products/x"
 
     class _Client:
         def __init__(self, *a: Any, **kw: Any) -> None:
@@ -469,8 +467,12 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
 
     async def go() -> None:
-        with pytest.raises(_httpx.HTTPStatusError):
+        # WAS `_httpx.HTTPStatusError` (from `raise_for_status`). It is now the typed
+        # `ExternalOfferUnavailable`, which carries the status and the final url — the seed
+        # refresh could not tell a 404 from a timeout while both arrived as bare exceptions.
+        with pytest.raises(eos.ExternalOfferUnavailable) as caught:
             await eos._fetch_html("https://brand.com/products/x")
+        assert caught.value.status_code == 429
 
     asyncio.run(go())
 
@@ -479,8 +481,8 @@ def test_fetch_html_paces_and_feeds_the_429_back(monkeypatch: pytest.MonkeyPatch
     )
     state = cp._STATE.get("brand.com")
     assert state is not None and state.consecutive_blocks == 1, (
-        "the 429 must be recorded even though raise_for_status raised — recording after it would "
-        "mean the backoff never sees a throttle"
+        "the 429 must be recorded even though the fetcher raised — recording after the throw "
+        "would mean the backoff never sees a throttle"
     )
     assert state.backoff_until > 0
 
@@ -761,6 +763,8 @@ def test_the_batch_scripts_opt_into_waiting_rather_than_being_refused() -> None:
 # removed gate AND on a newly added fetch, which is the moment someone should be made to think.
 _GATED_CRAWL_LANES = {
     "services/external_offers_service.py": 1,
+    # products.json paging + the per-destination PDP probe. Both fetch brand storefronts.
+    "services/external_seed_destination_liveness.py": 2,
     "services/brand_product_discovery.py": 1,
     "services/co_occurrence_finder.py": 1,
     "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch
@@ -1153,3 +1157,151 @@ def test_a_cancelled_robots_fetch_does_not_cache_no_restrictions(
         "for a full TTL, across every lane that shares this cache"
     )
     assert "slowbots.example" not in cp._ROBOTS_INFLIGHT, "the in-flight entry leaked"
+
+
+# --------------------------------------------------------------- the `observed` out-param
+
+def _fetch_with_observed(
+    monkeypatch: "pytest.MonkeyPatch",
+    *,
+    status_code: int,
+    final_url: str,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Drive the REAL `_fetch_html` and return what it stamped into `observed`."""
+    from services import external_offers_service as eos
+
+    class _Resp:
+        pass
+
+    resp = _Resp()
+    resp.status_code = status_code
+    resp.headers = {"content-type": "text/html", **(headers or {})}
+    resp.encoding = "utf-8"
+    resp.content = b"<html><title>t</title></html>"
+    resp.url = final_url
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            return resp
+
+    _serve_robots(monkeypatch, {"brand.com": ""})
+    monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
+    _patch_sleep(monkeypatch)
+
+    observed: Dict[str, Any] = {}
+
+    async def go() -> None:
+        try:
+            await eos._fetch_html("https://brand.com/products/x", observed=observed)
+        except eos.ExternalOfferUnavailable:
+            pass
+
+    asyncio.run(go())
+    return observed
+
+
+def test_fetch_html_reports_what_it_saw_on_a_200(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """`observed` is the ONLY channel the live path has for a destination verdict.
+
+    Every refresh test stubs `resolve_external_offer` and hand-fills this dict, so deleting
+    the three lines that populate it left the whole suite green while
+    `_refresh_external_seed_by_id` would report `not_observed` forever in production.
+    """
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 200
+    assert observed["final_url"] == "https://brand.com/products/x"
+    assert observed["bot_challenged"] is False
+
+
+def test_fetch_html_reports_the_FINAL_url_after_a_redirect(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """The final url is what separates a live product from a 301 onto a collection page."""
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/collections/all"
+    )
+    assert observed["final_url"] == "https://brand.com/collections/all"
+    assert observed["status_code"] == 200
+
+
+def test_fetch_html_reports_a_404_before_it_raises(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """The stamp has to happen BEFORE the throw, or the dead-link path learns nothing."""
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=404, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 404
+    assert observed["bot_challenged"] is False
+
+
+def test_fetch_html_flags_a_bot_challenge(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """429 + `cf-mitigated` is a refusal; the refresh must not read it as a dead product."""
+    observed = _fetch_with_observed(
+        monkeypatch,
+        status_code=429,
+        final_url="https://brand.com/products/x",
+        headers={"cf-mitigated": "challenge"},
+    )
+    assert observed["status_code"] == 429
+    assert observed["bot_challenged"] is True
+
+
+def test_fetch_html_raises_on_a_3xx_that_was_not_followed(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """`raise_for_status` threw for any non-2xx; `>= 400` did not, and that is not the same.
+
+    A 302 with no Location survives `follow_redirects=True`. Under the old predicate its body
+    was parsed as the product page and written into the snapshot.
+    """
+    from services import external_offers_service as eos
+
+    observed = _fetch_with_observed(
+        monkeypatch, status_code=302, final_url="https://brand.com/products/x"
+    )
+    assert observed["status_code"] == 302
+
+    class _Resp:
+        pass
+
+    resp = _Resp()
+    resp.status_code = 302
+    resp.headers = {"content-type": "text/html"}
+    resp.encoding = "utf-8"
+    resp.content = b"<html></html>"
+    resp.url = "https://brand.com/products/x"
+
+    class _Client:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> Any:
+            return resp
+
+    _serve_robots(monkeypatch, {"brand.com": ""})
+    monkeypatch.setattr(eos.httpx, "AsyncClient", _Client)
+    _patch_sleep(monkeypatch)
+
+    async def go() -> None:
+        with pytest.raises(eos.ExternalOfferUnavailable) as caught:
+            await eos._fetch_html("https://brand.com/products/x")
+        assert caught.value.status_code == 302
+
+    asyncio.run(go())

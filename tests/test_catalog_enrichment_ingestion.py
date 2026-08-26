@@ -536,12 +536,30 @@ def test_seed_data_mirrors_title_and_image_urls_for_audit():
     assert sd["image_urls"] == ["https://maccosmetics.com/img/ruby-woo.jpg"]
 
 
-def test_seed_passes_external_referral_audit():
-    """End-to-end pin: a seed produced by the new builder passes
-    services.external_referral_readiness.evaluate_external_referral_seed
-    with status='healthy'. This is the regression test for the actual
-    bug — pre-Phase-7c agent seeds were status='blocked' on
-    zero_variants and dropped silently at recall time."""
+def test_seed_clears_every_audit_blocker_it_can_earn_at_mint_time():
+    """End-to-end pin: a seed produced by the new builder earns NO content blocker.
+
+    This is the regression test for the actual bug — pre-Phase-7c agent seeds were
+    status='blocked' on zero_variants and dropped silently at recall time.
+
+    It no longer asserts status='healthy'. A newly minted seed is now blocked on
+    `destination_never_verified`, and correctly so: `validated_at` records when GEMINI
+    asserted the offer (grounded search, see services/catalog_enrichment_agent/
+    gemini_url_validator), and nothing in this pipeline ever fetches the PDP. An LLM's
+    claim that a URL exists is not an observation that it resolves — and these are exactly
+    the URLs most likely to be wrong. The seed serves once
+    jobs/external_seed_destination_sweep has actually loaded it, which it does first,
+    because the sweep queue is ordered `destination_checked_at NULLS FIRST`.
+
+    `stale_snapshot` is blocked for the SAME reason and it is a second, independent fact:
+    the builder writes no `snapshot.extracted_at` because it never extracted anything from a
+    page. Gemini asserted the price; nobody read it. A gate that let an LLM-asserted price
+    serve as "fresh content" is the fabrication this lane exists to keep out, so both
+    blockers standing here is the honest state, not a fixture gap.
+
+    So the assertion is the one this test was always about: every blocker the BUILDER can
+    clear is cleared.
+    """
     import asyncio as _asyncio
     from services.external_referral_readiness import evaluate_external_referral_seed
 
@@ -555,9 +573,49 @@ def test_seed_passes_external_referral_audit():
         return status
 
     status = _asyncio.run(_check())
+    blockers = set(status.blocker_anomaly_types or [])
+    assert blockers == {"destination_never_verified", "stale_snapshot"}, (
+        f"the builder must leave no blocker of its own; got {sorted(blockers)}"
+    )
+    assert "zero_variants" not in blockers, "the Phase-7c defect, pinned"
+
+
+def test_a_minted_seed_serves_once_its_destination_is_actually_verified():
+    """The other half: verification is the ONLY thing standing between mint and serving."""
+    import asyncio as _asyncio
+    from datetime import datetime, timezone
+
+    from services.external_referral_readiness import evaluate_external_referral_seed
+
+    result = ingest_validated_record(_record())
+    seed = dict(result["seeds"][0])
+    seed.update(
+        destination_checked_at=datetime.now(timezone.utc).isoformat(),
+        destination_http_status=200,
+        destination_verdict="live",
+        destination_failure_streak=0,
+    )
+    # BOTH facts, because they are two facts. The sweep proves the link resolves; it reads no
+    # price. A content refresh is what clears `stale_snapshot`, and a seed needs both before
+    # it may serve — that is precisely the pair a single `destination_checked_at` collapsed.
+    import json as _json
+
+    raw = seed.get("seed_data") or {}
+    seed_data = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+    snapshot = dict(seed_data.get("snapshot") or {})
+    snapshot["extracted_at"] = datetime.now(timezone.utc).isoformat()
+    seed_data["snapshot"] = snapshot
+    seed["seed_data"] = seed_data
+
+    async def _check():
+        return await evaluate_external_referral_seed(
+            seed, matched_via="test", allowed_domains=["maccosmetics.com"]
+        )
+
+    status = _asyncio.run(_check())
     assert status.status == "healthy", (
-        f"agent seed must pass audit cleanly; got status={status.status} "
-        f"blockers={list(status.blocker_anomaly_types or [])}"
+        f"a verified agent seed must pass cleanly; got blockers="
+        f"{list(status.blocker_anomaly_types or [])}"
     )
 
 

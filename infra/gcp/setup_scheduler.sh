@@ -53,6 +53,12 @@ esac
 : "${STORE_AUDIT_UCP_REPROBE_ARMED:=false}"
 : "${STORE_AUDIT_COMMERCE_REPROBE_WORKER:=false}"
 : "${STORE_AUDIT_COMMERCE_REPROBE_ARMED:=false}"
+# The destination sweep OBSERVES by default and RETIRES only when armed. Observing is safe
+# and useful on its own — the readiness gate blocks a never-verified seed, so the sweep has to
+# run before the external lane can serve at all. Retiring writes status=inactive and suppresses
+# the mirrored catalog rows, which is a different blast radius and gets its own switch.
+: "${EXTERNAL_SEED_DESTINATION_SWEEP:=false}"
+: "${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -63,6 +69,11 @@ case "$STORE_AUDIT_UCP_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_UC
 case "$STORE_AUDIT_UCP_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_UCP_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_UCP_REPROBE_ARMED')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_WORKER must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_WORKER')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
+case "$EXTERNAL_SEED_DESTINATION_SWEEP" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
+case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE')" >&2; exit 2 ;; esac
+if [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP" != true ]; then
+  echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true requires EXTERNAL_SEED_DESTINATION_SWEEP=true" >&2; exit 2
+fi
 if [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_UCP_REPROBE_WORKER" != true ]; then
   echo "STORE_AUDIT_UCP_REPROBE_ARMED=true requires STORE_AUDIT_UCP_REPROBE_WORKER=true" >&2; exit 2
 fi
@@ -352,8 +363,38 @@ sched(){ # name schedule job-name [invoker] [paused: 0|1]
        echo "   (paused: $name)" ;;
   esac
 }
+# ---- external-seed destination sweep -------------------------------------------------------
+# Re-reads the third-party product URLs we publish and withdraws the ones that are gone.
+# `mkcrawljob`, not `mkjob`: it fetches merchant storefronts, so it must leave from the reserved
+# pivota-crawl egress IP. A run from anywhere else is answered with a Cloudflare bot challenge by
+# most brand hosts and reports "0 dead links" while having seen almost nothing.
+# task-timeout is raised over the crawl default because per-host pacing is the point: ~1,700 seeds
+# a day is a full corpus pass inside the 7-day staleness window.
+if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
+  echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE)"
+  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,1700"
+  [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
+  mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 3600s \
+    --command python --args "$SWEEP_ARGS"
+else
+  echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
+fi
+
 echo "== scheduler triggers"
 sched relgraph-sync-cron "37 10 * * *" relgraph-sync
+if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
+  sched external-seed-destination-sweep-cron "20 2 * * *" external-seed-destination-sweep
+else
+  # An idempotent disarm, not merely a creation skip: turning the flag off must stop an
+  # existing trigger from continuing to crawl.
+  if have "$GCLOUD" scheduler jobs describe external-seed-destination-sweep-cron --location "$REGION"; then
+    "$GCLOUD" scheduler jobs pause external-seed-destination-sweep-cron --location "$REGION" --quiet
+    echo "   (paused: external-seed-destination-sweep-cron; EXTERNAL_SEED_DESTINATION_SWEEP=false)"
+  fi
+fi
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
 sched commerce-index-relgraph-cron "*/10 * * * *" commerce-index-relgraph
 sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
