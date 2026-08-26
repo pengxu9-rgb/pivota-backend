@@ -39,13 +39,15 @@ SWEEP_WORKFLOW = WORKFLOWS / "backend-test-sweep.yml"
 #
 #   agent-pdp-orphan-reaper.yml         daily 04:37 UTC. Confirmed failing since
 #                                       2026-08-26 05:07 (last green 08-25).
-#   derive-offer-market-currency.yml    weekly Mon 09:11 UTC. Last ran 08-24,
-#                                       while Railway was still up, so it is
-#                                       latent rather than red — it fails on its
-#                                       next firing.
+#
+# derive-offer-market-currency.yml was the second entry and is GONE — migrated to
+# the `derive-offer-market-currency` / `audit-domainless-offer-currency` Cloud Run
+# Jobs. It was the latent case: it last ran 2026-08-24 while Railway was still up,
+# so it was still green and would have failed first on 2026-08-31. Removed here
+# rather than left behind, because a name that outlives its file silently
+# pre-approves any future workflow that reuses it.
 KNOWN_UNMIGRATED = {
     "agent-pdp-orphan-reaper.yml",
-    "derive-offer-market-currency.yml",
 }
 
 DSN_SECRETS = ("secrets.DATABASE_URL", "secrets.DATABASE_URL_NOVERIFY")

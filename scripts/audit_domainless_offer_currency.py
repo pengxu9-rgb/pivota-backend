@@ -357,7 +357,7 @@ async def _run(args: argparse.Namespace) -> int:
               f"(of {len(mapping)} mapped; the difference is rows another writer "
               f"filled first — fill-only, never overwritten)")
         print("NOTE: these offers are now covered by scripts/audit_offer_currency.py "
-              "and the weekly derive-offer-market-currency workflow.")
+              "and the weekly derive-offer-market-currency Cloud Run Job.")
 
         if not args.quarantine_mismatched:
             return 0
