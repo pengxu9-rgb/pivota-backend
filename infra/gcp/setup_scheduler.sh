@@ -41,10 +41,43 @@ esac
 # attempts, duplicate captures. It did exactly that on 2026-08-20 (caught in under a minute, no
 # executions fired) because deploy_backend.sh had been made opt-in and this script had not.
 #
-#   pre-cutover:  infra/gcp/setup_scheduler.sh prod <a> <b>                  (inert: default)
-#   at cutover:   WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>
+#   reconcile:    infra/gcp/setup_scheduler.sh prod <a> <b>
+#                 Safe to re-run. Updates every job/trigger DEFINITION; changes no existing
+#                 trigger's pause state and rewrites no worker env (CONFIG=preserve).
+#   arm one lane: ARM=content-canonical-election-cron infra/gcp/setup_scheduler.sh prod <a> <b>
+#   disarm one:   DISARM=reviews-invitation-send-cron infra/gcp/setup_scheduler.sh prod <a> <b>
+#   rewrite env:  CONFIG=apply WORKERS=true infra/gcp/setup_scheduler.sh prod <a> <b>
+#                 Needs the Railway-ported files, which no longer exist. See CONFIG below.
+#
+# WHY THE DEFAULT CHANGED. `WORKERS=false PAUSED=1` was the correct default while GCP prod ran
+# against a COPY of production and Railway still served: everything had to come up inert. After
+# the cutover those same defaults made the script a weapon — a run intended to add one Job would
+# pause every live trigger and disarm the worker — and PAUSED=0, the apparent fix, was refused
+# whenever Store Audit was armed, which in prod it always is. Between them there was no usable
+# invocation, so the jobs migrated in #1892/#1894/#1895 were provisioned by hand instead. A
+# provisioning script nobody can run does not prevent provisioning; it moves it somewhere with no
+# review, which is the same lesson deploy_gateway.sh records.
+# Was each feature flag SET BY THE CALLER, or merely defaulted? The disarm branches below turn a
+# flag that is false into an active `scheduler jobs pause`, so without this distinction a run
+# that never mentioned Store Audit would still disarm its four live triggers. `${F+set}` is
+# empty only when F is genuinely unset.
+_RELGRAPH_PUBLICATION_WORKER_EXPLICIT="${RELGRAPH_PUBLICATION_WORKER+set}"
+_SEARCH_INDEX_PUBLICATION_WORKER_EXPLICIT="${SEARCH_INDEX_PUBLICATION_WORKER+set}"
+_CHECKOUT_VALIDATION_WORKER_EXPLICIT="${CHECKOUT_VALIDATION_WORKER+set}"
+_INSIGHT_REFRESH_WORKER_EXPLICIT="${INSIGHT_REFRESH_WORKER+set}"
+_STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
+_STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
+_EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
+: "${CONFIG:=preserve}"
+case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 : "${WORKERS:=false}"
 : "${PAUSED:=1}"
+# Trigger states to change DELIBERATELY, as comma-separated scheduler-job names. Everything not
+# named here keeps whatever state it already has (see sched()). This is how you arm one lane
+# without touching the other fifteen — the thing PAUSED=0 could never do.
+#   ARM=content-canonical-election-cron infra/gcp/setup_scheduler.sh prod <a> <b>
+: "${ARM:=}"
+: "${DISARM:=}"
 : "${RELGRAPH_PUBLICATION_WORKER:=false}"
 : "${SEARCH_INDEX_PUBLICATION_WORKER:=false}"
 : "${CHECKOUT_VALIDATION_WORKER:=false}"
@@ -80,12 +113,17 @@ fi
 if [ "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" != true ]; then
   echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED=true requires STORE_AUDIT_COMMERCE_REPROBE_WORKER=true" >&2; exit 2
 fi
-if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ] && [ "$PAUSED" = 0 ]; then
-  echo "refusing PAUSED=0 with Store Audit UCP enabled: it resumes unrelated schedulers; use PAUSED=1 STORE_AUDIT_UCP_REPROBE_ARMED=true to arm only UCP" >&2
-  exit 2
-fi
-if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ] && [ "$PAUSED" = 0 ]; then
-  echo "refusing PAUSED=0 with Store Audit commerce enabled: use PAUSED=1 STORE_AUDIT_COMMERCE_REPROBE_ARMED=true to arm only commerce" >&2
+# These two guards used to refuse PAUSED=0 outright, because PAUSED=0 resumed EVERY trigger and
+# would have armed lanes the operator never mentioned. That is no longer what PAUSED means: it now
+# decides the state of triggers this run CREATES, and an existing trigger keeps its state unless
+# named in ARM/DISARM. So the refusal is gone — and with both Store Audit workers armed in prod
+# (they are), it was the reason no invocation of this script was usable at all.
+#
+# What the guards protected is now structural rather than conditional, so nothing is lost. Kept as
+# an assertion of the invariant rather than deleted outright: if PAUSED ever goes back to meaning
+# "state of every trigger", this is the line that should stop it.
+if [ "$PAUSED" = 0 ] && [ -n "$ARM$DISARM" ]; then
+  echo "PAUSED=0 sets the state of NEWLY CREATED triggers; ARM/DISARM set existing ones. Passing both is ambiguous - drop PAUSED=0 and name what you mean in ARM." >&2
   exit 2
 fi
 if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
@@ -188,8 +226,16 @@ fi
 
 # ---------------------------------------------------------------- 1. the single-instance worker
 ENV_FILE="$HERE/env.$ENV.yaml"; SECRETS_FILE="$HERE/secrets.$ENV.list"
-[ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "missing $ENV_FILE / $SECRETS_FILE - run port_railway_env.py first" >&2; exit 1; }
+# CONFIG=preserve (the default) needs NEITHER file. See the CONFIG note in the header: both are
+# generated by port_railway_env.py from `railway variables --json`, Railway was decommissioned
+# 2026-08-22, and on a fresh checkout they cannot be regenerated - so this hard exit was the
+# outcome of EVERY run of this script, in both environments, before the first job was touched.
+# deploy_gateway.sh hit the same wall and answered it the same way.
+if [ "$CONFIG" = apply ]; then
+  [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] || { echo "CONFIG=apply needs $ENV_FILE / $SECRETS_FILE - run port_railway_env.py first (it reads Railway, which is retired)" >&2; exit 1; }
+fi
 MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
+if [ "$CONFIG" = apply ]; then
 # Drop keys we are about to set ourselves: the ported file may already carry them from the
 # overrides, and a duplicate YAML key is a warning today and an error in a future gcloud.
 grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|SKIP_HEAVY_STARTUP_INIT|AUDIT_WORKER_ENABLED|REVIEWS_INVITATION_WORKER_ENABLED|DB_POOL_MIN_SIZE|DB_POOL_MAX_SIZE):' "$ENV_FILE" > "$MERGED"
@@ -198,11 +244,21 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|SKIP_HEAVY_STARTUP_
   printf 'AUDIT_WORKER_ENABLED: "%s"\nREVIEWS_INVITATION_WORKER_ENABLED: "%s"\n' "$WORKERS" "$WORKERS"
   printf 'DB_POOL_MIN_SIZE: "2"\nDB_POOL_MAX_SIZE: "10"\n'
 } >> "$MERGED"
-echo "== worker service (min=max=1, ingress internal)"
+fi
+WORKER_CONFIG_ARGS=()
+if [ "$CONFIG" = apply ]; then
+  WORKER_CONFIG_ARGS=(--env-vars-file "$MERGED"
+    --set-secrets "DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")")
+else
+  # PRESERVE. Restamp the commit and re-pin the two knobs this script owns, and NOTHING else:
+  # `--update-env-vars` leaves every other variable and every secret mount exactly as the running
+  # revision has them. AUDIT_WORKER_ENABLED is deliberately absent - see the WORKERS note below.
+  WORKER_CONFIG_ARGS=(--update-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=worker,PIVOTA_COMMIT_SHA=$BACKEND_TAG,SKIP_HEAVY_STARTUP_INIT=true,DB_POOL_MIN_SIZE=2,DB_POOL_MAX_SIZE=10")
+fi
+echo "== worker service (min=max=1, ingress internal, CONFIG=$CONFIG)"
 "$GCLOUD" run deploy worker --region "$REGION" --image "$BACKEND_IMAGE" --service-account "$SA" \
   --network default --subnet default --vpc-egress all-traffic \
-  --env-vars-file "$MERGED" \
-  --set-secrets "DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL:latest,$(paste -sd, "$SECRETS_FILE")" \
+  "${WORKER_CONFIG_ARGS[@]}" \
   --port 8080 --cpu 1 --memory 2Gi --concurrency 1 \
   --min-instances 1 --max-instances 1 \
   --no-cpu-throttling --execution-environment gen2 --ingress internal \
@@ -551,7 +607,10 @@ fi
 PROJECT_NUMBER=$("$GCLOUD" projects describe "$PROJECT" --format='value(projectNumber)')
 RUN_INVOKER="$SA"
 have "$GCLOUD" projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$RUN_INVOKER" --role=roles/run.invoker --condition=None
-sched(){ # name schedule job-name [invoker] [paused: 0|1]
+in_list(){ # name list -- exact match against a comma-separated list
+  case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
   local name="$1" cron="$2" job="$3" invoker="${4:-$RUN_INVOKER}" paused="${5:-$PAUSED}"
   local uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT/jobs/$job:run"
   local verb=create; have "$GCLOUD" scheduler jobs describe "$name" --location "$REGION" && verb=update
@@ -559,10 +618,35 @@ sched(){ # name schedule job-name [invoker] [paused: 0|1]
     --schedule="$cron" --time-zone=Etc/UTC --uri="$uri" --http-method=POST \
     --oauth-service-account-email="$invoker" \
     --attempt-deadline=1800s --quiet
+
+  # WHOSE DECISION IS THE PAUSE STATE? Not this script's, for a trigger that already exists.
+  #
+  # This used to apply $PAUSED to EVERY trigger on EVERY run, and that is what made the script
+  # unrunnable against live prod. The default PAUSED=1 meant a run intended to add ONE job also
+  # paused relgraph-sync-cron, the per-minute reviews-invitation-send-cron and the commerce-index
+  # lanes; PAUSED=0 meant the opposite blast radius, resuming things an operator never mentioned,
+  # which is why the Store Audit guards below refuse it outright. Between them there was no
+  # invocation that reconciled the definitions without also rewriting live state - so the jobs
+  # migrated in #1892/#1894/#1895 had to be provisioned by hand.
+  #
+  # Now: $PAUSED decides the state of a trigger this run CREATES, and nothing else. An existing
+  # trigger keeps the state it has unless it is named in ARM or DISARM. Re-running the script is
+  # therefore idempotent for state, which is what makes it safe to run at all.
+  local desired=""
+  if [ "$verb" = create ]; then
+    desired="$paused"                                   # new trigger: $PAUSED, fail-closed below
+  elif in_list "$name" "$ARM"; then
+    desired=0
+  elif in_list "$name" "$DISARM"; then
+    desired=1
+  else
+    echo "   (state unchanged: $name)"
+    return 0
+  fi
   # FAIL CLOSED on anything that is not exactly 0. `[ "$PAUSED" = 1 ]` treated PAUSED=true, yes, on
   # and "1 " as UNPAUSED - an operator typing PAUSED=true for safety would have armed
   # reviews-invitation-send on a one-minute schedule against a copy of production.
-  case "$paused" in
+  case "$desired" in
     0) "$GCLOUD" scheduler jobs resume "$name" --location "$REGION" --quiet \
          || { echo "FAILED to resume $name" >&2; exit 1; }
        echo "   (RESUMED: $name)" ;;
@@ -600,7 +684,7 @@ if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
 else
   # An idempotent disarm, not merely a creation skip: turning the flag off must stop an
   # existing trigger from continuing to crawl.
-  if have "$GCLOUD" scheduler jobs describe external-seed-destination-sweep-cron --location "$REGION"; then
+  if [ -n "$_EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT" ] && have "$GCLOUD" scheduler jobs describe external-seed-destination-sweep-cron --location "$REGION"; then
     "$GCLOUD" scheduler jobs pause external-seed-destination-sweep-cron --location "$REGION" --quiet
     echo "   (paused: external-seed-destination-sweep-cron; EXTERNAL_SEED_DESTINATION_SWEEP=false)"
   fi
@@ -646,7 +730,7 @@ else
   # skip. Existing Jobs may remain for forensic inspection, but their triggers
   # must never keep crawling after an operator turns the feature off.
   for trigger in store-audit-ucp-reprobe-enqueue-cron store-audit-ucp-probe-cron; do
-    if have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
+    if [ -n "$_STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT" ] && have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
       "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet
       echo "   (paused: $trigger; STORE_AUDIT_UCP_REPROBE_WORKER=false)"
     fi
@@ -663,26 +747,26 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   sched store-audit-commerce-probe-cron "*/5 * * * *" store-audit-commerce-probe "$COMMERCE_SCHEDULER_SA" "$COMMERCE_PAUSED"
 else
   for trigger in store-audit-commerce-reprobe-enqueue-cron store-audit-commerce-probe-cron; do
-    if have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
+    if [ -n "$_STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT" ] && have "$GCLOUD" scheduler jobs describe "$trigger" --location "$REGION"; then
       "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet
       echo "   (paused: $trigger; STORE_AUDIT_COMMERCE_REPROBE_WORKER=false)"
     fi
   done
 fi
 # A global scheduler resume must never activate this new writer by accident.
-if [ "$RELGRAPH_PUBLICATION_WORKER" != true ]; then
+if [ "$RELGRAPH_PUBLICATION_WORKER" != true ] && [ -n "$_RELGRAPH_PUBLICATION_WORKER_EXPLICIT" ]; then
   "$GCLOUD" scheduler jobs pause commerce-index-relgraph-cron --location "$REGION" --quiet
   echo "   (paused: commerce-index-relgraph-cron; RELGRAPH_PUBLICATION_WORKER=false)"
 fi
-if [ "$SEARCH_INDEX_PUBLICATION_WORKER" != true ]; then
+if [ "$SEARCH_INDEX_PUBLICATION_WORKER" != true ] && [ -n "$_SEARCH_INDEX_PUBLICATION_WORKER_EXPLICIT" ]; then
   "$GCLOUD" scheduler jobs pause commerce-index-search-index-cron --location "$REGION" --quiet
   echo "   (paused: commerce-index-search-index-cron; SEARCH_INDEX_PUBLICATION_WORKER=false)"
 fi
-if [ "$CHECKOUT_VALIDATION_WORKER" != true ]; then
+if [ "$CHECKOUT_VALIDATION_WORKER" != true ] && [ -n "$_CHECKOUT_VALIDATION_WORKER_EXPLICIT" ]; then
   "$GCLOUD" scheduler jobs pause commerce-index-checkout-validation-cron --location "$REGION" --quiet
   echo "   (paused: commerce-index-checkout-validation-cron; CHECKOUT_VALIDATION_WORKER=false)"
 fi
-if [ "$INSIGHT_REFRESH_WORKER" != true ]; then
+if [ "$INSIGHT_REFRESH_WORKER" != true ] && [ -n "$_INSIGHT_REFRESH_WORKER_EXPLICIT" ]; then
   "$GCLOUD" scheduler jobs pause commerce-index-insight-refresh-cron --location "$REGION" --quiet
   echo "   (paused: commerce-index-insight-refresh-cron; INSIGHT_REFRESH_WORKER=false)"
 fi
