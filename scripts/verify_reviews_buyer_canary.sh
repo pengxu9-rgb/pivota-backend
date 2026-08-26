@@ -33,12 +33,16 @@ echo
 
 echo "== openapi paths present? =="
 # /openapi.json is admin-gated in production - it is the full internal route list. Without a key
-# the response is 404 (deliberately, so an anonymous caller cannot even confirm it exists), which
-# would surface here as a JSON parse error rather than an auth problem.
+# the response is a 307 redirect (empty body) to the curated public spec, which cannot contain
+# the internal paths this check wants - so the check is skipped rather than parsed into a
+# pipefail abort that would kill the canary before the review-lane checks below.
 ADMIN_KEY="${ADMIN_API_KEY:-${PROMOTIONS_ADMIN_KEY:-}}"
-[ -n "$ADMIN_KEY" ] || echo "   note: ADMIN_API_KEY not set - expect 404 from /openapi.json in production" >&2
-curl -sS ${ADMIN_KEY:+-H "X-ADMIN-KEY: $ADMIN_KEY"} "$BASE_URL/openapi.json" \
-| python3 -c 'import sys,json; p=json.load(sys.stdin).get("paths",{}); want=["/buyer/reviews/v1/verification/issue-token","/buyer/reviews/v1/verification/exchange","/buyer/reviews/v1/reviews","/buyer/reviews/v1/reviews/{review_id}","/buyer/reviews/v1/reviews/{review_id}/media","/employee/reviews/v1/moderation/reviews","/agent/shop/v1/invoke","/agent/shop/v1/review-media/{public_id}"]; miss=[x for x in want if x not in p]; print("all_present" if not miss else "missing="+",".join(miss))'
+if [ -n "$ADMIN_KEY" ]; then
+  curl -sS -H "X-ADMIN-KEY: $ADMIN_KEY" "$BASE_URL/openapi.json" \
+  | python3 -c 'import sys,json; p=json.load(sys.stdin).get("paths",{}); want=["/buyer/reviews/v1/verification/issue-token","/buyer/reviews/v1/verification/exchange","/buyer/reviews/v1/reviews","/buyer/reviews/v1/reviews/{review_id}","/buyer/reviews/v1/reviews/{review_id}/media","/employee/reviews/v1/moderation/reviews","/agent/shop/v1/invoke","/agent/shop/v1/review-media/{public_id}"]; miss=[x for x in want if x not in p]; print("all_present" if not miss else "missing="+",".join(miss))'
+else
+  echo "   skipping: ADMIN_API_KEY not set - anonymous /openapi.json redirects to the curated public spec" >&2
+fi
 
 SUBJECT_JSON="$(python3 -c 'import json,os; mid=os.environ["MERCHANT_ID"]; p=os.environ["PLATFORM"]; pp=os.environ["PLATFORM_PRODUCT_ID"]; vid=os.environ.get("VARIANT_ID","").strip(); s={"merchant_id":mid,"platform":p,"platform_product_id":pp}; 
 if vid: s["variant_id"]=vid

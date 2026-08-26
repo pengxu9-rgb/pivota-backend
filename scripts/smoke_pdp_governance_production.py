@@ -322,22 +322,41 @@ def _check_portal_bundles(
 
 
 def _check_openapi(api_base: str, failures: List[str]) -> None:
-    # /openapi.json is admin-gated in production (it is the full internal route list). Anonymous
-    # callers get 404, not 401, so a missing key looks exactly like a missing endpoint - say so
-    # rather than reporting "openapi returned status=404" and sending someone after a routing bug.
+    # /openapi.json is admin-gated in production (it is the full internal route list). A missing
+    # or wrong key gets a 307 redirect to the CURATED public spec - and urllib follows redirects,
+    # so a bad key still lands a 200. Status alone proves nothing here; the check must verify
+    # WHICH document came back, or a rotated key silently validates the wrong spec.
     admin_key = (os.environ.get("ADMIN_API_KEY") or os.environ.get("PROMOTIONS_ADMIN_KEY") or "").strip()
-    status, _headers, data = _fetch(
-        f"{api_base.rstrip('/')}/openapi.json", admin_key=admin_key or None, timeout=45
-    )
-    text = _decode(data)
-    if status == 404 and not admin_key:
+    if not admin_key:
         failures.append(
-            "openapi returned 404 and no ADMIN_API_KEY was set - the spec is admin-gated in "
-            "production; export ADMIN_API_KEY to run this check"
+            "no ADMIN_API_KEY set - the full spec is admin-gated in production and anonymous "
+            "/openapi.json redirects to the curated public spec; export ADMIN_API_KEY to run "
+            "this check"
         )
         return
+    status, _headers, data = _fetch(
+        f"{api_base.rstrip('/')}/openapi.json", admin_key=admin_key, timeout=45
+    )
+    text = _decode(data)
     if status != 200:
         failures.append(f"openapi returned status={status}")
+        return
+    try:
+        paths = list(json.loads(text).get("paths") or {})
+    except ValueError:
+        failures.append("openapi response is not JSON")
+        return
+    if not paths:
+        failures.append("openapi spec has no paths")
+        return
+    # The curated spec documents ONLY the agent-facing prefixes; the internal spec always has
+    # more. All-agent paths means the redirect for non-admin callers was followed.
+    if all(p.startswith(("/agent/v1", "/agent/v2", "/agent/shop/v1")) for p in paths):
+        failures.append(
+            "openapi served the CURATED public spec, not the internal one - ADMIN_API_KEY is "
+            "wrong or rotated (the non-admin redirect was silently followed)"
+        )
+        return
     _fail_if_legacy_url(text, "openapi", failures)
     host = parse.urlparse(api_base).netloc
     if host and host not in text:
