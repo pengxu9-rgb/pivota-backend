@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -461,6 +462,18 @@ def test_a_gate_refusal_degrades_to_unverified_rather_than_raising(
 
 # --- the route actually calls it ---------------------------------------------------------------
 
+# A seed only reaches the live verifier if the readiness gate lets it serve, and since
+# migration 200 that needs two OBSERVATIONS, not just a well-formed row:
+#   destination_checked_at        a fetch reached the origin (`destination_never_verified`)
+#   seed_data.snapshot.extracted_at   the content was read (`stale_snapshot`)
+# These fixtures predate both. They passed because the old staleness check was guarded on
+# `extracted_dt is not None` and the row carried no timestamp at all — the fail-open that
+# services/external_seed_destination_liveness exists to close. Stamping them fresh keeps these
+# tests about the VERIFIER; a seed that cannot serve is not an input to a verifier test.
+def _verified_recently() -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+
 def test_offers_resolve_verifies_and_drops_a_dead_offer(monkeypatch: pytest.MonkeyPatch) -> None:
     """A verifier nothing calls is decoration. This drives the REAL route, so it fails if the hop
     is ever dropped from `offers.resolve` — which no test of the module alone could catch.
@@ -497,10 +510,13 @@ def test_offers_resolve_verifies_and_drops_a_dead_offer(monkeypatch: pytest.Monk
         "canonical_url": "https://brand.com/products/serum",
         "domain": "brand.com", "title": "Serum", "price_amount": 19.0,
         "price_currency": "USD", "availability": "in_stock", "utm_template": None,
-        "seed_data": {"brand": "Brand", "snapshot": {"variants": [
+        "seed_data": {"brand": "Brand", "snapshot": {"extracted_at": _verified_recently(), "variants": [
             {"variant_id": "SKU-1", "title": "30ml", "price_amount": 19.0,
              "price_currency": "USD", "availability": "in_stock"}]}},
         "status": "active",
+        "destination_checked_at": _verified_recently(),
+        "destination_verdict": "live",
+        "destination_failure_streak": 0,
     }
 
     async def fake_fetch_all(query: str, values=None):
@@ -554,10 +570,13 @@ def test_offers_resolve_serves_unverified_rather_than_failing_the_turn(
         "canonical_url": "https://brand.com/products/serum",
         "domain": "brand.com", "title": "Serum", "price_amount": 19.0,
         "price_currency": "USD", "availability": "in_stock", "utm_template": None,
-        "seed_data": {"brand": "Brand", "snapshot": {"variants": [
+        "seed_data": {"brand": "Brand", "snapshot": {"extracted_at": _verified_recently(), "variants": [
             {"variant_id": "SKU-1", "title": "30ml", "price_amount": 19.0,
              "price_currency": "USD", "availability": "in_stock"}]}},
         "status": "active",
+        "destination_checked_at": _verified_recently(),
+        "destination_verdict": "live",
+        "destination_failure_streak": 0,
     }
 
     async def fake_fetch_all(query: str, values=None):
@@ -618,10 +637,13 @@ def test_verification_runs_AFTER_truncation_so_the_budget_is_not_spent_on_hidden
             "canonical_url": f"https://brand.com/products/serum-{i}",
             "domain": "brand.com", "title": f"Serum {i}", "price_amount": 19.0 + i,
             "price_currency": "USD", "availability": "in_stock", "utm_template": None,
-            "seed_data": {"brand": "Brand", "snapshot": {"variants": [
+            "seed_data": {"brand": "Brand", "snapshot": {"extracted_at": _verified_recently(), "variants": [
                 {"variant_id": "SKU-1", "title": "30ml", "price_amount": 19.0 + i,
                  "price_currency": "USD", "availability": "in_stock"}]}},
             "status": "active",
+            "destination_checked_at": _verified_recently(),
+            "destination_verdict": "live",
+            "destination_failure_streak": 0,
         }
 
     async def fake_fetch_all(query: str, values=None):
