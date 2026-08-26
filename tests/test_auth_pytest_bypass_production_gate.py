@@ -23,15 +23,15 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from utils.auth import get_current_user
+from tests.test_platform_shim import _ALL_KEYS as _PLATFORM_SIGNAL_KEYS
 
 
 def _clear_environment_labels(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in (
-        "PIVOTA_ENV",
-        "RAILWAY_ENVIRONMENT",
-        "RAILWAY_ENVIRONMENT_NAME",
-        "K_SERVICE",
-    ):
+    # Reuses config/platform.py's own canonical key list (test_platform_shim.py's
+    # _ALL_KEYS) rather than a hand-picked subset, so a developer's shell with a
+    # leftover RAILWAY_SERVICE_ID/PROJECT_ID/etc. can't make this test fail for
+    # the wrong reason.
+    for var in _PLATFORM_SIGNAL_KEYS:
         monkeypatch.delenv(var, raising=False)
 
 
