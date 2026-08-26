@@ -316,9 +316,30 @@ echo "== job: content-canonical-election (GH Actions cron 52 */6 * * *)"
 # public proxy, where the TLS+auth handshake regularly exceeded the 5s default.
 # In-VPC to a private IP that reason is gone, and keeping it would only delay
 # the failure signal on a genuinely wedged pool.
+#
+# INDEX_ELIGIBLE_SITEMAP=1 IS carried, and is the one env var here that is not
+# plumbing. `candidates_query(widen=None)` defaults to `sitemap_widen_enabled()`,
+# which reads that flag — so it decides WHICH ROWS ARE ELECTABLE. Live prod `web`
+# runs it =1, and without it this job would elect against a NARROWER candidate
+# set than the feed and get_pdp_v2 read with. The deleted workflow had the same
+# gap and it cost nothing (candidates_query returns 4,380 rows either way today,
+# and the skew direction is safe: writer's set is a subset of the reader's, so it
+# under-elects rather than naming a sig the reader rejects). But this block is
+# authoring the writer's environment from scratch, which is the moment to make
+# the two sides agree explicitly rather than by coincidence.
+#
+# NOT carried, and worth naming rather than leaving silent: the workflow's
+# `concurrency: {group: content-canonical-election, cancel-in-progress: false}`.
+# Cloud Run Jobs allow concurrent executions and Cloud Scheduler does not
+# serialize, so there is no equivalent to set. Schedule-vs-schedule overlap is
+# structurally impossible (6h interval, 900s timeout). The residual risk is a
+# HAND-RUN `gcloud run jobs execute` landing on top of a scheduled run:
+# plan_elections snapshots its candidates OUTSIDE the write transaction, so the
+# later writer would commit reasoning built on stale state. Take the runbook's
+# dry-run first, and do not hand-run one within the timeout of a :52 tick.
 mkjob content-canonical-election "$BACKEND_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=content-canonical-election,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
+  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=content-canonical-election,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2,INDEX_ELIGIBLE_SITEMAP=1" \
   --task-timeout 900s \
   --command python \
   --args "scripts/elect_content_canonicals.py,--apply,--seed-from-sitemap,https://agent.pivota.cc/sitemap-products.xml"
