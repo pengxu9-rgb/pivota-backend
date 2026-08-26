@@ -2057,8 +2057,9 @@ async def app_lifespan(_app: FastAPI):
     # environment this is (a Cloud Run revision deployed without PIVOTA_ENV),
     # the shim answers "production" so the guards stay armed — but running on
     # that guess is not acceptable, so refuse to come up at all. Local dev and
-    # the test suite (no K_SERVICE, no RAILWAY_*) resolve "development" and
-    # pass straight through.
+    # the test suite (no Cloud Run marker of EITHER family -- K_* for a service,
+    # CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION for a job -- and no RAILWAY_*) resolve
+    # "development" and pass straight through.
     resolved_env = require_platform_env()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)

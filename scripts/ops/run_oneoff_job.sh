@@ -56,7 +56,15 @@ REGION="${REGION:-us-west1}"
 IMAGE="${IMAGE:-us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-sa-worker@$PROJECT.iam.gserviceaccount.com}"
 SECRETS="${SECRETS:-DATABASE_URL=DATABASE_URL:latest}"
-ENV_VARS="${ENV_VARS:-DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600}"
+# PIVOTA_ENV is REQUIRED, not decorative. A Cloud Run Job injects CLOUD_RUN_JOB /
+# CLOUD_RUN_EXECUTION and no K_* at all, so config/platform.py now resolves this
+# container as a managed host (it previously read as "local", which was wrong:
+# PROJECT defaults to pivota-prod and SECRETS mounts the production DATABASE_URL).
+# Without PIVOTA_ENV the shim FAILS CLOSED to production anyway and logs a loud
+# ERROR on every run. Naming it is the difference between "production because we
+# said so" and "production because we could not tell" — and if you point this at
+# staging, override it, or every prod-only guard stays armed against staging data.
+ENV_VARS="${ENV_VARS:-PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-600s}"
 JOB_PREFIX="${JOB_PREFIX:-oneoff}"
 

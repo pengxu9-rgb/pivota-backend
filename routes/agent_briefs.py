@@ -135,10 +135,13 @@ async def build_brief(
             }
         )
     except Exception as e:
-        # In production, brief persistence is required (durable join key).
-        # In unit tests, allow degraded mode so the suite can run without a DB.
-        # Fails closed in production the same way the demo admin login lanes
-        # do (#1889) — see config.platform.pytest_bypass_allowed.
+        # On a deployed host, brief persistence is required (durable join
+        # key). In unit tests, allow degraded mode so the suite can run without
+        # a DB. Fails closed on ANY DEPLOYED host — staging included — as well
+        # as anything resolving to production; since #1900 the gate is `not
+        # (is_deployed() or is_production())`, and since the Cloud Run **Jobs**
+        # markers were added it covers job containers too. See
+        # config.platform.pytest_bypass_allowed.
         if pytest_bypass_allowed(bypass_name="the brief-persist degraded mode"):
             pass
         else:

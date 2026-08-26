@@ -101,6 +101,7 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --service-account sa-worker@pivota-prod.iam.gserviceaccount.com \
   --network default --subnet default --vpc-egress all-traffic \
   --set-secrets DATABASE_URL=DATABASE_URL:latest \
+  --set-env-vars PIVOTA_ENV=production \
   --max-retries 0 --task-timeout 600s \
   --command python --args=scripts/partner_settlement_dry_run.py
 gcloud run jobs execute "$JOB" --project pivota-prod --region us-west1 --wait || {
@@ -114,6 +115,12 @@ done
 printf '%s\n' "$OUT"
 gcloud run jobs delete "$JOB" --project pivota-prod --region us-west1 --quiet
 ```
+
+`PIVOTA_ENV=production` is not optional. A Cloud Run **Job** injects
+`CLOUD_RUN_JOB`/`CLOUD_RUN_EXECUTION` and none of the `K_*` variables a Cloud Run
+*service* gets, so `config/platform.py` treats it as a managed host; with no
+`PIVOTA_ENV` it fail-closes to production and logs an ERROR on every run. Set it
+so the answer is a decision rather than a guess.
 
 `scripts/ops/run_oneoff_job.sh` wraps exactly this, with the three footguns below
 already handled, and is what the operator scripts' own `--help` now points at:
