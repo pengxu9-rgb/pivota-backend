@@ -161,7 +161,11 @@ def _require_internal_key(x_internal_key: Optional[str]) -> None:
             detail={"error": "CONFIG_MISSING", "message": "AGENT_AUTH_INTROSPECT_INTERNAL_KEY is not configured"},
         )
     provided = str(x_internal_key or "").strip()
-    if not provided or not hmac.compare_digest(provided, expected):
+    # Compare as BYTES: Starlette decodes headers latin-1, and hmac.compare_digest on str
+    # RAISES on non-ASCII — an unauthenticated request could pick a 500 (the #1883 class).
+    if not provided or not hmac.compare_digest(
+        provided.encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "FORBIDDEN", "message": "Missing or invalid X-Internal-Key"},
