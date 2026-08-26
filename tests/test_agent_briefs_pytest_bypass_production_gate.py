@@ -8,8 +8,10 @@ minting privilege), but the same underlying defect: a leakable env var
 silently changes production behavior with no fail-closed check. Found in the
 same review pass as PR #1893's `utils.auth.get_current_user` fix.
 
-Now routed through `config.platform.pytest_bypass_allowed`, which adds the
-`not is_production()` conjunct.
+Routed through `config.platform.pytest_bypass_allowed`, which refuses it on
+ANY deployed host — `not (is_deployed() or is_production())`, not merely `not
+is_production()` as PR #1897 first shipped. On staging that meant a leaked
+`PYTEST_CURRENT_TEST` silently downgraded a durability failure to a 200.
 """
 from __future__ import annotations
 
@@ -83,24 +85,46 @@ def test_persist_failure_degrades_outside_production(monkeypatch, client: TestCl
     assert resp.json()["status"] == "success"
 
 
-@pytest.mark.parametrize("prod_var", ["PIVOTA_ENV", "RAILWAY_ENVIRONMENT", "K_SERVICE"])
-def test_persist_failure_raises_503_in_production_even_with_pytest_env(
-    monkeypatch, client: TestClient, prod_var
+#: Deployed environments the degraded mode must refuse, with whether each one
+#: resolves to `production`. The False rows were ARMED under PR #1897's
+#: `not is_production()` gate and are the actual behavior change here.
+_REFUSING_ENVS = {
+    "production_pivota_env": ({"PIVOTA_ENV": "production"}, True),
+    "production_railway": ({"RAILWAY_ENVIRONMENT": "production"}, True),
+    "production_cloud_run_fail_closed": ({"K_SERVICE": "pivota-backend-prod"}, True),
+    "staging_cloud_run": (
+        {"K_SERVICE": "pivota-backend-staging", "PIVOTA_ENV": "staging"},
+        False,
+    ),
+    "staging_railway": ({"RAILWAY_ENVIRONMENT": "staging"}, False),
+    "development_cloud_run": (
+        {"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "development"},
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "env,expect_production", _REFUSING_ENVS.values(), ids=_REFUSING_ENVS
+)
+def test_persist_failure_raises_503_on_any_deployed_host(
+    monkeypatch, client: TestClient, env, expect_production
 ):
     """Mutant check: PYTEST_CURRENT_TEST alone must not suppress the error.
 
     PYTEST_CURRENT_TEST is genuinely set here (pytest sets it for every
-    running test), so this only passes if the new is_production() conjunct,
-    via pytest_bypass_allowed(), is load-bearing.
+    running test), so this only passes if the deployment conjunct, via
+    pytest_bypass_allowed(), is load-bearing. The `expect_production=False`
+    rows pin that `is_production()` is NOT what refuses them — reverting the
+    gate to `not is_production()` re-arms exactly those rows.
     """
     import routes.agent_briefs as module
 
     assert __import__("os").getenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(module, "insert_brief", _fail_insert_brief)
-    monkeypatch.setenv(
-        prod_var,
-        "pivota-backend-prod" if prod_var == "K_SERVICE" else "production",
-    )
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert P.is_production() is expect_production
 
     resp = client.post(
         "/agent/v1/briefs/build",

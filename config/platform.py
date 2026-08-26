@@ -72,6 +72,7 @@ __all__ = [
     "is_staging",
     "is_development",
     "is_deployed",
+    "pytest_bypass_allowed",
     "service_name",
     "service_id",
     "project_id",
@@ -328,7 +329,7 @@ def is_production(env: Optional[Mapping[str, str]] = None) -> bool:
 def pytest_bypass_allowed(
     env: Optional[Mapping[str, str]] = None, *, bypass_name: str = "a test-only bypass"
 ) -> bool:
-    """True only inside an actual pytest run outside production.
+    """True only inside an actual pytest run on an UNMANAGED host.
 
     Several call sites short-circuit auth/durability checks whenever
     ``PYTEST_CURRENT_TEST`` is set, to let the unit-test suite run without
@@ -336,18 +337,56 @@ def pytest_bypass_allowed(
     set by pytest itself, but it is just an environment variable — a debug
     image built from a test stage, a copied ``.env``, or a misconfigured
     smoke harness could still leak it into a real server process. A bypass
-    gated on this variable alone would then be live in production.
+    gated on this variable alone would then be live on a real server.
 
-    Centralizing the check here means the ``not is_production()`` conjunct
-    can't be forgotten at a new call site the way it was for the bypasses
-    fixed in PR #1893 (see also the demo login lanes fixed in PR #1889).
+    Centralizing the check here means the deployment conjunct can't be
+    forgotten at a new call site the way it was for the bypasses fixed in
+    PR #1893 (see also the demo login lanes fixed in PR #1889).
+
+    ``is_deployed()`` — not ``is_production()``: this is the same distinction
+    pinned in :func:`utils.runtime_safety.is_production_runtime` and in the
+    comment above ``_shopify_prod_runtime`` in ``routes/webhook_routes.py``.
+    A test-only bypass is not a staging feature. Staging runs a restored
+    production snapshot and real third-party credentials, so a leaked
+    ``PYTEST_CURRENT_TEST`` on a staging revision still hands anyone who
+    knows ``test-token`` a ``role=admin`` session, and anyone who knows
+    ``test-agent-key`` an agent context with ``allowed_merchants=None`` and
+    no rate/quota enforcement. Gating on ``is_production()`` alone left every
+    staging revision — and every ``PIVOTA_ENV=development`` revision — armed.
+
+    ``is_production()`` is kept as a second conjunct rather than replaced:
+    ``is_deployed()`` is not a superset of it. ``PIVOTA_ENV=production`` with
+    no platform markers resolves to production while ``platform_name()``
+    stays ``"local"``.
+
+    This costs the suite nothing: no CI workflow sets ``RAILWAY_*``,
+    ``K_SERVICE`` or ``PIVOTA_ENV``, so ``platform_name()`` is ``"local"``
+    both in CI and on a developer laptop.
+
+    NOT closed by this check: a bare container with no platform markers at
+    all (``docker run`` of a test-stage image) is environmentally
+    indistinguishable from a laptop running pytest — every marker
+    ``is_deployed()`` reads is injected by the managed host, and such a
+    container injects none. That residual case needs a signal outside the
+    environment, not a different environment predicate.
     """
     if not _get(env, "PYTEST_CURRENT_TEST"):
         return False
-    if is_production(env):
+    if is_deployed(env) or is_production(env):
+        # Deliberately NOT _warn_once-memoised, unlike the fail-closed
+        # resolution path. That one fires per-call for a misconfiguration and
+        # would be per-request noise. This one fires only when someone
+        # presents a test credential to a deployed server, which is a
+        # per-attempt security event — collapsing repeats would hide the
+        # volume of an attack. It cannot become steady-state noise: on a
+        # correctly configured deployment PYTEST_CURRENT_TEST is never set,
+        # so this line never runs at all.
         logger.warning(
-            "[Platform] PYTEST_CURRENT_TEST is set but the environment "
-            "resolves to production; %s stays disabled",
+            "[Platform] PYTEST_CURRENT_TEST is set but this process is on a "
+            "managed host or resolves to production (platform=%s, env=%s); "
+            "%s stays disabled",
+            platform_name(env),
+            platform_env(env),
             bypass_name,
         )
         return False

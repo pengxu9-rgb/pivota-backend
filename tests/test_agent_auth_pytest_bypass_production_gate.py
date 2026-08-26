@@ -12,9 +12,13 @@ built from a test stage, a copied `.env`, or a misconfigured smoke harness
 could leak into a real server process.
 
 The bypass is heavily load-bearing (dozens of tests authenticate with
-`X-API-Key: test-agent-key`), so it is not removed here. Instead it now
-routes through `config.platform.pytest_bypass_allowed`, which adds the same
-`not is_production()` conjunct PR #1889 added to the demo login lanes.
+`X-API-Key: test-agent-key`), so it is not removed here. Instead it routes
+through `config.platform.pytest_bypass_allowed`, which refuses it on ANY
+deployed host — `not (is_deployed() or is_production())`, not merely `not
+is_production()` as PR #1897 first shipped. Staging is the case that matters:
+it runs a restored production snapshot and real third-party credentials, so a
+leaked `PYTEST_CURRENT_TEST` there hands anyone who knows `test-agent-key` an
+agent context with `allowed_merchants=None` and no rate/quota enforcement.
 """
 from __future__ import annotations
 
@@ -63,24 +67,46 @@ async def test_test_key_bypass_works_outside_production(monkeypatch, test_key):
     assert context.can_access_merchant("any_merchant") is True
 
 
+#: Deployed environments the bypass must refuse. The `production` group was
+#: already blocked by PR #1897; the `deployed_non_production` group is the
+#: behavior change — every one of those was ARMED under `not is_production()`.
+_REFUSING_ENVS = {
+    "production_pivota_env": ({"PIVOTA_ENV": "production"}, True),
+    "production_railway": ({"RAILWAY_ENVIRONMENT": "production"}, True),
+    "production_cloud_run_fail_closed": ({"K_SERVICE": "pivota-backend-prod"}, True),
+    "staging_cloud_run": (
+        {"K_SERVICE": "pivota-backend-staging", "PIVOTA_ENV": "staging"},
+        False,
+    ),
+    "staging_railway": ({"RAILWAY_ENVIRONMENT": "staging"}, False),
+    "development_cloud_run": (
+        {"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "development"},
+        False,
+    ),
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prod_var", ["PIVOTA_ENV", "RAILWAY_ENVIRONMENT", "K_SERVICE"])
-async def test_test_key_bypass_refuses_in_production_even_with_pytest_env(
-    monkeypatch, prod_var
+@pytest.mark.parametrize(
+    "env,expect_production", _REFUSING_ENVS.values(), ids=_REFUSING_ENVS
+)
+async def test_test_key_bypass_refuses_on_any_deployed_host(
+    monkeypatch, env, expect_production
 ):
     """Mutant check: PYTEST_CURRENT_TEST alone must not arm the bypass.
 
     PYTEST_CURRENT_TEST is genuinely set here (pytest sets it for every
-    running test), so this only passes if the new is_production() conjunct,
-    via pytest_bypass_allowed(), is load-bearing.
+    running test), so this only passes if the deployment conjunct, via
+    pytest_bypass_allowed(), is load-bearing. The `expect_production=False`
+    cases additionally pin that `is_production()` is NOT what refuses them —
+    reverting the gate to `not is_production()` re-arms exactly those rows.
     """
     import routes.agent_auth as module
 
     assert __import__("os").getenv("PYTEST_CURRENT_TEST")
-    monkeypatch.setenv(
-        prod_var,
-        "pivota-backend-prod" if prod_var == "K_SERVICE" else "production",
-    )
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert P.is_production() is expect_production
     monkeypatch.setattr(module, "_INTERNAL_TRUSTED_API_KEYS", ())
 
     with pytest.raises(Exception) as excinfo:
