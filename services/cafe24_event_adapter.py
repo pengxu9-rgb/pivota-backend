@@ -179,9 +179,6 @@ def _data_bridge_batch(
         "native_mall_id": mall_id,
         "native_shop_no": data.get("shop_no"),
         "native_products": _native_products(products),
-        "event_source_url": source_url,
-        "client_user_agent": _text(analytics.get("client_user_agent")),
-        "cvid_ad": _text(analytics.get("CVID_AD")),
         "webhook_trace_id": trace_id,
     }
     base_metadata = {key: value for key, value in base_metadata.items() if value not in (None, [], {})}

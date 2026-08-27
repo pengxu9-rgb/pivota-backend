@@ -6,7 +6,7 @@ import logging
 import socket
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
 
@@ -52,7 +52,7 @@ def normalize_magento_store_url(value: Any) -> str:
     return f"https://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
 
 
-async def _validate_public_https_target(store_url: str) -> None:
+async def _validate_public_https_target(store_url: str) -> Tuple[str, str]:
     parsed = urlparse(store_url)
     if parsed.scheme != "https" or not parsed.hostname:
         raise ValueError("Magento Store URL must use HTTPS")
@@ -75,6 +75,15 @@ async def _validate_public_https_target(store_url: str) -> None:
             raise ValueError("Magento Store resolved to an invalid address") from exc
         if not ip.is_global:
             raise ValueError("Magento Store must resolve only to public IP addresses")
+    return parsed.hostname, sorted(resolved)[0]
+
+
+def _pinned_https_url(url: str, address: str) -> str:
+    """Connect to a validated IP while the caller supplies the original TLS SNI/Host."""
+    parsed = urlparse(url)
+    address_host = f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+    netloc = address_host if parsed.port in (None, 443) else f"{address_host}:{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
 def normalize_magento_store_view(value: Any) -> str:
@@ -212,24 +221,35 @@ class MagentoAdapter:
         if not valid:
             return {"success": False, "error": error}
         try:
-            await _validate_public_https_target(self.store_url)
+            tls_hostname, pinned_address = await _validate_public_https_target(self.store_url)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
         base = build_magento_rest_base(self.store_url, self.store_view_code)
+        pinned_base = _pinned_https_url(base, pinned_address)
+        headers = {
+            **build_magento_headers(self.access_token),
+            "Host": urlparse(self.store_url).netloc,
+        }
         params = {
             "searchCriteria[pageSize]": 1,
             "searchCriteria[currentPage]": 1,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
                 response = await client.get(
-                    f"{base}/products",
-                    headers=build_magento_headers(self.access_token),
+                    f"{pinned_base}/products",
+                    headers=headers,
                     params=params,
+                    extensions={"sni_hostname": tls_hostname},
                 )
                 config_response = await client.get(
-                    f"{base}/store/storeConfigs",
-                    headers=build_magento_headers(self.access_token),
+                    f"{pinned_base}/store/storeConfigs",
+                    headers=headers,
+                    extensions={"sni_hostname": tls_hostname},
                 )
             if response.status_code != 200:
                 return {
@@ -418,17 +438,26 @@ class MagentoProductAdapter:
         page = max(1, _as_int(page_token, 1))
         page_size = max(1, min(_as_int(limit, 50), 100))
         base = build_magento_rest_base(normalized_url, store_view_code)
-        headers = build_magento_headers(access_token)
         try:
-            await _validate_public_https_target(normalized_url)
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+            tls_hostname, pinned_address = await _validate_public_https_target(normalized_url)
+            pinned_base = _pinned_https_url(base, pinned_address)
+            headers = {
+                **build_magento_headers(access_token),
+                "Host": urlparse(normalized_url).netloc,
+            }
+            async with httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
                 response = await client.get(
-                    f"{base}/products",
+                    f"{pinned_base}/products",
                     headers=headers,
                     params={
                         "searchCriteria[pageSize]": page_size,
                         "searchCriteria[currentPage]": page,
                     },
+                    extensions={"sni_hostname": tls_hostname},
                 )
                 if response.status_code != 200:
                     return [], None, f"Magento API returned HTTP {response.status_code}"
@@ -445,8 +474,9 @@ class MagentoProductAdapter:
                     if str(raw.get("type_id") or "").lower() == "configurable":
                         sku = quote(str(raw.get("sku") or ""), safe="")
                         child_response = await client.get(
-                            f"{base}/configurable-products/{sku}/children",
+                            f"{pinned_base}/configurable-products/{sku}/children",
                             headers=headers,
+                            extensions={"sni_hostname": tls_hostname},
                         )
                         if child_response.status_code == 200:
                             child_payload = child_response.json() or []

@@ -133,7 +133,7 @@ async def test_magento_connection_test_reads_catalog_and_store_configuration(mon
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
 
     async def public_target(_url):
-        return None
+        return "shop.example", "8.8.8.8"
 
     monkeypatch.setattr(module, "_validate_public_https_target", public_target)
 
@@ -191,7 +191,7 @@ async def test_magento_fetch_products_uses_search_pagination_and_children(monkey
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
 
     async def public_target(_url):
-        return None
+        return "shop.example", "8.8.8.8"
 
     monkeypatch.setattr(module, "_validate_public_https_target", public_target)
 
@@ -208,9 +208,11 @@ async def test_magento_fetch_products_uses_search_pagination_and_children(monkey
     assert error is None
     assert next_page == "2"
     assert len(products) == 1
-    assert requests[0][0] == "https://shop.example/rest/default/V1/products"
+    assert requests[0][0] == "https://8.8.8.8/rest/default/V1/products"
     assert requests[0][1]["params"]["searchCriteria[pageSize]"] == 1
     assert requests[0][1]["headers"]["Authorization"] == "Bearer secret-token"
+    assert requests[0][1]["headers"]["Host"] == "shop.example"
+    assert requests[0][1]["extensions"] == {"sni_hostname": "shop.example"}
     assert requests[1][0].endswith("/configurable-products/TEE/children")
 
 
@@ -337,3 +339,15 @@ async def test_magento_rejects_hostname_resolving_to_private_address(monkeypatch
     monkeypatch.setattr(module.asyncio, "get_running_loop", lambda: FakeLoop())
     with pytest.raises(ValueError, match="public IP"):
         await module._validate_public_https_target("https://shop.example")
+
+
+def test_magento_pins_validated_address_without_changing_tls_hostname():
+    from adapters.magento_adapter import _pinned_https_url
+
+    assert (
+        _pinned_https_url(
+            "https://shop.example:8443/base/rest/default/V1",
+            "2001:4860:4860::8888",
+        )
+        == "https://[2001:4860:4860::8888]:8443/base/rest/default/V1"
+    )

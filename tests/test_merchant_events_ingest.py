@@ -153,14 +153,28 @@ def test_metadata_rejects_unknown_top_level_keys(patched_route):
     assert patched_route == []
 
 
-def test_metadata_rejects_nested_sensitive_keys(patched_route):
+@pytest.mark.parametrize(
+    "nested_key,nested_value",
+    [
+        ("customerEmail", "buyer@example.com"),
+        ("billingAddress", "private street"),
+        ("creditCardNumber", "4111111111111111"),
+        ("customer.email", "buyer@example.com"),
+        ("note", "buyer@example.com"),
+    ],
+)
+def test_metadata_rejects_nested_sensitive_or_unknown_keys(
+    patched_route,
+    nested_key,
+    nested_value,
+):
     response = _post(
         {
             "events": [
                 _event(
                     metadata={
                         "native_line_items": [
-                            {"product_id": "p1", "customer_email": "buyer@example.com"}
+                            {"product_id": "p1", nested_key: nested_value}
                         ]
                     }
                 )

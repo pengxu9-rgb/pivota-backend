@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -68,11 +69,36 @@ ALLOWED_MERCHANT_METADATA_KEYS = frozenset(
         "native_paid_state",
         "native_payment_gateway",
         "native_shipping_type",
-        "event_source_url",
-        "client_user_agent",
-        "cvid_ad",
         "webhook_trace_id",
         "webhook_delivery_id",
+    }
+)
+SAFE_NATIVE_LINE_ITEM_KEYS = frozenset(
+    {
+        "id",
+        "product_id",
+        "variation_id",
+        "variant_id",
+        "sku",
+        "spu",
+        "quantity",
+        "price",
+        "subtotal",
+        "total",
+    }
+)
+SAFE_NATIVE_PRODUCT_KEYS = frozenset(
+    {
+        "product_no",
+        "variant_code",
+        "product_code",
+        "product_name",
+        "cate_no",
+        "cate_name",
+        "quantity",
+        "product_price",
+        "option_extra_price",
+        "option_value",
     }
 )
 SENSITIVE_METADATA_KEYS = frozenset(
@@ -127,10 +153,30 @@ SENSITIVE_PERSON_NAME_KEYS = frozenset(
 
 
 def _is_sensitive_metadata_key(key: str) -> bool:
-    normalized = "_".join(key.strip().lower().replace("-", "_").split())
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key.strip())
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", separated).strip("_").lower()
     if normalized in SENSITIVE_METADATA_KEYS or normalized in SENSITIVE_PERSON_NAME_KEYS:
         return True
     return bool(set(normalized.split("_")) & SENSITIVE_METADATA_KEY_TOKENS)
+
+
+def _validate_safe_native_items(value: Any, *, field: str, allowed: frozenset[str]) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"metadata.{field} must be a list")
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"metadata.{field}[{index}] must be an object")
+        unknown = sorted(set(item) - allowed)
+        if unknown:
+            raise ValueError(
+                f"metadata.{field}[{index}] contains unsupported keys: "
+                + ", ".join(str(key) for key in unknown[:10])
+            )
+        for key, child in item.items():
+            if _is_sensitive_metadata_key(str(key)):
+                raise ValueError(f"metadata.{field}[{index}] contains forbidden sensitive key: {key}")
+            if isinstance(child, (dict, list)):
+                raise ValueError(f"metadata.{field}[{index}].{key} must be a scalar")
 
 
 def _validate_safe_metadata_tree(value: Any, path: str = "metadata") -> None:
@@ -224,6 +270,18 @@ class MerchantCommerceEvent(BaseModel):
                 "metadata contains unsupported keys: " + ", ".join(unknown[:10])
             )
         _validate_safe_metadata_tree(value)
+        if "native_line_items" in value:
+            _validate_safe_native_items(
+                value["native_line_items"],
+                field="native_line_items",
+                allowed=SAFE_NATIVE_LINE_ITEM_KEYS,
+            )
+        if "native_products" in value:
+            _validate_safe_native_items(
+                value["native_products"],
+                field="native_products",
+                allowed=SAFE_NATIVE_PRODUCT_KEYS,
+            )
         return value
 
     @model_validator(mode="after")

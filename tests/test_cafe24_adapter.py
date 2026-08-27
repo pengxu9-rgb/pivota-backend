@@ -31,10 +31,11 @@ def _data_bridge_payload(event_name="VIEW_CONTENT"):
         "event_time": "2026-08-26T10:49:11+09:00",
         "event_data": data,
         "analytics_data": {
-            "event_source_url": "https://chatgpt.com/c/abc",
+            "event_source_url": "https://chatgpt.com/c/abc?email=buyer@example.com&token=secret",
             "client_user_agent": "Mozilla/5.0",
             "CVID": "CVID.session-1",
             "CVID_Y": "CVID_Y.visitor-1",
+            "CVID_AD": "advertising-visitor-1",
         },
     }
 
@@ -79,6 +80,11 @@ def test_data_bridge_view_maps_to_product_view_and_cvid_session():
     assert event.visitor_id == "CVID_Y.visitor-1"
     assert event.query_source == "chatgpt.com"
     assert event.metadata["native_product_no"] == "10001"
+    serialized = event.model_dump_json()
+    assert "buyer@example.com" not in serialized
+    assert "token=secret" not in serialized
+    assert "Mozilla/5.0" not in serialized
+    assert "advertising-visitor-1" not in serialized
 
 
 def test_order_created_paid_emits_two_correlated_events_and_krw_minor_units():
