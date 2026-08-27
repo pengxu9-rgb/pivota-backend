@@ -178,13 +178,38 @@ jobs:
           fi
 
           cat <<'EOF'
-          To ship main to production:
+          To ship main to production. Build once, then roll each service with ITS OWN tool -
+          they are not interchangeable, and CONFIG=preserve is required on both scripts because
+          the Railway-ported env files they default to no longer exist:
+
             gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
               --substitutions=COMMIT_SHA=<sha> .
-            infra/gcp/deploy_backend.sh prod <sha>
-            SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
+
+            # web
+            CONFIG=preserve infra/gcp/deploy_backend.sh prod <sha>
+
+            # proof-issuer (same image, different ASGI app; ENV_PREFIX is required for any non-web service)
+            CONFIG=preserve SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
               RUN_COMMAND=python RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
               infra/gcp/deploy_backend.sh prod <sha>
-            WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <sha> <gateway-sha>
+
+            # worker AND every backend Cloud Run Job - setup_scheduler.sh, NEVER deploy_backend.sh.
+            # deploy_backend.sh hardcodes prod MIN=2/MAX=20 and --concurrency 80; the worker needs
+            # min=max=1. services/audit_scheduler.py has no cross-process lock, so a second instance
+            # means duplicate settlement attempts and duplicate invitation emails.
+            # Safe to re-run: it reconciles definitions and changes no existing trigger's state.
+            # Add ARM=<trigger>-cron to arm one lane; do NOT reach for PAUSED=0.
+            infra/gcp/setup_scheduler.sh prod <sha> <gateway-sha>
+
+          THIS ALARM ONLY SEES `web`. It reads api.pivota.cc/health, which is the web service.
+          `worker` is ingress:internal and `proof-issuer` is internal-and-cloud-load-balancing with
+          no public hostname, so neither can be probed from a runner and neither is checked here.
+          They drifted 111 commits behind unnoticed on 2026-08-26. Until this workflow gets a
+          read-only GCP identity, confirm them by hand after any deploy:
+
+            for s in web worker proof-issuer; do
+              gcloud run services describe $s --region us-west1 --project pivota-prod \
+                --format="value(spec.template.spec.containers[0].image)"
+            done
           EOF
           exit 1
