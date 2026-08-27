@@ -195,8 +195,10 @@ jobs:
       # FILENAME in --ignore is harmless (pytest ignores nonexistent paths and
       # the test still runs), while a valid DIRECTORY is silent.
       #
-      # So: floor raised to 9,000 against a measured 9,257 (re-derived on this
-      # branch, not carried forward — see the calibration warning below), AND
+      # So: floor raised to 12,000 against a measured 12,245 executed (recalibrated
+      # 2026-08-26 from a green main run of THIS workflow — 12,278 collected,
+      # 33 skipped; the previous 9,000 floor had grown ~3,200 of slack, more than
+      # tests/services itself, i.e. exactly the "not a floor" hole above), AND
       # per-subtree
       # minimums, because a single global number cannot notice one tree leaving.
       # Raise these when the real numbers grow; never lower one to green a build.
@@ -205,10 +207,11 @@ jobs:
         run: |
           python - <<'PY'
           import sys, collections, xml.etree.ElementTree as ET
-          FLOOR = 9000
+          FLOOR = 12000
           # Per-subtree minimums. A single global number cannot notice ONE tree
-          # leaving — the hole review demonstrated. Measured 2026-07-29 under
-          # THIS EXACT command: tests.services=1636, readiness.tests=64.
+          # leaving — the hole review demonstrated. Measured 2026-08-26 from a
+          # green main CI run of this workflow (not a local run, whose env-gated
+          # skips differ): tests.services=1682, readiness.tests=79.
           #
           # ⚠️ Calibrate against the FINAL command, not an earlier one. My first
           # cut set readiness.tests>=90 from a run that used --ignore on
@@ -216,7 +219,7 @@ jobs:
           # would have failed the GREEN build. Caught before merge only because
           # the clean and mutant runs were compared side by side — a guard is
           # not verified until it has been run against a passing build too.
-          SUBTREES = {'tests.services': 1400, 'readiness.tests': 50}
+          SUBTREES = {'tests.services': 1600, 'readiness.tests': 70}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
