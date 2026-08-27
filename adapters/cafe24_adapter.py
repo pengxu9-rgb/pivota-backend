@@ -96,7 +96,7 @@ class Cafe24Adapter:
         config = config or {}
         self.mall_id = normalize_cafe24_mall_id(config.get("mall_id"))
         self.access_token = str(config.get("access_token") or "").strip()
-        self.api_version = str(config.get("api_version") or "2025-12-01").strip()
+        self.api_version = str(config.get("api_version") or "2026-03-01").strip()
 
     def validate_config(self) -> Tuple[bool, Optional[str]]:
         if not self.mall_id or not _MALL_ID_RE.fullmatch(self.mall_id):
@@ -250,7 +250,7 @@ class Cafe24ProductAdapter:
         page_token: Optional[str] = None,
         shop_no: int = 1,
         currency: str = "KRW",
-        api_version: str = "2025-12-01",
+        api_version: str = "2026-03-01",
         refresh_token: Optional[str] = None,
         expires_at: Optional[str] = None,
         store_id: Optional[str] = None,

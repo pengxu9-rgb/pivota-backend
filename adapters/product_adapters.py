@@ -2105,7 +2105,7 @@ async def fetch_merchant_products(
             page_token=page_token,
             shop_no=credentials.get("shop_no", 1),
             currency=credentials.get("currency", "KRW"),
-            api_version=credentials.get("api_version", "2025-12-01"),
+            api_version=credentials.get("api_version", "2026-03-01"),
             refresh_token=credentials.get("refresh_token"),
             expires_at=credentials.get("expires_at"),
             store_id=credentials.get("store_id"),

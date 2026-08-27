@@ -12,7 +12,7 @@ The OAuth path uses:
 - `CAFE24_REDIRECT_URI`
 - `CAFE24_WEBHOOK_API_KEY` — the verification code Cafe24 sends as `X-API-Key`
 - `CAFE24_OAUTH_STATE_SECRET` — optional when the normal JWT signing secret exists
-- `CAFE24_API_VERSION` — defaults to `2025-12-01`
+- `CAFE24_API_VERSION` — defaults to the current documented version `2026-03-01`
 - `CAFE24_SCOPES` — defaults to the minimum catalog/order/application scopes
 
 Start a merchant install with:
@@ -25,7 +25,9 @@ An operator may also connect already-issued tokens with
 `POST /integrations/cafe24/connect`. Access and rotating refresh tokens are stored
 inside the existing `merchant_stores.api_key` credential blob. The catalog adapter
 refreshes an expiring two-hour access token and persists the replacement refresh
-token before pulling products.
+token before pulling products. After connection, Pivota calls
+`PUT /admin/webhooks/setting` with `reception_status=T` to activate reception for
+the subscriptions already configured on the app.
 
 ## Catalog
 
@@ -76,8 +78,25 @@ phone numbers, billing details, and bank account numbers from Cafe24 order paylo
 are not stored in commerce-event metadata.
 
 Cafe24 recommends API reconciliation because webhooks can be delayed or missed.
-A webhook-log/order reconciliation poller remains a follow-up; the real-time native
-adapter does not represent webhook receipt as proof of complete historical coverage.
+Pivota therefore exposes:
+
+```text
+GET  /integrations/cafe24/{store_id}/status
+POST /integrations/cafe24/{store_id}/webhook-reception/enable
+POST /integrations/cafe24/{store_id}/reconcile?lookback_days=7&limit_per_stream=500
+```
+
+Reconciliation incrementally reads both `GET /admin/webhooks/logs` and
+`GET /admin/databridge/logs`, replays their allowlisted request bodies through the
+same canonical mapper, and stores separate cursors in the existing credential
+blob. Replays and concurrent runs are safe because the commerce ledger remains
+idempotent.
+
+Cafe24 does not expose an Admin REST endpoint for creating event subscriptions or
+setting their receiving URL. The event numbers and Data Bridge events must still
+be configured once in Developer Center > App Setup; the status response makes this
+boundary explicit. A production scheduler for invoking reconciliation remains a
+deployment follow-up—the service and authenticated manual trigger are implemented.
 
 ## Official references
 

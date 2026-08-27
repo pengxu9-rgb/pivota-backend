@@ -14,11 +14,15 @@ from config.settings import settings
 from services.cafe24_integration_service import (
     build_cafe24_authorization_url,
     create_cafe24_oauth_state,
+    enable_cafe24_webhook_reception,
     exchange_cafe24_token,
+    find_cafe24_store_by_id,
+    get_cafe24_webhook_reception_status,
     get_cafe24_oauth_config,
     upsert_cafe24_store,
     verify_cafe24_oauth_state,
 )
+from services.cafe24_reconciliation_service import reconcile_cafe24_store
 from utils.auth import get_current_user
 
 
@@ -38,7 +42,7 @@ class Cafe24ConnectRequest(BaseModel):
     webhook_api_key: str = Field(min_length=8)
     shop_no: int = Field(default=1, ge=1)
     currency: str = Field(default="KRW", min_length=3, max_length=3)
-    api_version: str = "2025-12-01"
+    api_version: str = "2026-03-01"
 
 
 def _authorize_merchant(current_user: dict, merchant_id: str) -> None:
@@ -55,6 +59,22 @@ def _portal_redirect(*, ok: bool, mall_id: Optional[str] = None, reason: Optiona
     )
     separator = "&" if "?" in base else "?"
     return f"{base}{separator}{urlencode({'installed': 'cafe24' if ok else 'error', 'mall_id': mall_id or '', 'reason': reason or ''})}"
+
+
+async def _enable_reception_best_effort(credentials: dict) -> dict:
+    try:
+        return await enable_cafe24_webhook_reception(credentials)
+    except Exception as exc:
+        logger.warning(
+            "Cafe24 webhook reception activation requires follow-up store_id=%s error=%s",
+            credentials.get("store_id"),
+            exc,
+        )
+        return {
+            "reception_status": "unknown",
+            "event_subscription_configuration": "developer_center_required",
+            "activation_error": str(exc)[:200],
+        }
 
 
 @router.post("/connect")
@@ -89,6 +109,16 @@ async def connect_cafe24(
         shop_no=body.shop_no,
         currency=body.currency,
     )
+    reception = await _enable_reception_best_effort(
+        {
+            "store_id": store_id,
+            "mall_id": adapter.mall_id,
+            "access_token": body.access_token,
+            "refresh_token": body.refresh_token,
+            "expires_at": body.expires_at,
+            "api_version": body.api_version,
+        }
+    )
     return {
         "status": "success",
         "platform": "cafe24",
@@ -96,7 +126,72 @@ async def connect_cafe24(
         "mall_id": adapter.mall_id,
         "product_count": check.get("product_count"),
         "webhook_path": "/webhooks/cafe24",
+        "webhook_reception": reception,
     }
+
+
+@router.get("/{store_id}/status")
+async def cafe24_integration_status(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    store = await find_cafe24_store_by_id(store_id)
+    if not store:
+        raise HTTPException(status_code=404, detail="Cafe24 store was not found")
+    _authorize_merchant(current_user, str(store["merchant_id"]))
+    try:
+        webhook_setting = await get_cafe24_webhook_reception_status(store["credentials"])
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "status": "success",
+        "platform": "cafe24",
+        "store_id": store_id,
+        "mall_id": normalize_cafe24_mall_id(store["credentials"].get("mall_id")),
+        "webhook_setting": webhook_setting,
+        "event_subscription_configuration": "developer_center_required",
+        "required_event_numbers": [90023, 90025, 90026, 90027, 90028, 90029, 90072, 90074],
+        "required_data_bridge_events": ["VIEW_CONTENT", "INITIATE_ORDERFORM", "CREATE_ORDER"],
+        "reconciliation": store["credentials"].get("reconciliation") or {},
+        "webhook_path": "/webhooks/cafe24",
+    }
+
+
+@router.post("/{store_id}/webhook-reception/enable")
+async def activate_cafe24_webhook_reception(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    store = await find_cafe24_store_by_id(store_id)
+    if not store:
+        raise HTTPException(status_code=404, detail="Cafe24 store was not found")
+    _authorize_merchant(current_user, str(store["merchant_id"]))
+    try:
+        result = await enable_cafe24_webhook_reception(store["credentials"])
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "success", "platform": "cafe24", "store_id": store_id, **result}
+
+
+@router.post("/{store_id}/reconcile")
+async def run_cafe24_reconciliation(
+    store_id: str,
+    lookback_days: int = Query(default=7, ge=1, le=90),
+    limit_per_stream: int = Query(default=500, ge=1, le=10_000),
+    current_user: dict = Depends(get_current_user),
+):
+    store = await find_cafe24_store_by_id(store_id)
+    if not store:
+        raise HTTPException(status_code=404, detail="Cafe24 store was not found")
+    _authorize_merchant(current_user, str(store["merchant_id"]))
+    try:
+        return await reconcile_cafe24_store(
+            store_id=store_id,
+            lookback_days=lookback_days,
+            limit_per_stream=limit_per_stream,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/oauth/start")
@@ -176,6 +271,16 @@ async def cafe24_oauth_callback(code: Optional[str] = None, state: Optional[str]
             refresh_token_expires_at=token.get("refresh_token_expires_at"),
             webhook_api_key=config.webhook_api_key,
             api_version=config.api_version,
+        )
+        await _enable_reception_best_effort(
+            {
+                "store_id": store_id,
+                "mall_id": mall_id,
+                "access_token": token["access_token"],
+                "refresh_token": token.get("refresh_token"),
+                "expires_at": token.get("expires_at"),
+                "api_version": config.api_version,
+            }
         )
         return RedirectResponse(
             _portal_redirect(ok=True, mall_id=mall_id) + f"&store_id={store_id}",

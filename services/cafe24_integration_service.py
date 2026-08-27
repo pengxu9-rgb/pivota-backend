@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
@@ -14,8 +15,15 @@ from urllib.parse import urlencode
 
 import httpx
 
-from adapters.cafe24_adapter import build_cafe24_api_base, normalize_cafe24_mall_id
+from adapters.cafe24_adapter import (
+    build_cafe24_api_base,
+    build_cafe24_headers,
+    normalize_cafe24_mall_id,
+)
 from db.database import database
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAFE24_SCOPES = (
@@ -42,7 +50,7 @@ def get_cafe24_oauth_config() -> Cafe24OAuthConfig:
         client_secret=os.getenv("CAFE24_CLIENT_SECRET", "").strip(),
         redirect_uri=os.getenv("CAFE24_REDIRECT_URI", "").strip(),
         scopes=os.getenv("CAFE24_SCOPES", DEFAULT_CAFE24_SCOPES).strip(),
-        api_version=os.getenv("CAFE24_API_VERSION", "2025-12-01").strip(),
+        api_version=os.getenv("CAFE24_API_VERSION", "2026-03-01").strip(),
         webhook_api_key=os.getenv("CAFE24_WEBHOOK_API_KEY", "").strip(),
         state_secret=(
             os.getenv("CAFE24_OAUTH_STATE_SECRET", "").strip()
@@ -191,23 +199,20 @@ async def upsert_cafe24_store(
     if not normalized:
         raise ValueError("Cafe24 mall_id is required")
     domain = f"{normalized}.cafe24api.com"
-    credential_blob = json.dumps(
-        {
-            "mall_id": normalized,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_at": expires_at,
-            "refresh_token_expires_at": refresh_token_expires_at,
-            "webhook_api_key": webhook_api_key,
-            "api_version": api_version,
-            "shop_no": max(1, int(shop_no or 1)),
-            "currency": str(currency or "KRW").upper(),
-        },
-        separators=(",", ":"),
-    )
+    new_credentials = {
+        "mall_id": normalized,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": expires_at,
+        "refresh_token_expires_at": refresh_token_expires_at,
+        "webhook_api_key": webhook_api_key,
+        "api_version": api_version,
+        "shop_no": max(1, int(shop_no or 1)),
+        "currency": str(currency or "KRW").upper(),
+    }
     existing = await database.fetch_one(
         """
-        SELECT store_id FROM merchant_stores
+        SELECT store_id, api_key FROM merchant_stores
         WHERE merchant_id = :merchant_id AND platform = 'cafe24' AND lower(domain) = :domain
         LIMIT 1
         """,
@@ -215,6 +220,13 @@ async def upsert_cafe24_store(
     )
     if existing:
         store_id = str(existing["store_id"])
+        credential_blob = json.dumps(
+            {
+                **parse_cafe24_credentials(existing["api_key"]),
+                **new_credentials,
+            },
+            separators=(",", ":"),
+        )
         await database.execute(
             """
             UPDATE merchant_stores
@@ -225,6 +237,7 @@ async def upsert_cafe24_store(
         )
         return store_id
 
+    credential_blob = json.dumps(new_credentials, separators=(",", ":"))
     digest = hashlib.sha256(f"{merchant_id}:{normalized}".encode("utf-8")).hexdigest()[:18]
     store_id = f"store_c24_{digest}"
     await database.execute(
@@ -266,6 +279,47 @@ async def find_cafe24_store(mall_id: str) -> Optional[Dict[str, Any]]:
     result = dict(row)
     result["credentials"] = parse_cafe24_credentials(result.pop("api_key", None))
     return result
+
+
+async def find_cafe24_store_by_id(store_id: str) -> Optional[Dict[str, Any]]:
+    row = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key, status
+        FROM merchant_stores
+        WHERE platform = 'cafe24'
+          AND store_id = :store_id
+          AND lower(COALESCE(status, 'connected')) IN ('active', 'connected')
+        LIMIT 1
+        """,
+        {"store_id": str(store_id or "").strip()},
+    )
+    if not row:
+        return None
+    result = dict(row)
+    result["credentials"] = parse_cafe24_credentials(result.pop("api_key", None))
+    result["credentials"]["store_id"] = str(result["store_id"])
+    return result
+
+
+async def merge_cafe24_store_credentials(
+    *,
+    store_id: str,
+    updates: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge operational state without clobbering rotating OAuth credentials."""
+    row = await database.fetch_one(
+        "SELECT api_key FROM merchant_stores WHERE platform = 'cafe24' AND store_id = :store_id",
+        {"store_id": store_id},
+    )
+    if not row:
+        raise ValueError("Cafe24 store was not found")
+    merged = {**parse_cafe24_credentials(row["api_key"]), **dict(updates or {})}
+    merged.pop("store_id", None)
+    await database.execute(
+        "UPDATE merchant_stores SET api_key = :api_key WHERE platform = 'cafe24' AND store_id = :store_id",
+        {"store_id": store_id, "api_key": json.dumps(merged, separators=(",", ":"))},
+    )
+    return merged
 
 
 def _parse_expiry(value: Any) -> Optional[datetime]:
@@ -343,3 +397,57 @@ async def resolve_cafe24_access_token(credentials: Dict[str, Any]) -> str:
             },
         )
     return str(refreshed["access_token"])
+
+
+async def get_cafe24_webhook_reception_status(credentials: Dict[str, Any]) -> Dict[str, Any]:
+    access_token = await resolve_cafe24_access_token(credentials)
+    mall_id = normalize_cafe24_mall_id(credentials.get("mall_id"))
+    api_version = str(credentials.get("api_version") or "2026-03-01")
+    if not access_token or not mall_id:
+        raise ValueError("Cafe24 credentials are incomplete")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{build_cafe24_api_base(mall_id)}/admin/webhooks/setting",
+            headers=build_cafe24_headers(access_token, api_version),
+        )
+    if response.status_code != 200:
+        raise ValueError(f"Cafe24 webhook setting lookup failed (HTTP {response.status_code})")
+    payload = response.json() or {}
+    setting = payload.get("webhook") or payload.get("setting") or payload
+    return dict(setting) if isinstance(setting, dict) else {"raw_status": setting}
+
+
+async def enable_cafe24_webhook_reception(credentials: Dict[str, Any]) -> Dict[str, Any]:
+    """Activate reception for subscriptions already configured in App Setup.
+
+    Cafe24's Admin API toggles reception but does not create event/URL
+    subscriptions. Those remain app-level Developer Center configuration.
+    """
+    access_token = await resolve_cafe24_access_token(credentials)
+    mall_id = normalize_cafe24_mall_id(credentials.get("mall_id"))
+    api_version = str(credentials.get("api_version") or "2026-03-01")
+    store_id = str(credentials.get("store_id") or "").strip()
+    if not access_token or not mall_id:
+        raise ValueError("Cafe24 credentials are incomplete")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.put(
+            f"{build_cafe24_api_base(mall_id)}/admin/webhooks/setting",
+            headers=build_cafe24_headers(access_token, api_version),
+            json={"request": {"reception_status": "T"}},
+        )
+    if response.status_code not in {200, 201, 202}:
+        raise ValueError(f"Cafe24 webhook activation failed (HTTP {response.status_code})")
+    result = {
+        "reception_status": "T",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "event_subscription_configuration": "developer_center_required",
+    }
+    if store_id:
+        try:
+            await merge_cafe24_store_credentials(
+                store_id=store_id,
+                updates={"webhook_reception": result},
+            )
+        except Exception:
+            logger.exception("Failed to persist Cafe24 webhook reception state store_id=%s", store_id)
+    return result

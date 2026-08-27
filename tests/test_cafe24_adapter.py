@@ -264,6 +264,275 @@ async def test_expired_access_token_rotates_and_persists_refresh_token(monkeypat
     assert persisted["webhook_api_key"] == "keep-this-webhook-key"
 
 
+@pytest.mark.asyncio
+async def test_reconnect_preserves_reconciliation_cursor(monkeypatch):
+    from services import cafe24_integration_service as service
+
+    writes = []
+
+    class FakeDB:
+        async def fetch_one(self, query, values=None):
+            return {
+                "store_id": "store-c24",
+                "api_key": json.dumps(
+                    {
+                        "access_token": "old-access",
+                        "reconciliation": {"webhooks_cursor": "88"},
+                    }
+                ),
+            }
+
+        async def execute(self, query, values=None):
+            writes.append(dict(values or {}))
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    store_id = await service.upsert_cafe24_store(
+        merchant_id="merchant-1",
+        mall_id="sample_mall",
+        access_token="new-access",
+        refresh_token="new-refresh",
+        expires_at="2099-01-01T00:00:00+00:00",
+        refresh_token_expires_at="2099-01-14T00:00:00+00:00",
+        webhook_api_key="webhook-secret",
+        api_version="2025-12-01",
+    )
+
+    persisted = json.loads(writes[0]["api_key"])
+    assert store_id == "store-c24"
+    assert persisted["access_token"] == "new-access"
+    assert persisted["reconciliation"]["webhooks_cursor"] == "88"
+
+
+@pytest.mark.asyncio
+async def test_webhook_reception_activation_uses_cafe24_setting_api(monkeypatch):
+    from services import cafe24_integration_service as service
+
+    requests = []
+    persisted = []
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def put(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return FakeResponse()
+
+    async def fake_resolve(credentials):
+        return "live-access"
+
+    async def fake_merge(**kwargs):
+        persisted.append(kwargs)
+        return kwargs["updates"]
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(service, "resolve_cafe24_access_token", fake_resolve)
+    monkeypatch.setattr(service, "merge_cafe24_store_credentials", fake_merge)
+
+    result = await service.enable_cafe24_webhook_reception(
+        {
+            "store_id": "store-c24",
+            "mall_id": "sample_mall",
+            "api_version": "2025-12-01",
+        }
+    )
+
+    assert requests[0][0].endswith("/admin/webhooks/setting")
+    assert requests[0][1]["json"] == {"request": {"reception_status": "T"}}
+    assert result["reception_status"] == "T"
+    assert result["event_subscription_configuration"] == "developer_center_required"
+    assert persisted[0]["store_id"] == "store-c24"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_replays_both_log_streams_and_persists_cursors(monkeypatch):
+    from services import cafe24_reconciliation_service as service
+
+    fetched = []
+    ingested = []
+    persisted = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            fetched.append((url, kwargs["params"]))
+            if "/webhooks/logs" in url:
+                return FakeResponse(
+                    {
+                        "webhooklogs": [
+                            {
+                                "log_id": 11,
+                                "trace_id": "trace-order-log",
+                                "request_body": json.dumps(_order_webhook()),
+                            }
+                        ]
+                    }
+                )
+            return FakeResponse(
+                {
+                    "databridgelogs": [
+                        {
+                            "log_id": 23,
+                            "trace_id": "trace-view-log",
+                            "request_body": _data_bridge_payload(),
+                        }
+                    ]
+                }
+            )
+
+    async def fake_find(store_id):
+        return {
+            "store_id": store_id,
+            "merchant_id": "merchant-1",
+            "domain": "sample_mall.cafe24api.com",
+            "credentials": {
+                "mall_id": "sample_mall",
+                "access_token": "access-1",
+                "api_version": "2025-12-01",
+            },
+        }
+
+    async def fake_resolve(credentials):
+        return "access-1"
+
+    async def fake_ingest(**kwargs):
+        ingested.append([event.event_type for event in kwargs["batch"].events])
+        return {
+            "accepted": len(kwargs["batch"].events),
+            "duplicates": 0,
+            "events": [],
+        }
+
+    async def fake_merge(**kwargs):
+        persisted.append(kwargs)
+        return kwargs["updates"]
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(service, "find_cafe24_store_by_id", fake_find)
+    monkeypatch.setattr(service, "resolve_cafe24_access_token", fake_resolve)
+    monkeypatch.setattr(service, "ingest_merchant_event_batch", fake_ingest)
+    monkeypatch.setattr(service, "merge_cafe24_store_credentials", fake_merge)
+
+    result = await service.reconcile_cafe24_store(store_id="store-c24")
+
+    assert result["accepted"] == 3
+    assert ingested == [["order.created", "order.paid"], ["product.viewed"]]
+    assert fetched[0][1]["requested_start_date"]
+    assert "since_log_id" not in fetched[0][1]
+    state = persisted[0]["updates"]["reconciliation"]
+    assert state["webhooks_cursor"] == "11"
+    assert state["databridge_cursor"] == "23"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_saved_cursors_and_rejects_cross_mall_log(monkeypatch):
+    from services import cafe24_reconciliation_service as service
+
+    fetched_params = []
+    ingested = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            fetched_params.append(dict(kwargs["params"]))
+            key = "webhooklogs" if "/webhooks/logs" in url else "databridgelogs"
+            return FakeResponse(
+                {
+                    key: [
+                        {
+                            "log_id": 31 if key == "webhooklogs" else 42,
+                            "trace_id": "wrong-mall",
+                            "request_body": _order_webhook(mall_id="another_mall"),
+                        }
+                    ]
+                }
+            )
+
+    async def fake_find(store_id):
+        return {
+            "store_id": store_id,
+            "merchant_id": "merchant-1",
+            "domain": "sample_mall.cafe24api.com",
+            "credentials": {
+                "mall_id": "sample_mall",
+                "access_token": "access-1",
+                "reconciliation": {
+                    "webhooks_cursor": "30",
+                    "databridge_cursor": "40",
+                },
+            },
+        }
+
+    async def fake_ingest(**kwargs):
+        ingested.append(kwargs)
+        return {"accepted": 0, "duplicates": 0, "events": []}
+
+    async def fake_merge(**kwargs):
+        return kwargs["updates"]
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(service, "find_cafe24_store_by_id", fake_find)
+
+    async def fake_resolve(credentials):
+        return "access-1"
+
+    monkeypatch.setattr(service, "resolve_cafe24_access_token", fake_resolve)
+    monkeypatch.setattr(service, "ingest_merchant_event_batch", fake_ingest)
+    monkeypatch.setattr(service, "merge_cafe24_store_credentials", fake_merge)
+
+    result = await service.reconcile_cafe24_store(store_id="store-c24")
+
+    assert fetched_params == [
+        {"limit": 500, "since_log_id": "30"},
+        {"limit": 500, "since_log_id": "40"},
+    ]
+    assert result["invalid"] == 2
+    assert ingested == []
+
+
 def test_universal_sync_prepares_cafe24_credentials_without_losing_store_id():
     from routes.universal_product_sync import prepare_platform_credentials
 
