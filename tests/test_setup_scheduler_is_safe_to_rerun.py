@@ -26,7 +26,9 @@ mistake that would let a rewrite pass while re-breaking the behaviour.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -258,3 +260,84 @@ def test_paused_zero_with_arm_is_refused_as_ambiguous(tmp_path):
              "PAUSED": "0", "ARM": "relgraph-sync-cron"},
     )
     assert proc.returncode == 2, "PAUSED=0 together with ARM should be refused"
+
+
+# ---- Store Audit preflight: which revision serves the untagged service URL? ----------------
+#
+# The predicate lives in setup_scheduler.sh as an embedded `python3 -c` heredoc. These tests
+# EXTRACT AND EXECUTE that exact block rather than restating it, so they exercise the shipping
+# code. A restated copy would keep passing while the script itself regressed — which is exactly
+# what happened on the first draft of this file.
+_ACTIVE_RE = re.compile(r"python3 -c '\n(import json,sys\no=json\.load\(sys\.stdin\)\n.*?)\n'\)\"", re.S)
+
+
+def _preflight_blocks():
+    src = (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text(encoding="utf-8")
+    blocks = [b for b in _ACTIVE_RE.findall(src) if "revisionName" in b and "percent" in b]
+    assert len(blocks) == 2, (
+        f"expected 2 active-revision preflight blocks in setup_scheduler.sh, found {len(blocks)}. "
+        "If the shape changed, fix this extractor - do NOT restate the predicate here, or these "
+        "tests stop testing the script."
+    )
+    return blocks
+
+
+def _active_revision(traffic):
+    """Run the script's OWN predicate over a traffic list; assert both copies agree."""
+    payload = json.dumps({"status": {"traffic": traffic}})
+    results = set()
+    for block in _preflight_blocks():
+        proc = subprocess.run(["python3", "-c", block], input=payload,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, f"preflight block failed: {proc.stderr}"
+        results.add(proc.stdout.strip())
+    assert len(results) == 1, f"the UCP and commerce preflights disagree: {results}"
+    return results.pop()
+
+
+def test_a_tagged_serving_revision_is_still_the_serving_revision():
+    """The state a normal deploy leaves behind must not be refused.
+
+    deploy_backend.sh ships every candidate with `--tag c-<sha>` and then promotes it, so the
+    revision at 100% keeps its own candidate tag until a later deploy retires it. The guard
+    used to require `not t.get("tag")` and so refused exactly that — observed in prod
+    2026-08-26, where web-00098-kax held 100% traffic AND tag c-6f8b201ba7dc, which made
+    setup_scheduler.sh unrunnable whenever Store Audit was armed.
+    """
+    prod_shape = [
+        {"revisionName": "web-00098-kax", "percent": 100, "tag": "c-6f8b201ba7dc"},
+        {"revisionName": "web-00100-nox", "tag": "c-820e3cb51eec"},  # candidate, no percent
+    ]
+    assert _active_revision(prod_shape) == "web-00098-kax"
+
+
+def test_an_untagged_serving_revision_still_resolves():
+    assert _active_revision([{"revisionName": "web-1", "percent": 100}]) == "web-1"
+
+
+def test_a_traffic_split_is_still_refused():
+    """The property the guard exists for. Neither half is THE serving revision."""
+    assert _active_revision([
+        {"revisionName": "web-1", "percent": 50},
+        {"revisionName": "web-2", "percent": 50},
+    ]) == ""
+
+
+def test_a_zero_traffic_candidate_alone_is_refused():
+    """A candidate that was verified but never promoted must not be mistaken for serving."""
+    assert _active_revision([{"revisionName": "web-2", "percent": 0, "tag": "c-abc"}]) == ""
+    assert _active_revision([{"revisionName": "web-2", "tag": "c-abc"}]) == ""
+
+
+def test_two_revisions_at_100_is_refused():
+    """Nonsensical, but the `len(active) == 1` guard is what makes it unambiguous."""
+    assert _active_revision([
+        {"revisionName": "web-1", "percent": 100},
+        {"revisionName": "web-2", "percent": 100},
+    ]) == ""
+
+
+def test_both_preflights_use_the_same_predicate():
+    """The UCP and commerce guards are two copies of one rule; they must not drift apart."""
+    blocks = _preflight_blocks()
+    assert blocks[0] == blocks[1], "the two preflight blocks have diverged"
