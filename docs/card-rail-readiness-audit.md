@@ -268,15 +268,17 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 > the scheduler file contains the entry), never by the absence of a grep hit. The previous pass
 > was dated against `4459f88e` and had gone stale in both directions.
 >
-> **7 complete · 2 built-but-dark · 2 partial · 1 closed as not-buildable · 4 not done.**
+> **7 complete · 3 built-but-dark · 2 partial · 1 closed-as-specified · 4 not done — 17 items, and the
+> buckets below must sum to 17.** (An earlier draft of this block summed to 16: item 3 had been
+> dropped silently, taking its findings with it. The denominator is stated so that cannot recur.)
 >
 > | | items | state |
 > |---|---|---|
-> | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints and is accepted back (`routes/card_rail_outcomes.py`, mounted at `main.py:1322`); the refresh can correct a stale price; dedicated crawl egress live; the execution spec has grown **7 → 14 fields**; every third-party crawl lane goes through the politeness gate; attribution rides the agent's own lane. |
-> | **Built, DARK** | 6, 14 | `LIVE_OFFER_VERIFICATION_ENABLED` still defaults to `"false"`. Item 14 advanced a long way on 2026-08-26 — crawl-recency ordering with a separate attempt clock (#1884), a `stale_snapshot` gate the refresh can actually clear (#1890), and batch pacing (#1898) — but `infra/gcp/setup_scheduler.sh` contains **no entry for `external_referral_refresh`**, so nothing runs it. |
-> | **Partial** | 4, 7 | Variant coverage **60.5%** and near its ceiling. Warm handoff is enabled in prod on the original **6** brands, not the Tier-1 cohort. |
-> | **Closed — NOT BUILDABLE** | 11 | Promo codes. We hold no code inventory (`catalog_promotions.code` was dropped under ADR-022), and UCP applies codes but cannot discover them. See the note under Wave 4. |
-> | **Not done** | 9, 13, 15, 16 | Item 9's backend half was withdrawn, not shipped — `services/outbound_warm_handoff.py:424` still reads *"NO VARIANT HINT IS SENT, AND NONE CAN BE."* Item 13's `ranking_w_business` knob exists but is unset and unfed. |
+> | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints and is accepted back (`routes/card_rail_outcomes.py`, mounted at `main.py:1322`); the refresh can correct a stale price; dedicated crawl egress live; every third-party crawl lane goes through the politeness gate; attribution rides the agent's own lane. **Item 5 is complete at its ORIGINAL scope only** — the backend composer still emits exactly the 7 fields the row specifies (`routes/agent_shop_gateway.py:4296`), and the gateway projects **11** top-level fields. An earlier draft claimed "7 → 14"; that counted `tracking`'s sub-keys on one side of the comparison and not the other, and it counted fields that do not populate — see the note under this table. |
+> | **Built, DARK** | 3, 6, 14 | **Item 3:** the UCP probe lane exists, but `store-audit-commerce-reprobe-enqueue-cron` reads **PAUSED** in prod with no staging counterpart. **Item 6:** `LIVE_OFFER_VERIFICATION_ENABLED` still defaults to `"false"`. **Item 14:** advanced a long way on 2026-08-26 — crawl-recency ordering with a separate attempt clock (#1884), a `stale_snapshot` gate the refresh can actually clear (#1890), batch pacing (#1898) — and `infra/gcp/setup_scheduler.sh` contains **no entry for `external_referral_refresh`** among the 12 jobs it provisions. ⚠️ *Inference, not a positive check:* "therefore nothing runs it" does not follow from one file, and **that same file records that jobs migrated in #1892/#1894/#1895 were provisioned BY HAND** because it could not be run. The positive check is `gcloud scheduler jobs list`, which was not available here. |
+> | **Partial** | 4, 7 | Variant coverage: **this document contradicts itself and the conflict is not resolved here.** A5/A6's census says **28.0%** (838/2,992, and "~72% … not a purchasable variant"), repeated at B9, at Wave-1 item 4, and in the provenance table. The status block has carried **60.5%** since a later backfill pass, sourced nowhere in either repo. Both are published; **treat 28.0% as the only figure with provenance** until a fresh count is run and recorded. Warm handoff is enabled in prod on the original **6** brands, not the Tier-1 cohort. |
+> | **Closed — NOT BUILDABLE *AS SPECIFIED*** | 11 | Promo codes. We hold no code inventory (`catalog_promotions.code` was dropped under ADR-022), and UCP applies codes but cannot discover them. The qualifier is load-bearing: the Wave-4 row records residual buildable work — a *request-contract* change letting a caller supply a code. See the note under Wave 4. |
+> | **Not done** | 9, 13, 15, 16 | Item 9's backend half was withdrawn, not shipped — `services/outbound_warm_handoff.py:**424**` still reads *"NO VARIANT HINT IS SENT, AND NONE CAN BE."* (The Wave-4 item-9 row cites `:457` for the same comment; **424 is the correct line** at `d5ae50cd`.) Item 13's `ranking_w_business` knob exists but is unset and unfed. |
 >
 > **What this means for the milestone.** The plumbing is done and the *correctness* work is not
 > switched on. §1 named index staleness as the real obstacle and A5 measured a **31.1%**
@@ -295,14 +297,19 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 >   (`PAYMENT_ISSUERS_JSON` holding only a canary, `create_payment_link` having no `ucpTool`
 >   name) describes the **PSP rail, which this model does not use.** Those are not blockers here.
 >   What the model needs, Pivota already emits: `execution_spec.cart_url` is a Shopify cart
->   permalink, and a live probe on 2026-08-26 confirmed it answers **302 straight to a
->   `/checkout/cn/<token>` page** — a real checkout, not a cart view — while preserving
->   `attributes[pivota_click_id]`. Reap lands exactly where it needs to type.
+>   permalink, and a live probe on 2026-08-26 confirmed it lands on a **real checkout, not a cart
+>   view**, while preserving `attributes[pivota_click_id]`. It takes **three** hops to get there
+>   (apex→www, then through **`shop.app`** carrying a Shop Pay token, then `…/checkouts/cn/<token>`),
+>   so a browser-driving agent traverses a third-party host on the way — measured on one host.
+>   Reap still lands where it needs to type.
 > * **Worse than recorded — A REAL ARCHITECTURAL GAP.** The card mint cannot serve that link.
 >   `CardIssueRequest` requires a **UCP `checkout_id`** and `resolve_merchant_quote` reads the
 >   total via `get_checkout` on the *merchant's own* UCP door. A cart permalink is a storefront
->   URL and produces **no `checkout_id`** — nothing in the repo bridges the two. The card rail
->   and the link rail are currently two different worlds.
+>   URL and produces **no `checkout_id`**. But "two different worlds" would overstate it: the
+>   warm-handoff lane in `PIVOTA-Agent` already calls `create_checkout` on the merchant's own UCP
+>   door from the SAME variant identity the permalink is built from, and keeps the full response —
+>   the checkout id is simply never extracted. The gap is **a field extraction plus a flag**, not
+>   an architecture. See the execution-flow section below.
 > * **And the cap is derived wrongly for this model.** `routes/agent_cards.py:108` sets
 >   `amount_cap_minor = quote["total_minor"]` with the comment *"v1: cap == quote, exactly"*.
 >   B7 established that a pre-address UCP checkout returns `total === subtotal`, no shipping and
@@ -336,22 +343,38 @@ the merchant key-enters and compares hashes; Browser Automation — the agent dr
 own checkout form with the payment data still encrypted in the container; and API/Direct, where an
 encrypted payload carries token objects, shipping and billing addresses in the request body.
 
-**Only Browser Automation reaches our cohort.** Key Entry requires the MERCHANT to participate —
-RFC 9421 signature verification, JWKS from `https://mcp.visa.com/.well-known/jwks`, the Agentic
-Consumer Recognition Object, nonce tracking in an 8-minute window — and the spec says outright
-that "Merchants are not required to use this proposal." **B8 measured our TAP coverage at zero**,
-and `docs/TARGET_ARCHITECTURE.md` still records TAP as "not implemented anywhere". (Do not read
-the 94.3% `/.well-known/ucp` figure as TAP support: UCP is a different protocol from a different
-vendor. Conflating them would overstate readiness by the whole cohort.)
+**The narrowing is real but NOT the one an earlier draft claimed.** That draft said "only Browser
+Automation reaches our cohort, because Key Entry requires the merchant to participate". The spec
+refutes the split: browser automation IS the guest-checkout key-entry case —
+
+> "if browser automation is being used to complete a web-based guest checkout, key entry
+> experience, this signature may contain a hash of the payment credential data that will be key
+> entered"
+
+— and the merchant side is the same either way: "The Merchant achieves this by using the same
+above key entered information to generate a hash and compares the hashes." A merchant that has not
+implemented TAP verifies no signature at all, so **every TAP mode requires merchant participation**,
+and the gate is explicit: a message whose `Signature-Input` carries neither `agent-browser-auth`
+nor `agent-payer-auth` "has not been signed by a trusted agent".
+
+**What actually reaches our cohort is PLAIN browser automation — outside TAP's trust model.** An
+agent can drive an unmodified Shopify checkout today; it simply does not get the accountable-agent
+recognition TAP exists to confer, and is subject to whatever bot management the host runs. That is
+a materially weaker position than "TAP mode 2 works here", and it is the honest one. Merchant TAP
+coverage across our cohort is **unmeasured** — B8 records that the field class does not exist, so
+there is no detector to measure with; `docs/TARGET_ARCHITECTURE.md:45` still reads "x402 / Visa TAP
+/ Mastercard Agent Pay | **Not implemented anywhere.** No placeholder code pretends otherwise".
+(Do not read the 94.3% `/.well-known/ucp` figure as TAP support: UCP is `ucp.dev`, a Shopify-hosted
+protocol from a different vendor. Conflating them would overstate readiness by the whole cohort.)
 
 | # | Step | Owner | What Pivota supplies |
 |---|---|---|---|
 | 1 | User states intent | Minds | — |
 | 2 | Find + rank offers | **Pivota** | `recommend_products` / `get_offers` |
-| 3 | Present options; user picks | Minds | `execution_spec`: `cart_url`, `variant_id`, `expected_item_total` + `expected_currency`, `expected_quantity`, `expires_at` |
+| 3 | Present options; user picks | Minds | `execution_spec`: `cart_url`, `variant_id`, `expires_at`. ⚠️ The `expected_*` money fields exist in the projection but are written **only** by `services/live_offer_verification.py`, reached only when item 6 is armed — so today they are `null` on every response |
 | 4 | **User authorizes an amount** | Minds / Visa | **the unresolved fork — see below** |
 | 5 | Mint the scoped card | Reap | the cap and its currency |
-| 6 | Open the link, land on checkout | Reap | `cart_url` — verified live to answer 302 straight to `/checkout/cn/<token>`, preserving `attributes[pivota_click_id]` |
+| 6 | Open the link, land on checkout | Reap | `cart_url` — probed live: **three** hops (apex→www 301, then 302 through **`shop.app`** with a Shop Pay token, then to `…/checkouts/cn/<token>`), landing on a real checkout with `attributes[pivota_click_id]` intact. Not "straight": a browser-driving agent must traverse a third-party host. Measured on one host; others may differ |
 | 7 | Fill shipping | Reap | — (whose address? open) |
 | 8 | Fill card, submit | Reap | — |
 | 9 | Report the outcome | Minds / Reap | `POST /agent/v1/outcomes` keyed by `recommendation_id` |
@@ -369,8 +392,17 @@ exactly", which declines the moment Reap enters an address.
 
 **(b) Two-phase.** Reap fills shipping first, reads the real total off the page, and only then
 mints for the exact amount. Better for trust — the user is told "$53.47", not a ceiling — but it
-needs a mid-flow mint, and our mint demands a UCP `checkout_id` that a browser-driven storefront
-checkout never produces.
+needs a mid-flow mint, and the mint demands a UCP `checkout_id`.
+
+**How far apart the two rails actually are — corrected.** An earlier draft said "nothing bridges
+them … two different worlds". That is too strong. `PIVOTA-Agent`'s warm-handoff lane ALREADY creates
+a real UCP checkout on the merchant's own door (`ucpWarmHandoff.js:356` → `ucpBuyerAgentClient.js:1020`
+`createCheckoutPreview` → `create_checkout`), from the **same numeric variant identity the cart
+permalink is built from**, and it keeps the whole response (`raw: payload`, `tool_result: result`).
+The checkout id is present and simply never extracted — the normalizer's key list has no `id`. So
+the gap is **a field extraction plus a flag, not an architecture**, and the UCP checkout's
+`continue_url` is itself a storefront checkout URL. (Also: `recommendation_id` is ALREADY an
+accepted optional field on `CardIssueRequest`; only `checkout_id` needs relaxing.)
 
 **(c) Pre-quote the landed total.** Not available. B7 closed this: not obtainable anonymously
 before an address, from UCP or from the `.js` endpoint.
@@ -396,12 +428,18 @@ The protocol is public and settled; what is undetermined is the interaction sequ
    we owe a re-quote endpoint.
 4. **Headless or user-visible checkout?** Bears on whether `expires_at` on the spec — and the
    cart token's own TTL — is generous enough for a human-in-the-loop pause.
-5. **Bot management.** We measured **213 of 286 brand hosts refusing a non-browser client**.
-   TAP exists partly so a merchant recognises an agent as accountable rather than blocking it, and
-   it is co-developed with Cloudflare — but on a merchant that has NOT implemented TAP, does Reap
-   still clear the WAF? *(Inference, not confirmed: Visa-directory onboarding may propagate to
-   Cloudflare-side recognition without merchant action. Worth asking directly rather than
-   assuming — it decides whether our crawled cohort is transactable at all.)*
+5. **Bot management — and note the axis, which an earlier draft got wrong.** The measurement is
+   **213 of 286 hosts unreadable from a NON-CRAWL-EGRESS client** (`docs/external-seed-dead-pdp-link-audit.md:85`),
+   and that source says explicitly it is *"not our user-agent — `PivotaAuditBot`, the httpx default,
+   and no UA at all are all refused."* The axis is **egress-IP reputation**, not browser-vs-bot.
+   Restating it as "non-browser client" inverts the mechanism the source rules out. So the question
+   to Reap is sharper than it first looked: **what egress does the Reap agent leave from, and what
+   is its reputation with Cloudflare?** TAP exists partly so a merchant recognises an agent as
+   accountable rather than blocking it — *(inference, not confirmed: TAP builds on Web Bot Auth, a
+   Cloudflare-led effort, so directory onboarding MAY propagate to Cloudflare-side recognition
+   without merchant action; I found no Visa statement using "co-developed")* — but on a merchant
+   that has not implemented TAP, whether Reap clears the WAF is unknown, and it decides whether our
+   crawled cohort is transactable at all.
 6. **Issuing jurisdiction.** Reap is a Visa Principal Issuer in Hong Kong and Mexico. What BIN and
    currency apply to a USD cart at a US merchant, and does that move acceptance, 3DS or FX?
 
