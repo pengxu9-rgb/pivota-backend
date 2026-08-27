@@ -2656,7 +2656,6 @@ def test_relaxed_surface_zero_offers_must_not_claim_exact_match(
     assert mapping.get("resolution_mode") == "not_servable"
     assert metadata.get("resolution_mode") == "not_servable"
 
-    assert body["resolution_mode"] in gateway.RESOLUTION_MODES
     assert metadata.get("reason_code") == "NO_CANDIDATES"
     assert metadata.get("has_external") is False
     assert metadata.get("has_internal") is False
@@ -3165,6 +3164,28 @@ def test_truncating_the_internal_offer_away_clears_resolved_target(
     assert body["substitution_reason_codes"] == []
 
 
+def test_the_resolution_mode_vocabulary_is_exactly_four_values() -> None:
+    """Pins the vocabulary itself, because the AST gate below is only as tight as this set.
+
+    `test_every_resolution_mode_assignment_is_in_the_vocabulary` checks assignments AGAINST
+    `RESOLUTION_MODES`, so widening that set silently widens the gate -- adding a fifth value
+    would let a fifth value through, which is precisely the drift the gate exists to stop.
+    A change here is a deliberate contract change and should have to edit this list.
+    """
+    import typing
+
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway.RESOLUTION_MODES == {
+        "exact_match",
+        "same_product_substitution",
+        "external_only",
+        "not_servable",
+    }
+    # ...and the frozenset must not drift from the Literal it claims to mirror.
+    assert gateway.RESOLUTION_MODES == set(typing.get_args(gateway.ResolutionMode))
+
+
 def test_every_resolution_mode_assignment_is_in_the_vocabulary() -> None:
     """The real gate behind the `ResolutionMode` Literal.
 
@@ -3217,3 +3238,114 @@ def test_every_resolution_mode_assignment_is_in_the_vocabulary() -> None:
         f"the first resolution_mode assignment is the initializer and it claims {assigned[0]!r} "
         "before anything has been established"
     )
+
+
+def test_product_level_match_without_the_requested_sku_is_documented_not_fixed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """CHARACTERIZATION. Pins a known residual so a future change to it is deliberate.
+
+    When the requested sku_id is absent from the matched product entirely, no variant was ever
+    identified to compare the shipped one against, so the handler reports `exact_match` for what
+    is really a product-level (confidence 0.8) match. Identical on main and on this branch --
+    this PR does not change it, and deliberately does not try to: distinguishing "matched the
+    product, could not find your variant" from "matched your variant" needs a fifth vocabulary
+    value, which is a contract change for third-party parsers, not a bug fix.
+
+    It is written into the ResolutionMode docstring rather than left implied. This test exists
+    so that if someone does fix it, this file forces them to notice they are changing a
+    published contract.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM products_cache" in str(query):
+            return [
+                _cache_row(
+                    "prod_other",
+                    [{"id": "sku_present", "sku": "sku_present", "price": 10.0, "inventory_quantity": 4}],
+                    merchant_id="m_only",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "sku_never_stocked"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    body = res.json()
+
+    assert body["offers_count"] == 1
+    # The shipped variant is NOT the requested one...
+    assert [(o.get("source") or {}).get("variant_id") for o in body["offers"]] == ["sku_present"]
+    assert body["requested_target"]["sku_id"] == "sku_never_stocked"
+    # ...and the handler still says exact_match. Known, documented, unchanged by this PR.
+    assert body["resolution_mode"] == "exact_match"
+    assert body["substitution_reason_codes"] == []
+
+
+def test_verification_dropping_an_internal_substitution_clears_the_target_too(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """not_servable must not explain a substitution it did not ship.
+
+    The sibling test above reaches `not_servable` with only an EXTERNAL candidate, so
+    `resolved_target` was never populated and asserting it is None there proves nothing --
+    a mutant that deletes the clearing survives it. This builds a real internal substitution
+    first (requested `sku_req` is out of stock, `sku_alt` ships), THEN has verification drop
+    everything. Without the clearing, the envelope carries a buy-here target and
+    `requested_variant_not_servable` reasons next to `offers_count: 0`.
+    """
+    import routes.agent_shop_gateway as gateway
+    from services import live_offer_verification as lov
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM products_cache" in str(query):
+            return [
+                _cache_row(
+                    "prod_sub",
+                    [
+                        {"id": "sku_req", "sku": "sku_req", "price": 10.0, "inventory_quantity": 0},
+                        {"id": "sku_alt", "sku": "sku_alt", "price": 10.0, "inventory_quantity": 6},
+                    ],
+                    merchant_id="m_sub",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    verified: dict = {}
+
+    async def fake_verify_offers(offers):
+        verified["routes"] = [str(o.get("purchase_route") or "") for o in offers]
+        return {index: lov.Verdict(status=lov.GONE, reason="dead") for index in range(len(offers))}
+
+    monkeypatch.setattr(lov, "is_enabled", lambda: True)
+    monkeypatch.setattr(lov, "verify_offers", fake_verify_offers)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "sku_req"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    body = res.json()
+
+    # An INTERNAL substitution really was built and handed to the verifier -- this is the
+    # part the sibling test cannot establish.
+    assert verified.get("routes") == ["internal_checkout"], verified
+
+    assert body["offers_count"] == 0
+    assert body["resolution_mode"] == "not_servable"
+    assert body["resolved_target"] is None
+    assert body["substitution_reason_codes"] == []
+    assert (body.get("metadata") or {}).get("has_internal") is False

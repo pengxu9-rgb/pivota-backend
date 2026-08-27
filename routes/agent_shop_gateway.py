@@ -3779,9 +3779,19 @@ async def _handle_offers_resolve(
     # initializer "equally untrue" and then fixed only the external-only half.
     #
     # "not_servable" is the honest pre-resolution state on BOTH surfaces: nothing has
-    # been shown to serve yet. The assignments below (internal lane) and the
-    # shipped-offer reconciliation at the end of this handler upgrade it to the
-    # truthful value; neither can be skipped on a path that emits the field.
+    # been shown to serve yet.
+    #
+    # BE PRECISE ABOUT WHAT THIS LINE DOES. On this branch it is a DEFENSIVE DEFAULT that no
+    # response can observe: the reconciliation below covers the empty-offers and no-internal
+    # cases, and the remaining case requires a shipped internal offer, whose append is
+    # followed straight-line by the bookkeeping that feeds the verdict. Reverting this line
+    # alone changes no emitted value -- proven by replacing it with a poison sentinel and
+    # guarding the return, which no test could trip. It is kept because it is the correct
+    # value for any path added later that emits before the reconciliation, and it is pinned
+    # structurally rather than behaviourally by
+    # tests/test_offers_resolve.py::test_every_resolution_mode_assignment_is_in_the_vocabulary.
+    # It was load-bearing on main; it is not load-bearing here, and saying otherwise would be
+    # the same kind of overclaim this handler is being fixed for.
     resolution_mode: ResolutionMode = "not_servable"
     requested_target: Dict[str, Any] = {
         **({"product_id": product_id} if product_id else {}),
@@ -5174,6 +5184,13 @@ async def _handle_offers_resolve(
     shipped_internal_count = len(shipped_internal)
     shipped_external_count = len(offers) - shipped_internal_count
 
+    # The three branches are exhaustive and mutually exclusive, and each one assigns the whole
+    # trio (resolution_mode, resolved_target, substitution_reason_codes) so no branch can
+    # inherit a field from another. Two of those assignments are provably redundant today --
+    # `substitution_reason_codes` is written nowhere else, so clearing it on the exact_match
+    # branch is a dead store and a mutant of it survives the suite. They are kept because
+    # "every branch states the whole answer" is what stops the next edit from reintroducing
+    # exactly the leak this block was written to fix; they are not load-bearing now.
     if not offers:
         # Nothing serves. True whatever we matched upstream -- a match whose only offer was
         # dropped is not a match the caller can act on.
