@@ -4433,10 +4433,20 @@ async def _handle_offers_resolve(
         # not in external_product_id, not in the urls, not in seed_data — so the fuzzy arm below
         # can never match one, and a seed-only product has no internal row for the retry lanes to
         # pivot from. Measured live 2026-08-27: get_offers(product_id=sig_…) answered zero offers
-        # for a product whose PDP served fine. The mirror (catalog_products) already holds the
-        # sig ↔ seed join: pivota_signature_id was minted per mirrored seed and source_ref carries
-        # the seed id. Resolve through it — two single-table queries rather than a JOIN, because
-        # the shared quarantine anti-join references unqualified seed columns and a JOIN with
+        # for a product whose PDP served fine. The mirror (catalog_products) holds the sig ↔ seed
+        # join with TWO keys, and both are needed:
+        #   - source_ref carries the seed row id (the mirror binds row.id);
+        #   - source_product_id carries the seed's external_product_id — the join that still works
+        #     on legacy-cohort mirror rows whose source_ref was never backfilled.
+        # No source_system conjunct: the first shipped version filtered on
+        # 'external_product_seeds' while the mirror actually writes
+        # 'external_product_seeds_mirror_v1' (scripts/mirror… SOURCE_SYSTEM), so the arm matched
+        # NOTHING in prod — the exact string-contract miss the cross-repo contract map warns
+        # about. The system name is not load-bearing here: pivota_signature_id is UNIQUE across
+        # catalog_products, and the second query only serves rows that really exist in
+        # external_product_seeds under status+quarantine gates, so a non-seed row's keys simply
+        # match nothing. Two single-table queries rather than a JOIN, because the shared
+        # quarantine anti-join references unqualified seed columns and a JOIN with
         # catalog_products would make them ambiguous.
         if not seed_rows:
             sig_aliases = [
@@ -4446,33 +4456,44 @@ async def _handle_offers_resolve(
                 sig_map_rows = await asyncio.wait_for(
                     database.fetch_all(
                         """
-                        SELECT source_ref
+                        SELECT source_ref, source_product_id
                         FROM catalog_products
                         WHERE pivota_signature_id = ANY(:sig_aliases)
-                          AND source_system = 'external_product_seeds'
-                          AND source_ref IS NOT NULL
+                          AND (source_ref IS NOT NULL OR source_product_id IS NOT NULL)
                         LIMIT 8
                         """,
                         {"sig_aliases": sig_aliases},
                     ),
                     timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
                 )
-                mapped_seed_ids = [
-                    str(_row_to_dict(row).get("source_ref") or "").strip()
-                    for row in (sig_map_rows or [])
-                ]
-                mapped_seed_ids = [seed_id for seed_id in mapped_seed_ids if seed_id]
-                if mapped_seed_ids:
+                mapped_seed_ids: List[str] = []
+                mapped_external_ids: List[str] = []
+                for row in sig_map_rows or []:
+                    row_dict = _row_to_dict(row)
+                    seed_id = str(row_dict.get("source_ref") or "").strip()
+                    external_id = str(row_dict.get("source_product_id") or "").strip()
+                    if seed_id:
+                        mapped_seed_ids.append(seed_id)
+                    if external_id:
+                        mapped_external_ids.append(external_id)
+                if mapped_seed_ids or mapped_external_ids:
                     seed_rows = await asyncio.wait_for(
                         database.fetch_all(
                             f"""
                             SELECT *
                             FROM external_product_seeds
-                            WHERE id = ANY(:mapped_seed_ids)
+                            WHERE (id = ANY(:mapped_seed_ids) OR external_product_id = ANY(:mapped_external_ids))
                               AND status = 'active'
                             {_seed_quarantine_clause()}
                             """,
-                            {"mapped_seed_ids": mapped_seed_ids},
+                            {
+                                # An empty Python list binds as an untyped empty array, which
+                                # asyncpg cannot infer a type for — pad with "" (never a valid
+                                # id: both columns are non-empty by construction) so each arm
+                                # always carries a typed, match-nothing value.
+                                "mapped_seed_ids": mapped_seed_ids or [""],
+                                "mapped_external_ids": mapped_external_ids or [""],
+                            },
                         ),
                         timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
                     )
