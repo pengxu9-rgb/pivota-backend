@@ -51,6 +51,7 @@ _RUNNABLE_JOB_IDS = frozenset(
         "executor_run_lease_reaper",
         "verification_run_lease_reaper",
         "external_conversion_poll",
+        "cafe24_reconciliation",
     }
 )
 

@@ -67,11 +67,19 @@ Supported mappings:
 | Webhook `90025` | payment status → `order.paid` / `payment.authorized` / `payment.failed` |
 | Webhook `90026`, `90072` | `order.cancelled` |
 | Webhook `90027`, `90028`, `90074` | `return.created` |
-| Webhook `90029` | `refund.created` / `refund.succeeded` |
+| Webhook `90029`, `90073` | `refund.created` / `refund.succeeded` |
+| Webhook `90084` | `cart.item_added` |
 
 Data Bridge `CVID` stitches product and checkout activity. Order, payment, return,
 and refund identifiers bridge the server-side lifecycle. The webhook trace id is
 part of each upstream idempotency key.
+
+Cafe24's verified native `90084` event covers add-to-cart without ScriptTag
+heuristics and provides native product, variant, and quantity fields. Cafe24 does
+not provide the same native signal for remove/update, so those remain optional
+Universal Web Collector coverage rather than being inferred from brittle theme
+click selectors. Bulk cancellation/refund/return events are expanded into one
+canonical event per comma-separated order ID.
 
 The adapter deliberately allowlists telemetry fields. Buyer names, email addresses,
 phone numbers, billing details, and bank account numbers from Cafe24 order payloads
@@ -95,8 +103,16 @@ idempotent.
 Cafe24 does not expose an Admin REST endpoint for creating event subscriptions or
 setting their receiving URL. The event numbers and Data Bridge events must still
 be configured once in Developer Center > App Setup; the status response makes this
-boundary explicit. A production scheduler for invoking reconciliation remains a
-deployment follow-up—the service and authenticated manual trigger are implemented.
+boundary explicit. The existing isolated APScheduler invokes a bounded,
+least-recently-run store batch every 15 minutes. It remains a no-op until
+`CAFE24_RECONCILIATION_ENABLED=true`; batch size, lookback, and per-stream limit
+are independently configurable:
+
+```text
+CAFE24_RECONCILIATION_BATCH_SIZE=10
+CAFE24_RECONCILIATION_LOOKBACK_DAYS=7
+CAFE24_RECONCILIATION_LIMIT_PER_STREAM=500
+```
 
 ## Official references
 

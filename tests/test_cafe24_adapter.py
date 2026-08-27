@@ -146,6 +146,66 @@ def test_payment_status_and_refund_status_map_to_canonical_events():
     assert refund.events[0].refund_id == "refund-1"
 
 
+def test_native_cart_webhook_maps_product_variant_and_quantity_without_scripttag():
+    from services.cafe24_event_adapter import map_cafe24_webhook
+
+    batch = map_cafe24_webhook(
+        {
+            "event_no": 90084,
+            "resource": {
+                "mall_id": "sample_mall",
+                "event_shop_no": "1",
+                "member_id": "member-1",
+                "shipping_type": "A",
+                "product_no": 781,
+                "variant_code": "P0000BEB000A",
+                "quantity": 2,
+                "product_bundle": "F",
+            },
+        },
+        trace_id="trace-cart-add",
+        store_id="store-c24",
+    )
+
+    assert len(batch.events) == 1
+    event = batch.events[0]
+    assert event.event_type == "cart.item_added"
+    assert event.buyer_id == "member-1"
+    assert event.metadata["native_product_no"] == "781"
+    assert event.metadata["native_variant_code"] == "P0000BEB000A"
+    assert event.metadata["native_quantity"] == 2
+    assert event.metadata["native_products"][0]["quantity"] == 2
+
+
+@pytest.mark.parametrize(
+    ("event_no", "event_type"),
+    [
+        (90072, "order.cancelled"),
+        (90073, "refund.created"),
+        (90074, "return.created"),
+    ],
+)
+def test_bulk_order_webhooks_expand_comma_separated_order_ids(event_no, event_type):
+    from services.cafe24_event_adapter import map_cafe24_webhook
+
+    batch = map_cafe24_webhook(
+        {
+            "event_no": event_no,
+            "resource": {
+                "mall_id": "sample_mall",
+                "event_shop_no": "1",
+                "order_id": "order-1,order-2",
+            },
+        },
+        trace_id=f"trace-bulk-{event_no}",
+        store_id="store-c24",
+    )
+
+    assert [event.event_type for event in batch.events] == [event_type, event_type]
+    assert [event.order_id for event in batch.events] == ["order-1", "order-2"]
+    assert len({event.event_id for event in batch.events}) == 2
+
+
 def test_product_adapter_converts_catalog_and_variants():
     from adapters.cafe24_adapter import Cafe24ProductAdapter
 

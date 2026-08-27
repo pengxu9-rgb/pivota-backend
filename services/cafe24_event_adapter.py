@@ -25,8 +25,12 @@ STORE_EVENT_MAP = {
     90028: "return.created",
     90029: "refund.status_changed",
     90072: "order.cancelled",
+    90073: "refund.status_changed",
     90074: "return.created",
+    90084: "cart.item_added",
 }
+
+BULK_ORDER_EVENT_NUMBERS = {90072, 90073, 90074}
 
 ZERO_DECIMAL_CURRENCIES = {
     "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF"
@@ -253,8 +257,28 @@ def _store_webhook_batch(
         raise UnsupportedCafe24Event(f"unsupported Cafe24 webhook event_no: {event_no}")
 
     resource = _dict(payload.get("resource"))
+    if event_no in BULK_ORDER_EVENT_NUMBERS:
+        order_ids = [
+            item.strip()
+            for item in str(resource.get("order_id") or "").split(",")
+            if item.strip()
+        ]
+        if len(order_ids) > 1:
+            events = []
+            for child_order_id in order_ids:
+                child_batch = _store_webhook_batch(
+                    {
+                        **payload,
+                        "resource": {**resource, "order_id": child_order_id},
+                    },
+                    trace_id=trace_id,
+                    store_id=store_id,
+                )
+                events.extend(child_batch.events)
+            return MerchantEventBatch(events=events)
     mall_id = normalize_cafe24_mall_id(resource.get("mall_id"))
     order_id = _text(resource.get("order_id"))
+    cart_id = _text(resource.get("cart_id") or resource.get("basket_id"))
     paid = str(resource.get("paid") or "").upper()
     currency = _text(resource.get("currency")) or "KRW"
     amount = resource.get("actual_payment_amount")
@@ -271,6 +295,8 @@ def _store_webhook_batch(
         resource.get("updated_date"),
     )
     products = _products(resource.get("items") or resource.get("product_list"))
+    if event_no == 90084:
+        products = [resource]
     payment_id = _text(
         resource.get("payment_id")
         or resource.get("transaction_id")
@@ -287,6 +313,11 @@ def _store_webhook_batch(
         "native_payment_method": _text(resource.get("payment_method")),
         "native_payment_gateway": _text(resource.get("payment_gateway_name")),
         "native_order_place_id": _text(resource.get("order_place_id")),
+        "native_product_no": _text(resource.get("product_no")),
+        "native_variant_code": _text(resource.get("variant_code")),
+        "native_quantity": resource.get("quantity"),
+        "native_shipping_type": _text(resource.get("shipping_type")),
+        "native_product_bundle": _text(resource.get("product_bundle")),
         "native_products": _native_products(products),
         "webhook_trace_id": trace_id,
     }
@@ -309,9 +340,11 @@ def _store_webhook_batch(
         if canonical_type in {"order.created", "order.paid", "order.cancelled"}:
             entity_kind, stable_entity_id = "order", order_id
         elif canonical_type.startswith("refund."):
-            entity_kind, stable_entity_id = "refund", refund_id
+            entity_kind = "refund" if refund_id else "order_refund"
+            stable_entity_id = refund_id or (order_id if event_no == 90073 else None)
         elif canonical_type.startswith("return."):
-            entity_kind, stable_entity_id = "return", return_id
+            entity_kind = "return" if return_id else "order_return"
+            stable_entity_id = return_id or (order_id if event_no == 90074 else None)
         elif canonical_type.startswith("payment."):
             entity_kind, stable_entity_id = "payment", payment_id
         else:
@@ -337,6 +370,7 @@ def _store_webhook_batch(
                 source="cafe24_webhook",
                 store_id=store_id,
                 buyer_id=_text(resource.get("member_id")),
+                cart_id=cart_id,
                 order_id=order_id,
                 payment_id=payment_id,
                 refund_id=refund_id,
