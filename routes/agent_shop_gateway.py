@@ -3328,28 +3328,43 @@ def _expand_ref_aliases(raw_ref: Optional[str]) -> List[str]:
     return aliases[:20]
 
 
+def _offers_scope_or_none(raw: Any) -> Optional[str]:
+    """A usable merchant scope, or None.
+
+    'external_seed' is the SOURCING sentinel every mirrored seed row advertises as its
+    merchant_id — and get_offers callers echo advertised fields back, so the sentinel arrives
+    here as a "scope" pointing at a merchant that does not exist. Treat it as unscoped (same
+    rule as the gateway's services/sourcingSentinel), so seed products resolve by identity
+    instead of dying inside a fake merchant's empty catalog.
+    """
+    s = str(raw or "").strip()
+    if not s or s.lower() in {"external_seed", "external seed"}:
+        return None
+    return s
+
+
 def _resolve_offers_merchant_scope(
     *,
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
 ) -> Optional[str]:
     # Explicit scope in payload wins.
-    scoped = str(payload.product.merchant_id or "").strip() or None
+    scoped = _offers_scope_or_none(payload.product.merchant_id)
     if scoped:
         return scoped
     meta = request_metadata if isinstance(request_metadata, dict) else {}
     for key in ("merchant_id", "merchantId"):
-        val = str(meta.get(key) or "").strip()
+        val = _offers_scope_or_none(meta.get(key))
         if val:
             return val
     merchant_scope = meta.get("merchant_scope")
     if isinstance(merchant_scope, list):
         for val in merchant_scope:
-            s = str(val or "").strip()
+            s = _offers_scope_or_none(val)
             if s:
                 return s
     if isinstance(merchant_scope, str):
-        s = merchant_scope.strip()
+        s = _offers_scope_or_none(merchant_scope)
         if s:
             return s
     return None
@@ -4413,6 +4428,56 @@ async def _handle_offers_resolve(
             )
             if seed_rows:
                 query_label = "external_seed_by_attached_ref"
+
+        # A sig_* ref is EXACT identity, but a Pivota signature appears nowhere in a seed row —
+        # not in external_product_id, not in the urls, not in seed_data — so the fuzzy arm below
+        # can never match one, and a seed-only product has no internal row for the retry lanes to
+        # pivot from. Measured live 2026-08-27: get_offers(product_id=sig_…) answered zero offers
+        # for a product whose PDP served fine. The mirror (catalog_products) already holds the
+        # sig ↔ seed join: pivota_signature_id was minted per mirrored seed and source_ref carries
+        # the seed id. Resolve through it — two single-table queries rather than a JOIN, because
+        # the shared quarantine anti-join references unqualified seed columns and a JOIN with
+        # catalog_products would make them ambiguous.
+        if not seed_rows:
+            sig_aliases = [
+                alias for alias in (product_id_aliases + sku_id_aliases) if alias.startswith("sig_")
+            ][:8]
+            if sig_aliases:
+                sig_map_rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT source_ref
+                        FROM catalog_products
+                        WHERE pivota_signature_id = ANY(:sig_aliases)
+                          AND source_system = 'external_product_seeds'
+                          AND source_ref IS NOT NULL
+                        LIMIT 8
+                        """,
+                        {"sig_aliases": sig_aliases},
+                    ),
+                    timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+                )
+                mapped_seed_ids = [
+                    str(_row_to_dict(row).get("source_ref") or "").strip()
+                    for row in (sig_map_rows or [])
+                ]
+                mapped_seed_ids = [seed_id for seed_id in mapped_seed_ids if seed_id]
+                if mapped_seed_ids:
+                    seed_rows = await asyncio.wait_for(
+                        database.fetch_all(
+                            f"""
+                            SELECT *
+                            FROM external_product_seeds
+                            WHERE id = ANY(:mapped_seed_ids)
+                              AND status = 'active'
+                            {_seed_quarantine_clause()}
+                            """,
+                            {"mapped_seed_ids": mapped_seed_ids},
+                        ),
+                        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+                    )
+                    if seed_rows:
+                        query_label = "external_seed_by_pivota_signature"
 
         if not seed_rows:
             prefetched_internal = await _prefetch_canonical_internal_context()
