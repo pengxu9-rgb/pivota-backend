@@ -20,6 +20,8 @@ from adapters.bigcommerce_adapter import (
 )
 from adapters.cafe24_adapter import Cafe24ProductAdapter
 from adapters.magento_adapter import MagentoProductAdapter
+from adapters.shopline_adapter import ShoplineProductAdapter
+from adapters.shoplazza_adapter import ShoplazzaProductAdapter
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 from services.wix_connection import (
@@ -2034,6 +2036,8 @@ PLATFORM_ADAPTERS = {
     "bigcommerce": BigCommerceProductAdapter,
     "cafe24": Cafe24ProductAdapter,
     "magento": MagentoProductAdapter,
+    "shopline": ShoplineProductAdapter,
+    "shoplazza": ShoplazzaProductAdapter,
 }
 
 
@@ -2122,6 +2126,26 @@ async def fetch_merchant_products(
             store_view_code=credentials.get("store_view_code", "default"),
             currency=credentials.get("currency", "USD"),
             product_url_suffix=credentials.get("product_url_suffix"),
+        )
+    elif platform == "shopline":
+        return await adapter_class.fetch_products(
+            handle=credentials.get("handle"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            api_version=credentials.get("api_version", "v20260601"),
+            currency=credentials.get("currency", "USD"),
+        )
+    elif platform == "shoplazza":
+        return await adapter_class.fetch_products(
+            store_url=credentials.get("store_url"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            api_version=credentials.get("api_version", "2026-01"),
+            currency=credentials.get("currency", "USD"),
         )
     else:
         return [], None, f"Platform {platform} not implemented"

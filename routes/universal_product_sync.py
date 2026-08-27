@@ -12,6 +12,8 @@ import json
 import logging
 from adapters.bigcommerce_adapter import normalize_bigcommerce_store_hash
 from adapters.magento_adapter import normalize_magento_store_url
+from adapters.shopline_adapter import normalize_shopline_handle
+from adapters.shoplazza_adapter import normalize_shoplazza_store_url
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
@@ -566,6 +568,29 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
             "currency": str(credentials.get("currency") or "USD").upper(),
             "product_url_suffix": credentials.get("product_url_suffix"),
         }
+
+    elif platform in {"shopline", "shoplazza"}:
+        raw_credentials = store_info.get("api_key")
+        if not raw_credentials:
+            return None
+        try:
+            parsed = json.loads(raw_credentials) if isinstance(raw_credentials, str) else raw_credentials
+        except json.JSONDecodeError:
+            parsed = {"access_token": raw_credentials}
+        credentials = dict(parsed) if isinstance(parsed, dict) else {"access_token": parsed}
+        access_token = str(credentials.get("access_token") or "").strip()
+        if not access_token:
+            return None
+        common = {
+            "access_token": access_token,
+            "api_version": str(credentials.get("api_version") or ("v20260601" if platform == "shopline" else "2026-01")),
+            "currency": str(credentials.get("currency") or "USD").upper(),
+        }
+        if platform == "shopline":
+            handle = normalize_shopline_handle(credentials.get("handle") or store_info.get("domain"))
+            return {**common, "handle": handle} if handle else None
+        store_url = normalize_shoplazza_store_url(store_info.get("domain"))
+        return {**common, "store_url": store_url} if store_url else None
     
     elif platform == "square":
         # Square uses location ID and access token

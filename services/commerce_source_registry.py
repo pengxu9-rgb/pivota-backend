@@ -65,6 +65,12 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
         "storefront",
         CommerceSourceCapabilities(catalog_pull=True),
     ),
+    "shopline": CommerceSourceDefinition(
+        "shopline", "storefront", CommerceSourceCapabilities(catalog_pull=True)
+    ),
+    "shoplazza": CommerceSourceDefinition(
+        "shoplazza", "storefront", CommerceSourceCapabilities(catalog_pull=True)
+    ),
     # Square is retained because the existing sync endpoint accepts its credentials;
     # its fetch adapter can be enabled independently of this policy contract.
     "square": CommerceSourceDefinition("square", "storefront", _CATALOG_CAPABILITIES),
