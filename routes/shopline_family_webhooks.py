@@ -16,6 +16,7 @@ from services.shopline_family_event_adapter import (
     map_shopline_webhook,
     map_shoplazza_webhook,
 )
+from services.shopline_family_webhook_auth import resolve_webhook_secret
 
 
 router = APIRouter(prefix="/webhooks", tags=["SHOPLINE and Shoplazza Webhooks"])
@@ -82,7 +83,7 @@ async def _receive(
         raise HTTPException(status_code=413, detail=f"{platform} webhook exceeds 1 MB")
     store = await _store(store_id, platform)
     credentials = _credentials((store or {}).get("api_key"))
-    app_secret = str(credentials.get("app_secret") or credentials.get("webhook_secret") or "").strip()
+    app_secret = resolve_webhook_secret(platform, credentials)
     if not store or not _valid_signature(raw, signature, app_secret):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -39,6 +39,20 @@ transaction; SHOPLINE documents that refund-form creation alone is unrelated to
 funds movement. Shoplazza maps order create/paid/cancelled plus partial/full
 refund notifications. Delivery IDs become retry-stable trace/idempotency keys.
 
+With `SHOPLINE_WEBHOOK_BASE_URL`, `SHOPLAZZA_WEBHOOK_BASE_URL`, or the shared
+`PUBLIC_BASE_URL` configured as an HTTPS public origin, authenticated merchants
+can install any missing subscriptions idempotently:
+
+```text
+POST /integrations/shopline/{store_id}/webhooks/ensure
+POST /integrations/shoplazza/{store_id}/webhooks/ensure
+```
+
+The installer lists current subscriptions first and creates only missing
+topic-and-callback pairs. A retry after a partial upstream failure is therefore
+safe. A per-store `app_secret` may be omitted when the deployment supplies
+`SHOPLINE_APP_SECRET` or `SHOPLAZZA_CLIENT_SECRET` centrally.
+
 Native payloads are reduced to an allowlist of order, payment, product/variant,
 quantity, status, amount, and attribution IDs. Names, email, phone, addresses,
 IP addresses, arbitrary item properties, and gateway receipts are not copied to
@@ -63,9 +77,13 @@ at 1 MB, and acknowledge unsupported topics without recording them.
 - https://developer.shopline.com/docs/apps/api-instructions-for-use/rest-admin-api/overview
 - https://developer.shopline.com/docs/admin-rest-api/product/product/get-products/
 - https://developer.shopline.com/docs/apps/api-instructions-for-use/webhooks/overview/
+- https://developer.shopline.com/docs/admin-rest-api/webhook/subscribe-to-a-webhook/
+- https://developer.shopline.com/docs/admin-rest-api/webhook/get-a-list-of-subscribed-webhooks/
 - https://developer.shopline.com/docs/webhook/order/order-created/
 - https://developer.shopline.com/docs/webhook/order/refund-created
 - https://www.shoplazza.dev/api/openapi
 - https://www.shoplazza.dev/api/products
 - https://www.shoplazza.dev/docs/app/building-blocks/webhooks/overview
 - https://www.shoplazza.dev/docs/app/building-blocks/webhooks/supported-webhook-events
+- https://www.shoplazza.dev/api/webhooks
+- https://www.shoplazza.dev/api/webhook-create

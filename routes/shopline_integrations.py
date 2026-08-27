@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Optional
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -18,6 +20,16 @@ from adapters.shoplazza_adapter import (
 )
 from db.database import database
 from services.store_lifecycle_service import sync_catalog_merchant_status
+from services.shopline_family_event_adapter import (
+    SUPPORTED_SHOPLAZZA_TOPICS,
+    SUPPORTED_SHOPLINE_TOPICS,
+)
+from services.shopline_family_webhook_auth import resolve_webhook_secret
+from services.shopline_family_webhook_subscriptions import (
+    WebhookSubscriptionError,
+    ensure_shoplazza_subscriptions,
+    ensure_shopline_subscriptions,
+)
 from utils.auth import get_current_user
 
 
@@ -49,6 +61,45 @@ def _authorize(current_user: dict, merchant_id: str) -> None:
         raise HTTPException(status_code=403, detail="Not authorized")
     if current_user.get("role") == "merchant" and current_user.get("merchant_id") != merchant_id:
         raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+
+def _credentials(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        parsed = json.loads(str(raw or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _callback_url(platform: str, store_id: str) -> str:
+    platform_env = "SHOPLINE_WEBHOOK_BASE_URL"
+    if platform == "shoplazza":
+        platform_env = "SHOPLAZZA_WEBHOOK_BASE_URL"
+    base = str(
+        os.getenv(platform_env)
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Configure {platform_env} or PUBLIC_BASE_URL as an HTTPS origin",
+        )
+    callback_url = f"{base}/webhooks/{platform}/{quote(store_id, safe='')}"
+    if len(callback_url) > 255:
+        raise HTTPException(status_code=503, detail="Webhook callback URL exceeds 255 characters")
+    return callback_url
 
 
 async def _upsert_store(
@@ -109,6 +160,58 @@ async def _upsert_store(
     return store_id
 
 
+async def _connected_store(store_id: str, platform: str) -> dict:
+    row = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = :platform
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id, "platform": platform},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Connected {platform} store not found")
+    return dict(row)
+
+
+async def _ensure_webhooks(store_id: str, platform: str, current_user: dict):
+    store = await _connected_store(store_id, platform)
+    _authorize(current_user, str(store["merchant_id"]))
+    credentials = _credentials(store.get("api_key"))
+    if not resolve_webhook_secret(platform, credentials):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{platform} app secret is required before enabling signed webhooks",
+        )
+    callback_url = _callback_url(platform, store_id)
+    access_token = str(credentials.get("access_token") or "").strip()
+    api_version = str(credentials.get("api_version") or "").strip()
+    if not access_token or not api_version:
+        raise HTTPException(status_code=409, detail=f"{platform} API credentials are incomplete")
+    try:
+        if platform == "shopline":
+            result = await ensure_shopline_subscriptions(
+                handle=str(credentials.get("handle") or store.get("domain") or ""),
+                access_token=access_token,
+                api_version=api_version,
+                callback_url=callback_url,
+                topics=sorted(SUPPORTED_SHOPLINE_TOPICS),
+            )
+        else:
+            result = await ensure_shoplazza_subscriptions(
+                store_url=str(store.get("domain") or ""),
+                access_token=access_token,
+                api_version=api_version,
+                callback_url=callback_url,
+                topics=sorted(SUPPORTED_SHOPLAZZA_TOPICS),
+            )
+    except WebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "success", "store_id": store_id, **result}
+
+
 @router.post("/shopline/connect")
 async def connect_shopline(
     body: ShoplineConnectRequest,
@@ -145,6 +248,7 @@ async def connect_shopline(
         "catalog_adapter": "native_rest",
         "telemetry_mode": "native_order_webhooks_plus_universal_collectors",
         "webhook_path": f"/webhooks/shopline/{store_id}",
+        "webhook_subscription_path": f"/integrations/shopline/{store_id}/webhooks/ensure",
         "required_webhook_topics": [
             "orders/create",
             "orders/paid",
@@ -187,6 +291,7 @@ async def connect_shoplazza(
         "catalog_adapter": "native_rest",
         "telemetry_mode": "native_order_webhooks_plus_universal_collectors",
         "webhook_path": f"/webhooks/shoplazza/{store_id}",
+        "webhook_subscription_path": f"/integrations/shoplazza/{store_id}/webhooks/ensure",
         "required_webhook_topics": [
             "orders/create",
             "orders/paid",
@@ -195,3 +300,19 @@ async def connect_shoplazza(
             "orders/cancelled",
         ],
     }
+
+
+@router.post("/shopline/{store_id}/webhooks/ensure")
+async def ensure_shopline_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    return await _ensure_webhooks(store_id, "shopline", current_user)
+
+
+@router.post("/shoplazza/{store_id}/webhooks/ensure")
+async def ensure_shoplazza_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    return await _ensure_webhooks(store_id, "shoplazza", current_user)
