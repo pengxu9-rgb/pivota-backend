@@ -376,6 +376,7 @@ from routes.shopify_products_sync_api import router as shopify_products_sync_rou
 from routes.platform_products_sync_api import router as platform_products_sync_router
 from routes.outbound_links import router as outbound_links_router
 from routes.attribution_conversions import router as attribution_conversions_router
+from routes.merchant_events import router as merchant_events_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
 from routes.ap2_trusted_issuers_admin import router as ap2_trusted_issuers_admin_router
 from routes.external_offers import router as external_offers_router
@@ -1278,6 +1279,7 @@ app.include_router(admin_cleanup_rebuild_router)  # Admin cleanup and rebuild
 app.include_router(admin_cleanup_stores_router)  # Admin cleanup stores
 app.include_router(outbound_links_router)  # Outbound links (resolve + redirect + ops config)
 app.include_router(attribution_conversions_router)  # Non-custodial conversion-report / receipt-ingest API (#1482)
+app.include_router(merchant_events_router)  # Platform-neutral Agent Commerce event ingestion
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)
 app.include_router(ap2_trusted_issuers_admin_router)  # AP2 trusted-issuer enrollment (#1495) — global tier + per-agent, proof-of-control
 app.include_router(external_offers_router)  # External offers (fetch/cache OG/JSON-LD for external-only products)

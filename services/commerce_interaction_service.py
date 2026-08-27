@@ -54,12 +54,15 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
         "interaction_id": _normalize_text(raw.get("interaction_id")),
         "merchant_id": _normalize_text(raw.get("merchant_id")),
         "platform": _normalize_text(raw.get("platform")),
+        "store_id": _normalize_text(raw.get("store_id")),
         "surface": _normalize_text(raw.get("surface")),
         "prompt_id": _normalize_text(raw.get("prompt_id")),
         "result_id": _normalize_text(raw.get("result_id")),
         "click_id": _normalize_text(raw.get("click_id")),
+        "cart_id": _normalize_text(raw.get("cart_id")),
         "quote_id": _normalize_text(raw.get("quote_id")),
         "checkout_id": _normalize_text(raw.get("checkout_id")),
+        "payment_id": _normalize_text(raw.get("payment_id")),
         "order_id": _normalize_text(raw.get("order_id")),
         "refund_id": _normalize_text(raw.get("refund_id")),
         "return_id": _normalize_text(raw.get("return_id")),
@@ -68,6 +71,7 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
         "trace_id": _normalize_text(raw.get("trace_id")),
         "brief_id": _normalize_text(raw.get("brief_id")),
         "session_id": _normalize_text(raw.get("session_id")),
+        "visitor_id": _normalize_text(raw.get("visitor_id")),
         "buyer_id": _normalize_text(raw.get("buyer_id")),
     }
     return refs
@@ -76,8 +80,10 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
 def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
     for key in (
         "click_id",
+        "cart_id",
         "order_id",
         "checkout_id",
+        "payment_id",
         "quote_id",
         "refund_id",
         "return_id",
@@ -90,7 +96,10 @@ def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
     ):
         value = refs.get(key)
         if value:
-            return _stable_id("int", refs.get("merchant_id"), key, value)
+            scope = [refs.get("merchant_id")]
+            if refs.get("store_id"):
+                scope.append(refs["store_id"])
+            return _stable_id("int", *scope, key, value)
     return f"int_{uuid.uuid4().hex[:24]}"
 
 
@@ -100,15 +109,25 @@ async def _lookup_existing_interaction(refs: Dict[str, Optional[str]]) -> Option
         "click_id",
         "order_id",
         "checkout_id",
+        "payment_id",
+        "cart_id",
         "quote_id",
         "refund_id",
         "return_id",
+        "session_id",
     )
+    merchant_id = refs.get("merchant_id")
     for key in keys:
         value = refs.get(key)
         if not value:
             continue
-        row = await database.fetch_one(select(commerce_interactions).where(getattr(commerce_interactions.c, key) == value))
+        conditions = [
+            commerce_interactions.c.merchant_id == merchant_id,
+            getattr(commerce_interactions.c, key) == value,
+        ]
+        if key in {"session_id", "cart_id", "payment_id"} and refs.get("store_id"):
+            conditions.append(commerce_interactions.c.store_id == refs["store_id"])
+        row = await database.fetch_one(select(commerce_interactions).where(*conditions))
         if row:
             return dict(row)
     return None
@@ -124,6 +143,20 @@ def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) ->
 
 def _status_from_event(event_type: str, current: Optional[str]) -> Optional[str]:
     mapping = {
+        "agent.requested": "observed",
+        "search.performed": "discovery",
+        "product.viewed": "pdp_viewed",
+        "cart.created": "cart_active",
+        "cart.item_added": "cart_active",
+        "cart.item_removed": "cart_active",
+        "cart.updated": "cart_active",
+        "checkout.started": "checkout_started",
+        "checkout.submitted": "checkout_submitted",
+        "payment.attempted": "payment_pending",
+        "payment.authorized": "payment_authorized",
+        "payment.declined": "payment_failed",
+        "payment.succeeded": "paid",
+        "payment.failed": "payment_failed",
         "listing.exported": "indexed",
         "listing.blocked": "blocked",
         "surface.impression": "surfaced",
@@ -132,8 +165,13 @@ def _status_from_event(event_type: str, current: Optional[str]) -> Optional[str]
         "payment.intent.created": "awaiting_payment",
         "payment.intent.viewed": "awaiting_payment",
         "order.created": "ordered",
+        "order.paid": "paid",
+        "order.cancelled": "cancelled",
+        "refund.created": "refund_pending",
         "refund.requested": "refund_pending",
         "refund.succeeded": "refunded",
+        "return.created": "return_pending",
+        "return.completed": "return_synced",
         "return.sync.completed": "return_synced",
     }
     return mapping.get(event_type, current)
@@ -167,8 +205,8 @@ async def ensure_interaction(
 
     existing = await _lookup_existing_interaction(refs)
     interaction_id = (
-        refs.get("interaction_id")
-        or (existing or {}).get("interaction_id")
+        (existing or {}).get("interaction_id")
+        or refs.get("interaction_id")
         or _fallback_interaction_id(refs)
     )
     now = _now()
@@ -179,13 +217,16 @@ async def ensure_interaction(
         "interaction_id": interaction_id,
         "merchant_id": merchant_id,
         "platform": refs.get("platform") or (existing or {}).get("platform"),
+        "store_id": refs.get("store_id") or (existing or {}).get("store_id"),
         "surface": refs.get("surface") or (existing or {}).get("surface"),
         "commerce_surface": taxonomy.get("commerce_surface") or (existing or {}).get("commerce_surface"),
         "prompt_id": refs.get("prompt_id") or (existing or {}).get("prompt_id"),
         "result_id": refs.get("result_id") or (existing or {}).get("result_id"),
         "click_id": refs.get("click_id") or (existing or {}).get("click_id"),
+        "cart_id": refs.get("cart_id") or (existing or {}).get("cart_id"),
         "quote_id": refs.get("quote_id") or (existing or {}).get("quote_id"),
         "checkout_id": refs.get("checkout_id") or (existing or {}).get("checkout_id"),
+        "payment_id": refs.get("payment_id") or (existing or {}).get("payment_id"),
         "order_id": refs.get("order_id") or (existing or {}).get("order_id"),
         "refund_id": refs.get("refund_id") or (existing or {}).get("refund_id"),
         "return_id": refs.get("return_id") or (existing or {}).get("return_id"),
@@ -194,6 +235,7 @@ async def ensure_interaction(
         "trace_id": refs.get("trace_id") or (existing or {}).get("trace_id"),
         "brief_id": refs.get("brief_id") or (existing or {}).get("brief_id"),
         "session_id": refs.get("session_id") or (existing or {}).get("session_id"),
+        "visitor_id": refs.get("visitor_id") or (existing or {}).get("visitor_id"),
         "buyer_id": refs.get("buyer_id") or (existing or {}).get("buyer_id"),
         "source_channel": taxonomy.get("source_channel") or (existing or {}).get("source_channel"),
         "source_family": taxonomy.get("source_family") or (existing or {}).get("source_family"),
@@ -306,6 +348,7 @@ async def record_commerce_event(
             interaction_id=interaction["interaction_id"],
             merchant_id=merchant_id,
             platform=refs.get("platform") or interaction.get("platform"),
+            store_id=refs.get("store_id") or interaction.get("store_id"),
             surface=refs.get("surface") or interaction.get("surface"),
             event_type=event_type,
             occurred_at=occurred,
@@ -314,6 +357,9 @@ async def record_commerce_event(
             trace_id=refs.get("trace_id") or interaction.get("trace_id"),
             brief_id=refs.get("brief_id") or interaction.get("brief_id"),
             session_id=refs.get("session_id") or interaction.get("session_id"),
+            visitor_id=refs.get("visitor_id") or interaction.get("visitor_id"),
+            cart_id=refs.get("cart_id") or interaction.get("cart_id"),
+            payment_id=refs.get("payment_id") or interaction.get("payment_id"),
             source=source,
             upstream_idempotency_key=upstream_idempotency_key,
             actor_type=actor_type,
