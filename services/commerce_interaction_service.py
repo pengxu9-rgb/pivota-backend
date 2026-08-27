@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import IS_POSTGRES, database
@@ -263,7 +263,7 @@ async def _event_write_lock(
     async with database.transaction():
         if key:
             await database.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
                 {"lock_key": f"event|{merchant_id}|{event_type}|{key}"},
             )
         existing = await _lookup_existing_interaction(refs)
@@ -273,7 +273,7 @@ async def _event_write_lock(
             or _fallback_interaction_id(refs)
         )
         await database.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
             {"lock_key": f"interaction|{merchant_id}|{interaction_id}"},
         )
         yield
