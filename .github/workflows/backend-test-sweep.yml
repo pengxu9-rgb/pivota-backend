@@ -207,26 +207,66 @@ jobs:
       #
       # AND a SLACK CAP, because "raise these when the real numbers grow" is an
       # instruction to a human, and this file's own history shows what that is
-      # worth: the 9,000 floor accumulated ~3,200 of slack in 28 days (the suite
-      # grows ~107 executed tests/day), so unattended, the floor re-opens a
-      # tests/services-sized hole in about two weeks. The cap makes decay a CI
-      # failure instead of a memory: if executed exceeds FLOOR by more than 10%
-      # (same per subtree), the job fails telling you to RAISE the floor.
-      # Deletions are safe — removing tests only shrinks slack, so the cap can
-      # never fire on a legitimate shrink; and a floor bump edits this file,
-      # which `.github/workflows/**` in the PR triggers routes straight back
-      # through this job, so every bump is verified by the run it gates.
+      # worth: the 9,000 floor sat 3,245 below the 12,245 it was meant to guard
+      # after 28 days (~116 executed tests/day over that window), so unattended,
+      # the floor re-opens a tests/services-sized hole in about two weeks. The
+      # cap makes decay visible instead of silent: when executed exceeds the
+      # floor by more than the allowance, you are told to RAISE the floor.
+      #
+      # ⚠️ IT WARNS ON PRs AND FAILS ONLY ON push-to-main, and that asymmetry is
+      # the whole design. Review of the first version measured the blast radius
+      # of failing on PRs: this job feeds the REQUIRED `CI Entrypoint` check and
+      # its paths filter matches nearly every backend PR, so the day the cap
+      # trips, EVERY open PR reddens at once — including ones that added no
+      # tests — and stays red until somebody lands a floor bump. That is a
+      # repo-wide merge outage as the remedy for a floor being conservative.
+      # Worse, main can cross the cap with no PR ever going red: two PRs each
+      # branched below it merge green, and the next innocent PR inherits the
+      # failure. On push-to-main the same finding is a red main build — loud,
+      # attributable to the commit that crossed, and blocking nobody.
+      #
+      # A shrink never trips the cap (deletions only reduce executed), but note
+      # the two bounds do tighten against each other: the cap pushes FLOOR up
+      # toward the real count, and a FLOOR set AT the real count leaves no room
+      # for a legitimate deletion. The error message prints the whole admissible
+      # window for that reason. And a floor bump edits this file, which
+      # `.github/workflows/**` in the PR triggers routes straight back through
+      # this job, so every bump is verified by the run it gates.
       - name: Assert the sweep actually ran
         if: '!cancelled()'
+        # Read as an env var, never interpolated into the run body — see
+        # tests/test_workflow_no_run_body_interpolation.py.
+        env:
+          SWEEP_EVENT: ${{ github.event_name }}
         run: |
           python - <<'PY'
-          import sys, collections, xml.etree.ElementTree as ET
+          import os, sys, math, collections, xml.etree.ElementTree as ET
           FLOOR = 12000
-          # Cap on slack, global and per-subtree: executed may not exceed the
-          # floor by more than 10%. See the SLACK CAP paragraph above — the
-          # failure this converts from silent decay into a red build is the
-          # floor drifting far enough below reality to stop being a floor.
+          # Slack allowance, global and per-subtree: 10% of the floor, but never
+          # fewer than ABS_SLACK tests. The absolute term is not decoration — a
+          # pure percentage is unusable on a small tree. readiness.tests
+          # measures 79 against a floor of 70, so a 10% cap is 77: the green
+          # build fails, and re-floating the floor to 73 only moves the cap to
+          # 80.3, room for exactly ONE new test. It would also have made this
+          # file's own stated goal a red build — un-quarantining
+          # readiness/tests/test_routes.py adds 49 tests in one PR. A floor's
+          # job is to notice a tree LEAVING; sizing its ceiling per-test is a
+          # different, worse question.
+          ABS_SLACK = 150
           SLACK = 1.10
+
+          def cap(floor):
+              return floor + max(ABS_SLACK, floor * (SLACK - 1))
+
+          def floor_window(ran):
+              """The floors that both admit `ran` and keep it under the cap."""
+              lo = ran - ABS_SLACK if ran <= ABS_SLACK * 11 else math.ceil(ran / SLACK)
+              return max(lo, 0), ran
+
+          # Cap findings FAIL the job only on push-to-main; on a PR they are
+          # annotations. See the ⚠️ paragraph above — failing PRs on this turns
+          # a conservative floor into a repo-wide merge outage.
+          ENFORCE_CAP = os.environ.get('SWEEP_EVENT') == 'push'
           # Per-subtree minimums, counted over EXECUTED testcases only. A single
           # global number cannot notice ONE tree leaving — the hole review
           # demonstrated. And the counter must exclude skipped testcases for the
@@ -234,13 +274,15 @@ jobs:
           # counted every <testcase> including skipped ones, so a mass env-gated
           # skip of all 79 readiness/tests testcases would still have
           # "contributed" 79 >= 70 — green with zero readiness tests executed —
-          # while only denting the global executed count by 79 against 245 of
+          # while only denting the global executed count by 79 against 254 of
           # headroom. The prefix match is anchored on the following '.' so a
           # future sibling package (tests/services_v2) cannot count toward
           # tests.services.
           #
           # Measured 2026-08-26 under THIS counting (executed only, anchored):
-          # tests.services=1682, readiness.tests=79 — numerically identical to
+          # tests.services=1682, readiness.tests=79 — both unchanged from the
+          # recalibration's figures, so its floors carry over as-is;
+          # numerically identical to
           # the collected-testcase figures the recalibration used, because
           # today all 33 skips live OUTSIDE both subtrees. That equality is a
           # present-tense fact, not a property: the moment either subtree
@@ -256,7 +298,7 @@ jobs:
           # would have failed the GREEN build. Caught before merge only because
           # the clean and mutant runs were compared side by side — a guard is
           # not verified until it has been run against a passing build too.
-          SUBTREES = {'tests.services': 1600, 'readiness.tests': 73}
+          SUBTREES = {'tests.services': 1600, 'readiness.tests': 70}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
@@ -274,30 +316,48 @@ jobs:
               for prefix in SUBTREES:
                   if cn.startswith(prefix + '.'):
                       by[prefix] += 1
-          bad = []
+          bad, decayed = [], []
+
+          def decay(name, value, floor):
+              lo, hi = floor_window(value)
+              decayed.append(f"{name}: {value} executed but its floor is only {floor} "
+                             f"(cap {cap(floor):.0f}) — the floor has decayed and no "
+                             f"longer bounds anything; set it between {lo} and {hi} in "
+                             f"this file. Do NOT exceed {hi}: a floor above the real "
+                             f"count fails as an under-floor error, and one set exactly "
+                             f"AT it leaves no room to delete a test.")
+
           if ran < FLOOR:
               bad.append(f"only {ran} tests executed, floor is {FLOOR} — a glob or "
                          f"--ignore is matching more than intended; this job would have "
                          f"reported green having tested far less than it claims")
-          elif ran > FLOOR * SLACK:
-              bad.append(f"{ran} tests executed but FLOOR is only {FLOOR} — the floor "
-                         f"has decayed by more than 10% and is no longer a floor; raise "
-                         f"FLOOR in this file to within 10% of {ran}")
+          elif ran > cap(FLOOR):
+              decay('FLOOR', ran, FLOOR)
           for prefix, minimum in sorted(SUBTREES.items()):
               got = by[prefix]
               print(f"  subtree {prefix}: {got} executed (min {minimum})")
               if got < minimum:
                   bad.append(f"subtree {prefix} executed only {got}, minimum {minimum} — "
                              f"the tree was dropped, or its tests were mass-skipped")
-              elif got > minimum * SLACK:
-                  bad.append(f"subtree {prefix} executed {got} but its minimum is only "
-                             f"{minimum} — raise it in this file to within 10% of {got}")
+              elif got > cap(minimum):
+                  decay(f"subtree {prefix}", got, minimum)
+
+          # A cap finding is advisory on a PR and fatal on push-to-main. Never
+          # the reverse: an UNDER-floor finding is fatal everywhere, because it
+          # means tests silently vanished from the run that is gating this PR.
+          for d in decayed:
+              print(f"::{'error' if ENFORCE_CAP else 'warning'}::{d}")
+          if decayed and ENFORCE_CAP:
+              bad.extend(decayed)
+          elif decayed:
+              print("(advisory on a pull request — raise the floor in a follow-up; "
+                    "this becomes a failure on push-to-main)")
           if bad:
               for b in bad:
                   print(f"::error::{b}")
               sys.exit("sweep floor invariants violated — an under-floor count means "
-                       "tests silently vanished; an over-slack count means the floor "
-                       "has decayed and must be raised (never lowered) in this file")
+                       "tests silently vanished; an over-cap count means the floor has "
+                       "decayed and must be raised (never lowered) in this file")
           PY
 
   # NEW TEST FILES MUST LAND INSIDE THE SWEPT TREES.
