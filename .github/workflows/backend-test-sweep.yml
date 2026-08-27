@@ -267,30 +267,21 @@ jobs:
           # annotations. See the ⚠️ paragraph above — failing PRs on this turns
           # a conservative floor into a repo-wide merge outage.
           ENFORCE_CAP = os.environ.get('SWEEP_EVENT') == 'push'
-          # Per-subtree minimums, counted over EXECUTED testcases only. A single
-          # global number cannot notice ONE tree leaving — the hole review
-          # demonstrated. And the counter must exclude skipped testcases for the
-          # same reason the global floor subtracts them: the first version
-          # counted every <testcase> including skipped ones, so a mass env-gated
-          # skip of all 79 readiness/tests testcases would still have
-          # "contributed" 79 >= 70 — green with zero readiness tests executed —
-          # while only denting the global executed count by 79 against 254 of
-          # headroom. The prefix match is anchored on the following '.' so a
-          # future sibling package (tests/services_v2) cannot count toward
-          # tests.services.
+          # Per-subtree minimums. A single global number cannot notice ONE tree
+          # leaving — the hole review demonstrated. (These are counted over
+          # EXECUTED testcases only; the loop below says why.)
           #
-          # Measured 2026-08-26 under THIS counting (executed only, anchored):
-          # tests.services=1682, readiness.tests=79 — both unchanged from the
-          # recalibration's figures, so its floors carry over as-is;
-          # numerically identical to
-          # the collected-testcase figures the recalibration used, because
-          # today all 33 skips live OUTSIDE both subtrees. That equality is a
-          # present-tense fact, not a property: the moment either subtree
-          # gains an env-gated skip the two countings diverge, which is the
-          # point of this one. A green MAIN run is a valid calibration source
-          # only while the pytest invocation AND this counting logic are
-          # untouched; a PR that edits either must calibrate against its own
-          # branch's CI run of the modified workflow — see the ⚠️ below.
+          # Measured 2026-08-26 under that counting: tests.services=1682,
+          # readiness.tests=79 — unchanged from the figures the recalibration
+          # took from collected testcases, because today all 33 skips live
+          # OUTSIDE both subtrees, so these floors carry over untouched. That
+          # equality is a present-tense fact, not a property: the moment either
+          # subtree gains an env-gated skip the two countings diverge, which is
+          # the whole reason the loop below excludes skips. A green MAIN run is
+          # a valid calibration source only while the pytest invocation AND the
+          # counting logic are untouched; a PR that edits either must calibrate
+          # against its own branch's CI run of the modified workflow — see the
+          # ⚠️ below.
           #
           # ⚠️ Calibrate against the FINAL command, not an earlier one. My first
           # cut set readiness.tests>=90 from a run that used --ignore on
@@ -308,6 +299,32 @@ jobs:
           ran = total - skipped
           print(f"collected={total} skipped={skipped} executed={ran} floor={FLOOR}")
 
+          # COUNT WHAT RAN, NOT WHAT WAS COLLECTED. The global floor above already
+          # subtracts skips (`ran = total - skipped`); this loop did not, so a
+          # subtree could go ENTIRELY INERT and still clear its minimum. Proven
+          # against this very script: feed it a sweep.xml where all 79
+          # `readiness.tests` cases carry <skipped/> and it printed
+          # `subtree readiness.tests: 79 (min 70)` and exited 0.
+          #
+          # The global floor is not a backstop for that. 79 skips sit well inside
+          # its 251 of headroom, so the whole readiness tree can stop executing
+          # with both gates green. (tests.services is incidentally covered — 1,682
+          # skips would blow through the global floor — but that is arithmetic
+          # luck, not a guarantee, and it evaporates the moment the floor rises.)
+          #
+          # A MODULE-level skip was always caught, because it collapses collection
+          # to one <testcase> per module. The gap is a per-test @pytest.mark.skipif
+          # sweep, which keeps the case count identical and the execution count zero
+          # — exactly the shape an environment-dependent guard degrades into.
+          #
+          # AND THE PREFIX IS ANCHORED on the following '.', so a future sibling
+          # package counts toward its own floor or none: unanchored, a
+          # `tests/services_v2` would have its tests counted toward
+          # tests.services, letting that minimum be satisfied by a tree it does
+          # not name. A no-op today (verified: anchored and unanchored give the
+          # same 1682/79, and no testcase's classname equals a prefix exactly —
+          # pytest emits dotted module paths, so there is always a '.' after a
+          # package), which is the only time such a fix is cheap to make.
           by = collections.Counter()
           for tc in suite.iter('testcase'):
               if tc.find('skipped') is not None:

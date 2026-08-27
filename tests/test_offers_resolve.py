@@ -562,6 +562,269 @@ def test_offers_resolve_external_only_product_serves_on_explicit_surface(
     assert metadata.get("resolution_mode") == "external_only"
 
 
+def _sig_lane_seed_row() -> dict:
+    return {
+        "id": "eps_sig_1",
+        "external_product_id": "ext_sig_1",
+        "market": "US",
+        "tool": "*",
+        "destination_url": "https://sigbrand.example/products/treatment",
+        "canonical_url": "https://sigbrand.example/products/treatment",
+        "domain": "sigbrand.example",
+        "title": "Sig Brand Treatment",
+        "price_amount": 45.0,
+        "price_currency": "USD",
+        "availability": "in_stock",
+        "utm_template": None,
+        "seed_data": {
+            "snapshot": dict(_VERIFIED_CONTENT),
+            "brand": "Sig Brand",
+            "variants": [
+                {
+                    "variant_id": "SKU_SIG_1",
+                    "title": "Sig Brand Treatment 50ml",
+                    "price_amount": 45.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                }
+            ],
+        },
+        "status": "active",
+        **_VERIFIED_DESTINATION,
+    }
+
+
+def _sig_lane_fetch_all(query: str, values=None):
+    """A seed findable ONLY through the catalog mirror: a Pivota signature appears nowhere in the
+    seed row itself, so the fuzzy arm and the retry lanes must all miss."""
+    q = str(query)
+    if "FROM catalog_products" in q and "pivota_signature_id = ANY" in q:
+        assert values["sig_aliases"] == ["sig_test_mirror_1"]
+        return [{"source_ref": "eps_sig_1"}]
+    if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
+        assert values["mapped_seed_ids"] == ["eps_sig_1"]
+        return [_sig_lane_seed_row()]
+    return []
+
+
+def test_offers_resolve_sig_ref_resolves_via_catalog_mirror(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The live symptom (2026-08-27): get_offers(product_id=sig_…) answered zero offers for a
+    product whose PDP served fine — no arm of the external lane could turn a signature into a
+    seed row. The mirror holds the join (pivota_signature_id ↔ source_ref); this pins it."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"product_id": "sig_test_mirror_1"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+                "commerce_surface": "agent_api",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    offers = body.get("offers") or []
+    assert offers, "a sig-only ref must resolve through the catalog mirror to its seed offer"
+    assert offers[0]["purchase_route"] == "affiliate_outbound"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("has_external") is True
+    assert any(
+        str(source.get("source")) == "external_product_seeds"
+        and str(source.get("status")) == "ok"
+        and str(source.get("query")) == "external_seed_by_pivota_signature"
+        for source in (metadata.get("sources") or [])
+    )
+
+
+def test_offers_resolve_sentinel_merchant_scope_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Seed products ADVERTISE merchant_id='external_seed' (a sourcing bucket, not a merchant),
+    and callers echo advertised fields back. A sentinel scope must resolve exactly like no scope —
+    never point the lanes at a merchant that does not exist."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {
+                "product": {"merchant_id": "external_seed", "product_id": "sig_test_mirror_1"},
+                "limit": 10,
+                "market": "US",
+                "tool": "*",
+                "commerce_surface": "agent_api",
+            },
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    offers = body.get("offers") or []
+    assert offers, "the advertised sentinel must not cost the caller the offers"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("merchant_scope") is None, (
+        "the sentinel is a sourcing bucket, not a scope — reporting it as one means the lanes ran scoped"
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_extra, metadata_extra",
+    [
+        ({"product_merchant": "external_seed"}, {}),
+        ({}, {"merchant_id": "external_seed"}),
+        ({}, {"merchantId": "external_seed"}),
+        ({}, {"merchant_scope": ["external_seed"]}),
+        ({}, {"merchant_scope": "external_seed"}),
+    ],
+    ids=["payload", "meta_merchant_id", "meta_merchantId", "meta_scope_list", "meta_scope_str"],
+)
+def test_offers_resolve_sentinel_is_unscoped_at_every_extraction_point(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, payload_extra, metadata_extra
+) -> None:
+    """Review finding on the first commit: only the payload extraction point was pinned —
+    reverting the metadata `merchant_id` extraction survived every test. Callers echo advertised
+    fields through metadata too, so each of the four sanitizer sites must treat the sentinel as
+    unscoped, and each row here kills that site's revert individually."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    product = {"product_id": "sig_test_mirror_1"}
+    if payload_extra.get("product_merchant"):
+        product["merchant_id"] = payload_extra["product_merchant"]
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": product, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui", **metadata_extra},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("merchant_scope") is None, (
+        "the sentinel arrived via this extraction point and must not become a scope"
+    )
+    assert body.get("offers"), "and the seed offer still serves"
+
+
+def test_offers_resolve_inactive_mirror_seed_falls_through_to_later_arms(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The arm's own design claim, previously untested (review finding): when the mirror maps a
+    sig to a seed the gated query refuses (inactive/quarantined), seed_rows stays empty and the
+    LATER arms must still run — the sig arm must never eat the lane. Deleting `status='active'`
+    from the new seed query flips this test (the inactive seed would serve)."""
+    import routes.agent_shop_gateway as gateway
+
+    fuzzy_ran = {"seen": False}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "pivota_signature_id = ANY" in q:
+            return [{"source_ref": "eps_sig_dead"}]
+        if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
+            # This fake plays the DATABASE, so it must honour the query it is handed: with the
+            # status filter present the retired seed is refused (empty result); if a mutant
+            # deletes the filter, the retired row comes back — and the assertions below turn
+            # that into a failure instead of letting the fake hide it.
+            if "status = 'active'" in q:
+                return []
+            return [
+                _sig_lane_seed_row()
+                | {"id": "eps_sig_dead", "external_product_id": "ext_dead", "title": "Retired Seed", "status": "retired"}
+            ]
+        if "FROM external_product_seeds" in q and "status = 'active'" in q:
+            fuzzy_ran["seen"] = True
+            return [_sig_lane_seed_row() | {"id": "eps_sig_alive", "external_product_id": "sig_test_mirror_1"}]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert fuzzy_ran["seen"], "an empty mirror resolution must fall through to the fuzzy arm"
+    offers = body.get("offers") or []
+    assert offers, "the fuzzy arm's live seed serves"
+    assert all(
+        (offer.get("source") or {}).get("external_product_id") != "ext_dead" for offer in offers
+    ), "a retired seed must never serve — if it did, the status filter is gone"
+
+
 def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:

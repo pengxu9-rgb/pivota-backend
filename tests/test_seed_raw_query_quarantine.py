@@ -1,9 +1,9 @@
 """Every RAW `external_product_seeds` query must exclude quarantined seeds.
 
-The shared seam (`fetch_external_seed_rows`) covers most consumers, but six raw
+The shared seam (`fetch_external_seed_rows`) covers most consumers, but seven raw
 queries read the table directly and had to be gated by hand:
 
-    routes/agent_shop_gateway.py   offers.resolve, x3  (UNAUTHENTICATED)
+    routes/agent_shop_gateway.py   offers.resolve, x4  (UNAUTHENTICATED)
     routes/agent_api.py            direct-id product lookup + TEXT fallback
     routes/accounts_orders_api.py  browse-history price lookup
 
@@ -39,7 +39,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # a gate changes this number and fails the completeness test below, rather than
 # quietly joining the ungated set.
 RAW_SEED_QUERY_SITES = {
-    "routes/agent_shop_gateway.py": 3,
+    "routes/agent_shop_gateway.py": 4,
     "routes/agent_api.py": 2,
     "routes/accounts_orders_api.py": 1,
 }
