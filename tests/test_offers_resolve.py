@@ -2725,12 +2725,40 @@ def test_relaxed_surface_reports_substitution_when_variant_was_substituted(
     assert "requested_variant_not_servable" in (body.get("substitution_reason_codes") or [])
 
 
-def _all_gone_verdicts(offers):
-    from services import live_offer_verification as lov
-
+# A seed row shaped like the ones that actually SERVE (see
+# test_offers_resolve_prefers_external_outbound). An earlier cut of the two tests below used a
+# differently-shaped row, `should_block_external_referral_runtime` filtered it, and the
+# assertions passed against zero offers WITHOUT live verification ever running -- green for the
+# wrong reason. Both tests now assert the verifier was actually handed offers.
+def _servable_seed_row(*, seed_id: str, external_product_id: str, variant_id: str) -> dict:
     return {
-        index: lov.Verdict(status=lov.GONE, reason="probe_dead_link")
-        for index in range(len(offers))
+        "id": seed_id,
+        "external_product_id": external_product_id,
+        "market": "US",
+        "tool": "*",
+        "destination_url": "https://fentybeauty.com/products/gloss-bomb",
+        "canonical_url": "https://fentybeauty.com/products/gloss-bomb",
+        "domain": "fentybeauty.com",
+        "title": "Gloss Bomb",
+        "price_amount": 19.0,
+        "price_currency": "USD",
+        "availability": "in_stock",
+        "utm_template": None,
+        "seed_data": {
+            "snapshot": dict(_VERIFIED_CONTENT),
+            "brand": "Fenty Beauty",
+            "variants": [
+                {
+                    "variant_id": variant_id,
+                    "title": "Gloss Bomb 9ml",
+                    "price_amount": 19.0,
+                    "price_currency": "USD",
+                    "availability": "in_stock",
+                }
+            ],
+        },
+        "status": "active",
+        **_VERIFIED_DESTINATION,
     }
 
 
@@ -2742,10 +2770,80 @@ def test_live_verification_dropping_every_offer_downgrades_resolution_mode(
     `live_offer_verification.apply_verdicts` DROPS offers it proved GONE and can drop all of
     them. #1907 stamped "external_only" ABOVE that block, and metadata computed `has_external`
     from the pre-verification candidate list, so a response whose only offer was verified away
-    announced "external_only" + has_external=true next to an empty `offers`.
+    announced "external_only" + has_external=true next to an empty `offers` list.
 
     Latent on main only because LIVE_OFFER_VERIFICATION_ENABLED defaults OFF. This test arms
-    it, which is the state the flag would put prod in.
+    the flag, which is the state arming it in prod would produce.
+    """
+    import routes.agent_shop_gateway as gateway
+    from services import live_offer_verification as lov
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [
+                _servable_seed_row(
+                    seed_id="eps_gone",
+                    external_product_id="ext_gone_1",
+                    variant_id="SKU_GONE_001",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?t=x")
+    )
+
+    verified: dict = {}
+
+    async def fake_verify_offers(offers):
+        # Records that verification actually ran, and on how much. Without this the test can
+        # go green on a response that had zero offers before the verifier was ever consulted.
+        verified["count"] = len(offers)
+        return {index: lov.Verdict(status=lov.GONE, reason="probe_dead_link") for index in range(len(offers))}
+
+    # apply_verdicts is left REAL so the genuine drop path runs, not a simulation of it.
+    monkeypatch.setattr(lov, "is_enabled", lambda: True)
+    monkeypatch.setattr(lov, "verify_offers", fake_verify_offers)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU_GONE_001"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+
+    # The offer EXISTED and was handed to the verifier -- this is a drop, not a no-match.
+    assert verified.get("count"), "live verification never ran; the seed never became an offer"
+
+    # ...and then every one of them was dropped.
+    assert body["offers_count"] == 0
+    assert body.get("offers") == []
+
+    # So nothing is external-only, and nothing is external at all.
+    metadata = body.get("metadata") or {}
+    assert body["resolution_mode"] != "external_only"
+    assert body["resolution_mode"] == "not_servable"
+    assert (body.get("mapping") or {}).get("resolution_mode") == "not_servable"
+    assert metadata.get("resolution_mode") == "not_servable"
+    assert metadata.get("has_external") is False
+    assert metadata.get("has_internal") is False
+
+
+def test_live_verification_dropping_the_internal_offer_reports_external_only(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Internal resolved, then died. What ships is external, so the answer is external_only.
+
+    The old stamp keyed on `external_offers and not internal_offers` -- pre-verification
+    candidate lists -- so an internal offer that verification proved GONE still suppressed the
+    external_only stamp, and the response kept the internal lane's "exact_match" while
+    shipping nothing but a referral. Deriving from the shipped list is what sees this.
     """
     import routes.agent_shop_gateway as gateway
     from services import live_offer_verification as lov
@@ -2754,40 +2852,54 @@ def test_live_verification_dropping_every_offer_downgrades_resolution_mode(
         q = str(query)
         if "FROM external_product_seeds" in q:
             return [
+                _servable_seed_row(
+                    seed_id="eps_survivor",
+                    external_product_id="ext_survivor",
+                    variant_id="SKU_MIX_001",
+                )
+            ]
+        if "FROM products_cache" in q:
+            return [
                 {
-                    "id": "eps_verify_gone",
-                    "merchant_domain": "brand.example.com",
-                    "brand_name": "Brand",
-                    "title": "Verified-Away Product",
-                    "external_product_id": "ext_gone_1",
-                    "canonical_url": "https://brand.example.com/products/gone",
-                    "destination_url": "https://brand.example.com/products/gone",
-                    "price": 42.0,
-                    "currency": "USD",
-                    "availability": "in_stock",
-                    "seed_data": {"price": 42.0, "currency": "USD"},
-                    **_VERIFIED_DESTINATION,
-                    **_VERIFIED_CONTENT,
+                    "merchant_id": "merch_mix",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_mix",
+                    "product_data": {
+                        "id": "prod_mix",
+                        "title": "Internal Product",
+                        "currency": "USD",
+                        "price": 20.0,
+                        "orderable": True,
+                        "variants": [{"id": "SKU_MIX_001", "price": 20.0, "inventory_quantity": 5}],
+                    },
                 }
             ]
         return []
 
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
-    # Arm the flag, and prove every offer dead. apply_verdicts is left REAL so the actual
-    # drop path runs rather than a simulation of it.
-    monkeypatch.setattr(lov, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?t=x")
+    )
+
+    routes_seen: dict = {}
 
     async def fake_verify_offers(offers):
-        assert offers, "verification should only run with offers in hand"
-        return _all_gone_verdicts(offers)
+        # Kill ONLY the internal offer; the referral survives.
+        routes_seen["routes"] = [str(o.get("purchase_route") or "") for o in offers]
+        return {
+            index: lov.Verdict(status=lov.GONE, reason="internal_dead")
+            for index, offer in enumerate(offers)
+            if str(offer.get("purchase_route") or "") == "internal_checkout"
+        }
 
+    monkeypatch.setattr(lov, "is_enabled", lambda: True)
     monkeypatch.setattr(lov, "verify_offers", fake_verify_offers)
 
     res = client.post(
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "ext_gone_1"}, "limit": 10},
+            "payload": {"product": {"sku_id": "SKU_MIX_001"}, "limit": 10},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -2795,15 +2907,17 @@ def test_live_verification_dropping_every_offer_downgrades_resolution_mode(
     body = res.json()
     assert body["status"] == "success"
 
-    # Everything was dropped...
-    assert body["offers_count"] == 0
-    assert body.get("offers") == []
+    # Both lanes really did produce an offer, and the internal one really was verified.
+    assert "internal_checkout" in (routes_seen.get("routes") or []), routes_seen
+    assert "affiliate_outbound" in (routes_seen.get("routes") or []), routes_seen
 
-    # ...so nothing is external-only, and nothing is external at all.
+    offers = body.get("offers") or []
+    assert offers, "the external offer should have survived verification"
+    assert all(o.get("purchase_route") == "affiliate_outbound" for o in offers), offers
+
     metadata = body.get("metadata") or {}
-    assert body["resolution_mode"] != "external_only"
-    assert body["resolution_mode"] == "not_servable"
-    assert (body.get("mapping") or {}).get("resolution_mode") == "not_servable"
-    assert metadata.get("resolution_mode") == "not_servable"
-    assert metadata.get("has_external") is False
+    assert body["resolution_mode"] == "external_only"
+    assert (body.get("mapping") or {}).get("resolution_mode") == "external_only"
+    assert metadata.get("resolution_mode") == "external_only"
     assert metadata.get("has_internal") is False
+    assert metadata.get("has_external") is True
