@@ -2833,6 +2833,9 @@ def test_live_verification_dropping_every_offer_downgrades_resolution_mode(
     assert metadata.get("resolution_mode") == "not_servable"
     assert metadata.get("has_external") is False
     assert metadata.get("has_internal") is False
+    # ...and nothing internal is named as resolved, either.
+    assert body.get("resolved_target") is None
+    assert body.get("substitution_reason_codes") == []
 
 
 def test_live_verification_dropping_the_internal_offer_reports_external_only(
@@ -2921,3 +2924,296 @@ def test_live_verification_dropping_the_internal_offer_reports_external_only(
     assert metadata.get("resolution_mode") == "external_only"
     assert metadata.get("has_internal") is False
     assert metadata.get("has_external") is True
+    assert body.get("resolved_target") is None
+
+
+# ---------------------------------------------------------------------------
+# resolution_mode DESCRIBES THE RESPONSE, NOT A ROW.
+#
+# The four tests below are the review findings on the first cut of this fix. Un-gating the
+# per-row assignment block so it ran on the relaxed surface made three latent strict-surface
+# defects reachable there, and traded one false label for another. They share one root cause:
+# a per-row assignment cannot answer a question about the response, because rows are a loop.
+# The verdict is now taken once, from the offers that actually ship.
+# ---------------------------------------------------------------------------
+
+
+def _cache_row(product_id: str, variants: list, merchant_id: str = "m_x") -> dict:
+    return {
+        "merchant_id": merchant_id,
+        "platform": "shopify",
+        "platform_product_id": product_id,
+        "product_data": {
+            "id": product_id,
+            "title": product_id,
+            "currency": "USD",
+            "price": 10.0,
+            "orderable": True,
+            "variants": variants,
+        },
+    }
+
+
+def test_relaxed_surface_shipping_the_requested_variant_is_not_a_substitution(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Ships EXACTLY what was asked for -- calling that a substitution is the same class of lie.
+
+    `chosen_variant_id` is bound before the relaxed-only fallback (`chosen_variant = variants[0]`)
+    swaps in a different variant object, and was left stale. The requested-vs-shipped comparison
+    reads it, so on the fallback path equality could never hold: an out-of-stock product whose
+    only variant IS the requested one shipped that variant and reported
+    same_product_substitution, with requested_target.sku_id == resolved_target.sku_id in the
+    same payload. Ordinary out-of-stock products, not a corner case.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM products_cache" in str(query):
+            return [
+                _cache_row(
+                    "prod_only",
+                    [{"id": "sku_only", "sku": "sku_only", "price": 10.0, "inventory_quantity": 0}],
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "sku_only"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "the fallback should still ship an offer"
+    # The offer really does carry the requested variant -- this is what makes the label wrong.
+    assert [(o.get("source") or {}).get("variant_id") for o in offers] == ["sku_only"]
+
+    assert body["resolution_mode"] == "exact_match"
+    assert body["substitution_reason_codes"] == []
+    # The stale id also robbed resolved_target of its variant_id while giving it a sku_id.
+    assert body["resolved_target"]["variant_id"] == "sku_only"
+    assert body["requested_target"]["sku_id"] == body["resolved_target"]["sku_id"]
+
+
+def test_an_exact_match_in_any_shipped_row_beats_a_later_substituting_row(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Best wins, not last wins.
+
+    The assignment block sat inside the per-row loop with no precedence rule, so the LAST row
+    overwrote every earlier one. Row 1 ships the requested variant, row 2 substitutes, BOTH
+    offers ship -- and the response reported same_product_substitution while `offers` visibly
+    contained an offer for exactly the requested sku.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM products_cache" in str(query):
+            return [
+                _cache_row(
+                    "prod_good",
+                    [{"id": "sku_req", "sku": "sku_req", "price": 10.0, "inventory_quantity": 9}],
+                    merchant_id="m_good",
+                ),
+                _cache_row(
+                    "prod_bad",
+                    [
+                        {"id": "sku_req", "sku": "sku_req", "price": 10.0, "inventory_quantity": 0},
+                        {"id": "sku_alt", "sku": "sku_alt", "price": 10.0, "inventory_quantity": 4},
+                    ],
+                    merchant_id="m_bad",
+                ),
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "sku_req"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    body = res.json()
+
+    # Both rows shipped, and one of them carries the requested variant.
+    assert body["offers_count"] == 2
+    shipped = [(o.get("source") or {}).get("variant_id") for o in body.get("offers") or []]
+    assert "sku_req" in shipped, shipped
+
+    assert body["resolution_mode"] == "exact_match"
+    assert body["substitution_reason_codes"] == []
+    # ...and resolved_target names the row that actually satisfied the request.
+    assert body["resolved_target"]["merchant_id"] == "m_good"
+    assert body["resolved_target"]["variant_id"] == "sku_req"
+
+
+def test_exact_match_never_ships_another_rows_substitution_reason_codes(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`substitution_reason_codes` was set by a substituting row and never cleared.
+
+    Row 1 substitutes and populates the codes; row 2 does not identify the requested variant at
+    all, takes the exact_match branch, and leaves the codes in place. The response then said
+    "exact match" while carrying `requested_variant_not_servable`.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM products_cache" in str(query):
+            return [
+                _cache_row(
+                    "p1",
+                    [
+                        {"id": "sku_req", "sku": "sku_req", "price": 10.0, "inventory_quantity": 0},
+                        {"id": "sku_alt", "sku": "sku_alt", "price": 10.0, "inventory_quantity": 5},
+                    ],
+                    merchant_id="m_one",
+                ),
+                _cache_row(
+                    "p2",
+                    [{"id": "sku_zzz", "sku": "sku_zzz", "price": 10.0, "inventory_quantity": 5}],
+                    merchant_id="m_other",
+                ),
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "sku_req"}, "limit": 10},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    body = res.json()
+
+    # Whatever the verdict, the two fields must agree with each other.
+    if body["resolution_mode"] == "exact_match":
+        assert body["substitution_reason_codes"] == []
+    else:
+        assert body["resolution_mode"] == "same_product_substitution"
+        assert body["substitution_reason_codes"]
+
+
+def test_truncating_the_internal_offer_away_clears_resolved_target(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """external_only with a stale resolved_target -- reachable TODAY, no feature flag needed.
+
+    `limit=1` plus merit-first ranking: the exact external seed (confidence 1.0, fit tier 0)
+    outranks an internal row that lacks the requested variant (0.8, tier 1), so truncation drops
+    the internal offer. resolution_mode and has_internal were reconciled against the shipped
+    list but resolved_target was not, leaving a target naming a merchant whose offer the caller
+    never received -- a state the field's own documented vocabulary calls impossible.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q:
+            return [
+                _servable_seed_row(
+                    seed_id="eps_hi",
+                    external_product_id="SKU_WANTED",
+                    variant_id="SKU_WANTED",
+                )
+            ]
+        if "FROM products_cache" in q:
+            return [
+                _cache_row(
+                    "prod_lo",
+                    [{"id": "SKU_DIFFERENT", "sku": "SKU_DIFFERENT", "price": 9.0, "inventory_quantity": 3}],
+                    merchant_id="m_lo",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?t=x")
+    )
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"sku_id": "SKU_WANTED"}, "limit": 1},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    body = res.json()
+
+    # An internal candidate existed but was truncated away; only the referral ships.
+    assert body["offers_count"] == 1
+    assert [o.get("purchase_route") for o in body.get("offers") or []] == ["affiliate_outbound"]
+
+    metadata = body.get("metadata") or {}
+    assert body["resolution_mode"] == "external_only"
+    assert metadata.get("has_internal") is False
+    assert body["resolved_target"] is None
+    assert body["substitution_reason_codes"] == []
+
+
+def test_every_resolution_mode_assignment_is_in_the_vocabulary() -> None:
+    """The real gate behind the `ResolutionMode` Literal.
+
+    The Literal annotates a local variable, and this repo runs NO static type checker in CI --
+    no mypy, pyright, pytype or pyre in .github/workflows, requirements*.txt, or any config
+    file -- so nothing would catch a fifth value or a typo at review time. `resolution_mode` is
+    parsed by third-party agents we cannot grep, which is exactly the situation where an
+    unenforced contract rots.
+
+    Asserted on the AST so a reformat cannot defeat it and a comment cannot satisfy it, in the
+    style of tests/test_external_seed_currency_not_fabricated.py's call-site guard.
+    """
+    import ast
+    import inspect
+
+    import routes.agent_shop_gateway as gateway
+
+    tree = ast.parse(inspect.getsource(gateway._handle_offers_resolve))
+
+    assigned: list[str] = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "resolution_mode" for t in targets):
+            continue
+        value = node.value
+        assert value is not None, "a bare `resolution_mode:` annotation leaves it unbound"
+        rendered = ast.unparse(value)
+        assert isinstance(value, ast.Constant) and isinstance(value.value, str), (
+            "resolution_mode must be assigned a plain string literal so this gate can read it "
+            f"-- got: {rendered}"
+        )
+        assigned.append(value.value)
+
+    assert assigned, "no resolution_mode assignments found — the handler was renamed or gutted"
+
+    unknown = sorted(set(assigned) - gateway.RESOLUTION_MODES)
+    assert not unknown, (
+        f"resolution_mode assigned value(s) outside the documented vocabulary: {unknown}. "
+        f"Extend ResolutionMode additively and document the meaning, or fix the typo."
+    )
+
+    # The initializer must not claim a resolution. This is the #1907 follow-up in one line.
+    assert assigned[0] == "not_servable", (
+        f"the first resolution_mode assignment is the initializer and it claims {assigned[0]!r} "
+        "before anything has been established"
+    )

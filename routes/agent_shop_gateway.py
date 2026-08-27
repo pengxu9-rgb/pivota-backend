@@ -3694,8 +3694,12 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
 # it and we cannot grep them, so the four values below are a CONTRACT -- extend it additively,
 # never repurpose an existing value.
 #
-#   exact_match              An internal offer ships for the variant the caller requested (or
-#                            no specific variant was requested and an internal offer ships).
+#   exact_match              An internal offer ships and no shipped offer had to swap away
+#                            from a requested variant it carried. NOTE the honest limit: when
+#                            the requested sku_id is not present on the matched product at all,
+#                            no variant was identified to compare against, so a product-level
+#                            match reports this value too. That predates this vocabulary; it is
+#                            written down rather than quietly implied.
 #   same_product_substitution An internal offer ships for the right PRODUCT but a different
 #                            variant than requested; `substitution_reason_codes` says why.
 #   external_only            Offers ship, but all of them are referred (affiliate_outbound);
@@ -3704,7 +3708,12 @@ def _rank_offers_merit_first(offers: List[Dict[str, Any]]) -> List[Dict[str, Any
 #                            must never claim a match before one is established.
 #
 # The response envelope returns a raw dict rather than a response_model, so this annotates
-# the variable instead: it makes a typo or a fifth value a static error at every assignment.
+# the variable instead. Be honest about what that buys: this repo runs NO static type checker
+# in CI (no mypy/pyright anywhere in .github/workflows, requirements*.txt, or any config), so
+# the annotation documents the vocabulary and helps a local language server -- it does not
+# gate anything. The gate is a test:
+# tests/test_offers_resolve.py::test_every_resolution_mode_assignment_is_in_the_vocabulary
+# AST-walks this handler and fails on any value not listed here.
 ResolutionMode = Literal[
     "exact_match",
     "same_product_substitution",
@@ -3784,6 +3793,9 @@ async def _handle_offers_resolve(
     exact_target_matched = False
     surface_not_servable_reason_codes: List[str] = []
     internal_identity_payloads: List[Dict[str, Any]] = []
+    # offer_id -> what that internal offer did about the caller's requested variant. Read by
+    # the shipped-offer reconciliation, which is the only place the verdict is decided.
+    internal_offer_context: Dict[str, Dict[str, Any]] = {}
 
     def _public_reason_code(raw_code: Optional[str]) -> str:
         code = str(raw_code or "").strip().lower()
@@ -4922,6 +4934,18 @@ async def _handle_offers_resolve(
                     if not chosen_variant and isinstance(variants, list) and variants:
                         first = variants[0]
                         chosen_variant = _coerce_variant_payload_dict(first if isinstance(first, dict) else {})
+                        # REFRESH. This relaxed-only fallback swaps in a different variant AFTER
+                        # chosen_variant_id was bound above, and everything downstream that asks
+                        # "which variant did we ship?" -- resolved_target, and the requested-vs-
+                        # shipped comparison -- reads chosen_variant_id. Leaving it stale made a
+                        # relaxed response that shipped EXACTLY the requested variant report
+                        # same_product_substitution, because a stale None can never equal the
+                        # requested id. It also gave resolved_target a sku_id (read from the
+                        # fresh variant) with no variant_id (read from the stale id).
+                        # `offer_id` above is deliberately left alone: it is the dedupe key for
+                        # rows already seen this pass, and re-keying it would change which rows
+                        # collapse.
+                        chosen_variant_id = _variant_ref_from_payload(chosen_variant)
 
                 exact_sku_match = bool(sku_id_aliases and exact_variant and _variant_ref_from_payload(exact_variant) in sku_id_aliases)
                 confidence = 0.95 if (exact_pid_match or exact_sku_match) else 0.8 if sku_id else 0.7
@@ -4953,17 +4977,16 @@ async def _handle_offers_resolve(
                 )
 
                 seen_internal_offer_ids.add(offer_id)
-                internal_offers.append(
-                    _build_internal_offer_summary(
-                        merchant_id=str(merchant_id),
-                        platform=str(platform),
-                        product_payload=product_payload,
-                        variant_payload=chosen_variant,
-                        confidence=confidence,
-                        canonical_ref=canonical_ref,
-                        canonical_group_id=canonical_group_id,
-                    )
+                internal_summary = _build_internal_offer_summary(
+                    merchant_id=str(merchant_id),
+                    platform=str(platform),
+                    product_payload=product_payload,
+                    variant_payload=chosen_variant,
+                    confidence=confidence,
+                    canonical_ref=canonical_ref,
+                    canonical_group_id=canonical_group_id,
                 )
+                internal_offers.append(internal_summary)
                 resolved_target = {
                     "merchant_id": str(merchant_id),
                     "platform": str(platform),
@@ -4971,28 +4994,32 @@ async def _handle_offers_resolve(
                     **({"variant_id": chosen_variant_id} if chosen_variant_id else {}),
                     **({"sku_id": _variant_sku_from_payload(chosen_variant)} if _variant_sku_from_payload(chosen_variant) else {}),
                 }
-                # Runs on BOTH surfaces. This block used to be gated on
-                # `strict_serving_mode`, which is why the relaxed surface never wrote
-                # resolution_mode at all and simply emitted the initializer forever:
-                # "exact_match" whether we had matched exactly, substituted a variant,
-                # or found nothing. The predicate below is surface-independent -- it
-                # compares the variant the caller ASKED for against the one this offer
-                # actually ships -- so there was never a reason to answer it only under
-                # an explicit commerce_surface. Reached only once an internal offer has
-                # been appended just above, so it never claims a match we did not build.
+                # BOOKKEEPING ONLY -- this row records what IT did; it does not decide the
+                # response. `resolution_mode` documents what the RESPONSE delivered, and a
+                # per-row assignment cannot answer that: rows are a loop, so the LAST row
+                # silently overwrote every earlier one. A request that matched its variant
+                # exactly in row 1 and substituted in row 2 reported "substitution" while
+                # shipping both offers, and the reason codes from a substituting row leaked
+                # onto a later row's "exact_match". The verdict is taken once, below, from
+                # the offers that actually ship.
+                #
+                # Keyed on the BUILT summary's offer_id (not the dedupe `offer_id` above,
+                # which may key on a stale variant); apply_verdicts copies every key, so it
+                # survives live verification.
                 requested_variant_id = _variant_ref_from_payload(exact_variant or {})
-                if requested_variant_id:
-                    if chosen_variant_id == requested_variant_id:
-                        resolution_mode = "exact_match"
-                    else:
-                        resolution_mode = "same_product_substitution"
-                        substitution_reason_codes = list(
-                            (exact_variant_projection or {}).get("agent_push_reason_codes") or []
-                        )
-                        if "requested_variant_not_servable" not in substitution_reason_codes:
-                            substitution_reason_codes.append("requested_variant_not_servable")
-                else:
-                    resolution_mode = "exact_match"
+                row_substituted = bool(requested_variant_id and chosen_variant_id != requested_variant_id)
+                row_codes: List[str] = []
+                if row_substituted:
+                    row_codes = list(
+                        (exact_variant_projection or {}).get("agent_push_reason_codes") or []
+                    )
+                    if "requested_variant_not_servable" not in row_codes:
+                        row_codes.append("requested_variant_not_servable")
+                internal_offer_context[str(internal_summary.get("offer_id") or "")] = {
+                    "substituted": row_substituted,
+                    "substitution_reason_codes": row_codes,
+                    "resolved_target": dict(resolved_target),
+                }
                 if len(internal_offers) >= min(3, limit):
                     break
             internal_status = "ok" if rows else "empty"
@@ -5139,20 +5166,56 @@ async def _handle_offers_resolve(
     # made it live. Deriving from `offers` here is what makes the flag safe to arm.
     #
     # Partitioned on purchase_route, the same discriminator _rank_offers_merit_first uses.
-    shipped_internal_count = sum(
-        1
+    shipped_internal = [
+        offer
         for offer in offers
         if isinstance(offer, dict) and str(offer.get("purchase_route") or "") == "internal_checkout"
-    )
+    ]
+    shipped_internal_count = len(shipped_internal)
     shipped_external_count = len(offers) - shipped_internal_count
+
     if not offers:
         # Nothing serves. True whatever we matched upstream -- a match whose only offer was
         # dropped is not a match the caller can act on.
         resolution_mode = "not_servable"
-    elif not shipped_internal_count:
+        resolved_target = None
+        substitution_reason_codes = []
+    elif not shipped_internal:
         # Only referred offers survived. Also catches "internal resolved but every internal
-        # offer was verified away", which the old pre-verification stamp could not see.
+        # offer was truncated away or verified away", which the old pre-verification stamp
+        # could not see. resolved_target is cleared to match: nothing internal reached the
+        # caller, so a target left over from a candidate that did not ship would describe a
+        # resolution this response does not contain -- which is what the vocabulary above
+        # promises never happens ("external_only ... resolved_target stays None").
         resolution_mode = "external_only"
+        resolved_target = None
+        substitution_reason_codes = []
+    else:
+        # BEST WINS, NOT LAST WINS. If ANY shipped internal offer carries the variant the
+        # caller asked for, this response did match exactly -- regardless of what some other
+        # row did. Only when no shipped offer satisfied the request is it a substitution, and
+        # then the reason codes come from the offer we actually name in resolved_target rather
+        # than from whichever row happened to run last.
+        exact_offer = next(
+            (
+                offer
+                for offer in shipped_internal
+                if not (
+                    internal_offer_context.get(str(offer.get("offer_id") or "")) or {}
+                ).get("substituted")
+            ),
+            None,
+        )
+        chosen_offer = exact_offer if exact_offer is not None else shipped_internal[0]
+        chosen_context = internal_offer_context.get(str(chosen_offer.get("offer_id") or "")) or {}
+        if chosen_context.get("resolved_target"):
+            resolved_target = dict(chosen_context["resolved_target"])
+        if exact_offer is not None:
+            resolution_mode = "exact_match"
+            substitution_reason_codes = []
+        else:
+            resolution_mode = "same_product_substitution"
+            substitution_reason_codes = list(chosen_context.get("substitution_reason_codes") or [])
 
     # ADR-009 ratified decision 1 (no-fallback): canonical_ref is pg-keyed or
     # ABSENT — never a merchant-scoped `pc:{merchant}:{platform}:{pid}`
