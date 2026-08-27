@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import logging
+import socket
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
@@ -22,9 +25,56 @@ def normalize_magento_store_url(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
-    if not raw.startswith(("http://", "https://")):
+    if "://" not in raw:
         raw = f"https://{raw}"
-    return raw.rstrip("/")
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        return ""
+    host = parsed.hostname.lower().rstrip(".")
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return ""
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        return ""
+    return f"https://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+
+
+async def _validate_public_https_target(store_url: str) -> None:
+    parsed = urlparse(store_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("Magento Store URL must use HTTPS")
+    loop = asyncio.get_running_loop()
+    try:
+        addresses = await loop.getaddrinfo(
+            parsed.hostname,
+            parsed.port or 443,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise ValueError("Magento Store hostname could not be resolved") from exc
+    resolved = {entry[4][0] for entry in addresses if entry and entry[4]}
+    if not resolved:
+        raise ValueError("Magento Store hostname could not be resolved")
+    for address in resolved:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise ValueError("Magento Store resolved to an invalid address") from exc
+        if not ip.is_global:
+            raise ValueError("Magento Store must resolve only to public IP addresses")
 
 
 def normalize_magento_store_view(value: Any) -> str:
@@ -151,8 +201,8 @@ class MagentoAdapter:
 
     def validate_config(self) -> Tuple[bool, Optional[str]]:
         parsed = urlparse(self.store_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return False, "Magento Store URL must be a valid http(s) URL"
+        if parsed.scheme != "https" or not parsed.netloc:
+            return False, "Magento Store URL must be a public HTTPS URL without credentials"
         if not self.access_token:
             return False, "Magento Integration Access Token is required"
         return True, None
@@ -161,13 +211,17 @@ class MagentoAdapter:
         valid, error = self.validate_config()
         if not valid:
             return {"success": False, "error": error}
+        try:
+            await _validate_public_https_target(self.store_url)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
         base = build_magento_rest_base(self.store_url, self.store_view_code)
         params = {
             "searchCriteria[pageSize]": 1,
             "searchCriteria[currentPage]": 1,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
                 response = await client.get(
                     f"{base}/products",
                     headers=build_magento_headers(self.access_token),
@@ -180,7 +234,7 @@ class MagentoAdapter:
             if response.status_code != 200:
                 return {
                     "success": False,
-                    "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                    "error": f"Magento API returned HTTP {response.status_code}",
                 }
             payload = response.json() or {}
             store_config: Dict[str, Any] = {}
@@ -209,9 +263,12 @@ class MagentoAdapter:
                 or None,
                 "product_url_suffix": store_config.get("product_url_suffix"),
             }
-        except Exception as exc:
-            logger.error("Magento connection test failed store=%s: %s", self.store_url, exc)
-            return {"success": False, "error": str(exc)}
+        except Exception:
+            logger.exception(
+                "Magento connection test failed host=%s",
+                urlparse(self.store_url).hostname,
+            )
+            return {"success": False, "error": "Magento connection request failed"}
 
 
 class MagentoProductAdapter:
@@ -363,7 +420,8 @@ class MagentoProductAdapter:
         base = build_magento_rest_base(normalized_url, store_view_code)
         headers = build_magento_headers(access_token)
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            await _validate_public_https_target(normalized_url)
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
                 response = await client.get(
                     f"{base}/products",
                     headers=headers,
@@ -373,9 +431,7 @@ class MagentoProductAdapter:
                     },
                 )
                 if response.status_code != 200:
-                    return [], None, (
-                        f"Magento API error: {response.status_code} - {response.text[:200]}"
-                    )
+                    return [], None, f"Magento API returned HTTP {response.status_code}"
                 payload = response.json() or {}
                 raw_products = payload.get("items") if isinstance(payload, dict) else None
                 if not isinstance(raw_products, list):
@@ -419,6 +475,9 @@ class MagentoProductAdapter:
             total_count = _as_int(payload.get("total_count"))
             next_page = str(page + 1) if page * page_size < total_count else None
             return products, next_page, None
-        except Exception as exc:
-            logger.error("Magento product fetch failed store=%s: %s", normalized_url, exc)
-            return [], None, f"Failed to fetch Magento products: {exc}"
+        except Exception:
+            logger.exception(
+                "Magento product fetch failed host=%s",
+                urlparse(normalized_url).hostname,
+            )
+            return [], None, "Failed to fetch Magento products"

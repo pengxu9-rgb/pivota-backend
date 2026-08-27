@@ -43,11 +43,25 @@ session_id + cart_id
 ```
 
 `merchant_id` is taken only from the authenticated API key. `store_id` scopes
-store-local session/cart/payment identifiers for merchants with multiple stores.
+store-local session, cart, quote, checkout, payment, order, refund, and return
+identifiers for merchants with multiple stores.
 `visitor_id` is retained for analysis but is not used by itself to merge sessions.
 
 Agent identity received through this merchant-signed endpoint is stored as
 `merchant_asserted`; it is not equivalent to a cryptographically verified agent.
+
+## Metadata safety
+
+`metadata` is a bounded analytics extension, not an arbitrary native-payload
+archive. The collector accepts only documented commerce fields such as
+`quantity`, `native_topic`, allowlisted native status/amount fields, sanitized
+line items/products, and webhook delivery identifiers. Unknown top-level keys
+are rejected, as are sensitive keys (including email, phone, address, IP,
+credentials, cookies, and payment-card data) at any nesting depth.
+
+Adapters must reduce native payloads to the safe vocabulary before ingestion.
+Buyer contact, shipping/billing details, raw headers, credentials, and full
+webhook payloads must never be placed in this ledger.
 
 ## Example
 
@@ -68,7 +82,7 @@ Agent identity received through this merchant-signed endpoint is stored as
       "amount_cents": 2599,
       "currency": "USD",
       "metadata": {
-        "native_event_type": "payment.completed"
+        "native_topic": "payment.completed"
       }
     }
   ]

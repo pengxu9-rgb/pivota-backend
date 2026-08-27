@@ -4,14 +4,15 @@ import hashlib
 import json
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
-from db.database import database
+from db.database import IS_POSTGRES, database
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 
@@ -125,8 +126,22 @@ async def _lookup_existing_interaction(refs: Dict[str, Optional[str]]) -> Option
             commerce_interactions.c.merchant_id == merchant_id,
             getattr(commerce_interactions.c, key) == value,
         ]
-        if key in {"session_id", "cart_id", "payment_id"} and refs.get("store_id"):
-            conditions.append(commerce_interactions.c.store_id == refs["store_id"])
+        if key in {
+            "session_id",
+            "cart_id",
+            "payment_id",
+            "order_id",
+            "checkout_id",
+            "quote_id",
+            "refund_id",
+            "return_id",
+        }:
+            store_id = refs.get("store_id")
+            conditions.append(
+                commerce_interactions.c.store_id == store_id
+                if store_id
+                else commerce_interactions.c.store_id.is_(None)
+            )
         row = await database.fetch_one(select(commerce_interactions).where(*conditions))
         if row:
             return dict(row)
@@ -139,6 +154,32 @@ def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) ->
     if extra:
         base.update(extra)
     return base or None
+
+
+_STATUS_RANK = {
+    "observed": 10,
+    "discovery": 20,
+    "pdp_viewed": 30,
+    "indexed": 30,
+    "blocked": 30,
+    "surfaced": 35,
+    "clicked": 40,
+    "cart_active": 50,
+    "checkout_started": 60,
+    "checkout_created": 65,
+    "checkout_submitted": 70,
+    "awaiting_payment": 75,
+    "payment_pending": 75,
+    "payment_failed": 75,
+    "payment_authorized": 80,
+    "ordered": 85,
+    "paid": 90,
+    "cancelled": 100,
+    "refund_pending": 110,
+    "refunded": 120,
+    "return_pending": 130,
+    "return_synced": 140,
+}
 
 
 def _status_from_event(event_type: str, current: Optional[str]) -> Optional[str]:
@@ -174,7 +215,68 @@ def _status_from_event(event_type: str, current: Optional[str]) -> Optional[str]
         "return.completed": "return_synced",
         "return.sync.completed": "return_synced",
     }
-    return mapping.get(event_type, current)
+    candidate = mapping.get(event_type)
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    if _STATUS_RANK.get(candidate, 0) < _STATUS_RANK.get(current, 0):
+        return current
+    return candidate
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) == "23505" or getattr(current, "pgcode", None) == "23505":
+            return True
+        if current.__class__.__name__ == "UniqueViolationError":
+            return True
+        if current.__class__.__name__ == "IntegrityError":
+            message = str(current).lower()
+            if "unique" in message or "duplicate" in message:
+                return True
+        current = getattr(current, "__cause__", None) or getattr(current, "orig", None)
+    return False
+
+
+async def _execute_insert(query: Any) -> Any:
+    """Keep a PostgreSQL constraint failure inside a recoverable savepoint."""
+    if IS_POSTGRES:
+        async with database.transaction():
+            return await database.execute(query)
+    return await database.execute(query)
+
+
+@asynccontextmanager
+async def _event_write_lock(
+    merchant_id: str,
+    event_type: str,
+    key: Optional[str],
+    refs: Dict[str, Optional[str]],
+):
+    if not IS_POSTGRES:
+        yield
+        return
+    async with database.transaction():
+        if key:
+            await database.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {"lock_key": f"event|{merchant_id}|{event_type}|{key}"},
+            )
+        existing = await _lookup_existing_interaction(refs)
+        interaction_id = (
+            (existing or {}).get("interaction_id")
+            or refs.get("interaction_id")
+            or _fallback_interaction_id(refs)
+        )
+        await database.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"interaction|{merchant_id}|{interaction_id}"},
+        )
+        yield
 
 
 async def ensure_interaction(
@@ -212,6 +314,8 @@ async def ensure_interaction(
     now = _now()
     first_seen = first_occurred_at or now
     last_seen = last_occurred_at or first_seen
+    existing_last = (existing or {}).get("last_occurred_at")
+    incoming_is_latest = existing_last is None or last_seen >= existing_last
     status = _status_from_event(latest_event_type or "", (existing or {}).get("status"))
     values: Dict[str, Any] = {
         "interaction_id": interaction_id,
@@ -245,7 +349,9 @@ async def ensure_interaction(
         "llm_provider": taxonomy.get("llm_provider") or (existing or {}).get("llm_provider"),
         "llm_model": taxonomy.get("llm_model") or (existing or {}).get("llm_model"),
         "caller_id": taxonomy.get("caller_id") or (existing or {}).get("caller_id"),
-        "latest_event_type": latest_event_type or (existing or {}).get("latest_event_type"),
+        "latest_event_type": (
+            latest_event_type if incoming_is_latest and latest_event_type else (existing or {}).get("latest_event_type")
+        ),
         "status": status,
         "metadata": _merge_metadata((existing or {}).get("metadata"), metadata_with_taxonomy),
         "first_occurred_at": min(
@@ -264,12 +370,26 @@ async def ensure_interaction(
             .values(**values)
         )
     else:
-        await database.execute(
-            commerce_interactions.insert().values(
-                created_at=now,
-                **values,
+        try:
+            await _execute_insert(
+                commerce_interactions.insert().values(
+                    created_at=now,
+                    **values,
+                )
             )
-        )
+        except Exception as exc:
+            if not _is_unique_violation(exc):
+                raise
+            raced = await _lookup_existing_interaction(refs)
+            if not raced:
+                raise
+            return await ensure_interaction(
+                metadata=metadata,
+                first_occurred_at=first_occurred_at,
+                last_occurred_at=last_occurred_at,
+                latest_event_type=latest_event_type,
+                **kwargs,
+            )
 
     row = await database.fetch_one(
         select(commerce_interactions).where(commerce_interactions.c.interaction_id == interaction_id)
@@ -307,13 +427,33 @@ async def record_commerce_event(
         raise ValueError("merchant_id is required for commerce interaction tracking")
 
     occurred = occurred_at or _now()
-    interaction = await ensure_interaction(
-        metadata=metadata_with_taxonomy,
-        first_occurred_at=occurred,
-        last_occurred_at=occurred,
-        latest_event_type=event_type,
-        **refs,
-    )
+    async with _event_write_lock(merchant_id, event_type, upstream_idempotency_key, refs):
+        return await _record_commerce_event_unlocked(
+            event_type=event_type,
+            metadata_with_taxonomy=metadata_with_taxonomy,
+            occurred=occurred,
+            source=source,
+            upstream_idempotency_key=upstream_idempotency_key,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            refs=refs,
+        )
+
+
+async def _record_commerce_event_unlocked(
+    *,
+    event_type: str,
+    metadata_with_taxonomy: Optional[Dict[str, Any]],
+    occurred: datetime,
+    source: Optional[str],
+    upstream_idempotency_key: Optional[str],
+    actor_type: Optional[str],
+    actor_id: Optional[str],
+    refs: Dict[str, Optional[str]],
+) -> Dict[str, Any]:
+    merchant_id = refs.get("merchant_id")
+    if not merchant_id:
+        raise ValueError("merchant_id is required for commerce interaction tracking")
 
     duplicate_event = None
     if upstream_idempotency_key:
@@ -325,11 +465,20 @@ async def record_commerce_event(
             )
         )
     if duplicate_event:
+        duplicate = dict(duplicate_event)
         return {
-            "interaction_id": interaction["interaction_id"],
-            "event_id": dict(duplicate_event).get("event_id"),
+            "interaction_id": duplicate.get("interaction_id"),
+            "event_id": duplicate.get("event_id"),
             "duplicate": True,
         }
+
+    interaction = await ensure_interaction(
+        metadata=metadata_with_taxonomy,
+        first_occurred_at=occurred,
+        last_occurred_at=occurred,
+        latest_event_type=event_type,
+        **refs,
+    )
 
     event_id = (
         _stable_id("evt", merchant_id, event_type, upstream_idempotency_key)
@@ -342,42 +491,50 @@ async def record_commerce_event(
             **{key: value for key, value in refs.items() if value},
         }
     )
-    await database.execute(
-        commerce_interaction_events.insert().values(
-            event_id=event_id,
-            interaction_id=interaction["interaction_id"],
-            merchant_id=merchant_id,
-            platform=refs.get("platform") or interaction.get("platform"),
-            store_id=refs.get("store_id") or interaction.get("store_id"),
-            surface=refs.get("surface") or interaction.get("surface"),
-            event_type=event_type,
-            occurred_at=occurred,
-            canonical_product_id=refs.get("canonical_product_id") or interaction.get("canonical_product_id"),
-            canonical_variant_id=refs.get("canonical_variant_id") or interaction.get("canonical_variant_id"),
-            trace_id=refs.get("trace_id") or interaction.get("trace_id"),
-            brief_id=refs.get("brief_id") or interaction.get("brief_id"),
-            session_id=refs.get("session_id") or interaction.get("session_id"),
-            visitor_id=refs.get("visitor_id") or interaction.get("visitor_id"),
-            cart_id=refs.get("cart_id") or interaction.get("cart_id"),
-            payment_id=refs.get("payment_id") or interaction.get("payment_id"),
-            source=source,
-            upstream_idempotency_key=upstream_idempotency_key,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            payload=payload,
+    try:
+        await _execute_insert(
+            commerce_interaction_events.insert().values(
+                event_id=event_id,
+                interaction_id=interaction["interaction_id"],
+                merchant_id=merchant_id,
+                platform=refs.get("platform") or interaction.get("platform"),
+                store_id=refs.get("store_id") or interaction.get("store_id"),
+                surface=refs.get("surface") or interaction.get("surface"),
+                event_type=event_type,
+                occurred_at=occurred,
+                canonical_product_id=refs.get("canonical_product_id") or interaction.get("canonical_product_id"),
+                canonical_variant_id=refs.get("canonical_variant_id") or interaction.get("canonical_variant_id"),
+                trace_id=refs.get("trace_id") or interaction.get("trace_id"),
+                brief_id=refs.get("brief_id") or interaction.get("brief_id"),
+                session_id=refs.get("session_id") or interaction.get("session_id"),
+                visitor_id=refs.get("visitor_id") or interaction.get("visitor_id"),
+                cart_id=refs.get("cart_id") or interaction.get("cart_id"),
+                payment_id=refs.get("payment_id") or interaction.get("payment_id"),
+                source=source,
+                upstream_idempotency_key=upstream_idempotency_key,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                payload=payload,
+            )
         )
-    )
-
-    await database.execute(
-        commerce_interactions.update()
-        .where(commerce_interactions.c.interaction_id == interaction["interaction_id"])
-        .values(
-            latest_event_type=event_type,
-            status=_status_from_event(event_type, interaction.get("status")),
-            last_occurred_at=occurred,
-            updated_at=_now(),
+    except Exception as exc:
+        if not upstream_idempotency_key or not _is_unique_violation(exc):
+            raise
+        duplicate_event = await database.fetch_one(
+            select(commerce_interaction_events).where(
+                commerce_interaction_events.c.merchant_id == merchant_id,
+                commerce_interaction_events.c.event_type == event_type,
+                commerce_interaction_events.c.upstream_idempotency_key == upstream_idempotency_key,
+            )
         )
-    )
+        if not duplicate_event:
+            raise
+        duplicate = dict(duplicate_event)
+        return {
+            "interaction_id": duplicate.get("interaction_id"),
+            "event_id": duplicate.get("event_id"),
+            "duplicate": True,
+        }
     return {
         "interaction_id": interaction["interaction_id"],
         "event_id": event_id,
@@ -429,16 +586,38 @@ async def record_commerce_event_best_effort(
         }
 
 
-async def find_interaction_by_checkout_id(checkout_id: str) -> Optional[Dict[str, Any]]:
+async def find_interaction_by_checkout_id(
+    checkout_id: str,
+    *,
+    merchant_id: str,
+    store_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    conditions = [
+        commerce_interactions.c.merchant_id == str(merchant_id).strip(),
+        commerce_interactions.c.checkout_id == str(checkout_id).strip(),
+    ]
+    if store_id:
+        conditions.append(commerce_interactions.c.store_id == str(store_id).strip())
     row = await database.fetch_one(
-        select(commerce_interactions).where(commerce_interactions.c.checkout_id == str(checkout_id).strip())
+        select(commerce_interactions).where(*conditions)
     )
     return dict(row) if row else None
 
 
-async def find_interaction_by_order_id(order_id: str) -> Optional[Dict[str, Any]]:
+async def find_interaction_by_order_id(
+    order_id: str,
+    *,
+    merchant_id: str,
+    store_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    conditions = [
+        commerce_interactions.c.merchant_id == str(merchant_id).strip(),
+        commerce_interactions.c.order_id == str(order_id).strip(),
+    ]
+    if store_id:
+        conditions.append(commerce_interactions.c.store_id == str(store_id).strip())
     row = await database.fetch_one(
-        select(commerce_interactions).where(commerce_interactions.c.order_id == str(order_id).strip())
+        select(commerce_interactions).where(*conditions)
     )
     return dict(row) if row else None
 

@@ -132,6 +132,11 @@ async def test_magento_connection_test_reads_catalog_and_store_configuration(mon
 
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
 
+    async def public_target(_url):
+        return None
+
+    monkeypatch.setattr(module, "_validate_public_https_target", public_target)
+
     result = await module.MagentoAdapter(
         {
             "store_url": "shop.example",
@@ -184,6 +189,11 @@ async def test_magento_fetch_products_uses_search_pagination_and_children(monkey
             return FakeResponse(200, [_configurable_child()])
 
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+
+    async def public_target(_url):
+        return None
+
+    monkeypatch.setattr(module, "_validate_public_https_target", public_target)
 
     products, next_page, error = await module.MagentoProductAdapter.fetch_products(
         store_url="shop.example/",
@@ -292,3 +302,38 @@ def test_magento_is_registered_as_native_catalog_source():
     assert source.capabilities.catalog_events is False
     assert source.capabilities.live_quote is False
     assert source.capabilities.checkout is False
+
+
+@pytest.mark.parametrize(
+    "store_url",
+    [
+        "http://shop.example",
+        "https://user:password@shop.example",
+        "https://127.0.0.1",
+        "https://169.254.169.254/latest/meta-data",
+        "https://10.0.0.8",
+        "https://localhost",
+        "https://shop.local",
+        "https://shop.example?redirect=https://attacker.example",
+    ],
+)
+def test_magento_rejects_unsafe_authenticated_targets(store_url):
+    from adapters.magento_adapter import MagentoAdapter
+
+    adapter = MagentoAdapter({"store_url": store_url, "access_token": "secret"})
+    valid, error = adapter.validate_config()
+    assert valid is False
+    assert "HTTPS" in error
+
+
+@pytest.mark.asyncio
+async def test_magento_rejects_hostname_resolving_to_private_address(monkeypatch):
+    from adapters import magento_adapter as module
+
+    class FakeLoop:
+        async def getaddrinfo(self, *args, **kwargs):
+            return [(None, None, None, None, ("10.0.0.8", 443))]
+
+    monkeypatch.setattr(module.asyncio, "get_running_loop", lambda: FakeLoop())
+    with pytest.raises(ValueError, match="public IP"):
+        await module._validate_public_https_target("https://shop.example")

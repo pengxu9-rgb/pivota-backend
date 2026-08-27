@@ -319,6 +319,44 @@ async def ensure_required_schema_light() -> None:
             ):
                 await database.execute(text(statement))
 
+            # Migration 205: external platform references are local to a
+            # merchant/store. Replace only legacy global indexes; once the
+            # scoped definition is present this block performs no DDL.
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    DECLARE
+                      ref_col TEXT;
+                      idx_name TEXT;
+                      idx_def TEXT;
+                    BEGIN
+                      FOREACH ref_col IN ARRAY ARRAY[
+                        'click_id', 'quote_id', 'checkout_id',
+                        'order_id', 'refund_id', 'return_id'
+                      ] LOOP
+                        idx_name := 'idx_commerce_interactions_' || ref_col || '_unique';
+                        SELECT indexdef INTO idx_def
+                          FROM pg_indexes
+                         WHERE schemaname = current_schema()
+                           AND indexname = idx_name;
+                        IF idx_def IS NULL
+                           OR position('merchant_id' IN idx_def) = 0
+                           OR position('store_id' IN idx_def) = 0 THEN
+                          EXECUTE format('DROP INDEX IF EXISTS %I', idx_name);
+                          EXECUTE format(
+                            'CREATE UNIQUE INDEX %I ON commerce_interactions '
+                            || '(merchant_id, COALESCE(store_id, ''''), %I) '
+                            || 'WHERE %I IS NOT NULL',
+                            idx_name, ref_col, ref_col
+                          );
+                        END IF;
+                      END LOOP;
+                    END $$;
+                    """
+                )
+            )
+
             await database.execute(
                 text(
                     """

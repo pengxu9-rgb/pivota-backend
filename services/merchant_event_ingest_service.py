@@ -34,6 +34,116 @@ STANDARD_COMMERCE_EVENT_TYPES = frozenset(
     }
 )
 
+# The public collector is an analytics contract, not an arbitrary document
+# store. Native adapters reduce their payloads to this vocabulary before model
+# validation; custom/headless collectors must do the same.
+ALLOWED_MERCHANT_METADATA_KEYS = frozenset(
+    {
+        "quantity",
+        "native_topic",
+        "native_status",
+        "native_financial_status",
+        "native_fulfillment_status",
+        "native_payment_method",
+        "native_payment_method_title",
+        "native_line_items",
+        "native_products",
+        "native_product_bundle",
+        "native_product_no",
+        "native_variant_code",
+        "native_quantity",
+        "native_discount_total",
+        "native_shipping_total",
+        "native_total_tax",
+        "native_cumulative_refund_total",
+        "native_amount_semantics",
+        "native_transaction_kind",
+        "native_transaction_status",
+        "native_event_name",
+        "native_event_no",
+        "native_event_code",
+        "native_mall_id",
+        "native_shop_no",
+        "native_order_place_id",
+        "native_paid_state",
+        "native_payment_gateway",
+        "native_shipping_type",
+        "event_source_url",
+        "client_user_agent",
+        "cvid_ad",
+        "webhook_trace_id",
+        "webhook_delivery_id",
+    }
+)
+SENSITIVE_METADATA_KEYS = frozenset(
+    {
+        "email",
+        "phone",
+        "address",
+        "address1",
+        "address2",
+        "first_name",
+        "last_name",
+        "full_name",
+        "browser_ip",
+        "ip",
+        "token",
+        "access_token",
+        "secret",
+        "password",
+        "authorization",
+        "cookie",
+        "card_number",
+        "credit_card_number",
+        "cpf",
+        "tax_id",
+        "receipt_json",
+    }
+)
+SENSITIVE_METADATA_KEY_TOKENS = frozenset(
+    {
+        "email",
+        "phone",
+        "address",
+        "ip",
+        "token",
+        "secret",
+        "password",
+        "authorization",
+        "cookie",
+        "card",
+        "cpf",
+    }
+)
+SENSITIVE_PERSON_NAME_KEYS = frozenset(
+    {
+        "customer_name",
+        "buyer_name",
+        "recipient_name",
+        "billing_name",
+        "shipping_name",
+    }
+)
+
+
+def _is_sensitive_metadata_key(key: str) -> bool:
+    normalized = "_".join(key.strip().lower().replace("-", "_").split())
+    if normalized in SENSITIVE_METADATA_KEYS or normalized in SENSITIVE_PERSON_NAME_KEYS:
+        return True
+    return bool(set(normalized.split("_")) & SENSITIVE_METADATA_KEY_TOKENS)
+
+
+def _validate_safe_metadata_tree(value: Any, path: str = "metadata") -> None:
+    if isinstance(value, dict):
+        for raw_key, child in value.items():
+            key = str(raw_key).strip().lower()
+            if _is_sensitive_metadata_key(key):
+                raise ValueError(f"{path} contains forbidden sensitive key: {raw_key}")
+            _validate_safe_metadata_tree(child, f"{path}.{raw_key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_safe_metadata_tree(child, f"{path}[{index}]")
+
 
 class MerchantCommerceEvent(BaseModel):
     """Platform-neutral event contract accepted from store adapters/collectors."""
@@ -104,6 +214,17 @@ class MerchantCommerceEvent(BaseModel):
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        unknown = sorted(set(value) - ALLOWED_MERCHANT_METADATA_KEYS)
+        if unknown:
+            raise ValueError(
+                "metadata contains unsupported keys: " + ", ".join(unknown[:10])
+            )
+        _validate_safe_metadata_tree(value)
+        return value
 
     @model_validator(mode="after")
     def require_stitch_key(self) -> "MerchantCommerceEvent":

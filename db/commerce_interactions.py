@@ -51,31 +51,43 @@ commerce_interactions = Table(
 
 Index(
     "idx_commerce_interactions_click_id_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
     commerce_interactions.c.click_id,
     unique=True,
 )
 Index(
     "idx_commerce_interactions_quote_id_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
     commerce_interactions.c.quote_id,
     unique=True,
 )
 Index(
     "idx_commerce_interactions_checkout_id_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
     commerce_interactions.c.checkout_id,
     unique=True,
 )
 Index(
     "idx_commerce_interactions_order_id_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
     commerce_interactions.c.order_id,
     unique=True,
 )
 Index(
     "idx_commerce_interactions_refund_id_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
     commerce_interactions.c.refund_id,
     unique=True,
 )
 Index(
     "idx_commerce_interactions_return_id_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
     commerce_interactions.c.return_id,
     unique=True,
 )
