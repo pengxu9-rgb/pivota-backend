@@ -163,6 +163,40 @@ def _pick_total(payload: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
     return None, currency
 
 
+def quote_covers(payload: Dict[str, Any]) -> Dict[str, bool]:
+    """Does this quote ALREADY include shipping and tax, or is it a bare item subtotal?
+
+    This is the whole basis for headroom. B7 measured that a pre-address UCP checkout returns
+    `total === subtotal` with `shipping_options: []` and `tax: null`, because Shopify collects
+    the delivery address on the STOREFRONT — so on the live path the answer is "neither", every
+    time. A cap set to such a total is short by exactly shipping + tax and declines the moment an
+    address is entered, which in the Minds/Reap model is the one action the agent exists to take.
+
+    Read POSITIVELY: a component counts as covered only when the merchant named a non-null amount
+    for it. An absent key is not evidence of a zero — it is the merchant declining to say, which
+    is the case this exists to detect.
+    """
+    totals = payload.get("totals")
+    by_type: Dict[str, Any] = {}
+    if isinstance(totals, list):
+        for entry in totals:
+            if isinstance(entry, dict) and isinstance(entry.get("type"), str):
+                by_type[entry["type"].strip().lower()] = entry.get("amount")
+
+    def _named(*keys: str) -> bool:
+        for key in keys:
+            if payload.get(key) is not None:
+                return True
+            if by_type.get(key) is not None:
+                return True
+        return False
+
+    return {
+        "shipping": _named("shipping", "total_shipping", "delivery"),
+        "tax": _named("tax", "total_tax", "taxes"),
+    }
+
+
 async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict[str, Any]:
     """Fetch the checkout's landed total from the merchant's own UCP door.
 
@@ -226,10 +260,86 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
     total_minor = to_minor_units(raw_total, currency)
     if total_minor is None:
         raise MerchantQuoteError("merchant quote total was not a positive amount")
+    covers = quote_covers(payload)
     return {
         "total_minor": total_minor,
         "currency": currency,
-        "quote_snapshot": {"totals": payload.get("totals"), "picked": raw_total},
+        "covers_shipping": covers["shipping"],
+        "covers_tax": covers["tax"],
+        # The snapshot is the audit trail for a cap that is no longer equal to the quote: it has
+        # to show what the merchant actually said, not just the number we picked out of it.
+        "quote_snapshot": {
+            "totals": payload.get("totals"),
+            "picked": raw_total,
+            "covers": covers,
+        },
+    }
+
+
+def headroom_policy() -> Dict[str, int]:
+    """Bounds on how far a cap may exceed the merchant's quote.
+
+    THESE NUMBERS ARE NOT MEASURED. They are conservative starting points, and the whole reason
+    the cap and the quote are separate audited columns (migration 201) is that the delta between
+    them is what makes them measurable: once cards are minted, `amount_cap_minor -
+    quote_total_minor` beside a `card_rail_outcomes` decline is the calibration data. Treat a
+    change here as a policy decision with evidence, not a tuning knob.
+
+      bps   1200 = 12%. The highest combined US sales tax is ~10.25%, so this covers tax with a
+                   little margin. A percentage alone is not enough: 12% of a $10 order is $1.20,
+                   which does not pay for $8 of shipping.
+      flat  $15.00. Typical US D2C shipping for this cohort. A flat amount alone is not enough
+                   either: it does not cover tax on a $500 order.
+      max   $75.00. The hard ceiling, and the number that actually bounds the blast radius. What
+                   an agent could overspend is this, once, at ONE merchant — the card is
+                   merchant-locked and single-use.
+    """
+    def _int(name: str, default: int) -> int:
+        try:
+            v = int(str(os.getenv(name) or "").strip() or default)
+        except ValueError:
+            return default
+        return v if v >= 0 else default
+
+    return {
+        "bps": _int("AGENT_CARD_HEADROOM_BPS", 1200),
+        "flat_minor": _int("AGENT_CARD_HEADROOM_FLAT_MINOR", 1500),
+        "max_minor": _int("AGENT_CARD_HEADROOM_MAX_MINOR", 7500),
+    }
+
+
+def cap_for_quote(quote: Dict[str, Any]) -> Dict[str, Any]:
+    """The amount the card may spend, and an auditable account of why it differs from the quote.
+
+    NEVER a blanket multiplier. Headroom exists to cover components the merchant did not quote,
+    so a quote that already includes shipping AND tax gets NONE — cap == quote, exactly, which is
+    v1's behaviour and remains correct wherever a landed total is actually available.
+
+    WHY THE UNKNOWN CASE ADDS HEADROOM. The two failure directions are not symmetric. Too little
+    headroom is a guaranteed decline the moment an address is entered — no money moves, but the
+    flow cannot complete at all. Too much is bounded by `max_minor`, once, at ONE merchant, on a
+    single-use card. Given B7 measured that the live path never carries shipping or tax, refusing
+    to add headroom unless we can prove it is missing would decline every real transaction.
+    """
+    total = int(quote["total_minor"])
+    covered = bool(quote.get("covers_shipping")) and bool(quote.get("covers_tax"))
+    policy = headroom_policy()
+
+    if covered:
+        return {
+            "amount_cap_minor": total,
+            "headroom_minor": 0,
+            "headroom_basis": "quote_is_landed",
+        }
+
+    # Integer arithmetic throughout: these are minor units, and a float would reintroduce the
+    # rounding the minor-unit convention exists to remove.
+    raw = policy["flat_minor"] + (total * policy["bps"]) // 10_000
+    headroom = min(raw, policy["max_minor"])
+    return {
+        "amount_cap_minor": total + headroom,
+        "headroom_minor": headroom,
+        "headroom_basis": "ceiling" if raw > policy["max_minor"] else "flat_plus_bps",
     }
 
 
