@@ -395,8 +395,19 @@ def test_no_args_value_beginning_with_a_dash_uses_the_space_form():
     before someone runs the script against production.
     """
     src = (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text(encoding="utf-8")
+    # Join backslash continuations FIRST. Review found the evasion: splitting
+    # `--args` from its value across two continued lines left the inspected line
+    # ending in `\`, so the extracted "value" was a backslash and the guard
+    # passed while gcloud still got the broken space form.
+    joined, buf = [], ""
+    for raw in src.splitlines():
+        buf += raw[:-1] + " " if raw.rstrip().endswith("\\") else raw
+        if not raw.rstrip().endswith("\\"):
+            joined.append(buf); buf = ""
+    if buf:
+        joined.append(buf)
     offenders = []
-    for i, line in enumerate(src.splitlines(), 1):
+    for i, line in enumerate(joined, 1):
         stripped = line.strip()
         if not stripped.startswith("--args ") and " --args " not in stripped:
             continue
