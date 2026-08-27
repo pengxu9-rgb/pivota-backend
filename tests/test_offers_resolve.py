@@ -698,6 +698,113 @@ def test_offers_resolve_sentinel_merchant_scope_is_ignored(
     )
 
 
+@pytest.mark.parametrize(
+    "payload_extra, metadata_extra",
+    [
+        ({"product_merchant": "external_seed"}, {}),
+        ({}, {"merchant_id": "external_seed"}),
+        ({}, {"merchantId": "external_seed"}),
+        ({}, {"merchant_scope": ["external_seed"]}),
+        ({}, {"merchant_scope": "external_seed"}),
+    ],
+    ids=["payload", "meta_merchant_id", "meta_merchantId", "meta_scope_list", "meta_scope_str"],
+)
+def test_offers_resolve_sentinel_is_unscoped_at_every_extraction_point(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, payload_extra, metadata_extra
+) -> None:
+    """Review finding on the first commit: only the payload extraction point was pinned —
+    reverting the metadata `merchant_id` extraction survived every test. Callers echo advertised
+    fields through metadata too, so each of the four sanitizer sites must treat the sentinel as
+    unscoped, and each row here kills that site's revert individually."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    product = {"product_id": "sig_test_mirror_1"}
+    if payload_extra.get("product_merchant"):
+        product["merchant_id"] = payload_extra["product_merchant"]
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": product, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui", **metadata_extra},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "success"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("merchant_scope") is None, (
+        "the sentinel arrived via this extraction point and must not become a scope"
+    )
+    assert body.get("offers"), "and the seed offer still serves"
+
+
+def test_offers_resolve_inactive_mirror_seed_falls_through_to_later_arms(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The arm's own design claim, previously untested (review finding): when the mirror maps a
+    sig to a seed the gated query refuses (inactive/quarantined), seed_rows stays empty and the
+    LATER arms must still run — the sig arm must never eat the lane. Deleting `status='active'`
+    from the new seed query flips this test (the inactive seed would serve)."""
+    import routes.agent_shop_gateway as gateway
+
+    fuzzy_ran = {"seen": False}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "pivota_signature_id = ANY" in q:
+            return [{"source_ref": "eps_sig_dead"}]
+        if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
+            # This fake plays the DATABASE, so it must honour the query it is handed: with the
+            # status filter present the retired seed is refused (empty result); if a mutant
+            # deletes the filter, the retired row comes back — and the assertions below turn
+            # that into a failure instead of letting the fake hide it.
+            if "status = 'active'" in q:
+                return []
+            return [
+                _sig_lane_seed_row()
+                | {"id": "eps_sig_dead", "external_product_id": "ext_dead", "title": "Retired Seed", "status": "retired"}
+            ]
+        if "FROM external_product_seeds" in q and "status = 'active'" in q:
+            fuzzy_ran["seen"] = True
+            return [_sig_lane_seed_row() | {"id": "eps_sig_alive", "external_product_id": "sig_test_mirror_1"}]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert fuzzy_ran["seen"], "an empty mirror resolution must fall through to the fuzzy arm"
+    offers = body.get("offers") or []
+    assert offers, "the fuzzy arm's live seed serves"
+    assert all(
+        (offer.get("source") or {}).get("external_product_id") != "ext_dead" for offer in offers
+    ), "a retired seed must never serve — if it did, the status filter is gone"
+
+
 def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
