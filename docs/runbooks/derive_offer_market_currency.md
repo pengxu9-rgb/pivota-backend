@@ -57,7 +57,7 @@ seed refresh between the two can move offers between domain groups:
 
 ```bash
 gcloud run jobs execute derive-offer-market-currency --region us-west1 --project pivota-prod --wait \
-  --args '-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25'
+  --args='-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25'
 ```
 
 Then apply, restricted to the domains you actually reviewed. `--only-domain` is
@@ -65,7 +65,7 @@ repeatable and is the safe form — it is what the old `only_domains` input buil
 
 ```bash
 gcloud run jobs execute derive-offer-market-currency --region us-west1 --project pivota-prod --wait \
-  --args '-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25,--only-domain,mintree.us,--only-domain,upcirclebeauty.com,--apply'
+  --args='-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25,--only-domain,mintree.us,--only-domain,upcirclebeauty.com,--apply'
 ```
 
 Three things to know before you press it:
@@ -96,7 +96,7 @@ and never overwrites, but it was never scheduled and should not be:
 
 ```bash
 gcloud run jobs execute audit-domainless-offer-currency --region us-west1 --project pivota-prod --wait \
-  --args '-m,scripts.audit_domainless_offer_currency,--apply,--confirm,AUDIT_DOMAINLESS_OFFER_CURRENCY'
+  --args='-m,scripts.audit_domainless_offer_currency,--apply,--confirm,AUDIT_DOMAINLESS_OFFER_CURRENCY'
 ```
 
 ## Why this is not a GitHub Actions workflow any more
