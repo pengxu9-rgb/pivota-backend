@@ -326,20 +326,31 @@ async def test_shopline_family_connect_persists_token_without_returning_it(monke
     user = {"role": "merchant", "merchant_id": "merchant-1"}
     if platform == "shopline":
         result = await route.connect_shopline(
-            route.ShoplineConnectRequest(merchant_id="merchant-1", handle="demo", access_token="secret"),
+            route.ShoplineConnectRequest(
+                merchant_id="merchant-1",
+                handle="demo",
+                access_token="secret",
+                app_secret="signing-secret",
+            ),
             current_user=user,
         )
     else:
         result = await route.connect_shoplazza(
             route.ShoplazzaConnectRequest(
-                merchant_id="merchant-1", store_url="demo.myshoplaza.com", access_token="secret"
+                merchant_id="merchant-1",
+                store_url="demo.myshoplaza.com",
+                access_token="secret",
+                app_secret="signing-secret",
             ),
             current_user=user,
         )
     persisted = json.loads(writes[0]["api_key"])
     assert persisted["access_token"] == "secret"
-    assert "secret" not in json.dumps(result)
+    assert persisted["app_secret"] == "signing-secret"
+    assert "signing-secret" not in json.dumps(result)
     assert result["platform"] == platform
+    assert result["webhook_path"] == f"/webhooks/{platform}/{result['store_id']}"
+    assert result["required_webhook_topics"]
     assert lifecycle == [("merchant-1", f"{platform}_connect")]
 
 

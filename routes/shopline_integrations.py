@@ -28,6 +28,7 @@ class ShoplineConnectRequest(BaseModel):
     merchant_id: str = Field(min_length=1, max_length=128)
     handle: str = Field(min_length=1, max_length=128)
     access_token: str = Field(min_length=1, max_length=4096)
+    app_secret: Optional[str] = Field(default=None, max_length=4096)
     api_version: str = Field(default=DEFAULT_SHOPLINE_API_VERSION, max_length=32)
     currency: str = Field(default="USD", min_length=3, max_length=3)
     store_name: Optional[str] = Field(default=None, max_length=255)
@@ -37,6 +38,7 @@ class ShoplazzaConnectRequest(BaseModel):
     merchant_id: str = Field(min_length=1, max_length=128)
     store_url: str = Field(min_length=1, max_length=512)
     access_token: str = Field(min_length=1, max_length=4096)
+    app_secret: Optional[str] = Field(default=None, max_length=4096)
     api_version: str = Field(default=DEFAULT_SHOPLAZZA_API_VERSION, max_length=32)
     currency: str = Field(default="USD", min_length=3, max_length=3)
     store_name: Optional[str] = Field(default=None, max_length=255)
@@ -59,12 +61,22 @@ async def _upsert_store(
 ) -> str:
     existing = await database.fetch_one(
         """
-        SELECT store_id FROM merchant_stores
+        SELECT store_id, api_key FROM merchant_stores
         WHERE merchant_id = :merchant_id AND platform = :platform AND domain = :domain
         LIMIT 1
         """,
         {"merchant_id": merchant_id, "platform": platform, "domain": domain},
     )
+    if existing:
+        raw_existing = dict(existing).get("api_key")
+        try:
+            parsed_existing = json.loads(str(raw_existing or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_existing = {}
+        if isinstance(parsed_existing, dict):
+            # A catalog-token rotation must not silently disable an already
+            # configured webhook when the merchant omits the app secret.
+            credentials = {**parsed_existing, **credentials}
     blob = json.dumps(credentials, separators=(",", ":"))
     if existing:
         store_id = str(existing["store_id"])
@@ -122,6 +134,7 @@ async def connect_shopline(
             "api_version": adapter.api_version,
             "currency": body.currency.upper(),
             "token_type": "merchant_supplied",
+            **({"app_secret": body.app_secret.strip()} if body.app_secret and body.app_secret.strip() else {}),
         },
     )
     await sync_catalog_merchant_status(body.merchant_id, reason="shopline_connect")
@@ -130,7 +143,14 @@ async def connect_shopline(
         "platform": "shopline",
         "store_id": store_id,
         "catalog_adapter": "native_rest",
-        "telemetry_mode": "universal_web_server_collectors",
+        "telemetry_mode": "native_order_webhooks_plus_universal_collectors",
+        "webhook_path": f"/webhooks/shopline/{store_id}",
+        "required_webhook_topics": [
+            "orders/create",
+            "orders/paid",
+            "orders/cancelled",
+            "refunds/create",
+        ],
     }
 
 
@@ -156,6 +176,7 @@ async def connect_shoplazza(
             "access_token": body.access_token,
             "api_version": adapter.api_version,
             "currency": body.currency.upper(),
+            **({"app_secret": body.app_secret.strip()} if body.app_secret and body.app_secret.strip() else {}),
         },
     )
     await sync_catalog_merchant_status(body.merchant_id, reason="shoplazza_connect")
@@ -164,5 +185,13 @@ async def connect_shoplazza(
         "platform": "shoplazza",
         "store_id": store_id,
         "catalog_adapter": "native_rest",
-        "telemetry_mode": "universal_web_server_collectors",
+        "telemetry_mode": "native_order_webhooks_plus_universal_collectors",
+        "webhook_path": f"/webhooks/shoplazza/{store_id}",
+        "required_webhook_topics": [
+            "orders/create",
+            "orders/paid",
+            "orders/partially_refunded",
+            "orders/refunded",
+            "orders/cancelled",
+        ],
     }
