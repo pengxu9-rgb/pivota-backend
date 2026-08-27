@@ -363,8 +363,29 @@ echo "== job: commerce-index-search-index (v2 targeted OpenSearch publication)"
 # be provisioned on the job before SEARCH_INDEX_PUBLICATION_WORKER is enabled.
 # The worker refuses to claim jobs if either the explicit apply gate or index
 # configuration is absent, so an incomplete setup cannot drain the queue.
+#
+# THE KEY IS MOUNTED ONLY WHEN THE LANE IS BEING ARMED, because the comment above
+# is otherwise self-contradicting: it says the secret may not be provisioned yet,
+# and then mounted it unconditionally. Cloud Run resolves secret refs at
+# create/update time, so on a project where CATALOG_SERVING_INDEX_API_KEY does
+# not exist this line does not merely leave the lane inert — it makes
+# `gcloud run jobs update` fail, and with `set -e` that aborts the WHOLE
+# reconcile. Confirmed in prod 2026-08-26: the secret does not exist, the live
+# job mounts it anyway, and the run died here before reaching the scheduler
+# section. (GCP reports an absent secret as "Permission denied", which sent the
+# first diagnosis after a nonexistent IAM grant.)
+#
+# Mounting it only under the flag matches what the Store Audit blocks below
+# already do — refuse to wire a lane until its dedicated secret exists, rather
+# than mount a name and hope. The lane is inert without the flag either way.
+SEARCH_INDEX_SECRETS="DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest"
+if [ "$SEARCH_INDEX_PUBLICATION_WORKER" = true ]; then
+  SEARCH_INDEX_SECRETS="$SEARCH_INDEX_SECRETS,CATALOG_SERVING_INDEX_API_KEY=CATALOG_SERVING_INDEX_API_KEY:latest"
+else
+  echo "   (CATALOG_SERVING_INDEX_API_KEY not mounted; SEARCH_INDEX_PUBLICATION_WORKER=false)"
+fi
 mkjob commerce-index-search-index "$GATEWAY_IMAGE" "$SA" \
-  --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest,CATALOG_SERVING_INDEX_API_KEY=CATALOG_SERVING_INDEX_API_KEY:latest" \
+  --set-secrets "$SEARCH_INDEX_SECRETS" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=commerce-index-search-index,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,COMMERCE_INDEX_SEARCH_PUBLICATION_APPLY=$SEARCH_INDEX_PUBLICATION_WORKER,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1" \
   --task-timeout 900s \
   --command node --args "scripts/drain-commerce-index-search-index.js,--worker-id,cloud-run-search-index"
