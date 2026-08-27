@@ -4,10 +4,18 @@ The global floor already subtracts skips (`ran = total - skipped`). The per-subt
 did not, so an entire subtree could go inert — every case collected, none executed — and
 still clear its minimum.
 
-The global floor is not a backstop for that. `readiness.tests` is 79 cases against 251 of
+The global floor is not a backstop for that. `readiness.tests` is 79 cases against ~245 of
 global headroom, so the whole tree can stop executing with BOTH gates green.
 (`tests.services` is incidentally covered only because 1,682 skips would exceed the global
 headroom — arithmetic luck, not a guarantee, and it evaporates when the floor next rises.)
+
+NOTE: pytest files an **xfail** under `<skipped type="pytest.xfail">`, so this filter
+excludes xfails as well as skips. That is deliberate and consistent — the global floor's
+`total - skipped` already counted them the same way, because pytest's own
+`testsuite@skipped` attribute includes xfail. An ERROR (setup failure) is `<error>` and is
+still counted, which is correct: an errored test makes pytest exit non-zero and the sweep
+step runs under `pipefail`, so the job is already red — an error can never produce the
+green-with-inert-subtree shape this gate exists to catch.
 
 A MODULE-level skip was always caught: it collapses collection to one <testcase> per
 module. The gap is a per-test `@pytest.mark.skipif` sweep, which keeps the case count
@@ -57,19 +65,34 @@ def _run(tmp_path: Path, xml: str):
 
 
 def _xml(*, services: int, readiness: int, skip_readiness: bool = False,
-         skip_services: bool = False, other: int = 11000) -> str:
+         skip_services: bool = False, other: int = 11000,
+         readiness_skipped: int = 0) -> str:
+    """readiness_skipped: mark exactly N of the readiness cases skipped (partial-skip case)."""
     cases = []
     for i in range(services):
         body = "<skipped/>" if skip_services else ""
         cases.append(f'<testcase classname="tests.services.test_x" name="t{i}">{body}</testcase>')
     for i in range(readiness):
-        body = "<skipped/>" if skip_readiness else ""
+        marked = skip_readiness or i < readiness_skipped
+        body = "<skipped/>" if marked else ""
         cases.append(f'<testcase classname="readiness.tests.test_y" name="t{i}">{body}</testcase>')
     for i in range(other):
         cases.append(f'<testcase classname="tests.test_other" name="t{i}"/>')
     total = services + readiness + other
-    skipped = (readiness if skip_readiness else 0) + (services if skip_services else 0)
-    return (f'<testsuite tests="{total}" skipped="{skipped}">' + "".join(cases) + "</testsuite>")
+    skipped = (readiness if skip_readiness else readiness_skipped) + (services if skip_services else 0)
+    # Faithful to what pytest --junitxml actually writes: a <testsuites> wrapper around a
+    # single <testsuite>, carrying errors/failures/name. An earlier version of this helper
+    # emitted a BARE <testsuite> root, which never exercised the workflow's
+    # `root if root.tag == 'testsuite' else root.find('testsuite')` line — so replacing it
+    # with `suite = root` survived every case here. Verified against real output:
+    #   <testsuites name="pytest tests"><testsuite name="pytest" errors="0" ... >
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites name="pytest tests">'
+        f'<testsuite name="pytest" errors="0" failures="0" skipped="{skipped}" tests="{total}" time="1.0">'
+        + "".join(cases)
+        + "</testsuite></testsuites>"
+    )
 
 
 def test_a_fully_skipped_subtree_is_rejected(tmp_path):
@@ -90,12 +113,10 @@ def test_a_healthy_run_still_passes(tmp_path):
 
 def test_partial_skips_are_subtracted(tmp_path):
     """70 is the minimum; 79 collected with 10 skipped is 69 executed — below it."""
-    xml = _xml(services=1682, readiness=69) .replace(
-        "</testsuite>",
-        "".join(f'<testcase classname="readiness.tests.test_y" name="s{i}"><skipped/></testcase>'
-                for i in range(10)) + "</testsuite>",
-    ).replace('skipped="0"', 'skipped="10"').replace('tests="12751"', 'tests="12761"')
-    proc = _run(tmp_path, xml)
+    # Built directly rather than by string-patching a hardcoded total, which silently
+    # no-ops if the `other=` default ever changes.
+    proc = _run(tmp_path, _xml(services=1682, readiness=79, skip_readiness=False,
+                               readiness_skipped=10))
     assert proc.returncode != 0, "69 executed should not clear a minimum of 70:\n" + proc.stdout
 
 
