@@ -465,16 +465,26 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
         and str(source.get("query")) == "external_seed_by_internal_identity"
         for source in (metadata.get("sources") or [])
     )
+    # Mixed internal+external must never read "external_only": the internal offer
+    # resolved (no variant was requested, so both surfaces report exact_match).
+    assert body["resolution_mode"] == "exact_match"
 
 
+@pytest.mark.parametrize("commerce_surface", [None, "agent_api"])
 def test_offers_resolve_external_only_product_serves_on_explicit_surface(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface
 ) -> None:
     """The prod symptom this contract exists for (2026-08-26): a product with NO internal
     offer at all — the whole external_seed corpus — asked for on the agent/MCP door, which
     pins commerce_surface=agent_api. With no internal match there is no canonical product and
     no internal identity, so neither retry lane can recover: the PRIMARY external lane must
-    itself run under an explicit surface, or the caller gets zero offers for every seed row."""
+    itself run under an explicit surface, or the caller gets zero offers for every seed row.
+
+    Follow-up (same probe): serving the offer is not enough — the metadata has to say so.
+    Only the internal lane wrote resolution_mode, so this exact response used to carry
+    resolution_mode="not_servable" (strict) / "exact_match" (relaxed) next to offers_count=1.
+    External-only now stamps "external_only" on every surface; resolved_target stays None
+    because nothing internal resolved."""
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
@@ -529,7 +539,7 @@ def test_offers_resolve_external_only_product_serves_on_explicit_surface(
                 "limit": 10,
                 "market": "US",
                 "tool": "*",
-                "commerce_surface": "agent_api",
+                **({"commerce_surface": commerce_surface} if commerce_surface else {}),
             },
             "metadata": {"source": "creator-agent-ui"},
         },
@@ -541,10 +551,15 @@ def test_offers_resolve_external_only_product_serves_on_explicit_surface(
     assert offers, "an external-only product must still yield its outbound offer on the agent surface"
     assert offers[0]["purchase_route"] == "affiliate_outbound"
     metadata = body.get("metadata") or {}
-    assert metadata.get("commerce_surface") == "agent_api"
+    if commerce_surface:
+        assert metadata.get("commerce_surface") == commerce_surface
     assert metadata.get("has_external") is True
     assert metadata.get("has_internal") is False
     assert metadata.get("reason_code") == "OK"
+    assert body["resolution_mode"] == "external_only"
+    assert body["resolved_target"] is None
+    assert (body.get("mapping") or {}).get("resolution_mode") == "external_only"
+    assert metadata.get("resolution_mode") == "external_only"
 
 
 def test_offers_resolve_attached_retry_serves_external_on_explicit_surface(

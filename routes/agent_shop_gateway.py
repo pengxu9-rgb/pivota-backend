@@ -5058,6 +5058,13 @@ async def _handle_offers_resolve(
                 query="external_seed_by_internal_identity",
             )
 
+    # Only the internal lane writes resolution_mode, so an external-only response
+    # would keep the initializer — "not_servable" (strict) / "exact_match" (relaxed) —
+    # while delivering offers. Neither is true: the offers serve, but nothing internal
+    # resolved, which is also why resolved_target stays None here.
+    if external_offers and not internal_offers:
+        resolution_mode = "external_only"
+
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
