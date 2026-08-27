@@ -341,3 +341,38 @@ def test_both_preflights_use_the_same_predicate():
     """The UCP and commerce guards are two copies of one rule; they must not drift apart."""
     blocks = _preflight_blocks()
     assert blocks[0] == blocks[1], "the two preflight blocks have diverged"
+
+
+def _secrets_for(calls: list[str], job: str) -> str:
+    for c in calls:
+        if c.startswith(f"run jobs create {job} ") or c.startswith(f"run jobs update {job} "):
+            parts = c.split()
+            return parts[parts.index("--set-secrets") + 1]
+    raise AssertionError(f"no create/update recorded for {job}")
+
+
+def test_search_index_key_is_not_mounted_unless_the_lane_is_armed(tmp_path):
+    """A secret that may not exist must not be mounted unconditionally.
+
+    Cloud Run resolves secret refs at create/update time, so mounting a name that does not
+    exist does NOT merely leave the lane inert — `gcloud run jobs update` fails, and under
+    `set -e` that aborts the whole reconcile. Confirmed in prod 2026-08-26:
+    CATALOG_SERVING_INDEX_API_KEY does not exist, the live job mounted it anyway, and the
+    run died there before reaching the scheduler section.
+    """
+    secrets = _secrets_for(_run(tmp_path, {}), "commerce-index-search-index")
+    assert "CATALOG_SERVING_INDEX_API_KEY" not in secrets, (
+        "the API key must not be mounted while SEARCH_INDEX_PUBLICATION_WORKER is false"
+    )
+    # The DSNs it genuinely needs are still there — this is a narrowing, not a removal.
+    assert "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" in secrets
+    assert "PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" in secrets
+
+
+def test_search_index_key_IS_mounted_once_the_lane_is_armed(tmp_path):
+    """Arming the lane is the point at which the secret is expected to exist."""
+    secrets = _secrets_for(
+        _run(tmp_path, {"SEARCH_INDEX_PUBLICATION_WORKER": "true"}),
+        "commerce-index-search-index",
+    )
+    assert "CATALOG_SERVING_INDEX_API_KEY=CATALOG_SERVING_INDEX_API_KEY:latest" in secrets
