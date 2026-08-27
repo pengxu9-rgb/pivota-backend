@@ -124,17 +124,28 @@ def test_flag_off_gates_on_api_key(vg):
     assert mod.credentials_available() is False
 
 
-def test_flag_on_with_no_credential_fails_closed(vg):
+def test_flag_on_with_no_credential_fails_closed(vg, tmp_path):
     """Staging's exact shape: flag on, project set, no credential anywhere.
 
     Must degrade rather than report available — callers treat this as "is the
     LLM usable", and a false positive turns a clean degradation into a
     mid-request exception.
+
+    "No credential anywhere" cannot be expressed by UNSETTING the env vars:
+    with GOOGLE_APPLICATION_CREDENTIALS absent, google.auth.default() falls
+    through to the gcloud well-known file (~/.config/gcloud/
+    application_default_credentials.json), so on any machine where someone has
+    run `gcloud auth application-default login` the "missing" credential
+    resolves and this test asserts False against a True. Pointing the env var
+    at a file that does not exist pins the outcome instead: default() raises
+    on an explicit-but-unreadable path WITHOUT consulting the well-known file
+    or the metadata server, so resolution fails identically on a bare CI
+    runner and on a dev machine with live ADC.
     """
     mod = vg(
         VERTEX_AI_ENABLED="true",
         GOOGLE_CLOUD_PROJECT="project-f165a637-145f-4de2-89d",
-        GOOGLE_APPLICATION_CREDENTIALS=None,
+        GOOGLE_APPLICATION_CREDENTIALS=str(tmp_path / "absent-adc.json"),
         GOOGLE_APPLICATION_CREDENTIALS_JSON=None,
     )
     assert mod.credentials_available() is False
