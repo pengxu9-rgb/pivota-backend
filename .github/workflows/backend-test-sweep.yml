@@ -204,19 +204,51 @@ jobs:
       # per-subtree
       # minimums, because a single global number cannot notice one tree leaving.
       # Raise these when the real numbers grow; never lower one to green a build.
+      #
+      # AND a SLACK CAP, because "raise these when the real numbers grow" is an
+      # instruction to a human, and this file's own history shows what that is
+      # worth: the 9,000 floor accumulated ~3,200 of slack in 28 days (the suite
+      # grows ~107 executed tests/day), so unattended, the floor re-opens a
+      # tests/services-sized hole in about two weeks. The cap makes decay a CI
+      # failure instead of a memory: if executed exceeds FLOOR by more than 10%
+      # (same per subtree), the job fails telling you to RAISE the floor.
+      # Deletions are safe — removing tests only shrinks slack, so the cap can
+      # never fire on a legitimate shrink; and a floor bump edits this file,
+      # which `.github/workflows/**` in the PR triggers routes straight back
+      # through this job, so every bump is verified by the run it gates.
       - name: Assert the sweep actually ran
         if: '!cancelled()'
         run: |
           python - <<'PY'
           import sys, collections, xml.etree.ElementTree as ET
           FLOOR = 12000
-          # Per-subtree minimums. A single global number cannot notice ONE tree
-          # leaving — the hole review demonstrated. Measured 2026-08-26 from a
-          # green main CI run of this workflow (not a local run, whose env-gated
-          # skips differ): tests.services=1682, readiness.tests=79. A green MAIN
-          # run is a valid source only while the pytest invocation is untouched;
-          # a PR that edits the command must calibrate against its own branch's
-          # CI run of the modified workflow — see the ⚠️ below.
+          # Cap on slack, global and per-subtree: executed may not exceed the
+          # floor by more than 10%. See the SLACK CAP paragraph above — the
+          # failure this converts from silent decay into a red build is the
+          # floor drifting far enough below reality to stop being a floor.
+          SLACK = 1.10
+          # Per-subtree minimums, counted over EXECUTED testcases only. A single
+          # global number cannot notice ONE tree leaving — the hole review
+          # demonstrated. And the counter must exclude skipped testcases for the
+          # same reason the global floor subtracts them: the first version
+          # counted every <testcase> including skipped ones, so a mass env-gated
+          # skip of all 79 readiness/tests testcases would still have
+          # "contributed" 79 >= 70 — green with zero readiness tests executed —
+          # while only denting the global executed count by 79 against 245 of
+          # headroom. The prefix match is anchored on the following '.' so a
+          # future sibling package (tests/services_v2) cannot count toward
+          # tests.services.
+          #
+          # Measured 2026-08-26 under THIS counting (executed only, anchored):
+          # tests.services=1682, readiness.tests=79 — numerically identical to
+          # the collected-testcase figures the recalibration used, because
+          # today all 33 skips live OUTSIDE both subtrees. That equality is a
+          # present-tense fact, not a property: the moment either subtree
+          # gains an env-gated skip the two countings diverge, which is the
+          # point of this one. A green MAIN run is a valid calibration source
+          # only while the pytest invocation AND this counting logic are
+          # untouched; a PR that edits either must calibrate against its own
+          # branch's CI run of the modified workflow — see the ⚠️ below.
           #
           # ⚠️ Calibrate against the FINAL command, not an earlier one. My first
           # cut set readiness.tests>=90 from a run that used --ignore on
@@ -224,7 +256,7 @@ jobs:
           # would have failed the GREEN build. Caught before merge only because
           # the clean and mutant runs were compared side by side — a guard is
           # not verified until it has been run against a passing build too.
-          SUBTREES = {'tests.services': 1600, 'readiness.tests': 70}
+          SUBTREES = {'tests.services': 1600, 'readiness.tests': 73}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
@@ -236,23 +268,36 @@ jobs:
 
           by = collections.Counter()
           for tc in suite.iter('testcase'):
+              if tc.find('skipped') is not None:
+                  continue
               cn = tc.get('classname') or ''
               for prefix in SUBTREES:
-                  if cn.startswith(prefix):
+                  if cn.startswith(prefix + '.'):
                       by[prefix] += 1
           bad = []
           if ran < FLOOR:
-              bad.append(f"only {ran} tests executed, floor is {FLOOR}")
+              bad.append(f"only {ran} tests executed, floor is {FLOOR} — a glob or "
+                         f"--ignore is matching more than intended; this job would have "
+                         f"reported green having tested far less than it claims")
+          elif ran > FLOOR * SLACK:
+              bad.append(f"{ran} tests executed but FLOOR is only {FLOOR} — the floor "
+                         f"has decayed by more than 10% and is no longer a floor; raise "
+                         f"FLOOR in this file to within 10% of {ran}")
           for prefix, minimum in sorted(SUBTREES.items()):
               got = by[prefix]
-              print(f"  subtree {prefix}: {got} (min {minimum})")
+              print(f"  subtree {prefix}: {got} executed (min {minimum})")
               if got < minimum:
-                  bad.append(f"subtree {prefix} contributed {got}, minimum {minimum}")
+                  bad.append(f"subtree {prefix} executed only {got}, minimum {minimum} — "
+                             f"the tree was dropped, or its tests were mass-skipped")
+              elif got > minimum * SLACK:
+                  bad.append(f"subtree {prefix} executed {got} but its minimum is only "
+                             f"{minimum} — raise it in this file to within 10% of {got}")
           if bad:
               for b in bad:
                   print(f"::error::{b}")
-              sys.exit("a glob or --ignore is matching more than intended — this job "
-                       "would have reported green having tested far less than it claims")
+              sys.exit("sweep floor invariants violated — an under-floor count means "
+                       "tests silently vanished; an over-slack count means the floor "
+                       "has decayed and must be raised (never lowered) in this file")
           PY
 
   # NEW TEST FILES MUST LAND INSIDE THE SWEPT TREES.
