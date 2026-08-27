@@ -57,6 +57,14 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
     "woocommerce": CommerceSourceDefinition("woocommerce", "storefront", _CATALOG_CAPABILITIES),
     "bigcommerce": CommerceSourceDefinition("bigcommerce", "storefront", _CATALOG_CAPABILITIES),
     "cafe24": CommerceSourceDefinition("cafe24", "storefront", _CATALOG_CAPABILITIES),
+    # Phase 1 is an authenticated native catalog pull. Commerce telemetry is
+    # already coverable by the universal collectors, but no Magento-native
+    # catalog-event, quote, or checkout connector is claimed yet.
+    "magento": CommerceSourceDefinition(
+        "magento",
+        "storefront",
+        CommerceSourceCapabilities(catalog_pull=True),
+    ),
     # Square is retained because the existing sync endpoint accepts its credentials;
     # its fetch adapter can be enabled independently of this policy contract.
     "square": CommerceSourceDefinition("square", "storefront", _CATALOG_CAPABILITIES),

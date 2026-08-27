@@ -11,6 +11,7 @@ import httpx
 import json
 import logging
 from adapters.bigcommerce_adapter import normalize_bigcommerce_store_hash
+from adapters.magento_adapter import normalize_magento_store_url
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from adapters.product_adapters import fetch_merchant_products
 from routes.product_routes import upsert_product_cache
@@ -529,12 +530,42 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
                     "consumer_key": api_key_data,
                     "consumer_secret": ""
                 }
+
             except json.JSONDecodeError:
                 return {
                     "store_url": store_url,
                     "consumer_key": api_key_data,
                     "consumer_secret": ""
                 }
+
+    elif platform == "magento":
+        store_url = normalize_magento_store_url(store_info.get("domain"))
+        raw_credentials = store_info.get("api_key")
+        if not store_url or not raw_credentials:
+            return None
+        try:
+            parsed_credentials = (
+                json.loads(raw_credentials)
+                if isinstance(raw_credentials, str) and raw_credentials.strip().startswith("{")
+                else raw_credentials
+            )
+        except json.JSONDecodeError:
+            parsed_credentials = raw_credentials
+        credentials = (
+            dict(parsed_credentials)
+            if isinstance(parsed_credentials, dict)
+            else {"access_token": parsed_credentials}
+        )
+        access_token = str(credentials.get("access_token") or "").strip()
+        if not access_token:
+            return None
+        return {
+            "store_url": store_url,
+            "access_token": access_token,
+            "store_view_code": str(credentials.get("store_view_code") or "default"),
+            "currency": str(credentials.get("currency") or "USD").upper(),
+            "product_url_suffix": credentials.get("product_url_suffix"),
+        }
     
     elif platform == "square":
         # Square uses location ID and access token

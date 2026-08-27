@@ -19,6 +19,7 @@ from adapters.bigcommerce_adapter import (
     normalize_bigcommerce_store_hash,
 )
 from adapters.cafe24_adapter import Cafe24ProductAdapter
+from adapters.magento_adapter import MagentoProductAdapter
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 from services.wix_connection import (
@@ -2032,6 +2033,7 @@ PLATFORM_ADAPTERS = {
     "woocommerce": WooCommerceProductAdapter,
     "bigcommerce": BigCommerceProductAdapter,
     "cafe24": Cafe24ProductAdapter,
+    "magento": MagentoProductAdapter,
 }
 
 
@@ -2109,6 +2111,17 @@ async def fetch_merchant_products(
             refresh_token=credentials.get("refresh_token"),
             expires_at=credentials.get("expires_at"),
             store_id=credentials.get("store_id"),
+        )
+    elif platform == "magento":
+        return await adapter_class.fetch_products(
+            store_url=credentials.get("store_url"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            store_view_code=credentials.get("store_view_code", "default"),
+            currency=credentials.get("currency", "USD"),
+            product_url_suffix=credentials.get("product_url_suffix"),
         )
     else:
         return [], None, f"Platform {platform} not implemented"
