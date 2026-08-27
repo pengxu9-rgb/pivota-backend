@@ -234,8 +234,27 @@ jobs:
           ran = total - skipped
           print(f"collected={total} skipped={skipped} executed={ran} floor={FLOOR}")
 
+          # COUNT WHAT RAN, NOT WHAT WAS COLLECTED. The global floor above already
+          # subtracts skips (`ran = total - skipped`); this loop did not, so a
+          # subtree could go ENTIRELY INERT and still clear its minimum. Proven
+          # against this very script: feed it a sweep.xml where all 79
+          # `readiness.tests` cases carry <skipped/> and it printed
+          # `subtree readiness.tests: 79 (min 70)` and exited 0.
+          #
+          # The global floor is not a backstop for that. 79 skips sit well inside
+          # its 251 of headroom, so the whole readiness tree can stop executing
+          # with both gates green. (tests.services is incidentally covered — 1,682
+          # skips would blow through the global floor — but that is arithmetic
+          # luck, not a guarantee, and it evaporates the moment the floor rises.)
+          #
+          # A MODULE-level skip was always caught, because it collapses collection
+          # to one <testcase> per module. The gap is a per-test @pytest.mark.skipif
+          # sweep, which keeps the case count identical and the execution count zero
+          # — exactly the shape an environment-dependent guard degrades into.
           by = collections.Counter()
           for tc in suite.iter('testcase'):
+              if tc.find('skipped') is not None:
+                  continue
               cn = tc.get('classname') or ''
               for prefix in SUBTREES:
                   if cn.startswith(prefix):
