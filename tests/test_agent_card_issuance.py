@@ -55,7 +55,16 @@ def rig(monkeypatch: pytest.MonkeyPatch):
     state: Dict[str, Any] = {
         # 2317 is deliberately odd and appears nowhere else: a mutant hardcoding the cap,
         # doubling it, or reading it from anything but the quote cannot echo it by accident.
-        "quote": {"total_minor": 2317, "currency": "USD", "quote_snapshot": {"totals": []}},
+        # The coverage keys are what `resolve_merchant_quote` really returns; their ABSENCE is
+        # now a distinct fail-closed case (no headroom), covered in test_agent_card_cap_headroom.
+        # This default is B7's measured live shape: a bare subtotal, neither component quoted.
+        "quote": {
+            "total_minor": 2317,
+            "currency": "USD",
+            "covers_shipping": False,
+            "covers_tax": False,
+            "quote_snapshot": {"totals": []},
+        },
         "issuer": _Issuer(),
         "creates": [],
         "created_id": "will-be-set",
@@ -174,18 +183,81 @@ def test_caller_supplied_amount_fields_are_refused(rig, field):
     assert state["creates"] == []
 
 
-def test_cap_equals_merchant_quote_exactly(rig):
+def test_cap_is_the_quote_plus_bounded_headroom(rig):
+    """SUPERSEDES `test_cap_equals_merchant_quote_exactly`, deliberately.
+
+    That test existed to stop "a headroom multiplier smuggled into v1", and it did its job — it
+    failed loudly when this landed. Headroom is now a stated policy rather than a smuggled one,
+    so the contract it guards changes with it. What must NOT change is the reason it existed:
+    the cap may not come from the caller, and it may not drift from the quote by anything other
+    than the published policy.
+
+    2317 minor, no shipping or tax named -> 1500 flat + (2317 * 1200 // 10000) = 1778 headroom.
+    `quote_total_minor` still records what the MERCHANT said; the delta is the audit trail.
+    """
     client, state = rig
     r = _post(client)
     assert r.status_code == 200
     p = state["creates"][-1]
-    # Mutants killed: cap from anywhere but the quote; a *100 in the conversion path; a
-    # headroom multiplier smuggled into v1.
-    assert p["amount_cap_minor"] == 2317
-    assert p["quote_total_minor"] == 2317
+    assert p["quote_total_minor"] == 2317, "the merchant's own number must survive untouched"
+    assert p["amount_cap_minor"] == 4095
+    assert p["amount_cap_minor"] - p["quote_total_minor"] == 1778
     assert p["currency"] == "USD"
     assert p["single_use"] is True  # mutant: flipping the INSERT param while IssueRequest stays True
-    assert r.json()["card"]["amount_cap"] == {"amount_minor": 2317, "currency": "USD"}
+    assert r.json()["card"]["amount_cap"] == {"amount_minor": 4095, "currency": "USD"}
+
+
+def test_the_row_and_the_issuer_are_minted_against_the_SAME_cap(rig):
+    """The audit-integrity property, and the one a second derivation would break.
+
+    If the row kept the quote while the issuer received the headroom (or the reverse), every
+    number in `agent_issued_cards` would describe a card that was never minted — and
+    `amount_cap_minor` is what migration 201's whole design leans on being true.
+    """
+    client, state = rig
+    r = _post(client)
+    assert r.status_code == 200
+    row_cap = state["creates"][-1]["amount_cap_minor"]
+    issued_cap = state["issuer"].requests[-1].amount_cap_minor
+    assert issued_cap == row_cap == 4095
+
+
+def test_a_landed_quote_gets_NO_headroom(rig):
+    """v1's behaviour, preserved exactly where it was right.
+
+    Headroom pays for components the merchant did not quote. A merchant that quoted shipping AND
+    tax has left nothing to cover, and adding to that total would be the blanket multiplier this
+    policy is specifically not.
+    """
+    client, state = rig
+    state["quote"] = {
+        "total_minor": 2317,
+        "currency": "USD",
+        "covers_shipping": True,
+        "covers_tax": True,
+        "quote_snapshot": {"totals": []},
+    }
+    r = _post(client)
+    assert r.status_code == 200
+    p = state["creates"][-1]
+    assert p["amount_cap_minor"] == 2317 == p["quote_total_minor"]
+    assert state["issuer"].requests[-1].amount_cap_minor == 2317
+
+
+def test_a_partially_landed_quote_still_gets_headroom(rig):
+    """Shipping named but tax not (or vice versa) is NOT landed. Covering one component does not
+    cover the other, and a cap short by the tax declines exactly as one short by the shipping."""
+    client, state = rig
+    state["quote"] = {
+        "total_minor": 2317,
+        "currency": "USD",
+        "covers_shipping": True,
+        "covers_tax": False,
+        "quote_snapshot": {"totals": []},
+    }
+    r = _post(client)
+    assert r.status_code == 200
+    assert state["creates"][-1]["amount_cap_minor"] == 4095
 
 
 def test_agent_id_stamped_from_token(rig):
@@ -198,7 +270,9 @@ def test_issuer_receives_the_same_constraints(rig):
     client, state = rig
     _post(client)
     req = state["issuer"].requests[-1]
-    assert req.amount_cap_minor == 2317
+    # The CAP, which is the quote plus published headroom — not the quote. See
+    # test_the_row_and_the_issuer_are_minted_against_the_SAME_cap for why these must not diverge.
+    assert req.amount_cap_minor == 4095
     assert req.currency == "USD"
     assert req.merchant_domain == "shop.example.com"
     assert req.single_use is True

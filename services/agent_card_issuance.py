@@ -151,16 +151,91 @@ def _pick_total(payload: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
         if isinstance(v, str) and v.strip():
             currency = v.strip().upper()
             break
-    totals = payload.get("totals")
-    by_type: Dict[str, Any] = {}
-    if isinstance(totals, list):
-        for entry in totals:
-            if isinstance(entry, dict) and isinstance(entry.get("type"), str):
-                by_type[entry["type"].strip().lower()] = entry.get("amount")
+    by_type = _totals_by_type(payload)
     for candidate in (payload.get("total_amount"), payload.get("grand_total"), by_type.get("total")):
         if candidate is not None:
             return candidate, currency
     return None, currency
+
+
+def _totals_by_type(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The ONE index of `totals[]`. `_pick_total` and `quote_covers` both read it.
+
+    Built once because two derivations of one fact drift — and here they would drift in the
+    direction of quietly adding headroom to a landed quote.
+    """
+    by_type: Dict[str, Any] = {}
+    totals = payload.get("totals")
+    if isinstance(totals, list):
+        for entry in totals:
+            if isinstance(entry, dict) and isinstance(entry.get("type"), str):
+                by_type[entry["type"].strip().lower()] = entry.get("amount")
+    return by_type
+
+
+# THE WIRE VOCABULARY, NOT THE DISPLAY VOCABULARY — and the first cut of this got it backwards.
+# UCP's totals type enum is "subtotal, items_discount, discount, FULFILLMENT, tax, fee, total"
+# (https://ucp.dev/2026-04-08/schemas/shopping/types/total.json). "Shipping" and "Delivery" appear
+# in that schema ONLY as `display_text` examples — the human label. Live confirmation on
+# cosrx-renewal.myshopify.com: `fulfillment` appears 12 times in its checkout schemas, `"shipping"`
+# as a totals type zero times, `delivery` zero times.
+#
+# Matching only the labels made `quote_is_landed` UNREACHABLE against a spec-conformant merchant:
+# a checkout that had quoted both components read as unlanded and earned full headroom, which is
+# exactly the blanket multiplier this policy is not supposed to be. The label spellings are kept
+# as aliases because a non-conformant merchant may well use them.
+_SHIPPING_KEYS = ("fulfillment", "total_shipping", "shipping", "delivery")
+_TAX_KEYS = ("tax", "total_tax", "taxes")
+
+
+def _is_quoted_amount(value: Any) -> bool:
+    """Did the merchant name an AMOUNT here, or merely a key?
+
+    Mirrors the gateway's `pickMoney`, which this backend copy was looser than: a number, a
+    numeric string, or an object carrying `amount`/`value` is a quote; `{}`, `[]`, `False`,
+    `"n/a"` and None are not. Accepting any non-None read `{"tax": {}}` as "tax is covered",
+    removing headroom from a quote that never carried tax — the decline direction.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value.strip())
+        except ValueError:
+            return False
+        return True
+    if isinstance(value, dict):
+        for key in ("amount", "value"):
+            if key in value:
+                return _is_quoted_amount(value[key])
+    return False
+
+
+def quote_covers(payload: Dict[str, Any]) -> Dict[str, bool]:
+    """Does this quote ALREADY include shipping and tax, or is it a bare item subtotal?
+
+    This is the whole basis for headroom. B7 measured that a pre-address UCP checkout returns
+    `total === subtotal` with `shipping_options: []` and `tax: null`, because Shopify collects
+    the delivery address on the STOREFRONT — so on that path the answer is "neither". But the
+    landed case IS reachable: `resolve_merchant_quote` reads a checkout the agent already built
+    and may already have addressed, so this must recognise a landed quote when it sees one.
+
+    Read POSITIVELY, and only a NAMED AMOUNT counts. An absent key is the merchant declining to
+    say, which is the case this exists to detect; a present key holding no amount is not a quote.
+    """
+    by_type = _totals_by_type(payload)
+
+    def _named(keys: Tuple[str, ...]) -> bool:
+        for key in keys:
+            if _is_quoted_amount(payload.get(key)):
+                return True
+            if _is_quoted_amount(by_type.get(key)):
+                return True
+        return False
+
+    return {"shipping": _named(_SHIPPING_KEYS), "tax": _named(_TAX_KEYS)}
 
 
 async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict[str, Any]:
@@ -226,10 +301,119 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
     total_minor = to_minor_units(raw_total, currency)
     if total_minor is None:
         raise MerchantQuoteError("merchant quote total was not a positive amount")
+    covers = quote_covers(payload)
     return {
         "total_minor": total_minor,
         "currency": currency,
-        "quote_snapshot": {"totals": payload.get("totals"), "picked": raw_total},
+        "covers_shipping": covers["shipping"],
+        "covers_tax": covers["tax"],
+        # The snapshot is the audit trail for a cap that is no longer equal to the quote: it has
+        # to show what the merchant actually said, not just the number we picked out of it.
+        "quote_snapshot": {
+            "totals": payload.get("totals"),
+            "picked": raw_total,
+            "covers": covers,
+        },
+    }
+
+
+def headroom_policy() -> Dict[str, int]:
+    """Bounds on how far a cap may exceed the merchant's quote.
+
+    THESE NUMBERS ARE NOT MEASURED. They are conservative starting points, and the whole reason
+    the cap and the quote are separate audited columns (migration 201) is that the delta between
+    them is what makes them measurable: once cards are minted, `amount_cap_minor -
+    quote_total_minor` beside a `card_rail_outcomes` decline is the calibration data. Treat a
+    change here as a policy decision with evidence, not a tuning knob.
+
+      bps   1200 = 12%. The highest combined US sales tax is ~10.25%, so this covers tax with a
+                   little margin. A percentage alone is not enough: 12% of a $10 order is $1.20,
+                   which does not pay for $8 of shipping.
+      flat  $15.00. Typical US D2C shipping for this cohort. A flat amount alone is not enough
+                   either: it does not cover tax on a $500 order.
+      max   $75.00. The hard ceiling, and the number that actually bounds the blast radius. What
+                   an agent could overspend is this, once, at ONE merchant — the card is
+                   merchant-locked and single-use.
+    """
+    def _int(name: str, default: int) -> int:
+        try:
+            v = int(str(os.getenv(name) or "").strip() or default)
+        except ValueError:
+            return default
+        # Bounded at both ends: a negative is nonsense, and an unbounded value would remove the
+        # only absolute limit on headroom. Out of range falls back to the published default
+        # rather than to zero (silent declines) or to something unbounded.
+        return v if 0 <= v <= _MAX_CAP_MINOR else default
+
+    return {
+        "bps": _int("AGENT_CARD_HEADROOM_BPS", 1200),
+        "flat_minor": _int("AGENT_CARD_HEADROOM_FLAT_MINOR", 1500),
+        "max_minor": _int("AGENT_CARD_HEADROOM_MAX_MINOR", 7500),
+    }
+
+
+def cap_for_quote(quote: Dict[str, Any]) -> Dict[str, Any]:
+    """The amount the card may spend, and an auditable account of why it differs from the quote.
+
+    NEVER a blanket multiplier. Headroom exists to cover components the merchant did not quote,
+    so a quote that already includes shipping AND tax gets NONE — cap == quote, exactly, which is
+    v1's behaviour and remains correct wherever a landed total is actually available.
+
+    WHY THE UNKNOWN CASE ADDS HEADROOM. The two failure directions are not symmetric. Too little
+    headroom is a guaranteed decline the moment an address is entered — no money moves, but the
+    flow cannot complete at all. Too much is bounded by `max_minor`, once, at ONE merchant, on a
+    single-use card. Given B7 measured that the live path never carries shipping or tax, refusing
+    to add headroom unless we can prove it is missing would decline every real transaction.
+    """
+    total = int(quote["total_minor"])
+
+    # FAIL CLOSED ON AN UNKNOWN QUOTE. `.get()` with a falsy default would hand MAXIMUM headroom
+    # to any quote missing these keys — an older cached shape, a hand-built dict, a future
+    # refactor that drops one. On a money path the missing-key direction must be the safe one,
+    # and "no headroom" is safe: it declines, it does not overspend.
+    if "covers_shipping" not in quote or "covers_tax" not in quote:
+        return {
+            "amount_cap_minor": total,
+            "headroom_minor": 0,
+            "headroom_basis": "coverage_unknown",
+        }
+
+    # THE POLICY IS CALIBRATED IN USD MINOR UNITS and says so. `flat_minor` and `max_minor` are
+    # raw minor units, so applying them to another currency silently changes what they mean:
+    # 1500 minor is $15.00, but ¥1,500 and ₩1,500 are entirely different amounts, and for the
+    # 3-decimal currencies it is off by a further factor of ten. Migration 201 named FX drift as
+    # the reason these columns are separate; non-USD needs its own calibration, and until it has
+    # one the honest answer is v1's — cap == quote, which cannot overspend.
+    if str(quote.get("currency") or "").strip().upper() != "USD":
+        return {
+            "amount_cap_minor": total,
+            "headroom_minor": 0,
+            "headroom_basis": "currency_not_calibrated",
+        }
+
+    covered = bool(quote["covers_shipping"]) and bool(quote["covers_tax"])
+    policy = headroom_policy()
+
+    if covered:
+        return {
+            "amount_cap_minor": total,
+            "headroom_minor": 0,
+            "headroom_basis": "quote_is_landed",
+        }
+
+    # Integer arithmetic throughout: these are minor units, and a float would reintroduce the
+    # rounding the minor-unit convention exists to remove.
+    raw = policy["flat_minor"] + (total * policy["bps"]) // 10_000
+    headroom = min(raw, policy["max_minor"])
+    # THE ABSOLUTE BOUND STILL APPLIES. `_MAX_CAP_MINOR` exists so a hostile or broken merchant
+    # total surfaces as a clean refusal instead of a Postgres 22003 overflow raised as a 500 —
+    # but `to_minor_units` enforces it on the QUOTE, and headroom is added after that check. Two
+    # misconfigured env vars were enough to push the cap past BIGINT.
+    headroom = min(headroom, max(0, _MAX_CAP_MINOR - total))
+    return {
+        "amount_cap_minor": total + headroom,
+        "headroom_minor": headroom,
+        "headroom_basis": "ceiling" if raw > policy["max_minor"] else "flat_plus_bps",
     }
 
 

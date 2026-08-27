@@ -32,6 +32,7 @@ from db.agent_issued_cards import (
 from routes.agent_auth import AgentContext, get_agent_context
 from services.agent_card_issuance import (
     MerchantQuoteError,
+    cap_for_quote,
     card_expiry,
     is_enabled,
     issuance_policy,
@@ -95,6 +96,11 @@ async def issue_card(
         raise HTTPException(status_code=422 if err.caller_fault else 502, detail=str(err))
 
     policy = issuance_policy()
+    # ONE cap, computed ONCE, used by BOTH the row and the issuer. Deriving it twice — or letting
+    # the row keep the quote while the issuer gets the headroom — would make the audit trail
+    # describe a card that was never minted, and `amount_cap_minor` is the number the whole
+    # migration-201 design leans on being true.
+    cap = cap_for_quote(quote)
     card_id = mint_card_id()
     expires_at = card_expiry()  # once — the row and the issuer must agree on the expiry
     created = await create_card_guarded(
@@ -105,7 +111,12 @@ async def issue_card(
             "merchant_domain": body.merchant_domain.strip().lower(),
             "checkout_id": body.checkout_id,
             "quote_total_minor": quote["total_minor"],
-            "amount_cap_minor": quote["total_minor"],  # v1: cap == quote, exactly
+            # THE VISIBLE DELTA migration 201 asked for: headroom is the difference between two
+            # audited columns, never a silent multiplier. Zero when the merchant already quoted a
+            # landed total; otherwise it covers the shipping and tax a pre-address checkout
+            # cannot carry (B7), without which the card declines the moment Reap enters an
+            # address — the one action that flow exists to perform.
+            "amount_cap_minor": cap["amount_cap_minor"],
             "currency": quote["currency"],
             "quote_snapshot": json.dumps(quote["quote_snapshot"]),
             "issuer": issuer.name,
@@ -122,7 +133,7 @@ async def issue_card(
         issued = await issuer.issue(
             IssueRequest(
                 card_id=card_id,
-                amount_cap_minor=quote["total_minor"],
+                amount_cap_minor=cap["amount_cap_minor"],
                 currency=quote["currency"],
                 merchant_domain=body.merchant_domain.strip().lower(),
                 single_use=True,
