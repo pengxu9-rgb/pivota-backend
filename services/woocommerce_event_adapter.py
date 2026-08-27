@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional
+
+from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
+from services.woocommerce_conversion_poller import extract_click_id_from_wc_order
+
+
+SUPPORTED_WOOCOMMERCE_TOPICS = frozenset({"order.created", "order.updated"})
+_PAID_STATUSES = frozenset({"processing", "completed"})
+
+
+class UnsupportedWooCommerceEvent(ValueError):
+    pass
+
+
+def _text(value: Any) -> Optional[str]:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _occurred_at(*values: Any) -> datetime:
+    for value in values:
+        raw = _text(value)
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return datetime.now(timezone.utc)
+
+
+def _amount_cents(value: Any, decimals: Any = 2) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        amount = Decimal(str(value))
+        places = max(0, min(int(decimals), 6))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if amount < 0:
+        return None
+    multiplier = Decimal(10) ** places
+    return int((amount * multiplier).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _line_items(order: Dict[str, Any]) -> List[Dict[str, Any]]:
+    allowlisted = []
+    for item in order.get("line_items") or []:
+        if not isinstance(item, dict):
+            continue
+        allowlisted.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "id",
+                    "product_id",
+                    "variation_id",
+                    "sku",
+                    "quantity",
+                    "price",
+                    "subtotal",
+                    "total",
+                )
+                if item.get(key) is not None
+            }
+        )
+    return allowlisted
+
+
+def _entity_event_id(store_id: str, event_type: str, entity_id: str) -> str:
+    material = json.dumps(
+        ["woocommerce", store_id, event_type, entity_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return f"woocommerce:{event_type}:{digest}"
+
+
+def map_woocommerce_webhook(
+    payload: Dict[str, Any],
+    *,
+    topic: str,
+    delivery_id: Optional[str],
+    store_id: str,
+) -> MerchantEventBatch:
+    normalized_topic = str(topic or "").strip().lower()
+    if normalized_topic not in SUPPORTED_WOOCOMMERCE_TOPICS:
+        raise UnsupportedWooCommerceEvent(
+            f"unsupported WooCommerce webhook topic: {normalized_topic or 'missing'}"
+        )
+    if not isinstance(payload, dict):
+        raise ValueError("WooCommerce webhook body must be an object")
+    # Modern wc/v3 sends the order object directly. Older webhook versions wrap
+    # it as {"order": {...}}; accepting both keeps the mapper version-tolerant.
+    wrapped = payload.get("order")
+    order = dict(wrapped) if isinstance(wrapped, dict) else dict(payload)
+    order_id = _text(order.get("id") or order.get("order_number"))
+    if not order_id:
+        raise ValueError("WooCommerce order webhook is missing order id")
+
+    status = str(order.get("status") or "").strip().lower()
+    transaction_id = _text(order.get("transaction_id"))
+    customer_id = _text(order.get("customer_id"))
+    if customer_id == "0":
+        customer_id = None
+    click_id = extract_click_id_from_wc_order(order)
+    currency = str(order.get("currency") or "").strip().upper() or None
+    decimals = order.get("currency_minor_unit", 2)
+    trace_id = _text(delivery_id) or hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:32]
+    metadata = {
+        "native_topic": normalized_topic,
+        "native_status": status or None,
+        "native_payment_method": _text(order.get("payment_method")),
+        "native_payment_method_title": _text(order.get("payment_method_title")),
+        "native_line_items": _line_items(order),
+        "native_discount_total": order.get("discount_total"),
+        "native_shipping_total": order.get("shipping_total"),
+        "native_total_tax": order.get("total_tax"),
+        "webhook_delivery_id": _text(delivery_id),
+    }
+    metadata = {key: value for key, value in metadata.items() if value not in (None, [], {})}
+
+    event_types: List[str]
+    if status == "cancelled":
+        event_types = ["order.cancelled"]
+    elif status == "failed":
+        event_types = ["payment.failed"]
+    elif status == "refunded":
+        event_types = ["refund.succeeded"]
+    elif status in _PAID_STATUSES or order.get("date_paid_gmt") or order.get("date_paid"):
+        event_types = ["order.created", "order.paid"]
+    else:
+        event_types = ["order.created"]
+
+    events = []
+    for event_type in event_types:
+        if event_type == "order.created":
+            event_occurred = _occurred_at(
+                order.get("date_created_gmt"),
+                order.get("date_created"),
+            )
+        elif event_type == "order.paid":
+            event_occurred = _occurred_at(
+                order.get("date_paid_gmt"),
+                order.get("date_paid"),
+                order.get("date_modified_gmt"),
+                order.get("date_modified"),
+            )
+        else:
+            event_occurred = _occurred_at(
+                order.get("date_modified_gmt"),
+                order.get("date_modified"),
+                order.get("date_created_gmt"),
+                order.get("date_created"),
+            )
+        amount_value = order.get("total_refunded") if event_type.startswith("refund.") else order.get("total")
+        stable_entity = (
+            transaction_id
+            if event_type.startswith("payment.") and transaction_id
+            else f"{order_id}:refund"
+            if event_type.startswith("refund.")
+            else order_id
+        )
+        events.append(
+            MerchantCommerceEvent(
+                event_id=_entity_event_id(store_id, event_type, stable_entity),
+                event_type=event_type,
+                occurred_at=event_occurred,
+                platform="woocommerce",
+                source="woocommerce_webhook",
+                store_id=store_id,
+                buyer_id=customer_id,
+                click_id=click_id,
+                payment_id=transaction_id,
+                order_id=order_id,
+                trace_id=trace_id,
+                amount_cents=_amount_cents(amount_value, decimals),
+                currency=currency,
+                metadata=metadata,
+            )
+        )
+    return MerchantEventBatch(events=events)

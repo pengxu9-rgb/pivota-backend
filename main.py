@@ -380,6 +380,7 @@ from routes.merchant_events import router as merchant_events_router
 from routes.cafe24_integration import router as cafe24_integration_router
 from routes.magento_integration import router as magento_integration_router
 from routes.cafe24_webhooks import router as cafe24_webhooks_router
+from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
 from routes.ap2_trusted_issuers_admin import router as ap2_trusted_issuers_admin_router
 from routes.external_offers import router as external_offers_router
@@ -1286,6 +1287,7 @@ app.include_router(merchant_events_router)  # Platform-neutral Agent Commerce ev
 app.include_router(cafe24_integration_router)  # Cafe24 OAuth/manual connection and catalog adapter
 app.include_router(magento_integration_router)  # Magento/Adobe Commerce native REST catalog adapter
 app.include_router(cafe24_webhooks_router)  # Cafe24 Data Bridge + order lifecycle events
+app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order lifecycle events
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)
 app.include_router(ap2_trusted_issuers_admin_router)  # AP2 trusted-issuer enrollment (#1495) — global tier + per-agent, proof-of-control
 app.include_router(external_offers_router)  # External offers (fetch/cache OG/JSON-LD for external-only products)
