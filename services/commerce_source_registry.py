@@ -65,6 +65,14 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
         "storefront",
         CommerceSourceCapabilities(catalog_pull=True),
     ),
+    # SCAPI Shopper Search/Products is a native, site-scoped sellable catalog
+    # source. Checkout and event capabilities remain unclaimed until their
+    # separate SLAS basket/order and integration-event contracts are wired.
+    "salesforce_commerce_cloud": CommerceSourceDefinition(
+        "salesforce_commerce_cloud",
+        "storefront",
+        CommerceSourceCapabilities(catalog_pull=True),
+    ),
     "shopline": CommerceSourceDefinition(
         "shopline", "storefront", CommerceSourceCapabilities(catalog_pull=True)
     ),

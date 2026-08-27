@@ -20,6 +20,7 @@ from adapters.bigcommerce_adapter import (
 )
 from adapters.cafe24_adapter import Cafe24ProductAdapter
 from adapters.magento_adapter import MagentoProductAdapter
+from adapters.sfcc_adapter import SalesforceCommerceCloudProductAdapter
 from adapters.shopline_adapter import ShoplineProductAdapter
 from adapters.shoplazza_adapter import ShoplazzaProductAdapter
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
@@ -2036,6 +2037,7 @@ PLATFORM_ADAPTERS = {
     "bigcommerce": BigCommerceProductAdapter,
     "cafe24": Cafe24ProductAdapter,
     "magento": MagentoProductAdapter,
+    "salesforce_commerce_cloud": SalesforceCommerceCloudProductAdapter,
     "shopline": ShoplineProductAdapter,
     "shoplazza": ShoplazzaProductAdapter,
 }
@@ -2126,6 +2128,20 @@ async def fetch_merchant_products(
             store_view_code=credentials.get("store_view_code", "default"),
             currency=credentials.get("currency", "USD"),
             product_url_suffix=credentials.get("product_url_suffix"),
+        )
+    elif platform == "salesforce_commerce_cloud":
+        return await adapter_class.fetch_products(
+            short_code=credentials.get("short_code"),
+            organization_id=credentials.get("organization_id"),
+            site_id=credentials.get("site_id"),
+            client_id=credentials.get("client_id"),
+            client_secret=credentials.get("client_secret"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            currency=credentials.get("currency", "USD"),
+            locale=credentials.get("locale"),
+            storefront_url=credentials.get("storefront_url", ""),
         )
     elif platform == "shopline":
         return await adapter_class.fetch_products(
