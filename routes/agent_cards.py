@@ -53,6 +53,25 @@ class CardIssueRequest(BaseModel):
     recommendation_id: Optional[str] = Field(default=None, max_length=64)
 
 
+def _snapshot_with_headroom(quote: Dict[str, Any], cap: Dict[str, Any]) -> Dict[str, Any]:
+    """The merchant's quote record, plus why the cap differs from it.
+
+    TOLERATES A NON-DICT SNAPSHOT. `resolve_merchant_quote` always builds a dict, but the
+    previous line spread it — so a `None`, a list, or a string reached `json.dumps` as a
+    TypeError and a 500. `cap_for_quote`, two lines earlier in the same request, explicitly
+    fail-closes against exactly this ("an older cached shape, a hand-built dict, a future
+    refactor"); this had no business being stricter than its own neighbour.
+
+    OUR KEY WINS. The snapshot carries merchant-controlled VALUES (`totals` is arbitrary
+    merchant JSON), and while it does not today carry merchant-controlled KEYS, the audit field
+    must not be shadowable if that ever changes — so `headroom` is applied last, deliberately.
+    """
+    base = quote.get("quote_snapshot")
+    if not isinstance(base, dict):
+        base = {"unexpected_snapshot_shape": repr(base)[:200]}
+    return {**base, "headroom": cap}
+
+
 def _card_view(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "card_id": row["card_id"],
@@ -131,7 +150,7 @@ async def issue_card(
             # tell" is a decline waiting to happen. `ceiling` vs `flat_plus_bps` is the signal for
             # whether the ceiling ever engages at real order sizes — the question #1923 left open
             # about its own defaults, and the one this record exists to answer.
-            "quote_snapshot": json.dumps({**quote["quote_snapshot"], "headroom": cap}),
+            "quote_snapshot": json.dumps(_snapshot_with_headroom(quote, cap)),
             "issuer": issuer.name,
             "single_use": True,
             "expires_at": expires_at,

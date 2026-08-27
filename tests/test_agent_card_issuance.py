@@ -453,3 +453,88 @@ def test_the_two_kinds_of_ZERO_headroom_are_distinguishable(rig, quote_extra, ex
     p = state["creates"][-1]
     assert p["amount_cap_minor"] == p["quote_total_minor"] == 2317
     assert _json.loads(p["quote_snapshot"])["headroom"]["headroom_basis"] == expected_basis
+
+
+def test_the_merchant_quote_carries_the_ROWS_currency(rig):
+    """SURVIVOR: hardcoding `"USD"` in `merchant_quote` passed all 163 card-rail tests.
+
+    The suite had a JPY case, but it asserted only on the INSERT params — no test ever RENDERED
+    a non-USD card view. A regression here reports a ¥ quote as dollars on the exact surface this
+    change exists to make readable.
+    """
+    client, state = rig
+    state["quote"] = {
+        "total_minor": 2317,
+        "currency": "JPY",
+        "covers_shipping": False,
+        "covers_tax": False,
+        "quote_snapshot": {"totals": []},
+    }
+    r = _post(client)
+    assert r.status_code == 200
+    card = r.json()["card"]
+    assert card["merchant_quote"]["currency"] == "JPY"
+    assert card["amount_cap"]["currency"] == "JPY"
+
+
+def test_a_missing_quote_column_FAILS_LOUDLY_rather_than_reporting_zero(rig, monkeypatch):
+    """SURVIVOR: `row["quote_total_minor"]` -> `row.get(..., 0)` passed the whole suite.
+
+    The two differ only when the column is absent — which `get_card` guarantees it is not, since
+    it SELECTs the column and migration 201 declares it NOT NULL. That makes the strict form
+    correct rather than merely stylistic, and this pins WHY: a defensive `.get()` would report a
+    $0.00 merchant quote on schema drift, with CI green. Loud is the right failure here.
+    """
+    import routes.agent_cards as mod
+
+    with pytest.raises(KeyError):
+        mod._card_view({
+            "card_id": "crd_1", "status": "issued", "merchant_domain": "shop.example.com",
+            "checkout_id": "chk_1", "amount_cap_minor": 4095, "currency": "USD",
+            "single_use": True, "expires_at": None,
+        })
+
+
+def test_the_headroom_record_cannot_be_shadowed_by_merchant_data(rig):
+    """SURVIVOR: reversing the merge order passed the suite.
+
+    It is equivalent only because the snapshot happens to carry three literal keys today and the
+    merchant controls VALUES, not keys. If that ever changes, the reversed order lets merchant
+    data overwrite the audit field — so the precedence is asserted rather than left incidental.
+    """
+    import json as _json
+
+    client, state = rig
+    state["quote"] = {
+        "total_minor": 2317,
+        "currency": "USD",
+        "covers_shipping": False,
+        "covers_tax": False,
+        # a snapshot that already claims the key our audit field uses
+        "quote_snapshot": {"totals": [], "headroom": "merchant-supplied nonsense"},
+    }
+    r = _post(client)
+    assert r.status_code == 200
+    snap = _json.loads(state["creates"][-1]["quote_snapshot"])
+    assert snap["headroom"]["headroom_basis"] == "flat_plus_bps"
+
+
+@pytest.mark.parametrize("bad", [None, [], "not-a-dict", 42])
+def test_a_non_dict_snapshot_does_not_500_the_mint(rig, bad):
+    """The previous spread raised a TypeError as a 500 on shapes `json.dumps` used to accept.
+
+    `cap_for_quote`, two lines earlier in the same request, explicitly fail-closes against this
+    same class of drift; the snapshot write had no business being stricter than its neighbour.
+    """
+    import json as _json
+
+    client, state = rig
+    state["quote"] = {
+        "total_minor": 2317, "currency": "USD",
+        "covers_shipping": False, "covers_tax": False, "quote_snapshot": bad,
+    }
+    r = _post(client)
+    assert r.status_code == 200
+    snap = _json.loads(state["creates"][-1]["quote_snapshot"])
+    assert snap["headroom"]["headroom_minor"] == 1778
+    assert "unexpected_snapshot_shape" in snap
