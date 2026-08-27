@@ -6,7 +6,8 @@ name: Backend Test Sweep
 # some workflow, 7 belong to the Postgres dialect gate — leaving **785 (89.6%)**
 # that no CI job executed. A green PR check said almost nothing about this repo.
 #
-# It was not cost. This job executes **9,219 tests in ~137s on CI** (72s locally).
+# It was not cost. At introduction this job executed **9,219 tests in ~137s on
+# CI** (72s locally); current counts live beside FLOOR in the assert step below.
 # Roughly two minutes of compute was the entire distance between "CI is green"
 # and "CI means something".
 #
@@ -181,8 +182,9 @@ jobs:
       # The sibling failure this guards against: a glob that matches nothing, or
       # an --ignore typo'd into a directory, exits 0 having run almost nothing and
       # reports green. `postgres-dialect-gate.yml` solves this by failing on ANY
-      # skip; that cannot work here, because this suite has ~24 LEGITIMATE
-      # env-gated skips (migration harness, Postgres e2e). So the equivalent
+      # skip; that cannot work here, because this suite has LEGITIMATE
+      # env-gated skips (migration harness, Postgres e2e; 33 at the 2026-08-26
+      # calibration). So the equivalent
       # protection is a FLOOR on tests actually executed, plus per-subtree floors.
       #
       # ⚠️ THE FIRST VERSION OF THIS COMMENT WAS FALSE. It claimed 7,500 was
@@ -195,8 +197,10 @@ jobs:
       # FILENAME in --ignore is harmless (pytest ignores nonexistent paths and
       # the test still runs), while a valid DIRECTORY is silent.
       #
-      # So: floor raised to 9,000 against a measured 9,257 (re-derived on this
-      # branch, not carried forward — see the calibration warning below), AND
+      # So: floor raised to 12,000 against a measured 12,245 executed (recalibrated
+      # 2026-08-26 from a green main run of THIS workflow — 12,278 collected,
+      # 33 skipped; the previous 9,000 floor had grown ~3,200 of slack, more than
+      # tests/services itself, i.e. exactly the "not a floor" hole above), AND
       # per-subtree
       # minimums, because a single global number cannot notice one tree leaving.
       # Raise these when the real numbers grow; never lower one to green a build.
@@ -205,10 +209,14 @@ jobs:
         run: |
           python - <<'PY'
           import sys, collections, xml.etree.ElementTree as ET
-          FLOOR = 9000
+          FLOOR = 12000
           # Per-subtree minimums. A single global number cannot notice ONE tree
-          # leaving — the hole review demonstrated. Measured 2026-07-29 under
-          # THIS EXACT command: tests.services=1636, readiness.tests=64.
+          # leaving — the hole review demonstrated. Measured 2026-08-26 from a
+          # green main CI run of this workflow (not a local run, whose env-gated
+          # skips differ): tests.services=1682, readiness.tests=79. A green MAIN
+          # run is a valid source only while the pytest invocation is untouched;
+          # a PR that edits the command must calibrate against its own branch's
+          # CI run of the modified workflow — see the ⚠️ below.
           #
           # ⚠️ Calibrate against the FINAL command, not an earlier one. My first
           # cut set readiness.tests>=90 from a run that used --ignore on
@@ -216,7 +224,7 @@ jobs:
           # would have failed the GREEN build. Caught before merge only because
           # the clean and mutant runs were compared side by side — a guard is
           # not verified until it has been run against a passing build too.
-          SUBTREES = {'tests.services': 1400, 'readiness.tests': 50}
+          SUBTREES = {'tests.services': 1600, 'readiness.tests': 70}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
