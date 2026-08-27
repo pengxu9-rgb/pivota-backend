@@ -376,3 +376,51 @@ def test_search_index_key_IS_mounted_once_the_lane_is_armed(tmp_path):
         "commerce-index-search-index",
     )
     assert "CATALOG_SERVING_INDEX_API_KEY=CATALOG_SERVING_INDEX_API_KEY:latest" in secrets
+
+
+def test_no_args_value_beginning_with_a_dash_uses_the_space_form():
+    """`--args "-m,..."` is rejected by gcloud, and the plan-shim cannot catch it.
+
+    gcloud's parser reads a value beginning with `-` as the next FLAG and fails with
+    "argument --args: expected one argument". The `--args=` form binds it.
+
+    Confirmed against prod 2026-08-26: the reconcile aborted at
+    derive-offer-market-currency AFTER already updating ten jobs, so this is not a
+    cosmetic preference — it makes those job definitions permanently un-updatable by the
+    script, and it fails halfway through rather than up front.
+
+    This is a SOURCE-TEXT assertion on purpose. The behavioural harness records what the
+    script *would* invoke; it cannot reproduce gcloud's own argument parsing, so it is
+    structurally blind to this class. A source check is the only thing that catches it
+    before someone runs the script against production.
+    """
+    src = (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text(encoding="utf-8")
+    # Join backslash continuations FIRST. Review found the evasion: splitting
+    # `--args` from its value across two continued lines left the inspected line
+    # ending in `\`, so the extracted "value" was a backslash and the guard
+    # passed while gcloud still got the broken space form.
+    joined, buf = [], ""
+    for raw in src.splitlines():
+        buf += raw[:-1] + " " if raw.rstrip().endswith("\\") else raw
+        if not raw.rstrip().endswith("\\"):
+            joined.append(buf); buf = ""
+    if buf:
+        joined.append(buf)
+    offenders = []
+    for i, line in enumerate(joined, 1):
+        stripped = line.strip()
+        if not stripped.startswith("--args ") and " --args " not in stripped:
+            continue
+        # the value gcloud would receive, after `--args `
+        value = stripped.split("--args ", 1)[1].lstrip()
+        if value[:1] in ("'", '"'):
+            value = value[1:]
+        if value.startswith("-") or value.startswith("$"):
+            # `$VAR` is equally unsafe: the shell expands it before gcloud sees it, so a
+            # variable holding "-m,..." fails exactly the same way.
+            offenders.append(f"{i}: {stripped[:90]}")
+    assert not offenders, (
+        "these --args use the space-separated form with a value that begins with '-' "
+        "(or a variable that may): gcloud will reject them. Use --args=<value>.\n  "
+        + "\n  ".join(offenders)
+    )

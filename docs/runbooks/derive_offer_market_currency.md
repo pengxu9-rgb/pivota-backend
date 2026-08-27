@@ -57,16 +57,36 @@ seed refresh between the two can move offers between domain groups:
 
 ```bash
 gcloud run jobs execute derive-offer-market-currency --region us-west1 --project pivota-prod --wait \
-  --args '-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25'
+  --args='-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25'
 ```
 
 Then apply, restricted to the domains you actually reviewed. `--only-domain` is
-repeatable and is the safe form — it is what the old `only_domains` input built:
+the safe form — it is what the old `only_domains` input built.
+
+**ONE DOMAIN PER EXECUTION.** `--only-domain` is `action="append"`, so more than
+one domain means repeating the flag — and gcloud's `--args` is an ArgList that
+**refuses a repeated element**:
+
+```
+ERROR: (gcloud.run.jobs.execute) argument --args: "--only-domain" cannot be specified multiple times
+```
+
+That is a gcloud parser limit, not a script limit, and the alternate delimiter
+below does not help — `--args='^:^…:--only-domain:a:--only-domain:b'` fails
+identically. So run the job once per reviewed domain:
 
 ```bash
-gcloud run jobs execute derive-offer-market-currency --region us-west1 --project pivota-prod --wait \
-  --args '-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25,--only-domain,mintree.us,--only-domain,upcirclebeauty.com,--apply'
+for d in mintree.us upcirclebeauty.com; do
+  gcloud run jobs execute derive-offer-market-currency --region us-west1 --project pivota-prod --wait \
+    --args="-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25,--only-domain,$d,--apply"
+done
 ```
+
+Each execution re-runs the classification and applies only to `$d`, so the loop
+is equivalent to the one-shot form the dispatch input used to build — just N
+scans instead of one. Do NOT work around it by dropping `--only-domain`; that
+applies to every classified domain, which is the blast radius this step exists
+to avoid.
 
 Three things to know before you press it:
 
@@ -74,7 +94,12 @@ Three things to know before you press it:
   flat comma-separated string. No current flag value contains a comma; if one
   ever does, use gcloud's alternate delimiter (`--args=^:^a:b`) rather than
   quoting. `scripts/ops/run_oneoff_job.sh` already picks a delimiter that does
-  not occur in the payload.
+  not occur in the payload. The delimiter changes only the SPLIT character — it
+  does not lift the no-repeated-element rule above, so it is no help for a
+  repeatable flag.
+* **Use `--args=`, never `--args `.** A value beginning with `-` (every one here
+  starts `-m`) is read as the next flag in the space-separated form:
+  `argument --args: expected one argument`.
 * **Omitting `--only-domain` applies to every classified domain** in the report,
   up to `--max-domains`. That is a much bigger blast radius than the dispatch
   form's blank-means-all default made obvious.
@@ -96,7 +121,7 @@ and never overwrites, but it was never scheduled and should not be:
 
 ```bash
 gcloud run jobs execute audit-domainless-offer-currency --region us-west1 --project pivota-prod --wait \
-  --args '-m,scripts.audit_domainless_offer_currency,--apply,--confirm,AUDIT_DOMAINLESS_OFFER_CURRENCY'
+  --args='-m,scripts.audit_domainless_offer_currency,--apply,--confirm,AUDIT_DOMAINLESS_OFFER_CURRENCY'
 ```
 
 ## Why this is not a GitHub Actions workflow any more

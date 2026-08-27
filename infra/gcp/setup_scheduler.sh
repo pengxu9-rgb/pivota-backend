@@ -492,7 +492,7 @@ echo "== job: derive-offer-market-currency (GH Actions cron 11 9 * * 1)"
 # Baking --apply into these args would convert a report into an unattended
 # relabel of live offer currencies. The manual apply path is now
 #   gcloud run jobs execute derive-offer-market-currency --region "$REGION" \
-#     --project "$PROJECT" --wait --args '-m,scripts.backfill_offer_market_currency,...,--apply'
+#     --project "$PROJECT" --wait --args='-m,scripts.backfill_offer_market_currency,...,--apply'
 # which OVERRIDES these args; see docs/runbooks/derive_offer_market_currency.md
 # for the reviewed-subset form (`--only-domain`) the workflow's `only_domains`
 # input used to build.
@@ -519,12 +519,22 @@ echo "== job: derive-offer-market-currency (GH Actions cron 11 9 * * 1)"
 # The workflow uploaded reports/workflow_ops/.../run.log as an artifact. Cloud
 # Run Jobs have no artifact store; both scripts already print the whole report
 # to stdout, so it lands in Cloud Logging instead — see the runbook for the read.
+# `--args=` NOT `--args `, here and at audit-domainless-offer-currency and the destination
+# sweep. The value starts with `-m`, and in the space-separated form gcloud's parser reads that
+# as the next FLAG and fails with "argument --args: expected one argument". Confirmed against
+# prod 2026-08-26: the reconcile aborted here after already updating ten jobs, so those three
+# job definitions were simply not updatable by this script. Any --args value beginning with `-`
+# needs the `=` form; tests/test_setup_scheduler_is_safe_to_rerun.py refuses the other spelling.
+#
+# NB a comment must never sit between the backslash-continued lines below: it silently ends the
+# command, and `bash -n` still passes. That is how the first draft of this fix truncated the
+# invocation and reddened ten unrelated tests.
 mkjob derive-offer-market-currency "$BACKEND_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=derive-offer-market-currency,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
   --task-timeout 1800s \
   --command python \
-  --args "-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25"
+  --args="-m,scripts.backfill_offer_market_currency,--min-offers,3,--max-domains,25"
 
 echo "== job: audit-domainless-offer-currency (companion report of the same GH lane)"
 # The SECOND step of the same deleted workflow, and a separate Job because a
@@ -556,7 +566,7 @@ mkjob audit-domainless-offer-currency "$BACKEND_IMAGE" "$SA" \
   --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=audit-domainless-offer-currency,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2" \
   --task-timeout 1800s \
   --command python \
-  --args "-m,scripts.audit_domainless_offer_currency"
+  --args="-m,scripts.audit_domainless_offer_currency"
 echo "== job: agent-pdp-orphan-reaper (GH Actions cron 37 4 * * *)"
 # Migrated from .github/workflows/agent-pdp-orphan-reaper.yml, deleted in the
 # same commit, for the same reason as content-canonical-election above: Cloud SQL
@@ -715,7 +725,7 @@ if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
     --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
     --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
     --task-timeout 3600s \
-    --command python --args "$SWEEP_ARGS"
+    --command python --args="$SWEEP_ARGS"
 else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
 fi
