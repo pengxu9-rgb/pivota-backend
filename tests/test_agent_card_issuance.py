@@ -55,7 +55,16 @@ def rig(monkeypatch: pytest.MonkeyPatch):
     state: Dict[str, Any] = {
         # 2317 is deliberately odd and appears nowhere else: a mutant hardcoding the cap,
         # doubling it, or reading it from anything but the quote cannot echo it by accident.
-        "quote": {"total_minor": 2317, "currency": "USD", "quote_snapshot": {"totals": []}},
+        # The coverage keys are what `resolve_merchant_quote` really returns; their ABSENCE is
+        # now a distinct fail-closed case (no headroom), covered in test_agent_card_cap_headroom.
+        # This default is B7's measured live shape: a bare subtotal, neither component quoted.
+        "quote": {
+            "total_minor": 2317,
+            "currency": "USD",
+            "covers_shipping": False,
+            "covers_tax": False,
+            "quote_snapshot": {"totals": []},
+        },
         "issuer": _Issuer(),
         "creates": [],
         "created_id": "will-be-set",

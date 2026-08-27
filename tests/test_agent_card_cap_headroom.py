@@ -26,7 +26,10 @@ from services.agent_card_issuance import cap_for_quote, headroom_policy, quote_c
 
 
 def _quote(total_minor: int, **kw):
-    return {"total_minor": total_minor, "currency": "USD", **kw}
+    # covers_* present by default: their ABSENCE is now its own (fail-closed) case, tested below.
+    base = {"total_minor": total_minor, "currency": "USD", "covers_shipping": False, "covers_tax": False}
+    base.update(kw)
+    return base
 
 
 # ------------------------------------------------------------------ what the quote already covers
@@ -151,3 +154,189 @@ def test_a_malformed_policy_value_falls_back_to_the_default(monkeypatch, bad):
     """Fail to the published default, never to zero (silent declines) or to something unbounded."""
     monkeypatch.setenv("AGENT_CARD_HEADROOM_MAX_MINOR", bad)
     assert headroom_policy()["max_minor"] == 7500
+
+
+# ------------------------------------------------------ the seam nothing was executing
+
+class _FakeResp:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return {"jsonrpc": "2.0", "id": "1", "result": {"structuredContent": self._payload}}
+
+
+class _FakeClient:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None):
+        return _FakeResp(self._payload)
+
+
+async def _quote_from(monkeypatch, payload):
+    """Drive the REAL resolve_merchant_quote, faking only the HTTP transport."""
+    import httpx
+
+    from services import agent_card_issuance as mod
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeClient(payload))
+    # The SSRF guard is a live-DNS dependency, not the thing under test here, and it makes these
+    # rows flaky. It keeps its own coverage in tests/test_agent_card_issuance.py.
+    monkeypatch.setattr(mod, "resolves_only_public", lambda domain: True)
+    return await mod.resolve_merchant_quote("shop.example.com", "chk_1")
+
+
+@pytest.mark.asyncio
+async def test_a_LANDED_ucp_quote_gets_no_headroom_end_to_end(monkeypatch):
+    """THE TEST WHOSE ABSENCE HID EVERYTHING ELSE.
+
+    `resolve_merchant_quote` had no direct test — every route test monkeypatches it — so
+    `quote_covers` and `cap_for_quote` were each verified in isolation while the SEAM between
+    them ran nowhere. Deleting `covers_shipping`/`covers_tax` from the returned dict, or swapping
+    them, passed all 149 card-rail tests.
+
+    The payload is spec-shaped: UCP's totals type enum is `subtotal, items_discount, discount,
+    FULFILLMENT, tax, fee, total` — `shipping`/`delivery` are only `display_text` examples. An
+    earlier cut matched the display words, so this landed quote read as unlanded and earned full
+    headroom, which is the blanket multiplier the policy exists not to be.
+    """
+    quote = await _quote_from(monkeypatch, {
+        "currency": "USD",
+        "totals": [
+            {"type": "subtotal", "amount": 2317, "display_text": "Subtotal"},
+            {"type": "fulfillment", "amount": 800, "display_text": "Shipping"},
+            {"type": "tax", "amount": 190, "display_text": "Tax"},
+            {"type": "total", "amount": 3307},
+        ],
+    })
+
+    assert quote["covers_shipping"] is True, "the spec calls shipping `fulfillment`"
+    assert quote["covers_tax"] is True
+    out = cap_for_quote(quote)
+    assert out["headroom_minor"] == 0
+    assert out["amount_cap_minor"] == quote["total_minor"] == 3307
+
+
+@pytest.mark.asyncio
+async def test_the_live_pre_address_shape_DOES_get_headroom_end_to_end(monkeypatch):
+    """The other half of the seam: B7's measured shape — a bare subtotal, tax null."""
+    quote = await _quote_from(monkeypatch, {
+        "currency": "USD",
+        "tax": None,
+        "totals": [
+            {"type": "subtotal", "amount": 2317},
+            {"type": "total", "amount": 2317},
+        ],
+    })
+
+    assert quote["covers_shipping"] is False
+    assert quote["covers_tax"] is False
+    out = cap_for_quote(quote)
+    assert out["headroom_minor"] == 1778
+    assert out["amount_cap_minor"] == 4095
+
+
+@pytest.mark.asyncio
+async def test_the_coverage_flags_are_not_swapped(monkeypatch):
+    """A mutant that swapped them survived the whole suite, because no test ever saw a payload
+    that covered one component and not the other THROUGH resolve_merchant_quote."""
+    quote = await _quote_from(monkeypatch, {
+        "currency": "USD",
+        "totals": [
+            {"type": "subtotal", "amount": 2317},
+            {"type": "fulfillment", "amount": 800},
+            {"type": "total", "amount": 3117},
+        ],
+    })
+    assert quote["covers_shipping"] is True
+    assert quote["covers_tax"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_records_what_the_cap_was_reasoned_from(monkeypatch):
+    """`quote_snapshot` is the audit trail for a cap that no longer equals the quote. Without
+    `covers` in it, nothing recoverable explains why headroom was or was not applied."""
+    quote = await _quote_from(monkeypatch, {
+        "currency": "USD",
+        "totals": [{"type": "subtotal", "amount": 2317}, {"type": "total", "amount": 2317}],
+    })
+    assert quote["quote_snapshot"]["covers"] == {"shipping": False, "tax": False}
+
+
+# ---------------------------------------------------------------- fail-closed and bounded
+
+def test_an_unknown_coverage_shape_gets_NO_headroom():
+    """`.get()` with a falsy default handed MAXIMUM headroom to any quote missing these keys.
+    On a money path the missing-key direction must be the safe one."""
+    out = cap_for_quote({"total_minor": 2317, "currency": "USD"})
+    assert out["amount_cap_minor"] == 2317
+    assert out["headroom_basis"] == "coverage_unknown"
+
+
+def test_a_non_usd_quote_gets_NO_headroom():
+    """`flat_minor`/`max_minor` are raw minor units calibrated in USD. 1500 minor is $15.00, but
+    ¥1,500 and ₩1,500 are entirely different amounts. Until non-USD has its own calibration the
+    honest answer is v1's, which cannot overspend."""
+    out = cap_for_quote(_quote(2317, currency="JPY", covers_shipping=False, covers_tax=False))
+    assert out["amount_cap_minor"] == 2317
+    assert out["headroom_basis"] == "currency_not_calibrated"
+
+
+def test_the_cap_cannot_be_pushed_past_the_absolute_bound(monkeypatch):
+    """`_MAX_CAP_MINOR` keeps a hostile merchant total inside BIGINT so it refuses cleanly
+    instead of raising a Postgres 22003 as a 500 — but it is enforced on the QUOTE, and headroom
+    is added afterwards. Two misconfigured env vars were enough to clear it."""
+    from services.agent_card_issuance import _MAX_CAP_MINOR
+
+    monkeypatch.setenv("AGENT_CARD_HEADROOM_FLAT_MINOR", str(10**18))
+    monkeypatch.setenv("AGENT_CARD_HEADROOM_MAX_MINOR", str(10**18))
+    out = cap_for_quote(_quote(_MAX_CAP_MINOR))
+    assert out["amount_cap_minor"] <= _MAX_CAP_MINOR
+
+
+@pytest.mark.parametrize("bad", [str(10**18), "-5"])
+def test_an_out_of_range_policy_value_falls_back_to_the_default(monkeypatch, bad):
+    monkeypatch.setenv("AGENT_CARD_HEADROOM_MAX_MINOR", bad)
+    assert headroom_policy()["max_minor"] == 7500
+
+
+# ------------------------------------------------- tolerance for non-conformant merchants
+
+@pytest.mark.parametrize(
+    "totals_type,component",
+    [
+        ("fulfillment", "shipping"),  # the SPEC's wire name — the one that must never be dropped
+        ("shipping", "shipping"),     # the display word, used by merchants that ignore the enum
+        ("delivery", "shipping"),     # the other display word the gateway's indexTotals accepts
+        ("tax", "tax"),
+        ("taxes", "tax"),             # plural, likewise from the gateway's alias list
+    ],
+)
+def test_each_accepted_spelling_is_actually_accepted(totals_type, component):
+    """Every alias is either load-bearing or dead weight, and an untested one is indistinguishable
+    from the second. Mutants dropping `delivery` and `taxes` survived until these rows existed —
+    the aliases were carried over from the gateway's `indexTotals` on faith.
+
+    The spec permits `Businesses MAY use additional values`, so tolerating the display spellings
+    is right; asserting them is what keeps that a decision rather than an accident.
+    """
+    covers = quote_covers({"totals": [{"type": totals_type, "amount": 500}]})
+    assert covers[component] is True
+
+
+@pytest.mark.parametrize("raw", ["Fulfillment", "  fulfillment  ", "FULFILLMENT", "\tTax\n"])
+def test_the_totals_type_key_is_normalised(raw):
+    """`type` is a free-text string in the schema, so casing and stray whitespace are the
+    merchant's to choose. Dropping `.strip().lower()` survived the suite — and would have turned
+    a landed `"Fulfillment"` quote into an unlanded one earning full headroom."""
+    covers = quote_covers({"totals": [{"type": raw, "amount": 500}]})
+    assert covers["shipping"] is True or covers["tax"] is True
