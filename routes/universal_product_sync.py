@@ -593,6 +593,27 @@ def prepare_platform_credentials(platform: str, store_info: Dict) -> Optional[Di
                     "access_token": api_key_data,
                     "client_id": ""
                 }
+
+    elif platform == "cafe24":
+        domain = store_info.get("domain")
+        api_key_data = (
+            store_info.get("api_credentials")
+            or store_info.get("api_key_raw")
+            or store_info.get("api_key")
+        )
+        if domain and api_key_data:
+            try:
+                credentials = (
+                    json.loads(api_key_data)
+                    if isinstance(api_key_data, str)
+                    else dict(api_key_data)
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            credentials["mall_id"] = credentials.get("mall_id") or str(domain).split(".", 1)[0]
+            credentials["store_id"] = store_info.get("store_id")
+            if credentials.get("access_token"):
+                return credentials
     
     # Add more platforms as needed
     logger.warning(f"Platform {platform} not yet implemented in credential preparation")

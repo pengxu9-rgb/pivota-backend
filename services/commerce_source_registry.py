@@ -56,6 +56,7 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
     "wix": CommerceSourceDefinition("wix", "storefront", _CATALOG_CAPABILITIES),
     "woocommerce": CommerceSourceDefinition("woocommerce", "storefront", _CATALOG_CAPABILITIES),
     "bigcommerce": CommerceSourceDefinition("bigcommerce", "storefront", _CATALOG_CAPABILITIES),
+    "cafe24": CommerceSourceDefinition("cafe24", "storefront", _CATALOG_CAPABILITIES),
     # Square is retained because the existing sync endpoint accepts its credentials;
     # its fetch adapter can be enabled independently of this policy contract.
     "square": CommerceSourceDefinition("square", "storefront", _CATALOG_CAPABILITIES),
