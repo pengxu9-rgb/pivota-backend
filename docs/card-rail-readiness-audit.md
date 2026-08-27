@@ -263,36 +263,64 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 
 ## 4. Prioritized backlog
 
-> **VERIFIED STATE — re-checked 2026-08-25 against `origin/main` @ `4459f88e` and against live GCP.**
-> Every line below was confirmed by a POSITIVE check (the symbol exists / the env var reads / the
-> scheduler job answers), not by the absence of a grep hit. Two earlier passes of this section got
-> that wrong in both directions, so the method matters more than the table.
+> **VERIFIED STATE — re-checked 2026-08-26 against `origin/main` @ `d5ae50cd`.**
+> Every line was confirmed by a POSITIVE check (the symbol exists, the flag's default reads,
+> the scheduler file contains the entry), never by the absence of a grep hit. The previous pass
+> was dated against `4459f88e` and had gone stale in both directions.
 >
-> **8 of 17 complete · 4 built-but-inert · 5 not started.** Item 6 (live verification)
-> shipped 2026-08-25 as `services/live_offer_verification.py`, wired into `offers.resolve`
-> behind `LIVE_OFFER_VERIFICATION_ENABLED` (default OFF).
+> **7 complete · 2 built-but-dark · 2 partial · 1 closed as not-buildable · 4 not done.**
 >
 > | | items | state |
 > |---|---|---|
-> | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints AND is accepted back; the refresh can correct a stale price; dedicated crawl egress is live in staging AND prod; all 7 execution-spec fields ship; every one of the six third-party crawl lanes goes through the politeness gate; `card_rail_outcomes` + `POST /agent/v1/outcomes` exist and are mounted. |
-> | **Built, switched off** | 3, 14 | The UCP probe lane and `scheduled_ucp_reprobe` exist in code, but `store-audit-commerce-reprobe-enqueue-cron` reads **PAUSED** in prod and has no counterpart in staging. There is still **no per-row `last_crawled_at`** anywhere in `db/` or `services/`. |
-> | **Partial** | 4, 7 | Variant-id coverage **60.5%** and close to its ceiling (§4 note). Warm handoff is **ENABLED in prod** — but on the original **6** brands, not the Tier-1 cohort item 7 asks for. |
-> | **Not started** | 9, 11, 13, 15, 16 | Live top-3 verification; landed total via UCP; promo codes in the spec; `p_complete` into ranking; the reco-latency work (also unmeasured post-cutover); 3C cohort seeding. |
+> | **Complete** | 1, 2, 3a, 5, 8, 10, 12 | `recommendation_id` mints and is accepted back (`routes/card_rail_outcomes.py`, mounted at `main.py:1322`); the refresh can correct a stale price; dedicated crawl egress live; the execution spec has grown **7 → 14 fields**; every third-party crawl lane goes through the politeness gate; attribution rides the agent's own lane. |
+> | **Built, DARK** | 6, 14 | `LIVE_OFFER_VERIFICATION_ENABLED` still defaults to `"false"`. Item 14 advanced a long way on 2026-08-26 — crawl-recency ordering with a separate attempt clock (#1884), a `stale_snapshot` gate the refresh can actually clear (#1890), and batch pacing (#1898) — but `infra/gcp/setup_scheduler.sh` contains **no entry for `external_referral_refresh`**, so nothing runs it. |
+> | **Partial** | 4, 7 | Variant coverage **60.5%** and near its ceiling. Warm handoff is enabled in prod on the original **6** brands, not the Tier-1 cohort. |
+> | **Closed — NOT BUILDABLE** | 11 | Promo codes. We hold no code inventory (`catalog_promotions.code` was dropped under ADR-022), and UCP applies codes but cannot discover them. See the note under Wave 4. |
+> | **Not done** | 9, 13, 15, 16 | Item 9's backend half was withdrawn, not shipped — `services/outbound_warm_handoff.py:424` still reads *"NO VARIANT HINT IS SENT, AND NONE CAN BE."* Item 13's `ranking_w_business` knob exists but is unset and unfed. |
 >
-> **What this means for the milestone.** The *plumbing* is done: an agent can be handed a spec that
-> says exactly where a buyer lands and what will be in the cart, and it can report back what
-> happened. What is NOT done is the thing this audit named as the real obstacle in §1 — **index
-> staleness**. Item 6 (live verification) now EXISTS but ships inert — arming it is a deliberate act because it adds request-path egress on the shared crawl IP; item 14
-> (the freshness floor) exists as code but is paused and lacks the per-row freshness field it was
-> specified with. Nothing currently prevents the 31.1% wrong-spec rate from reaching a buyer.
+> **What this means for the milestone.** The plumbing is done and the *correctness* work is not
+> switched on. §1 named index staleness as the real obstacle and A5 measured a **31.1%**
+> wrong-or-unexecutable spec rate; the two mechanisms that address it (item 6 live verification,
+> item 14 the freshness floor) are both dark. Arming either adds request-path or scheduled crawl
+> egress against third-party merchants, so it is a deliberate act — but until one of them runs,
+> nothing stops a wrong spec reaching a buyer.
 >
-> **One correction to an earlier finding.** I previously recorded the click-time warm-handoff
-> interaction as "latent, not live" because `OUTBOUND_WARM_HANDOFF_ENABLED` defaults to false. It
-> reads **true in prod** with the internal key set. The interaction was reconciled independently
-> (`could_upgrade_at_click_time` — the spec now answers `null` rather than a `false` the lane could
-> contradict, with a runbook at `docs/runbooks/outbound_warm_handoff_rollout.md`). A documented
-> residual remains: widening the brand allowlist invalidates `false` answers on tokens minted
-> before the widening and still inside their 7-day TTL. That matters for item 7.
+> **THE HANDOFF MODEL DECIDES WHICH GAPS MATTER, and this audit had assumed the wrong one.**
+> Clarified 2026-08-26: Minds is an **orchestration layer** and Reap is the agent that **fills
+> shipping and card details on the merchant's own checkout page**. Pivota therefore does not need
+> to complete an order at all — it needs to hand over a prefilled, ready-to-checkout link plus a
+> spend cap. That reading changes the readiness verdict in both directions:
+>
+> * **Better than recorded.** The whole `complete_checkout_session` / payment-authz analysis
+>   (`PAYMENT_ISSUERS_JSON` holding only a canary, `create_payment_link` having no `ucpTool`
+>   name) describes the **PSP rail, which this model does not use.** Those are not blockers here.
+>   What the model needs, Pivota already emits: `execution_spec.cart_url` is a Shopify cart
+>   permalink, and a live probe on 2026-08-26 confirmed it answers **302 straight to a
+>   `/checkout/cn/<token>` page** — a real checkout, not a cart view — while preserving
+>   `attributes[pivota_click_id]`. Reap lands exactly where it needs to type.
+> * **Worse than recorded — A REAL ARCHITECTURAL GAP.** The card mint cannot serve that link.
+>   `CardIssueRequest` requires a **UCP `checkout_id`** and `resolve_merchant_quote` reads the
+>   total via `get_checkout` on the *merchant's own* UCP door. A cart permalink is a storefront
+>   URL and produces **no `checkout_id`** — nothing in the repo bridges the two. The card rail
+>   and the link rail are currently two different worlds.
+> * **And the cap is derived wrongly for this model.** `routes/agent_cards.py:108` sets
+>   `amount_cap_minor = quote["total_minor"]` with the comment *"v1: cap == quote, exactly"*.
+>   B7 established that a pre-address UCP checkout returns `total === subtotal`, no shipping and
+>   `tax: null`. A card capped at exactly a pre-shipping subtotal is **declined at the moment
+>   Reap enters an address** — the one action this model exists to perform. Any cap for the
+>   storefront rail has to come from `expected_item_total` plus explicit shipping/tax headroom,
+>   because a landed total is not obtainable before an address.
+>
+> **So the shortest path to a Minds→Reap transaction is not on the Wave-4 list at all:** derive
+> the cap from the execution spec with headroom, and accept a `cart_url` (or a
+> `recommendation_id`) where the mint currently demands a `checkout_id`.
+>
+> **One correction to an earlier finding.** The click-time warm-handoff interaction was recorded
+> as "latent, not live" because `OUTBOUND_WARM_HANDOFF_ENABLED` defaults to false. It reads
+> **true in prod** with the internal key set. A documented residual remains: widening the brand
+> allowlist invalidates `false` answers on tokens minted before the widening and still inside
+> their 7-day TTL. That matters for item 7.
+
 
 ### Wave 1 — now → Sep 6. Code-only, platform-agnostic, rides the cutover for free
 
