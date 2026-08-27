@@ -60,6 +60,12 @@ def _card_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "merchant_domain": row["merchant_domain"],
         "checkout_id": row["checkout_id"],
         "amount_cap": {"amount_minor": row["amount_cap_minor"], "currency": row["currency"]},
+        # THE OTHER HALF OF THE DELTA. `amount_cap` is what the card may spend; this is what the
+        # merchant actually quoted. Since #1923 they differ by policy headroom, and an agent shown
+        # only the cap cannot tell a $23.17 order with $17.78 of headroom from a $40.95 order — it
+        # would quote the cap to the buyer as if it were the price. `get_card` already SELECTs
+        # this column; the view simply dropped it.
+        "merchant_quote": {"amount_minor": row["quote_total_minor"], "currency": row["currency"]},
         "single_use": row["single_use"],
         "expires_at": row["expires_at"],
         "reveal_handle": row.get("reveal_handle"),
@@ -118,7 +124,14 @@ async def issue_card(
             # address — the one action that flow exists to perform.
             "amount_cap_minor": cap["amount_cap_minor"],
             "currency": quote["currency"],
-            "quote_snapshot": json.dumps(quote["quote_snapshot"]),
+            # WHY, not just how much. `amount_cap_minor - quote_total_minor` recovers the size of
+            # the headroom but not its reason, and the reasons are not interchangeable:
+            # `quote_is_landed` and `currency_not_calibrated` both yield zero, and a zero that
+            # means "nothing to cover" is a healthy quote while a zero that means "we could not
+            # tell" is a decline waiting to happen. `ceiling` vs `flat_plus_bps` is the signal for
+            # whether the ceiling ever engages at real order sizes — the question #1923 left open
+            # about its own defaults, and the one this record exists to answer.
+            "quote_snapshot": json.dumps({**quote["quote_snapshot"], "headroom": cap}),
             "issuer": issuer.name,
             "single_use": True,
             "expires_at": expires_at,

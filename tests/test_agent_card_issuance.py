@@ -105,6 +105,10 @@ def rig(monkeypatch: pytest.MonkeyPatch):
             "merchant_domain": p.get("merchant_domain", "shop.example.com"),
             "checkout_id": p.get("checkout_id", "chk_1"),
             "amount_cap_minor": p.get("amount_cap_minor", 0),
+            # NOT NULL in migration 201 and always SELECTed by get_card — the double omitted it,
+            # so `_card_view` raised a KeyError as a 500 the moment the view read it. A double
+            # that is missing a column the real row always has hides exactly this.
+            "quote_total_minor": p.get("quote_total_minor", 0),
             "currency": p.get("currency", "USD"),
             "issuer": "mock",
             "issuer_card_ref": "mockcard_1",
@@ -391,3 +395,61 @@ def test_unresolvable_hostname_is_refused(monkeypatch):
 ])
 def test_to_minor_units(amount, currency, expected):
     assert to_minor_units(amount, currency) == expected
+
+
+# --- the audit trail behind a cap that no longer equals the quote --------------------------
+
+def test_the_agent_is_shown_the_merchant_quote_beside_the_cap(rig):
+    """An agent shown only the cap cannot tell a $23.17 order carrying $17.78 of headroom from a
+    $40.95 order — and would quote the cap to the buyer as the price.
+
+    `get_card` already SELECTs `quote_total_minor`; `_card_view` dropped it, so the "visible
+    delta" migration 201 asked for was visible only in Postgres.
+    """
+    client, state = rig
+    r = _post(client)
+    assert r.status_code == 200
+    card = r.json()["card"]
+    assert card["amount_cap"] == {"amount_minor": 4095, "currency": "USD"}
+    assert card["merchant_quote"] == {"amount_minor": 2317, "currency": "USD"}
+
+
+def test_the_snapshot_records_WHY_the_cap_is_what_it_is(rig):
+    """The delta recovers how MUCH; only the basis recovers WHY, and the reasons are not
+    interchangeable."""
+    import json as _json
+
+    client, state = rig
+    r = _post(client)
+    assert r.status_code == 200
+    snap = _json.loads(state["creates"][-1]["quote_snapshot"])
+    assert snap["headroom"]["headroom_minor"] == 1778
+    assert snap["headroom"]["headroom_basis"] == "flat_plus_bps"
+    assert snap["headroom"]["amount_cap_minor"] == 4095
+    # the pre-existing coverage record is still there
+    assert "covers" in snap or "totals" in snap
+
+
+@pytest.mark.parametrize(
+    "quote_extra,expected_basis",
+    [
+        ({"covers_shipping": True, "covers_tax": True}, "quote_is_landed"),
+        ({"currency": "JPY", "covers_shipping": False, "covers_tax": False}, "currency_not_calibrated"),
+    ],
+)
+def test_the_two_kinds_of_ZERO_headroom_are_distinguishable(rig, quote_extra, expected_basis):
+    """Both yield `cap == quote`, and they mean opposite things.
+
+    `quote_is_landed` is a healthy quote that needed nothing. `currency_not_calibrated` is a cap
+    we could not safely raise — a decline waiting to happen. A delta of zero cannot tell them
+    apart, so without the basis the calibration data this policy depends on is unreadable.
+    """
+    import json as _json
+
+    client, state = rig
+    state["quote"] = {"total_minor": 2317, "currency": "USD", "quote_snapshot": {"totals": []}, **quote_extra}
+    r = _post(client)
+    assert r.status_code == 200
+    p = state["creates"][-1]
+    assert p["amount_cap_minor"] == p["quote_total_minor"] == 2317
+    assert _json.loads(p["quote_snapshot"])["headroom"]["headroom_basis"] == expected_basis
