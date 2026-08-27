@@ -322,6 +322,98 @@ Cutover is **Sep 8–12**, soak **Sep 12–26**, first real charge late Septembe
 > their 7-day TTL. That matters for item 7.
 
 
+### The Minds → Reap execution flow
+
+Recorded 2026-08-26 from a conversation with Reap (a Visa Intelligent Commerce issuer) plus the
+public [Trusted Agent Protocol specification](https://developer.visa.com/capabilities/trusted-agent-protocol/trusted-agent-protocol-specifications).
+**Roles:** Minds is an ORCHESTRATION layer; Reap is the agent that fills shipping and card
+details at the merchant's checkout. Pivota never completes an order — it supplies the offer, the
+link, and the numbers the cap is derived from.
+
+**TAP defines three ways credentials reach a merchant, and Reap named the first two:**
+Guest Checkout (Key Entry) — a hash of the credentials rides in the Agentic Payment Container and
+the merchant key-enters and compares hashes; Browser Automation — the agent drives the merchant's
+own checkout form with the payment data still encrypted in the container; and API/Direct, where an
+encrypted payload carries token objects, shipping and billing addresses in the request body.
+
+**Only Browser Automation reaches our cohort.** Key Entry requires the MERCHANT to participate —
+RFC 9421 signature verification, JWKS from `https://mcp.visa.com/.well-known/jwks`, the Agentic
+Consumer Recognition Object, nonce tracking in an 8-minute window — and the spec says outright
+that "Merchants are not required to use this proposal." **B8 measured our TAP coverage at zero**,
+and `docs/TARGET_ARCHITECTURE.md` still records TAP as "not implemented anywhere". (Do not read
+the 94.3% `/.well-known/ucp` figure as TAP support: UCP is a different protocol from a different
+vendor. Conflating them would overstate readiness by the whole cohort.)
+
+| # | Step | Owner | What Pivota supplies |
+|---|---|---|---|
+| 1 | User states intent | Minds | — |
+| 2 | Find + rank offers | **Pivota** | `recommend_products` / `get_offers` |
+| 3 | Present options; user picks | Minds | `execution_spec`: `cart_url`, `variant_id`, `expected_item_total` + `expected_currency`, `expected_quantity`, `expires_at` |
+| 4 | **User authorizes an amount** | Minds / Visa | **the unresolved fork — see below** |
+| 5 | Mint the scoped card | Reap | the cap and its currency |
+| 6 | Open the link, land on checkout | Reap | `cart_url` — verified live to answer 302 straight to `/checkout/cn/<token>`, preserving `attributes[pivota_click_id]` |
+| 7 | Fill shipping | Reap | — (whose address? open) |
+| 8 | Fill card, submit | Reap | — |
+| 9 | Report the outcome | Minds / Reap | `POST /agent/v1/outcomes` keyed by `recommendation_id` |
+
+#### Step 4 is forced by physics, and it is the one that lands on our code
+
+Shipping and tax **cannot be known before an address is entered** — B7 verified that a pre-address
+UCP checkout returns `total === subtotal`, `shipping_options: []` and `tax: null`. The card cap is
+set at step 5, two steps before the address exists. So the flow must choose:
+
+**(a) Cap with headroom.** Mint at `expected_item_total` plus a shipping/tax allowance. One-shot
+and simple; the user authorizes "up to $62" for a $48 item. `routes/agent_cards.py:108` cannot do
+this today — it is `amount_cap_minor = quote["total_minor"]`, commented "v1: cap == quote,
+exactly", which declines the moment Reap enters an address.
+
+**(b) Two-phase.** Reap fills shipping first, reads the real total off the page, and only then
+mints for the exact amount. Better for trust — the user is told "$53.47", not a ceiling — but it
+needs a mid-flow mint, and our mint demands a UCP `checkout_id` that a browser-driven storefront
+checkout never produces.
+
+**(c) Pre-quote the landed total.** Not available. B7 closed this: not obtainable anonymously
+before an address, from UCP or from the `.js` endpoint.
+
+**Both viable options need the same two changes**, which is what makes this worth writing down:
+accept a `cart_url` or `recommendation_id` where `CardIssueRequest` currently requires a
+`checkout_id`, and let the cap come from the execution spec rather than from
+`resolve_merchant_quote`'s `get_checkout` call against the merchant's UCP door. Note the second
+change makes `expected_item_total` **load-bearing on money**: in this model a stale spec price is
+a decline or an overspend, not merely a weak recommendation. That is the strongest argument on
+this page for arming item 6 and item 14.
+
+#### Open with Reap — flow questions, not protocol questions
+
+The protocol is public and settled; what is undetermined is the interaction sequence.
+
+1. **Whose shipping address, held where?** TAP's API mode carries shipping and billing inside the
+   encrypted payload, but the spec does not say who holds the address in Browser Automation mode.
+   If Reap holds the user profile, Pivota supplies nothing; if not, someone must.
+2. **Is the authorized amount fixed at intent time, or raisable mid-flow?** This single answer
+   picks (a) over (b).
+3. **On a decline at the final total, who retries, and does the user see it?** Determines whether
+   we owe a re-quote endpoint.
+4. **Headless or user-visible checkout?** Bears on whether `expires_at` on the spec — and the
+   cart token's own TTL — is generous enough for a human-in-the-loop pause.
+5. **Bot management.** We measured **213 of 286 brand hosts refusing a non-browser client**.
+   TAP exists partly so a merchant recognises an agent as accountable rather than blocking it, and
+   it is co-developed with Cloudflare — but on a merchant that has NOT implemented TAP, does Reap
+   still clear the WAF? *(Inference, not confirmed: Visa-directory onboarding may propagate to
+   Cloudflare-side recognition without merchant action. Worth asking directly rather than
+   assuming — it decides whether our crawled cohort is transactable at all.)*
+6. **Issuing jurisdiction.** Reap is a Visa Principal Issuer in Hong Kong and Mexico. What BIN and
+   currency apply to a USD cart at a US merchant, and does that move acceptance, 3DS or FX?
+
+#### What this does NOT change
+
+The cart-permalink handoff is agnostic to all of it — it is a URL that lands on a real checkout,
+and it works whether or not the merchant implements TAP. That is a genuine strength of what is
+already built. The reach limiter on it is item 4: at **60.5%** variant coverage, roughly 40% of
+rows have no numeric variant id, degrade to a PDP link, and leave Reap to choose the variant
+itself.
+
+
 ### Wave 1 — now → Sep 6. Code-only, platform-agnostic, rides the cutover for free
 
 | # | Item | Effort | Where | Why first |
