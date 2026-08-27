@@ -179,8 +179,9 @@ jobs:
 
           cat <<'EOF'
           To ship main to production. Build once, then roll each service with ITS OWN tool -
-          they are not interchangeable, and CONFIG=preserve is required on both scripts because
-          the Railway-ported env files they default to no longer exist:
+          they are not interchangeable. CONFIG=preserve is needed on deploy_backend.sh ONLY,
+          which still defaults to `apply` and so looks for the Railway-ported env files that no
+          longer exist. setup_scheduler.sh already defaults to preserve and needs neither file:
 
             gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
               --substitutions=COMMIT_SHA=<sha> .
@@ -205,11 +206,18 @@ jobs:
           `worker` is ingress:internal and `proof-issuer` is internal-and-cloud-load-balancing with
           no public hostname, so neither can be probed from a runner and neither is checked here.
           They drifted 111 commits behind unnoticed on 2026-08-26. Until this workflow gets a
-          read-only GCP identity, confirm them by hand after any deploy:
+          READ-ONLY GCP identity (the existing WIF principal holds run.admin, which is far too
+          much for a scheduled check), confirm them by hand after any deploy:
 
             for s in web worker proof-issuer; do
               gcloud run services describe $s --region us-west1 --project pivota-prod \
                 --format="value(spec.template.spec.containers[0].image)"
             done
+
+          Those three are what THIS repo ships. pivota-prod also runs `gateway` (from
+          PIVOTA-Agent, which has its own gateway-prod-drift alarm - that is where the
+          <gateway-sha> above comes from, and it is NOT built by the backend build step printed
+          here) and `catalog-intelligence`. Neither is this alarm's subject; listed so the count
+          is not mistaken for the whole project.
           EOF
           exit 1
