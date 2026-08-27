@@ -603,6 +603,7 @@ def _sig_lane_fetch_all(query: str, values=None):
         return [{"source_ref": "eps_sig_1"}]
     if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
         assert values["mapped_seed_ids"] == ["eps_sig_1"]
+        assert values["mapped_external_ids"] == [""], "the absent arm must still bind a typed match-nothing value"
         return [_sig_lane_seed_row()]
     return []
 
@@ -656,6 +657,59 @@ def test_offers_resolve_sig_ref_resolves_via_catalog_mirror(
         str(source.get("source")) == "external_product_seeds"
         and str(source.get("status")) == "ok"
         and str(source.get("query")) == "external_seed_by_pivota_signature"
+        for source in (metadata.get("sources") or [])
+    )
+
+
+def test_offers_resolve_legacy_mirror_row_resolves_via_external_product_id(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Prod (2026-08-27): the first shipped sig arm matched NOTHING — its source_system conjunct
+    said 'external_product_seeds' while the mirror writes 'external_product_seeds_mirror_v1', and
+    the probed legacy-cohort row ALSO had no source_ref. The arm now maps through BOTH mirror
+    keys; this pins the legacy path: source_ref NULL, source_product_id carries the seed's
+    external_product_id."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "pivota_signature_id = ANY" in q:
+            assert "source_system" not in q, (
+                "no source_system conjunct — the mirror's system name is versioned "
+                "(external_product_seeds_mirror_v1) and filtering on the wrong literal matched nothing in prod"
+            )
+            return [{"source_ref": None, "source_product_id": "ext_legacy_1"}]
+        if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
+            assert values["mapped_seed_ids"] == [""], "no seed-id arm for this row"
+            assert values["mapped_external_ids"] == ["ext_legacy_1"]
+            return [_sig_lane_seed_row() | {"external_product_id": "ext_legacy_1"}]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=legacy"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10, "market": "US", "tool": "*"},
+            "metadata": {"source": "creator-agent-ui"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "a legacy mirror row (source_ref NULL) must still resolve via external_product_id"
+    assert offers[0]["purchase_route"] == "affiliate_outbound"
+    metadata = body.get("metadata") or {}
+    assert any(
+        str(source.get("query")) == "external_seed_by_pivota_signature"
+        and str(source.get("status")) == "ok"
         for source in (metadata.get("sources") or [])
     )
 
