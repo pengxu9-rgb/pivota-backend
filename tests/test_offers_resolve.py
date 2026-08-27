@@ -621,6 +621,11 @@ def test_offers_resolve_sig_ref_resolves_via_catalog_mirror(
     async def fake_gate(*args, **kwargs):
         return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
 
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
@@ -669,6 +674,11 @@ def test_offers_resolve_sentinel_merchant_scope_is_ignored(
     async def fake_gate(*args, **kwargs):
         return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
 
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
@@ -724,6 +734,11 @@ def test_offers_resolve_sentinel_is_unscoped_at_every_extraction_point(
     async def fake_gate(*args, **kwargs):
         return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
 
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
@@ -783,6 +798,11 @@ def test_offers_resolve_inactive_mirror_seed_falls_through_to_later_arms(
     async def fake_gate(*args, **kwargs):
         return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
 
+    # Anon-limiter budget: the store is MODULE-LEVEL shared state (60 rpm per IP per minute) and
+    # every anonymous invoke here spends budget a later file needs — adding this PR's first tests
+    # tipped test_pdp_resolution_stability's 30-call loop into a 429 in the sweep. rpm == 0
+    # short-circuits BEFORE the store increments, so these spend nothing.
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=sig"))
