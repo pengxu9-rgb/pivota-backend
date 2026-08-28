@@ -36,8 +36,26 @@ GCLOUD="${GCLOUD:-gcloud}"
 API="https://monitoring.googleapis.com/v3/projects/$PROJECT"
 TOKEN="$("$GCLOUD" auth print-access-token)"
 
-# An alert with no channel is decoration. Default to the operator's own account.
-ALERT_EMAIL="${ALERT_EMAIL:-$("$GCLOUD" config get-value account 2>/dev/null)}"
+# An alert with no channel is decoration - and an alert pointed at the WRONG channel is worse,
+# because the dashboard says "5 policies, all enabled" either way.
+#
+# This used to default to `gcloud config get-value account`: whoever happened to be logged in when
+# the script last ran decided where production pages go. On 2026-08-28 that silently aimed every
+# prod alert at an address nobody watches, and the backend sat wedged on database pool exhaustion
+# for 5h40m. The uptime check DID detect it - `check_passed` for api.pivota.cc was 0.00 from 12:32
+# onward and "prod: host is down" fired correctly. Nobody saw it. Detection was never the problem.
+#
+# So prod must say the address out loud. Staging keeps the convenience default; it pages no one.
+if [ -z "${ALERT_EMAIL:-}" ]; then
+  if [ "$ENV" = prod ]; then
+    echo "ALERT_EMAIL is required for prod. Set it to the address that is actually READ:" >&2
+    echo "  ALERT_EMAIL=you@example.com $0 prod" >&2
+    echo "Refusing to infer it from \`gcloud config get-value account\` - that is how prod alerts" >&2
+    echo "ended up going to an unwatched inbox (see the comment above this check)." >&2
+    exit 2
+  fi
+  ALERT_EMAIL="$("$GCLOUD" config get-value account 2>/dev/null)"
+fi
 [ -n "$ALERT_EMAIL" ] || { echo "ALERT_EMAIL empty and no gcloud account set" >&2; exit 2; }
 
 # Public hostnames, prod only. Staging is IAM-gated with nothing public to probe.
@@ -80,6 +98,19 @@ for c in d.get("notificationChannels", []):
 
 if [ -n "$CHANNEL" ]; then
   echo "   reusing $CHANNEL"
+  VERIFIED="$(api GET "${CHANNEL#projects/*/}" 2>/dev/null | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    print(json.loads(raw).get("verificationStatus", "") if raw else "")
+except ValueError:
+    print("")
+')"
+  if [ "$VERIFIED" != VERIFIED ]; then
+    echo "   WARNING: channel is '${VERIFIED:-UNSET}', not VERIFIED." >&2
+    echo "   Cloud Monitoring does not deliver to an unverified email channel. Every policy below" >&2
+    echo "   will fire into the void. Open the channel in the console and complete verification." >&2
+  fi
 else
   BODY="$(python3 -c '
 import json, sys
@@ -117,6 +148,27 @@ print(json.dumps({
   check "$RESP" "uptime $h"
   echo "   created $h"
 done
+
+echo "== log-based metrics"
+# "prod: host is down" tells you the service is unreachable. It does not tell you WHY, and on
+# 2026-08-28 the why took three hours of log spelunking to establish: every error in the window was
+# `PoolCheckoutTimeout: timed out waiting 120.0s for a database connection`, while Cloud SQL sat at
+# 28 of 300 connections with 23 of them IDLE. The database was healthy the whole time; the
+# application was holding pool slots it never returned.
+#
+# That distinction is invisible to every other policy here. "Cloud SQL connections high" watches
+# num_backends, which was at 9% - it CANNOT catch a leak on the client side, because a leaked
+# connection looks identical to an idle one from the server. This metric names the failure directly.
+METRIC=pool_checkout_timeout
+if "$GCLOUD" logging metrics describe "$METRIC" --project "$PROJECT" >/dev/null 2>&1; then
+  echo "   $METRIC exists"
+else
+  "$GCLOUD" logging metrics create "$METRIC" --project "$PROJECT" \
+    --description "Count of PoolCheckoutTimeout - the app cannot obtain a DB connection from its own pool" \
+    --log-filter='resource.type="cloud_run_revision" AND severity>=ERROR AND textPayload:"PoolCheckoutTimeout"' \
+    --quiet
+  echo "   created $METRIC"
+fi
 
 echo "== alert policies"
 upsert() { # DISPLAY_NAME BODY   -> replace by displayName so thresholds live in git
@@ -174,11 +226,19 @@ upsert "prod: TLS certificate expiring" "$(policy \
   'metric.type="monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires" AND resource.type="uptime_url"' \
   ALIGN_MIN REDUCE_MIN resource.label.host COMPARISON_LT 14 3600s 3600s 86400s)"
 
+# 0.2/s was UNREACHABLE and so this policy had never fired once. It asks for 12 5xx per second on
+# an API whose baseline is roughly 2 requests per MINUTE (~0.03/s measured 2026-08-28) - a total
+# outage returning 5xx to every single caller still tops out an order of magnitude below the
+# threshold. A rate threshold has to be set against real traffic, not a round number.
+#
+# 0.01/s over 600s = 6 errors in ten minutes. Against a ~20-request baseline in that window that is
+# a ~30% error rate: high enough not to trip on one unhandled exception, low enough that a wedged
+# service cannot hide under it. Revisit if traffic grows by an order of magnitude.
 upsert "prod: load balancer 5xx" "$(policy \
   "prod: load balancer 5xx" \
   "The external load balancer is returning 5xx. This is the user-visible symptom of most backend failures - a revision that will not start, database saturation, or an unhandled exception." \
   'metric.type="loadbalancing.googleapis.com/https/request_count" AND resource.type="https_lb_rule" AND metric.label.response_code_class="500"' \
-  ALIGN_RATE REDUCE_SUM "" COMPARISON_GT 0.2 300s 300s 3600s)"
+  ALIGN_RATE REDUCE_SUM "" COMPARISON_GT 0.01 600s 600s 3600s)"
 
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
@@ -191,6 +251,12 @@ upsert "prod: Cloud SQL connections high" "$(policy \
   "Postgres backends are above 80% of max_connections (300). This codebase has wedged on pool exhaustion before - see the 2026-08-20 sitemap incident, where a plan built without statistics opened enough connections to exhaust the pool. Look for a stuck query or a revision that will not scale down." \
   'metric.type="cloudsql.googleapis.com/database/postgresql/num_backends" AND resource.type="cloudsql_database"' \
   ALIGN_MAX REDUCE_SUM "" COMPARISON_GT 240 300s 300s 3600s)"
+
+upsert "prod: database pool exhausted" "$(policy \
+  "prod: database pool exhausted" \
+  "The backend cannot get a connection from its own pool (PoolCheckoutTimeout). Check Cloud SQL num_backends FIRST: if it is low - it was 28/300 on 2026-08-28 - the database is fine and the application is leaking pool slots, so restarting the revision restores service while the leak is found. There is no liveness probe on the web service, so a wedged instance is never recycled on its own." \
+  'metric.type="logging.googleapis.com/user/pool_checkout_timeout" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 300s 300s 3600s)"
 
 echo
 echo "channel : $ALERT_EMAIL"
