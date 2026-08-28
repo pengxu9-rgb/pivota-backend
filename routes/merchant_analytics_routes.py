@@ -88,6 +88,8 @@ async def get_commerce_funnel(
     llm_provider: Optional[str] = Query(None),
     llm_model: Optional[str] = Query(None),
     commerce_surface: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    store_id: Optional[str] = Query(None),
     principal: Dict[str, Any] = Depends(_get_principal),
 ):
     merchant_id = principal.get("merchant_id")
@@ -113,6 +115,8 @@ async def get_commerce_funnel(
         llm_provider=str(llm_provider).strip().lower() if llm_provider else None,
         llm_model=str(llm_model).strip().lower() if llm_model else None,
         commerce_surface=str(commerce_surface).strip().lower() if commerce_surface else None,
+        platform=(str(platform).strip().lower() or None) if platform else None,
+        store_id=(str(store_id).strip() or None) if store_id else None,
     )
 
 

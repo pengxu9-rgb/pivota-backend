@@ -422,7 +422,22 @@ def test_offers_resolve_maps_sku_to_internal_product(monkeypatch: pytest.MonkeyP
 
 
 def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    from middleware.rate_limiter import RateLimitMiddleware
     import routes.agent_shop_gateway as gateway
+
+    # This is a burst/stability assertion, not a rate-limit integration test.
+    # The full sweep reuses the global FastAPI app and legitimately consumes
+    # most of its anonymous ceiling before this late-running test. Start this
+    # test with an isolated in-memory global bucket so its 30 calls measure the
+    # resolver instead of suite-order leakage; production limits are unchanged.
+    if app.middleware_stack is None:
+        app.middleware_stack = app.build_middleware_stack()
+    middleware = app.middleware_stack
+    while middleware is not None and not isinstance(middleware, RateLimitMiddleware):
+        middleware = getattr(middleware, "app", None)
+    assert middleware is not None, "RateLimitMiddleware not found in app stack"
+    monkeypatch.setattr(middleware, "redis", None)
+    monkeypatch.delitem(middleware._anon_store, "global", raising=False)
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
