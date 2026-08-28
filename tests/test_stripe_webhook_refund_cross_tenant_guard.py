@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from decimal import Decimal
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -113,9 +114,19 @@ def _install(
         if "FROM merchant_psps" in query and "merchant_id" in query:
             h.owner_lookups.append(values["psp_id"])
             return {"merchant_id": MERCHANT_A}
+        # The orders table is read three ways: by payment_intent, by order_id,
+        # and (under a merchant scope) with a merchant_id predicate. Model all
+        # three, or a scoped lookup silently returns the unscoped row.
         if "FROM orders" in query:
-            h.order_lookups.append(values["payment_intent_id"])
-            return dict(order_row) if order_row is not None else None
+            if "payment_intent_id" in values:
+                h.order_lookups.append(values["payment_intent_id"])
+            if order_row is None:
+                return None
+            row = dict(order_row)
+            for column in ("payment_intent_id", "order_id", "merchant_id"):
+                if column in values and str(row.get(column)) != str(values[column]):
+                    return None
+            return row
         raise AssertionError(f"Unexpected query: {query}")
 
     def fake_construct_event(payload: bytes, signature: Optional[str], secret: str) -> Dict[str, Any]:
@@ -543,3 +554,327 @@ async def test_partial_refund_within_order_total_still_applies(
     assert len(h.status_updates) == 1
     assert h.status_updates[0]["status"] == "partially_refunded"
     assert str(h.status_updates[0]["total_refunded"]) == "120"
+
+
+# ---------------------------------------------------------------------------
+# charge.dispute.* — the same attack, via a branch that took its identity
+# straight from event metadata and never resolved an order at all
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispute_on_foreign_psp_endpoint_does_not_touch_other_merchants_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dispute branch reversed the attribution edge — the same financial
+    primitive the refund branches write — keyed on an attacker-supplied
+    metadata.order_id, with no tenant predicate on the UPDATE."""
+    event = _stripe_event(
+        "charge.dispute.created",
+        {
+            "id": "dp_cross_tenant",
+            "amount": 50000,
+            "currency": "usd",
+            "payment_intent": "pi_merchant_b",
+            "metadata": {"order_id": "ORD_MERCHANT_B", "merchant_id": MERCHANT_B},
+        },
+    )
+    h = _install(monkeypatch, event=event, order_row=_victim_order())
+
+    resp = await _post()
+
+    assert resp.json() == {
+        "status": "unmatched",
+        "event": "charge.dispute.created",
+        "reason": "cross_tenant_blocked",
+    }
+    assert h.owner_lookups == [MERCHANT_A_PSP]
+    assert h.attribution_calls == []
+    assert h.mutations == []
+
+
+@pytest.mark.asyncio
+async def test_dispute_metadata_cannot_name_a_foreign_merchant_when_no_order_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with no order to resolve, the dispute record must be attributed to
+    the endpoint owner — never to the merchant_id the event asked for."""
+    event = _stripe_event(
+        "charge.dispute.created",
+        {
+            "id": "dp_forged_merchant",
+            "amount": 50000,
+            "currency": "usd",
+            "payment_intent": "pi_not_stored_anywhere",
+            "metadata": {"merchant_id": MERCHANT_B},
+        },
+    )
+    h = _install(monkeypatch, event=event, order_row=None)
+
+    import routes.webhook_routes as webhook_routes_module
+
+    upserts: List[Dict[str, Any]] = []
+
+    async def fake_get_order(order_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(webhook_routes_module, "get_order", fake_get_order)
+
+    import services.dispute_records_service as dispute_module
+
+    async def fake_upsert(dispute: Dict[str, Any], **kwargs: Any) -> None:
+        upserts.append(kwargs)
+
+    monkeypatch.setattr(
+        dispute_module, "upsert_stripe_dispute_record_best_effort", fake_upsert
+    )
+
+    resp = await _post()
+
+    assert resp.json() == {"status": "success", "event": "charge.dispute.created"}
+    assert h.owner_lookups == [MERCHANT_A_PSP]
+    # Identity came from the endpoint owner, not from the event's metadata.
+    assert len(upserts) == 1
+    assert upserts[0]["merchant_id_hint"] == MERCHANT_A
+    assert upserts[0]["merchant_scope"] == MERCHANT_A
+    assert upserts[0]["order_id_hint"] is None
+    # No order resolved under this tenant => nothing order-keyed may fire.
+    assert h.attribution_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispute_for_the_endpoint_owners_own_order_still_reverses_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control — the dispute lane must still work for its own tenant."""
+    event = _stripe_event(
+        "charge.dispute.created",
+        {
+            "id": "dp_own_order",
+            "amount": 50000,
+            "currency": "usd",
+            "payment_intent": "pi_merchant_a",
+            "metadata": {"order_id": "ORD_MERCHANT_A", "merchant_id": MERCHANT_A},
+        },
+    )
+    h = _install(monkeypatch, event=event, order_row=_own_order())
+
+    resp = await _post()
+
+    assert resp.json() == {"status": "success", "event": "charge.dispute.created"}
+    assert h.owner_lookups == [MERCHANT_A_PSP]
+    assert h.attribution_calls == [
+        {"order_id": "ORD_MERCHANT_A", "refund_id": "dp_own_order", "amount": Decimal("500")}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: an unresolvable psp_id owner must refuse, not fall open
+# ---------------------------------------------------------------------------
+
+
+def _install_with_owner_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch, *, event: Dict[str, Any], failure: BaseException | None
+) -> _Harness:
+    """Same harness, but the OWNER query fails (or returns nothing) while the
+    secret and orders queries succeed — the partial-failure shape, since these
+    are three independent round-trips."""
+    h = _install(monkeypatch, event=event, order_row=_victim_order())
+
+    import db.database as database_module
+
+    async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Any:
+        if "FROM merchant_psps" in query and "provider_config" in query:
+            return {"provider_config": {"webhook_endpoint_secret": ENDPOINT_SECRET}}
+        if "FROM merchant_psps" in query and "merchant_id" in query:
+            h.owner_lookups.append(values["psp_id"])
+            if failure is not None:
+                raise failure
+            return None
+        if "FROM orders" in query:
+            h.order_lookups.append(values["payment_intent_id"])
+            return _victim_order()
+        raise AssertionError(f"Unexpected query: {query}")
+
+    monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
+    return h
+
+
+@pytest.mark.asyncio
+async def test_owner_lookup_timeout_refuses_instead_of_restoring_the_exploit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single failed owner query used to make `_order_belongs_to_psp_owner`
+    return True for every order — the full pre-fix exploit, restored by a DB
+    blip. It must refuse instead."""
+    event = _stripe_event(
+        "charge.refunded",
+        {
+            "id": "ch_owner_timeout",
+            "payment_intent": "pi_merchant_b",
+            "amount_refunded": 50000,
+            "currency": "usd",
+        },
+    )
+    h = _install_with_owner_lookup_failure(
+        monkeypatch,
+        event=event,
+        failure=RuntimeError("canceling statement due to statement timeout"),
+    )
+
+    resp = await _post()
+
+    # 503, NOT 200: Stripe redelivers, so a transient failure does not discard a
+    # real refund. A 200 would be a silent drop — 'unmatched' has no consumer.
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "psp_owner_unresolved"
+    assert h.owner_lookups == [MERCHANT_A_PSP]
+    assert h.mutations == []
+    assert h.attribution_calls == []
+
+
+@pytest.mark.asyncio
+async def test_psp_id_with_no_owner_row_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`merchant_psps.psp_id` is the PRIMARY KEY and `merchant_id` is NOT NULL,
+    so a psp_id in the path with no owner row is always an error state — never a
+    legitimate platform-wide call."""
+    event = _stripe_event(
+        "charge.refunded",
+        {
+            "id": "ch_no_owner_row",
+            "payment_intent": "pi_merchant_b",
+            "amount_refunded": 50000,
+            "currency": "usd",
+        },
+    )
+    h = _install_with_owner_lookup_failure(monkeypatch, event=event, failure=None)
+
+    resp = await _post()
+
+    assert resp.status_code == 503
+    assert h.mutations == []
+
+
+@pytest.mark.asyncio
+async def test_owner_lookup_failure_on_the_bare_endpoint_is_not_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bare endpoint never resolves an owner, so the fail-closed path cannot
+    fire there — the platform-wide secret keeps working during a DB blip."""
+    event = _stripe_event(
+        "charge.refunded",
+        {
+            "id": "ch_bare_no_owner",
+            "payment_intent": "pi_merchant_b",
+            "amount_refunded": 50000,
+            "currency": "usd",
+        },
+    )
+    h = _install(monkeypatch, event=event, order_row=_victim_order())
+
+    import routes.webhook_routes as webhook_routes_module
+
+    monkeypatch.setattr(
+        webhook_routes_module.settings, "stripe_webhook_secret", ENDPOINT_SECRET, raising=False
+    )
+
+    resp = await _post(psp_id=None)
+
+    assert resp.status_code == 200
+    assert h.owner_lookups == []
+    assert len(h.status_updates) == 1
+
+
+# ---------------------------------------------------------------------------
+# dispute_records_service: the scoped identity resolution itself
+#
+# The webhook test above stubs the upsert out, so these drive the real
+# `_resolve_order_and_merchant_from_stripe_payload`. Without them, deleting the
+# whole `if scope:` branch leaves every other test green.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDb:
+    """Models `orders` for the three lookup shapes the resolver uses."""
+
+    def __init__(self, rows: List[Dict[str, Any]]) -> None:
+        self.rows = rows
+        self.queries: List[Tuple[str, Dict[str, Any]]] = []
+
+    async def fetch_one(self, query: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        self.queries.append((query, values))
+        for row in self.rows:
+            if "order_id" in values and str(row["order_id"]) != str(values["order_id"]):
+                continue
+            if "pi" in values and str(row["payment_intent_id"]) != str(values["pi"]):
+                continue
+            if "merchant_id" in values and str(row["merchant_id"]) != str(values["merchant_id"]):
+                continue
+            return dict(row)
+        return None
+
+
+def _orders_fixture() -> List[Dict[str, Any]]:
+    return [
+        {"order_id": "ORD_MERCHANT_A", "merchant_id": MERCHANT_A, "payment_intent_id": "pi_merchant_a"},
+        {"order_id": "ORD_MERCHANT_B", "merchant_id": MERCHANT_B, "payment_intent_id": "pi_merchant_b"},
+    ]
+
+
+async def _resolve(scope: Optional[str], **kwargs: Any) -> Tuple[Optional[str], Optional[str]]:
+    from services.dispute_records_service import (
+        _resolve_order_and_merchant_from_stripe_payload,
+    )
+
+    db = _FakeDb(_orders_fixture())
+    return await _resolve_order_and_merchant_from_stripe_payload(
+        kwargs.pop("payload", {}),
+        payment_intent_id=kwargs.pop("payment_intent_id", None),
+        order_id_hint=kwargs.pop("order_id_hint", None),
+        merchant_id_hint=kwargs.pop("merchant_id_hint", None),
+        db=db,
+        merchant_scope=scope,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_resolution_pins_merchant_to_the_scope_not_the_hint() -> None:
+    order_id, merchant_id = await _resolve(
+        MERCHANT_A,
+        order_id_hint="ORD_MERCHANT_B",
+        merchant_id_hint=MERCHANT_B,
+        payment_intent_id="pi_merchant_b",
+    )
+    assert merchant_id == MERCHANT_A
+    # ORD_MERCHANT_B is not merchant A's, so it must not survive scoping — and
+    # the PI fallback must not resurrect it either.
+    assert order_id is None
+
+
+@pytest.mark.asyncio
+async def test_scoped_resolution_drops_a_foreign_payment_intent() -> None:
+    order_id, merchant_id = await _resolve(MERCHANT_A, payment_intent_id="pi_merchant_b")
+    assert (order_id, merchant_id) == (None, MERCHANT_A)
+
+
+@pytest.mark.asyncio
+async def test_scoped_resolution_still_finds_the_scopes_own_order() -> None:
+    by_pi = await _resolve(MERCHANT_A, payment_intent_id="pi_merchant_a")
+    assert by_pi == ("ORD_MERCHANT_A", MERCHANT_A)
+
+    by_hint = await _resolve(MERCHANT_A, order_id_hint="ORD_MERCHANT_A")
+    assert by_hint == ("ORD_MERCHANT_A", MERCHANT_A)
+
+
+@pytest.mark.asyncio
+async def test_unscoped_resolution_keeps_legacy_behaviour() -> None:
+    """The bare platform endpoint passes no scope; that path is unchanged."""
+    order_id, merchant_id = await _resolve(
+        None, order_id_hint="ORD_MERCHANT_B", merchant_id_hint=MERCHANT_B
+    )
+    assert (order_id, merchant_id) == ("ORD_MERCHANT_B", MERCHANT_B)
+
+    by_pi = await _resolve(None, payment_intent_id="pi_merchant_b")
+    assert by_pi == ("ORD_MERCHANT_B", MERCHANT_B)
