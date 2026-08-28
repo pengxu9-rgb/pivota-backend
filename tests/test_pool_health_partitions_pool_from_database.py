@@ -21,6 +21,24 @@ import pytest
 from routes.pool_health import _tasks_by_frame, _verdict
 
 
+# Two frames deliberately in DIFFERENT functions: `_framework_entry` is the
+# task's outermost coroutine (uvicorn's run_asgi stands here in production) and
+# `_app_code` is where the task is really parked. An implementation that reports
+# the outermost frame names the wrong one.
+async def _app_code() -> None:
+    await asyncio.sleep(30)
+
+
+_APP_CODE_LINE = _app_code.__code__.co_firstlineno + 1
+
+
+async def _framework_entry() -> None:
+    await _app_code()
+
+
+_FRAMEWORK_LINE = _framework_entry.__code__.co_firstlineno + 1
+
+
 class TestVerdict:
     """pool_ok x direct_ok -> the operator's next move."""
 
@@ -98,15 +116,147 @@ class TestTasksByFrame:
             task.cancel()
 
     @pytest.mark.asyncio
-    async def test_output_is_bounded(self) -> None:
-        """A wedge is exactly when task counts are abnormal.
+    async def test_it_reports_the_deepest_app_frame_not_the_outermost(self) -> None:
+        """The defect that made the original implementation useless.
 
-        An unbounded dict here would make the diagnostic unreadable in the one
-        situation it exists for.
+        `Task.get_stack()` on a SUSPENDED task returns only the outermost
+        coroutine frame — coroutine frames do not link `f_back` while suspended,
+        so the walk stops after one and `limit` never binds. Under uvicorn every
+        request task's outermost coroutine is `RequestResponseCycle.run_asgi`, so
+        every parked request collapsed into a single anonymous group.
+
+        The original test could not see this: its task's coroutine was defined in
+        the test file, so outermost and parked frame were the SAME frame. Here
+        they are deliberately different — `_framework_entry` is the outermost and
+        `_app_code` is where the task is actually parked.
         """
-        from routes.pool_health import _MAX_FRAME_GROUPS
+        task = asyncio.create_task(_framework_entry())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        try:
+            frames = _tasks_by_frame()
+            reported = [k for k in frames if "test_pool_health" in k]
+            assert reported, f"no app frame reported at all: {frames}"
+            lines = {int(k.rsplit(":", 1)[1]) for k in reported}
+            assert _APP_CODE_LINE in lines, (
+                f"reported {sorted(lines)}, expected the parked frame at line "
+                f"{_APP_CODE_LINE} (_app_code), not the outermost entry at "
+                f"{_FRAMEWORK_LINE} (_framework_entry)"
+            )
+        finally:
+            task.cancel()
 
-        assert len(_tasks_by_frame()) <= _MAX_FRAME_GROUPS
+    @pytest.mark.asyncio
+    async def test_plumbing_frames_are_never_the_answer(self) -> None:
+        """Walking all the way down lands in asyncio.sleep on every parked task.
+
+        A dump that says `tasks.py:711` for everything is as useless as one that
+        says `h11_impl.py:259` for everything.
+        """
+        from routes.pool_health import _is_app_frame
+
+        assert not _is_app_frame("/usr/lib/python3.11/asyncio/tasks.py")
+        assert not _is_app_frame("/app/.venv/lib/python3.11/site-packages/uvicorn/x.py")
+        assert _is_app_frame("/app/routes/agent_shop_gateway.py")
+
+        task = asyncio.create_task(_framework_entry())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        try:
+            assert not any("tasks.py" in k for k in _tasks_by_frame())
+        finally:
+            task.cancel()
+
+
+class TestPoolCounters:
+    """Untested in the first cut, and 100% wrong as a result."""
+
+    def test_it_reads_the_pool_off_the_backend(self, monkeypatch) -> None:
+        """`_pool` is an attribute of the BACKEND, not the Database facade.
+
+        Reading `database._pool` returns None on a perfectly healthy pool, and
+        getattr never raises, so the endpoint reported `no_pool` unconditionally —
+        a state that elsewhere in this repo means "the pool object is gone", i.e.
+        a different incident with a different fix. The single number this endpoint
+        exists to produce could never appear.
+        """
+        import db.database as dbmod
+        from routes.pool_health import _pool_counters
+
+        class FakePool:
+            def get_size(self) -> int:
+                return 6
+
+            def get_idle_size(self) -> int:
+                return 0
+
+            def get_max_size(self) -> int:
+                return 6
+
+        class FakeBackend:
+            _pool = FakePool()
+
+        class FakeDatabase:
+            _backend = FakeBackend()
+
+        monkeypatch.setattr(dbmod, "database", FakeDatabase())
+        counters = _pool_counters()
+        assert counters["state"] == "present", (
+            f"a live pool reported as {counters!r} — the endpoint is blind"
+        )
+        assert counters["max_size"] == 6
+        # Fully checked out and nothing returned: the wedge signature.
+        assert counters["in_use"] == 6
+
+    def test_in_use_is_size_minus_idle(self, monkeypatch) -> None:
+        import db.database as dbmod
+        from routes.pool_health import _pool_counters
+
+        class FakePool:
+            def get_size(self) -> int:
+                return 6
+
+            def get_idle_size(self) -> int:
+                return 4
+
+            def get_max_size(self) -> int:
+                return 6
+
+        class FakeBackend:
+            _pool = FakePool()
+
+        class FakeDatabase:
+            _backend = FakeBackend()
+
+        monkeypatch.setattr(dbmod, "database", FakeDatabase())
+        assert _pool_counters()["in_use"] == 2
+
+
+class TestDirectProbeIsBounded:
+    """This route is unauthenticated and has NO rate limit.
+
+    Both global middlewares early-return for non-/agent paths, so anyone on the
+    internet can drive it. Each uncached call opens a real connection OUTSIDE the
+    pool budget — unbounded, that saturates the 300-connection ceiling and the
+    diagnostic becomes the incident.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_callers_open_one_connection(self, monkeypatch) -> None:
+        import routes.pool_health as ph
+
+        calls = {"n": 0}
+
+        async def fake_uncached():
+            calls["n"] += 1
+            await asyncio.sleep(0.02)
+            return {"ok": True, "elapsed_ms": 1}
+
+        monkeypatch.setattr(ph, "_probe_direct_uncached", fake_uncached)
+        ph._cached.clear()
+        results = await asyncio.gather(*[ph._probe_direct() for _ in range(12)])
+        assert calls["n"] == 1, f"opened {calls['n']} connections for 12 callers"
+        assert all(r["ok"] for r in results)
 
 
 def test_the_endpoint_is_actually_mounted() -> None:
