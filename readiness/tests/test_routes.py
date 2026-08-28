@@ -2044,12 +2044,17 @@ async def _exercise_readiness_payment_intent_probe(
     merchant_id: str,
     allowlist: str,
     test_psp_probe: bool,
+    probe_enabled: str = "1",
+    psp_mode: str = "stripe_checkout",
 ):
     from adapters.psp_adapter import PaymentIntent
     from readiness import order_sync as readiness_order_sync
     from readiness import service as readiness_service
 
-    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    # `probe_enabled` and `psp_mode` are parameters, not constants: each of the
+    # three conjuncts in _resolve_checkout_live_readiness_requirement needs to be
+    # varied on its own, or a mutant that deletes one of them survives the suite.
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", probe_enabled)
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", allowlist)
 
     journal = InMemoryReadinessJournal()
@@ -2143,7 +2148,7 @@ async def _exercise_readiness_payment_intent_probe(
         merchant_id,
         checkout.checkout_id,
         preferred_psps=["stripe"],
-        psp_mode="stripe_checkout",
+        psp_mode=psp_mode,
         test_psp_probe=test_psp_probe,
     )
     return result, create_calls
@@ -2178,6 +2183,134 @@ async def test_readiness_payment_intent_non_allowlisted_test_probe_fails_closed(
     detail = exc.value.args[0]
     assert detail["code"] == "PAYMENT_FAILED"
     assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_probe_fails_closed_when_master_switch_off(monkeypatch):
+    """ALLOW_TEST_PSP_PROBE off must keep live-readiness ENFORCED.
+
+    This is the default-OFF kill switch. Everything else about the request is
+    sanctioned -- allowlisted merchant, explicit probe request -- so this test
+    isolates the env-flag conjunct and nothing else.
+    """
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+            test_psp_probe=True,
+            probe_enabled="0",
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_probe_fails_closed_when_switch_unset(monkeypatch):
+    """An ABSENT ALLOW_TEST_PSP_PROBE is not a permissive one: default is OFF."""
+    monkeypatch.delenv("ALLOW_TEST_PSP_PROBE", raising=False)
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+            test_psp_probe=True,
+            probe_enabled="",
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_without_explicit_probe_request_enforces_live_readiness(monkeypatch):
+    """No explicit probe request => enforcement stays on, even for an allowlisted merchant.
+
+    The switch is ON and the merchant IS allowlisted here, so being allowlisted
+    must not by itself relax live-readiness -- the caller has to ask.
+    """
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+            test_psp_probe=False,
+            probe_enabled="1",
+            psp_mode="stripe_checkout",
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_probe_psp_mode_token_is_an_explicit_request(monkeypatch):
+    """psp_mode=test_psp_probe is the other spelling of an explicit probe request."""
+    result, create_calls = await _exercise_readiness_payment_intent_probe(
+        monkeypatch,
+        merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+        allowlist=DEFAULT_ALPHA_MERCHANT_ID,
+        test_psp_probe=False,
+        probe_enabled="1",
+        psp_mode="test_psp_probe",
+    )
+
+    assert result["payment_intent_id"] == "pi_alpha_probe_1"
+    assert create_calls[0]["enforce_live_readiness"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_probe_gate_reads_the_canonical_order_routes_helpers(monkeypatch):
+    """readiness must not re-fork the two env readers it once duplicated.
+
+    Patching the CANONICAL helpers in routes.order_routes has to change the
+    readiness lane's decision. If readiness reintroduces private copies, these
+    patches stop reaching it and the assertions below fail -- which is the point:
+    this pins the wiring, not just the behavior.
+    """
+    from readiness import service as readiness_service
+    from routes import order_routes
+
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", DEFAULT_ALPHA_MERCHANT_ID)
+
+    # Sanity: with the real canonical helpers, this request is granted the bypass.
+    assert (
+        readiness_service._resolve_checkout_live_readiness_requirement(
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            psp_mode="stripe_checkout",
+            test_psp_probe=True,
+        )
+        is False
+    )
+
+    monkeypatch.setattr(order_routes, "_test_psp_probe_enabled", lambda: False)
+    assert (
+        readiness_service._resolve_checkout_live_readiness_requirement(
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            psp_mode="stripe_checkout",
+            test_psp_probe=True,
+        )
+        is True
+    ), "readiness ignored the canonical ALLOW_TEST_PSP_PROBE reader"
+
+    monkeypatch.setattr(order_routes, "_test_psp_probe_enabled", lambda: True)
+    monkeypatch.setattr(order_routes, "_test_psp_probe_merchants", lambda: {"merch_someone_else"})
+    assert (
+        readiness_service._resolve_checkout_live_readiness_requirement(
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            psp_mode="stripe_checkout",
+            test_psp_probe=True,
+        )
+        is True
+    ), "readiness ignored the canonical TEST_PSP_PROBE_MERCHANTS reader"
+
+    assert not hasattr(readiness_service, "_test_psp_probe_enabled")
+    assert not hasattr(readiness_service, "_test_psp_probe_merchants")
 
 
 def test_payment_status_sync_requires_existing_payment_intent(monkeypatch):

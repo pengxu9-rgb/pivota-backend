@@ -74,15 +74,6 @@ def _coerce_readiness_bool(value: Any) -> Optional[bool]:
     return None
 
 
-def _test_psp_probe_enabled() -> bool:
-    return str(os.getenv("ALLOW_TEST_PSP_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _test_psp_probe_merchants() -> set[str]:
-    raw = os.getenv("TEST_PSP_PROBE_MERCHANTS", "") or ""
-    return {m.strip().lower() for m in raw.split(",") if m.strip()}
-
-
 def _explicit_readiness_test_psp_probe_requested(
     *,
     psp_mode: Optional[str],
@@ -99,6 +90,23 @@ def _resolve_checkout_live_readiness_requirement(
     psp_mode: Optional[str] = None,
     test_psp_probe: Any = None,
 ) -> bool:
+    """Whether this readiness checkout must charge a LIVE-ready processor.
+
+    The scoped test-processor probe relaxes live-readiness only when all three
+    conjuncts hold: the caller explicitly asked for the probe, the server-side
+    master switch ALLOW_TEST_PSP_PROBE is on (default OFF), and the merchant is
+    in TEST_PSP_PROBE_MERCHANTS. Dropping any one of them would let a charge
+    route to a TEST processor and the order be marked paid with no real money.
+
+    The two env readers are imported from routes.order_routes rather than
+    reimplemented here: this module used to carry byte-identical private copies,
+    which meant a future tightening of the canonical gate (or of the env
+    vocabulary it accepts) would silently skip this lane. Imported lazily,
+    matching the existing `sync_order_to_connected_store` import below, so
+    readiness does not pull the whole order_routes graph at module import.
+    """
+    from routes.order_routes import _test_psp_probe_enabled, _test_psp_probe_merchants
+
     if (
         _explicit_readiness_test_psp_probe_requested(psp_mode=psp_mode, test_psp_probe=test_psp_probe)
         and _test_psp_probe_enabled()
