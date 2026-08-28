@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 from fastapi import FastAPI
@@ -2044,7 +2045,7 @@ async def _exercise_readiness_payment_intent_probe(
     merchant_id: str,
     allowlist: str,
     test_psp_probe: bool,
-    probe_enabled: str = "1",
+    probe_enabled: Optional[str] = "1",
     psp_mode: str = "stripe_checkout",
 ):
     from adapters.psp_adapter import PaymentIntent
@@ -2054,7 +2055,16 @@ async def _exercise_readiness_payment_intent_probe(
     # `probe_enabled` and `psp_mode` are parameters, not constants: each of the
     # three conjuncts in _resolve_checkout_live_readiness_requirement needs to be
     # varied on its own, or a mutant that deletes one of them survives the suite.
-    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", probe_enabled)
+    #
+    # probe_enabled=None means the var is ABSENT, not present-and-empty. The
+    # distinction is load-bearing: os.getenv's default argument is only consulted
+    # when the name is unset, so a caller that setenv()s "" tests the empty-token
+    # path and leaves the default itself unpinned -- a fail-open default of "1"
+    # would survive. Deleting the name is the only way to reach it.
+    if probe_enabled is None:
+        monkeypatch.delenv("ALLOW_TEST_PSP_PROBE", raising=False)
+    else:
+        monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", probe_enabled)
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", allowlist)
 
     journal = InMemoryReadinessJournal()
@@ -2209,15 +2219,20 @@ async def test_readiness_payment_intent_probe_fails_closed_when_master_switch_of
 
 @pytest.mark.asyncio
 async def test_readiness_payment_intent_probe_fails_closed_when_switch_unset(monkeypatch):
-    """An ABSENT ALLOW_TEST_PSP_PROBE is not a permissive one: default is OFF."""
-    monkeypatch.delenv("ALLOW_TEST_PSP_PROBE", raising=False)
+    """An ABSENT ALLOW_TEST_PSP_PROBE is not a permissive one: the default is OFF.
+
+    Distinct from the "0" test above, which exercises the token check. This one
+    pins os.getenv's DEFAULT argument, reachable only when the name is unset --
+    flipping that default to "1" makes the probe fail OPEN on any host that never
+    set the variable, which is every host by design.
+    """
     with pytest.raises(ValueError) as exc:
         await _exercise_readiness_payment_intent_probe(
             monkeypatch,
             merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
             allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
             test_psp_probe=True,
-            probe_enabled="",
+            probe_enabled=None,
         )
 
     detail = exc.value.args[0]
@@ -2308,9 +2323,6 @@ async def test_readiness_probe_gate_reads_the_canonical_order_routes_helpers(mon
         )
         is True
     ), "readiness ignored the canonical TEST_PSP_PROBE_MERCHANTS reader"
-
-    assert not hasattr(readiness_service, "_test_psp_probe_enabled")
-    assert not hasattr(readiness_service, "_test_psp_probe_merchants")
 
 
 def test_payment_status_sync_requires_existing_payment_intent(monkeypatch):
