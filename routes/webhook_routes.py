@@ -437,8 +437,26 @@ async def _resolve_stripe_order_for_payment_event(
     return order
 
 
+# Test-mode events may be exempted ONLY for the event types whose order
+# resolution this gate mirrors EXACTLY (`data["id"]` + `data["metadata"]`, via
+# _resolve_stripe_order_for_payment_event — see the branches in
+# handle_stripe_webhook). An event type that resolves its order some OTHER way
+# must never be exempted: `charge.refunded`, for instance, resolves on
+# `data["payment_intent"]` through a raw query with no cross-tenant guard, so
+# exempting it on a match found via `data["id"]` would authorize the gate
+# against one order while the handler mutates a different one. Keep this set
+# minimal; adding a type REQUIRES checking that its branch resolves identically.
+_TEST_MODE_PROBE_EXEMPTIBLE_EVENT_TYPES = frozenset(
+    {
+        "payment_intent.succeeded",
+        "checkout.session.completed",
+    }
+)
+
+
 async def _test_mode_stripe_event_probe_exempt(
     *,
+    event_type: Optional[str],
     data: Dict[str, Any],
     psp_id: Optional[str],
 ) -> bool:
@@ -453,62 +471,52 @@ async def _test_mode_stripe_event_probe_exempt(
     TEST_PSP_PROBE_MERCHANTS while ALLOW_TEST_PSP_PROBE is on. Anything short of
     that (env off, merchant not allowlisted, order unresolvable, order never
     asked for a test processor) keeps the unconditional production drop.
+
+    CRITICAL — the exemption must bind to the SAME order the handler will
+    mutate. This resolves on `data["id"]` + `data["metadata"]`, byte-for-byte
+    what the exemptible branches use, so "the order that granted the bypass" and
+    "the order that gets written" cannot diverge. Resolving on any BROADER set of
+    references (e.g. also trying `data["payment_intent"]`) would turn one
+    sanctioned probe order into a reusable passport: name it where the gate looks,
+    point the handler's field at a different order, and a fake test-mode event
+    drives a real one. Read-only by construction: allow_repoint=False, so
+    deciding the gate can never write to an order.
     """
     from routes.order_routes import (
+        _coerce_order_metadata,
         _resolve_order_live_readiness_requirement,
         _test_psp_probe_enabled,
         _test_psp_probe_merchants,
     )
 
+    if str(event_type or "") not in _TEST_MODE_PROBE_EXEMPTIBLE_EVENT_TYPES:
+        return False
     if not _test_psp_probe_enabled():
         return False
     if not _test_psp_probe_merchants():
         return False
 
-    raw_object_id = str(data.get("id") or "").strip()
-    payment_intent_id = (
-        raw_object_id
-        if raw_object_id.startswith("pi_")
-        else str(data.get("payment_intent") or "").strip()
-    )
     payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
     if not isinstance(payment_meta, dict):
         payment_meta = {}
 
-    order = None
-    # Hosted-checkout orders store the cs_ session id while payment events carry
-    # the pi_, so try both references before giving up.
-    for payment_reference in dict.fromkeys([payment_intent_id, raw_object_id]):
-        if not payment_reference:
-            continue
-        try:
-            order = await _resolve_stripe_order_for_payment_event(
-                payment_intent_id=payment_reference,
-                payment_meta=payment_meta,
-                allow_repoint=False,
-                psp_id=psp_id,
-            )
-        except Exception:
-            order = None
-        if order:
-            break
+    try:
+        order = await _resolve_stripe_order_for_payment_event(
+            payment_intent_id=data.get("id"),
+            payment_meta=payment_meta,
+            allow_repoint=False,
+            psp_id=psp_id,
+        )
+    except Exception:
+        order = None
     if not order:
         return False
-
-    order_metadata = order.get("metadata")
-    if isinstance(order_metadata, str):
-        try:
-            order_metadata = json.loads(order_metadata)
-        except Exception:
-            order_metadata = None
-    if not isinstance(order_metadata, dict):
-        order_metadata = {}
 
     # False == the live-readiness requirement is waived, i.e. the probe bypass
     # (armed env + allowlisted merchant + order-level request) is granted.
     return (
         _resolve_order_live_readiness_requirement(
-            order_metadata, order.get("merchant_id")
+            _coerce_order_metadata(order), order.get("merchant_id")
         )
         is False
     )
@@ -1048,7 +1056,7 @@ async def handle_stripe_webhook(
             # (ALLOW_TEST_PSP_PROBE on + merchant in TEST_PSP_PROBE_MERCHANTS +
             # order-level request) — otherwise the drop stays unconditional.
             probe_exempt = await _test_mode_stripe_event_probe_exempt(
-                data=data, psp_id=psp_id
+                event_type=event_type, data=data, psp_id=psp_id
             )
             if not probe_exempt:
                 logger.warning(
