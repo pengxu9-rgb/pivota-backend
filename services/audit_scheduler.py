@@ -39,6 +39,9 @@ Job registration happens at start-up time. Currently registers:
   upstream (Shopify shop.json / Wix products query) and disconnects the ones
   the platform no longer recognises, then re-derives
   catalog_merchants.status from merchant_stores (issue #1648).
+- `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
+  Data Bridge logs for a bounded least-recently-run store batch. It is dormant
+  unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -109,6 +112,7 @@ _JOB_RUN_DEADLINES = {
     "settlement_file_transfer": 3600,
     # hourly-ish
     "store_lifecycle_reconciliation": 1800,
+    "cafe24_reconciliation": 900,
     "audit_health_tick": 600,
     "catalog_onboard_queue_drain": 1500,
     "external_conversion_poll": 600,
@@ -367,6 +371,23 @@ async def start_scheduler() -> None:
             "cron",
             minute=17,
             id="store_lifecycle_reconciliation",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # Cafe24 webhook/Data Bridge recovery: the platform explicitly advises
+        # reading both log APIs because real-time webhook delivery can be missed.
+        # Registered through the production-only isolated scheduler path, but
+        # DORMANT until CAFE24_RECONCILIATION_ENABLED=true. Least-recently-run
+        # stores are processed first inside the bounded tick.
+        from jobs.cafe24_reconciliation_job import run_cafe24_reconciliation_tick
+        _add_job(
+            run_cafe24_reconciliation_tick,
+            "cron",
+            minute="7,22,37,52",
+            id="cafe24_reconciliation",
             replace_existing=True,
             misfire_grace_time=600,
             coalesce=True,
@@ -991,6 +1012,7 @@ async def start_scheduler() -> None:
             "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
             "+ catalog_row_trust_backfill (cron */6h :17, ACTIVE) "
             "+ agent_pdp_view_reconcile (cron */6h :43, ACTIVE) "
+            "+ cafe24_reconciliation (15min, flag-gated CAFE24_RECONCILIATION_ENABLED) "
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
         )

@@ -1407,6 +1407,7 @@ class ConnectWooCommerceRequest(BaseModel):
     store_url: str
     consumer_key: str
     consumer_secret: str
+    webhook_secret: Optional[str] = None
 
 
 class ConnectBigCommerceRequest(BaseModel):
@@ -2205,6 +2206,7 @@ async def merchant_connect_woocommerce(
             {
                 "consumer_key": request.consumer_key,
                 "consumer_secret": request.consumer_secret,
+                "webhook_secret": request.webhook_secret or request.consumer_secret,
             },
             separators=(",", ":"),
         )
@@ -2247,7 +2249,9 @@ async def merchant_connect_woocommerce(
         return {
             "status": "success",
             "message": "WooCommerce store connected successfully",
-            "store_id": store_id
+            "store_id": store_id,
+            "webhook_path": f"/webhooks/woocommerce/{store_id}",
+            "required_webhook_topics": ["order.created", "order.updated"],
         }
         
     except HTTPException:

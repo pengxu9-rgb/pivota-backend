@@ -333,7 +333,8 @@ async def get_checkout_payment_intent(
     if not payment_action.get("url") and not payment_action.get("client_secret"):
         raise HTTPException(status_code=409, detail="Checkout does not have an active payment action")
 
-    interaction = await find_interaction_by_order_id(checkout_id)
+    merchant_id = str(order.get("merchant_id") or "").strip()
+    interaction = await find_interaction_by_order_id(checkout_id, merchant_id=merchant_id)
     await record_commerce_event(
         event_type="payment.intent.viewed",
         metadata={
@@ -368,7 +369,8 @@ async def get_checkout_status(
     context: AgentContext = Depends(get_agent_context),
 ):
     order = _ensure_order_access(await get_order(checkout_id), context)
-    interaction = await find_interaction_by_order_id(checkout_id)
+    merchant_id = str(order.get("merchant_id") or "").strip()
+    interaction = await find_interaction_by_order_id(checkout_id, merchant_id=merchant_id)
     trace = await trace_interaction(str(interaction.get("interaction_id"))) if interaction else {"interaction": None, "events": []}
     store = await get_primary_store(str(order.get("merchant_id") or "")) or {}
     return {
@@ -405,7 +407,8 @@ async def create_checkout_refund(
         background_tasks=background_tasks,
         current_user={"role": "agent", "agent_id": context.agent_id},
     )
-    interaction = await find_interaction_by_order_id(checkout_id)
+    merchant_id = str(order.get("merchant_id") or "").strip()
+    interaction = await find_interaction_by_order_id(checkout_id, merchant_id=merchant_id)
     await record_commerce_event(
         event_type="refund.requested",
         metadata={
@@ -442,7 +445,7 @@ async def sync_checkout_returns(
     merchant_id = str(order.get("merchant_id") or "").strip()
     store = await get_primary_store(merchant_id) or {}
     platform = str(store.get("platform") or "").strip().lower()
-    interaction = await find_interaction_by_order_id(checkout_id)
+    interaction = await find_interaction_by_order_id(checkout_id, merchant_id=merchant_id)
 
     if platform != "shopify":
         await record_commerce_event(

@@ -56,6 +56,29 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
     "wix": CommerceSourceDefinition("wix", "storefront", _CATALOG_CAPABILITIES),
     "woocommerce": CommerceSourceDefinition("woocommerce", "storefront", _CATALOG_CAPABILITIES),
     "bigcommerce": CommerceSourceDefinition("bigcommerce", "storefront", _CATALOG_CAPABILITIES),
+    "cafe24": CommerceSourceDefinition("cafe24", "storefront", _CATALOG_CAPABILITIES),
+    # Phase 1 is an authenticated native catalog pull. Commerce telemetry is
+    # already coverable by the universal collectors, but no Magento-native
+    # catalog-event, quote, or checkout connector is claimed yet.
+    "magento": CommerceSourceDefinition(
+        "magento",
+        "storefront",
+        CommerceSourceCapabilities(catalog_pull=True),
+    ),
+    # SCAPI Shopper Search/Products is a native, site-scoped sellable catalog
+    # source. Checkout and event capabilities remain unclaimed until their
+    # separate SLAS basket/order and integration-event contracts are wired.
+    "salesforce_commerce_cloud": CommerceSourceDefinition(
+        "salesforce_commerce_cloud",
+        "storefront",
+        CommerceSourceCapabilities(catalog_pull=True),
+    ),
+    "shopline": CommerceSourceDefinition(
+        "shopline", "storefront", CommerceSourceCapabilities(catalog_pull=True)
+    ),
+    "shoplazza": CommerceSourceDefinition(
+        "shoplazza", "storefront", CommerceSourceCapabilities(catalog_pull=True)
+    ),
     # Square is retained because the existing sync endpoint accepts its credentials;
     # its fetch adapter can be enabled independently of this policy contract.
     "square": CommerceSourceDefinition("square", "storefront", _CATALOG_CAPABILITIES),

@@ -11,8 +11,6 @@ the reporting merchant's API key; `X-Pivota-Merchant-Id` names the merchant. The
 key is per-merchant and is never transmitted. Binding is idempotent on
 (merchant_id, external_order_id): a replay never double-counts GMV.
 """
-import hashlib
-import hmac
 import json
 import logging
 from typing import Optional
@@ -22,14 +20,6 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/attribution/conversions", tags=["Attribution"])
-
-# A merchant in one of these lifecycle states is NOT a live merchant and may not
-# report attribution — critically ``deleted``, since soft-delete tombstones the
-# record but does NOT clear the api_key (so a valid signature alone is not enough).
-# ``rejected`` is a KYC-refused merchant. Mirrors the house ``status != "deleted"``
-# liveness convention in db.merchant_onboarding.get_all_merchant_onboardings.
-_INACTIVE_MERCHANT_STATUSES = {"deleted", "rejected"}
-
 
 @router.post("/report")
 async def report_conversion(
@@ -48,37 +38,22 @@ async def report_conversion(
     (soft-deleted / KYC-refused). 400 on a bad body, a missing `external_order_id`,
     or a non-numeric / negative `gross_amount_cents`.
     """
-    from db.merchant_onboarding import get_merchant_onboarding
     from services.commerce_attribution_service import close_external_order_conversion
-
-    if not x_pivota_merchant_id or not x_pivota_signature:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-Pivota-Merchant-Id or X-Pivota-Signature",
-        )
+    from services.merchant_hmac_auth import MerchantHMACAuthError, authenticate_hmac_merchant
 
     # Verify the HMAC over the RAW body BEFORE parsing/trusting anything. Read the
     # raw bytes (Starlette caches them) so the signature is over exactly what the
     # merchant signed. Unknown merchant / no api key fails the same way as a bad
     # signature — no oracle. Constant-time compare.
     raw_body = await request.body()
-    merchant = await get_merchant_onboarding(x_pivota_merchant_id)
-    api_key = (merchant or {}).get("api_key")
-    expected = (
-        hmac.new(api_key.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-        if api_key
-        else None
-    )
-    if not expected or not hmac.compare_digest(str(x_pivota_signature), expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
-
-    # A valid signature proves key possession but NOT that the merchant is still
-    # live: soft-delete leaves the api_key intact. Reject tombstoned / KYC-refused
-    # merchants here (403 — the caller already holds the key, so no existence oracle
-    # is leaked). Checked AFTER the HMAC so an attacker without the key learns
-    # nothing about merchant state.
-    if str((merchant or {}).get("status") or "").strip() in _INACTIVE_MERCHANT_STATUSES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Merchant is not active")
+    try:
+        merchant = await authenticate_hmac_merchant(
+            raw_body=raw_body,
+            merchant_id=x_pivota_merchant_id,
+            signature=x_pivota_signature,
+        )
+    except MerchantHMACAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     merchant_id = merchant["merchant_id"]
 

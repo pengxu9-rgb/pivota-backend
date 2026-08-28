@@ -18,6 +18,11 @@ from adapters.bigcommerce_adapter import (
     build_bigcommerce_headers,
     normalize_bigcommerce_store_hash,
 )
+from adapters.cafe24_adapter import Cafe24ProductAdapter
+from adapters.magento_adapter import MagentoProductAdapter
+from adapters.sfcc_adapter import SalesforceCommerceCloudProductAdapter
+from adapters.shopline_adapter import ShoplineProductAdapter
+from adapters.shoplazza_adapter import ShoplazzaProductAdapter
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from models.standard_product import StandardProduct, StandardProductVariant, ProductStatus
 from services.wix_connection import (
@@ -2030,6 +2035,11 @@ PLATFORM_ADAPTERS = {
     "wix": WixProductAdapter,
     "woocommerce": WooCommerceProductAdapter,
     "bigcommerce": BigCommerceProductAdapter,
+    "cafe24": Cafe24ProductAdapter,
+    "magento": MagentoProductAdapter,
+    "salesforce_commerce_cloud": SalesforceCommerceCloudProductAdapter,
+    "shopline": ShoplineProductAdapter,
+    "shoplazza": ShoplazzaProductAdapter,
 }
 
 
@@ -2093,6 +2103,65 @@ async def fetch_merchant_products(
             merchant_id=merchant_id,
             limit=limit,
             page_token=page_token,
+        )
+    elif platform == "cafe24":
+        return await adapter_class.fetch_products(
+            mall_id=credentials.get("mall_id"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            shop_no=credentials.get("shop_no", 1),
+            currency=credentials.get("currency", "KRW"),
+            api_version=credentials.get("api_version", "2026-03-01"),
+            refresh_token=credentials.get("refresh_token"),
+            expires_at=credentials.get("expires_at"),
+            store_id=credentials.get("store_id"),
+        )
+    elif platform == "magento":
+        return await adapter_class.fetch_products(
+            store_url=credentials.get("store_url"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            store_view_code=credentials.get("store_view_code", "default"),
+            currency=credentials.get("currency", "USD"),
+            product_url_suffix=credentials.get("product_url_suffix"),
+        )
+    elif platform == "salesforce_commerce_cloud":
+        return await adapter_class.fetch_products(
+            short_code=credentials.get("short_code"),
+            organization_id=credentials.get("organization_id"),
+            site_id=credentials.get("site_id"),
+            client_id=credentials.get("client_id"),
+            client_secret=credentials.get("client_secret"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            currency=credentials.get("currency", "USD"),
+            locale=credentials.get("locale"),
+            storefront_url=credentials.get("storefront_url", ""),
+        )
+    elif platform == "shopline":
+        return await adapter_class.fetch_products(
+            handle=credentials.get("handle"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            api_version=credentials.get("api_version", "v20260601"),
+            currency=credentials.get("currency", "USD"),
+        )
+    elif platform == "shoplazza":
+        return await adapter_class.fetch_products(
+            store_url=credentials.get("store_url"),
+            access_token=credentials.get("access_token"),
+            merchant_id=merchant_id,
+            limit=limit,
+            page_token=page_token,
+            api_version=credentials.get("api_version", "2026-01"),
+            currency=credentials.get("currency", "USD"),
         )
     else:
         return [], None, f"Platform {platform} not implemented"
