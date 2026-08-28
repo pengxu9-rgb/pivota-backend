@@ -75,6 +75,7 @@ def _install_webhook_plumbing(
     *,
     event: Dict[str, Any],
     orders: List[Dict[str, Any]],
+    psp_owner: str | None = None,
 ) -> Dict[str, list]:
     """Wire signature verification + DB resolution over a set of orders.
 
@@ -97,6 +98,13 @@ def _install_webhook_plumbing(
     }
 
     async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        # The psp-owner lookup (SELECT merchant_id FROM merchant_psps) is what
+        # arms the cross-tenant guard; the secret lookup selects provider_config
+        # and falls through to the platform secret.
+        if "merchant_psps" in query and "merchant_id" in query:
+            return {"merchant_id": psp_owner} if psp_owner else None
+        if "merchant_psps" in query:
+            return None
         calls["fetch_one"].append(dict(values))
         reference = values.get("payment_intent_id")
         if reference is None:
@@ -189,22 +197,28 @@ def _arm_probe(monkeypatch: pytest.MonkeyPatch, *, env_on: bool = True) -> None:
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", PROBE_MERCHANT)
 
 
-async def _post_webhook() -> httpx.Response:
+async def _post_webhook(path: str = "/webhooks/stripe") -> httpx.Response:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.post(
-            "/webhooks/stripe",
+            path,
             content=b'{"id":"evt_probe_test_mode"}',
             headers={"stripe-signature": "sig_probe"},
         )
 
 
 def _succeeded_event(
-    *, object_id: str, metadata: Dict[str, Any] | None = None, amount: int = 4520
+    *,
+    object_id: str,
+    metadata: Dict[str, Any] | None = None,
+    amount: int = 4520,
+    payment_intent: str | None = None,
 ) -> Dict[str, Any]:
     obj: Dict[str, Any] = {"id": object_id, "amount": amount, "currency": "usd"}
     if metadata is not None:
         obj["metadata"] = metadata
+    if payment_intent is not None:
+        obj["payment_intent"] = payment_intent
     return {
         "type": "payment_intent.succeeded",
         "livemode": False,
@@ -396,6 +410,9 @@ async def test_probe_order_is_not_a_passport_for_a_foreign_order(
     The gate must resolve the SAME order the handler will, and refuse."""
     event = _succeeded_event(
         object_id="cs_victim_session",
+        # A non-existent pi_ here is what pushed the pre-fix gate past its first
+        # lookup and into the attacker-controlled metadata hint.
+        payment_intent="pi_does_not_exist",
         metadata={"order_id": "ORD_PROBE"},
         amount=49900,
     )
@@ -466,10 +483,14 @@ async def test_test_mode_refund_event_is_never_exempt(
                 total="499.00",
             ),
         ],
+        # The probe merchant's OWN endpoint arms the cross-tenant guard, which
+        # blocks the gate's first lookup and sends it to the metadata hint —
+        # while the refund branch's raw query has no guard at all.
+        psp_owner=PROBE_MERCHANT,
     )
     _arm_probe(monkeypatch)
 
-    resp = await _post_webhook()
+    resp = await _post_webhook("/webhooks/stripe/psp_probe")
 
     assert resp.status_code == 200
     assert resp.json()["reason"] == "test_mode_event_in_production"
