@@ -291,20 +291,43 @@ async def _resolve_stripe_order_for_refund(
     *,
     payment_intent_id: Optional[str],
     refund_meta: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+    psp_id: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve the order a Stripe refund event belongs to.
+
+    Returns `(order, reject_reason)`. `reject_reason` is set ONLY when an order
+    was found and then REFUSED — today that is the cross-tenant block. A plain
+    miss is `(None, None)`, which preserves the historical behaviour that a
+    refund for a payment_intent we do not track is a no-op success.
+
+    `psp_id` (the webhook endpoint owner) enforces the same cross-tenant guard
+    the payment branches use: a merchant who knows their own endpoint secret must
+    not be able to drive refund state on another merchant's order, whether by
+    replaying a foreign payment_intent id or by forging metadata.order_id.
+    """
+    psp_owner = await _stripe_psp_owner_merchant_id(psp_id)
+
+    def _scoped(order: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        return _scope_stripe_order_to_psp_owner(
+            order,
+            psp_owner_merchant_id=psp_owner,
+            psp_id=psp_id,
+            payment_intent_id=payment_intent_id,
+        )
+
     query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
     from db.database import database
 
     if payment_intent_id:
         result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
         if result:
-            return _db_row_to_dict(result)
+            return _scoped(_db_row_to_dict(result))
 
     if isinstance(refund_meta, dict):
         order_hint = str(refund_meta.get("order_id") or "").strip()
         if order_hint:
-            return _db_row_to_dict(await get_order(order_hint))
-    return None
+            return _scoped(_db_row_to_dict(await get_order(order_hint)))
+    return None, None
 
 
 async def _persist_stripe_refund_observability(
@@ -344,6 +367,35 @@ async def _stripe_psp_owner_merchant_id(psp_id: Optional[str]) -> Optional[str]:
     return None
 
 
+def _scope_stripe_order_to_psp_owner(
+    order: Optional[Dict[str, Any]],
+    *,
+    psp_owner_merchant_id: Optional[str],
+    psp_id: Optional[str],
+    payment_intent_id: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Apply the cross-tenant guard to a resolved order and log the block.
+
+    Shared by the payment and refund resolvers so both surfaces enforce (and
+    alert on) the guard identically. Returns `(order, reject_reason)`.
+    """
+    if order is None:
+        return None, None
+    if not _order_belongs_to_psp_owner(order, psp_owner_merchant_id):
+        logger.error(
+            {
+                "alert": "stripe_webhook_cross_tenant_blocked",
+                "psp_id": psp_id,
+                "psp_owner_merchant_id": psp_owner_merchant_id,
+                "order_id": order.get("order_id"),
+                "order_merchant_id": order.get("merchant_id"),
+                "payment_intent_id": payment_intent_id,
+            }
+        )
+        return None, "cross_tenant_blocked"
+    return order, None
+
+
 def _order_belongs_to_psp_owner(order: Dict[str, Any], psp_owner_merchant_id: Optional[str]) -> bool:
     """Cross-tenant guard: the resolved order must belong to the merchant that
     owns the webhook endpoint's psp_id. Skipped when psp_owner is unknown (bare
@@ -381,21 +433,13 @@ async def _resolve_stripe_order_for_payment_event(
     psp_owner = await _stripe_psp_owner_merchant_id(psp_id)
 
     def _scoped(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if order is None:
-            return None
-        if not _order_belongs_to_psp_owner(order, psp_owner):
-            logger.error(
-                {
-                    "alert": "stripe_webhook_cross_tenant_blocked",
-                    "psp_id": psp_id,
-                    "psp_owner_merchant_id": psp_owner,
-                    "order_id": order.get("order_id"),
-                    "order_merchant_id": order.get("merchant_id"),
-                    "payment_intent_id": payment_intent_id,
-                }
-            )
-            return None
-        return order
+        allowed, _reject = _scope_stripe_order_to_psp_owner(
+            order,
+            psp_owner_merchant_id=psp_owner,
+            psp_id=psp_id,
+            payment_intent_id=payment_intent_id,
+        )
+        return allowed
 
     query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
     from db.database import database
@@ -850,6 +894,85 @@ def _stripe_event_payment_matches_order(
     return True, None
 
 
+def _stripe_event_refund_matches_order(
+    order: Dict[str, Any],
+    *,
+    refund_amount_minor: Any,
+    currency: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Verify the signed Stripe refund event's amount + currency are consistent
+    with the order it claims to refund.
+
+    The payment branches verify the charge against the order total before marking
+    it paid; the refund branches used to apply whatever amount the event carried.
+    The event IS signature-verified, so the amount is a real PSP amount — but it
+    still has to belong to THIS order. A refund larger than the order total (or in
+    a different currency) writes a bogus `total_refunded` and flips the order to
+    `refunded`/`partially_refunded` on an amount we never charged.
+
+    Both refund success paths feed `refund_total` to `finalize_refund_success`,
+    which takes `max(current_total_refunded, refund_total)` — cumulative
+    semantics — so the order total is the correct ceiling for either a cumulative
+    `charge.refunded.amount_refunded` or a single `refund.amount`.
+
+    Returns (ok, reason_if_not).
+    """
+    order_currency = str(order.get("currency") or "").strip().lower()
+    event_currency = str(currency or "").strip().lower()
+    if order_currency and event_currency and order_currency != event_currency:
+        return False, f"refund_currency_mismatch:order={order_currency},event={event_currency}"
+
+    if refund_amount_minor is None:
+        return False, "refund_amount_missing"
+
+    order_total = order.get("total")
+    if order_total is None:
+        return False, "order_total_missing"
+
+    try:
+        factor = _stripe_minor_unit_factor(event_currency or order_currency)
+        observed = Decimal(str(refund_amount_minor)) / factor
+        max_refundable = Decimal(str(order_total))
+    except Exception as exc:  # noqa: BLE001
+        return False, f"refund_amount_parse_error:{exc}"
+
+    if observed <= Decimal("0"):
+        return False, f"refund_amount_not_positive:observed={observed}"
+    if observed > max_refundable:
+        return (
+            False,
+            f"refund_exceeds_order_total:order_total={max_refundable},observed={observed}",
+        )
+    return True, None
+
+
+async def _flag_unmatched_stripe_refund_event(
+    *,
+    event_id: Optional[str],
+    event_type: Optional[str],
+    payment_intent_id: Optional[str],
+    refund_reference: Optional[str],
+    reason: str,
+) -> None:
+    """A signed refund event resolved to an order we REFUSED to mutate — either
+    the cross-tenant guard blocked it, or its amount/currency does not match the
+    order. The refund is real at the PSP, so recording the event as 'processed'
+    would sweep it under the rug. Record 'unmatched' and alert loudly; the
+    reconcile sweep is the recovery net."""
+    logger.error(
+        {
+            "alert": "stripe_refund_event_unmatched",
+            "event_type": event_type,
+            "event_id": event_id,
+            "payment_intent_id": payment_intent_id,
+            "refund_reference": refund_reference,
+            "reason": reason,
+            "impact": "refund was NOT applied to any order; reconcile required",
+        }
+    )
+    await _mark_stripe_webhook_event_status_best_effort(event_id, "unmatched", reason)
+
+
 async def _flag_unmatched_stripe_payment_event(
     *,
     event_id: Optional[str],
@@ -1257,12 +1380,46 @@ async def handle_stripe_webhook(
             refund_amount = data.get("amount_refunded")
             currency = (data.get("currency") or "").strip().lower() or None
             
-            query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
-            from db.database import database
-            result = await database.fetch_one(query, {"payment_intent_id": payment_intent_id})
-            result = _db_row_to_dict(result)
-            
+            # This branch used to run a raw
+            # `SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id`
+            # with NO psp scoping, so a merchant holding their own endpoint secret
+            # could drive refund state on another merchant's order. It now goes
+            # through the same guarded resolver the payment branches use.
+            # `refund_meta=None` keeps the lookup surface exactly as narrow as it
+            # was (payment_intent only — no metadata.order_id hint).
+            result, refund_reject = await _resolve_stripe_order_for_refund(
+                payment_intent_id=payment_intent_id,
+                refund_meta=None,
+                psp_id=psp_id,
+            )
+            if refund_reject:
+                await _flag_unmatched_stripe_refund_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    refund_reference=charge_id,
+                    reason=refund_reject,
+                )
+                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
+
             if result:
+                # Integrity: unlike the payment branches, this path applied
+                # whatever amount the event carried. Verify it against the order.
+                amount_ok, amount_reason = _stripe_event_refund_matches_order(
+                    result,
+                    refund_amount_minor=refund_amount,
+                    currency=currency,
+                )
+                if not amount_ok:
+                    await _flag_unmatched_stripe_refund_event(
+                        event_id=stripe_webhook_event_id,
+                        event_type=event_type,
+                        payment_intent_id=payment_intent_id,
+                        refund_reference=charge_id,
+                        reason=amount_reason or "refund_amount_verification_failed",
+                    )
+                    return {"status": "unmatched", "event": event_type, "reason": amount_reason}
+
                 order_id = result["order_id"]
                 try:
                     refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
@@ -1299,10 +1456,20 @@ async def handle_stripe_webhook(
                 source_event="refund.created",
             )
 
-            result = await _resolve_stripe_order_for_refund(
+            result, refund_reject = await _resolve_stripe_order_for_refund(
                 payment_intent_id=payment_intent_id,
                 refund_meta=refund_meta if isinstance(refund_meta, dict) else None,
+                psp_id=psp_id,
             )
+            if refund_reject:
+                await _flag_unmatched_stripe_refund_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    refund_reference=refund_id,
+                    reason=refund_reject,
+                )
+                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
 
             if result:
                 await _persist_stripe_refund_observability(result, refund_snapshot)
@@ -1336,10 +1503,20 @@ async def handle_stripe_webhook(
                 source_event="refund.updated",
             )
 
-            result = await _resolve_stripe_order_for_refund(
+            result, refund_reject = await _resolve_stripe_order_for_refund(
                 payment_intent_id=payment_intent_id,
                 refund_meta=refund_meta if isinstance(refund_meta, dict) else None,
+                psp_id=psp_id,
             )
+            if refund_reject:
+                await _flag_unmatched_stripe_refund_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    refund_reference=refund_id,
+                    reason=refund_reject,
+                )
+                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
 
             if result:
                 order_id = result["order_id"]
@@ -1348,6 +1525,24 @@ async def handle_stripe_webhook(
                     existing_meta = {}
 
                 if refund_status == "succeeded":
+                    # Same integrity check the charge.refunded path applies: this
+                    # is the other branch that writes total_refunded from an
+                    # event-supplied amount.
+                    amount_ok, amount_reason = _stripe_event_refund_matches_order(
+                        result,
+                        refund_amount_minor=refund_amount,
+                        currency=currency,
+                    )
+                    if not amount_ok:
+                        await _flag_unmatched_stripe_refund_event(
+                            event_id=stripe_webhook_event_id,
+                            event_type=event_type,
+                            payment_intent_id=payment_intent_id,
+                            refund_reference=refund_id,
+                            reason=amount_reason or "refund_amount_verification_failed",
+                        )
+                        return {"status": "unmatched", "event": event_type, "reason": amount_reason}
+
                     try:
                         refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
                     except Exception:
@@ -1435,10 +1630,20 @@ async def handle_stripe_webhook(
             )
 
             refund_meta = data.get("metadata") or {}
-            result = await _resolve_stripe_order_for_refund(
+            result, refund_reject = await _resolve_stripe_order_for_refund(
                 payment_intent_id=payment_intent_id,
                 refund_meta=refund_meta if isinstance(refund_meta, dict) else None,
+                psp_id=psp_id,
             )
+            if refund_reject:
+                await _flag_unmatched_stripe_refund_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    refund_reference=refund_id,
+                    reason=refund_reject,
+                )
+                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
 
             if result:
                 finalization = await _finalize_stripe_refund_failure(
