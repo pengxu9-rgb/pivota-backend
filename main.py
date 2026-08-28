@@ -1074,6 +1074,8 @@ app.include_router(audit_runs_router)  # P2.3: async audit_runs lifecycle (POST/
 # log line never surfaces in log fetches; this endpoint provides direct state.
 from routes.scheduler_health import router as scheduler_health_router
 app.include_router(scheduler_health_router)
+from routes.pool_health import router as pool_health_router
+app.include_router(pool_health_router)  # GET /__pool_health: pool-vs-database partition during a wedge
 
 # Admin: resume/pause allowlisted settlement crons (T7/T8 + settlement-file
 # jobs) for Stage-4 promotion and rollback without a redeploy.
