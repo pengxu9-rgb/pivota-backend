@@ -15,10 +15,25 @@ two of them silently is the failure mode worth guarding.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
 from routes.pool_health import _tasks_by_frame, _verdict
+
+
+async def _drain(task: "asyncio.Task") -> None:
+    """Cancel AND await.
+
+    A bare `task.cancel()` only requests cancellation; the task is still pending
+    when pytest-asyncio closes the loop, which surfaces as a flood of
+    `RuntimeError: Event loop is closed` at GC and leaves a coroutine reachable
+    from a dead loop's task set. Tests that leak tasks contaminate whatever runs
+    next in the same process.
+    """
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 # Two frames deliberately in DIFFERENT functions: `_framework_entry` is the
@@ -91,7 +106,7 @@ class TestTasksByFrame:
             ), f"the parked task's own frame is missing from {frames}"
             assert all(isinstance(v, int) for v in frames.values())
         finally:
-            task.cancel()
+            await _drain(task)
 
     @pytest.mark.asyncio
     async def test_it_leaks_no_arguments_or_sql(self) -> None:
@@ -113,7 +128,7 @@ class TestTasksByFrame:
             assert secret not in rendered
             assert "token" not in rendered
         finally:
-            task.cancel()
+            await _drain(task)
 
     @pytest.mark.asyncio
     async def test_it_reports_the_deepest_app_frame_not_the_outermost(self) -> None:
@@ -144,7 +159,7 @@ class TestTasksByFrame:
                 f"{_FRAMEWORK_LINE} (_framework_entry)"
             )
         finally:
-            task.cancel()
+            await _drain(task)
 
     @pytest.mark.asyncio
     async def test_plumbing_frames_are_never_the_answer(self) -> None:
@@ -165,7 +180,7 @@ class TestTasksByFrame:
         try:
             assert not any("tasks.py" in k for k in _tasks_by_frame())
         finally:
-            task.cancel()
+            await _drain(task)
 
 
 class TestPoolCounters:
