@@ -14,11 +14,28 @@ Configure these core WooCommerce webhook topics:
 - `order.created`
 - `order.updated`
 
+After connecting the store, Pivota can install or repair both subscriptions
+idempotently through the WooCommerce REST API:
+
+```text
+POST /integrations/woocommerce/{store_id}/webhooks/ensure
+```
+
+Set `WOOCOMMERCE_WEBHOOK_BASE_URL` or `PUBLIC_BASE_URL` to Pivota's public HTTPS
+origin. The installer lists existing webhooks, creates missing topic-and-callback
+pairs, and re-synchronizes the signing secret and active status on matches. This
+also makes a webhook-secret rotation recoverable without deleting subscriptions
+by hand. WooCommerce API credentials are sent with HTTPS Basic authentication;
+they are never placed in query strings or error responses. The connected REST
+API key needs read/write permission to list and create webhooks.
+
 Set the Delivery URL to the store-specific path returned by
 `POST /integrations/woocommerce/connect`. Set the webhook Secret to the optional
-`webhook_secret` supplied during connection. If it is omitted in both places,
-WooCommerce defaults the signature secret to the API user's consumer secret and
-Pivota uses the connected consumer secret as the compatibility fallback.
+`webhook_secret` supplied during connection. When the installer is used, Pivota
+sets that secret explicitly; if it was omitted at connection time, Pivota
+explicitly uses the connected consumer secret as the compatibility fallback.
+Manual subscriptions must use that same value rather than relying on the
+platform's default secret.
 
 The receiver verifies the official base64-encoded HMAC-SHA256 signature over the
 raw request body, checks the reported source host, and accepts only active

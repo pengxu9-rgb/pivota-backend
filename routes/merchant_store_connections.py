@@ -14,6 +14,8 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
+import asyncio
 import logging
 import httpx
 import json
@@ -23,9 +25,10 @@ import hmac
 import os
 import re
 import secrets
-from urllib.parse import urlparse, urlencode
+from urllib.parse import quote, urlparse, urlencode
 
-from db.database import database
+from db.database import IS_POSTGRES, database
+from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
 from utils.auth import get_current_user, hash_password, verify_password as verify_bcrypt_password
 from config.settings import settings
 
@@ -1410,6 +1413,137 @@ class ConnectWooCommerceRequest(BaseModel):
     webhook_secret: Optional[str] = None
 
 
+def _woocommerce_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("WOOCOMMERCE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure WOOCOMMERCE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/woocommerce/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
+def _woocommerce_credentials(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    if ":" in value and not value.startswith("{"):
+        consumer_key, consumer_secret = value.split(":", 1)
+        return {
+            "consumer_key": consumer_key.strip(),
+            "consumer_secret": consumer_secret.strip(),
+        }
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+@asynccontextmanager
+async def _woocommerce_webhook_install_lock(store_id: str):
+    """Serialize one store without consuming the serving database pool."""
+
+    if not IS_POSTGRES:
+        yield
+        return
+    dsn = _asyncpg_dsn()
+    if not dsn:
+        raise HTTPException(
+            status_code=503,
+            detail="WooCommerce webhook installation lock is unavailable",
+        )
+    lock_name = f"woocommerce:webhook-install:{store_id}"
+    connection = None
+    try:
+        import asyncpg
+
+        connection = await asyncio.wait_for(
+            asyncpg.connect(dsn, **_connect_kwargs()),
+            timeout=5.0,
+        )
+        acquired = bool(
+            await asyncio.wait_for(
+                connection.fetchval(
+                    "SELECT pg_try_advisory_lock(hashtext($1))",
+                    lock_name,
+                ),
+                timeout=5.0,
+            )
+        )
+    except BaseException as exc:
+        if connection is not None:
+            try:
+                connection.terminate()
+            except Exception:
+                pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail="WooCommerce webhook installation lock is unavailable",
+        ) from exc
+    if not acquired:
+        try:
+            await asyncio.wait_for(connection.close(), timeout=5.0)
+        except Exception:
+            connection.terminate()
+        raise HTTPException(
+            status_code=409,
+            detail="WooCommerce webhook installation is already in progress",
+        )
+    try:
+        yield
+    finally:
+        try:
+            await asyncio.wait_for(
+                connection.execute(
+                    "SELECT pg_advisory_unlock(hashtext($1))",
+                    lock_name,
+                ),
+                timeout=5.0,
+            )
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                connection.terminate()
+                raise
+            logger.warning(
+                "WooCommerce webhook advisory unlock failed store_id=%s error=%s",
+                store_id,
+                str(exc)[:200],
+            )
+        try:
+            await asyncio.wait_for(connection.close(), timeout=5.0)
+        except BaseException as exc:
+            connection.terminate()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+
+
+_WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+
+
 class ConnectBigCommerceRequest(BaseModel):
     merchant_id: str
     store_hash: str
@@ -2251,6 +2385,9 @@ async def merchant_connect_woocommerce(
             "message": "WooCommerce store connected successfully",
             "store_id": store_id,
             "webhook_path": f"/webhooks/woocommerce/{store_id}",
+            "webhook_subscription_path": (
+                f"/integrations/woocommerce/{store_id}/webhooks/ensure"
+            ),
             "required_webhook_topics": ["order.created", "order.updated"],
         }
         
@@ -2261,6 +2398,73 @@ async def merchant_connect_woocommerce(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to connect WooCommerce: {str(e)}")
+
+
+@router.post("/woocommerce/{store_id}/webhooks/ensure")
+async def ensure_woocommerce_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'woocommerce'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected WooCommerce store not found")
+    store = dict(store)
+    if (
+        current_user.get("role") == "merchant"
+        and current_user.get("merchant_id") != str(store.get("merchant_id") or "")
+    ):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    credentials = _woocommerce_credentials(store.get("api_key"))
+    consumer_key = str(credentials.get("consumer_key") or "").strip()
+    consumer_secret = str(credentials.get("consumer_secret") or "").strip()
+    webhook_secret = str(
+        credentials.get("webhook_secret") or consumer_secret
+    ).strip()
+    if not consumer_key or not consumer_secret or not webhook_secret:
+        raise HTTPException(status_code=409, detail="WooCommerce API credentials are incomplete")
+
+    from services.woocommerce_webhook_subscriptions import (
+        WooCommerceWebhookSubscriptionError,
+        ensure_woocommerce_subscriptions,
+    )
+
+    try:
+        async with asyncio.timeout(90.0):
+            async with _WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY:
+                async with _woocommerce_webhook_install_lock(store_id):
+                    result = await ensure_woocommerce_subscriptions(
+                        store_url=str(store.get("domain") or ""),
+                        consumer_key=consumer_key,
+                        consumer_secret=consumer_secret,
+                        webhook_secret=webhook_secret,
+                        callback_url=_woocommerce_webhook_callback_url(store_id),
+                        topics=("order.created", "order.updated"),
+                    )
+    except WooCommerceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="WooCommerce webhook management request failed",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="WooCommerce webhook installation timed out",
+        ) from exc
+    return {"status": "success", "store_id": store_id, **result}
 
 
 @router.post("/bigcommerce/connect")
