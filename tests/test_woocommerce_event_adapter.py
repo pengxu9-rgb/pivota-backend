@@ -223,5 +223,6 @@ async def test_woocommerce_connect_persists_webhook_secret_and_returns_setup_pat
     persisted = json.loads(writes[0][1]["api_key"])
     assert persisted["webhook_secret"] == "hook-secret"
     assert result["webhook_path"].startswith("/webhooks/woocommerce/")
+    assert result["webhook_subscription_path"].endswith("/webhooks/ensure")
     assert result["required_webhook_topics"] == ["order.created", "order.updated"]
     assert "hook-secret" not in json.dumps(result)
