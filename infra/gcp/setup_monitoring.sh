@@ -98,19 +98,6 @@ for c in d.get("notificationChannels", []):
 
 if [ -n "$CHANNEL" ]; then
   echo "   reusing $CHANNEL"
-  VERIFIED="$(api GET "${CHANNEL#projects/*/}" 2>/dev/null | python3 -c '
-import json, sys
-raw = sys.stdin.read().strip()
-try:
-    print(json.loads(raw).get("verificationStatus", "") if raw else "")
-except ValueError:
-    print("")
-')"
-  if [ "$VERIFIED" != VERIFIED ]; then
-    echo "   WARNING: channel is '${VERIFIED:-UNSET}', not VERIFIED." >&2
-    echo "   Cloud Monitoring does not deliver to an unverified email channel. Every policy below" >&2
-    echo "   will fire into the void. Open the channel in the console and complete verification." >&2
-  fi
 else
   BODY="$(python3 -c '
 import json, sys
@@ -120,6 +107,35 @@ print(json.dumps({"type": "email", "displayName": "pivota prod alerts",
   check "$RESP" "create channel"
   CHANNEL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$RESP")"
   echo "   created $CHANNEL"
+fi
+
+# Deliberately OUTSIDE the if/else. An API-created email channel is born
+# UNVERIFIED and stays that way until a human completes the emailed code, so the
+# CREATE arm is the one that manufactures an undeliverable channel. Checking only
+# the reuse arm instruments the branch that OBSERVES the damage while staying
+# silent on the branch that CAUSES it — which is how the live 08-28 channel came
+# to exist with no verificationStatus while the script reported success.
+#
+# `${CHANNEL#projects/*/}` is a SHORTEST-prefix strip: `*` cannot swallow the
+# second `/` because the character after `projects/` is `p`, so this yields
+# `notificationChannels/<id>`, which `api()` prefixes with the project path. `##`
+# would yield a bare id and GET a 404, making the warning fire unconditionally
+# and training the reader to ignore it. A test pins the single `#`.
+CHANNEL_VERIFIED="$(api GET "${CHANNEL#projects/*/}" 2>/dev/null | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    print(json.loads(raw).get("verificationStatus", "") if raw else "")
+except ValueError:
+    print("")
+')"
+CHANNEL_UNDELIVERABLE=0
+if [ "$CHANNEL_VERIFIED" != VERIFIED ]; then
+  CHANNEL_UNDELIVERABLE=1
+  echo "   WARNING: channel is '${CHANNEL_VERIFIED:-UNSET}', not VERIFIED." >&2
+  echo "   Cloud Monitoring does not deliver to an unverified email channel. Every policy" >&2
+  echo "   below will fire into the void. Open the channel in the console and complete" >&2
+  echo "   verification, then re-run this script to confirm." >&2
 fi
 
 echo "== uptime checks"
@@ -156,6 +172,18 @@ echo "== log-based metrics"
 # 28 of 300 connections with 23 of them IDLE. The database was healthy the whole time; the
 # application was holding pool slots it never returned.
 #
+# TWO alternatives and NO `severity>=ERROR`, both load-bearing. The line this
+# codebase deliberately emits for the condition is db/database.py's
+# `logger.warning("database pool checkout timed out after %.1fs ...")` — a
+# WARNING whose text does not contain the class name. Meanwhile the designed
+# handling path (utils/db_retry.py -> db_busy_http_exception) turns the exception
+# into HTTPException(503), for which FastAPI logs no traceback at all. A filter
+# requiring ERROR *and* the class name therefore matches only when the exception
+# escapes every classifier — the exact outcome PoolCheckoutTimeout exists to
+# prevent. It caught 08-28 and would degrade toward never firing as more of the
+# ~15 call sites adopt with_asyncpg_busy_retry: an enabled policy that cannot
+# fire, the same defect this PR fixes on the LB 5xx rate.
+#
 # That distinction is invisible to every other policy here. "Cloud SQL connections high" watches
 # num_backends, which was at 9% - it CANNOT catch a leak on the client side, because a leaked
 # connection looks identical to an idle one from the server. This metric names the failure directly.
@@ -165,7 +193,7 @@ if "$GCLOUD" logging metrics describe "$METRIC" --project "$PROJECT" >/dev/null 
 else
   "$GCLOUD" logging metrics create "$METRIC" --project "$PROJECT" \
     --description "Count of PoolCheckoutTimeout - the app cannot obtain a DB connection from its own pool" \
-    --log-filter='resource.type="cloud_run_revision" AND severity>=ERROR AND textPayload:"PoolCheckoutTimeout"' \
+    --log-filter='resource.type="cloud_run_revision" AND (textPayload:"PoolCheckoutTimeout" OR textPayload:"database pool checkout timed out")' \
     --quiet
   echo "   created $METRIC"
 fi
@@ -231,9 +259,9 @@ upsert "prod: TLS certificate expiring" "$(policy \
 # outage returning 5xx to every single caller still tops out an order of magnitude below the
 # threshold. A rate threshold has to be set against real traffic, not a round number.
 #
-# 0.01/s over 600s = 6 errors in ten minutes. Against a ~20-request baseline in that window that is
-# a ~30% error rate: high enough not to trip on one unhandled exception, low enough that a wedged
-# service cannot hide under it. Revisit if traffic grows by an order of magnitude.
+# 0.01/s over 600s needs SEVEN errors in ten minutes — COMPARISON_GT is strict and 6/600 is exactly
+# 0.01, so six does not trip it. Against a ~20-request baseline that is a ~35% error rate: high enough
+# not to trip on one unhandled exception, low enough that a wedged service cannot hide under it. Revisit if traffic grows by an order of magnitude.
 upsert "prod: load balancer 5xx" "$(policy \
   "prod: load balancer 5xx" \
   "The external load balancer is returning 5xx. This is the user-visible symptom of most backend failures - a revision that will not start, database saturation, or an unhandled exception." \
@@ -273,3 +301,14 @@ import json, sys
 d = json.load(sys.stdin)
 print("uptime  :", len(d.get("uptimeCheckConfigs", [])))
 '
+
+# A warning on stderr is only a result if a human is standing there to read it.
+# This script is exactly the kind of thing that gets wrapped in CI or a runbook
+# step, and an undeliverable channel means every policy above is decoration — so
+# say it with the exit code too. Deliberately LAST: the policies are still
+# created and reported first, because a half-configured project is worse than a
+# fully configured one that reports a problem.
+if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then
+  echo "FAILED: alerts are configured but the channel cannot receive them." >&2
+  exit 1
+fi
