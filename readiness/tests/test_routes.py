@@ -175,6 +175,7 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
         blocked_only: bool = False,
         low_quality_only: bool = False,
         sort_by: str = "default",
+        segment: str = "all",
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert force_refresh is False
@@ -188,6 +189,7 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
         assert blocked_only is False
         assert low_quality_only is False
         assert sort_by == "default"
+        assert segment == "all"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -349,6 +351,7 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         blocked_only: bool = False,
         low_quality_only: bool = False,
         sort_by: str = "default",
+        segment: str = "all",
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert force_refresh is True
@@ -361,6 +364,7 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         assert blocked_only is False
         assert low_quality_only is False
         assert sort_by == "default"
+        assert segment == "all"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -440,6 +444,7 @@ def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch)
         blocked_only: bool = False,
         low_quality_only: bool = False,
         sort_by: str = "default",
+        segment: str = "all",
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert force_refresh is False
@@ -452,6 +457,7 @@ def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch)
         assert blocked_only is True
         assert low_quality_only is True
         assert sort_by == "cq_desc"
+        assert segment == "fix_here"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -521,6 +527,7 @@ def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch)
             "blocked_only": "true",
             "low_quality_only": "true",
             "sort_by": "cq_desc",
+            "segment": "fix_here",
         },
     )
 

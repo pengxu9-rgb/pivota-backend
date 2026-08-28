@@ -145,11 +145,22 @@ jobs:
       # FOUND BY THIS PR'S OWN STRAY-FILE GUARD: `readiness/tests/` is a whole
       # sub-package — 15 test files, 111 passing — that ran in NO CI job either. It is
       # swept in here rather than deferred, because 111 tests of coverage now
-      # beats a tidier denylist later. Three of its files are red and join the
+      # beats a tidier denylist later. Two of its files are red and join the
       # quarantine:
       #   readiness/tests/test_real_merchant_goldens.py
-      #   readiness/tests/test_routes.py          (3 route tests)
       #   readiness/tests/test_shopify_live_source.py
+      #
+      # UN-QUARANTINED 2026-08-28: readiness/tests/test_routes.py (+54 executed).
+      # Its 3 red tests were not a product bug — `fake_build_readiness_optimization`
+      # had drifted from build_readiness_optimization (readiness/summary.py:3177
+      # gained `segment`), so every call raised TypeError -> 500. Doubles repaired,
+      # file green standalone AND inside this sweep. This mattered beyond tidiness:
+      # while it sat here, the security tests pinning the test-PSP probe gate's
+      # conjuncts (readiness/service.py) never ran in CI, so a mutant deleting the
+      # ALLOW_TEST_PSP_PROBE kill switch passed the sweep. A quarantined file does
+      # not just defer its own red tests; it silently swallows every test added to
+      # it afterwards. The +54 is inside the ABS_SLACK=150 cap by design — see the
+      # floor guard below, which sized that slack for exactly this un-quarantine.
       #   readiness/tests/test_summary.py — ORDER-DEPENDENT, and found only by
       #     combining the two trees: green running `readiness/tests` alone, red
       #     inside the sweep. Exactly the effect the 2026-07-28 recon predicted —
@@ -170,7 +181,6 @@ jobs:
             --ignore=tests/test_audit_scheduler_worker_env_gate.py \
             --ignore=tests/test_external_seed_csv_import.py \
             --ignore=readiness/tests/test_real_merchant_goldens.py \
-            --ignore=readiness/tests/test_routes.py \
             --ignore=readiness/tests/test_shopify_live_source.py \
             --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
             --ignore-glob='tests/test_*_postgres.py' \
