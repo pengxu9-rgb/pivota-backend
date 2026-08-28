@@ -63,6 +63,43 @@ Adapters must reduce native payloads to the safe vocabulary before ingestion.
 Buyer contact, shipping/billing details, raw headers, credentials, and full
 webhook payloads must never be placed in this ledger.
 
+## Merchant funnel reads
+
+Canonical adapter events are included in the existing merchant analytics API:
+
+```text
+GET /merchant/analytics/commerce-funnel
+GET /merchant/analytics/commerce-funnel?group_by=platform
+GET /merchant/analytics/commerce-funnel?group_by=store&platform=cafe24
+```
+
+The response keeps the original listing/click/attribution fields intact and
+adds `event_funnel`, `ledger_events_total`, `ledger_interactions_total`, and
+`observed_*` fields. `attributed_orders` continues to mean orders connected to
+a Pivota click; `observed_order_conversion` additionally includes native store
+events that do not have a click attribution edge.
+
+Reads are newest-first and bounded by `COMMERCE_FUNNEL_LEDGER_EVENT_LIMIT`
+(default 50,000, minimum 100, maximum 200,000). The response sets
+`event_funnel.truncated=true` when the bound was reached, so callers never
+mistake a partial aggregate for a complete all-time count.
+If the canonical event store is temporarily unavailable during rollout,
+`event_funnel.available=false` distinguishes that state from a valid empty
+funnel while the legacy analytics response remains available.
+Migration `206_commerce_event_funnel_read_index.sql` builds the merchant,
+platform, and store recency indexes concurrently; it must be applied before
+enabling the endpoint for a high-volume ledger and intentionally does not run
+inside the latency-sensitive startup schema guard.
+
+The legacy click/attribution tables do not have a reliable platform or store
+identity. When `platform` or `store_id` is supplied, their metrics are therefore
+excluded—including unscoped listing counts—instead of being incorrectly
+assigned. The response makes this explicit in
+`metric_scopes.legacy_attribution`; canonical `event_funnel` and `observed_*`
+metrics remain exactly scoped to those filters. Platform/store groupings expose
+canonical event slices only, which is reported by `slices_grouped=false` for
+the legacy metrics.
+
 ## Example
 
 ```json

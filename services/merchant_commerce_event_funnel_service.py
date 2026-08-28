@@ -1,0 +1,423 @@
+from __future__ import annotations
+
+import logging
+import os
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set
+
+from sqlalchemy import select
+
+from db.commerce_interactions import commerce_interaction_events
+from db.database import database
+from services.traffic_taxonomy_service import taxonomy_from_row
+
+
+logger = logging.getLogger("merchant_commerce_event_funnel_service")
+
+
+def _event_limit() -> int:
+    raw = str(os.getenv("COMMERCE_FUNNEL_LEDGER_EVENT_LIMIT") or "50000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 50000
+    return max(100, min(value, 200000))
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if isinstance(row, dict):
+        return dict(row)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return dict(mapping)
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _analytics_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    # Canonical columns are authoritative when present. Payload retains the
+    # wider checkout/order/refund references that predate dedicated columns.
+    return {
+        **payload,
+        **{key: value for key, value in row.items() if value is not None},
+    }
+
+
+def _dimension(row: Dict[str, Any], group_by: str) -> str:
+    if group_by == "product":
+        return _text(row.get("canonical_product_id")) or "unknown"
+    if group_by == "variant":
+        return _text(row.get("canonical_variant_id")) or "unknown"
+    if group_by == "store":
+        return _text(row.get("store_id")) or "unknown"
+    if group_by == "commerce_surface":
+        return _text(row.get("commerce_surface") or row.get("surface")) or "unknown"
+    if group_by in {
+        "source_channel",
+        "source_family",
+        "protocol_name",
+        "agent_id",
+        "query_source",
+        "llm_provider",
+        "llm_model",
+    }:
+        return _text(taxonomy_from_row(row).get(group_by)) or "unknown"
+    return _text(row.get(group_by)) or "unknown"
+
+
+def _matches_filters(row: Dict[str, Any], filters: Dict[str, Optional[str]]) -> bool:
+    for field, expected in filters.items():
+        if not expected:
+            continue
+        dimension = "store" if field == "store_id" else field
+        if _dimension(row, dimension).lower() != _text(expected).lower():
+            return False
+    return True
+
+
+def _event_scope(row: Dict[str, Any]) -> tuple[str, str]:
+    return (
+        _text(row.get("platform")).lower() or "unknown",
+        _text(row.get("store_id")) or "unknown",
+    )
+
+
+def _attach_resolved_order_ids(rows: List[Dict[str, Any]]) -> None:
+    interaction_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
+    payment_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
+    refund_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
+    for row in rows:
+        order_id = _text(row.get("order_id"))
+        if not order_id:
+            continue
+        platform, store_id = _event_scope(row)
+        interaction_id = _text(row.get("interaction_id"))
+        payment_id = _text(row.get("payment_id"))
+        refund_id = _text(row.get("refund_id"))
+        if interaction_id:
+            interaction_orders[(platform, store_id, interaction_id)].add(order_id)
+        if payment_id:
+            payment_orders[(platform, store_id, payment_id)].add(order_id)
+        if refund_id:
+            refund_orders[(platform, store_id, refund_id)].add(order_id)
+
+    for row in rows:
+        platform, store_id = _event_scope(row)
+        order_id = _text(row.get("order_id"))
+        interaction_id = _text(row.get("interaction_id"))
+        candidates: Set[str] = set()
+        if order_id:
+            candidates.add(order_id)
+        for reference, mapping in (
+            (_text(row.get("payment_id")), payment_orders),
+            (_text(row.get("refund_id")), refund_orders),
+            (interaction_id, interaction_orders),
+        ):
+            scoped_reference = (platform, store_id, reference)
+            if reference and len(mapping.get(scoped_reference, set())) == 1:
+                candidates.update(mapping[scoped_reference])
+        row["_resolved_order_id"] = order_id or (
+            next(iter(candidates)) if len(candidates) == 1 else ""
+        )
+
+
+_CART_EVENTS = {
+    "cart.created",
+    "cart.item_added",
+    "cart.item_removed",
+    "cart.updated",
+}
+_CHECKOUT_EVENTS = {"checkout.started", "checkout.submitted"}
+_PAYMENT_ATTEMPT_EVENTS = {
+    "payment.attempted",
+    "payment.authorized",
+    "payment.declined",
+    "payment.failed",
+    "payment.succeeded",
+}
+_PAID_EVENTS = {"payment.succeeded", "order.paid"}
+_ORDER_EVENTS = {"order.created", "order.paid"}
+_REFUND_EVENTS = {"refund.created", "refund.succeeded"}
+_RETURN_EVENTS = {"return.created", "return.completed"}
+
+
+@dataclass
+class _Accumulator:
+    event_types: Counter[str] = field(default_factory=Counter)
+    interaction_ids: Set[str] = field(default_factory=set)
+    event_ids: Set[str] = field(default_factory=set)
+    stage_interactions: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
+    platforms: Counter[str] = field(default_factory=Counter)
+    stores: Counter[str] = field(default_factory=Counter)
+    paid_amounts: Dict[str, Dict[tuple[str, str, str], int]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    refund_amounts: Dict[str, Dict[tuple[str, str, str], int]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    order_keys: Set[tuple[str, str, str]] = field(default_factory=set)
+    paid_keys: Set[tuple[str, str, str]] = field(default_factory=set)
+    refund_keys: Set[tuple[str, str, str]] = field(default_factory=set)
+    order_ids: Set[str] = field(default_factory=set)
+    paid_order_ids: Set[str] = field(default_factory=set)
+    refund_order_ids: Set[str] = field(default_factory=set)
+
+    def add(self, row: Dict[str, Any]) -> None:
+        event_type = _text(row.get("event_type")).lower()
+        event_id = _text(row.get("event_id"))
+        interaction_id = _text(row.get("interaction_id")) or event_id
+        if not event_type or not interaction_id:
+            return
+
+        if event_id:
+            self.event_ids.add(event_id)
+        self.interaction_ids.add(interaction_id)
+        self.event_types[event_type] += 1
+        self.platforms[_text(row.get("platform")) or "unknown"] += 1
+        self.stores[_text(row.get("store_id")) or "unknown"] += 1
+
+        if event_type == "agent.requested":
+            self.stage_interactions["agent_requested"].add(interaction_id)
+        if event_type == "search.performed":
+            self.stage_interactions["search_performed"].add(interaction_id)
+        if event_type == "product.viewed":
+            self.stage_interactions["product_viewed"].add(interaction_id)
+        if event_type in _CART_EVENTS:
+            self.stage_interactions["cart_active"].add(interaction_id)
+        if event_type in _CHECKOUT_EVENTS:
+            self.stage_interactions["checkout_started"].add(interaction_id)
+        if event_type in _PAYMENT_ATTEMPT_EVENTS:
+            self.stage_interactions["payment_attempted"].add(interaction_id)
+        if event_type == "payment.authorized":
+            self.stage_interactions["payment_authorized"].add(interaction_id)
+        if event_type in {"payment.declined", "payment.failed"}:
+            self.stage_interactions["payment_failed"].add(interaction_id)
+        if event_type in _ORDER_EVENTS:
+            self.stage_interactions["order_created"].add(interaction_id)
+        if event_type in _PAID_EVENTS:
+            self.stage_interactions["paid"].add(interaction_id)
+        if event_type == "order.cancelled":
+            self.stage_interactions["order_cancelled"].add(interaction_id)
+        if event_type in _REFUND_EVENTS:
+            self.stage_interactions["refund_active"].add(interaction_id)
+        if event_type == "refund.succeeded":
+            self.stage_interactions["refunded"].add(interaction_id)
+        if event_type in _RETURN_EVENTS:
+            self.stage_interactions["return_active"].add(interaction_id)
+        if event_type == "return.completed":
+            self.stage_interactions["return_completed"].add(interaction_id)
+
+        platform, store_id = _event_scope(row)
+        resolved_order_id = _text(row.get("_resolved_order_id"))
+        order_key = (platform, store_id, resolved_order_id or f"interaction:{interaction_id}")
+        if event_type in _ORDER_EVENTS:
+            self.order_keys.add(order_key)
+            if resolved_order_id:
+                self.order_ids.add(resolved_order_id)
+        if event_type in _PAID_EVENTS:
+            self.paid_keys.add(order_key)
+            if resolved_order_id:
+                self.paid_order_ids.add(resolved_order_id)
+        if event_type == "refund.succeeded":
+            self.refund_keys.add(order_key)
+            if resolved_order_id:
+                self.refund_order_ids.add(resolved_order_id)
+
+        currency = _text(row.get("currency")).upper()
+        amount_cents = _int(row.get("amount_cents"))
+        if not currency or amount_cents is None or amount_cents < 0:
+            return
+        if event_type in _PAID_EVENTS:
+            # A purchase can legitimately receive both payment.succeeded and
+            # order.paid. Keep the largest reported total per resolved order
+            # instead of double-counting that purchase.
+            current = self.paid_amounts[currency].get(order_key, 0)
+            self.paid_amounts[currency][order_key] = max(current, amount_cents)
+        if event_type == "refund.succeeded":
+            refund_key = (
+                platform,
+                store_id,
+                _text(row.get("refund_id")) or event_id or interaction_id,
+            )
+            current = self.refund_amounts[currency].get(refund_key, 0)
+            self.refund_amounts[currency][refund_key] = max(current, amount_cents)
+
+    def public_summary(self) -> Dict[str, Any]:
+        return {
+            "events_total": len(self.event_ids),
+            "interactions_total": len(self.interaction_ids),
+            "stages": {
+                stage: len(interactions)
+                for stage, interactions in sorted(self.stage_interactions.items())
+            },
+            "event_type_breakdown": dict(sorted(self.event_types.items())),
+            "platform_breakdown": dict(sorted(self.platforms.items())),
+            "store_breakdown": dict(sorted(self.stores.items())),
+            "paid_amount_cents_by_currency": {
+                currency: sum(amounts.values())
+                for currency, amounts in sorted(self.paid_amounts.items())
+            },
+            "refunded_amount_cents_by_currency": {
+                currency: sum(amounts.values())
+                for currency, amounts in sorted(self.refund_amounts.items())
+            },
+        }
+
+
+@dataclass
+class CommerceEventFunnelResult:
+    payload: Dict[str, Any]
+    order_keys: Set[tuple[str, str, str]] = field(default_factory=set)
+    paid_keys: Set[tuple[str, str, str]] = field(default_factory=set)
+    refund_keys: Set[tuple[str, str, str]] = field(default_factory=set)
+    order_ids: Set[str] = field(default_factory=set)
+    paid_order_ids: Set[str] = field(default_factory=set)
+    refund_order_ids: Set[str] = field(default_factory=set)
+
+
+def empty_event_funnel_result(
+    *,
+    limit: Optional[int] = None,
+    available: bool = True,
+) -> CommerceEventFunnelResult:
+    return CommerceEventFunnelResult(
+        payload={
+            "summary": {
+                "events_total": 0,
+                "interactions_total": 0,
+                "stages": {},
+                "event_type_breakdown": {},
+                "platform_breakdown": {},
+                "store_breakdown": {},
+                "paid_amount_cents_by_currency": {},
+                "refunded_amount_cents_by_currency": {},
+            },
+            "slices": [],
+            "truncated": False,
+            "event_limit": limit or _event_limit(),
+            "available": available,
+            "unavailable_reason": None if available else "canonical_event_store_unavailable",
+        }
+    )
+
+
+async def _fetch_event_rows(
+    *,
+    merchant_id: str,
+    surface: Optional[str],
+    platform: Optional[str],
+    store_id: Optional[str],
+    limit: int,
+) -> tuple[List[Dict[str, Any]], bool]:
+    if not getattr(database, "is_connected", True):
+        raise RuntimeError("database is not connected")
+    query = select(commerce_interaction_events).where(
+        commerce_interaction_events.c.merchant_id == merchant_id
+    )
+    if surface:
+        query = query.where(commerce_interaction_events.c.surface == surface)
+    if platform:
+        query = query.where(commerce_interaction_events.c.platform == platform)
+    if store_id:
+        query = query.where(commerce_interaction_events.c.store_id == store_id)
+    query = query.order_by(commerce_interaction_events.c.occurred_at.desc()).limit(limit + 1)
+    rows = [_row_to_dict(row) for row in await database.fetch_all(query)]
+    return rows[:limit], len(rows) > limit
+
+
+async def get_merchant_commerce_event_funnel(
+    *,
+    merchant_id: str,
+    group_by: str,
+    surface: Optional[str] = None,
+    source_channel: Optional[str] = None,
+    source_family: Optional[str] = None,
+    protocol_name: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    query_source: Optional[str] = None,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    commerce_surface: Optional[str] = None,
+    platform: Optional[str] = None,
+    store_id: Optional[str] = None,
+) -> CommerceEventFunnelResult:
+    limit = _event_limit()
+    try:
+        raw_rows, truncated = await _fetch_event_rows(
+            merchant_id=merchant_id,
+            surface=surface,
+            platform=platform,
+            store_id=store_id,
+            limit=limit,
+        )
+    except Exception as exc:
+        # The legacy funnel remains available during a partial schema rollout.
+        logger.warning(
+            "Canonical commerce event funnel unavailable merchant_id=%s: %s",
+            merchant_id,
+            exc,
+        )
+        return empty_event_funnel_result(limit=limit, available=False)
+
+    filters = {
+        "source_channel": source_channel,
+        "source_family": source_family,
+        "protocol_name": protocol_name,
+        "agent_id": agent_id,
+        "query_source": query_source,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "commerce_surface": commerce_surface,
+        "platform": platform,
+        "store_id": store_id,
+    }
+    rows = [
+        analytics_row
+        for analytics_row in (_analytics_row(row) for row in raw_rows)
+        if _matches_filters(analytics_row, filters)
+    ]
+    _attach_resolved_order_ids(rows)
+
+    total = _Accumulator()
+    grouped: Dict[str, _Accumulator] = defaultdict(_Accumulator)
+    for row in rows:
+        total.add(row)
+        grouped[_dimension(row, group_by)].add(row)
+
+    payload = {
+        "summary": total.public_summary(),
+        "slices": [
+            {"key": key, **accumulator.public_summary()}
+            for key, accumulator in sorted(grouped.items())
+        ],
+        "truncated": truncated,
+        "event_limit": limit,
+        "available": True,
+        "unavailable_reason": None,
+    }
+    return CommerceEventFunnelResult(
+        payload=payload,
+        order_keys=set(total.order_keys),
+        paid_keys=set(total.paid_keys),
+        refund_keys=set(total.refund_keys),
+        order_ids=set(total.order_ids),
+        paid_order_ids=set(total.paid_order_ids),
+        refund_order_ids=set(total.refund_order_ids),
+    )

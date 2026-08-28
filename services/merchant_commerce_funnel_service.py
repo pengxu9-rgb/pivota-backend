@@ -10,6 +10,7 @@ from db.commerce_attribution import commerce_attribution_edges, surface_click_ev
 from db.database import database
 from db.orders import orders
 from services.merchant_catalog_listing_fallback_service import fetch_listing_rows_with_catalog_fallback
+from services.merchant_commerce_event_funnel_service import get_merchant_commerce_event_funnel
 from services.traffic_taxonomy_service import taxonomy_from_row
 
 
@@ -25,6 +26,8 @@ SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS = {
     "query_source",
     "llm_provider",
     "llm_model",
+    "platform",
+    "store",
 }
 
 
@@ -102,6 +105,40 @@ def _resolve_bucket_key(row: Dict[str, Any], *, key_field: str, alias_to_bucket:
     return alias_to_bucket.get(raw, raw)
 
 
+def _observed_fields(event_summary: Dict[str, Any]) -> Dict[str, Any]:
+    stages = event_summary.get("stages") if isinstance(event_summary.get("stages"), dict) else {}
+    return {
+        "observed_product_views": int(stages.get("product_viewed") or 0),
+        "observed_cart_interactions": int(stages.get("cart_active") or 0),
+        "observed_checkouts": int(stages.get("checkout_started") or 0),
+        "observed_payment_attempts": int(stages.get("payment_attempted") or 0),
+        "observed_orders": int(stages.get("order_created") or 0),
+        "observed_paid_interactions": int(stages.get("paid") or 0),
+        "observed_refunds": int(stages.get("refunded") or 0),
+    }
+
+
+def _empty_legacy_slice(key: str) -> Dict[str, Any]:
+    return {
+        "key": key,
+        "indexed_exposure": 0,
+        "surfaced_exposure": 0,
+        "clicked_exposure": 0,
+        "clicked_events_total": 0,
+        "ordered_conversion": 0,
+        "attributed_orders": 0,
+        "paid_conversion": 0,
+        "refunded_orders": 0,
+        "refunded_amount": "0",
+        "clicked_rate": 0,
+        "ordered_rate": 0,
+        "paid_order_rate": 0,
+        "listing_rows_total": 0,
+        "listing_status_breakdown_rows": {},
+        "listing_status_breakdown_by_surface": {},
+    }
+
+
 async def _fetch_listing_rows(merchant_id: str, surface: Optional[str]) -> List[Dict[str, Any]]:
     return await fetch_listing_rows_with_catalog_fallback(merchant_id, surface)
 
@@ -149,11 +186,28 @@ async def get_merchant_commerce_funnel(
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
     commerce_surface: Optional[str] = None,
+    platform: Optional[str] = None,
+    store_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    platform = _normalize_text(platform).lower() or None
+    store_id = _normalize_text(store_id) or None
     resolved_surface = surface or commerce_surface
-    listing_rows = await _fetch_listing_rows(merchant_id, resolved_surface)
-    click_rows = await _fetch_click_rows(merchant_id, resolved_surface)
-    edge_rows = await _fetch_edge_rows(merchant_id, resolved_surface)
+    unsupported_legacy_filters = [
+        field
+        for field, value in (("platform", platform), ("store_id", store_id))
+        if value is not None
+    ]
+    if unsupported_legacy_filters:
+        # The legacy tables cannot safely distinguish stores or platforms.
+        # Fail closed rather than mixing unscoped listings/attribution into a
+        # precisely scoped canonical event response.
+        listing_rows: List[Dict[str, Any]] = []
+        click_rows: List[Dict[str, Any]] = []
+        edge_rows: List[Dict[str, Any]] = []
+    else:
+        listing_rows = await _fetch_listing_rows(merchant_id, resolved_surface)
+        click_rows = await _fetch_click_rows(merchant_id, resolved_surface)
+        edge_rows = await _fetch_edge_rows(merchant_id, resolved_surface)
 
     filters = {
         "source_channel": source_channel,
@@ -164,11 +218,30 @@ async def get_merchant_commerce_funnel(
         "llm_provider": llm_provider,
         "llm_model": llm_model,
         "commerce_surface": commerce_surface,
+        "platform": platform,
+        "store_id": store_id,
     }
+    event_funnel = await get_merchant_commerce_event_funnel(
+        merchant_id=merchant_id,
+        group_by=group_by,
+        surface=surface,
+        source_channel=source_channel,
+        source_family=source_family,
+        protocol_name=protocol_name,
+        agent_id=agent_id,
+        query_source=query_source,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        commerce_surface=commerce_surface,
+        platform=platform,
+        store_id=store_id,
+    )
 
     def _row_dimension(row: Dict[str, Any], field: str) -> str:
         if field == "commerce_surface":
             return _normalize_text(row.get("commerce_surface") or row.get("surface")) or "unknown"
+        if field == "store_id":
+            return _normalize_text(row.get("store_id")) or "unknown"
         if field in {
             "source_channel",
             "source_family",
@@ -246,6 +319,36 @@ async def get_merchant_commerce_funnel(
         "listing_status_breakdown_rows": listing_status_breakdown,
         "listing_status_breakdown_by_surface": listing_status_breakdown_by_surface,
     }
+    legacy_order_ids = {
+        _normalize_text(row.get("order_id"))
+        for row in filtered_edge_rows
+        if _normalize_text(row.get("order_id"))
+    }
+    legacy_refunded_order_ids = {
+        _normalize_text(row.get("order_id"))
+        for row in filtered_edge_rows
+        if _normalize_text(row.get("order_id")) and row.get("latest_refund_id")
+    }
+    ledger_summary = event_funnel.payload.get("summary") or {}
+    summary.update(
+        {
+            **_observed_fields(ledger_summary),
+            "ledger_events_total": int(ledger_summary.get("events_total") or 0),
+            "ledger_interactions_total": int(ledger_summary.get("interactions_total") or 0),
+            "observed_order_conversion": (
+                len(event_funnel.order_keys)
+                + len(legacy_order_ids - event_funnel.order_ids)
+            ),
+            "observed_paid_conversion": (
+                len(event_funnel.paid_keys)
+                + len(paid_order_ids - event_funnel.paid_order_ids)
+            ),
+            "observed_refunded_orders": (
+                len(event_funnel.refund_keys)
+                + len(legacy_refunded_order_ids - event_funnel.refund_order_ids)
+            ),
+        }
+    )
 
     slices: Dict[str, Dict[str, Any]] = {}
     if group_by in {"product", "variant", "surface"}:
@@ -369,7 +472,7 @@ async def get_merchant_commerce_funnel(
             }
             for key, value in grouped.items()
         }
-    elif group_by in SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS:
+    elif group_by in SUPPORTED_COMMERCE_FUNNEL_GROUP_BYS - {"platform", "store"}:
         grouped: Dict[str, Dict[str, Any]] = defaultdict(
             lambda: {
                 "key": None,
@@ -449,11 +552,44 @@ async def get_merchant_commerce_funnel(
             for key, value in grouped.items()
         }
 
+    for event_slice in event_funnel.payload.get("slices") or []:
+        key = _normalize_text(event_slice.get("key")) or "unknown"
+        slice_payload = slices.get(key) or _empty_legacy_slice(key)
+        slice_payload.update(_observed_fields(event_slice))
+        slice_payload["event_funnel"] = {
+            field: value for field, value in event_slice.items() if field != "key"
+        }
+        slices[key] = slice_payload
+
     return {
         "merchant_id": merchant_id,
         "surface": surface,
         "summary": summary,
         "group_by": group_by,
         "applied_filters": {key: value for key, value in filters.items() if value is not None},
+        "metric_scopes": {
+            "legacy_attribution": {
+                "included": not unsupported_legacy_filters,
+                "slices_grouped": (
+                    not unsupported_legacy_filters and group_by not in {"platform", "store"}
+                ),
+                "unsupported_filters": unsupported_legacy_filters,
+                "reason": (
+                    "Legacy click and attribution rows do not carry a reliable platform/store identity; "
+                    "legacy metrics are excluded instead of being assigned to the wrong store."
+                    if unsupported_legacy_filters
+                    else None
+                ),
+            },
+            "canonical_events": {
+                "included": bool(event_funnel.payload.get("available", True)),
+                "scoped_filters": [
+                    field
+                    for field in ("platform", "store_id")
+                    if filters.get(field) is not None
+                ],
+            },
+        },
         "slices": list(slices.values()),
+        "event_funnel": event_funnel.payload,
     }

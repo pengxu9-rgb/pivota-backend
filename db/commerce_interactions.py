@@ -127,3 +127,20 @@ Index(
     commerce_interaction_events.c.upstream_idempotency_key,
     unique=True,
 )
+Index(
+    "idx_commerce_interaction_events_merchant_occurred",
+    commerce_interaction_events.c.merchant_id,
+    commerce_interaction_events.c.occurred_at.desc(),
+)
+Index(
+    "idx_commerce_interaction_events_merchant_platform_occurred",
+    commerce_interaction_events.c.merchant_id,
+    commerce_interaction_events.c.platform,
+    commerce_interaction_events.c.occurred_at.desc(),
+)
+Index(
+    "idx_commerce_interaction_events_merchant_store_occurred",
+    commerce_interaction_events.c.merchant_id,
+    commerce_interaction_events.c.store_id,
+    commerce_interaction_events.c.occurred_at.desc(),
+)

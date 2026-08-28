@@ -532,6 +532,8 @@ def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.Mo
         assert kwargs["group_by"] == "source_channel"
         assert kwargs["source_channel"] == "shopping-agent-ui"
         assert kwargs["query_source"] == "cache_multi_intent"
+        assert kwargs["platform"] == "cafe24"
+        assert kwargs["store_id"] == "store_cafe"
         return {"merchant_id": "merch_1", "summary": {"indexed_exposure": 3}, "slices": []}
 
     app.dependency_overrides[module._get_principal] = fake_principal
@@ -544,6 +546,8 @@ def test_merchant_analytics_route_exposes_commerce_funnel(monkeypatch: pytest.Mo
             "group_by": "source_channel",
             "source_channel": "shopping-agent-ui",
             "query_source": "cache_multi_intent",
+            "platform": "cafe24",
+            "store_id": "store_cafe",
         },
     )
 
