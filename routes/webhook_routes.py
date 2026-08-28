@@ -437,6 +437,83 @@ async def _resolve_stripe_order_for_payment_event(
     return order
 
 
+async def _test_mode_stripe_event_probe_exempt(
+    *,
+    data: Dict[str, Any],
+    psp_id: Optional[str],
+) -> bool:
+    """Whether a livemode=false Stripe event may be processed in production.
+
+    Allowlist, never denylist: the exemption exists solely for the controlled
+    test-processor probe (see order_routes._resolve_order_live_readiness_requirement,
+    which let the test-mode charge be created in the first place). A test-mode
+    event is processed ONLY when the order it targets resolves — under the same
+    per-psp cross-tenant guard as real event handling — to an order whose own
+    metadata requested the test-psp bypass AND whose merchant is in
+    TEST_PSP_PROBE_MERCHANTS while ALLOW_TEST_PSP_PROBE is on. Anything short of
+    that (env off, merchant not allowlisted, order unresolvable, order never
+    asked for a test processor) keeps the unconditional production drop.
+    """
+    from routes.order_routes import (
+        _resolve_order_live_readiness_requirement,
+        _test_psp_probe_enabled,
+        _test_psp_probe_merchants,
+    )
+
+    if not _test_psp_probe_enabled():
+        return False
+    if not _test_psp_probe_merchants():
+        return False
+
+    raw_object_id = str(data.get("id") or "").strip()
+    payment_intent_id = (
+        raw_object_id
+        if raw_object_id.startswith("pi_")
+        else str(data.get("payment_intent") or "").strip()
+    )
+    payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
+    if not isinstance(payment_meta, dict):
+        payment_meta = {}
+
+    order = None
+    # Hosted-checkout orders store the cs_ session id while payment events carry
+    # the pi_, so try both references before giving up.
+    for payment_reference in dict.fromkeys([payment_intent_id, raw_object_id]):
+        if not payment_reference:
+            continue
+        try:
+            order = await _resolve_stripe_order_for_payment_event(
+                payment_intent_id=payment_reference,
+                payment_meta=payment_meta,
+                allow_repoint=False,
+                psp_id=psp_id,
+            )
+        except Exception:
+            order = None
+        if order:
+            break
+    if not order:
+        return False
+
+    order_metadata = order.get("metadata")
+    if isinstance(order_metadata, str):
+        try:
+            order_metadata = json.loads(order_metadata)
+        except Exception:
+            order_metadata = None
+    if not isinstance(order_metadata, dict):
+        order_metadata = {}
+
+    # False == the live-readiness requirement is waived, i.e. the probe bypass
+    # (armed env + allowlisted merchant + order-level request) is granted.
+    return (
+        _resolve_order_live_readiness_requirement(
+            order_metadata, order.get("merchant_id")
+        )
+        is False
+    )
+
+
 async def _finalize_stripe_payment_success(
     order: Dict[str, Any],
     *,
@@ -966,12 +1043,26 @@ async def handle_stripe_webhook(
         is_prod_env = _stripe_livemode_gate_active()
         event_livemode = event.get("livemode")
         if is_prod_env and event_livemode is False:
+            # Sole exemption: the controlled test-processor probe. The order the
+            # event targets must itself have been granted the test-psp bypass
+            # (ALLOW_TEST_PSP_PROBE on + merchant in TEST_PSP_PROBE_MERCHANTS +
+            # order-level request) — otherwise the drop stays unconditional.
+            probe_exempt = await _test_mode_stripe_event_probe_exempt(
+                data=data, psp_id=psp_id
+            )
+            if not probe_exempt:
+                logger.warning(
+                    "Ignoring test-mode Stripe webhook (livemode=false) in production: type=%s id=%s",
+                    event_type,
+                    event.get("id"),
+                )
+                return {"status": "ignored", "event": event_type, "reason": "test_mode_event_in_production"}
             logger.warning(
-                "Ignoring test-mode Stripe webhook (livemode=false) in production: type=%s id=%s",
+                "Processing test-mode Stripe webhook (livemode=false) for allowlisted "
+                "test-psp probe order in production: type=%s id=%s",
                 event_type,
                 event.get("id"),
             )
-            return {"status": "ignored", "event": event_type, "reason": "test_mode_event_in_production"}
 
         stripe_webhook_event_id = _stripe_webhook_event_id(event, payload, event_type)
         is_duplicate = await _record_stripe_webhook_event_best_effort(
