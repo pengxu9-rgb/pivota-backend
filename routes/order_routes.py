@@ -535,17 +535,26 @@ def _test_psp_probe_merchants() -> set:
 
 
 async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
-    """True only when EVERY active processor for this merchant is demonstrably TEST-mode.
+    """True only when EVERY active processor for this merchant normalises to TEST.
 
-    Fails CLOSED: no rows, one live-looking row, or any error all return False. This is what makes
-    allowlisting a merchant safe — a merchant that somehow has a live processor cannot be granted a
-    test-mode bypass even if someone puts it in TEST_PSP_PROBE_MERCHANTS by mistake.
+    Uses the repo's canonical `normalize_psp_environment`, which knows each provider's real key
+    shapes (stripe sk_/pk_live_, checkout sk_sbox_, adyen live_/test_, antom sandbox) and — crucially
+    — treats a key prefix as STRONGER evidence than the persisted `environment` column, returning
+    "unknown" when it cannot tell. Hand-rolling a stripe-only prefix check here silently graded an
+    adyen row holding `live_…` (and a checkout row holding `pk_live_…`, and a stripe row whose only
+    credential is in provider_config) as test-mode.
+
+    Fails CLOSED on: any row that is not "test", no rows at all, or any error. "unknown" is not
+    test — an unrecognised credential must never earn a test-mode bypass.
     """
     merchant = str(merchant_id or "").strip()
     if not merchant:
         return False
     try:
-        from services.merchant_psp_config_service import fetch_active_merchant_psps
+        from services.merchant_psp_config_service import (
+            fetch_active_merchant_psps,
+            normalize_psp_environment,
+        )
 
         rows = await fetch_active_merchant_psps(merchant_id=merchant)
     except Exception:
@@ -554,21 +563,39 @@ async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
         return False
     for row in rows:
         record = row if isinstance(row, dict) else {}
-        environment = str(record.get("environment") or "").strip().lower()
-        key = str(
-            record.get("runtime_secret_key")
-            or record.get("secret_key")
-            or record.get("api_key")
-            or ""
-        ).strip()
-        # A LIVE-looking key refuses the row outright, whatever the `environment` column claims.
-        # environment is a label someone types; the key is what actually charges a card, and a row
-        # mislabelled test while holding sk_live_ is exactly the shape this guard exists to stop.
-        if key.startswith(("sk_live_", "rk_live_")):
+        provider = record.get("provider")
+        environment = record.get("environment")
+        # The RAW config, deliberately not `normalize_provider_config`: that helper SANITISES
+        # (for stripe it returns only mode/account_id/public_key/webhook_*), so it cannot see the
+        # secret this check exists to grade. It may be stored as a JSON string.
+        raw_config = record.get("provider_config")
+        if isinstance(raw_config, str):
+            try:
+                raw_config = json.loads(raw_config)
+            except Exception:
+                raw_config = None
+        config = raw_config if isinstance(raw_config, dict) else {}
+
+        # Non-Stripe credentials frequently live only in provider_config, so the primary key must
+        # look there too or the row is graded on a credential that does not exist.
+        candidates = [
+            record.get("runtime_secret_key"),
+            record.get("secret_key"),
+            record.get("api_key"),
+            config.get("secret_key"),
+            config.get("api_key"),
+            config.get("public_key"),
+        ]
+        primary_key = next((str(c) for c in candidates if str(c or "").strip()), "")
+        if normalize_psp_environment(provider, primary_key, environment) != "test":
             return False
-        looks_test = environment in {"test", "sandbox"} or key.startswith(("sk_test_", "rk_test_"))
-        if not looks_test:
-            return False
+        # Belt: no VISIBLE credential on the row may look live. `environment` is deliberately not
+        # passed here, so only the key prefix speaks — this catches a live secret hiding in
+        # provider_config behind an `environment` column that claims test.
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value and normalize_psp_environment(provider, value, None) == "live":
+                return False
     return True
 
 
@@ -610,7 +637,15 @@ async def _apply_server_granted_test_psp_stamp(
     if not await _merchant_active_psp_is_test_mode(merchant_id):
         return False
     metadata["allow_test_psp_surfaces"] = True
+    # Overwrite, never trust: this field is caller-supplied like the rest of order metadata, so a
+    # caller could otherwise forge "server_allowlist" on an order the server refused to stamp and
+    # make an incident review unable to tell the two apart.
     metadata["test_psp_surfaces_granted_by"] = "server_allowlist"
+    logger.warning(
+        "[OrderRoutes] test-PSP bypass GRANTED server-side merchant=%s "
+        "(ALLOW_TEST_PSP_PROBE on, merchant allowlisted, all active processors normalise to test)",
+        str(merchant_id or "").strip(),
+    )
     return True
 
 
@@ -4238,7 +4273,6 @@ async def create_new_order(
             # 则通过 metadata.psp_mode 告诉 Stripe 适配器走 Checkout Session 流程，
             # 但 PSP provider 仍然是 "stripe"（由 routing 决定）。
             psp_mode = requested_psp_mode
-            await _apply_server_granted_test_psp_stamp(order_metadata, order_request.merchant_id)
             enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
             payment_return_url = _build_order_payment_return_url(order_id, order_metadata)
             auth_first_payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
