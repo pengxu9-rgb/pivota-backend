@@ -491,6 +491,19 @@ def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, clie
     assert middleware is not None, "RateLimitMiddleware not found in app stack"
     monkeypatch.setattr(middleware, "redis", None)
     monkeypatch.delitem(middleware._anon_store, "global", raising=False)
+    # The middleware is not the only limiter on this path. agent_shop_gateway has
+    # its OWN per-IP budget for credential-less callers
+    # (`_check_invoke_anon_rate_limit`, 60/min by SHOP_INVOKE_ANON_RPM) keyed on a
+    # WALL-CLOCK minute bucket — `int(time.time() // 60)`, not a window from this
+    # test's start. Every anonymous /agent/shop/v1/invoke anywhere in the suite
+    # charges the same bucket, so whenever 31+ of them land in the same minute as
+    # this 30-call burst, it 429s. That is the intermittent sweep failure: it
+    # passes in isolation, fails under the full suite, and moves whenever any test
+    # is added anywhere, because what changes is which side of a minute boundary
+    # the burst lands on. Resetting only the middleware stores left this one
+    # charging, which is exactly the suite-order leakage the comment above says
+    # this setup exists to prevent.
+    monkeypatch.setattr(gateway, "_INVOKE_ANON_IP_LIMIT_STORE", {})
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
