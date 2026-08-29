@@ -898,10 +898,18 @@ async def _replace_child_rows_multi(
     transaction — one bad child row cost the merchant every catalog_products row
     in the run (prod 2026-08-29):
 
-      1. WITHIN this batch. Product-level payloads are collected once per
-         variant — `beauty_content_assets` rows are appended inside the variant
-         loop from product-level metadata — so a two-variant product hands the
-         same asset id in twice, legitimately. Dedupe on the PK, last wins.
+      1. WITHIN this batch. One product can legitimately derive the same child
+         id twice. Two `platform_metadata.tutorials` entries carrying the same
+         merchant-declared `asset_id` hash to one `asset_id`; two variants with
+         no variant id of their own both fall back to `product_key` and hash to
+         one `shade_id` per shade name. Dedupe on the PK, last wins.
+
+         Product-level payloads collected once per VARIANT used to be the third
+         and loudest case here. They no longer are: `beauty_content_assets` and
+         `beauty_usage_guides` rows are derived once, outside the variant loop,
+         and written with a NULL `sku_key`. Deduping them was never enough on
+         its own — the survivor kept the LAST variant's `sku_key`, so a per-SKU
+         read found a product-level tutorial on one variant and no other.
 
       2. OUTSIDE the delete scope. Every derivation is merchant-scoped now, so
          this can only be residue written under an older, unscoped derivation.

@@ -174,15 +174,31 @@ def _drive(coro_factory):
         dbmod.database = original
 
 
-def _payload(merchant_id: str, *, shades: bool = True, tutorials: bool = False) -> dict:
+def _payload(
+    merchant_id: str,
+    *,
+    shades: bool = True,
+    tutorials: bool = False,
+    duplicate_declared_asset: bool = False,
+) -> dict:
     """One platform product, as the SAME Shopify store hands it to whichever
     merchant it is connected to. Only `merchant_id` differs between the two
     merchants — the platform product id, variants and metadata are identical,
-    which is the whole point."""
+    which is the whole point.
+
+    `duplicate_declared_asset` makes the store hand the SAME merchant-declared
+    `asset_id` twice in one product's metadata — the within-batch duplicate that
+    still reaches `_replace_child_rows_multi`'s dedupe now that product-level
+    payloads are no longer collected once per variant."""
     metadata: dict = {"how_to_use": "Apply daily."}
     if tutorials:
         metadata["tutorials"] = [
             {"url": "https://cdn.example.com/t1.mp4", "title": "How to apply"}
+        ]
+    if duplicate_declared_asset:
+        metadata["tutorials"] = [
+            {"url": "https://cdn.example.com/t1.mp4", "asset_id": "tut-1", "title": "How to apply"},
+            {"url": "https://cdn.example.com/t2.mp4", "asset_id": "tut-1", "title": "How to apply (long cut)"},
         ]
     return {
         "id": SOURCE_PRODUCT_ID,
@@ -329,10 +345,16 @@ def test_one_merchants_resync_does_not_touch_the_others_child_rows(engine):
 
 
 def test_a_product_level_asset_seen_once_per_variant_writes_one_row(engine):
-    """`beauty_content_assets` rows come from PRODUCT-level metadata but are
-    collected inside the VARIANT loop, so a two-variant product offers the same
-    asset id twice in one batch. That alone raised
-    `duplicate key ... beauty_content_assets_pkey` — no second merchant needed."""
+    """`beauty_content_assets` rows come from PRODUCT-level metadata. They are
+    now derived ONCE, outside the variant loop, so this pins the count from the
+    other side: a two-variant product still writes exactly one asset row.
+
+    Historically the duplicate arrived because the derivation sat INSIDE the
+    variant loop, and a two-variant product offered the same asset id twice —
+    which alone raised `duplicate key ... beauty_content_assets_pkey`, no second
+    merchant needed. That specific source of in-batch duplicates is gone; the
+    dedupe it motivated is still exercised, by
+    test_two_tutorials_declaring_one_asset_id_write_one_row below."""
     stats = _ingest(MERCHANT_A, tutorials=True)
 
     assert stats["products_ingested"] == 1, stats
@@ -503,3 +525,138 @@ def test_a_product_level_asset_reaches_every_variants_read_payload(engine):
             lambda sk=sku_key: pq._fetch_beauty_vertical_payload(product_key, sk)
         )
         assert len(payload["shades"]) == 1, (sku_key, payload["shades"])
+
+
+def test_two_tutorials_declaring_one_asset_id_write_one_row(engine):
+    """#1940's within-batch dedupe, on a duplicate source that still exists.
+
+    Hoisting the product-level derivation out of the variant loop removed the
+    duplicate that motivated the dedupe, which would leave
+    `_replace_child_rows_multi`'s case 1 with no regression test at all. It is
+    still reachable: two `tutorials` entries carrying the same merchant-declared
+    `asset_id` hash to one `asset_id` inside ONE product. Without the dedupe
+    that is a plain INSERT collision, and the whole ingest transaction rolls
+    back — the 2026-08-29 blast radius.
+    """
+    stats = _ingest(MERCHANT_A, duplicate_declared_asset=True)
+
+    assert stats["products_ingested"] == 1, stats
+    assert stats["products_failed"] == 0, stats
+    assert stats["beauty_content_assets_upserted"] == 1, stats
+    # Last wins, and the row is still product-level.
+    assert _rows(engine, "SELECT sku_key, url FROM beauty_content_assets") == [
+        (None, "https://cdn.example.com/t2.mp4")
+    ]
+    # The ingest COMMITTED — a rollback would take the product row with it.
+    assert _rows(engine, "SELECT merchant_id FROM catalog_products") == [(MERCHANT_A,)]
+
+
+def test_a_legacy_per_sku_row_is_still_served_to_its_own_variant(engine):
+    """The `sku_key = :sku_key` arm of the read predicate is load-bearing RIGHT
+    NOW, and nothing else covers it.
+
+    Every `beauty_content_assets` / `beauty_usage_guides` row in prod today
+    carries a non-NULL `sku_key`; they become product-level only when their
+    merchant next syncs. That is the whole basis for shipping this without a
+    backfill, so the deploy window has to work: until the resync, the row is
+    reachable through the equality arm and through nothing else. A test that
+    only ever sees NULL-sku rows would stay green if that arm were deleted.
+
+    Simulated by rewriting the freshly-ingested rows back to the pre-deploy
+    shape rather than by hand-authoring DDL-shaped fixtures — the columns and
+    ids are the real ones ingest just wrote.
+    """
+    from sqlalchemy import text
+
+    import services.catalog_sync_service as sync
+    import services.pivot_query_service as pq
+
+    _ingest(MERCHANT_A, tutorials=True)
+    product_key = sync.make_catalog_product_key(MERCHANT_A, "shopify", SOURCE_PRODUCT_ID)
+    sku_keys = sorted(
+        k
+        for (k,) in _rows(
+            engine,
+            f"SELECT sku_key FROM catalog_skus WHERE product_key = '{product_key}'",
+        )
+    )
+    assert len(sku_keys) == 2, sku_keys
+    legacy_sku, other_sku = sku_keys[1], sku_keys[0]
+
+    # Back to the pre-deploy shape: one row stamped with ONE variant's sku_key.
+    with engine.begin() as c:
+        for table in ("beauty_content_assets", "beauty_usage_guides"):
+            c.execute(
+                text(f"UPDATE {table} SET sku_key = :sk"), {"sk": legacy_sku}
+            )
+
+    served = _drive(lambda: pq._fetch_beauty_vertical_payload(product_key, legacy_sku))
+    assert [t["url"] for t in served["tutorials"]] == [
+        "https://cdn.example.com/t1.mp4"
+    ], served["tutorials"]
+    assert served["how_to_use"] == "Apply daily.", served["how_to_use"]
+
+    # And the other variant sees nothing — which is precisely the defect this
+    # branch fixes, still present until that merchant resyncs. Asserting it
+    # keeps the deploy-window story honest instead of implying the read change
+    # retroactively repairs un-resynced rows.
+    starved = _drive(lambda: pq._fetch_beauty_vertical_payload(product_key, other_sku))
+    assert starved["tutorials"] == [], starved["tutorials"]
+    assert starved["how_to_use"] is None, starved["how_to_use"]
+
+
+def test_merchant_authored_how_to_use_replaces_the_platform_guide_wholesale(engine):
+    """Converging the two writers on ONE `guide_id` put them on one ROW, and a
+    partial UPDATE over a shared row serves a mixed-provenance answer.
+
+    `_write_how_to_use` sets `how_to_use_text` only. Ingest also writes
+    `steps_json` / `frequency` / `warnings_json` into the same row, and
+    `_fetch_beauty_vertical_payload` reads `how_to_use` and `usage_steps` out of
+    it together — so the agent surface would emit the merchant's new prose next
+    to the platform's contradicting steps. Before the convergence the two
+    writers held separate rows and this could not happen, so the fix and the
+    hazard arrived in the same change.
+    """
+    import services.beauty_field_authoring as authoring
+    import services.catalog_sync_service as sync
+    import services.pivot_query_service as pq
+
+    _ingest(MERCHANT_A, tutorials=True)
+    product_key = sync.make_catalog_product_key(MERCHANT_A, "shopify", SOURCE_PRODUCT_ID)
+
+    # The platform copy ingest just wrote: prose AND structured steps.
+    assert _rows(
+        engine, "SELECT how_to_use_text FROM beauty_usage_guides"
+    ) == [("Apply daily.",)]
+    steps_before = _rows(engine, "SELECT steps_json FROM beauty_usage_guides")
+    assert steps_before == [(["Apply daily."],)], steps_before
+
+    _drive(
+        lambda: authoring._write_how_to_use(
+            product_key=product_key,
+            merchant_id=MERCHANT_A,
+            value="Use at night only, on dry skin.",
+        )
+    )
+
+    # ONE row still — the whole point of sharing the id — and no leftover
+    # platform structure underneath the merchant's prose.
+    assert _rows(
+        engine, "SELECT count(*) FROM beauty_usage_guides"
+    ) == [(1,)]
+    assert _rows(
+        engine,
+        "SELECT how_to_use_text, steps_json, frequency, warnings_json"
+        " FROM beauty_usage_guides",
+    ) == [("Use at night only, on dry skin.", None, None, None)]
+
+    sku_key = sorted(
+        k
+        for (k,) in _rows(
+            engine,
+            f"SELECT sku_key FROM catalog_skus WHERE product_key = '{product_key}'",
+        )
+    )[0]
+    payload = _drive(lambda: pq._fetch_beauty_vertical_payload(product_key, sku_key))
+    assert payload["how_to_use"] == "Use at night only, on dry skin.", payload["how_to_use"]
+    assert payload["usage_steps"] == [], payload["usage_steps"]

@@ -353,6 +353,22 @@ async def _write_raw_inci(
 async def _write_how_to_use(
     *, product_key: str, merchant_id: str, value: str,
 ) -> str:
+    """Merchant-authored how_to_use REPLACES the whole guide, not just its prose.
+
+    Catalog ingest derives this row's id through the same
+    `product_usage_guide_id`, so the two writers share ONE row and this UPDATE
+    lands on top of whatever ingest last wrote. Setting only `how_to_use_text`
+    left ingest's `steps_json` / `frequency` / `time_of_day` /
+    `application_order` / `warnings_json` standing underneath the merchant's new
+    prose, and `_fetch_beauty_vertical_payload` reads `how_to_use` and
+    `usage_steps` out of that one row — so the agent surface served the
+    merchant's text next to the platform's contradicting steps.
+
+    The merchant supplies prose only, so the co-dependent structured columns are
+    cleared rather than carried: they described the text that was replaced.
+    `evidence_refs_json` goes with them — ingest's `source_ref` substantiated
+    the platform copy, not this one.
+    """
     guide_id = product_usage_guide_id(product_key)
     await database.execute(
         """
@@ -361,6 +377,12 @@ async def _write_how_to_use(
         ) VALUES (:gid, :pk, NULL, :mid, :txt, NOW())
         ON CONFLICT (guide_id) DO UPDATE SET
           how_to_use_text = EXCLUDED.how_to_use_text,
+          steps_json = NULL,
+          frequency = NULL,
+          time_of_day = NULL,
+          application_order = NULL,
+          warnings_json = NULL,
+          evidence_refs_json = NULL,
           updated_at = NOW()
         """,
         {"gid": guide_id, "pk": product_key, "mid": merchant_id, "txt": value},
