@@ -187,7 +187,9 @@ def _payload(merchant_id: str, *, shades: bool = True, tutorials: bool = False) 
         "price": 42.0,
         "currency": "USD",
         "inventory_quantity": 10,
-        "ingredient_ids": ["niacinamide"],
+        # retinol + salicylic_acid is the pair `_compatibility_rules_from_ingredients`
+        # fires on, so beauty_compatibility_rules gets exercised too.
+        "ingredient_ids": ["niacinamide", "retinol", "salicylic_acid"],
         "image_url": "https://cdn.example.com/a.jpg",
         "images": ["https://cdn.example.com/a.jpg"],
         "variants": [
@@ -270,6 +272,18 @@ def test_second_merchant_carrying_the_same_platform_product_ingests(engine):
     # Four rows means four distinct shade_ids; the defect was that the two
     # merchants derived the SAME two.
     assert len({sid for _, _, sid in shades}) == 4
+
+    # beauty_compatibility_rules was NOT re-keyed by the fix and must not be:
+    # its `compatibility_rule_id` hashes `sku_key`, which already embeds the
+    # merchant-scoped `product_key`. Pinned so a later "fix it for symmetry"
+    # has to explain itself.
+    assert stats_a["beauty_compatibility_rules_upserted"] == 2, stats_a
+    rules = _rows(
+        engine,
+        "SELECT merchant_id, compatibility_rule_id FROM beauty_compatibility_rules",
+    )
+    assert len(rules) == 4, rules
+    assert len({rid for _, rid in rules}) == 4
 
 
 def test_one_merchants_resync_does_not_touch_the_others_child_rows(engine):
