@@ -125,6 +125,44 @@ def test_pivot_multi_rollout_allowed_is_guarded_by_source_and_page(monkeypatch: 
     ) is False
 
 
+def test_search_price_contract_requires_a_currency_qualified_price_or_offer() -> None:
+    assert gateway._has_canonical_price_or_offer(
+        {"price": {"current": {"amount": 24, "currency": "USD"}}}
+    ) is True
+    assert gateway._has_canonical_price_or_offer(
+        {
+            "price": 0,
+            "offers": [{"price": {"amount": 28, "currency": "EUR"}}],
+        }
+    ) is True
+    assert gateway._has_canonical_price_or_offer(
+        {"price": 28, "currency": None}
+    ) is False
+    assert gateway._has_canonical_price_or_offer(
+        {"price": 0, "currency": "USD"}
+    ) is False
+
+
+def test_search_price_contract_removes_unpriced_cards_and_records_the_drop() -> None:
+    result = {
+        "products": [
+            {"product_id": "priced", "price": 18, "currency": "USD"},
+            {"product_id": "unpriced", "price": 0, "currency": "USD"},
+        ],
+        "total": 2,
+    }
+
+    gateway._enforce_search_price_contract(result)
+
+    assert [product["product_id"] for product in result["products"]] == ["priced"]
+    assert result["page_size"] == 1
+    assert result["total"] == 1
+    assert result["metadata"]["price_contract"] == {
+        "canonical_price_or_offer_required": True,
+        "dropped_unpriced": 1,
+    }
+
+
 @pytest.mark.asyncio
 async def test_handle_find_products_multi_can_serve_from_pivot_semantic_core(
     monkeypatch: pytest.MonkeyPatch,

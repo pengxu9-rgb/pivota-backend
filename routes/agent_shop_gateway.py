@@ -3124,6 +3124,128 @@ def _coerce_float(v: Any) -> Optional[float]:
         return None
 
 
+def _positive_price_amount(value: Any) -> Optional[float]:
+    """Read a positive Money-like amount without inventing a price."""
+    if isinstance(value, dict):
+        candidates = [
+            value.get("amount"),
+            value.get("value"),
+            value.get("price_amount"),
+            value.get("price"),
+            value.get("current_price"),
+            value.get("sale_price"),
+            value.get("min_price"),
+        ]
+        for nested_key in ("current", "sale", "min"):
+            nested = value.get(nested_key)
+            if isinstance(nested, dict):
+                candidates.extend([nested.get("amount"), nested.get("value")])
+        for candidate in candidates:
+            amount = _positive_price_amount(candidate)
+            if amount is not None:
+                return amount
+        return None
+
+    amount = _coerce_float(value)
+    return amount if amount is not None and amount > 0 else None
+
+
+def _observed_price_currency(value: Any, fallback: Any = None) -> Optional[str]:
+    if isinstance(value, dict):
+        for key in ("currency", "currency_code", "price_currency"):
+            currency = str(value.get(key) or "").strip().upper()
+            if currency:
+                return currency
+        for nested_key in ("current", "sale", "min"):
+            currency = _observed_price_currency(value.get(nested_key))
+            if currency:
+                return currency
+    currency = str(fallback or "").strip().upper()
+    return currency or None
+
+
+def _has_canonical_price_or_offer(product: Any) -> bool:
+    """A searchable product must carry a positive, currency-qualified price.
+
+    This is deliberately evaluated on the final card payload rather than a
+    retrieval lane, so cached, pivot, delegated, internal, and external cards
+    all obey the same public contract.
+    """
+    if not isinstance(product, dict):
+        return False
+
+    product_currency = _observed_price_currency(
+        product,
+        product.get("currency") or product.get("price_currency"),
+    )
+
+    def is_priced(value: Any, fallback_currency: Any) -> bool:
+        return (
+            _positive_price_amount(value) is not None
+            and _observed_price_currency(value, fallback_currency) is not None
+        )
+
+    for key in (
+        "price",
+        "pricing",
+        "price_amount",
+        "current_price",
+        "sale_price",
+        "min_price",
+        "offer_price",
+    ):
+        if is_priced(product.get(key), product_currency):
+            return True
+
+    for variant in product.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        variant_currency = _observed_price_currency(variant, product_currency)
+        for key in ("price", "pricing", "price_amount", "current_price"):
+            if is_priced(variant.get(key), variant_currency):
+                return True
+
+    for offer in product.get("offers") or []:
+        if not isinstance(offer, dict):
+            continue
+        offer_currency = _observed_price_currency(offer, product_currency)
+        for key in ("price", "pricing", "price_amount", "current_price"):
+            if is_priced(offer.get(key), offer_currency):
+                return True
+
+    return False
+
+
+def _enforce_search_price_contract(result: Dict[str, Any]) -> None:
+    """Remove search cards that cannot state a canonical price or seller offer."""
+    products = result.get("products")
+    if not isinstance(products, list):
+        return
+
+    priced_products = [
+        product for product in products if _has_canonical_price_or_offer(product)
+    ]
+    dropped = len(products) - len(priced_products)
+    result["products"] = priced_products
+    result["page_size"] = len(priced_products)
+    if isinstance(result.get("total"), int):
+        result["total"] = max(0, result["total"] - dropped)
+
+    metadata = result.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata["price_contract"] = {
+        "canonical_price_or_offer_required": True,
+        "dropped_unpriced": dropped,
+    }
+    result["metadata"] = metadata
+    if dropped:
+        logger.info(
+            "find_products_multi.excluded_unpriced",
+            extra={"dropped": dropped, "surface": "find_products_multi"},
+        )
+
+
 def _row_to_dict(row: Any) -> Dict[str, Any]:
     if isinstance(row, dict):
         return row
@@ -8608,6 +8730,8 @@ async def _handle_find_products_multi(
             "slate served WITHOUT the quarantine gate",
             exc_info=True,
         )
+    if isinstance(result, dict):
+        _enforce_search_price_contract(result)
     try:
         if isinstance(result, dict):
             await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")

@@ -3751,7 +3751,14 @@ async def test_shop_gateway_find_products_multi_delegate_to_upstream_when_enable
     )
 
     upstream_response = {
-        "products": [{"id": "p_upstream_1", "title": "Upstream Product"}],
+        "products": [
+            {
+                "id": "p_upstream_1",
+                "title": "Upstream Product",
+                "price": 24,
+                "currency": "USD",
+            }
+        ],
         "total": 1,
         "page": 1,
         "page_size": 1,
@@ -3947,7 +3954,14 @@ async def test_shop_gateway_find_products_multi_delegate_upstream_success_cached
     agent_shop_gateway_module._MULTI_SEARCH_UPSTREAM_CACHE.clear()
 
     upstream_response = {
-        "products": [{"id": "p_upstream_1", "title": "Upstream Product"}],
+        "products": [
+            {
+                "id": "p_upstream_1",
+                "title": "Upstream Product",
+                "price": 24,
+                "currency": "USD",
+            }
+        ],
         "total": 1,
         "page": 1,
         "page_size": 1,
