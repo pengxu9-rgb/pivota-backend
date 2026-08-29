@@ -12,8 +12,8 @@ set -euo pipefail
 ENV="${1:-}"; TAG="${2:-}"
 [ -n "$ENV" ] && [ -n "$TAG" ] || { echo "usage: $0 staging|prod <image-tag>" >&2; exit 2; }
 case "$ENV" in
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8 ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=6 ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8;  CONCURRENCY=80 ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=10; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=12; CONCURRENCY=20 ;;
   *) echo "bad env" >&2; exit 2 ;;
 esac
 
@@ -49,6 +49,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
+# PROD SHAPE IS A CONNECTION BUDGET, not a throughput guess. Cloud SQL `pivota-pg` runs
+# max_connections=300, shared with worker/catalog-intelligence/ops, so web's ceiling is
+# MAX x POOL_MAX = 10 x 12 = 120. The previous shape (MAX=20, POOL_MAX=6, --concurrency 80) wedged
+# production twice in one week: 80 concurrent requests against 6 connections is 13x oversubscription,
+# and with DB_COMMAND_TIMEOUT_SECONDS a stalled socket pins a slot for its full duration, so six
+# stalls take the instance out entirely. Every error in both outages was the same line —
+# `PoolCheckoutTimeout: timed out waiting 120.0s for a database connection` — while Cloud SQL sat
+# RUNNABLE at 28/300 backends with 23 of them IDLE: from the server a client blocked on a dead
+# socket is indistinguishable from an idle one, which is why the DATABASE looked innocent.
+# 2026-08-29: concurrency 20 and pool 12 is 1.7x, and 10 x 20 = 200 request slots against observed
+# traffic of ~28 requests per 15 minutes. Raise MAX or CONCURRENCY only together with the budget.
+#
 # WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
 # vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
 # constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
@@ -398,7 +410,7 @@ probe_health(){ # url -> echoes the status code
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
   ${CMD_ARGS[@]+"${CMD_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
+  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency "$CONCURRENCY" --timeout 300 \
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \

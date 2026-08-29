@@ -25,6 +25,7 @@ Same approach as tests/test_setup_scheduler_is_safe_to_rerun.py.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -97,19 +98,43 @@ def test_it_refuses_when_the_fleet_ceiling_exceeds_the_budget(tmp_path: Path) ->
         f"expected refusal, got {result.returncode}\n{combined[-2000:]}"
     )
     assert "400" in combined, "the refusal must state the computed ceiling"
-    assert "DB_POOL_MAX_SIZE=6" in combined, "the refusal must name the remediation"
+    # Assert the SHAPE of the remediation, not a literal. Pinning "DB_POOL_MAX_SIZE=6" made this
+    # test fail the moment the prod pool was legitimately resized (6 -> 12 after the 2026-08-29
+    # wedge), which teaches the next person to edit the assertion rather than think about it. What
+    # actually matters is that the remediation it prints would BRING THE FLEET BACK INSIDE BUDGET.
+    # Anchored on `--update-env-vars`: the message ALSO prints the drifted live value in its
+    # diagnostic ("DB_POOL_MAX_SIZE=20 x maxScale=20"), and a bare search finds that one first —
+    # which would assert the drift against itself and pass for the wrong reason.
+    match = re.search(r"--update-env-vars\s+DB_POOL_MAX_SIZE=(\d+)", combined)
+    assert match, f"the refusal must name a runnable remediation\n{combined[-2000:]}"
+    # The remediation must actually REDUCE the drifted pool (live is 20 here). Asserting the
+    # script's own constant instead would just re-pin a literal, and multiplying by the injected
+    # live maxScale is wrong too: the suggestion assumes the deploy also reasserts the script's
+    # maxScale, which is the whole point of preserve mode reasserting shape.
+    assert int(match.group(1)) < 20, (
+        f"the remediation DB_POOL_MAX_SIZE={match.group(1)} does not reduce the drifted pool"
+    )
 
 
-def test_the_correct_configuration_passes(tmp_path: Path) -> None:
-    """6 x 20 = 120 is the intended prod shape and must not be blocked.
+@pytest.mark.parametrize(
+    ("pool_max", "max_scale", "expected"),
+    [
+        ("6", "20", "pool drift check: 6 x 20 = 120"),   # the shape before 2026-08-29
+        ("12", "10", "pool drift check: 12 x 10 = 120"),  # the shape after: same ceiling, 1.7x
+    ],
+)
+def test_a_correct_configuration_passes(tmp_path: Path, pool_max: str, max_scale: str, expected: str) -> None:
+    """Both in-budget shapes must deploy.
 
-    A guard that fails closed on the CORRECT configuration is worse than none —
-    it would block every deploy and get bypassed permanently within a day.
+    A guard that fails closed on the CORRECT configuration is worse than none — it would block
+    every deploy and get bypassed permanently within a day. The second row is the shape adopted
+    after the 2026-08-29 pool wedge: the ceiling is unchanged at 120 connections, but concurrency
+    per instance drops from 80 to 20 so the pool is 1.7x oversubscribed instead of 13x.
     """
-    result = _run(tmp_path, pool_max="6", max_scale="20")
+    result = _run(tmp_path, pool_max=pool_max, max_scale=max_scale)
     combined = result.stdout + result.stderr
     assert "REFUSING to deploy" not in combined, combined[-2000:]
-    assert "pool drift check: 6 x 20 = 120" in combined
+    assert expected in combined
 
 
 def test_an_unreadable_value_is_not_a_pass(tmp_path: Path) -> None:
