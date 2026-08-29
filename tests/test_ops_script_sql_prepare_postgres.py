@@ -193,11 +193,17 @@ ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS usage_scenarios JSONB;
 def _agent_pdp_view_catchup_ddl() -> List[str]:
     """`ALTER TABLE agent_pdp_view ...` statements from db/migrations, in order.
 
-    agent_pdp_view IS a db.catalog table, so `metadata.create_all` creates it —
-    but db/catalog.py's Table definition is BEHIND the migrations:
-    evidence_profile, required_disclaimers, bullet_points and usage_scenarios
-    exist only in db/migrations/*.sql. Statements naming them therefore failed
-    with UndefinedColumn against a fixture that looked complete.
+    agent_pdp_view IS a db.catalog table, so `metadata.create_all` creates it,
+    and db/catalog.py's Table definition now declares the full migration column
+    set (evidence_profile, required_disclaimers, rating_value, rating_count,
+    bullet_points, usage_scenarios) — on a genuinely fresh database these ALTERs
+    are no-ops.
+
+    They stay because the database is SHARED and reused: `create_all` is
+    checkfirst-only and will not widen a table that already exists, so a
+    catalog table built by an OLDER db/catalog.py keeps its narrow shape and
+    statements naming the newer columns fail with UndefinedColumn against a
+    fixture that looks complete.
 
     Additive ALTERs lifted from the migrations themselves, never hand-written —
     the 🚨 rule above forbids hand-rolling DDL for a table db.catalog owns, and
@@ -214,7 +220,17 @@ def _agent_pdp_view_catchup_ddl() -> List[str]:
             continue
         for statement in filter(None, (s.strip() for s in body.split(";"))):
             collapsed = " ".join(statement.split()).lower()
-            if collapsed.startswith("alter table agent_pdp_view") and "add column" in collapsed:
+            # BOTH spellings. Matching only `alter table agent_pdp_view` silently
+            # skipped migration 186, which writes `ALTER TABLE IF EXISTS
+            # agent_pdp_view` — so rating_value/rating_count were never caught up
+            # and report_agent_depth_scorecard's APV_DEPTH_SQL failed to PREPARE.
+            # It looked green only because a sibling gate file that sorts earlier
+            # (tests/test_citation_read_surfaces_postgres.py) adds those two
+            # columns to the SHARED database first.
+            if "add column" not in collapsed:
+                continue
+            if collapsed.startswith(("alter table agent_pdp_view",
+                                    "alter table if exists agent_pdp_view")):
                 out.append(statement)
     return out
 

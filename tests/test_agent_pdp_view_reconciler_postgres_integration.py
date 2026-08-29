@@ -197,9 +197,11 @@ async def test_reconciler_sql_selects_orders_and_converges_on_real_postgres():
 
     await database.connect()
     try:
-        # Prod's refreshed_at is TIMESTAMPTZ (migration 085); the SQLAlchemy
-        # Table object says plain DateTime, so create_all would make it naive
-        # and change the AT TIME ZONE semantics under test — align with prod.
+        # Prod's refreshed_at is TIMESTAMPTZ (migration 085), and db/catalog.py
+        # now says DateTime(timezone=True) to match, so create_all builds it
+        # correctly. Kept because create_all skips a table that already exists:
+        # a table built by an older model is still naive, which changes the
+        # AT TIME ZONE semantics under test.
         current_type = await database.fetch_val(
             "SELECT data_type FROM information_schema.columns "
             "WHERE table_name = 'agent_pdp_view' AND column_name = 'refreshed_at'"
