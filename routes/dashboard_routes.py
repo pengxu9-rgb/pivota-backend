@@ -12,6 +12,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from realtime.metrics_store import get_metrics_store, snapshot
 from realtime.ws_manager import get_connection_manager
+from realtime.ws_guard import ws_admission
 from utils.auth import verify_jwt_token, validate_entity_access, check_permission
 
 logger = logging.getLogger("dashboard_routes")
@@ -109,10 +110,35 @@ async def reset_metrics() -> Dict[str, Any]:
 
 @router.websocket("/ws/metrics")
 async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(None)):
-    """WebSocket endpoint for real-time metrics updates with JWT authentication"""
+    """WebSocket endpoint for real-time metrics updates with JWT authentication.
+
+    "with JWT authentication" overstates it: `ConnectionManager.connect` accepts
+    the socket first and downgrades to an anonymous session when the token is
+    missing OR fails to decode, so reaching this handler needs no credential.
+    That is a separate question from this one and is left alone here; what
+    matters for slot exhaustion is that an anonymous caller can hold a Cloud Run
+    concurrency slot on this path exactly as it can on /api/ws/simple.
+
+    So the ceiling below is the same object /api/ws/simple reserves from, not a
+    second budget. A per-route ceiling would leave the attack intact — capping
+    one path while the other stays open just moves it, and two routes capped at
+    N each still add up to 2N held slots.
+
+    No idle deadline here, and that asymmetry is deliberate rather than an
+    oversight: unlike /api/ws/simple, this endpoint really is pushed to —
+    `publish_event_to_ws` broadcasts to this manager from main.py and
+    utils/event_publisher.py — so a client that never sends is a legitimate
+    listener, not a squatter, and a deadline keyed on client messages would
+    disconnect it. A deadline keyed on traffic in either direction would instead
+    be reset by the very broadcasts it was watching for. Either way the ceiling,
+    not a deadline, is what bounds this path.
+    """
     manager = get_connection_manager()
     connection_id = None
-    
+
+    if not await ws_admission.reserve(websocket):
+        return
+
     try:
         # Connect first, then authenticate
         connection_id = await manager.connect(websocket, token)
@@ -164,11 +190,18 @@ async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(N
                 
     except WebSocketDisconnect:
         logger.info(f"WebSocket connection {connection_id} disconnected")
-        manager.disconnect(websocket)
-        
+
     except Exception as e:
         logger.error(f"WebSocket error for connection {connection_id}: {e}")
+
+    finally:
+        # Cleanup moved out of the handlers above. asyncio.CancelledError is a
+        # BaseException, so neither handler ran when the platform tore the
+        # connection down at --timeout 300 or during a shutdown drain — leaking
+        # an entry in ConnectionManager.active_connections every time, and (now
+        # that a ceiling exists) a slot that would never be returned.
         manager.disconnect(websocket)
+        ws_admission.release()
 
 # Import time at the top level
 import time
