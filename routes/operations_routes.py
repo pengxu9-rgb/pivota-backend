@@ -511,7 +511,13 @@ async def get_dashboard_summary(
     
     # Get metrics from the main system
     metrics_store = get_metrics_store()
-    system_metrics = metrics_store.get_snapshot() if metrics_store else {}
+    # role is required now; this route already proved the caller is an
+    # operator or admin above, so pass that rather than a default.
+    system_metrics = (
+        metrics_store.get_snapshot(role=str(credentials.get("role") or "operator"))
+        if metrics_store
+        else {}
+    )
     
     # Calculate onboarding metrics
     pending_agents = len([a for a in operations_store["agents"].values() 

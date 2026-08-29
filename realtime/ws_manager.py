@@ -5,9 +5,8 @@ Handles WebSocket connections, broadcasting, and authentication
 
 import json
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Callable, Dict, List, Any, Optional
 from fastapi import WebSocket, WebSocketDisconnect
-import jwt
 import time
 
 logger = logging.getLogger("ws_manager")
@@ -18,45 +17,46 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.connection_metadata: Dict[str, Dict[str, Any]] = {}
-        self.jwt_secret = "your-secret-key"  # In production, use environment variable
-        
-    async def connect(self, websocket: WebSocket, token: Optional[str] = None) -> str:
-        """Accept a WebSocket connection and optionally validate JWT token"""
+        self._sequence = 0
+
+    async def connect(self, websocket: WebSocket, principal) -> str:
+        """Accept an ALREADY-AUTHENTICATED connection and register it.
+
+        This used to do its own JWT check, and that check had never once
+        authenticated anybody: it verified against a hardcoded
+        `"your-secret-key"` while every token this system issues is signed with
+        `utils.auth.JWT_SECRET`. Real tokens therefore always failed to decode
+        and were silently downgraded to an anonymous `viewer`, while a token
+        forged with the literal from the source decoded fine. Authentication now
+        happens in utils.dashboard_auth BEFORE the socket is accepted, and this
+        method takes the resolved principal — it cannot fall back to anonymous
+        because there is no longer a fallback to reach.
+        """
         await websocket.accept()
-        
-        connection_id = f"conn_{int(time.time() * 1000)}"
-        
-        # Always allow connection, validate token if provided
-        user_info = {
-            "user_id": "anonymous",
-            "role": "viewer",
-            "entity_id": None
-        }
-        
-        if token:
-            try:
-                payload = jwt.decode(token, self.jwt_secret, algorithms=["HS256"])
-                user_info = {
-                    "user_id": payload.get("sub"),
-                    "role": payload.get("role", "viewer"),
-                    "entity_id": payload.get("entity_id")
-                }
-                logger.info(f"Authenticated WebSocket connection for user {user_info['user_id']} with role {user_info['role']}")
-            except jwt.InvalidTokenError:
-                logger.warning(f"Invalid JWT token for WebSocket connection, using anonymous")
-                # Don't close connection, just use anonymous
-            except Exception as e:
-                logger.warning(f"JWT validation error: {e}, using anonymous")
-        else:
-            logger.info(f"Anonymous WebSocket connection established")
-        
+
+        # Monotonic counter, not a millisecond timestamp. Two sockets opened in
+        # the same millisecond used to collide on the same id, and the second
+        # silently evicted the first from active_connections — it stopped
+        # receiving broadcasts and its disconnect() became a no-op, leaking the
+        # entry. Mass reconnects are exactly when that happens.
+        self._sequence += 1
+        connection_id = f"conn_{self._sequence}"
+
         self.active_connections[connection_id] = websocket
         self.connection_metadata[connection_id] = {
             "connected_at": time.time(),
-            "user_info": user_info
+            "principal": principal,
+            "user_info": {
+                "user_id": principal.sub,
+                "role": principal.role,
+                "entity_id": principal.entity_id,
+            },
         }
-        
-        logger.info(f"WebSocket connection {connection_id} established")
+
+        logger.info(
+            "WebSocket connection %s established for %s (role=%s)",
+            connection_id, principal.sub, principal.role,
+        )
         return connection_id
     
     def disconnect(self, websocket: WebSocket) -> None:
@@ -80,7 +80,13 @@ class ConnectionManager:
             logger.error(f"Failed to send JSON to WebSocket: {e}")
     
     async def broadcast(self, data: Dict[str, Any], role_filter: Optional[str] = None, entity_filter: Optional[str] = None) -> None:
-        """Broadcast data to all connected clients, optionally filtered by role/entity"""
+        """Broadcast ONE payload to all connected clients.
+
+        `role_filter` / `entity_filter` choose RECIPIENTS; they do not scope the
+        payload. Only use this for data that every recipient may see. To push
+        anything derived from the metrics store, use `broadcast_scoped`, which
+        builds a separate payload per connection.
+        """
         disconnected_connections = []
         
         for connection_id, websocket in self.active_connections.items():
@@ -108,6 +114,32 @@ class ConnectionManager:
             if connection_id in self.connection_metadata:
                 del self.connection_metadata[connection_id]
     
+    async def broadcast_scoped(
+        self, build: Callable[[Dict[str, Any]], Dict[str, Any]]
+    ) -> None:
+        """Push a payload built SEPARATELY for each connection's principal.
+
+        Recipient filtering is not payload scoping, and conflating the two is
+        how authenticating the handshake would have bought nothing: the pushed
+        snapshot was generated once, unscoped, and sent to everyone, so a
+        merchant-scoped socket received the whole platform's figures anyway.
+        `build` receives that connection's user_info and returns what that
+        connection alone may see.
+        """
+        disconnected_connections = []
+
+        for connection_id, websocket in list(self.active_connections.items()):
+            try:
+                metadata = self.connection_metadata.get(connection_id, {})
+                await self.send_json(websocket, build(metadata.get("user_info", {})))
+            except Exception as e:
+                logger.error(f"Failed to broadcast to connection {connection_id}: {e}")
+                disconnected_connections.append(connection_id)
+
+        for connection_id in disconnected_connections:
+            self.connection_metadata.pop(connection_id, None)
+            self.active_connections.pop(connection_id, None)
+
     async def broadcast_to_role(self, data: Dict[str, Any], role: str) -> None:
         """Broadcast data to all connections with a specific role"""
         await self.broadcast(data, role_filter=role)
@@ -136,38 +168,44 @@ def get_connection_manager() -> ConnectionManager:
     return _manager
 
 async def publish_event_to_ws(event: Dict[str, Any]) -> None:
-    """Publish an event to WebSocket clients"""
+    """Publish an event to WebSocket clients, scoped per recipient."""
     from .metrics_store import record_event, snapshot
-    
+
     # Record the event in metrics store
     record_event(event)
-    
-    # Generate updated snapshot
-    current_snapshot = snapshot()
-    
-    # Broadcast the event
-    event_data = {
-        "type": "event",
-        "event": event,
-        "snapshot": current_snapshot,
-        "timestamp": time.time()
-    }
-    
-    # Send to all connected clients
-    await _manager.broadcast(event_data)
-    
+
+    now = time.time()
+
+    def _for(user_info: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "event",
+            "event": event,
+            "snapshot": snapshot(
+                role=user_info.get("role", ""),
+                entity_id=user_info.get("entity_id"),
+            ),
+            "timestamp": now,
+        }
+
+    await _manager.broadcast_scoped(_for)
+
     logger.debug(f"Published event to WebSocket clients: {event.get('type', 'unknown')}")
 
 async def broadcast_snapshot() -> None:
-    """Broadcast current snapshot to all connected clients"""
+    """Broadcast the current snapshot, scoped per recipient."""
     from .metrics_store import snapshot
-    
-    snapshot_data = snapshot()
-    data = {
-        "type": "snapshot",
-        "data": snapshot_data,
-        "timestamp": time.time()
-    }
-    
-    await _manager.broadcast(data)
+
+    now = time.time()
+
+    def _for(user_info: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "snapshot",
+            "data": snapshot(
+                role=user_info.get("role", ""),
+                entity_id=user_info.get("entity_id"),
+            ),
+            "timestamp": now,
+        }
+
+    await _manager.broadcast_scoped(_for)
     logger.debug("Broadcasted snapshot to all WebSocket clients")

@@ -13,7 +13,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from realtime.metrics_store import get_metrics_store, snapshot
 from realtime.ws_manager import get_connection_manager
 from realtime.ws_guard import ws_admission
-from utils.auth import verify_jwt_token, validate_entity_access, check_permission
+from utils.dashboard_auth import (
+    DashboardPrincipal,
+    authenticate_websocket,
+    require_dashboard_admin,
+    require_dashboard_principal,
+)
 
 logger = logging.getLogger("dashboard_routes")
 
@@ -21,45 +26,49 @@ router = APIRouter(prefix="/api", tags=["dashboard"])
 
 @router.get("/snapshot")
 async def get_snapshot(
-    role: str = Query("admin", description="User role: admin, agent, merchant"),
-    id: str = Query(None, description="Entity ID for filtered views"),
-    token: Optional[str] = Query(None, description="JWT token for authentication")
+    role: Optional[str] = Query(None, description="Narrow the view (admins only)"),
+    id: Optional[str] = Query(None, description="Entity ID (admins only)"),
+    principal: DashboardPrincipal = Depends(require_dashboard_principal),
 ) -> Dict[str, Any]:
-    """Get current metrics snapshot with optional role-based filtering and JWT authentication"""
+    """Current metrics snapshot, scoped to the authenticated caller.
+
+    Authentication used to run ONLY when a token happened to be supplied. With
+    none, `role` came straight off the query string and defaulted to "admin", so
+    an anonymous caller named its own authority and received the whole
+    platform's figures. Scope now comes from the credential.
+
+    `role`/`id` survive as a NARROWING filter for admins — the operator use case
+    of inspecting one merchant's slice is real — and are ignored for everybody
+    else, whose scope is already fixed by their token.
+    """
+    if principal.is_admin and (role or id):
+        effective_role, effective_id = (role or principal.role), id
+    else:
+        if role or id:
+            logger.info(
+                "ignoring caller-supplied scope for %s (role=%s)",
+                principal.sub, principal.role,
+            )
+        effective_role, effective_id = principal.role, principal.entity_id
+
     try:
-        # Authenticate if token provided
-        user_info = None
-        if token:
-            try:
-                user_info = verify_jwt_token(token)
-                logger.info(f"Authenticated user: {user_info['sub']} with role {user_info['role']}")
-                
-                # Override role and id with authenticated user's info
-                role = user_info["role"]
-                if user_info.get("entity_id"):
-                    id = user_info["entity_id"]
-                    
-            except HTTPException as e:
-                logger.warning(f"Authentication failed: {e.detail}")
-                raise HTTPException(status_code=401, detail="Invalid or expired token")
-        
-        metrics_store = get_metrics_store()
-        snapshot_data = snapshot(role=role, entity_id=id)
-        
-        logger.info(f"Generated snapshot for role={role}, id={id}")
-        return snapshot_data
-        
-    except HTTPException:
-        raise
+        return snapshot(role=effective_role, entity_id=effective_id)
     except Exception as e:
         logger.error(f"Failed to generate snapshot: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate snapshot: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate snapshot")
 
 @router.get("/recent-events")
 async def get_recent_events(
-    limit: int = Query(100, description="Number of recent events to return")
+    limit: int = Query(100, description="Number of recent events to return"),
+    principal: DashboardPrincipal = Depends(require_dashboard_admin),
 ) -> Dict[str, Any]:
-    """Get recent events for live feed"""
+    """Get recent events for live feed. Admin only.
+
+    Had no authentication at all. Raw events carry agent, merchant and PSP
+    identifiers with no role filtering anywhere in the path — there is no
+    scoped version of this to hand a merchant — so it is admin-only rather than
+    principal-scoped.
+    """
     try:
         metrics_store = get_metrics_store()
         events = metrics_store.get_recent_events(limit=limit)
@@ -75,8 +84,15 @@ async def get_recent_events(
         raise HTTPException(status_code=500, detail=f"Failed to get recent events: {str(e)}")
 
 @router.get("/connection-stats")
-async def get_connection_stats() -> Dict[str, Any]:
-    """Get WebSocket connection statistics"""
+async def get_connection_stats(
+    principal: DashboardPrincipal = Depends(require_dashboard_admin),
+) -> Dict[str, Any]:
+    """WebSocket connection statistics. Admin only.
+
+    Had no authentication. Also the readout an attacker would use to watch its
+    own progress against the ws_guard ceiling, which is why it is not merely
+    authenticated but restricted to admins.
+    """
     try:
         manager = get_connection_manager()
         
@@ -91,8 +107,15 @@ async def get_connection_stats() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Failed to get connection stats: {str(e)}")
 
 @router.post("/reset-metrics")
-async def reset_metrics() -> Dict[str, Any]:
-    """Reset all metrics (for testing purposes)"""
+async def reset_metrics(
+    principal: DashboardPrincipal = Depends(require_dashboard_admin),
+) -> Dict[str, Any]:
+    """Reset all metrics. Admin only.
+
+    The worst of the set: an unauthenticated MUTATION. Any anonymous caller
+    could wipe the store, which is both destructive and an easy way to erase
+    evidence of whatever else they had been doing.
+    """
     try:
         metrics_store = get_metrics_store()
         metrics_store.reset_metrics()
@@ -110,38 +133,34 @@ async def reset_metrics() -> Dict[str, Any]:
 
 @router.websocket("/ws/metrics")
 async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(None)):
-    """WebSocket endpoint for real-time metrics updates with JWT authentication.
+    """Real-time metrics for an authenticated caller.
 
-    "with JWT authentication" overstates it: `ConnectionManager.connect` accepts
-    the socket first and downgrades to an anonymous session when the token is
-    missing OR fails to decode, so reaching this handler needs no credential.
-    That is a separate question from this one and is left alone here; what
-    matters for slot exhaustion is that an anonymous caller can hold a Cloud Run
-    concurrency slot on this path exactly as it can on /api/ws/simple.
+    The docstring here used to say "with JWT authentication" and that was false
+    in both directions: ConnectionManager accepted the socket first and
+    downgraded a missing OR undecodable token to an anonymous viewer, and it
+    checked signatures against a hardcoded "your-secret-key" that no token this
+    system issues is signed with — so the token parameter had never once
+    authenticated anybody. Both halves are gone; utils.dashboard_auth resolves
+    one identity for this surface.
 
-    So the ceiling below is the same object /api/ws/simple reserves from, not a
-    second budget. A per-route ceiling would leave the attack intact — capping
-    one path while the other stays open just moves it, and two routes capped at
-    N each still add up to 2N held slots.
+    Authentication runs BEFORE the slot is reserved, and the ordering is the
+    fix rather than a detail. It closes the residual recorded in
+    realtime/ws_guard: while anonymous sockets could reserve, eight of them
+    parked here — the route with no idle deadline — held the shared ceiling and
+    refused the dashboard to everyone. An unauthenticated flood now never
+    reaches the ceiling, so the budget is spendable only by credential holders.
 
-    No idle deadline here, and that asymmetry is deliberate rather than an
-    oversight: unlike /api/ws/simple, this endpoint really is pushed to, so a
-    client that never sends is a legitimate listener rather than a squatter and
-    a deadline keyed on client messages would disconnect it. A deadline keyed on
-    traffic in EITHER direction would instead be reset by the very broadcasts it
-    was watching for. Either way the ceiling, not a deadline, bounds this path.
-
-    The live push path, traced rather than assumed (an earlier version of this
-    comment also cited main.py, which merely DEFINES a publish_event_to_ws
-    wrapper that nothing calls):
-    orchestrator/payment_orchestrator.py:149,173 -> utils/event_publisher.py ->
-    realtime/ws_manager.publish_event_to_ws -> _manager.broadcast(), unfiltered,
-    reachable via POST /api/payments/process.
-
-    The cost of that asymmetry is in realtime/ws_guard's RESIDUAL EXPOSURE note:
-    this is the route an attacker parks idle sockets on, because it is the one
-    nothing reclaims them from.
+    Still no idle deadline, for the unchanged reason: this endpoint really is
+    pushed to (payment_orchestrator -> utils/event_publisher ->
+    ws_manager.publish_event_to_ws), so a silent client is a legitimate listener.
+    Those pushes are now built per connection via broadcast_scoped — a single
+    unscoped snapshot fanned out to everyone would have made authenticating the
+    handshake pointless for exactly the data it protects.
     """
+    principal = await authenticate_websocket(websocket, token)
+    if principal is None:
+        return
+
     manager = get_connection_manager()
     connection_id = None
 
@@ -149,13 +168,12 @@ async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(N
         return
 
     try:
-        # Connect first, then authenticate
-        connection_id = await manager.connect(websocket, token)
-        if not connection_id:
-            return  # Connection was rejected
-        
-        # Send initial snapshot
-        initial_snapshot = snapshot()
+        connection_id = await manager.connect(websocket, principal)
+
+        # Send initial snapshot, scoped to this caller
+        initial_snapshot = snapshot(
+            role=principal.role, entity_id=principal.entity_id
+        )
         await manager.send_json(websocket, {
             "type": "snapshot",
             "data": initial_snapshot,
@@ -172,7 +190,9 @@ async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(N
                 
                 if data.get("type") == "snapshot_request":
                     # Client requested a fresh snapshot
-                    current_snapshot = snapshot()
+                    current_snapshot = snapshot(
+                        role=principal.role, entity_id=principal.entity_id
+                    )
                     await manager.send_json(websocket, {
                         "type": "snapshot",
                         "data": current_snapshot,

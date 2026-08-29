@@ -40,6 +40,18 @@ from realtime.ws_guard import (  # noqa: E402
     ws_admission,
 )
 from routes import dashboard_routes, simple_ws_routes  # noqa: E402
+from utils.auth import create_jwt_token  # noqa: E402
+
+
+def admin_url(path: str) -> str:
+    """Every socket here needs a real credential now.
+
+    Minted with the SAME issuer the app verifies against (utils.auth), not a
+    hand-rolled token or a monkeypatched gate — a fixture the gate would reject,
+    or a gate stubbed out to accept it, would make every assertion below vacuous
+    while still going green.
+    """
+    return f"{path}?token={create_jwt_token('ws-tests', 'admin')}"
 
 
 def wait_for_slots(expected: int, timeout: float = 2.0) -> None:
@@ -96,13 +108,13 @@ def client():
 def test_the_socket_that_would_exhaust_the_instance_is_refused(client, monkeypatch):
     monkeypatch.setenv("WS_MAX_CONNECTIONS", "2")
 
-    with client.websocket_connect("/api/ws/simple") as first:
+    with client.websocket_connect(admin_url("/api/ws/simple")) as first:
         first.receive_json()
-        with client.websocket_connect("/api/ws/simple") as second:
+        with client.websocket_connect(admin_url("/api/ws/simple")) as second:
             second.receive_json()
 
             with pytest.raises(WebSocketDisconnect) as refused:
-                with client.websocket_connect("/api/ws/simple"):
+                with client.websocket_connect(admin_url("/api/ws/simple")):
                     pass
 
     assert refused.value.code == WS_CLOSE_TRY_AGAIN_LATER
@@ -117,13 +129,13 @@ def test_the_ceiling_is_shared_across_every_websocket_route(client, monkeypatch)
     """
     monkeypatch.setenv("WS_MAX_CONNECTIONS", "2")
 
-    with client.websocket_connect("/api/ws/simple") as first:
+    with client.websocket_connect(admin_url("/api/ws/simple")) as first:
         first.receive_json()
-        with client.websocket_connect("/api/ws/simple") as second:
+        with client.websocket_connect(admin_url("/api/ws/simple")) as second:
             second.receive_json()
 
             with pytest.raises(WebSocketDisconnect) as refused:
-                with client.websocket_connect("/api/ws/metrics"):
+                with client.websocket_connect(admin_url("/api/ws/metrics")):
                     pass
 
     assert refused.value.code == WS_CLOSE_TRY_AGAIN_LATER
@@ -144,7 +156,7 @@ def test_the_metrics_route_returns_its_slot_too(client):
     manager = dashboard_routes.get_connection_manager()
 
     for _ in range(3):
-        with client.websocket_connect("/api/ws/metrics") as ws:
+        with client.websocket_connect(admin_url("/api/ws/metrics")) as ws:
             assert ws.receive_json()["type"] == "snapshot"
         wait_for_slots(0)
 
@@ -156,11 +168,11 @@ def test_a_closed_socket_returns_its_slot(client, monkeypatch):
     monkeypatch.setenv("WS_MAX_CONNECTIONS", "1")
 
     for _ in range(3):
-        with client.websocket_connect("/api/ws/simple") as ws:
+        with client.websocket_connect(admin_url("/api/ws/simple")) as ws:
             ws.receive_json()
         wait_for_slots(0)
 
-    with client.websocket_connect("/api/ws/simple") as ws:
+    with client.websocket_connect(admin_url("/api/ws/simple")) as ws:
         ws.receive_json()
 
 
@@ -173,10 +185,10 @@ def test_the_refusal_is_distinguishable_in_the_log(client, monkeypatch, caplog):
     monkeypatch.setenv("WS_MAX_CONNECTIONS", "1")
 
     with caplog.at_level("WARNING", logger="ws_guard"):
-        with client.websocket_connect("/api/ws/simple") as ws:
+        with client.websocket_connect(admin_url("/api/ws/simple")) as ws:
             ws.receive_json()
             with pytest.raises(WebSocketDisconnect):
-                with client.websocket_connect("/api/ws/simple"):
+                with client.websocket_connect(admin_url("/api/ws/simple")):
                     pass
 
     line = "\n".join(r.getMessage() for r in caplog.records)
@@ -196,7 +208,10 @@ def test_the_ceiling_is_not_published_to_callers(client):
 
     middleware/rate_limiter withholds its thresholds for the same reason.
     """
-    body = client.get("/api/ws/status").json()
+    body = client.get(
+        "/api/ws/status",
+        headers={"Authorization": f"Bearer {create_jwt_token('ws-tests', 'admin')}"},
+    ).json()
     assert set(body) == {"active_connections", "timestamp"}, (
         "a new key here is how the ceiling leaks; add it deliberately or not at all"
     )
@@ -212,10 +227,15 @@ class _FakeWebSocket:
     starlette.websockets.WebSocket with these signatures.
     """
 
-    def __init__(self, on_receive):
+    def __init__(self, on_receive, token=None):
         self._on_receive = on_receive
         self.sent: list = []
         self.closed_with = None
+        # Real starlette WebSockets expose .headers; authenticate_websocket
+        # reads Authorization and X-ADMIN-KEY off it. Nothing invented.
+        self.headers = {
+            "authorization": f"Bearer {token or create_jwt_token('ws-tests', 'admin')}"
+        }
 
     async def accept(self) -> None:
         return None
@@ -270,7 +290,7 @@ def test_ping_gets_a_pong(client, monkeypatch):
     """
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "5")
 
-    with client.websocket_connect("/api/ws/simple") as ws:
+    with client.websocket_connect(admin_url("/api/ws/simple")) as ws:
         ws.receive_json()
         for _ in range(3):
             ws.send_json({"type": "ping"})
@@ -288,7 +308,7 @@ def test_a_client_that_obeys_the_published_interval_survives(client, monkeypatch
     """
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "2")
 
-    with client.websocket_connect("/api/ws/simple") as ws:
+    with client.websocket_connect(admin_url("/api/ws/simple")) as ws:
         hello = ws.receive_json()
         interval = hello["keepalive_seconds"]
         assert interval < hello["idle_timeout_seconds"], (

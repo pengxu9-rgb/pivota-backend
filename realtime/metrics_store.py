@@ -11,6 +11,12 @@ import logging
 
 logger = logging.getLogger("metrics_store")
 
+# Roles that see the whole platform rather than their own slice. Defined HERE,
+# next to the filtering it governs, and imported by utils.dashboard_auth rather
+# than the other way round: this module holds pure counters and must not acquire
+# a dependency on JWT decoding and settings just to name its own vocabulary.
+PLATFORM_WIDE_ROLES = frozenset({"admin", "super_admin", "operator", "viewer"})
+
 class MetricsStore:
     """Real-time metrics store with rolling windows and snapshots"""
     
@@ -146,8 +152,15 @@ class MetricsStore:
         while self.events and self.events[0]["recorded_at"] < cutoff_time:
             self.events.popleft()
 
-    def get_snapshot(self, role: str = "admin", entity_id: Optional[str] = None) -> Dict[str, Any]:
-        """Generate a snapshot of current metrics with optional filtering"""
+    def get_snapshot(self, role: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
+        """Generate a snapshot of current metrics, scoped to `role`.
+
+        `role` is REQUIRED and has no default. It used to default to "admin",
+        and every caller took that default, which is how an anonymous request
+        ended up receiving the whole platform's figures. A caller that has not
+        decided whose data this is must fail loudly here rather than quietly
+        receive everything.
+        """
         
         # Calculate average latencies
         def calc_avg_latency(samples):
@@ -194,7 +207,7 @@ class MetricsStore:
         # Apply role-based filtering
         filtered_summary = self.counters.copy()
         
-        if role in ["admin", "operator", "viewer"]:
+        if role in PLATFORM_WIDE_ROLES:
             # Admin, operator, and viewer see full system data
             pass
         elif role == "agent" and entity_id:
@@ -226,6 +239,21 @@ class MetricsStore:
             else:
                 filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
         
+        if role not in PLATFORM_WIDE_ROLES:
+            # The branch above narrows agent_data or merchant_data, and NOTHING
+            # ever narrowed these two — so a merchant-scoped snapshot still
+            # carried every PSP's volumes, latencies and routing mix. PSP figures
+            # are platform-level: they describe our processors, not the caller's
+            # own traffic, so a scoped caller gets none of them rather than a
+            # filtered view of them.
+            psp_data = {}
+            psp_usage_data = {}
+            if role not in ("agent", "merchant"):
+                # An unrecognised role is not a licence to see the totals.
+                agent_data = {}
+                merchant_data = {}
+                filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
+
         snapshot = {
             "summary": filtered_summary,
             "psp": psp_data,
@@ -264,6 +292,9 @@ def record_event(event: Dict[str, Any]) -> None:
     """Record an event in the global metrics store"""
     _metrics_store.record_event(event)
 
-def snapshot(role: str = "admin", entity_id: Optional[str] = None) -> Dict[str, Any]:
-    """Generate a snapshot from the global metrics store"""
+def snapshot(role: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
+    """Generate a snapshot from the global metrics store, scoped to `role`.
+
+    No default role — see MetricsStore.get_snapshot.
+    """
     return _metrics_store.get_snapshot(role, entity_id)

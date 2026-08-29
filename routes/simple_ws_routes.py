@@ -6,8 +6,14 @@ Basic WebSocket without complex authentication
 import json
 import logging
 import time
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from typing import Optional
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from realtime.metrics_store import snapshot
+from utils.dashboard_auth import (
+    DashboardPrincipal,
+    authenticate_websocket,
+    require_dashboard_admin,
+)
 from realtime.ws_guard import (
     WS_CLOSE_IDLE_TIMEOUT,
     WebSocketIdleTimeout,
@@ -53,13 +59,19 @@ class SimpleConnectionManager:
 simple_manager = SimpleConnectionManager()
 
 @router.websocket("/ws/simple")
-async def simple_websocket(websocket: WebSocket):
-    """Simple WebSocket endpoint without authentication.
+async def simple_websocket(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """Metrics WebSocket, authenticated and scoped to the caller.
 
-    Unauthenticated, so the only thing standing between an anonymous caller and
-    every concurrency slot on the instance is `ws_admission` (a process-wide
-    ceiling) and the idle deadline below. See `realtime/ws_guard` for what each
-    of those does and does not buy.
+    Was "without authentication", and served `snapshot()` on its admin default,
+    so any anonymous socket received per-PSP, per-agent and per-merchant volumes
+    and latencies. It now resolves an identity through utils.dashboard_auth
+    before the socket is accepted, like /api/ws/metrics, and every snapshot it
+    sends is scoped to that identity.
+
+    Authentication runs BEFORE the ceiling is touched, so an unauthenticated
+    flood cannot spend the shared budget. `ws_admission` and the idle deadline
+    now bound what an authenticated caller can hold, which is a much smaller
+    threat than the anonymous one they used to be the only defence against.
 
     The idle deadline is safe to apply here specifically because this endpoint
     never pushes: `simple_manager.broadcast` has no callers, so a client that
@@ -67,6 +79,10 @@ async def simple_websocket(websocket: WebSocket):
     holding a slot for no one's benefit. `/api/ws/metrics` is not in that
     position — see the note on it in routes/dashboard_routes.py.
     """
+    principal = await authenticate_websocket(websocket, token)
+    if principal is None:
+        return
+
     if not await ws_admission.reserve(websocket):
         return
 
@@ -79,7 +95,9 @@ async def simple_websocket(websocket: WebSocket):
         # nothing: a client that pings exactly that often always arrives late
         # and is dropped every time. keepalive_seconds is the interval to send
         # on; idle_timeout_seconds is when we give up.
-        initial_snapshot = snapshot()
+        initial_snapshot = snapshot(
+            role=principal.role, entity_id=principal.entity_id
+        )
         await simple_manager.send_json(websocket, {
             "type": "snapshot",
             "data": initial_snapshot,
@@ -96,7 +114,9 @@ async def simple_websocket(websocket: WebSocket):
                 
                 if data.get("type") == "snapshot_request":
                     # Send fresh snapshot
-                    current_snapshot = snapshot()
+                    current_snapshot = snapshot(
+                        role=principal.role, entity_id=principal.entity_id
+                    )
                     await simple_manager.send_json(websocket, {
                         "type": "snapshot",
                         "data": current_snapshot,
@@ -148,8 +168,16 @@ async def simple_websocket(websocket: WebSocket):
         ws_admission.release()
 
 @router.get("/ws/status")
-async def websocket_status():
-    """Get WebSocket connection status"""
+async def websocket_status(
+    principal: DashboardPrincipal = Depends(require_dashboard_admin),
+):
+    """WebSocket connection status. Admin only.
+
+    Had no authentication. A bare count leaks little on its own, but it is the
+    readout an attacker uses to watch its own sockets accumulate against the
+    ws_guard ceiling, and its sibling /api/connection-stats is admin-only for
+    the same reason.
+    """
     return {
         "active_connections": len(simple_manager.active_connections),
         "timestamp": time.time()
