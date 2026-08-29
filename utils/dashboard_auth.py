@@ -110,6 +110,21 @@ WS_CLOSE_POLICY_VIOLATION = 1008
 # Roles that may reset the store or read connection internals.
 ADMIN_ROLES = frozenset({"admin", "super_admin"})
 
+# Roles that describe ONE tenant and are meaningless without naming it.
+SCOPED_ROLES = frozenset({"agent", "merchant"})
+
+# The claim each issuer actually emits for the tenant id, per role. There is no
+# `entity_id` claim anywhere in this system despite the name being used
+# internally: utils.auth.create_jwt_token writes `merchant_id`/`agent_id`
+# (utils/auth.py:583-589) and routes/auth_routes.py writes `merchant_id` at
+# login (:304). Reading `entity_id` — which is what this module did first —
+# resolved every scoped token to None, and under the store's old fall-through
+# that meant such a caller saw EVERYTHING.
+_TENANT_CLAIMS = {
+    "merchant": ("merchant_id", "entity_id"),
+    "agent": ("agent_id", "entity_id"),
+}
+
 
 @dataclass(frozen=True)
 class DashboardPrincipal:
@@ -161,12 +176,21 @@ def _principal_from_token(token: str) -> DashboardPrincipal:
     if not subject:
         raise DashboardAuthError("token carries no subject")
 
-    entity_id = payload.get("entity_id")
-    return DashboardPrincipal(
-        sub=subject,
-        role=role,
-        entity_id=str(entity_id) if entity_id else None,
-    )
+    entity_id = None
+    for claim in _TENANT_CLAIMS.get(role, ("entity_id",)):
+        value = payload.get(claim)
+        if value:
+            entity_id = str(value)
+            break
+
+    if role in SCOPED_ROLES and not entity_id:
+        # A scoped role that does not say WHICH tenant cannot be authorized.
+        # Refused here rather than allowed through as a principal that happens
+        # to see nothing: the store's filter also returns nothing for this case,
+        # but the two layers must not depend on each other to be safe.
+        raise DashboardAuthError(f"{role} token names no tenant")
+
+    return DashboardPrincipal(sub=subject, role=role, entity_id=entity_id)
 
 
 def resolve_principal(

@@ -204,55 +204,56 @@ class MetricsStore:
         # Build PSP usage
         psp_usage_data = dict(self.psp_usage)
         
-        # Apply role-based filtering
-        filtered_summary = self.counters.copy()
-        
+        # Apply role-based filtering.
+        #
+        # Rewritten as one exhaustive decision rather than an if/elif chain with
+        # a fall-through, because the fall-through was a hole: the old
+        # `elif role == "agent" and entity_id:` simply did not match when the
+        # token carried no entity_id, and execution fell past every branch with
+        # all three datasets and the platform totals still intact. A `merchant`
+        # token with the entity_id claim OMITTED therefore saw everything — the
+        # same shape as the "no role claim means admin" bug, escalation by
+        # leaving a claim out. Every path below now assigns.
+        #
+        # The other half: each old branch narrowed only its OWN dimension and
+        # left the other whole, so a scoped agent still received every merchant
+        # and a scoped merchant still received every agent. Cross-tenant, and it
+        # did not matter while nothing was authenticated; it matters now that
+        # this filter is what authorization rests on.
+        empty_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
+
+        def _summary_from(metrics: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "total": metrics.get("total", 0),
+                "success": metrics.get("success_count", 0),
+                "fail": metrics.get("fail_count", 0),
+                "retries": metrics.get("retry_count", 0),
+            }
+
         if role in PLATFORM_WIDE_ROLES:
-            # Admin, operator, and viewer see full system data
-            pass
-        elif role == "agent" and entity_id:
-            # Filter to only show data for this agent
-            agent_data = {entity_id: agent_data.get(entity_id, {})}
-            # Calculate filtered summary for this agent
-            if entity_id in agent_data:
-                agent_metrics = agent_data[entity_id]
-                filtered_summary = {
-                    "total": agent_metrics.get("total", 0),
-                    "success": agent_metrics.get("success_count", 0),
-                    "fail": agent_metrics.get("fail_count", 0),
-                    "retries": agent_metrics.get("retry_count", 0)
-                }
-            else:
-                filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
-        elif role == "merchant" and entity_id:
-            # Filter to only show data for this merchant
-            merchant_data = {entity_id: merchant_data.get(entity_id, {})}
-            # Calculate filtered summary for this merchant
-            if entity_id in merchant_data:
-                merchant_metrics = merchant_data[entity_id]
-                filtered_summary = {
-                    "total": merchant_metrics.get("total", 0),
-                    "success": merchant_metrics.get("success_count", 0),
-                    "fail": merchant_metrics.get("fail_count", 0),
-                    "retries": merchant_metrics.get("retry_count", 0)
-                }
-            else:
-                filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
-        
-        if role not in PLATFORM_WIDE_ROLES:
-            # The branch above narrows agent_data or merchant_data, and NOTHING
-            # ever narrowed these two — so a merchant-scoped snapshot still
-            # carried every PSP's volumes, latencies and routing mix. PSP figures
-            # are platform-level: they describe our processors, not the caller's
-            # own traffic, so a scoped caller gets none of them rather than a
-            # filtered view of them.
+            # Admin, operator and viewer see full system data.
+            filtered_summary = self.counters.copy()
+        elif role in ("agent", "merchant") and entity_id:
+            own = agent_data if role == "agent" else merchant_data
+            mine = own.get(entity_id, {})
+            filtered_summary = _summary_from(mine) if mine else dict(empty_summary)
+            # Your own row, nothing from the other dimension, and no
+            # platform-level PSP figures: those describe our processors rather
+            # than the caller's traffic, so a scoped caller gets none of them
+            # rather than a filtered view of them.
+            agent_data = {entity_id: mine} if role == "agent" else {}
+            merchant_data = {entity_id: mine} if role == "merchant" else {}
             psp_data = {}
             psp_usage_data = {}
-            if role not in ("agent", "merchant"):
-                # An unrecognised role is not a licence to see the totals.
-                agent_data = {}
-                merchant_data = {}
-                filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
+        else:
+            # Everything else — an unrecognised role, or a scoped role whose
+            # token carries no entity_id, which is unscopeable rather than
+            # unlimited.
+            filtered_summary = dict(empty_summary)
+            agent_data = {}
+            merchant_data = {}
+            psp_data = {}
+            psp_usage_data = {}
 
         snapshot = {
             "summary": filtered_summary,

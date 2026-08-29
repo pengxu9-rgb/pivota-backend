@@ -146,16 +146,18 @@ def test_an_anonymous_socket_never_spends_the_ceiling(client, path, monkeypatch)
 # --- the credential decides the scope, not the caller ------------------------
 
 def test_a_merchant_cannot_ask_for_admin_scope(client):
-    seed_one_event()
+    seed_two_tenants()
 
     body = client.get(
-        "/api/snapshot?role=admin&id=someone_else",
+        "/api/snapshot?role=admin&id=merchant_b",
         headers=bearer(role="merchant", entity_id="merchant_a"),
     ).json()
 
     assert body["psp"] == {}, "a merchant was handed platform PSP figures"
     assert body["psp_usage"] == {}
-    assert set(body["merchant"]) == {"merchant_a"}
+    assert set(body["merchant"]) == {"merchant_a"}, "a merchant reached another tenant"
+    assert body["agent"] == {}
+    assert body["summary"]["total"] == 1  # its own row only, not the platform's 2
 
 
 def test_an_admin_may_still_narrow_the_view(client):
@@ -181,7 +183,12 @@ def test_a_token_with_no_role_is_rejected_not_defaulted():
 
 def test_reset_metrics_is_admin_only(client):
     seed_one_event()
-    assert client.post("/api/reset-metrics", headers=bearer(role="merchant")).status_code == 403
+    # A FULLY VALID merchant — tenant claim and all — so this proves the admin
+    # check rejects it, not merely that authentication did. Without the tenant
+    # it 401s at the resolver and never reaches the authorization it is testing.
+    assert client.post(
+        "/api/reset-metrics", headers=bearer(role="merchant", entity_id="merchant_a")
+    ).status_code == 403
     assert metrics_store.get_metrics_store().counters["total"] == 1
 
     assert client.post("/api/reset-metrics", headers=bearer(role="admin")).status_code == 200
@@ -277,6 +284,65 @@ def test_the_snapshot_has_no_default_role():
         metrics_store.snapshot()
 
 
+def seed_two_tenants():
+    store = metrics_store.get_metrics_store()
+    for suffix in ("a", "b"):
+        store.record_event(
+            {
+                "type": "payment",
+                "status": "succeeded",
+                "psp": "stripe",
+                "agent": f"agent_{suffix}",
+                "merchant": f"merchant_{suffix}",
+                "latency_ms": 5,
+            }
+        )
+
+
+@pytest.mark.parametrize("role", ["agent", "merchant"])
+def test_a_scoped_role_with_no_entity_id_sees_nothing(role):
+    """Escalation by OMITTING a claim — the same shape as "no role means admin".
+
+    The old filter read `elif role == "agent" and entity_id:`, which simply did
+    not match when the token carried no entity_id. Execution fell past every
+    branch with all three datasets and the platform totals intact, so a
+    `merchant` token minted without an entity_id claim saw everything. Being
+    unscopeable must mean nothing, not unlimited.
+    """
+    seed_two_tenants()
+    body = metrics_store.snapshot(role=role, entity_id=None)
+    assert body["agent"] == {}
+    assert body["merchant"] == {}
+    assert body["psp"] == {}
+    assert body["summary"] == {"total": 0, "success": 0, "fail": 0, "retries": 0}
+
+
+def test_a_scoped_agent_sees_no_other_tenant():
+    """Each old branch narrowed only its OWN dimension and left the other whole,
+    so a scoped agent received every merchant and vice versa. Cross-tenant."""
+    seed_two_tenants()
+
+    agent = metrics_store.snapshot(role="agent", entity_id="agent_a")
+    assert set(agent["agent"]) == {"agent_a"}
+    assert agent["merchant"] == {}, "an agent was handed every merchant"
+    assert agent["summary"]["total"] == 1
+
+    merchant = metrics_store.snapshot(role="merchant", entity_id="merchant_a")
+    assert set(merchant["merchant"]) == {"merchant_a"}
+    assert merchant["agent"] == {}, "a merchant was handed every agent"
+    assert merchant["summary"]["total"] == 1
+
+
+def test_a_scoped_role_over_http_cannot_reach_another_tenant(client):
+    seed_two_tenants()
+    body = client.get(
+        "/api/snapshot", headers=bearer(role="merchant", entity_id="merchant_a")
+    ).json()
+    assert set(body["merchant"]) == {"merchant_a"}
+    assert body["agent"] == {}
+    assert body["psp"] == {}
+
+
 def test_an_unrecognised_role_receives_nothing():
     seed_one_event()
     body = metrics_store.snapshot(role="not-a-real-role")
@@ -343,3 +409,35 @@ def test_secret_strength_rules(monkeypatch, secret, trustworthy):
 
     monkeypatch.setattr(dashboard_auth, "JWT_SECRET", secret)
     assert dashboard_auth._jwt_secret_is_trustworthy() is trustworthy
+
+
+# --- the resolver must read the claims the issuers actually emit -------------
+
+@pytest.mark.parametrize(
+    "role,claim,tenant",
+    [("merchant", "merchant_id", "merchant_a"), ("agent", "agent_id", "agent_a")],
+)
+def test_the_tenant_id_is_read_from_the_claim_the_issuer_writes(role, claim, tenant):
+    """There is no `entity_id` claim anywhere in this system.
+
+    utils.auth.create_jwt_token writes merchant_id/agent_id, and
+    routes/auth_routes.py writes merchant_id at login. Reading `entity_id` — the
+    name used internally — resolved EVERY scoped token to None, and under the
+    store's old fall-through a caller with no tenant id saw everything. Minted
+    through the real issuer here, not hand-rolled, so the claim shape under test
+    is the one production emits.
+    """
+    principal = resolve_principal(token=create_jwt_token("u", role, tenant))
+    assert principal.entity_id == tenant
+
+    decoded = jwt.decode(create_jwt_token("u", role, tenant), JWT_SECRET, algorithms=["HS256"])
+    assert claim in decoded and "entity_id" not in decoded
+
+
+@pytest.mark.parametrize("role", ["merchant", "agent"])
+def test_a_scoped_token_naming_no_tenant_is_refused(role):
+    """Defence in depth: the store also returns nothing for this, but the two
+    layers must not rely on each other to be safe."""
+    naked = jwt.encode({"sub": "u", "role": role}, JWT_SECRET, algorithm="HS256")
+    with pytest.raises(DashboardAuthError):
+        resolve_principal(token=naked)
