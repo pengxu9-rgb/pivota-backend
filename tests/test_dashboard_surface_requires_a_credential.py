@@ -47,12 +47,32 @@ ABANDONED_WS_SECRET = "your-secret-key"
 
 @pytest.fixture(autouse=True)
 def _clean_state():
+    """Reset on setup AND restore on teardown.
+
+    Cleaning only on setup was not enough, because a test here REPLACES the
+    process-global manager's dicts with fakes rather than mutating them. The
+    residue then survived until whichever test happened to run next in this
+    module, and leaked across files: running the broadcast test immediately
+    before the sibling file's metrics-slot test produced `assert 2 == 0` from
+    two `_Recorder` objects that were never real connections. Reachable with
+    -k, --lf, a --deselect, or any reordering. The sibling file's fixture
+    asserts on teardown for exactly this reason; this one adopted the reset and
+    not the teardown.
+    """
+    manager = ws_manager.get_connection_manager()
+    original = (manager.active_connections, manager.connection_metadata)
+
     ws_admission._active = 0
     simple_ws_routes.simple_manager.active_connections.clear()
-    ws_manager.get_connection_manager().active_connections.clear()
-    ws_manager.get_connection_manager().connection_metadata.clear()
+    manager.active_connections = {}
+    manager.connection_metadata = {}
     metrics_store.get_metrics_store().reset_metrics()
     yield
+    manager.active_connections, manager.connection_metadata = original
+    manager.active_connections.clear()
+    manager.connection_metadata.clear()
+    simple_ws_routes.simple_manager.active_connections.clear()
+    ws_admission._active = 0
 
 
 @pytest.fixture()
@@ -62,6 +82,45 @@ def client():
     app.include_router(dashboard_routes.router)
     with TestClient(app) as test_client:
         yield test_client
+
+
+def connect_bounded(client, path, timeout: float = 15.0):
+    """Open a socket with a wall-clock bound, and re-raise whatever it raised.
+
+    An unbounded `websocket_connect` does not FAIL when the refusal path stops
+    closing the socket — it BLOCKS, so `backend-test-sweep` reports a 15-minute
+    job timeout instead of a named failure. Verified: deleting the
+    `await websocket.close(...)` from authenticate_websocket hung this file past
+    420s. The sibling file designs around the same trap for its idle test; these
+    need it too.
+    """
+    import threading
+
+    box: dict = {}
+
+    def _open():
+        try:
+            with client.websocket_connect(path):
+                box["ok"] = "accepted"
+        except BaseException as exc:  # re-raised on the calling thread below
+            box["err"] = exc
+
+    # A DAEMON thread, deliberately. The obvious ThreadPoolExecutor version does
+    # not work: `result(timeout=...)` returns control, but `__exit__` calls
+    # shutdown(wait=True) and joins the still-blocked worker forever, so the
+    # bound silently does nothing. A non-daemon thread has the same problem at
+    # interpreter exit. This one can simply be abandoned.
+    worker = threading.Thread(target=_open, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise AssertionError(
+            f"websocket_connect({path!r}) did not settle in {timeout}s — the "
+            "refusal path is blocking rather than closing the socket"
+        )
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
 
 
 def bearer(role="admin", sub="tester", entity_id=None):
@@ -115,8 +174,7 @@ def test_no_dashboard_path_answers_without_a_credential(client, method, path):
 @pytest.mark.parametrize("path", ["/api/ws/simple", "/api/ws/metrics"])
 def test_no_websocket_accepts_an_anonymous_socket(client, path):
     with pytest.raises(WebSocketDisconnect) as refused:
-        with client.websocket_connect(path):
-            pass
+        connect_bounded(client, path)
     assert refused.value.code == WS_CLOSE_POLICY_VIOLATION
 
 
@@ -132,8 +190,7 @@ def test_an_anonymous_socket_never_spends_the_ceiling(client, path, monkeypatch)
 
     for _ in range(5):
         with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect(path):
-                pass
+            connect_bounded(client, path)
         assert ws_admission.active == 0
 
     # and the budget is still fully available to a real caller
@@ -163,7 +220,7 @@ def test_a_merchant_cannot_ask_for_admin_scope(client):
 
 def test_an_admin_may_still_narrow_the_view(client):
     """The operator use case survives — scope narrows, it does not escalate."""
-    seed_one_event()
+    seed_two_tenants()
 
     body = client.get(
         "/api/snapshot?role=merchant&id=merchant_a", headers=bearer(role="admin")
@@ -204,8 +261,7 @@ def test_a_token_forged_with_the_abandoned_ws_secret_is_refused(client):
         {"sub": "attacker", "role": "admin"}, ABANDONED_WS_SECRET, algorithm="HS256"
     )
     with pytest.raises(WebSocketDisconnect) as refused:
-        with client.websocket_connect(f"/api/ws/metrics?token={forged}"):
-            pass
+        connect_bounded(client, f"/api/ws/metrics?token={forged}")
     assert refused.value.code == WS_CLOSE_POLICY_VIOLATION
 
 
@@ -226,12 +282,13 @@ def test_a_genuinely_issued_token_is_accepted_on_the_socket(client):
 
 
 def test_the_socket_snapshot_is_scoped_to_the_token(client):
-    seed_one_event()
+    seed_two_tenants()  # two, so this can tell narrowed from "all of the one"
     token = create_jwt_token("m", "merchant", "merchant_a")
     with client.websocket_connect(f"/api/ws/simple?token={token}") as ws:
         payload = ws.receive_json()["data"]
     assert payload["psp"] == {}
     assert set(payload["merchant"]) == {"merchant_a"}
+    assert payload["agent"] == {}, "the other dimension was left whole"
 
 
 # --- pushed data is scoped too, or the handshake check bought nothing --------
@@ -254,12 +311,20 @@ async def test_a_broadcast_is_built_per_connection():
 
             sent[self.name] = json.loads(data)
 
+    seed_two_tenants()  # so "narrowed" is distinguishable from "all of the one"
+
     manager = ws_manager.get_connection_manager()
     manager.active_connections = {"a": _Recorder("admin"), "m": _Recorder("merchant")}
     manager.connection_metadata = {
         "a": {"user_info": {"user_id": "a", "role": "admin", "entity_id": None}},
         "m": {"user_info": {"user_id": "m", "role": "merchant", "entity_id": "merchant_a"}},
+        # No user_info at all. Reachable in production — see
+        # test_a_connection_id_collision_cannot_evict_a_live_socket — and the
+        # fail-closed `.get("role", "")` default that covers it was otherwise
+        # never exercised, because every other case here supplies a full one.
+        "orphan": {},
     }
+    manager.active_connections["orphan"] = _Recorder("orphan")
 
     await ws_manager.publish_event_to_ws(
         {
@@ -275,6 +340,11 @@ async def test_a_broadcast_is_built_per_connection():
     assert "stripe" in sent["admin"]["snapshot"]["psp"]
     assert sent["merchant"]["snapshot"]["psp"] == {}
     assert set(sent["merchant"]["snapshot"]["merchant"]) == {"merchant_a"}
+    assert sent["merchant"]["snapshot"]["agent"] == {}, "other dimension left whole"
+
+    orphan = sent["orphan"]["snapshot"]
+    assert orphan["psp"] == orphan["agent"] == orphan["merchant"] == {}
+    assert orphan["summary"]["total"] == 0
 
 
 # --- the store itself refuses to guess --------------------------------------
@@ -562,3 +632,148 @@ def test_a_query_string_token_is_no_longer_accepted_over_http(client):
 
     with client.websocket_connect(f"/api/ws/simple?token={token}") as ws:
         assert ws.receive_json()["type"] == "snapshot"
+
+
+
+# --- findings from the coverage review of 4d35f860 --------------------------
+
+def test_the_guard_fires_on_staging_too_not_only_production(monkeypatch):
+    """The disjunct audit: neither half was proven necessary.
+
+    Every other test here sets only K_SERVICE, and config/platform.py fails
+    CLOSED to production on any Cloud Run marker — so under that one env both
+    is_deployed() and is_production() are True and either disjunct alone passes
+    the suite. Staging is the separating case, and the one the docstring argues
+    the `or` exists for: deployed, but explicitly not production.
+    """
+    from config import platform
+    from utils import dashboard_auth
+
+    monkeypatch.setattr(_auth, "JWT_SECRET", "your-super-secret-key")
+    monkeypatch.setenv("K_SERVICE", "pivota-backend")
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    platform.reset_platform_state()
+    try:
+        assert platform.is_deployed() is True
+        assert platform.is_production() is False, "not the separating case"
+        assert dashboard_auth._refuse_forgeable_tokens() is True
+    finally:
+        platform.reset_platform_state()
+
+
+def test_a_local_host_with_a_weak_secret_is_left_alone(monkeypatch):
+    """The other half of the disjunct audit: a laptop must NOT be refused."""
+    from config import platform
+    from utils import dashboard_auth
+
+    monkeypatch.setattr(_auth, "JWT_SECRET", "your-super-secret-key")
+    for marker in ("K_SERVICE", "K_REVISION", "K_CONFIGURATION", "PIVOTA_ENV"):
+        monkeypatch.delenv(marker, raising=False)
+    platform.reset_platform_state()
+    try:
+        assert platform.is_deployed() is False and platform.is_production() is False
+        assert dashboard_auth._refuse_forgeable_tokens() is False
+    finally:
+        platform.reset_platform_state()
+
+
+def test_the_method_has_no_default_role_either():
+    """`snapshot()` was pinned; `MetricsStore.get_snapshot` was not — and it is
+    the one routes/operations_routes.py calls, so it could silently regain
+    role="admin" with the suite green."""
+    with pytest.raises(TypeError):
+        metrics_store.get_metrics_store().get_snapshot()
+
+
+async def test_a_connection_id_collision_cannot_evict_a_live_socket():
+    """Two sockets opened in the same millisecond used to collide on
+    `conn_<ms>`: the second overwrote the first in active_connections, so the
+    first stopped receiving broadcasts and its disconnect() became a no-op,
+    leaking the entry. Mass reconnects are exactly when that happens, and
+    reverting the monotonic counter passed the entire suite."""
+    from utils.dashboard_auth import DashboardPrincipal
+
+    manager = ws_manager.ConnectionManager()
+
+    class _Socket:
+        async def accept(self):
+            return None
+
+    ids = [await manager.connect(_Socket(), DashboardPrincipal("u", "admin")) for _ in range(50)]
+    assert len(set(ids)) == 50, "ids collided; a live socket was evicted"
+    assert manager.get_connection_count() == 50
+
+
+def test_an_unset_admin_key_never_matches(monkeypatch):
+    """The invariant _admin_key_matches' own docstring states — "an unset key
+    must never match an unset header — otherwise the entire surface opens up" —
+    was enforced only by the caller's `if admin_key` short-circuit, in a
+    different function. Two layers must not depend on each other to be safe."""
+    from utils.dashboard_auth import _admin_key_matches
+
+    for name in ("ADMIN_API_KEY", "PROMOTIONS_ADMIN_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    assert _admin_key_matches("") is False
+    assert _admin_key_matches("anything") is False
+
+    monkeypatch.setenv("ADMIN_API_KEY", "   ")  # whitespace-only strips to empty
+    assert _admin_key_matches("") is False
+    assert _admin_key_matches("   ") is False
+
+
+def test_the_guard_fires_on_production_without_platform_markers(monkeypatch):
+    """The OTHER separating case, without which `is_deployed()` alone passes.
+
+    config/platform.py documents these as independent, not nested:
+    PIVOTA_ENV=production on an unmanaged host is is_production()=True with
+    is_deployed()=False. The staging test covers the converse. Both are needed
+    or the `or` is decoration.
+    """
+    from config import platform
+    from utils import dashboard_auth
+
+    monkeypatch.setattr(_auth, "JWT_SECRET", "your-super-secret-key")
+    for marker in ("K_SERVICE", "K_REVISION", "K_CONFIGURATION", "RAILWAY_ENVIRONMENT"):
+        monkeypatch.delenv(marker, raising=False)
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    platform.reset_platform_state()
+    try:
+        assert platform.is_deployed() is False, "not the separating case"
+        assert platform.is_production() is True
+        assert dashboard_auth._refuse_forgeable_tokens() is True
+    finally:
+        platform.reset_platform_state()
+
+
+def test_the_operations_dashboard_gives_a_roleless_token_nothing():
+    """The fifth path to the same store, and it had no test at all.
+
+    routes/operations_routes.py read `credentials.get("role") or "operator"`,
+    and "operator" is platform-wide — so a token carrying no role claim received
+    the WHOLE platform from a route this PR touched. Exactly the default this
+    change exists to abolish, re-introduced by the line meant to fix it.
+    """
+    from fastapi import FastAPI
+    from routes import operations_routes
+
+    seed_two_tenants()
+    app = FastAPI()
+    app.include_router(operations_routes.router)
+
+    with TestClient(app) as ops:
+        roleless = jwt.encode({"sub": "someone"}, JWT_SECRET, algorithm="HS256")
+        body = ops.get(f"/api/operations/dashboard-summary?token={roleless}").json()
+        assert body["system_health"]["total_transactions"] == 0, (
+            "a role-less token was handed the whole platform"
+        )
+
+        admin = ops.get(
+            f"/api/operations/dashboard-summary?token={create_jwt_token('op', 'admin')}"
+        ).json()
+        assert admin["system_health"]["total_transactions"] == 2
+
+        # employee is platform-wide per utils/auth.py's own permission map
+        employee = ops.get(
+            f"/api/operations/dashboard-summary?token={create_jwt_token('e', 'employee')}"
+        ).json()
+        assert employee["system_health"]["total_transactions"] == 2

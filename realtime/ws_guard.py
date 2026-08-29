@@ -8,10 +8,12 @@ deploys with `--concurrency 80 --timeout 300`, so one accepted socket holds
 1/concurrency of an instance for up to five minutes, and nothing in the stack
 reclaimed it earlier:
 
-* Neither WebSocket route requires credentials. `/api/ws/simple` says so in its
-  own docstring; `/api/ws/metrics` takes a `token` query param but
-  `ConnectionManager.connect` falls through to an anonymous session when the
-  token is missing OR invalid, so it is unauthenticated in practice too.
+* Neither WebSocket route required credentials when this module was written.
+  `/api/ws/simple` said so in its own docstring; `/api/ws/metrics` took a
+  `token` query param but `ConnectionManager.connect` fell through to an
+  anonymous session when the token was missing OR invalid. BOTH ARE
+  AUTHENTICATED NOW (utils/dashboard_auth), and the authentication runs BEFORE
+  `reserve()` — see RESIDUAL EXPOSURE below, which that ordering closed.
 * `RateLimitMiddleware` cannot see either of them. It is a
   `BaseHTTPMiddleware`, which Starlette runs only for `scope["type"] == "http"`;
   the WebSocket handshake never enters it.
@@ -48,25 +50,24 @@ reasoning already written down in `middleware/rate_limiter._reject_anonymous`.
    an idle deadline keyed on client messages would disconnect a legitimately
    passive listener — see the note in `routes/dashboard_routes.py`.
 
-RESIDUAL EXPOSURE — what this does NOT fix
-------------------------------------------
-The ceiling converts "wedge the whole instance" into "deny the WebSocket
-surface", and that second thing is now CHEAPER than the first was. Measured
-against a real uvicorn at the shipped defaults: 8 anonymous, silent sockets
-parked on `/api/ws/metrics` — the route with no idle deadline — hold the shared
-budget indefinitely and every subsequent handshake on BOTH routes is refused.
-Pre-fix, denying the dashboard cost 80 sockets and took all HTTP down with it,
-which is loud; post-fix it costs 8 and is invisible to everything except this
-module's own log line.
+RESIDUAL EXPOSURE — CLOSED, and how
+-----------------------------------
+When this module shipped alone, the ceiling converted "wedge the whole instance"
+into "deny the WebSocket surface", and the second was CHEAPER than the first:
+measured against a real uvicorn at the shipped defaults, 8 anonymous silent
+sockets parked on `/api/ws/metrics` held the shared budget and every subsequent
+handshake on BOTH routes was refused. No ceiling number fixed that, because a
+guard cannot prefer a legitimate socket over an anonymous one when it cannot
+tell them apart.
 
-That trade is deliberate — losing the dashboard beats losing every HTTP request
-on the instance — but it is a trade, not a clean win, and the arithmetic that
-makes it cheap is the same fact underneath both: neither route requires a
-credential. There is no ceiling number that fixes this, because the guard cannot
-prefer a legitimate socket over an anonymous one when it cannot tell them apart.
-Closing it means authenticating `/api/ws/metrics` (and deciding whether
-`/api/ws/simple`, which has no consumer at all, should exist), which is a
-separate decision about who may use the dashboard.
+Closed by authenticating both routes and, crucially, doing it BEFORE `reserve()`
+— ordering rather than a new mechanism. An unauthenticated flood is now refused
+without ever touching the ceiling. Re-measured the same way at ceiling 8:
+20 anonymous sockets, 20 refused, 0 slots consumed, all 8 still available to
+credential holders.
+
+What remains is bounded to callers who hold a credential, which is the threat
+this ceiling was always the right size for.
 
 The ceiling is NOT published to callers. `middleware/rate_limiter` withholds its
 thresholds for the same reason: a caller told the exact ceiling is told exactly

@@ -15,7 +15,16 @@ logger = logging.getLogger("metrics_store")
 # next to the filtering it governs, and imported by utils.dashboard_auth rather
 # than the other way round: this module holds pure counters and must not acquire
 # a dependency on JWT decoding and settings just to name its own vocabulary.
-PLATFORM_WIDE_ROLES = frozenset({"admin", "super_admin", "operator", "viewer"})
+# `employee` and `outsourced` are here on the evidence of this repo's own
+# permission model, not a judgement call: utils/auth.py:331 grants both
+# "view_dashboard" and "view_transactions". Omitting them silently regressed
+# every internal viewer to an all-zero dashboard the moment the admin default
+# was removed — a functional break dressed as a security fix. If outsourced
+# contractors should NOT see platform figures, that belongs in the permission
+# map where the claim is already made, not in a second disagreeing list here.
+PLATFORM_WIDE_ROLES = frozenset(
+    {"admin", "super_admin", "operator", "viewer", "employee", "outsourced"}
+)
 
 class MetricsStore:
     """Real-time metrics store with rolling windows and snapshots"""

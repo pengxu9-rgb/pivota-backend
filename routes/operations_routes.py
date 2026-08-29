@@ -508,26 +508,32 @@ async def get_dashboard_summary(
 ):
     """Get operations dashboard summary - requires operator or admin role"""
     check_permission(credentials, "operator")
-    
+
     # Get metrics from the main system
     metrics_store = get_metrics_store()
-    # role is required now, so pass the caller's own rather than the "admin"
-    # default this used to take.
+    # `role` is required now. Take it from the verified token with NO fallback:
+    # the previous version of this line read `credentials.get("role") or
+    # "operator"`, and "operator" is platform-wide, so a token carrying no role
+    # claim received the WHOLE platform. That is the precise bug
+    # utils.dashboard_auth exists to refuse ("a credential that does not say what
+    # it is must not inherit the most privileged default"), re-introduced by the
+    # line meant to fix this route. An absent role now resolves to no data.
     #
-    # NOT "the caller is already known to be an operator": the line above is
-    # `check_permission(credentials, "operator")`, and utils.auth.check_permission
-    # RETURNS a bool and never raises, so that bare call is a discarded
-    # expression and this route is open to any authenticated role. Verified: it
-    # answers 200 for merchant, agent, employee and viewer alike. The same
-    # no-op appears at :93, :150, :210, :246 and :299. Passing the real role at
-    # least stops this line handing a merchant the platform's figures; the
-    # missing authorization is a separate fix with its own blast radius.
+    # The authorization above is NOT enforced and this comment must not imply it
+    # is. `check_permission` RETURNS a bool and never raises, so the call is a
+    # discarded expression — and it asks for the permission string "operator",
+    # which appears in no role's list in utils/auth.py:331, so it would deny
+    # every caller including admin if its result were ever read. Both halves are
+    # wrong, the same shape repeats at :93, :150, :210, :246 and :299, and
+    # fixing them is a change to five untouched routes' access that does not
+    # belong inside this one. What this line can do is stop handing platform
+    # figures to whoever gets through.
     system_metrics = (
-        metrics_store.get_snapshot(role=str(credentials.get("role") or "operator"))
+        metrics_store.get_snapshot(role=str(credentials.get("role") or ""))
         if metrics_store
         else {}
     )
-    
+
     # Calculate onboarding metrics
     pending_agents = len([a for a in operations_store["agents"].values() 
                          if a["status"] == OnboardingStatus.PENDING])

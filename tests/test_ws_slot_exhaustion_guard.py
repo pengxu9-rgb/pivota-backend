@@ -123,9 +123,11 @@ def test_the_socket_that_would_exhaust_the_instance_is_refused(client, monkeypat
 def test_the_ceiling_is_shared_across_every_websocket_route(client, monkeypatch):
     """Capping one route while its twin stays open would only move the attack.
 
-    /api/ws/metrics is reachable with no credential too — ConnectionManager
-    downgrades a missing or undecodable token to an anonymous session — so a
-    per-route budget would leave the instance exhaustible at 2N sockets.
+    Both routes now require a credential, and authentication runs before
+    `reserve()`, so the flood this ceiling was written against cannot reach it
+    at all. The ceiling still has to be SHARED: a per-route budget would let one
+    credential holder take 2N slots instead of N, and this is the test that says
+    so.
     """
     monkeypatch.setenv("WS_MAX_CONNECTIONS", "2")
 
