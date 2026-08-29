@@ -326,6 +326,44 @@ def test_a_product_level_asset_seen_once_per_variant_writes_one_row(engine):
     assert len({aid for _, aid in assets}) == 2
 
 
+def test_a_child_row_outside_the_delete_scope_does_not_abort_the_whole_ingest(engine):
+    """Defence in depth for the blast radius, not for the collision.
+
+    The DELETE clears one `product_key`; the write is keyed by primary key. Any
+    row carrying an incoming id but sitting OUTSIDE that delete scope — residue
+    written under the pre-fix derivation is the case that existed — used to
+    raise out of a plain INSERT and take down the ingest of every product in the
+    run. It must degrade to a row rewrite instead.
+    """
+    from sqlalchemy import text
+
+    import services.catalog_sync_service as sync
+    from models.standard_product import StandardProduct
+
+    product = StandardProduct(**_payload(MERCHANT_A))
+    key_a = sync.make_catalog_product_key(MERCHANT_A, "shopify", SOURCE_PRODUCT_ID)
+    incoming_id = sync._extract_shades(key_a, product.variants[0])[0]["shade_id"]
+
+    with engine.begin() as c:
+        c.execute(
+            text(
+                "INSERT INTO beauty_shades (shade_id, sku_key, product_key,"
+                " merchant_id, shade_name) VALUES (:sid, 'sku::legacy',"
+                " 'prod::legacy', 'legacy_merchant', 'Legacy')"
+            ),
+            {"sid": incoming_id},
+        )
+
+    stats = _ingest(MERCHANT_A)
+    assert stats["products_ingested"] == 1, stats
+    assert stats["beauty_shades_upserted"] == 2, stats
+    assert _rows(
+        engine,
+        f"SELECT merchant_id, shade_name FROM beauty_shades"
+        f" WHERE shade_id = '{incoming_id}'",
+    ) == [(MERCHANT_A, "Rose Nude")]
+
+
 def test_child_row_ids_are_derived_from_the_merchant_scoped_product_key():
     """The derivations themselves, with no database in the way: the same
     platform product under two merchants must produce different child ids.
