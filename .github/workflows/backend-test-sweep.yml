@@ -143,7 +143,7 @@ jobs:
       #     is not the same as what is broken.
       #
       # FOUND BY THIS PR'S OWN STRAY-FILE GUARD: `readiness/tests/` is a whole
-      # sub-package — 15 test files, 111 passing — that ran in NO CI job either. It is
+      # sub-package — 16 test files, 133 executed today — that ran in NO CI job either. It is
       # swept in here rather than deferred, because 111 tests of coverage now
       # beats a tidier denylist later. Two of its files are red and join the
       # quarantine:
@@ -154,9 +154,9 @@ jobs:
       #     combining the two trees: green running `readiness/tests` alone, red
       #     inside the sweep. Exactly the effect the 2026-07-28 recon predicted —
       #     "a globbed job runs a different set than the full suite, so
-      #     order-dependent tests flip in both directions". Both are
-      #     `--deselect`s rather than `--ignore`s, so they suppress two TESTS
-      #     rather than two files.
+      #     order-dependent tests flip in both directions". It is a
+      #     `--deselect` rather than an `--ignore`, so it suppresses ONE TEST
+      #     rather than the whole file.
       #
       # UN-QUARANTINED 2026-08-28: readiness/tests/test_routes.py (+54 executed).
       # Its 3 red tests were not a product bug — `fake_build_readiness_optimization`
@@ -260,7 +260,7 @@ jobs:
           # build fails, and re-floating the floor to 73 only moves the cap to
           # 80.3, room for exactly ONE new test. It would also have made this
           # file's own stated goal a red build — un-quarantining
-          # readiness/tests/test_routes.py adds 49 tests in one PR. A floor's
+          # readiness/tests/test_routes.py adds 54 tests in one PR. A floor's
           # job is to notice a tree LEAVING; sizing its ceiling per-test is a
           # different, worse question.
           ABS_SLACK = 150

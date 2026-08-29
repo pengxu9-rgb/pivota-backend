@@ -90,7 +90,11 @@ def _build_test_client(monkeypatch, *, psp_enabled: bool, include_error_handler:
     from readiness import order_sync as readiness_order_sync
     from routes.readiness_internal import router as readiness_router
 
-    readiness_order_sync._default_journal = InMemoryReadinessJournal()
+    # monkeypatch, not a bare assignment: a direct write replaces the module-level
+    # DatabaseReadinessJournal for the REST OF THE PYTEST PROCESS. Harmless only
+    # while file order keeps a later reader from seeing it -- and un-quarantining
+    # this file is exactly the kind of change that alters what runs after it.
+    monkeypatch.setattr(readiness_order_sync, "_default_journal", InMemoryReadinessJournal())
     app = FastAPI()
     if include_error_handler:
         app.add_middleware(ErrorHandlerMiddleware)
@@ -364,7 +368,9 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         assert blocked_only is False
         assert low_quality_only is False
         assert sort_by == "default"
-        assert segment == "all"
+        # A NON-default value, sent by the request below: asserting "all" here
+        # would pass whether or not the route forwards the field at all.
+        assert segment == "in_store"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -415,7 +421,7 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
 
     response = route_client.post(
         "/merchant/readiness/actions/refresh",
-        json={"scope": "merchant", "reason": "manual"},
+        json={"scope": "merchant", "reason": "manual", "segment": "in_store"},
     )
 
     assert response.status_code == 200
@@ -2075,7 +2081,7 @@ async def _exercise_readiness_payment_intent_probe(
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", allowlist)
 
     journal = InMemoryReadinessJournal()
-    readiness_order_sync._default_journal = journal
+    monkeypatch.setattr(readiness_order_sync, "_default_journal", journal)
     checkout = await journal.create_checkout_session(
         merchant_id=merchant_id,
         channel="ucp",
