@@ -490,7 +490,7 @@ async def _resolve_stripe_order_for_payment_event(
     payment_meta: Optional[Dict[str, Any]],
     allow_repoint: bool = False,
     psp_id: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Resolve the order a Stripe payment event belongs to.
 
     Lookup order: (1) by stored payment_intent_id, then (2) by the PI's
@@ -506,19 +506,26 @@ async def _resolve_stripe_order_for_payment_event(
 
     `psp_id` (the webhook endpoint owner) enforces a cross-tenant guard: a
     merchant who knows their own endpoint secret cannot drive state on another
-    merchant's order by forging metadata.order_id. A mismatch resolves to None
-    (treated as unmatched) so the caller does not mutate the foreign order.
+    merchant's order by forging metadata.order_id.
+
+    Returns `(order, reject_reason)`. `reject_reason` is set ONLY when an order
+    was found and REFUSED (the cross-tenant block); a plain miss is
+    `(None, None)`. Callers need that distinction: a refusal is PERMANENT, while
+    a miss is usually an order that has not been committed yet — and those two
+    want opposite delivery outcomes. They used to be indistinguishable, both
+    recorded as `no_order_resolved`.
     """
     psp_owner = await _stripe_psp_owner_merchant_id(psp_id)
 
-    def _scoped(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        allowed, _reject = _scope_stripe_order_to_psp_owner(
+    def _scoped(
+        order: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        return _scope_stripe_order_to_psp_owner(
             order,
             psp_owner_merchant_id=psp_owner,
             psp_id=psp_id,
             payment_intent_id=payment_intent_id,
         )
-        return allowed
 
     query = "SELECT * FROM orders WHERE payment_intent_id = :payment_intent_id"
     from db.database import database
@@ -532,14 +539,15 @@ async def _resolve_stripe_order_for_payment_event(
     if isinstance(payment_meta, dict):
         order_hint = str(payment_meta.get("order_id") or "").strip()
     if not order_hint:
-        return None
+        return None, None
 
     order = await get_order(order_hint)
     if not order:
-        return None
+        return None, None
     order = _db_row_to_dict(order)
-    if _scoped(order) is None:
-        return None
+    scoped, reject = _scoped(order)
+    if scoped is None:
+        return None, reject
 
     current_payment_intent_id = str(order.get("payment_intent_id") or "").strip()
     if allow_repoint and payment_intent_id and current_payment_intent_id != payment_intent_id:
@@ -557,7 +565,7 @@ async def _resolve_stripe_order_for_payment_event(
         except Exception:
             pass
 
-    return order
+    return order, None
 
 
 async def _finalize_stripe_payment_success(
@@ -1116,6 +1124,62 @@ def _stripe_refund_ledger_without(
     return ledger
 
 
+# Refusal reasons that can NEVER succeed on redelivery. Everything else is
+# treated as possibly-transient and handed to Stripe's retry schedule.
+_STRIPE_PERMANENT_REFUSAL_PREFIXES = (
+    "cross_tenant_blocked",
+    "refund_currency_mismatch",
+    "currency_mismatch",
+    "amount_mismatch",
+    "refund_exceeds_order_total",
+    "refund_amount_not_positive",
+    "event_amount_missing",
+    "refund_amount_missing",
+)
+
+
+def _stripe_refusal_is_permanent(reason: Optional[str]) -> bool:
+    """Is this refusal one that redelivering the identical event cannot fix?
+
+    A cross-tenant block or an amount that does not match the order is a
+    property of the signed event itself — the same bytes will be refused
+    forever, so retrying is pure noise. A miss (`no_order_resolved`) is usually
+    a RACE: the charge landed before the order was committed. Those want
+    opposite outcomes, and until now both answered 200 and were recorded
+    'unmatched', where nothing ever looked at them again.
+    """
+    text = str(reason or "").strip()
+    if not text:
+        return False
+    return text.startswith(_STRIPE_PERMANENT_REFUSAL_PREFIXES)
+
+
+def _stripe_unmatched_response(*, event_type: Optional[str], reason: Optional[str]) -> Dict[str, Any]:
+    """The delivery outcome for a refused event.
+
+    Permanent refusal -> 200 + 'unmatched'. Retrying cannot help, and a 200 stops
+    Stripe hammering an endpoint over an event it will always refuse.
+
+    Possibly-transient refusal -> 503, so STRIPE REDELIVERS. This is the whole
+    recovery net: `webhook_events.status = 'unmatched'` has no consumer in this
+    repo, so a 200 here means a real charge or refund is dropped for good. Stripe
+    already retries with backoff for ~3 days; using that beats inventing a sweep
+    that does not exist. If the order never materialises the event ends up
+    failed-and-visible rather than silently swept up as handled.
+    """
+    if _stripe_refusal_is_permanent(reason):
+        return {"status": "unmatched", "event": event_type, "reason": reason}
+    logger.error(
+        {
+            "alert": "stripe_webhook_deferred_for_redelivery",
+            "event_type": event_type,
+            "reason": reason,
+            "impact": "answered 503; Stripe will redeliver on its retry schedule",
+        }
+    )
+    raise HTTPException(status_code=503, detail=str(reason or "unmatched"))
+
+
 async def _flag_unmatched_stripe_refund_event(
     *,
     event_id: Optional[str],
@@ -1160,8 +1224,13 @@ async def _flag_unmatched_stripe_payment_event(
     """A signed payment SUCCESS event resolved to no order (or failed integrity
     verification). This is the charge-stuck failure mode: a real charge with no
     finalizable order. Record the event as 'unmatched' (NOT 'processed', so it is
-    never silently swept under the rug) and emit a loud alert. The periodic
-    reconcile sweep is the recovery net once the order materializes."""
+    never silently swept under the rug) and emit a loud alert.
+
+    ⚠️ There is NO reconcile sweep — `webhook_events.status = 'unmatched'` has no
+    consumer anywhere in this repo. Recovery for a POSSIBLY-TRANSIENT refusal is
+    Stripe's own redelivery, which `_stripe_unmatched_response` triggers with a
+    503. A permanent refusal genuinely ends here, and the alert above is the only
+    signal."""
     meta_order_id = None
     if isinstance(payment_meta, dict):
         meta_order_id = str(payment_meta.get("order_id") or "").strip() or None
@@ -1291,7 +1360,7 @@ async def handle_stripe_webhook(
             payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
             # allow_repoint=True: hosted-checkout orders store the cs_ session id;
             # the success event carries the pi_, so capturing it is correct here.
-            result = await _resolve_stripe_order_for_payment_event(
+            result, payment_reject = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
                 allow_repoint=True,
@@ -1307,9 +1376,12 @@ async def handle_stripe_webhook(
                     event_type=event_type,
                     payment_intent_id=payment_intent_id,
                     payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
-                    reason="no_order_resolved",
+                    reason=payment_reject or "no_order_resolved",
                 )
-                return {"status": "unmatched", "event": event_type}
+                return _stripe_unmatched_response(
+                    event_type=event_type,
+                    reason=payment_reject or "no_order_resolved",
+                )
 
             # Integrity: the signed charge amount/currency must match the order.
             amount_ok, amount_reason = _stripe_event_payment_matches_order(result, data)
@@ -1321,7 +1393,9 @@ async def handle_stripe_webhook(
                     payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
                     reason=amount_reason or "amount_verification_failed",
                 )
-                return {"status": "unmatched", "event": event_type, "reason": amount_reason}
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=amount_reason or "amount_verification_failed"
+                )
 
             order_id = result["order_id"]
             merchant_id = result["merchant_id"]
@@ -1443,7 +1517,7 @@ async def handle_stripe_webhook(
         elif event_type == "payment_intent.amount_capturable_updated":
             payment_intent_id = data.get("id")
             payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
-            result = await _resolve_stripe_order_for_payment_event(
+            result, _payment_reject = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
                 allow_repoint=True,
@@ -1481,7 +1555,7 @@ async def handle_stripe_webhook(
                 )
             )
             if auth_first_hint:
-                result = await _resolve_stripe_order_for_payment_event(
+                result, _payment_reject = await _resolve_stripe_order_for_payment_event(
                     payment_intent_id=session_id,
                     payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
                     allow_repoint=True,
@@ -1519,7 +1593,7 @@ async def handle_stripe_webhook(
             payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
             # allow_repoint stays False: a stale/abandoned failed PI must never
             # repoint (and then demote) a paid order via metadata.order_id.
-            result = await _resolve_stripe_order_for_payment_event(
+            result, _payment_reject = await _resolve_stripe_order_for_payment_event(
                 payment_intent_id=payment_intent_id,
                 payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
                 allow_repoint=False,
@@ -1576,7 +1650,9 @@ async def handle_stripe_webhook(
                     refund_reference=charge_id,
                     reason=refund_reject,
                 )
-                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=refund_reject
+                )
 
             if result:
                 # Integrity: unlike the payment branches, this path applied
@@ -1594,7 +1670,9 @@ async def handle_stripe_webhook(
                         refund_reference=charge_id,
                         reason=amount_reason or "refund_amount_verification_failed",
                     )
-                    return {"status": "unmatched", "event": event_type, "reason": amount_reason}
+                    return _stripe_unmatched_response(
+                        event_type=event_type, reason=amount_reason or "refund_amount_verification_failed"
+                    )
 
                 order_id = result["order_id"]
                 try:
@@ -1645,7 +1723,9 @@ async def handle_stripe_webhook(
                     refund_reference=refund_id,
                     reason=refund_reject,
                 )
-                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=refund_reject
+                )
 
             if result:
                 await _persist_stripe_refund_observability(result, refund_snapshot)
@@ -1692,7 +1772,9 @@ async def handle_stripe_webhook(
                     refund_reference=refund_id,
                     reason=refund_reject,
                 )
-                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=refund_reject
+                )
 
             if result:
                 order_id = result["order_id"]
@@ -1717,7 +1799,9 @@ async def handle_stripe_webhook(
                             refund_reference=refund_id,
                             reason=amount_reason or "refund_amount_verification_failed",
                         )
-                        return {"status": "unmatched", "event": event_type, "reason": amount_reason}
+                        return _stripe_unmatched_response(
+                            event_type=event_type, reason=amount_reason or "refund_amount_verification_failed"
+                        )
 
                     try:
                         refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
@@ -1828,7 +1912,9 @@ async def handle_stripe_webhook(
                     refund_reference=refund_id,
                     reason=refund_reject,
                 )
-                return {"status": "unmatched", "event": event_type, "reason": refund_reject}
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=refund_reject
+                )
 
             if result:
                 finalization = await _finalize_stripe_refund_failure(
@@ -1900,7 +1986,9 @@ async def handle_stripe_webhook(
                         refund_reference=dispute_id,
                         reason=dispute_reject,
                     )
-                    return {"status": "unmatched", "event": event_type, "reason": dispute_reject}
+                    return _stripe_unmatched_response(
+                        event_type=event_type, reason=dispute_reject
+                    )
 
                 if dispute_order:
                     # Resolved AND scoped: the object we are allowed to touch.
