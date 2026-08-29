@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -755,6 +756,64 @@ async def test_run_catalog_sync_job_marks_running_then_completes(
     assert updates[0]["status"] == "running"
     assert result["job_id"] == "job_123"
     assert result["status"] == "running" or result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_catalog_sync_job_logs_the_failure_it_only_records_in_the_row(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing ingest must say so in the LOGS, not only in
+    `catalog_sync_jobs.status`.
+
+    This job is handed to a FastAPI BackgroundTask
+    (routes/merchant_store_connections.py), so it runs after the response is
+    sent — on Cloud Run, after CPU is throttled — and the endpoint has already
+    answered `catalog_ingest_queued: true` with a 200. Re-raising is not a log
+    line: the exception lands in the ASGI server's handler, outside this
+    service's logging. On 2026-08-29 that made a sync which wrote zero rows
+    invisible except as one `status='failed'` row.
+    """
+    stored = {
+        "job_id": "job_fail",
+        "merchant_id": "merch_1",
+        "connector": "shopify",
+        "mode": "reconcile",
+        "scope_json": {"platform": "shopify"},
+        "status": "pending",
+        "stats_json": {},
+    }
+    updates = []
+
+    async def fake_get_catalog_sync_job(job_id: str):
+        return dict(stored)
+
+    async def fake_upsert(_table, _pk_name, values):
+        updates.append(dict(values))
+        stored.update(values)
+
+    async def boom(**_kwargs):
+        raise RuntimeError(
+            'duplicate key value violates unique constraint "beauty_shades_pkey"'
+        )
+
+    monkeypatch.setattr(module, "get_catalog_sync_job", fake_get_catalog_sync_job)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert)
+    monkeypatch.setattr(module, "sync_products_cache_to_catalog", boom)
+
+    with caplog.at_level(logging.ERROR, logger=module.logger.name):
+        with pytest.raises(RuntimeError):
+            await module.run_catalog_sync_job("job_fail")
+
+    assert updates[-1]["status"] == "failed"
+    failures = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert failures, "the job failed and logged nothing"
+    logged = failures[0].getMessage()
+    assert "job_fail" in logged and "merch_1" in logged, logged
+    assert "beauty_shades_pkey" in logged, logged
+    # logger.exception, not logger.error — without the traceback the log names
+    # the job but not the statement that broke it.
+    assert failures[0].exc_info is not None
 
 
 @pytest.mark.asyncio
