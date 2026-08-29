@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://www.demandware.com/xml/impex/metadata/2006-10-31">
+    <custom-type type-id="PivotaTelemetryOutbox">
+        <display-name xml:lang="x-default">Pivota Telemetry Outbox</display-name>
+        <description xml:lang="x-default">Short-lived, PII-free commerce events waiting for asynchronous delivery.</description>
+        <staging-mode>no-staging</staging-mode>
+        <storage-scope>site</storage-scope>
+        <key-definition attribute-id="ID">
+            <display-name xml:lang="x-default">Event ID</display-name>
+            <type>string</type>
+            <min-length>1</min-length>
+            <field-length>256</field-length>
+        </key-definition>
+        <attribute-definitions>
+            <attribute-definition attribute-id="payload">
+                <display-name xml:lang="x-default">Allowlisted event payload</display-name>
+                <type>text</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="attempts">
+                <display-name xml:lang="x-default">Delivery attempts</display-name>
+                <type>int</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+                <min-value>0</min-value>
+                <default-value>0</default-value>
+            </attribute-definition>
+            <attribute-definition attribute-id="availableAt">
+                <display-name xml:lang="x-default">Next delivery time</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="expiresAt">
+                <display-name xml:lang="x-default">Expiry time</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>true</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+        </attribute-definitions>
+        <group-definitions>
+            <attribute-group group-id="pivotaTelemetryOutbox">
+                <display-name xml:lang="x-default">Pivota Telemetry Outbox</display-name>
+                <attribute attribute-id="ID"/>
+                <attribute attribute-id="payload"/>
+                <attribute attribute-id="attempts"/>
+                <attribute attribute-id="availableAt"/>
+                <attribute attribute-id="expiresAt"/>
+            </attribute-group>
+        </group-definitions>
+    </custom-type>
+</metadata>

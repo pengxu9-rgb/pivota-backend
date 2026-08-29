@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jobs xmlns="http://www.demandware.com/xml/impex/jobs/2015-07-01">
+    <!-- Per-site template: duplicate this job element for every connected site,
+         replacing RefArch in both the job ID and context. -->
+    <job job-id="PivotaTelemetryDrain-RefArch">
+        <description>Asynchronously delivers the Pivota commerce telemetry outbox.</description>
+        <flow>
+            <context site-id="RefArch"/>
+            <step step-id="PivotaTelemetryDrain" type="custom.PivotaTelemetryDrain" enforce-restart="false">
+                <parameters>
+                    <parameter name="BatchSize">50</parameter>
+                </parameters>
+            </step>
+        </flow>
+        <rules>
+            <on-running runtime-threshold="10m" enabled="true">
+                <mark-job-as-hanging/>
+            </on-running>
+        </rules>
+        <triggers/>
+    </job>
+</jobs>

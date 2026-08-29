@@ -383,6 +383,7 @@ from routes.adobe_commerce_events import router as adobe_commerce_events_router
 from routes.cafe24_webhooks import router as cafe24_webhooks_router
 from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
 from routes.sfcc_integration import router as sfcc_integration_router
+from routes.sfcc_events import router as sfcc_events_router
 from routes.shopline_integrations import router as shopline_integrations_router
 from routes.shopline_family_webhooks import router as shopline_family_webhooks_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
@@ -1296,6 +1297,7 @@ app.include_router(adobe_commerce_events_router)  # Signed Adobe I/O order/payme
 app.include_router(cafe24_webhooks_router)  # Cafe24 Data Bridge + order lifecycle events
 app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order lifecycle events
 app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
+app.include_router(sfcc_events_router)  # Signed SFCC cartridge order/cart/payment events
 app.include_router(shopline_integrations_router)  # SHOPLINE / Shoplazza native REST catalog adapters
 app.include_router(shopline_family_webhooks_router)  # Signed SHOPLINE / Shoplazza order lifecycle events
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)

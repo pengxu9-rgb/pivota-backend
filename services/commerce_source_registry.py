@@ -66,8 +66,9 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
         CommerceSourceCapabilities(catalog_pull=True),
     ),
     # SCAPI Shopper Search/Products is a native, site-scoped sellable catalog
-    # source. Checkout and event capabilities remain unclaimed until their
-    # separate SLAS basket/order and integration-event contracts are wired.
+    # source. Checkout remains unclaimed. Commerce lifecycle telemetry is a
+    # separate signed cartridge/outbox contract; this registry has no commerce-
+    # telemetry flag, and catalog_events intentionally remains false.
     "salesforce_commerce_cloud": CommerceSourceDefinition(
         "salesforce_commerce_cloud",
         "storefront",
