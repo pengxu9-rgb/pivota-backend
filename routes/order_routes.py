@@ -534,6 +534,86 @@ def _test_psp_probe_merchants() -> set:
     return {m.strip().lower() for m in raw.split(",") if m.strip()}
 
 
+async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
+    """True only when EVERY active processor for this merchant is demonstrably TEST-mode.
+
+    Fails CLOSED: no rows, one live-looking row, or any error all return False. This is what makes
+    allowlisting a merchant safe — a merchant that somehow has a live processor cannot be granted a
+    test-mode bypass even if someone puts it in TEST_PSP_PROBE_MERCHANTS by mistake.
+    """
+    merchant = str(merchant_id or "").strip()
+    if not merchant:
+        return False
+    try:
+        from services.merchant_psp_config_service import fetch_active_merchant_psps
+
+        rows = await fetch_active_merchant_psps(merchant_id=merchant)
+    except Exception:
+        return False
+    if not rows:
+        return False
+    for row in rows:
+        record = row if isinstance(row, dict) else {}
+        environment = str(record.get("environment") or "").strip().lower()
+        key = str(
+            record.get("runtime_secret_key")
+            or record.get("secret_key")
+            or record.get("api_key")
+            or ""
+        ).strip()
+        # A LIVE-looking key refuses the row outright, whatever the `environment` column claims.
+        # environment is a label someone types; the key is what actually charges a card, and a row
+        # mislabelled test while holding sk_live_ is exactly the shape this guard exists to stop.
+        if key.startswith(("sk_live_", "rk_live_")):
+            return False
+        looks_test = environment in {"test", "sandbox"} or key.startswith(("sk_test_", "rk_test_"))
+        if not looks_test:
+            return False
+    return True
+
+
+async def _apply_server_granted_test_psp_stamp(
+    metadata: Optional[Dict[str, Any]], merchant_id: Optional[str]
+) -> bool:
+    """Stamp an allowlisted probe merchant's order server-side, so the bypass no longer depends on
+    the CALLER remembering a URL parameter.
+
+    Why: a TEST processor is refused unless the order carries `allow_test_psp_surfaces`, and the
+    checkout page only sets that from a URL parameter. A buyer arriving through PDP -> add to bag
+    -> cart -> Checkout carries none, so payment always died "All PSPs blocked: stripe: Processor
+    is configured for test, not live" on a merchant explicitly allowlisted for the probe (observed
+    in production 2026-08-29: ORD_9F4C24E73705231D unstamped failed, ORD_50C00A24BEADFA78 stamped
+    paid — same merchant, same env).
+
+    This does not widen containment. The stamp was never a secret: order metadata is caller-supplied
+    and forwarded verbatim, so any caller could already set it for any merchant, and the gate has
+    always ignored it unless {ALLOW_TEST_PSP_PROBE on} + {merchant allowlisted}. What changes is
+    that the server now writes the stamp itself, gated additionally on the merchant's processors
+    ACTUALLY being test-mode — a guard the caller-supplied stamp never had.
+
+    Writing the stamp (rather than special-casing the gate) keeps every downstream reader —
+    `_resolve_order_live_readiness_requirement`, the payment SDK, and the Stripe webhook livemode
+    exemption — working on exactly the semantics they were reviewed under.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    # An explicit request to ENFORCE live readiness is the stricter choice and always wins.
+    if _coerce_metadata_bool(metadata.get("enforce_live_readiness")) is True:
+        return False
+    # Already permitted via a caller stamp — nothing to add.
+    if _resolve_order_live_readiness_requirement(metadata, merchant_id) is False:
+        return False
+    if not _test_psp_probe_enabled():
+        return False
+    if str(merchant_id or "").strip().lower() not in _test_psp_probe_merchants():
+        return False
+    if not await _merchant_active_psp_is_test_mode(merchant_id):
+        return False
+    metadata["allow_test_psp_surfaces"] = True
+    metadata["test_psp_surfaces_granted_by"] = "server_allowlist"
+    return True
+
+
 def _resolve_order_live_readiness_requirement(
     metadata: Optional[Dict[str, Any]], merchant_id: Optional[str] = None
 ) -> bool:
@@ -3938,6 +4018,7 @@ async def create_new_order(
 
         order_metadata["amounts_source"] = "quote_snapshot" if pricing_quote_meta else "legacy_incomplete"
         persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
+        await _apply_server_granted_test_psp_stamp(order_metadata, order_request.merchant_id)
         enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
         _t = time.perf_counter()
         explicit_preferred_provider = await _ensure_explicit_preferred_psp_available(
@@ -4157,6 +4238,7 @@ async def create_new_order(
             # 则通过 metadata.psp_mode 告诉 Stripe 适配器走 Checkout Session 流程，
             # 但 PSP provider 仍然是 "stripe"（由 routing 决定）。
             psp_mode = requested_psp_mode
+            await _apply_server_granted_test_psp_stamp(order_metadata, order_request.merchant_id)
             enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
             payment_return_url = _build_order_payment_return_url(order_id, order_metadata)
             auth_first_payment_flow = order_metadata.get("payment_flow") if isinstance(order_metadata.get("payment_flow"), dict) else {}
