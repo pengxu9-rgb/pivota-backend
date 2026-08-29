@@ -189,10 +189,14 @@ catalog_products = Table(
     # fails that build (swallowed as a best-effort warning).
     Column("rating_value", Numeric, nullable=True),
     Column("rating_count", Integer, nullable=True),
-    # Cached renderability verdict for the canonical PDP (mig 188), read by
-    # the idx_catalog_products_pdp_will_render_true partial index.
-    Column("pdp_will_render", Boolean, nullable=True),
-    Column("pdp_will_render_computed_at", DateTime(timezone=True), nullable=True),
+    # pdp_will_render / pdp_will_render_computed_at (mig 188) are DELIBERATELY
+    # ABSENT, and a drift audit that "helpfully" adds them is reverting a
+    # decision, not fixing an oversight. services/pdp_renderability_store.py
+    # documents why: the columns are referenced only BY NAME (a
+    # sa.literal_column predicate and a raw UPDATE), because adding them here
+    # makes every select(catalog_products) in the repo emit them, and a deploy
+    # that lands before the database grows the column turns each of those into
+    # an UndefinedColumn 500. The safeguard IS their absence from this Table.
     Column("content_changed_at", DateTime, server_default=func.now(), nullable=False),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
@@ -313,6 +317,16 @@ catalog_offers = Table(
 )
 
 
+# KNOWN MODEL/MIGRATION DISAGREEMENT, deliberately left as-is.
+# db/migrations/132 declares `applied_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+# but main.py runs metadata.create_all BEFORE the migrations, so on every
+# database the app has ever booted this table was created HERE, naive, and
+# 132's CREATE TABLE IF NOT EXISTS has no-opped ever since. The model is what
+# prod actually has; the migration is the one that never landed. Changing this
+# to timezone=True would make fresh migrations-first databases disagree with
+# prod rather than agree with it, so the fix belongs in a decision about which
+# of the two owns this table, not in a type swap here. Migration 132 also
+# indexes (writer_name, applied_at DESC); the Index below is ASC.
 writer_audit_log = Table(
     "writer_audit_log",
     metadata,

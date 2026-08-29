@@ -80,14 +80,14 @@ def db_url():
     # column types drift is exactly the false confidence these gates exist to stop.
     metadata.tables["agent_pdp_view"].create(engine, checkfirst=True)
     # ...and then layer every migration that touches agent_pdp_view on top, in
-    # version order. db/catalog.py now declares the full shipped column set
-    # (evidence_profile, required_disclaimers, rating_value, rating_count and the
-    # rest were realigned to the migrations), so on a genuinely fresh database
-    # these are no-ops — but `create(checkfirst=True)` will not touch a table that
-    # already exists, and this database is reused, so replaying the migrations is
-    # what keeps a table built by an OLDER model from silently staying narrow.
-    # Failures are tolerated: several of these files also touch tables this
-    # private database does not have.
+    # version order. Since db/catalog.py was realigned to the migrations these
+    # are all no-ops HERE — this fixture drops and recreates its own private
+    # database above, so the table is always built by the CURRENT model. Kept
+    # anyway, cheaply: it is what makes the fixture the shipped shape rather
+    # than the model's word for it, which is the whole claim the file rests on,
+    # and it fails loudly the day the two diverge again. Do not read it as
+    # evidence the model is behind. Failures are tolerated: several of these
+    # files also touch tables this private database does not have.
     import re as _re
     from sqlalchemy import text as _text
 

@@ -190,6 +190,16 @@ ALTER TABLE product_enrichment ADD COLUMN IF NOT EXISTS usage_scenarios JSONB;
 """
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Drop `--` line comments and `/* */` block comments. Test-side only.
+
+    Quote-naive on purpose: it is used to CLASSIFY a statement, never to build
+    one, and the statements it classifies are DDL with no string literals.
+    """
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    return re.sub(r"--[^\n]*", " ", sql)
+
+
 def _agent_pdp_view_catchup_ddl() -> List[str]:
     """`ALTER TABLE agent_pdp_view ...` statements from db/migrations, in order.
 
@@ -209,6 +219,8 @@ def _agent_pdp_view_catchup_ddl() -> List[str]:
     the 🚨 rule above forbids hand-rolling DDL for a table db.catalog owns, and
     ADD COLUMN IF NOT EXISTS is safe to replay in the shared database.
     """
+    from db.sql_migrations import split_statements
+
     out: List[str] = []
     paths = sorted(
         (REPO_ROOT / "db" / "migrations").glob("*.sql"),
@@ -218,20 +230,41 @@ def _agent_pdp_view_catchup_ddl() -> List[str]:
         body = path.read_text(encoding="utf-8")
         if "agent_pdp_view" not in body:
             continue
-        for statement in filter(None, (s.strip() for s in body.split(";"))):
-            collapsed = " ".join(statement.split()).lower()
-            # BOTH spellings. Matching only `alter table agent_pdp_view` silently
-            # skipped migration 186, which writes `ALTER TABLE IF EXISTS
-            # agent_pdp_view` — so rating_value/rating_count were never caught up
-            # and report_agent_depth_scorecard's APV_DEPTH_SQL failed to PREPARE.
-            # It looked green only because a sibling gate file that sorts earlier
-            # (tests/test_citation_read_surfaces_postgres.py) adds those two
-            # columns to the SHARED database first.
+        # `split_statements`, NOT `body.split(";")`. The naive split is wrong
+        # twice over, and both were live defects:
+        #
+        #   * it cuts on a `;` inside a `--` comment. Migration 096 line 17 has
+        #     "(or absence of intent); shadowing it with" in prose, so the
+        #     fragment carrying its real ALTER begins mid-comment and fails any
+        #     prefix test — 096 was dropped no matter how the prefix was spelled.
+        #   * the prefix test itself matched only `alter table agent_pdp_view`,
+        #     dropping migration 186, which writes `ALTER TABLE IF EXISTS`.
+        #
+        # 186 cost `report_agent_depth_scorecard`'s APV_DEPTH_SQL a PREPARE
+        # (`column "rating_value" does not exist`) on a fresh database, masked
+        # because a sibling gate file that sorts earlier
+        # (tests/test_citation_read_surfaces_postgres.py) patches the SHARED
+        # database first. This splitter is the one the real migration runner
+        # uses, so it is quote-, dollar-quote- and comment-aware.
+        for statement in filter(None, (s.strip() for s in split_statements(body))):
+            # Comments STRIPPED before the prefix test, because `split_statements`
+            # keeps the comment block that precedes a statement attached to it —
+            # migration 096's ALTER arrives as `-- Idempotent: ...\nALTER TABLE
+            # IF EXISTS agent_pdp_view ...` and no `startswith` can see past that.
+            # Executed unstripped: only the TEST needs the bare SQL.
+            collapsed = " ".join(_strip_sql_comments(statement).split()).lower()
             if "add column" not in collapsed:
                 continue
             if collapsed.startswith(("alter table agent_pdp_view",
                                     "alter table if exists agent_pdp_view")):
-                out.append(statement)
+                # The STRIPPED text is what we emit, not the original. The
+                # fixture below joins these with ";" and re-splits the blob on
+                # ";" — and 096's comment block contains a prose semicolon
+                # ("(or absence of intent); shadowing it with"), which that
+                # re-split turns into a comment-only fragment and psycopg2
+                # rejects as "can't execute an empty query". Stripping here
+                # keeps the statement whole through the naive split downstream.
+                out.append(" ".join(_strip_sql_comments(statement).split()))
     return out
 
 
