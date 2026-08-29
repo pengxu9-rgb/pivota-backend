@@ -12,8 +12,8 @@ set -euo pipefail
 ENV="${1:-}"; TAG="${2:-}"
 [ -n "$ENV" ] && [ -n "$TAG" ] || { echo "usage: $0 staging|prod <image-tag>" >&2; exit 2; }
 case "$ENV" in
-  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8 ;;
-  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=20; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=6 ;;
+  staging) PROJECT=pivota-staging; PIVOTA_ENV=staging;    MIN=1; MAX=4;  CPU=2; MEM=2Gi; POOL_MIN=2; POOL_MAX=8;  CONCURRENCY=80 ;;
+  prod)    PROJECT=pivota-prod;    PIVOTA_ENV=production; MIN=2; MAX=10; CPU=2; MEM=4Gi; POOL_MIN=2; POOL_MAX=12; CONCURRENCY=20 ;;
   *) echo "bad env" >&2; exit 2 ;;
 esac
 
@@ -49,12 +49,26 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
 case "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED')" >&2; exit 2 ;; esac
+# PROD SHAPE IS A CONNECTION BUDGET, not a throughput guess. Cloud SQL `pivota-pg` runs
+# max_connections=300, shared with worker/catalog-intelligence/ops, so web's ceiling is
+# MAX x POOL_MAX = 10 x 12 = 120. The previous shape (MAX=20, POOL_MAX=6, --concurrency 80) wedged
+# production twice in one week: 80 concurrent requests against 6 connections is 13x oversubscription,
+# and with DB_COMMAND_TIMEOUT_SECONDS a stalled socket pins a slot for its full duration, so six
+# stalls take the instance out entirely. Every error in both outages was the same line —
+# `PoolCheckoutTimeout: timed out waiting 120.0s for a database connection` — while Cloud SQL sat
+# RUNNABLE at 28/300 backends with 23 of them IDLE: from the server a client blocked on a dead
+# socket is indistinguishable from an idle one, which is why the DATABASE looked innocent.
+# 2026-08-29: concurrency 20 and pool 12 is 1.7x, and 10 x 20 = 200 request slots against observed
+# traffic of ~28 requests per 15 minutes. Raise MAX or CONCURRENCY only together with the budget.
+#
 # WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
 # vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
 # constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
-# --timeout, --ingress, --vpc-egress, --labels, --service-account. Those match live prod today so
-# nothing drifts - but an operator who widened --max-instances by hand during an incident will
-# have it pulled back silently by the next CI deploy.
+# --timeout, --ingress, --vpc-egress, --labels, --service-account. An operator who widened
+# --max-instances by hand during an incident will have it pulled back silently by the next CI
+# deploy. (The sentence here used to add "those match live prod today so nothing drifts"; that is
+# no longer true by design — 2026-08-29 deliberately changed --concurrency and --max-instances, so
+# the next deploy after that change reshapes the running service. The constants are the intent.)
 #
 # WORKERS and MOUNT_DB only take effect through the env/secret files, so under `preserve` they are
 # read and then ignored. Refuse rather than ignore: the cutover runbook's headline command is
@@ -250,10 +264,18 @@ if [ "$CONFIG" = preserve ]; then
     echo "deploy blind in preserve mode. Set POOL_FLEET_BUDGET=0 to bypass deliberately." >&2
     [ "$POOL_FLEET_BUDGET" = 0 ] || exit 2
   elif [ "$POOL_FLEET_BUDGET" != 0 ]; then
-    FLEET_CEILING=$((LIVE_POOL_MAX * LIVE_MAX_INSTANCES))
+    # Against the maxScale THIS DEPLOY WILL APPLY, not the live one. preserve mode reasserts
+    # shape, so the post-deploy ceiling is live-pool x applied-maxScale — and computing against the
+    # live maxScale made the printed remediation unable to converge: with live 20x20=400 it says
+    # "set DB_POOL_MAX_SIZE=$POOL_MAX", and the next run then computes POOL_MAX x live-20 and
+    # refuses again, forever, with no mention of maxScale. The operator loops or reaches for
+    # POOL_FLEET_BUDGET=0. Predicting the post-deploy state is both correct and self-consistent.
+    APPLIED_MAX_INSTANCES="${MAX_INSTANCES:-$MAX}"
+    FLEET_CEILING=$((LIVE_POOL_MAX * APPLIED_MAX_INSTANCES))
     if [ "$FLEET_CEILING" -gt "$POOL_FLEET_BUDGET" ]; then
-      echo "REFUSING to deploy: the LIVE service would open up to $FLEET_CEILING database" >&2
-      echo "connections (DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$LIVE_MAX_INSTANCES)," >&2
+      echo "REFUSING to deploy: the service would open up to $FLEET_CEILING database" >&2
+      echo "connections (live DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$APPLIED_MAX_INSTANCES" >&2
+      echo "as this deploy would apply it; live maxScale is currently $LIVE_MAX_INSTANCES)," >&2
       echo "over the $POOL_FLEET_BUDGET budget and against a max_connections of 300 shared" >&2
       echo "with worker/gateway/jobs. This script would set POOL_MAX=$POOL_MAX; preserve mode" >&2
       echo "does not apply it, so the live value drifted and every deploy has carried it." >&2
@@ -262,7 +284,16 @@ if [ "$CONFIG" = preserve ]; then
       echo "    --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2
       exit 2
     fi
-    echo "   pool drift check: $LIVE_POOL_MAX x $LIVE_MAX_INSTANCES = $FLEET_CEILING (budget $POOL_FLEET_BUDGET)"
+    echo "   pool drift check: $LIVE_POOL_MAX x $APPLIED_MAX_INSTANCES = $FLEET_CEILING (budget $POOL_FLEET_BUDGET)"
+    # preserve mode does NOT apply POOL_MAX (env vars are the live service's to keep), so the
+    # script's intent and production can disagree silently and indefinitely. Say so on every
+    # deploy: this is exactly how the live pool sat at 6 while this file said otherwise.
+    if [ "$LIVE_POOL_MAX" != "$POOL_MAX" ]; then
+      echo "   WARNING: live DB_POOL_MAX_SIZE=$LIVE_POOL_MAX but this script intends $POOL_MAX." >&2
+      echo "   preserve mode will NOT change it. To adopt the intended value:" >&2
+      echo "     gcloud run services update $SERVICE --region $REGION --project $PROJECT \\" >&2
+      echo "       --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2
+    fi
   fi
   if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
     # --update-* merges only these two keys.  It must not replace the active
@@ -398,7 +429,7 @@ probe_health(){ # url -> echoes the status code
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
   ${CMD_ARGS[@]+"${CMD_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency 80 --timeout 300 \
+  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency "$CONCURRENCY" --timeout 300 \
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \

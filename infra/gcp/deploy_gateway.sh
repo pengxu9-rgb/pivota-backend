@@ -190,7 +190,9 @@ grep -vE '^(PIVOTA_ENV|PIVOTA_SERVICE_NAME|PIVOTA_COMMIT_SHA|PIVOTA_PLATFORM|SKI
   # repo, so that sizing was inert. Measure the variable names before trusting a budget.
   #
   # BUDGET against max_connections=300 (raised from 200):
-  #   web 20x6=120 + gateway 20x5=100 + worker 1x10=10 = 230, leaving 70 for ops and superuser.
+  #   web 10x12=120 + gateway 20x5=100 + worker 1x10=10 = 230, leaving 70 for ops and superuser.
+  #   (web was 20x6 until 2026-08-29; same 120 ceiling, but concurrency 80->20 so its pool is
+  #    1.7x oversubscribed instead of 13x — see deploy_backend.sh's prod case arm.)
   #   proof-issuer and acp mount no DATABASE_URL at all, so they contribute 0.
   printf 'DB_POOL_MAX: "%s"\nPCI_KB_DB_POOL_MAX: "%s"\nINGREDIENT_REFERENCE_DB_POOL_MAX: "%s"\nINGREDIENT_SIGNAL_DB_POOL_MAX: "%s"\n' \
     "$GW_POOL_MAIN" "$GW_POOL_AUX" "$GW_POOL_AUX" "$GW_POOL_AUX"
