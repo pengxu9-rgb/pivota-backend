@@ -362,7 +362,7 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    cutover and the late-Sep launch. ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real
    restart, so this is not cosmetic.
 9. **Cloud SQL connection budget — RESOLVED, measured.** `max_connections` raised 200 → 300.
-   Measured worst case 230/300 (headroom 70): web 20x6, gateway 20x5, worker 1x10, and
+   Measured worst case 230/300 (headroom 70): web 10x12, gateway 20x5, worker 1x10, and
    proof-issuer + acp contribute **0** because they mount no `DATABASE_URL` at all. Re-derive this
    from the live services (not from comments) whenever a service or a pool default changes.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git

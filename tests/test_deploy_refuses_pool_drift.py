@@ -91,13 +91,18 @@ def _run(tmp_path: Path, pool_max: str, max_scale: str, **extra_env):
 
 
 def test_it_refuses_when_the_fleet_ceiling_exceeds_the_budget(tmp_path: Path) -> None:
-    """The exact drift that shipped: 20 x 20 = 400 against max_connections 300."""
+    """The drift that shipped: a live pool of 20.
+
+    The ceiling is computed against the maxScale THIS DEPLOY APPLIES (10), not the live one (20) —
+    that is what makes the printed remediation converge instead of looping. 20 x 10 = 200, still
+    over the 180 budget, so it must still refuse.
+    """
     result = _run(tmp_path, pool_max="20", max_scale="20")
     combined = result.stdout + result.stderr
     assert result.returncode == 2, (
         f"expected refusal, got {result.returncode}\n{combined[-2000:]}"
     )
-    assert "400" in combined, "the refusal must state the computed ceiling"
+    assert "200" in combined, "the refusal must state the computed ceiling"
     # Assert the SHAPE of the remediation, not a literal. Pinning "DB_POOL_MAX_SIZE=6" made this
     # test fail the moment the prod pool was legitimately resized (6 -> 12 after the 2026-08-29
     # wedge), which teaches the next person to edit the assertion rather than think about it. What
@@ -107,20 +112,31 @@ def test_it_refuses_when_the_fleet_ceiling_exceeds_the_budget(tmp_path: Path) ->
     # which would assert the drift against itself and pass for the wrong reason.
     match = re.search(r"--update-env-vars\s+DB_POOL_MAX_SIZE=(\d+)", combined)
     assert match, f"the refusal must name a runnable remediation\n{combined[-2000:]}"
-    # The remediation must actually REDUCE the drifted pool (live is 20 here). Asserting the
-    # script's own constant instead would just re-pin a literal, and multiplying by the injected
-    # live maxScale is wrong too: the suggestion assumes the deploy also reasserts the script's
-    # maxScale, which is the whole point of preserve mode reasserting shape.
-    assert int(match.group(1)) < 20, (
-        f"the remediation DB_POOL_MAX_SIZE={match.group(1)} does not reduce the drifted pool"
+    # The remediation must bring the fleet INSIDE the budget once applied. An earlier draft
+    # asserted only `< 20` (the injected live value), which passes for a remediation of 0 and for
+    # 19 — and 19 x the applied maxScale is 190, still over budget — while its comment claimed to
+    # check exactly this. Read both numbers from the script rather than duplicating them: a copy
+    # here can drift, and then this guard asserts against a stale version of what it guards.
+    script = SCRIPT.read_text()
+    prod_line = next(ln for ln in script.splitlines() if ln.strip().startswith("prod)"))
+    applied_max = int(re.search(r"\bMAX=\"?(\d+)\"?", prod_line).group(1))
+    budget = int(
+        re.search(r'POOL_FLEET_BUDGET="\$\{POOL_FLEET_BUDGET:-(\d+)\}"', script).group(1)
+    )
+    suggested = int(match.group(1))
+    assert suggested > 0, "a remediation of 0 connections is not a usable instruction"
+    assert suggested * applied_max <= budget, (
+        f"the remediation DB_POOL_MAX_SIZE={suggested} x applied maxScale {applied_max} = "
+        f"{suggested * applied_max} still exceeds the {budget}-connection budget"
     )
 
 
 @pytest.mark.parametrize(
     ("pool_max", "max_scale", "expected"),
     [
-        ("6", "20", "pool drift check: 6 x 20 = 120"),   # the shape before 2026-08-29
-        ("12", "10", "pool drift check: 12 x 10 = 120"),  # the shape after: same ceiling, 1.7x
+        # Both rows use the maxScale the deploy APPLIES (10), whatever the live value is.
+        ("6", "20", "pool drift check: 6 x 10 = 60"),    # live pool still 6, deploy shrinks scale
+        ("12", "10", "pool drift check: 12 x 10 = 120"),  # the shape adopted after 2026-08-29
     ],
 )
 def test_a_correct_configuration_passes(tmp_path: Path, pool_max: str, max_scale: str, expected: str) -> None:

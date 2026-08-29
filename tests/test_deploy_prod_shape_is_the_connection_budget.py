@@ -1,19 +1,24 @@
-"""The prod service SHAPE the deploy applies is a connection budget, and must not drift back.
+"""The prod service SHAPE the deploy applies is a connection budget, and must not regress.
 
-Context: prod `web` wedged its database pool twice in one week (2026-08-28 ~6h, 2026-08-29 ~1h).
-Every error in both was the same line — `PoolCheckoutTimeout: timed out waiting 120.0s for a
-database connection` — while Cloud SQL sat RUNNABLE at 28/300 backends, 23 of them IDLE. The cause
-was shape, not load: 80 concurrent requests per instance against a pool of 6 is 13x
-oversubscription, and traffic at onset was ~28 requests per 15 minutes.
+prod `web` wedged its database pool twice in one week — 2026-08-28 (~6h) and 2026-08-29 (~1h, 310
+timeouts). Every error in both was `PoolCheckoutTimeout: timed out waiting 120.0s for a database
+connection`, while Cloud SQL sat RUNNABLE at 28/300 backends with 23 IDLE and traffic ran at
+~0.03 req/s. Shape, not load: 80 concurrent requests against a pool of 6.
 
-`deploy_backend.sh` is the source of truth for shape — its own comment says an operator who widens
-a value by hand "will have it pulled back silently by the next CI deploy", and that is exactly what
-happened to the first fix. So the fix has to live in the script, and something has to hold it there:
-before this file, reverting POOL_MAX to 6 or CONCURRENCY to 80 broke no test at all.
+`deploy_backend.sh` is the source of truth for shape — its own comment warns that a value widened
+by hand "will have it pulled back silently by the next CI deploy", which is exactly what happened
+to the first fix. So the fix lives in the script, and this file holds it there: before it, reverting
+POOL_MAX to 6 or CONCURRENCY to 80 broke no test in the repo.
 
-Asserts on the arguments the script ACTUALLY passes to `gcloud run deploy`, captured through the
-same GCLOUD injection point tests/test_deploy_refuses_pool_drift.py uses — not on source text, so
-a rewrite that preserves the behaviour still passes.
+HOW THIS ASSERTS, and where it does not:
+  - The two `deploy_argv` tests assert OUTCOMES — the arguments the script really passes to
+    `gcloud run deploy`, captured through the same GCLOUD injection point the pool-drift test uses.
+  - The budget/floor tests necessarily read the script's CONSTANTS, because the constants ARE the
+    contract. That is source parsing, and it is brittle to reformatting (quoting, line
+    continuations, renaming the case arm); `_prod_constants` raises with an explicit message rather
+    than a bare AttributeError so the next person knows what broke and why.
+  - POOL_FLEET_BUDGET is READ from the script, never duplicated. A copy here could drift, and then
+    this guard would be asserting against a stale version of the very budget it guards.
 """
 
 from __future__ import annotations
@@ -29,13 +34,40 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "infra" / "gcp" / "deploy_backend.sh"
 
-# Cloud SQL `pivota-pg` (db-custom-2-7680) runs max_connections=300, shared with worker,
-# catalog-intelligence and ops. The script's own guard budgets web at 180.
-FLEET_BUDGET = 180
+# Post-incident floors. These are REGRESSION PINS, not derived constants — say so rather than
+# dress them up. 2026-08-29: pool 6 with concurrency 80 wedged production twice, so the shape
+# adopted after it is 12/20. Moving either past these needs a deliberate edit here and a reason.
+POOL_MAX_FLOOR = 12
+CONCURRENCY_CEILING = 20
+
+
+def _script_source() -> str:
+    return SCRIPT.read_text()
+
+
+def _prod_constants() -> dict[str, int]:
+    """Parse the prod case arm. Raises with context — a bare regex None here is unreadable."""
+    source = _script_source()
+    line = next(
+        (ln for ln in source.splitlines() if ln.strip().startswith("prod)")), None
+    )
+    assert line, "no `prod)` case arm in deploy_backend.sh — the shape contract moved; update this test"
+    out: dict[str, int] = {}
+    for name in ("MAX", "POOL_MAX", "CONCURRENCY"):
+        match = re.search(rf"\b{name}=\"?(\d+)\"?", line)
+        assert match, f"could not read {name} from the prod case arm:\n  {line.strip()}"
+        out[name] = int(match.group(1))
+    return out
+
+
+def _fleet_budget() -> int:
+    """The script's OWN budget, not a copy of it."""
+    match = re.search(r'POOL_FLEET_BUDGET="\$\{POOL_FLEET_BUDGET:-(\d+)\}"', _script_source())
+    assert match, "could not read POOL_FLEET_BUDGET's default from deploy_backend.sh"
+    return int(match.group(1))
 
 
 def _shim(tmp_path: Path) -> Path:
-    """A gcloud that answers `describe` with the intended prod shape and records the deploy call."""
     shim = tmp_path / "gcloud"
     shim.write_text(
         textwrap.dedent(
@@ -59,24 +91,29 @@ def _shim(tmp_path: Path) -> Path:
     return shim
 
 
-@pytest.fixture(scope="module")
-def deploy_argv(tmp_path_factory) -> list[str]:
-    tmp_path = tmp_path_factory.mktemp("shape")
-    env = dict(os.environ)
-    env.update({"GCLOUD": str(_shim(tmp_path)), "CONFIG": "preserve", "PROMOTE": "0"})
+def _deploy_argv(tmp_path: Path, env_name: str) -> list[str]:
+    """Capture the real `gcloud run deploy` argv for an environment.
+
+    A MINIMAL env, deliberately: the script honours MAX_INSTANCES/MIN_INSTANCES/POOL_FLEET_BUDGET
+    from the environment, so inheriting os.environ wholesale makes these tests fail on a machine
+    that happens to export one of them.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "GCLOUD": str(_shim(tmp_path)),
+        "CONFIG": "preserve",
+        "PROMOTE": "0",
+    }
     result = subprocess.run(
-        ["bash", str(SCRIPT), "prod", "deadbeefcafe"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=180,
+        ["bash", str(SCRIPT), env_name, "deadbeefcafe"],
+        capture_output=True, text=True, env=env, timeout=180,
     )
     combined = result.stdout + result.stderr
     line = next(
-        (ln for ln in combined.splitlines() if ln.startswith("SHIM_CALLED run deploy")),
-        None,
+        (ln for ln in combined.splitlines() if ln.startswith("SHIM_CALLED run deploy")), None
     )
-    assert line, f"the script never reached `gcloud run deploy`\n{combined[-3000:]}"
+    assert line, f"`{env_name}` never reached `gcloud run deploy`\n{combined[-3000:]}"
     return line.split()
 
 
@@ -85,39 +122,56 @@ def _flag(argv: list[str], name: str) -> str:
     return argv[argv.index(name) + 1]
 
 
-def test_prod_deploys_with_the_budgeted_concurrency(deploy_argv: list[str]) -> None:
-    """80 concurrent against a pool of 12 is the 6.7x that a single stalled socket can wedge."""
-    assert _flag(deploy_argv, "--concurrency") == "20"
+def test_prod_deploys_the_concurrency_the_script_declares(tmp_path: Path) -> None:
+    """Wiring: the per-env constant must actually reach gcloud, not a hardcoded literal."""
+    argv = _deploy_argv(tmp_path, "prod")
+    assert _flag(argv, "--concurrency") == str(_prod_constants()["CONCURRENCY"])
+    assert _flag(argv, "--max-instances") == str(_prod_constants()["MAX"])
 
 
-def test_prod_deploys_with_the_budgeted_instance_ceiling(deploy_argv: list[str]) -> None:
-    assert _flag(deploy_argv, "--max-instances") == "10"
+def test_staging_still_deploys(tmp_path: Path) -> None:
+    """The staging arm needs its own CONCURRENCY or `set -u` aborts EVERY staging deploy.
 
-
-def test_the_fleet_ceiling_stays_inside_the_connection_budget() -> None:
-    """max-instances x DB_POOL_MAX_SIZE must fit the budget the script's own guard enforces.
-
-    Reads the constants the script applies for prod. This is the one assertion that has to look at
-    the constants: they ARE the contract, and the arithmetic between them is the property that
-    keeps production up.
+    Deleting `CONCURRENCY=80` from the staging line left the whole suite green while
+    `deploy_backend.sh staging <tag>` died with `CONCURRENCY: unbound variable`.
     """
-    source = SCRIPT.read_text()
-    prod = next(ln for ln in source.splitlines() if ln.strip().startswith("prod)"))
-    max_instances = int(re.search(r"\bMAX=(\d+)", prod).group(1))
-    pool_max = int(re.search(r"\bPOOL_MAX=(\d+)", prod).group(1))
-    concurrency = int(re.search(r"\bCONCURRENCY=(\d+)", prod).group(1))
-
-    assert max_instances * pool_max <= FLEET_BUDGET, (
-        f"prod fleet ceiling {max_instances} x {pool_max} = {max_instances * pool_max} "
-        f"exceeds the {FLEET_BUDGET}-connection budget"
+    argv = _deploy_argv(tmp_path, "staging")
+    concurrency = _flag(argv, "--concurrency")
+    assert concurrency.isdigit() and int(concurrency) > 0, (
+        f"staging deploys with a non-numeric --concurrency {concurrency!r}"
     )
-    # The ratio that caused both outages. 13x wedged prod twice in a week; the post-incident shape
-    # is 20/12 = 1.7x. The bar is 2x — a pool should absorb at least half its instance's concurrent
-    # requests before anyone queues, because a request that queues for a connection is holding a
-    # worker AND waiting out DB_POOL_CHECKOUT_TIMEOUT_SECONDS (120s) before it even fails.
-    # Deliberately tight: at 4x a POOL_MAX reverted to 6 still passed, which is precisely the
-    # regression this file exists to stop.
-    assert concurrency / pool_max <= 2, (
-        f"concurrency {concurrency} against pool {pool_max} is "
-        f"{concurrency / pool_max:.1f}x oversubscribed — a single stalled socket can wedge the pool"
+
+
+def test_the_fleet_ceiling_stays_inside_the_scripts_own_budget() -> None:
+    """max-instances x pool must fit the budget THIS SCRIPT enforces (read, never duplicated)."""
+    prod = _prod_constants()
+    budget = _fleet_budget()
+    ceiling = prod["MAX"] * prod["POOL_MAX"]
+    assert ceiling <= budget, (
+        f"prod fleet ceiling {prod['MAX']} x {prod['POOL_MAX']} = {ceiling} "
+        f"exceeds the script's own {budget}-connection budget"
+    )
+
+
+def test_the_pool_has_not_regressed_below_the_post_incident_floor() -> None:
+    """A floor on POOL_MAX is the property the outage actually implies.
+
+    An instance wedges once concurrent stalled connections reach POOL_MAX — the pool size is the
+    thing that decides how many stalls it survives, independent of concurrency. Pinning a ratio
+    instead (an earlier draft used concurrency/pool <= 2) had no derivation: it was chosen because
+    it happened to kill a POOL_MAX=6 mutant, staging violates it at 10x, and it would block
+    legitimate shapes like a large concurrency over cheap cached routes.
+    """
+    pool_max = _prod_constants()["POOL_MAX"]
+    assert pool_max >= POOL_MAX_FLOOR, (
+        f"prod POOL_MAX={pool_max} is below the post-incident floor of {POOL_MAX_FLOOR}; "
+        "6 wedged production twice on 2026-08-28 and 2026-08-29"
+    )
+
+
+def test_concurrency_has_not_regressed_above_the_post_incident_ceiling() -> None:
+    concurrency = _prod_constants()["CONCURRENCY"]
+    assert concurrency <= CONCURRENCY_CEILING, (
+        f"prod CONCURRENCY={concurrency} exceeds the post-incident ceiling of "
+        f"{CONCURRENCY_CEILING}; 80 against a pool of 6 wedged production twice"
     )
