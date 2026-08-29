@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from sqlalchemy import (
+    REAL,
     BigInteger,
     Boolean,
     Column,
     DateTime,
-    Float,
     Index,
     Integer,
     Numeric,
@@ -38,13 +38,14 @@ catalog_merchants = Table(
     Column("metadata_json", JSONB_TYPE, nullable=True),
     # PR-1b — opt-in for the auto-re-audit scheduler. 'none' | 'weekly'
     # | 'monthly'. Migration 078_catalog_merchants_audit_schedule.sql
-    # adds the column with default 'none' to existing rows.
-    Column("audit_schedule", String(16), nullable=False, server_default="none"),
+    # adds the column with default 'none' to existing rows — as TEXT, not
+    # VARCHAR(16), so that is what this declares.
+    Column("audit_schedule", Text, nullable=False, server_default="none"),
     # Stage 2a (mig 084): timestamp of the merchant's most recent
     # successful Path A full sync. Used by the sweep to compare per-row
     # last_seen_in_sync_at — without it we couldn't tell "merchant
     # hasn't synced lately" from "row was deleted from upstream."
-    Column("last_full_sync_at", DateTime, nullable=True),
+    Column("last_full_sync_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
 )
@@ -64,7 +65,7 @@ catalog_products = Table(
     Column("source_ref", String(255), nullable=True),
     Column("source_domain", Text, nullable=True),
     Column("suppression_reason", Text, nullable=True),
-    Column("suppressed_at", DateTime, nullable=True),
+    Column("suppressed_at", DateTime(timezone=True), nullable=True),
     Column("suppression_metadata", JSONB_TYPE, nullable=True),
     Column("title", Text, nullable=False),
     Column("description", Text, nullable=True),
@@ -74,7 +75,10 @@ catalog_products = Table(
     # Phase 2 / O-5 — hierarchical PDP taxonomy path. The sync path writes
     # these inline, so runtime metadata must match migration 069.
     Column("category_path", String(255), nullable=True),
-    Column("category_confidence", Float, nullable=True),
+    # Human-readable leaf label for category_path (mig 097). Also in
+    # schema_guard's REQUIRED_SCHEMA for catalog_products.
+    Column("category_label", String(255), nullable=True),
+    Column("category_confidence", REAL, nullable=True),
     Column("category_label_source", String(32), nullable=True),
     # Durable category_kind in {skincare, haircare, supplement} (mig 151).
     # Drives claim-safety / disclaimers / serving-gate; see services.category_kind.
@@ -113,7 +117,7 @@ catalog_products = Table(
     # stay aligned with the live schema.
     Column("pdp_scope", String(32), nullable=False, server_default="unverified"),
     Column("pdp_scope_source", String(32), nullable=True),
-    Column("pdp_scope_set_at", DateTime, nullable=True),
+    Column("pdp_scope_set_at", DateTime(timezone=True), nullable=True),
     # Phase O-4 — onboarding lifecycle stage (mig 077). Computed at
     # ingest by every path; recall (Phase O-5) filters on
     # validated|published. See docs/PDP_ONBOARDING_PLAYBOOK.md.
@@ -130,13 +134,14 @@ catalog_products = Table(
     # expected_steady) in merchant_view.diagnosis. See migration 073
     # + services/pivota_indexing_arc.py. Nullable for now because the
     # backfill sets pre-existing rows to their created_at.
-    Column("pivota_signature_minted_at", DateTime, nullable=True),
+    Column("pivota_signature_minted_at", DateTime(timezone=True), nullable=True),
     # Stage 1 of the PDP architecture roadmap (mig 083). Content-derived
     # product identity: same physical product across merchants/paths
     # produces the same content_key. See services/catalog_identity.py
     # + plans/rosy-mixing-bengio.md. Nullable for rows predating mig
-    # 083; backfilled by scripts/backfill_content_key.py.
-    Column("content_key", Text, nullable=True),
+    # 083; backfilled by scripts/backfill_content_key.py. VARCHAR(40), matching
+    # migration 083 and agent_pdp_view.content_key — not TEXT.
+    Column("content_key", String(40), nullable=True),
     # ADR-011 (mig 178): GS1-canonical GTIN-14 as a MATCH ATTRIBUTE on the
     # canonical identity — NOT folded into content_key. The SPU model
     # (Amazon ASIN / Dewu SPU): content_key is the merchant-agnostic
@@ -156,7 +161,7 @@ catalog_products = Table(
     # sets last_seen_in_sync_at=NOW() on every write. NULL on rows from
     # non-sync paths (external_seed mirror, enrichment agent) or rows
     # predating mig 084.
-    Column("last_seen_in_sync_at", DateTime, nullable=True),
+    Column("last_seen_in_sync_at", DateTime(timezone=True), nullable=True),
     # Stage 2a (mig 084): sync lifecycle. 'live' (default) | 'stale' |
     # 'archived'. Sweep flips to stale when last_seen falls behind
     # catalog_merchants.last_full_sync_at by GRACE_HOURS. Recall layer
@@ -170,13 +175,28 @@ catalog_products = Table(
     # column names" — surfaced via the 2026-05-18 E2E validation run.
     Column("material", Text, nullable=True),
     Column("material_source", String(32), nullable=True),
-    Column("material_confidence", Float, nullable=True),
+    Column("material_confidence", REAL, nullable=True),
     Column("care", Text, nullable=True),
     Column("care_source", String(32), nullable=True),
-    Column("care_confidence", Float, nullable=True),
+    Column("care_confidence", REAL, nullable=True),
     Column("size_guide", JSONB_TYPE, nullable=True),
     Column("size_guide_source", String(32), nullable=True),
-    Column("size_guide_confidence", Float, nullable=True),
+    Column("size_guide_confidence", REAL, nullable=True),
+    # Review signal lifted from a PDP's schema.org aggregateRating (mig 186).
+    # The decision-intelligence lane reads exactly these names, and
+    # services/agent_pdp_view_assembler.py SELECTs cp.rating_value when it
+    # builds agent_pdp_view — a schema built from this model without them
+    # fails that build (swallowed as a best-effort warning).
+    Column("rating_value", Numeric, nullable=True),
+    Column("rating_count", Integer, nullable=True),
+    # pdp_will_render / pdp_will_render_computed_at (mig 188) are DELIBERATELY
+    # ABSENT, and a drift audit that "helpfully" adds them is reverting a
+    # decision, not fixing an oversight. services/pdp_renderability_store.py
+    # documents why: the columns are referenced only BY NAME (a
+    # sa.literal_column predicate and a raw UPDATE), because adding them here
+    # makes every select(catalog_products) in the repo emit them, and a deploy
+    # that lands before the database grows the column turns each of those into
+    # an UndefinedColumn 500. The safeguard IS their absence from this Table.
     Column("content_changed_at", DateTime, server_default=func.now(), nullable=False),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
@@ -233,7 +253,7 @@ catalog_skus = Table(
     Column("source_variant_id", String(128), nullable=False),
     Column("source_domain", Text, nullable=True),
     Column("suppression_reason", Text, nullable=True),
-    Column("suppressed_at", DateTime, nullable=True),
+    Column("suppressed_at", DateTime(timezone=True), nullable=True),
     Column("suppression_metadata", JSONB_TYPE, nullable=True),
     Column("sku", String(128), nullable=True, index=True),
     Column("barcode", String(128), nullable=True),
@@ -289,7 +309,7 @@ catalog_offers = Table(
     Column("source_domain", Text, nullable=True),
     Column("offer_payload", JSONB_TYPE, nullable=True),
     Column("suppression_reason", Text, nullable=True),
-    Column("suppressed_at", DateTime, nullable=True),
+    Column("suppressed_at", DateTime(timezone=True), nullable=True),
     Column("suppression_metadata", JSONB_TYPE, nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
@@ -297,6 +317,16 @@ catalog_offers = Table(
 )
 
 
+# KNOWN MODEL/MIGRATION DISAGREEMENT, deliberately left as-is.
+# db/migrations/132 declares `applied_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+# but main.py runs metadata.create_all BEFORE the migrations, so on every
+# database the app has ever booted this table was created HERE, naive, and
+# 132's CREATE TABLE IF NOT EXISTS has no-opped ever since. The model is what
+# prod actually has; the migration is the one that never landed. Changing this
+# to timezone=True would make fresh migrations-first databases disagree with
+# prod rather than agree with it, so the fix belongs in a decision about which
+# of the two owns this table, not in a type swap here. Migration 132 also
+# indexes (writer_name, applied_at DESC); the Index below is ASC.
 writer_audit_log = Table(
     "writer_audit_log",
     metadata,
@@ -645,14 +675,23 @@ agent_pdp_view = Table(
     # merchant_authored > llm_extraction_v1 > external_seed.
     Column("material", Text, nullable=True),
     Column("material_source", String(32), nullable=True),
-    Column("material_confidence", Float, nullable=True),
+    Column("material_confidence", REAL, nullable=True),
     Column("care", Text, nullable=True),
     Column("care_source", String(32), nullable=True),
-    Column("care_confidence", Float, nullable=True),
+    Column("care_confidence", REAL, nullable=True),
     Column("size_guide", JSONB_TYPE, nullable=True),
     Column("size_guide_source", String(32), nullable=True),
-    Column("size_guide_confidence", Float, nullable=True),
-    Column("refreshed_at", DateTime, server_default=func.now(), nullable=False),
+    Column("size_guide_confidence", REAL, nullable=True),
+    # Provenance-backed evidence + disclaimers mirrored from
+    # beauty_product_profiles (mig 152).
+    Column("evidence_profile", JSONB_TYPE, nullable=True),
+    Column("required_disclaimers", JSONB_TYPE, nullable=True),
+    # Review signal mirrored from catalog_products for the serve path (mig 186).
+    Column("rating_value", Numeric, nullable=True),
+    Column("rating_count", Integer, nullable=True),
+    Column(
+        "refreshed_at", DateTime(timezone=True), server_default=func.now(), nullable=False
+    ),
     Column("refreshed_by_proposal_id", BigInteger, nullable=True),
     Column("refresh_source", Text, nullable=True),
     Index(

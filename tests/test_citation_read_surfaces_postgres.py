@@ -93,19 +93,21 @@ CREATE TABLE IF NOT EXISTS content_canonical_election (content_key text PRIMARY 
 ALTER TABLE content_canonical_election ADD COLUMN IF NOT EXISTS canonical_sig_id text;
 
 CREATE TABLE IF NOT EXISTS aurora_product_intel_kb (kb_key text, analysis jsonb);
--- The evidence columns (migration 152) postdate `db.catalog.agent_pdp_view`'s
--- Core definition, which is why `routes/pivota_canonical_routes` reads them
--- through a local lightweight `table()` shim instead. `metadata.create_all`
--- therefore builds the table WITHOUT them, exactly as it would on any fresh
--- database, and prod gets them from db/schema_guard.py instead. Mirror that
--- here or the by-sig route cannot prepare.
+-- The evidence columns (migration 152) are declared by `db.catalog` and by
+-- db/schema_guard.py, so `metadata.create_all` builds them on a fresh database.
+-- `routes/pivota_canonical_routes` still reads them through a local lightweight
+-- `table()` shim, a leftover from when the Core definition lacked them. These
+-- ALTERs stay because this database is SHARED and reused: `create_all` skips a
+-- table that already exists, so a table built by an older model would otherwise
+-- stay narrow and the by-sig route could not prepare.
 ALTER TABLE agent_pdp_view
   ADD COLUMN IF NOT EXISTS evidence_profile jsonb,
   ADD COLUMN IF NOT EXISTS required_disclaimers jsonb;
--- Migration 186 (ratings) postdates the Core Table definition too. Same
--- pattern as the evidence columns above: prod gets these from
--- db/schema_guard.py, so the fixture must mirror them or every gated,
--- widened, and bypass SELECT fails to PREPARE on a fresh schema.
+-- Migration 186 (ratings). Same pattern as the evidence columns above: the
+-- Core Table declares them and prod also self-heals them from
+-- db/schema_guard.py, but a pre-existing table in this shared database keeps
+-- whatever shape it was built with, so mirror them or every gated, widened,
+-- and bypass SELECT fails to PREPARE.
 -- NOTE this DDL string is split on every semicolon character, comments
 -- included, and the local dialect-gate database is initdb'd with locale=C.
 -- Comments here must therefore be plain ASCII and semicolon-free.
