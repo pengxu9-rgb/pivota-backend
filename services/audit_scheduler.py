@@ -128,6 +128,12 @@ _JOB_RUN_DEADLINES = {
     "executor_run_worker_tick": 1800,
     "verification_run_worker_tick": 300,
     "quality_backfill_drain_tick": 3600,
+    # catalog ingest walks a merchant's whole products_cache and writes the
+    # catalog tree; same order of magnitude as the quality backfill it feeds,
+    # and its runner requeues the row on cancel
+    # (services.catalog_sync_service.requeue_catalog_sync_job) so a cut run
+    # is retried rather than stranding the merchant with an empty catalog.
+    "catalog_sync_drain_tick": 3600,
     # DB-only reapers (60s / 5min cadence)
     "audit_run_lease_reaper": 120,
     "audit_run_abandoned_reaper": 120,
@@ -905,6 +911,28 @@ async def start_scheduler() -> None:
             "interval",
             seconds=30,
             id="quality_backfill_drain_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # Catalog-ingest drain: the step BEFORE the quality backfill above.
+        # `create_catalog_sync_job` writes a pending row from a request handler
+        # (merchant "Sync products", the Shopify catalog webhook, POST
+        # /v1/catalog/sync/jobs) and this tick runs it. It used to be run by a
+        # FastAPI BackgroundTask in the API process instead, which meant the
+        # work had no retry and no supervision: a revision swap or an
+        # unhandled error between the 200 response and the task's completion
+        # dropped the ingest with nothing but a `failed`/`running` row to show
+        # for it (2026-08-29: a second merchant's sync wrote zero catalog rows
+        # and the endpoint had already answered 200 catalog_ingest_queued=true).
+        # 30s matches the quality drain, so onboarding stays prompt.
+        from services.catalog_sync_drain import run_catalog_sync_drain_tick
+        _add_job(
+            run_catalog_sync_drain_tick,
+            "interval",
+            seconds=30,
+            id="catalog_sync_drain_tick",
             replace_existing=True,
             coalesce=True,
             max_instances=1,

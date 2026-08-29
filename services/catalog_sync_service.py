@@ -2493,6 +2493,128 @@ async def get_catalog_sync_job(job_id: str) -> Optional[Dict[str, Any]]:
     return await _fetch_one_by_pk(catalog_sync_jobs, "job_id", job_id)
 
 
+# --- catalog_sync_jobs queue claims ----------------------------------------
+#
+# `catalog_sync_jobs` rows used to be driven ONLY by whoever created them —
+# inline in a request, or from a FastAPI BackgroundTask. Both die with the
+# process (a Cloud Run revision swap, a scale-down, an unhandled error inside
+# the task) and neither leaves anything behind that would retry, so a merchant's
+# ingest could vanish leaving the row `pending` (never started) or `running`
+# (started, never finished) forever. `run_catalog_sync_drain_tick` now drains the
+# queue out of band, which means several runners can see the same row: every
+# pending -> running transition below is therefore a CONDITIONAL update that
+# returns the row only to the caller that actually won it.
+
+
+async def claim_catalog_sync_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically move ONE pending job to `running`.
+
+    Returns the claimed row, or None when the row does not exist or was already
+    claimed by someone else. The `AND status = 'pending'` is what makes this a
+    lock: a blind `UPDATE ... SET status='running'` (what `run_catalog_sync_job`
+    used to do) lets a request-inline runner and the drain tick both ingest the
+    same merchant concurrently.
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE catalog_sync_jobs
+        SET status = 'running',
+            started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP,
+            error_message = NULL
+        WHERE job_id = :job_id
+          AND status = 'pending'
+        RETURNING *
+        """,
+        {"job_id": job_id},
+    )
+    return dict(row) if row is not None else None
+
+
+async def claim_next_catalog_sync_job() -> Optional[Dict[str, Any]]:
+    """Claim the OLDEST pending job, or None when the queue is empty."""
+    queued = await database.fetch_one(
+        """
+        SELECT job_id
+        FROM catalog_sync_jobs
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1
+        """
+    )
+    if not queued:
+        return None
+    job_id = str(dict(queued).get("job_id") or "")
+    if not job_id:
+        return None
+    return await claim_catalog_sync_job(job_id)
+
+
+async def requeue_catalog_sync_job(job_id: str) -> bool:
+    """Put ONE running job back to `pending` so the next tick re-runs it.
+
+    Used when a run is CANCELLED rather than failed — the scheduler bounds every
+    tick by a deadline and cancels it on expiry, and a CancelledError bypasses
+    the `except Exception -> status='failed'` path in `run_catalog_sync_job`.
+    Without this the row stays `running` and no drainer will ever look at it
+    again. Same shape as `db.product_quality_backfill_jobs.requeue_quality_backfill_job`.
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE catalog_sync_jobs
+        SET status = 'pending',
+            started_at = NULL,
+            completed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = :job_id
+          AND status = 'running'
+        RETURNING job_id
+        """,
+        {"job_id": job_id},
+    )
+    return row is not None
+
+
+async def requeue_stale_catalog_sync_jobs(
+    *,
+    stale_after_seconds: int = 3600,
+    limit: int = 5,
+) -> int:
+    """Recover jobs stranded in `running` by a process that died mid-run.
+
+    This is the recovery the BackgroundTasks shape never had: a revision swap
+    killed the task, the row kept saying `running`, and nothing on any later
+    boot went looking for it. Bounded per tick so a backlog cannot monopolise
+    one drain.
+    """
+    cutoff_seconds = max(300, int(stale_after_seconds))
+    cutoff = _utcnow() - timedelta(seconds=cutoff_seconds)
+    result = await database.execute(
+        """
+        UPDATE catalog_sync_jobs
+        SET status = 'pending',
+            started_at = NULL,
+            completed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP,
+            error_message = 'stale_catalog_sync_job_requeued'
+        WHERE job_id IN (
+            SELECT job_id
+            FROM catalog_sync_jobs
+            WHERE status = 'running'
+              AND started_at IS NOT NULL
+              AND started_at < :cutoff
+            ORDER BY started_at ASC
+            LIMIT :limit
+        )
+        """,
+        {"cutoff": cutoff, "limit": max(1, int(limit))},
+    )
+    try:
+        return int(result or 0)
+    except Exception:  # noqa: BLE001 - driver-dependent return type
+        return 0
+
+
 async def record_catalog_sync_event(
     *,
     merchant_id: str,
@@ -2589,28 +2711,78 @@ async def sync_products_cache_to_catalog(
     )
 
 
-async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
-    job = await get_catalog_sync_job(job_id)
-    if not job:
-        raise RuntimeError(f"Catalog sync job not found: {job_id}")
+async def _settle_catalog_sync_event(
+    scope: Dict[str, Any],
+    *,
+    status: str,
+    error_message: Optional[str] = None,
+) -> None:
+    """Close the `catalog_sync_events` row named by a job's scope, if any.
 
+    Best-effort: the catalog write already landed (or already failed), and an
+    event bookkeeping error must not change that outcome.
+    """
+    event_id = str(scope.get("catalog_sync_event_id") or "").strip()
+    if not event_id:
+        return
+    try:
+        await mark_catalog_sync_event_processed(
+            event_id, status=status, error_message=error_message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "catalog_sync: could not mark event %s as %s", event_id, status, exc_info=True,
+        )
+
+
+async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
+    """Claim ONE pending catalog sync job and run it to completion.
+
+    The claim is atomic (`claim_catalog_sync_job`), so this is safe to call from
+    a request handler and from `run_catalog_sync_drain_tick` at the same time:
+    the loser gets the current row back and does NOT re-ingest. A job that is
+    not `pending` is therefore returned as-is rather than re-run.
+    """
+    claimed = await claim_catalog_sync_job(job_id)
+    if claimed is None:
+        existing = await get_catalog_sync_job(job_id)
+        if not existing:
+            raise RuntimeError(f"Catalog sync job not found: {job_id}")
+        logger.info(
+            "catalog_sync: job %s already claimed (status=%s); not re-running",
+            job_id, existing.get("status"),
+        )
+        return existing
+
+    return await run_claimed_catalog_sync_job(claimed)
+
+
+async def run_claimed_catalog_sync_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a job whose pending -> running claim the CALLER already won.
+
+    Split out so the drain tick, which claims with `claim_next_catalog_sync_job`,
+    does not have to claim a second time.
+    """
+    job_id = str(job.get("job_id") or "")
     scope = _json_dict(job.get("scope_json"))
     connector = str(job.get("connector") or "shopify")
     merchant_id = str(job.get("merchant_id") or "").strip()
     mode = str(job.get("mode") or "reconcile")
 
-    await _upsert_by_pk(
-        catalog_sync_jobs,
-        "job_id",
-        {
-            **job,
-            "status": "running",
-            "started_at": _utcnow(),
-            "error_message": None,
-        },
-    )
-
     try:
+        # `force_refresh` means "re-pull from the platform before ingesting", not
+        # just "ingest what products_cache already holds". It lives in the job's
+        # scope, so it runs for WHOEVER drains the row — this used to be done by
+        # the caller's BackgroundTask (routes/catalog_routes), which meant the
+        # stored job did not actually describe the work it stood for.
+        if bool(scope.get("force_refresh")) and connector == "shopify":
+            from services.shopify_products_sync import sync_shopify_products_for_merchant
+            await sync_shopify_products_for_merchant(
+                merchant_id=merchant_id,
+                limit=int(scope.get("limit") or 500),
+                ingest_catalog=False,
+            )
+
         stats = await sync_products_cache_to_catalog(
             merchant_id=merchant_id,
             platform=str(scope.get("platform") or connector or "shopify"),
@@ -2641,6 +2813,12 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
                 "catalog_sync: quality-backfill enqueue failed merchant=%s: %s",
                 merchant_id, exc,
             )
+        # A webhook-triggered job carries the `catalog_sync_events` row that
+        # produced it. Closing that row used to be the background task's job, so
+        # a dropped task left the event `pending` forever — settle it HERE, where
+        # the work actually happens, for whichever runner drained the row.
+        await _settle_catalog_sync_event(scope, status="processed")
+
         updated = await get_catalog_sync_job(job_id)
         if updated:
             return updated
@@ -2652,15 +2830,29 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
             "status": "completed",
             "stats_json": stats,
         }
+    except asyncio.CancelledError:
+        # Cancelled mid-run (scheduler run deadline, or the process going away):
+        # do NOT leave the row in `running`, which no drainer looks at. Requeue
+        # best-effort, then let the cancellation propagate. Same shape as the
+        # quality-backfill drain.
+        try:
+            await requeue_catalog_sync_job(job_id)
+            logger.warning("catalog_sync: job %s cancelled mid-run; requeued", job_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "catalog_sync: job %s cancelled; requeue failed", job_id, exc_info=True,
+            )
+        raise
     except Exception as exc:
-        # Log BEFORE the re-raise. This runs under a FastAPI BackgroundTask
-        # (routes/merchant_store_connections.py), i.e. after the response has
-        # been sent, so nothing in the request window reports it and the caller
-        # has already been told `catalog_ingest_queued: true` with a 200. On
-        # 2026-08-29 that left `catalog_sync_jobs.status='failed'` as the ONLY
-        # trace of a sync that wrote zero rows. The re-raise alone is not a log
-        # line: it lands in the ASGI server's handler, outside this service's
-        # structured logging.
+        # Log BEFORE the re-raise, and log it HERE rather than leaving the
+        # traceback to whatever called us. On 2026-08-29 the ONLY trace of a
+        # sync that wrote zero rows was `catalog_sync_jobs.status='failed'`:
+        # this ran under a FastAPI BackgroundTask, so the re-raise landed in the
+        # ASGI server's handler — outside this service's structured logging, and
+        # after the caller had already been told `catalog_ingest_queued: true`
+        # with a 200. The runner is out of band now and the caller gets a
+        # pollable job_id, but the log line stays: a `failed` row still says
+        # only THAT it failed, never why.
         logger.exception(
             "catalog_sync: job FAILED job_id=%s merchant=%s connector=%s mode=%s err=%s",
             job_id, merchant_id, connector, mode, exc,
@@ -2675,6 +2867,7 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
                 "completed_at": _utcnow(),
             },
         )
+        await _settle_catalog_sync_event(scope, status="failed", error_message=str(exc))
         raise
 
 
