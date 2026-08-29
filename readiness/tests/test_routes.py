@@ -2324,7 +2324,11 @@ async def test_readiness_probe_gate_reads_the_canonical_order_routes_helpers(mon
             test_psp_probe=True,
         )
         is True
-    ), "readiness ignored the canonical ALLOW_TEST_PSP_PROBE reader"
+    ), (
+        "patching routes.order_routes did not change the readiness decision: the ALLOW_TEST_PSP_PROBE\n"
+        "reader must be resolved from the canonical module at CALL time, not copied or "
+        "bound at import"
+    )
 
     monkeypatch.setattr(order_routes, "_test_psp_probe_enabled", lambda: True)
     monkeypatch.setattr(order_routes, "_test_psp_probe_merchants", lambda: {"merch_someone_else"})
@@ -2335,7 +2339,11 @@ async def test_readiness_probe_gate_reads_the_canonical_order_routes_helpers(mon
             test_psp_probe=True,
         )
         is True
-    ), "readiness ignored the canonical TEST_PSP_PROBE_MERCHANTS reader"
+    ), (
+        "patching routes.order_routes did not change the readiness decision: the TEST_PSP_PROBE_MERCHANTS\n"
+        "reader must be resolved from the canonical module at CALL time, not copied or "
+        "bound at import"
+    )
 
 
 def test_payment_status_sync_requires_existing_payment_intent(monkeypatch):

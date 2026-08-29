@@ -126,4 +126,10 @@ def test_the_global_floor_still_bites(tmp_path):
     """Unchanged behaviour — the fix must not disturb the global gate."""
     proc = _run(tmp_path, _xml(services=1682, readiness=133, other=100))
     assert proc.returncode != 0
-    assert "floor" in (proc.stdout + proc.stderr).lower()
+    # Assert the GLOBAL line specifically. The bare word "floor" appears in
+    # sys.exit's summary on EVERY failure, subtree ones included, so matching it
+    # would let this case keep its name while quietly testing the subtree gate --
+    # which is what would happen the first time a floor raise pushes the readiness
+    # minimum past the 133 this fixture models.
+    out = proc.stdout + proc.stderr
+    assert "only 1915 tests executed" in out, out

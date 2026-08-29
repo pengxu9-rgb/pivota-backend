@@ -144,7 +144,7 @@ jobs:
       #
       # FOUND BY THIS PR'S OWN STRAY-FILE GUARD: `readiness/tests/` is a whole
       # sub-package — 16 test files, 133 executed today — that ran in NO CI job either. It is
-      # swept in here rather than deferred, because 111 tests of coverage now
+      # swept in here rather than deferred, because that much coverage now
       # beats a tidier denylist later. Two of its files are red and join the
       # quarantine:
       #   readiness/tests/test_real_merchant_goldens.py
