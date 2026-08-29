@@ -4,8 +4,10 @@ The global floor already subtracts skips (`ran = total - skipped`). The per-subt
 did not, so an entire subtree could go inert — every case collected, none executed — and
 still clear its minimum.
 
-The global floor is not a backstop for that. `readiness.tests` is 79 cases against ~245 of
-global headroom, so the whole tree can stop executing with BOTH gates green.
+The global floor is not a backstop for that. `readiness.tests` is 133 cases against ~578 of
+global headroom, so the whole tree can stop executing with BOTH gates green. (It was 79
+against ~245 when this was written; un-quarantining readiness/tests/test_routes.py grew
+both numbers and the conclusion holds a fortiori.)
 (`tests.services` is incidentally covered only because 1,682 skips would exceed the global
 headroom — arithmetic luck, not a guarantee, and it evaporates when the floor next rises.)
 
@@ -97,7 +99,7 @@ def _xml(*, services: int, readiness: int, skip_readiness: bool = False,
 
 def test_a_fully_skipped_subtree_is_rejected(tmp_path):
     """THE hole. Every readiness case collected, none executed — previously exit 0."""
-    proc = _run(tmp_path, _xml(services=1682, readiness=79, skip_readiness=True))
+    proc = _run(tmp_path, _xml(services=1682, readiness=133, skip_readiness=True))
     assert proc.returncode != 0, (
         "a subtree whose every test is SKIPPED cleared its minimum:\n" + proc.stdout
     )
@@ -106,22 +108,28 @@ def test_a_fully_skipped_subtree_is_rejected(tmp_path):
 
 def test_a_healthy_run_still_passes(tmp_path):
     """Guard the guard: the fix must not red a genuinely green sweep."""
-    proc = _run(tmp_path, _xml(services=1682, readiness=79))
+    proc = _run(tmp_path, _xml(services=1682, readiness=133))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "readiness.tests: 79" in proc.stdout
+    assert "readiness.tests: 133" in proc.stdout
 
 
 def test_partial_skips_are_subtracted(tmp_path):
-    """70 is the minimum; 79 collected with 10 skipped is 69 executed — below it."""
+    """120 is the minimum; 133 collected with 14 skipped is 119 executed — below it."""
     # Built directly rather than by string-patching a hardcoded total, which silently
     # no-ops if the `other=` default ever changes.
-    proc = _run(tmp_path, _xml(services=1682, readiness=79, skip_readiness=False,
-                               readiness_skipped=10))
-    assert proc.returncode != 0, "69 executed should not clear a minimum of 70:\n" + proc.stdout
+    proc = _run(tmp_path, _xml(services=1682, readiness=133, skip_readiness=False,
+                               readiness_skipped=14))
+    assert proc.returncode != 0, "119 executed should not clear a minimum of 120:\n" + proc.stdout
 
 
 def test_the_global_floor_still_bites(tmp_path):
     """Unchanged behaviour — the fix must not disturb the global gate."""
-    proc = _run(tmp_path, _xml(services=1682, readiness=79, other=100))
+    proc = _run(tmp_path, _xml(services=1682, readiness=133, other=100))
     assert proc.returncode != 0
-    assert "floor" in (proc.stdout + proc.stderr).lower()
+    # Assert the GLOBAL line specifically. The bare word "floor" appears in
+    # sys.exit's summary on EVERY failure, subtree ones included, so matching it
+    # would let this case keep its name while quietly testing the subtree gate --
+    # which is what would happen the first time a floor raise pushes the readiness
+    # minimum past the 133 this fixture models.
+    out = proc.stdout + proc.stderr
+    assert "only 1915 tests executed" in out, out

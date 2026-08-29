@@ -39,6 +39,7 @@ from db.merchant_onboarding import merchant_onboarding
 from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
+from services.beauty_field_authoring import product_usage_guide_id
 from services.catalog_identity import make_content_key
 from services.category_kind import resolve_category_kind
 from services.vertical_profiles import (
@@ -593,7 +594,21 @@ def _extract_raw_inci(metadata: Dict[str, Any], ingredient_ids: List[str]) -> Op
     return None
 
 
-def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_tutorial_assets(product_key: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Child-row identities are derived from `product_key`, which is
+    merchant-scoped (`make_catalog_product_key`) — NOT from the platform's own
+    product id, which two merchants selling the same platform product share.
+
+    The rows are replaced by a DELETE scoped to this merchant's `product_key`,
+    so a key derived off the bare platform id made the second merchant's INSERT
+    collide with the FIRST merchant's surviving row: prod 2026-08-29,
+    `duplicate key value violates unique constraint "beauty_content_assets_pkey"`,
+    aborting the whole ingest transaction and leaving that merchant zero
+    catalog_products rows. A merchant-supplied `asset_id` is namespaced for the
+    same reason — two merchants carrying one platform product carry one
+    platform-supplied asset id too. `beauty_usage_guides.guide_id` already had
+    this shape and never collided; this is that shape.
+    """
     tutorials = _json_list(_extract_metadata_values(metadata, "tutorials", "tutorial_assets", "media_assets"))
     assets: List[Dict[str, Any]] = []
     for idx, item in enumerate(tutorials):
@@ -602,9 +617,14 @@ def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any])
         url = str(item.get("url") or item.get("href") or "").strip()
         if not url:
             continue
+        declared_asset_id = str(item.get("asset_id") or "").strip()
         assets.append(
             {
-                "asset_id": item.get("asset_id") or _stable_key("beauty_asset", product.id, idx, url),
+                "asset_id": (
+                    _stable_key("beauty_asset", product_key, "declared", declared_asset_id)
+                    if declared_asset_id
+                    else _stable_key("beauty_asset", product_key, idx, url)
+                ),
                 "asset_type": str(item.get("asset_type") or item.get("type") or "tutorial"),
                 "title": item.get("title"),
                 "url": url,
@@ -616,7 +636,10 @@ def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any])
     return assets
 
 
-def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+def _extract_shades(product_key: str, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+    """`product_key`, not `product.id` — see `_extract_tutorial_assets`. This is
+    the derivation that actually fired in prod on 2026-08-29
+    (`beauty_shades_pkey`)."""
     shades: List[Dict[str, Any]] = []
     labels = list(variant.visible_option_labels or [])
     for idx, label in enumerate(labels):
@@ -627,7 +650,7 @@ def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -
             continue
         shades.append(
             {
-                "shade_id": _stable_key("beauty_shade", product.id, variant.variant_id or variant.id, shade_name),
+                "shade_id": _stable_key("beauty_shade", product_key, variant.variant_id or variant.id, shade_name),
                 "shade_name": shade_name,
                 "shade_code": None,
                 "shade_family": _shade_family_from_name(shade_name),
@@ -859,19 +882,53 @@ async def _replace_child_rows(table: Any, match_column: str, match_value: Any, r
     return count
 
 
-async def _replace_child_rows_multi(table: Any, where_clauses: List[Any], rows: Iterable[Dict[str, Any]]) -> int:
+async def _replace_child_rows_multi(
+    table: Any,
+    where_clauses: List[Any],
+    rows: Iterable[Dict[str, Any]],
+    *,
+    pk_name: str,
+) -> int:
+    """Replace one scope's child rows — DELETE the scope, then write `rows`.
+
+    The DELETE is scoped (this merchant's `product_key`); the write is keyed by
+    primary key, and those two scopes are not the same set. Two independent ways
+    a key can already be present when we go to write it, both of which used to
+    raise `UniqueViolation` out of a plain INSERT and abort the ENTIRE ingest
+    transaction — one bad child row cost the merchant every catalog_products row
+    in the run (prod 2026-08-29):
+
+      1. WITHIN this batch. One product can legitimately derive the same child
+         id twice. Two `platform_metadata.tutorials` entries carrying the same
+         merchant-declared `asset_id` hash to one `asset_id`; two variants with
+         no variant id of their own both fall back to `product_key` and hash to
+         one `shade_id` per shade name. Dedupe on the PK, last wins.
+
+         Product-level payloads collected once per VARIANT used to be the third
+         and loudest case here. They no longer are: `beauty_content_assets` and
+         `beauty_usage_guides` rows are derived once, outside the variant loop,
+         and written with a NULL `sku_key`. Deduping them was never enough on
+         its own — the survivor kept the LAST variant's `sku_key`, so a per-SKU
+         read found a product-level tutorial on one variant and no other.
+
+      2. OUTSIDE the delete scope. Every derivation is merchant-scoped now, so
+         this can only be residue written under an older, unscoped derivation.
+         Upsert rather than INSERT so that residue degrades to a row rewrite
+         instead of costing the merchant their whole catalog.
+
+    Returns the number of DISTINCT rows written, which is what the caller's
+    `*_upserted` stat means.
+    """
     stmt = table.delete()
     for clause in where_clauses:
         stmt = stmt.where(clause)
     await database.execute(stmt)
-    count = 0
+    deduped: Dict[Any, Dict[str, Any]] = {}
     for row in rows:
-        payload = dict(row)
-        payload.setdefault("created_at", _utcnow())
-        payload.setdefault("updated_at", _utcnow())
-        await database.execute(table.insert().values(**payload))
-        count += 1
-    return count
+        deduped[row.get(pk_name)] = dict(row)
+    for payload in deduped.values():
+        await _upsert_by_pk(table, pk_name, payload)
+    return len(deduped)
 
 
 async def _append_snapshot(table: Any, values: Dict[str, Any]) -> None:
@@ -1642,6 +1699,12 @@ async def ingest_standard_products(
             )
 
             variants = _iter_variants(product)
+            # PRODUCT-level payloads, derived ONCE. `metadata` is the product's
+            # `platform_metadata`; it does not vary by variant, so deriving these
+            # inside the variant loop below only ever stamped product-level data
+            # with one variant's identity. See the write block after the loop.
+            how_to_use_text, how_to_use_steps = _extract_how_to_use(metadata)
+            tutorial_assets = _extract_tutorial_assets(product_key, metadata)
             beauty_usage_rows: List[Dict[str, Any]] = []
             beauty_shade_rows: List[Dict[str, Any]] = []
             beauty_asset_rows: List[Dict[str, Any]] = []
@@ -1888,24 +1951,10 @@ async def ingest_standard_products(
                         commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                     )
 
-                    how_to_use_text, steps = _extract_how_to_use(metadata)
-                    if how_to_use_text or steps:
-                        beauty_usage_rows.append(
-                            {
-                                "guide_id": _stable_key("beauty_usage", product_key, sku_key or "product"),
-                                "product_key": product_key,
-                                "sku_key": sku_key,
-                                "merchant_id": merchant_id,
-                                "how_to_use_text": how_to_use_text,
-                                "steps_json": steps,
-                                "frequency": str(metadata.get("usage_frequency") or "").strip() or None,
-                                "time_of_day": str(metadata.get("usage_time_of_day") or metadata.get("am_pm") or "").strip()
-                                or None,
-                                "application_order": _safe_int(metadata.get("application_order")),
-                                "warnings_json": _json_list(_extract_metadata_values(metadata, "warnings", "usage_warnings")),
-                                "evidence_refs_json": [source_ref] if source_ref else [],
-                            }
-                        )
+                    # The GUIDE row is product-level and is written after the
+                    # loop; this field fact is genuinely per-SKU (`entity_id` is
+                    # the sku_key), so it stays here — one fact per variant.
+                    if how_to_use_text or how_to_use_steps:
                         await _upsert_field_fact(
                             entity_type="sku",
                             entity_id=sku_key,
@@ -1913,7 +1962,7 @@ async def ingest_standard_products(
                             field_key="how_to_use",
                             source_system=source_system,
                             source_ref=source_ref,
-                            value={"text": how_to_use_text, "steps": steps},
+                            value={"text": how_to_use_text, "steps": how_to_use_steps},
                             fresh_until=_utcnow() + timedelta(days=30),
                             confidence=Decimal("0.8"),
                             merchant_id=merchant_id,
@@ -1929,18 +1978,7 @@ async def ingest_standard_products(
                                 "product_key": product_key,
                                 "merchant_id": merchant_id,
                             }
-                            for shade in _extract_shades(product, variant)
-                        ]
-                    )
-                    beauty_asset_rows.extend(
-                        [
-                            {
-                                **asset,
-                                "product_key": product_key,
-                                "sku_key": sku_key,
-                                "merchant_id": merchant_id,
-                            }
-                            for asset in _extract_tutorial_assets(product, metadata)
+                            for shade in _extract_shades(product_key, variant)
                         ]
                     )
                     beauty_compat_rows.extend(
@@ -1969,26 +2007,77 @@ async def ingest_standard_products(
                 )
                 stats["beauty_profiles_upserted"] += 1
 
+                # PRODUCT-level child rows, written ONCE with `sku_key = NULL`.
+                # NULL is this schema's product-level marker: `sku_key` is
+                # nullable on both tables (unlike `beauty_shades.sku_key`, which
+                # is NOT NULL and genuinely per-variant),
+                # `beauty_field_authoring` writes the merchant-authored
+                # how_to_use with a NULL sku_key, and
+                # `routes/merchant_products.py` joins guides on `sku_key IS
+                # NULL`.
+                #
+                # Collected inside the variant loop instead, product-level data
+                # took on a variant's identity and the two tables failed
+                # differently: the usage guide's id hashes `sku_key`, so it
+                # multiplied into one identical row per variant (and never
+                # matched that IS NULL join); the asset id hashes only
+                # `product_key`, so every variant offered the SAME id and
+                # `_replace_child_rows_multi` deduped them down to one row
+                # stamped with the LAST variant's sku_key — a per-SKU read then
+                # found the tutorial on that one variant and on no other.
+                if how_to_use_text or how_to_use_steps:
+                    beauty_usage_rows.append(
+                        {
+                            "guide_id": product_usage_guide_id(product_key),
+                            "product_key": product_key,
+                            "sku_key": None,
+                            "merchant_id": merchant_id,
+                            "how_to_use_text": how_to_use_text,
+                            "steps_json": how_to_use_steps,
+                            "frequency": str(metadata.get("usage_frequency") or "").strip() or None,
+                            "time_of_day": str(metadata.get("usage_time_of_day") or metadata.get("am_pm") or "").strip()
+                            or None,
+                            "application_order": _safe_int(metadata.get("application_order")),
+                            "warnings_json": _json_list(_extract_metadata_values(metadata, "warnings", "usage_warnings")),
+                            "evidence_refs_json": [source_ref] if source_ref else [],
+                        }
+                    )
+                beauty_asset_rows.extend(
+                    [
+                        {
+                            **asset,
+                            "product_key": product_key,
+                            "sku_key": None,
+                            "merchant_id": merchant_id,
+                        }
+                        for asset in tutorial_assets
+                    ]
+                )
+
                 stats["beauty_ingredient_rows_upserted"] += ingredient_row_upserts
                 stats["beauty_usage_guides_upserted"] += await _replace_child_rows_multi(
                     beauty_usage_guides,
                     [beauty_usage_guides.c.product_key == product_key],
                     beauty_usage_rows,
+                    pk_name="guide_id",
                 )
                 stats["beauty_shades_upserted"] += await _replace_child_rows_multi(
                     beauty_shades,
                     [beauty_shades.c.product_key == product_key],
                     beauty_shade_rows,
+                    pk_name="shade_id",
                 )
                 stats["beauty_content_assets_upserted"] += await _replace_child_rows_multi(
                     beauty_content_assets,
                     [beauty_content_assets.c.product_key == product_key],
                     beauty_asset_rows,
+                    pk_name="asset_id",
                 )
                 stats["beauty_compatibility_rules_upserted"] += await _replace_child_rows_multi(
                     beauty_compatibility_rules,
                     [beauty_compatibility_rules.c.product_key == product_key],
                     beauty_compat_rows,
+                    pk_name="compatibility_rule_id",
                 )
 
         if content_key:
@@ -2601,6 +2690,18 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
             "stats_json": stats,
         }
     except Exception as exc:
+        # Log BEFORE the re-raise. This runs under a FastAPI BackgroundTask
+        # (routes/merchant_store_connections.py), i.e. after the response has
+        # been sent, so nothing in the request window reports it and the caller
+        # has already been told `catalog_ingest_queued: true` with a 200. On
+        # 2026-08-29 that left `catalog_sync_jobs.status='failed'` as the ONLY
+        # trace of a sync that wrote zero rows. The re-raise alone is not a log
+        # line: it lands in the ASGI server's handler, outside this service's
+        # structured logging.
+        logger.exception(
+            "catalog_sync: job FAILED job_id=%s merchant=%s connector=%s mode=%s err=%s",
+            job_id, merchant_id, connector, mode, exc,
+        )
         await _upsert_by_pk(
             catalog_sync_jobs,
             "job_id",

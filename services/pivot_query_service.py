@@ -358,8 +358,18 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             """
             SELECT how_to_use_text, steps_json
             FROM beauty_usage_guides
+            -- `sku_key IS NULL` is the PRODUCT-level marker: both writers
+            -- (catalog ingest and `beauty_field_authoring`) write one guide row
+            -- per product with a NULL sku_key. Testing only the PARAMETER for
+            -- NULL hid those rows from every per-SKU caller — which is all of
+            -- them here, since `_fetch_beauty_vertical_payload` is called with a
+            -- concrete sku_key. The equality arm still serves per-SKU rows.
             WHERE product_key = :product_key
-              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
+              AND (
+                sku_key IS NULL
+                OR CAST(:sku_key AS text) IS NULL
+                OR sku_key = CAST(:sku_key AS text)
+              )
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -385,8 +395,16 @@ async def _fetch_beauty_vertical_payload(product_key: str, sku_key: Optional[str
             """
             SELECT asset_id, asset_type, title, url, thumbnail_url, sort_order
             FROM beauty_content_assets
+            -- Same product-level marker as the usage-guide read above:
+            -- `platform_metadata.tutorials` describes the product, so ingest
+            -- writes ONE asset row with a NULL sku_key. Without the IS NULL arm
+            -- a per-SKU read returned that tutorial on no variant at all.
             WHERE product_key = :product_key
-              AND (CAST(:sku_key AS text) IS NULL OR sku_key = CAST(:sku_key AS text))
+              AND (
+                sku_key IS NULL
+                OR CAST(:sku_key AS text) IS NULL
+                OR sku_key = CAST(:sku_key AS text)
+              )
             ORDER BY sort_order ASC, updated_at DESC
             """,
             {"product_key": product_key, "sku_key": sku_key},

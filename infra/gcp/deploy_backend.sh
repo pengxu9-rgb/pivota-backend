@@ -208,6 +208,62 @@ if [ "$CONFIG" = preserve ]; then
   # --update-env-vars MERGES one key. --set-env-vars / --env-vars-file REPLACE the whole set, and
   # would wipe the other 187.
   PRESERVE_ENV_UPDATES="PIVOTA_COMMIT_SHA=$TAG"
+
+  # DRIFT GUARD. preserve mode treats the LIVE service as the source of truth,
+  # which is correct — and it means this script's own POOL_MAX is not applied,
+  # so a hand edit to the running service silently becomes permanent and every
+  # later deploy propagates it.
+  #
+  # That is not hypothetical. Measured 2026-08-29: DB_POOL_MAX_SIZE went 6 -> 20
+  # in revision web-00067-jzz at 17:01:15Z, from something outside this repo (the
+  # same edit added WOOCOMMERCE_WEBHOOK_BASE_URL, which no file here defines).
+  # Three later preserve deploys carried it forward exactly as designed. Nobody
+  # noticed, because a service running at idle looks identical either way — it
+  # only bites on scale-out, and the failure it produces is pool exhaustion,
+  # which is the outage this codebase had that same morning.
+  #
+  # The arithmetic is the one in the comment further down this file: the pool is
+  # PER PROCESS, so the fleet's ceiling is pool x max-instances. At 20 x 20 = 400
+  # against a max_connections of 300, `web` alone can exhaust the server and take
+  # every other service and every ops session down with it.
+  #
+  # Budget rather than the raw ceiling: worker, gateway, catalog-intelligence and
+  # ~20 Cloud Run Jobs share the same 300, and an operator needs a session to
+  # diagnose whatever went wrong. 180 leaves 40% for them.
+  POOL_FLEET_BUDGET="${POOL_FLEET_BUDGET:-180}"
+  LIVE_POOL_MAX="$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" \
+    --region "$REGION" --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
+    | tr ';' '\n' | grep "'DB_POOL_MAX_SIZE'" | grep -oE "'value': '[0-9]+'" \
+    | grep -oE '[0-9]+' | head -1 || true)"
+  LIVE_MAX_INSTANCES="$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" \
+    --region "$REGION" \
+    --format='value(spec.template.metadata.annotations."autoscaling.knative.dev/maxScale")' \
+    2>/dev/null | head -1 || true)"
+  # `|| true` on both: under `set -e` a grep that matches nothing fails the whole
+  # command substitution and kills the script with a bare exit 1 and no message —
+  # which is a REFUSAL, but an unreadable one that looks like a crash. Let the
+  # empty value reach the explicit check below, which says what happened.
+  # Unreadable is NOT a pass. A describe that fails or a value this parser cannot
+  # find must not wave the deploy through — that is how a guard becomes theatre.
+  if [ -z "$LIVE_POOL_MAX" ] || [ -z "$LIVE_MAX_INSTANCES" ]; then
+    echo "could not read live DB_POOL_MAX_SIZE / maxScale for $SERVICE — refusing to" >&2
+    echo "deploy blind in preserve mode. Set POOL_FLEET_BUDGET=0 to bypass deliberately." >&2
+    [ "$POOL_FLEET_BUDGET" = 0 ] || exit 2
+  elif [ "$POOL_FLEET_BUDGET" != 0 ]; then
+    FLEET_CEILING=$((LIVE_POOL_MAX * LIVE_MAX_INSTANCES))
+    if [ "$FLEET_CEILING" -gt "$POOL_FLEET_BUDGET" ]; then
+      echo "REFUSING to deploy: the LIVE service would open up to $FLEET_CEILING database" >&2
+      echo "connections (DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$LIVE_MAX_INSTANCES)," >&2
+      echo "over the $POOL_FLEET_BUDGET budget and against a max_connections of 300 shared" >&2
+      echo "with worker/gateway/jobs. This script would set POOL_MAX=$POOL_MAX; preserve mode" >&2
+      echo "does not apply it, so the live value drifted and every deploy has carried it." >&2
+      echo "Fix the service, then redeploy:" >&2
+      echo "  gcloud run services update $SERVICE --region $REGION --project $PROJECT \\" >&2
+      echo "    --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2
+      exit 2
+    fi
+    echo "   pool drift check: $LIVE_POOL_MAX x $LIVE_MAX_INSTANCES = $FLEET_CEILING (budget $POOL_FLEET_BUDGET)"
+  fi
   if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ]; then
     # --update-* merges only these two keys.  It must not replace the active
     # service's configuration, which is now the production source of truth.

@@ -64,15 +64,23 @@ async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
     import routes.webhook_routes as webhook_routes_module
 
     used_secrets: list[str] = []
+    owner_lookups: list[str] = []
 
     async def fake_fetch_one(query: str, values: Dict[str, Any]) -> Any:
-        if "FROM merchant_psps" in query:
+        # `merchant_psps` is read TWICE on a psp path — once for the endpoint
+        # secret (provider_config) and once for the cross-tenant guard's owner
+        # (merchant_id). Answering both with the secret row left the guard
+        # unarmed here, so model the real table and discriminate.
+        if "FROM merchant_psps" in query and "provider_config" in query:
             assert values["psp_id"] == "psp_stripe_live_123"
             return {
                 "provider_config": {
                     "webhook_endpoint_secret": "whsec_merchant_specific",
                 }
             }
+        if "FROM merchant_psps" in query and "merchant_id" in query:
+            owner_lookups.append(values["psp_id"])
+            return {"merchant_id": "m_psp_path_owner"}
         if values.get("payment_intent_id") == "pi_psp_path_secret":
             return None
         raise AssertionError(f"Unexpected query: {query}")
@@ -108,6 +116,7 @@ async def test_stripe_webhook_psp_path_uses_merchant_specific_secret(
     assert resp.status_code == 200
     assert resp.json() == {"status": "success", "event": "payment_intent.payment_failed"}
     assert used_secrets == ["whsec_merchant_specific"]
+    assert owner_lookups == ["psp_stripe_live_123"]
 
 
 @pytest.mark.asyncio

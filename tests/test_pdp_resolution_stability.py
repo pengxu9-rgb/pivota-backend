@@ -20,6 +20,59 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_anonymous_invoke_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take this file out of the shared anonymous budget for /agent/shop/v1/invoke.
+
+    That endpoint runs a per-IP anon limiter (`_INVOKE_ANON_IP_LIMIT_STORE`,
+    SHOP_INVOKE_ANON_RPM=60/min) whose store is MODULE-LEVEL, so one budget is
+    shared by the whole pytest session. Twelve test files post there without a
+    credential. By the time this late-running file executes the budget is partly
+    spent, and `test_offers_resolve_stability_30_calls` alone adds 30 more --
+    tipping it past 60, so the burst assertion fails with 429 != 200.
+
+    This is a REPEAT. tests/test_offers_resolve.py:2484 already records it
+    ("adding these tests tipped test_pdp_resolution_stability's 30-call loop into
+    a 429") and fixed it by zeroing the rpm in the files that SPEND the budget.
+    That puts the obligation on every future anonymous caller to remember, so the
+    failure returns the moment one does not -- and it did: the sweep went red on
+    main at 16e5af95 and stayed red. Fixing it at the victim instead makes this
+    file independent of whatever the rest of the suite spends, and `rpm == 0`
+    short-circuits BEFORE the store is incremented, so this file also stops
+    spending budget that later files need.
+
+    The pre-spent store is a deliberate tripwire, not setup. It makes the
+    guarantee DETERMINISTIC: remove the setenv below and the very first
+    anonymous call in this file 429s immediately, on any machine, in any order --
+    instead of passing locally and going red in CI weeks later when some
+    unrelated file adds one more anonymous request. Nothing here weakens a
+    production limit; both changes are per-test and monkeypatch-restored.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(
+        gateway,
+        "_INVOKE_ANON_IP_LIMIT_STORE",
+        {"testclient": (int(time.time() // 60), 10_000)},
+    )
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+
+
+def test_anonymous_invoke_budget_isolation_is_in_effect() -> None:
+    """Fails loudly if the autouse isolation above is ever removed.
+
+    Without this, deleting the fixture would not break anything here and now --
+    it would re-arm an order-dependent 429 that only shows up in the full sweep,
+    which is exactly how this bug came back the first time.
+    """
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._invoke_anon_rpm() == 0, (
+        "the anonymous invoke budget is no longer isolated for this file; "
+        "test_offers_resolve_stability_30_calls will flake in the full sweep"
+    )
+
+
 def _build_product_cache_row(product_id: str, title: str) -> Dict[str, Any]:
     return {
         "merchant_id": KNOWN_MERCHANT_ID,
@@ -438,6 +491,19 @@ def test_offers_resolve_stability_30_calls(monkeypatch: pytest.MonkeyPatch, clie
     assert middleware is not None, "RateLimitMiddleware not found in app stack"
     monkeypatch.setattr(middleware, "redis", None)
     monkeypatch.delitem(middleware._anon_store, "global", raising=False)
+    # The middleware is not the only limiter on this path. agent_shop_gateway has
+    # its OWN per-IP budget for credential-less callers
+    # (`_check_invoke_anon_rate_limit`, 60/min by SHOP_INVOKE_ANON_RPM) keyed on a
+    # WALL-CLOCK minute bucket — `int(time.time() // 60)`, not a window from this
+    # test's start. Every anonymous /agent/shop/v1/invoke anywhere in the suite
+    # charges the same bucket, so whenever 31+ of them land in the same minute as
+    # this 30-call burst, it 429s. That is the intermittent sweep failure: it
+    # passes in isolation, fails under the full suite, and moves whenever any test
+    # is added anywhere, because what changes is which side of a minute boundary
+    # the burst lands on. Resetting only the middleware stores left this one
+    # charging, which is exactly the suite-order leakage the comment above says
+    # this setup exists to prevent.
+    monkeypatch.setattr(gateway, "_INVOKE_ANON_IP_LIMIT_STORE", {})
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
