@@ -633,7 +633,11 @@ async def _test_mode_stripe_event_probe_exempt(
         payment_meta = {}
 
     try:
-        order = await _resolve_stripe_order_for_payment_event(
+        # Returns (order, reject_reason) — the tuple landed in #1935 so a
+        # cross-tenant REFUSAL could be told apart from a plain miss. This gate
+        # wants neither: a refused order is not ours to exempt, and a miss has
+        # nothing to exempt, so both fall through to the unconditional drop.
+        order, _reject_reason = await _resolve_stripe_order_for_payment_event(
             payment_intent_id=data.get("id"),
             payment_meta=payment_meta,
             allow_repoint=False,
