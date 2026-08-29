@@ -569,6 +569,95 @@ async def _resolve_stripe_order_for_payment_event(
     return order, None
 
 
+# Test-mode events may be exempted ONLY for the event types whose order
+# resolution this gate mirrors EXACTLY (`data["id"]` + `data["metadata"]`, via
+# _resolve_stripe_order_for_payment_event — see the branches in
+# handle_stripe_webhook). An event type that resolves its order some OTHER way
+# must never be exempted: `charge.refunded`, for instance, resolves on
+# `data["payment_intent"]` through a raw query with no cross-tenant guard, so
+# exempting it on a match found via `data["id"]` would authorize the gate
+# against one order while the handler mutates a different one. Keep this set
+# minimal; adding a type REQUIRES checking that its branch resolves identically.
+_TEST_MODE_PROBE_EXEMPTIBLE_EVENT_TYPES = frozenset(
+    {
+        "payment_intent.succeeded",
+        "checkout.session.completed",
+    }
+)
+
+
+async def _test_mode_stripe_event_probe_exempt(
+    *,
+    event_type: Optional[str],
+    data: Dict[str, Any],
+    psp_id: Optional[str],
+) -> bool:
+    """Whether a livemode=false Stripe event may be processed in production.
+
+    Allowlist, never denylist: the exemption exists solely for the controlled
+    test-processor probe (see order_routes._resolve_order_live_readiness_requirement,
+    which let the test-mode charge be created in the first place). A test-mode
+    event is processed ONLY when the order it targets resolves — under the same
+    per-psp cross-tenant guard as real event handling — to an order whose own
+    metadata requested the test-psp bypass AND whose merchant is in
+    TEST_PSP_PROBE_MERCHANTS while ALLOW_TEST_PSP_PROBE is on. Anything short of
+    that (env off, merchant not allowlisted, order unresolvable, order never
+    asked for a test processor) keeps the unconditional production drop.
+
+    CRITICAL — the exemption must bind to the SAME order the handler will
+    mutate. This resolves on `data["id"]` + `data["metadata"]`, byte-for-byte
+    what the exemptible branches use, so "the order that granted the bypass" and
+    "the order that gets written" cannot diverge. Resolving on any BROADER set of
+    references (e.g. also trying `data["payment_intent"]`) would turn one
+    sanctioned probe order into a reusable passport: name it where the gate looks,
+    point the handler's field at a different order, and a fake test-mode event
+    drives a real one. Read-only by construction: allow_repoint=False, so
+    deciding the gate can never write to an order.
+    """
+    from routes.order_routes import (
+        _coerce_order_metadata,
+        _resolve_order_live_readiness_requirement,
+        _test_psp_probe_enabled,
+        _test_psp_probe_merchants,
+    )
+
+    if str(event_type or "") not in _TEST_MODE_PROBE_EXEMPTIBLE_EVENT_TYPES:
+        return False
+    if not _test_psp_probe_enabled():
+        return False
+    if not _test_psp_probe_merchants():
+        return False
+
+    payment_meta = _stripe_object_to_dict(data.get("metadata") or {})
+    if not isinstance(payment_meta, dict):
+        payment_meta = {}
+
+    try:
+        # Returns (order, reject_reason) — the tuple landed in #1935 so a
+        # cross-tenant REFUSAL could be told apart from a plain miss. This gate
+        # wants neither: a refused order is not ours to exempt, and a miss has
+        # nothing to exempt, so both fall through to the unconditional drop.
+        order, _reject_reason = await _resolve_stripe_order_for_payment_event(
+            payment_intent_id=data.get("id"),
+            payment_meta=payment_meta,
+            allow_repoint=False,
+            psp_id=psp_id,
+        )
+    except Exception:
+        order = None
+    if not order:
+        return False
+
+    # False == the live-readiness requirement is waived, i.e. the probe bypass
+    # (armed env + allowlisted merchant + order-level request) is granted.
+    return (
+        _resolve_order_live_readiness_requirement(
+            _coerce_order_metadata(order), order.get("merchant_id")
+        )
+        is False
+    )
+
+
 async def _finalize_stripe_payment_success(
     order: Dict[str, Any],
     *,
@@ -1387,12 +1476,26 @@ async def handle_stripe_webhook(
         is_prod_env = _stripe_livemode_gate_active()
         event_livemode = event.get("livemode")
         if is_prod_env and event_livemode is False:
+            # Sole exemption: the controlled test-processor probe. The order the
+            # event targets must itself have been granted the test-psp bypass
+            # (ALLOW_TEST_PSP_PROBE on + merchant in TEST_PSP_PROBE_MERCHANTS +
+            # order-level request) — otherwise the drop stays unconditional.
+            probe_exempt = await _test_mode_stripe_event_probe_exempt(
+                event_type=event_type, data=data, psp_id=psp_id
+            )
+            if not probe_exempt:
+                logger.warning(
+                    "Ignoring test-mode Stripe webhook (livemode=false) in production: type=%s id=%s",
+                    event_type,
+                    event.get("id"),
+                )
+                return {"status": "ignored", "event": event_type, "reason": "test_mode_event_in_production"}
             logger.warning(
-                "Ignoring test-mode Stripe webhook (livemode=false) in production: type=%s id=%s",
+                "Processing test-mode Stripe webhook (livemode=false) for allowlisted "
+                "test-psp probe order in production: type=%s id=%s",
                 event_type,
                 event.get("id"),
             )
-            return {"status": "ignored", "event": event_type, "reason": "test_mode_event_in_production"}
 
         stripe_webhook_event_id = _stripe_webhook_event_id(event, payload, event_type)
         is_duplicate = await _record_stripe_webhook_event_best_effort(
