@@ -381,3 +381,27 @@ async def test_partials_that_exactly_reach_the_order_total_are_allowed(
 
     assert order.total_refunded == Decimal("500")
     assert order.statuses[-1] == "refunded"
+
+
+@pytest.mark.asyncio
+async def test_an_id_less_refund_redelivery_does_not_double_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An id-less refund writes an id-less row. Self-exclusion was gated on the
+    incoming id being non-empty, so on redelivery the row was summed on top of
+    itself: $200 became $400."""
+    order = _StatefulOrder()
+    _install(monkeypatch, order)
+
+    idless = {
+        "status": "succeeded",
+        "payment_intent": "pi_partial",
+        "amount": 20000,
+        "currency": "usd",
+        "metadata": {},
+    }
+    await _send(monkeypatch, "refund.updated", idless)
+    assert order.total_refunded == Decimal("200")
+
+    await _send(monkeypatch, "refund.updated", dict(idless))
+    assert order.total_refunded == Decimal("200")

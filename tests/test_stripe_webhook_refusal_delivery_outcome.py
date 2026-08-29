@@ -121,7 +121,7 @@ def _succeeded(pi: str, amount: int = 50000) -> Dict[str, Any]:
                 "amount": amount,
                 "amount_received": amount,
                 "currency": "usd",
-                "metadata": {"order_id": "ORD_HINT"},
+                "metadata": {"order_id": "ORD_0123456789ABCDEF"},
             }
         },
     }
@@ -129,7 +129,7 @@ def _succeeded(pi: str, amount: int = 50000) -> Dict[str, Any]:
 
 def _order(merchant_id: str, total: str = "500.00") -> Dict[str, Any]:
     return {
-        "order_id": "ORD_HINT",
+        "order_id": "ORD_0123456789ABCDEF",
         "merchant_id": merchant_id,
         "payment_intent_id": "pi_known",
         "total": total,
@@ -252,7 +252,17 @@ def test_every_reason_the_handler_produces_is_classified() -> None:
     # Every `return False, f"..."` / `return False, "..."` reason literal.
     produced = set(re.findall(r'return\s+False,\s+f?"([a-z_]+)', src))
     produced |= set(re.findall(r'return\s+\(\s*\n\s*False,\s*\n\s*f"([a-z_]+)', src))
+    # The RESOLVERS reject with `return None, "reason"` — that family feeds the
+    # deferral decision, and `cross_tenant_blocked` lives there. Omitting this
+    # pattern let the single most important reason go unharvested.
+    produced |= set(re.findall(r'return\s+None,\s+f?"([a-z_]+)', src))
     assert produced, "harvest found nothing — the regex has drifted from the source"
+    # Floor on the HARVEST itself. Without this, narrowing the regex silently
+    # shrinks what is checked and the completeness claim becomes vacuous — which
+    # is exactly how `cross_tenant_blocked` (a `return None, "..."` producer) went
+    # unharvested in the first version of this test.
+    for anchor in ("cross_tenant_blocked", "refund_exceeds_order_total", "amount_parse_error"):
+        assert anchor in produced, f"harvest regex no longer matches {anchor}"
 
     from routes.webhook_routes import _stripe_refusal_is_permanent
 
@@ -321,7 +331,7 @@ async def test_a_forged_metadata_hint_on_the_payment_path_is_not_retried(
         raise AssertionError(f"Unexpected query: {query}")
 
     async def fake_get_order(order_id: str) -> Optional[Dict[str, Any]]:
-        assert order_id == "ORD_HINT"
+        assert order_id == "ORD_0123456789ABCDEF"
         return _order(OTHER)  # the forged hint names a FOREIGN order
 
     monkeypatch.setattr(database_module.database, "fetch_one", fake_fetch_one)
@@ -394,7 +404,7 @@ async def test_a_cross_tenant_block_on_the_auth_first_branch_is_not_swallowed(
                 "id": "pi_auth_foreign",
                 "amount": 50000,
                 "currency": "usd",
-                "metadata": {"order_id": "ORD_HINT"},
+                "metadata": {"order_id": "ORD_0123456789ABCDEF"},
             }
         },
     }
@@ -410,3 +420,44 @@ async def test_a_cross_tenant_block_on_the_auth_first_branch_is_not_swallowed(
     }
     assert h.mutations == []
     assert ("unmatched", "cross_tenant_blocked") in [(s, r) for _e, s, r in h.event_status]
+
+
+@pytest.mark.asyncio
+async def test_a_storefront_order_id_is_not_treated_as_ours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`order_id` in PaymentIntent metadata is a WooCommerce/Magento/custom-cart
+    convention, not a Pivota marker. A merchant's own storefront charge — on
+    their own Stripe account, delivered to this account-wide endpoint — carries
+    one too. Matching on mere PRESENCE would defer every such charge for the full
+    retry schedule; only our id shape may defer."""
+    event = {
+        "type": "payment_intent.succeeded",
+        "data": {
+            "object": {
+                "id": "pi_woo_storefront",
+                "amount": 4999,
+                "amount_received": 4999,
+                "currency": "usd",
+                "metadata": {"order_id": "wc-10231", "site_url": "https://shop.example"},
+            }
+        },
+    }
+    h = _install(monkeypatch, event=event, order_row=None)
+
+    resp = await _post()
+
+    assert resp.status_code == 200
+    assert resp.json()["reason"] == "no_order_resolved"
+    assert h.mutations == []
+
+
+def test_only_our_order_id_shape_counts_as_provenance() -> None:
+    from routes.webhook_routes import _stripe_event_names_a_pivota_order
+
+    assert _stripe_event_names_a_pivota_order({"order_id": "ORD_0123456789ABCDEF"}) is True
+    # Other systems' ids, and shapes we no longer mint, fail closed to a 200.
+    for hint in ("wc-10231", "1042", "ORD_lowercase123456", "ORD_TOOSHORT", "", None):
+        assert _stripe_event_names_a_pivota_order({"order_id": hint}) is False
+    assert _stripe_event_names_a_pivota_order({}) is False
+    assert _stripe_event_names_a_pivota_order(None) is False

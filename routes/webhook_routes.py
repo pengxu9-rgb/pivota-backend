@@ -14,6 +14,7 @@ import os
 import hmac
 import hashlib
 import json
+import re
 import socket
 from datetime import datetime
 from decimal import Decimal
@@ -1066,15 +1067,27 @@ def _stripe_refund_level_cumulative(
     So sum only the REFUND-LEVEL rows and hand the result to the ceiling.
 
     WHY psp_refund_records AND NOT A DEDICATED KEY. A first cut kept its own
-    `stripe_refund_ledger` blob. That is the wrong home for money-bearing state:
-    `update_order` REPLACES the whole metadata column from a request-start
-    snapshot (db/orders.py), and `_persist_stripe_refund_observability` calls it
-    on the `refund.created` path — so a concurrent `refund.created` silently wiped
-    the ledger and reinstated the exact under-count this fixes. psp_refund_records
-    is maintained by `update_order_status`, which merges additively against a
-    fresh read, and it is ALREADY pruned on rollback, so this needs no bookkeeping
-    of its own. (That `update_order` full-replace remains a hazard for
-    psp_refund_records itself — pre-existing, tracked separately.)
+    `stripe_refund_ledger` blob, which added a SECOND store with the same
+    weakness. psp_refund_records at least already exists, is stamped by the call
+    sites, and is pruned on rollback by the failure path — so this needs no
+    bookkeeping of its own.
+
+    ⚠️ IT IS NOT CONCURRENCY-SAFE, and this derivation inherits that. Order
+    metadata is read at request start and written back whole:
+    `update_order` replaces the entire column (db/orders.py), and
+    `update_order_status` merges only at the TOP level
+    (`{**existing_metadata, **update_data["metadata"]}`) — `psp_refund_records` is
+    a nested dict supplied by the caller, so it is replaced wholesale either way.
+    Two overlapping refund events, or a `refund.created` whose snapshot predates a
+    `refund.updated` write, therefore lose a row.
+
+    The failure is ONE-DIRECTIONAL: rows can only be lost, never duplicated, and
+    `total_refunded` is a real column that survives, so a lost row degrades this
+    to the pre-existing under-count rather than inventing money. That makes
+    concurrent delivery no worse than before this change — but it is NOT the
+    guarantee serialized delivery gets. Durable per-refund storage (a row per
+    refund, or a JSONB sub-key merge done in SQL) is the actual fix and is
+    tracked separately.
     """
     records: Dict[str, Any] = {}
     meta = existing_metadata if isinstance(existing_metadata, dict) else {}
@@ -1090,7 +1103,10 @@ def _stripe_refund_level_cumulative(
         if str(record.get("source_event") or "") not in _STRIPE_REFUND_LEVEL_SOURCE_EVENTS:
             continue
         # This refund's own prior row is superseded by the amount just received.
-        if this_refund and str(record.get("refund_reference") or "").strip() == this_refund:
+        # Compared directly rather than gated on a non-empty id: an id-less refund
+        # writes an id-less row, and skipping the comparison made its redelivery
+        # sum that row on top of itself.
+        if str(record.get("refund_reference") or "").strip() == this_refund:
             continue
         # `amount_minor` is the event's FACE amount, passed straight through by the
         # finalizer. Do NOT use `amount`: that is the delta actually applied, which
@@ -1147,6 +1163,28 @@ def _stripe_refusal_is_permanent(reason: Optional[str]) -> bool:
     return text.startswith(_STRIPE_PERMANENT_REFUSAL_PREFIXES)
 
 
+# `db.orders.create_order` mints `ORD_<16 uppercase hex>`. Used to tell an event
+# that names one of OUR orders from one carrying some other system's order_id.
+_PIVOTA_ORDER_ID_SHAPE = re.compile(r"^ORD_[0-9A-F]{16}$")
+
+
+def _stripe_event_names_a_pivota_order(payment_meta: Optional[Dict[str, Any]]) -> bool:
+    """Does this event's metadata name an order that could be ours?
+
+    `order_id` in PaymentIntent metadata is a WooCommerce/Magento/custom-cart
+    convention, not a Pivota marker — a merchant's own storefront charge on their
+    own Stripe account carries one too. Matching on mere PRESENCE would defer
+    those for the full retry schedule; matching on our id shape does not.
+
+    Unknown shapes fail CLOSED to the historical 200, so a legacy order id we no
+    longer mint is never deferred.
+    """
+    if not isinstance(payment_meta, dict):
+        return False
+    hint = str(payment_meta.get("order_id") or "").strip()
+    return bool(_PIVOTA_ORDER_ID_SHAPE.match(hint))
+
+
 def _stripe_unmatched_response(
     *,
     event_type: Optional[str],
@@ -1174,8 +1212,13 @@ def _stripe_unmatched_response(
     never resolve, on the full retry schedule, and Stripe disables endpoints that
     fail continuously. Losing the endpoint would take down payment finalization
     AND refunds for that merchant: strictly worse than the dropped event this is
-    meant to fix. So only an event that names one of our orders is deferred;
-    anything with no Pivota provenance keeps the historical 200.
+    meant to fix. So only an event whose metadata names an order matching OUR id
+    shape is deferred; anything else keeps the historical 200.
+
+    Residual, accepted: a succeeded PI for a SOFT-DELETED Pivota order matches the
+    shape and never resolves (`get_order` filters `is_deleted`), so it defers for
+    the full schedule. That is one bounded event, not the per-charge volume that
+    threatens the endpoint, and it fails visibly rather than silently.
     """
     if _stripe_refusal_is_permanent(reason) or not claims_our_order:
         return {"status": "unmatched", "event": event_type, "reason": reason}
@@ -1393,10 +1436,7 @@ async def handle_stripe_webhook(
                     reason=payment_reject or "no_order_resolved",
                     # Only defer when the event names one of OUR orders; see the
                     # account-wide-endpoint note in _stripe_unmatched_response.
-                    claims_our_order=bool(
-                        isinstance(payment_meta, dict)
-                        and str(payment_meta.get("order_id") or "").strip()
-                    ),
+                    claims_our_order=_stripe_event_names_a_pivota_order(payment_meta),
                 )
 
             # Integrity: the signed charge amount/currency must match the order.
