@@ -143,20 +143,32 @@ jobs:
       #     is not the same as what is broken.
       #
       # FOUND BY THIS PR'S OWN STRAY-FILE GUARD: `readiness/tests/` is a whole
-      # sub-package — 15 test files, 111 passing — that ran in NO CI job either. It is
-      # swept in here rather than deferred, because 111 tests of coverage now
-      # beats a tidier denylist later. Three of its files are red and join the
+      # sub-package — 16 test files, 133 executed today — that ran in NO CI job either. It is
+      # swept in here rather than deferred, because that much coverage now
+      # beats a tidier denylist later. Two of its files are red and join the
       # quarantine:
       #   readiness/tests/test_real_merchant_goldens.py
-      #   readiness/tests/test_routes.py          (3 route tests)
       #   readiness/tests/test_shopify_live_source.py
+      #
       #   readiness/tests/test_summary.py — ORDER-DEPENDENT, and found only by
       #     combining the two trees: green running `readiness/tests` alone, red
       #     inside the sweep. Exactly the effect the 2026-07-28 recon predicted —
       #     "a globbed job runs a different set than the full suite, so
-      #     order-dependent tests flip in both directions". Both are
-      #     `--deselect`s rather than `--ignore`s, so they suppress two TESTS
-      #     rather than two files.
+      #     order-dependent tests flip in both directions". It is a
+      #     `--deselect` rather than an `--ignore`, so it suppresses ONE TEST
+      #     rather than the whole file.
+      #
+      # UN-QUARANTINED 2026-08-28: readiness/tests/test_routes.py (+54 executed).
+      # Its 3 red tests were not a product bug — `fake_build_readiness_optimization`
+      # had drifted from build_readiness_optimization (readiness/summary.py:3177
+      # gained `segment`), so every call raised TypeError -> 500. Doubles repaired,
+      # file green standalone AND inside this sweep. This mattered beyond tidiness:
+      # while it sat here, the security tests pinning the test-PSP probe gate's
+      # conjuncts (readiness/service.py) never ran in CI, so a mutant deleting the
+      # ALLOW_TEST_PSP_PROBE kill switch passed the sweep. A quarantined file does
+      # not just defer its own red tests; it silently swallows every test added to
+      # it afterwards. The +54 is inside the ABS_SLACK=150 cap by design — see the
+      # floor guard below, which sized that slack for exactly this un-quarantine.
       #
       # ⚠️ A denylist entry is a promise to come back, not a resolution. If this
       # list is the same length in a month, this job has become the thing it
@@ -170,7 +182,6 @@ jobs:
             --ignore=tests/test_audit_scheduler_worker_env_gate.py \
             --ignore=tests/test_external_seed_csv_import.py \
             --ignore=readiness/tests/test_real_merchant_goldens.py \
-            --ignore=readiness/tests/test_routes.py \
             --ignore=readiness/tests/test_shopify_live_source.py \
             --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
             --ignore-glob='tests/test_*_postgres.py' \
@@ -249,7 +260,7 @@ jobs:
           # build fails, and re-floating the floor to 73 only moves the cap to
           # 80.3, room for exactly ONE new test. It would also have made this
           # file's own stated goal a red build — un-quarantining
-          # readiness/tests/test_routes.py adds 49 tests in one PR. A floor's
+          # readiness/tests/test_routes.py adds 54 tests in one PR. A floor's
           # job is to notice a tree LEAVING; sizing its ceiling per-test is a
           # different, worse question.
           ABS_SLACK = 150
@@ -289,7 +300,18 @@ jobs:
           # would have failed the GREEN build. Caught before merge only because
           # the clean and mutant runs were compared side by side — a guard is
           # not verified until it has been run against a passing build too.
-          SUBTREES = {'tests.services': 1600, 'readiness.tests': 70}
+          # readiness.tests RAISED 70 -> 120 (2026-08-28), calibrated against this
+          # branch's own sweep: 133 executed after un-quarantining test_routes.py.
+          # REQUIRED by that un-quarantine, not cosmetic. At 70 the file could be
+          # re-`--ignore`d tomorrow -- dropping the subtree back to 79 and taking
+          # the probe-gate security tests with it -- and BOTH gates stay green
+          # (79 >= 70; the global 12000 floor cannot see one file leave). The
+          # decay warning would not fire either: cap(70) = 220, and 133 < 220, so
+          # the job prints nothing. That is the "a floor with too much slack is
+          # not a floor" failure this file documents above, reproduced by the
+          # un-quarantine itself. 120 leaves 13 for a legitimate deletion while
+          # still noticing the file leaving; cap(120) = 270 stays clear of 133.
+          SUBTREES = {'tests.services': 1600, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
