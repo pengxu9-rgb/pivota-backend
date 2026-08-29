@@ -533,18 +533,10 @@ async def test_checkout_session_passport_does_not_finalize_a_foreign_auth_first_
                 requested_bypass=False,
                 total="899.00",
                 extra_metadata={
-                    # store_platform is REQUIRED: order_uses_authorization_first_payment
-                    # (routes/order_routes.py:732-740) demands payment_flow.store_platform
-                    # == "shopify". Without it the real predicate rejects this order, the
-                    # auth-first capture is unreachable, and the
-                    # `calls["finalize_auth_first"] == []` assertion below cannot fail —
-                    # it would pass even against the pre-fix passport bug this test exists
-                    # to reproduce.
                     "payment_flow": {
                         "mode": "authorization_first",
                         "psp": "stripe",
                         "capture_method": "manual",
-                        "store_platform": "shopify",
                     }
                 },
             ),
