@@ -125,13 +125,22 @@ async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(N
     N each still add up to 2N held slots.
 
     No idle deadline here, and that asymmetry is deliberate rather than an
-    oversight: unlike /api/ws/simple, this endpoint really is pushed to —
-    `publish_event_to_ws` broadcasts to this manager from main.py and
-    utils/event_publisher.py — so a client that never sends is a legitimate
-    listener, not a squatter, and a deadline keyed on client messages would
-    disconnect it. A deadline keyed on traffic in either direction would instead
-    be reset by the very broadcasts it was watching for. Either way the ceiling,
-    not a deadline, is what bounds this path.
+    oversight: unlike /api/ws/simple, this endpoint really is pushed to, so a
+    client that never sends is a legitimate listener rather than a squatter and
+    a deadline keyed on client messages would disconnect it. A deadline keyed on
+    traffic in EITHER direction would instead be reset by the very broadcasts it
+    was watching for. Either way the ceiling, not a deadline, bounds this path.
+
+    The live push path, traced rather than assumed (an earlier version of this
+    comment also cited main.py, which merely DEFINES a publish_event_to_ws
+    wrapper that nothing calls):
+    orchestrator/payment_orchestrator.py:149,173 -> utils/event_publisher.py ->
+    realtime/ws_manager.publish_event_to_ws -> _manager.broadcast(), unfiltered,
+    reachable via POST /api/payments/process.
+
+    The cost of that asymmetry is in realtime/ws_guard's RESIDUAL EXPOSURE note:
+    this is the route an attacker parks idle sockets on, because it is the one
+    nothing reclaims them from.
     """
     manager = get_connection_manager()
     connection_id = None

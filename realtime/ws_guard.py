@@ -48,6 +48,26 @@ reasoning already written down in `middleware/rate_limiter._reject_anonymous`.
    an idle deadline keyed on client messages would disconnect a legitimately
    passive listener — see the note in `routes/dashboard_routes.py`.
 
+RESIDUAL EXPOSURE — what this does NOT fix
+------------------------------------------
+The ceiling converts "wedge the whole instance" into "deny the WebSocket
+surface", and that second thing is now CHEAPER than the first was. Measured
+against a real uvicorn at the shipped defaults: 8 anonymous, silent sockets
+parked on `/api/ws/metrics` — the route with no idle deadline — hold the shared
+budget indefinitely and every subsequent handshake on BOTH routes is refused.
+Pre-fix, denying the dashboard cost 80 sockets and took all HTTP down with it,
+which is loud; post-fix it costs 8 and is invisible to everything except this
+module's own log line.
+
+That trade is deliberate — losing the dashboard beats losing every HTTP request
+on the instance — but it is a trade, not a clean win, and the arithmetic that
+makes it cheap is the same fact underneath both: neither route requires a
+credential. There is no ceiling number that fixes this, because the guard cannot
+prefer a legitimate socket over an anonymous one when it cannot tell them apart.
+Closing it means authenticating `/api/ws/metrics` (and deciding whether
+`/api/ws/simple`, which has no consumer at all, should exist), which is a
+separate decision about who may use the dashboard.
+
 The ceiling is NOT published to callers. `middleware/rate_limiter` withholds its
 thresholds for the same reason: a caller told the exact ceiling is told exactly
 how many sockets to open. The idle timeout IS published, because a client cannot
@@ -71,12 +91,23 @@ logger = logging.getLogger("ws_guard")
 # authorization refusal. See WebSocketAdmission.reserve for what a caller
 # actually observes.
 WS_CLOSE_TRY_AGAIN_LATER = 1013
-# RFC 6455 1001 "Going Away" — the server, not the client, is ending a healthy
-# connection.
-WS_CLOSE_GOING_AWAY = 1001
+# RFC 6455 4000-4999 is the private-use range. Deliberately NOT 1001 "Going
+# Away", which clients conventionally read as "server restarting, reconnect
+# now" — applied to an idle deadline that turns one stable socket into a
+# handshake every WS_IDLE_TIMEOUT_SECONDS, costing more than the reclaim saves.
+# 4408 echoes HTTP 408 Request Timeout so the intent is legible without a table.
+WS_CLOSE_IDLE_TIMEOUT = 4408
 
 
-def _positive_int(raw, default: int) -> int:
+# A ceiling above this is treated as a typo rather than an instruction. This is
+# ONLY a typo guard, not a safety property: the number that actually matters is
+# the deploy script's --concurrency, which this process cannot see. It exists
+# because `WS_MAX_CONNECTIONS=80000` — one stray zero — would otherwise silently
+# disable the entire guarantee while looking like a deliberate setting.
+_CEILING_TYPO_GUARD = 256
+
+
+def _positive_int(raw, default: int, maximum: Optional[int] = None) -> int:
     """Parse a positive int from the environment, falling back on anything else.
 
     A misconfigured ceiling must not disable the ceiling. `0`, a negative value
@@ -89,7 +120,11 @@ def _positive_int(raw, default: int) -> int:
         value = int(str(raw).strip())
     except (TypeError, ValueError, AttributeError):
         return default
-    return value if value > 0 else default
+    if value <= 0:
+        return default
+    if maximum is not None and value > maximum:
+        return default
+    return value
 
 
 class WebSocketIdleTimeout(Exception):
@@ -116,22 +151,49 @@ class WebSocketAdmission:
         self._denied_since_log = 0
         self._last_denial_log = 0.0
         self._denial_log_interval = 10.0
+        # When the ceiling most recently went from "has room" to "full". The
+        # denial line reports `_active`, which at the moment of a denial is
+        # ALWAYS equal to the ceiling and therefore says nothing; how long the
+        # ceiling has been continuously full is the number that separates "four
+        # operators opened tabs" from "someone is parking sockets on us".
+        self._saturated_since = None
 
     @property
     def max_connections(self) -> int:
-        """Read from the environment on each use so it is tunable at runtime.
+        """Read from the environment on each use.
 
-        The default is deliberately sized against what an INSTANCE survives
-        rather than against measured client demand, because demand here is not
-        measured: `/api/ws/simple` has no in-repo consumer and nothing ever
-        calls `simple_manager.broadcast`, and `/api/ws/metrics` is an internal
-        dashboard. Being wrong low is visible and recoverable — an operator's
-        tab is refused and reconnects, very likely onto another instance, since
-        this is per-process state. Being wrong high is the bug being fixed. Raise
+        Not "tunable at runtime" on the deployment target, despite the
+        per-call getenv: Cloud Run env vars are immutable per revision, so
+        changing this ships a new revision and therefore a fresh process
+        with `_active` back at 0. The per-call read buys testability and
+        costs a dict lookup; it does not buy a live dial.
+
+        The default is sized against what an INSTANCE survives rather than
+        against measured client demand, because demand here is not measured:
+        neither route has an in-repo consumer, and nothing ever calls
+        `simple_manager.broadcast`.
+
+        Do NOT read the low default as harmless. An earlier version of this
+        docstring claimed a refused operator "reconnects, very likely onto
+        another instance"; that is not a property Cloud Run provides. It routes
+        on request concurrency and cannot see this in-process counter, so an
+        instance holding 8 sockets out of `--concurrency 80` looks ~90% idle to
+        the scheduler and is a PREFERRED target for the next handshake. With
+        MIN=2 instances (infra/gcp/deploy_backend.sh) a refused client has
+        roughly a coin flip of landing back on the saturated one, and retrying
+        does not improve those odds. The real reason to be wrong low rather than
+        high is that the failure is confined to the WebSocket surface instead of
+        taking every HTTP request on the instance with it — not that it
+        self-heals. See the module docstring's RESIDUAL EXPOSURE note.
+
+        Note also that a dashboard page opening both routes spends TWO slots, so
+        this default is roughly four concurrent viewers per instance. Raise
         `WS_MAX_CONNECTIONS` deliberately once real demand is measured.
         """
         return _positive_int(
-            os.getenv("WS_MAX_CONNECTIONS"), self._default_max_connections
+            os.getenv("WS_MAX_CONNECTIONS"),
+            self._default_max_connections,
+            maximum=_CEILING_TYPO_GUARD,
         )
 
     @property
@@ -142,13 +204,21 @@ class WebSocketAdmission:
         """Claim a slot, or refuse the handshake. True means the caller owns a
         slot and MUST `release()` it in a `finally`.
 
-        The refusal is sent before `accept()`, which Starlette turns into a
-        rejected handshake (HTTP 403) rather than an accepted-then-closed
-        session. That is the cheap path on purpose: under the flood this guard
-        exists for, refusing must cost less than accepting, or the guard becomes
-        the amplifier. The trade is that a well-behaved client sees a handshake
-        rejection rather than close code 1013, so the code is logged here
-        instead.
+        The refusal is sent before `accept()`. That is the cheap path on
+        purpose: under the flood this guard exists for, refusing must cost less
+        than accepting, or the guard becomes the amplifier.
+
+        The trade is worse than "the client sees a different close code", and
+        the cost lands on operators, so it is spelled out. uvicorn DISCARDS the
+        code on a pre-accept close and answers the handshake with a flat HTTP
+        403 — verified against uvicorn 0.51.0, whose sans-io implementation
+        emits FORBIDDEN unconditionally. So `WS_CLOSE_TRY_AGAIN_LATER` is only
+        ever observed by Starlette's TestClient; in production a refused caller
+        cannot tell capacity from authorization, and on a route whose docstring
+        advertises JWT auth it will read as an auth failure and send someone to
+        debug tokens. `_log_denial` therefore carries the code and the
+        saturation duration, because the server log is the ONLY place this
+        condition is distinguishable.
 
         The check and the increment are deliberately not separated by an
         `await`. The event loop cannot interleave another handler between them,
@@ -157,6 +227,8 @@ class WebSocketAdmission:
         """
         limit = self.max_connections
         if self._active >= limit:
+            if self._saturated_since is None:
+                self._saturated_since = time.monotonic()
             self._log_denial(limit)
             await websocket.close(code=WS_CLOSE_TRY_AGAIN_LATER)
             return False
@@ -176,17 +248,31 @@ class WebSocketAdmission:
         """
         if self._active > 0:
             self._active -= 1
+        if self._active < self.max_connections:
+            self._saturated_since = None
 
     def _log_denial(self, limit: int) -> None:
+        """The only place a refusal is distinguishable from an auth failure.
+
+        Carries the close code because uvicorn drops it on the wire (see
+        `reserve`), and the saturation duration because `_active` == `limit` is
+        a tautology at the point of denial.
+        """
         self._denied_since_log += 1
         now = time.monotonic()
         if now - self._last_denial_log < self._denial_log_interval:
             return
+        saturated_for = (
+            now - self._saturated_since if self._saturated_since is not None else 0.0
+        )
         logger.warning(
-            "websocket handshake refused: %d slot(s) in use, ceiling %d "
+            "websocket handshake refused with close code %d (sent on the wire as "
+            "HTTP 403): %d slot(s) in use, ceiling %d, saturated for %.1fs "
             "(%d refused since last report)",
+            WS_CLOSE_TRY_AGAIN_LATER,
             self._active,
             limit,
+            saturated_for,
             self._denied_since_log,
         )
         self._last_denial_log = now
@@ -200,6 +286,22 @@ ws_admission = WebSocketAdmission()
 def idle_timeout_seconds(default: int = 90) -> int:
     """Seconds of client silence tolerated before a socket is reclaimed."""
     return _positive_int(os.getenv("WS_IDLE_TIMEOUT_SECONDS"), default)
+
+
+def keepalive_seconds() -> int:
+    """The interval a client should actually send on — HALF the deadline.
+
+    Publishing the deadline itself, which is what this used to do, is a bug that
+    disconnects every client that obeys it: a ping sent `idle_timeout` seconds
+    after the last one arrives at `deadline + ε`, so the socket is already being
+    reclaimed. Measured against a real uvicorn with the deadline at 3s, a client
+    pinging every 3s got the idle-timeout error frame instead of its first pong
+    and was closed before the second.
+
+    Half leaves a full missed interval of slack, so one dropped or delayed ping
+    does not cost the connection.
+    """
+    return max(1, idle_timeout_seconds() // 2)
 
 
 async def idle_receive_text(

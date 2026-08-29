@@ -4,16 +4,20 @@ Basic WebSocket without complex authentication
 """
 
 import json
+import logging
 import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from realtime.metrics_store import snapshot
 from realtime.ws_guard import (
-    WS_CLOSE_GOING_AWAY,
+    WS_CLOSE_IDLE_TIMEOUT,
     WebSocketIdleTimeout,
     idle_receive_text,
     idle_timeout_seconds,
+    keepalive_seconds,
     ws_admission,
 )
+
+logger = logging.getLogger("simple_ws_routes")
 
 router = APIRouter(prefix="/api", tags=["simple-websocket"])
 
@@ -69,13 +73,18 @@ async def simple_websocket(websocket: WebSocket):
     try:
         await simple_manager.connect(websocket)
 
-        # Send initial snapshot. The keepalive interval rides along because a
-        # client cannot honour a deadline it was never told about.
+        # Send initial snapshot. Both halves of the liveness contract ride
+        # along, because a client cannot honour a deadline it was never told
+        # about — and telling it ONLY the deadline is worse than telling it
+        # nothing: a client that pings exactly that often always arrives late
+        # and is dropped every time. keepalive_seconds is the interval to send
+        # on; idle_timeout_seconds is when we give up.
         initial_snapshot = snapshot()
         await simple_manager.send_json(websocket, {
             "type": "snapshot",
             "data": initial_snapshot,
-            "keepalive_seconds": idle_timeout_seconds(),
+            "keepalive_seconds": keepalive_seconds(),
+            "idle_timeout_seconds": idle_timeout_seconds(),
             "timestamp": time.time()
         })
         
@@ -120,9 +129,11 @@ async def simple_websocket(websocket: WebSocket):
             "timestamp": time.time()
         })
         try:
-            await websocket.close(code=WS_CLOSE_GOING_AWAY)
+            await websocket.close(code=WS_CLOSE_IDLE_TIMEOUT)
         except Exception as e:
-            print(f"❌ Failed to close idle WebSocket: {e}")
+            # logger, not print: this is the one new failure path an operator
+            # would need to search for, and stdout carries no severity.
+            logger.warning("Failed to close idle WebSocket: %s", e)
     except WebSocketDisconnect:
         pass
     except Exception as e:
