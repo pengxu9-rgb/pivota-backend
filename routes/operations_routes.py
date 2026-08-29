@@ -511,8 +511,17 @@ async def get_dashboard_summary(
     
     # Get metrics from the main system
     metrics_store = get_metrics_store()
-    # role is required now; this route already proved the caller is an
-    # operator or admin above, so pass that rather than a default.
+    # role is required now, so pass the caller's own rather than the "admin"
+    # default this used to take.
+    #
+    # NOT "the caller is already known to be an operator": the line above is
+    # `check_permission(credentials, "operator")`, and utils.auth.check_permission
+    # RETURNS a bool and never raises, so that bare call is a discarded
+    # expression and this route is open to any authenticated role. Verified: it
+    # answers 200 for merchant, agent, employee and viewer alike. The same
+    # no-op appears at :93, :150, :210, :246 and :299. Passing the real role at
+    # least stops this line handing a merchant the platform's figures; the
+    # missing authorization is a separate fix with its own blast radius.
     system_metrics = (
         metrics_store.get_snapshot(role=str(credentials.get("role") or "operator"))
         if metrics_store

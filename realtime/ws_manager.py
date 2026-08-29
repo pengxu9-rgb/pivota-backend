@@ -6,6 +6,8 @@ Handles WebSocket connections, broadcasting, and authentication
 import json
 import logging
 from typing import Callable, Dict, List, Any, Optional
+
+from realtime.metrics_store import PLATFORM_WIDE_ROLES
 from fastapi import WebSocket, WebSocketDisconnect
 import time
 
@@ -177,15 +179,22 @@ async def publish_event_to_ws(event: Dict[str, Any]) -> None:
     now = time.time()
 
     def _for(user_info: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        role = user_info.get("role", "")
+        payload = {
             "type": "event",
-            "event": event,
-            "snapshot": snapshot(
-                role=user_info.get("role", ""),
-                entity_id=user_info.get("entity_id"),
-            ),
+            "snapshot": snapshot(role=role, entity_id=user_info.get("entity_id")),
             "timestamp": now,
         }
+        # The raw event is PLATFORM-WIDE ONLY. Scoping the snapshot while
+        # emitting `event` verbatim to everyone left the actual leak intact: a
+        # merchant-scoped socket received another tenant's order id, amount,
+        # transaction id and customer email in full. There is no scoped version
+        # of a raw event — that is exactly why /api/recent-events is admin-only
+        # (routes/dashboard_routes.py) — so a scoped caller gets the effect of
+        # the event on its OWN figures, via the snapshot, and not the payload.
+        if role in PLATFORM_WIDE_ROLES:
+            payload["event"] = event
+        return payload
 
     await _manager.broadcast_scoped(_for)
 

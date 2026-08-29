@@ -41,6 +41,16 @@ async def get_snapshot(
     of inspecting one merchant's slice is real — and are ignored for everybody
     else, whose scope is already fixed by their token.
     """
+    if id and not role:
+        # `?id=` alone did nothing at all: effective_role fell back to the
+        # admin's own role, which is platform-wide, so entity_id was ignored and
+        # the caller got the WHOLE platform — the exact opposite of the
+        # narrowing this parameter advertises, silently.
+        raise HTTPException(
+            status_code=400,
+            detail="id requires role (e.g. role=merchant&id=<merchant_id>)",
+        )
+
     if principal.is_admin and (role or id):
         effective_role, effective_id = (role or principal.role), id
     else:
@@ -150,12 +160,30 @@ async def websocket_metrics(websocket: WebSocket, token: Optional[str] = Query(N
     refused the dashboard to everyone. An unauthenticated flood now never
     reaches the ceiling, so the budget is spendable only by credential holders.
 
-    Still no idle deadline, for the unchanged reason: this endpoint really is
-    pushed to (payment_orchestrator -> utils/event_publisher ->
-    ws_manager.publish_event_to_ws), so a silent client is a legitimate listener.
-    Those pushes are now built per connection via broadcast_scoped — a single
-    unscoped snapshot fanned out to everyone would have made authenticating the
-    handshake pointless for exactly the data it protects.
+    Still no idle deadline — but the reason given for that in the previous two
+    commits was WRONG and is corrected here rather than quietly dropped. Those
+    said this endpoint "really is pushed to" via payment_orchestrator ->
+    utils/event_publisher -> ws_manager.publish_event_to_ws. The wiring exists;
+    the calls do not work. orchestrator/payment_orchestrator.py:149 passes
+    payment_id/success/fees/transaction_id to publish_payment_result, which
+    accepts none of them and requires `status` besides, so it raises TypeError
+    into the `except Exception` at :189 and is swallowed. Same at :173 for
+    publish_order_event. So publish_event_to_ws has NO working caller today and
+    broadcast_snapshot has none at all: nothing is pushed, and a silent client
+    here is currently a squatter rather than a listener.
+
+    The deadline stays off anyway, deliberately. Whoever repairs those call sites
+    restores real pushes, and a deadline added now on the strength of the path
+    being broken would become a bug the moment it is fixed. The ceiling bounds
+    this route, and sockets must now authenticate to reach it at all, so what a
+    squatter can hold is small and credentialled. Repairing the orchestrator is
+    NOT done here: it would switch on a dormant production path inside a
+    security change.
+
+    When those pushes do resume they are built per connection via
+    broadcast_scoped, and the raw event goes only to platform-wide roles — a
+    single unscoped payload fanned out to everyone would have made
+    authenticating the handshake pointless for exactly the data it protects.
     """
     principal = await authenticate_websocket(websocket, token)
     if principal is None:

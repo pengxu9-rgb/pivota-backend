@@ -262,8 +262,19 @@ class MetricsStore:
             "merchant": merchant_data,
             "psp_usage": psp_usage_data,
             "timestamp": time.time(),
+            # A configured constant, not anyone's data.
             "window_size_seconds": self.window_size_seconds,
-            "total_events": len(self.events)
+            # Scoped like everything else. This sat OUTSIDE the branch and so
+            # reported the platform's event count to every caller — a merchant
+            # with 3 of 10 events got summary.total=3 next to total_events=10,
+            # and an unrecognised role got an all-zero summary next to the same
+            # 10. Platform volume is a business metric; "every path assigns" has
+            # to mean every field.
+            "total_events": (
+                len(self.events)
+                if role in PLATFORM_WIDE_ROLES
+                else filtered_summary["total"]
+            ),
         }
         
         return snapshot

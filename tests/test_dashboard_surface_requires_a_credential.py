@@ -31,6 +31,7 @@ if str(BACKEND_ROOT) not in sys.path:
 from realtime import metrics_store, ws_manager  # noqa: E402
 from realtime.ws_guard import ws_admission  # noqa: E402
 from routes import dashboard_routes, simple_ws_routes  # noqa: E402
+from utils import auth as _auth  # noqa: E402
 from utils.auth import JWT_SECRET, create_jwt_token  # noqa: E402
 from utils.dashboard_auth import (  # noqa: E402
     WS_CLOSE_POLICY_VIOLATION,
@@ -363,7 +364,11 @@ def test_a_forgeable_jwt_secret_disables_token_auth_on_a_real_server(monkeypatch
     from config import platform
     from utils import dashboard_auth
 
-    monkeypatch.setattr(dashboard_auth, "JWT_SECRET", "your-super-secret-key")
+    # Patch utils.auth — the single source both decode_token and the guard read.
+    # Patching dashboard_auth's own name (which this did while it held a
+    # `from ... import JWT_SECRET` copy) asserted the guard's opinion of a
+    # secret the system was not actually signing or verifying with.
+    monkeypatch.setattr(_auth, "JWT_SECRET", "your-super-secret-key")
     monkeypatch.setenv("K_SERVICE", "pivota-backend")  # a Cloud Run marker
     platform.reset_platform_state()
     try:
@@ -385,7 +390,7 @@ def test_a_strong_secret_on_a_real_server_is_accepted(monkeypatch):
     from config import platform
     from utils import dashboard_auth
 
-    monkeypatch.setattr(dashboard_auth, "JWT_SECRET", "x" * 32)
+    monkeypatch.setattr(_auth, "JWT_SECRET", "x" * 32)
     monkeypatch.setenv("K_SERVICE", "pivota-backend")
     platform.reset_platform_state()
     try:
@@ -407,7 +412,7 @@ def test_a_strong_secret_on_a_real_server_is_accepted(monkeypatch):
 def test_secret_strength_rules(monkeypatch, secret, trustworthy):
     from utils import dashboard_auth
 
-    monkeypatch.setattr(dashboard_auth, "JWT_SECRET", secret)
+    monkeypatch.setattr(_auth, "JWT_SECRET", secret)
     assert dashboard_auth._jwt_secret_is_trustworthy() is trustworthy
 
 
@@ -441,3 +446,119 @@ def test_a_scoped_token_naming_no_tenant_is_refused(role):
     naked = jwt.encode({"sub": "u", "role": role}, JWT_SECRET, algorithm="HS256")
     with pytest.raises(DashboardAuthError):
         resolve_principal(token=naked)
+
+
+
+# --- findings from adversarial review of 9662674b/4d35f860 ------------------
+
+@pytest.mark.parametrize("header", ["\xe9", "adm\xefn-key", "\xff" * 4])
+def test_a_non_ascii_admin_key_does_not_crash_the_surface(monkeypatch, header):
+    """hmac.compare_digest on `str` raises TypeError for any non-ASCII char, and
+    Starlette decodes header bytes as latin-1 — so `X-ADMIN-KEY: \xc3\xa9` was an
+    uncaught TypeError: a 500 on every route here from an unauthenticated
+    caller, and only once ADMIN_API_KEY was configured, i.e. only in production.
+
+    Driven through resolve_principal rather than TestClient because httpx
+    refuses to SEND a non-ASCII header value (UnicodeEncodeError in
+    httpx/_utils.py), so no test client can reach this line — a real client
+    speaking HTTP has no such scruples. The strings below are exactly what
+    Starlette hands the app after its latin-1 decode. Confirmed end-to-end
+    against uvicorn over a raw socket; see the commit message.
+    """
+    monkeypatch.setenv("ADMIN_API_KEY", "a-real-admin-key")
+    with pytest.raises(DashboardAuthError):  # refused, NOT TypeError
+        resolve_principal(admin_key=header)
+
+
+def test_the_admin_key_still_matches_after_the_bytes_fix(client, monkeypatch):
+    """The positive counterpart — the fix must not break the credential."""
+    monkeypatch.setenv("ADMIN_API_KEY", "a-real-admin-key")
+    assert client.get("/api/snapshot", headers={"X-ADMIN-KEY": "a-real-admin-key"}).status_code == 200
+    assert client.get("/api/snapshot", headers={"X-ADMIN-KEY": "wrong"}).status_code == 401
+    assert resolve_principal(admin_key="a-real-admin-key").role == "admin"
+
+
+async def test_the_pushed_event_payload_is_platform_wide_only():
+    """Scoping the snapshot while emitting `event` verbatim left the real leak.
+
+    A merchant-scoped socket received another tenant's order id, amount,
+    transaction id and customer email in full. There is no scoped version of a
+    raw event — which is exactly why /api/recent-events is admin-only.
+    """
+    import json
+
+    sent: dict = {}
+
+    class _Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        async def send_text(self, data: str) -> None:
+            sent[self.name] = json.loads(data)
+
+    manager = ws_manager.get_connection_manager()
+    manager.active_connections = {"a": _Recorder("admin"), "m": _Recorder("merchant")}
+    manager.connection_metadata = {
+        "a": {"user_info": {"user_id": "a", "role": "admin", "entity_id": None}},
+        "m": {"user_info": {"user_id": "m", "role": "merchant", "entity_id": "merchant_a"}},
+    }
+
+    await ws_manager.publish_event_to_ws(
+        {
+            "type": "payment",
+            "status": "succeeded",
+            "psp": "stripe",
+            "agent": "agent_b",
+            "merchant": "merchant_b",
+            "latency_ms": 12,
+            "customer_email": "victim@example.com",
+            "transaction_id": "txn_secret_b",
+        }
+    )
+
+    assert "event" in sent["admin"]
+    assert "event" not in sent["merchant"], "a merchant was handed another tenant's raw event"
+    blob = json.dumps(sent["merchant"])
+    assert "victim@example.com" not in blob
+    assert "txn_secret_b" not in blob
+    assert "merchant_b" not in blob
+
+
+def test_total_events_is_scoped_like_everything_else():
+    """It sat outside the filter branch, so it reported platform volume to
+    everyone — a merchant saw summary.total=1 beside total_events=3."""
+    seed_two_tenants()
+    metrics_store.get_metrics_store().record_event(
+        {"type": "p", "status": "succeeded", "psp": "stripe",
+         "agent": "agent_b", "merchant": "merchant_b", "latency_ms": 5}
+    )
+
+    assert metrics_store.snapshot(role="admin")["total_events"] == 3
+    scoped = metrics_store.snapshot(role="merchant", entity_id="merchant_a")
+    assert scoped["total_events"] == scoped["summary"]["total"] == 1
+    assert metrics_store.snapshot(role="nonsense")["total_events"] == 0
+
+
+def test_id_without_role_is_refused_rather_than_silently_ignored(client):
+    """`?id=` alone fell back to the admin's platform-wide role, so entity_id was
+    ignored and the caller got the WHOLE platform — the opposite of the
+    narrowing the parameter advertises, with no error."""
+    seed_two_tenants()
+    r = client.get("/api/snapshot?id=merchant_a", headers=bearer(role="admin"))
+    assert r.status_code == 400
+    assert "role" in r.json()["detail"]
+
+    ok = client.get("/api/snapshot?role=merchant&id=merchant_a", headers=bearer(role="admin"))
+    assert set(ok.json()["merchant"]) == {"merchant_a"}
+
+
+def test_a_query_string_token_is_no_longer_accepted_over_http(client):
+    """A 24h bearer in a query string lands in uvicorn's access log and Cloud
+    Run's httpRequest.requestUrl. An HTTP client can always send a header; only
+    a browser WebSocket cannot, which is why the socket still takes one."""
+    token = create_jwt_token("tester", "admin")
+    assert client.get(f"/api/snapshot?token={token}").status_code == 401
+    assert client.get("/api/snapshot", headers=bearer()).status_code == 200
+
+    with client.websocket_connect(f"/api/ws/simple?token={token}") as ws:
+        assert ws.receive_json()["type"] == "snapshot"

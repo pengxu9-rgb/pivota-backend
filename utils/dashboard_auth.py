@@ -54,7 +54,8 @@ from fastapi.security import HTTPAuthorizationCredentials
 
 from config.platform import is_deployed, is_production
 from realtime.metrics_store import PLATFORM_WIDE_ROLES
-from utils.auth import JWT_SECRET, decode_token, optional_security
+from utils import auth as _auth
+from utils.auth import decode_token, is_admin as is_admin_role, optional_security
 
 logger = logging.getLogger("dashboard_auth")
 
@@ -74,7 +75,12 @@ def _jwt_secret_is_trustworthy() -> bool:
     the tree, so that guard has never run. `utils.auth` binds
     `config.settings.settings.jwt_secret_key`, which falls back to a literal.
     """
-    secret = (JWT_SECRET or "").strip()
+    # Read through the module rather than a `from ... import JWT_SECRET` snapshot:
+    # `decode_token` resolves utils.auth.JWT_SECRET at call time, so a by-value
+    # copy here could disagree with the secret actually verifying tokens — and a
+    # test patching only one side would be asserting this guard's opinion of a
+    # secret the system is not using.
+    secret = (getattr(_auth, "JWT_SECRET", "") or "").strip()
     if not secret or secret == _DEV_DEFAULT_JWT_SECRET:
         return False
     return len(secret.encode()) >= _MIN_JWT_SECRET_BYTES
@@ -83,11 +89,11 @@ def _jwt_secret_is_trustworthy() -> bool:
 def _refuse_forgeable_tokens() -> bool:
     """Whether to reject token credentials outright on this host.
 
-    BOTH conjuncts, deliberately, per the rule the repo already follows in
-    `utils/runtime_safety.py`: `is_deployed()` and `is_production()` are
-    independent, so `not is_production()` would permit every staging revision
-    and `not is_deployed()` would permit PIVOTA_ENV=production on an unmanaged
-    host. This is a "must not happen on a real server" guard, so it needs both.
+    BOTH predicates, OR-ed — they are independent, not nested, so either alone
+    leaves a gap: `is_production()` alone permits every staging revision, and
+    `is_deployed()` alone permits PIVOTA_ENV=production on an unmanaged host.
+    This is a "must not happen on a real server" guard, so it fires on either.
+    Same shape as `utils/runtime_safety.py:16-24`.
 
     It refuses rather than crashes. Raising at import would take the whole
     service down if a deployment really is running on the fallback secret, which
@@ -107,8 +113,9 @@ WS_CLOSE_POLICY_VIOLATION = 1008
 # PLATFORM_WIDE_ROLES is imported, not redeclared. A second copy of an
 # authorization list is how the two JWT secrets drifted apart in the first place.
 
-# Roles that may reset the store or read connection internals.
-ADMIN_ROLES = frozenset({"admin", "super_admin"})
+# Admin-ness is decided by utils.auth.is_admin, not by a fourth copy of
+# ["admin", "super_admin"] — the same reasoning that makes PLATFORM_WIDE_ROLES an
+# import rather than a redeclaration.
 
 # Roles that describe ONE tenant and are meaningless without naming it.
 SCOPED_ROLES = frozenset({"agent", "merchant"})
@@ -124,6 +131,15 @@ _TENANT_CLAIMS = {
     "merchant": ("merchant_id", "entity_id"),
     "agent": ("agent_id", "entity_id"),
 }
+# CAVEAT on the "agent" row: nothing in this repo currently ISSUES a token
+# carrying `agent_id`. utils.auth.create_jwt_token writes it, but its only
+# agent-scoped caller (routes/dashboard_api.py:97) passes an `expires_delta=`
+# kwarg that function does not accept, so it raises; and routes/auth_routes.py
+# writes only `merchant_id` despite a comment at :302 saying "merchant_id or
+# agent_id". So every role="agent" token in circulation names no tenant and is
+# refused here. That direction is safe — refusal, not exposure — but it means
+# agent dashboards do not work until an issuer emits the claim, and this map is
+# what they will need to satisfy.
 
 
 @dataclass(frozen=True)
@@ -140,7 +156,7 @@ class DashboardPrincipal:
 
     @property
     def is_admin(self) -> bool:
-        return self.role in ADMIN_ROLES
+        return is_admin_role(self.role)
 
 
 class DashboardAuthError(Exception):
@@ -153,9 +169,18 @@ def _admin_key_matches(supplied: str) -> bool:
     An unset key must never match an unset header — otherwise the entire surface
     opens up the moment a deployment forgets to configure one.
     """
+    # Compared as BYTES. `hmac.compare_digest` on `str` raises TypeError for any
+    # non-ASCII character, and Starlette decodes header bytes as latin-1, so a
+    # header of `X-ADMIN-KEY: \xc3\xa9` produced an uncaught TypeError — a 500 on
+    # every route of this surface, from an unauthenticated caller, and only once
+    # ADMIN_API_KEY was configured (the `if expected` guard), i.e. only in
+    # production. The predecessor this mirrors, utils.auth.require_admin_or_key,
+    # uses `in` and cannot throw; the parity its docstring claims has to include
+    # not being crashable.
+    supplied_bytes = supplied.encode("utf-8", "surrogateescape")
     for name in ("ADMIN_API_KEY", "PROMOTIONS_ADMIN_KEY"):
         expected = (os.getenv(name) or "").strip()
-        if expected and hmac.compare_digest(supplied, expected):
+        if expected and hmac.compare_digest(supplied_bytes, expected.encode()):
             return True
     return False
 
@@ -227,14 +252,24 @@ def resolve_principal(
 
 
 async def require_dashboard_principal(
-    token: Optional[str] = Query(None, description="JWT (browsers only; prefer the Authorization header)"),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
     x_admin_key: Optional[str] = Header(None, alias="X-ADMIN-KEY"),
 ) -> DashboardPrincipal:
-    """FastAPI dependency. 401 when no credential resolves."""
+    """FastAPI dependency. 401 when no credential resolves.
+
+    Header credentials only. `GET /api/snapshot` used to take `?token=`, and a
+    query string is not a safe place for a 24-hour bearer token: uvicorn's access
+    log writes the request line with its query string, and Cloud Run records
+    `httpRequest.requestUrl` regardless of what the app does — so every such
+    request parked a live credential in the logs. (The app's own
+    `middleware/structured_logging` redacts query keys containing "token", but it
+    is a BaseHTTPMiddleware and neither the platform log nor a WebSocket scope
+    passes through it.) An HTTP client can always send a header. A BROWSER
+    WebSocket cannot, which is the sole reason `authenticate_websocket` still
+    accepts one — unavoidable there, avoidable here.
+    """
     try:
         return resolve_principal(
-            token=token,
             bearer=credentials.credentials if credentials else None,
             admin_key=x_admin_key,
         )
