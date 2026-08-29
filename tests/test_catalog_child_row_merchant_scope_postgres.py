@@ -30,6 +30,14 @@ built from PRODUCT-level metadata but appended inside the VARIANT loop, so a
 two-variant product hands the same asset id in twice within ONE run. That one
 needs no second merchant — it aborted a single merchant's ingest on its own.
 
+Deduping those two copies (#1940) stopped the abort but left the surviving row
+stamped with the LAST variant's `sku_key`, so the tutorial surfaced on exactly
+one of the product's variants. Product-level payloads are now derived once,
+outside the loop, and written with `sku_key = NULL` — the product-level marker
+`beauty_field_authoring` and `routes/merchant_products.py` already used — and
+read through an `IS NULL` arm. Both halves are pinned below: one test that ONE
+row is written, one that EVERY variant can read it.
+
 WHY THIS TEST NEEDS POSTGRES: the failure IS a primary-key constraint. The
 repo's fake-database tests (`tests/test_catalog_sync_service_integration.py`)
 keep rows in dicts and would report both merchants succeeding against the
@@ -410,3 +418,88 @@ def test_child_row_ids_are_derived_from_the_merchant_scoped_product_key():
     declared_b = sync._extract_tutorial_assets(key_b, declared)
     assert declared_a[0]["asset_id"] != "tut-1"
     assert declared_a[0]["asset_id"] != declared_b[0]["asset_id"]
+
+
+def test_a_product_level_asset_reaches_every_variants_read_payload(engine):
+    """The sibling half of the test above: that one pins that ONE row is
+    written, this one pins WHO CAN READ IT.
+
+    `platform_metadata.tutorials` and `how_to_use` describe the PRODUCT. Derived
+    inside the variant loop they were stamped with a variant's `sku_key`, and
+    the two tables then failed differently:
+
+      * every variant derived the SAME `asset_id` (it hashes only
+        `product_key`), so the dedupe in `_replace_child_rows_multi` left one
+        row carrying the LAST variant's sku_key. `_fetch_beauty_vertical_payload`
+        is called per-SKU with a concrete `sku_key`, so variant 1 got zero
+        tutorials and variant 2 got one.
+      * `guide_id` hashes `sku_key`, so the usage guide multiplied into one
+        identical row per variant and never matched the `sku_key IS NULL` join
+        `routes/merchant_products.py` uses for it.
+
+    Both are written once now with `sku_key = NULL`, the product-level marker
+    `beauty_field_authoring` already used, and read through an `IS NULL` arm.
+
+    Note WHY that arm is needed: the pre-existing predicate
+    `CAST(:sku_key AS text) IS NULL OR sku_key = ...` tests the PARAMETER, not
+    the column, so writing a NULL sku_key without touching the read would have
+    hidden the row from every per-SKU caller instead of fixing it.
+    """
+    import services.catalog_sync_service as sync
+    import services.pivot_query_service as pq
+
+    stats = _ingest(MERCHANT_A, tutorials=True)
+    assert stats["products_ingested"] == 1, stats
+    assert stats["beauty_content_assets_upserted"] == 1, stats
+    assert stats["beauty_usage_guides_upserted"] == 1, stats
+
+    # The stored marker: one product-level row per table, sku_key NULL.
+    assert _rows(engine, "SELECT sku_key FROM beauty_content_assets") == [(None,)]
+    assert _rows(engine, "SELECT sku_key FROM beauty_usage_guides") == [(None,)]
+    # ... and it is the id `beauty_field_authoring` writes, so the merchant's
+    # own how_to_use and ingest's converge on ONE row rather than racing two
+    # NULL-sku rows past that IS NULL join.
+    from services.beauty_field_authoring import product_usage_guide_id
+
+    product_key = sync.make_catalog_product_key(MERCHANT_A, "shopify", SOURCE_PRODUCT_ID)
+    assert _rows(engine, "SELECT guide_id FROM beauty_usage_guides") == [
+        (product_usage_guide_id(product_key),)
+    ]
+
+    sku_keys = sorted(
+        k
+        for (k,) in _rows(
+            engine,
+            "SELECT sku_key FROM catalog_skus"
+            f" WHERE product_key = '{product_key}'",
+        )
+    )
+    # Two variants, or the read assertions below prove nothing.
+    assert len(sku_keys) == 2, sku_keys
+
+    for sku_key in sku_keys:
+        payload = _drive(
+            lambda sk=sku_key: pq._fetch_beauty_vertical_payload(product_key, sk)
+        )
+        assert [t["url"] for t in payload["tutorials"]] == [
+            "https://cdn.example.com/t1.mp4"
+        ], (sku_key, payload["tutorials"])
+        assert payload["how_to_use"] == "Apply daily.", (sku_key, payload["how_to_use"])
+
+    # The product-level read (no sku_key) still works — that is the arm the old
+    # predicate served, and it must not have been traded away for the new one.
+    product_payload = _drive(
+        lambda: pq._fetch_beauty_vertical_payload(product_key, None)
+    )
+    assert [t["url"] for t in product_payload["tutorials"]] == [
+        "https://cdn.example.com/t1.mp4"
+    ], product_payload["tutorials"]
+
+    # Per-SKU rows are still per-SKU: shades stay split across the two variants
+    # (`beauty_shades.sku_key` is NOT NULL — that table is genuinely variant
+    # scoped), so this is not "everything became product-level".
+    for sku_key in sku_keys:
+        payload = _drive(
+            lambda sk=sku_key: pq._fetch_beauty_vertical_payload(product_key, sk)
+        )
+        assert len(payload["shades"]) == 1, (sku_key, payload["shades"])

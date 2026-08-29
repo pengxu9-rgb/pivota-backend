@@ -260,7 +260,16 @@ def _product_key(merchant_id: str, platform: str, source_product_id: str) -> str
     return f"prod::{merchant_id}::{platform}::{source_product_id}"
 
 
-def _usage_guide_id(product_key: str) -> str:
+def product_usage_guide_id(product_key: str) -> str:
+    """THE id of a product's one product-level `beauty_usage_guides` row.
+
+    `how_to_use` describes the product, not a variant, so a product_key has
+    exactly one guide row and it carries `sku_key = NULL` (this schema's
+    product-level marker — `routes/merchant_products.py` joins on
+    `bug.sku_key IS NULL`). Catalog ingest derives the same id through this
+    function, so the two writers converge on one row instead of racing two
+    NULL-sku rows past that join.
+    """
     digest = hashlib.sha256(f"usage::{product_key}::product".encode()).hexdigest()[:20]
     return f"guide_{digest}"
 
@@ -344,7 +353,7 @@ async def _write_raw_inci(
 async def _write_how_to_use(
     *, product_key: str, merchant_id: str, value: str,
 ) -> str:
-    guide_id = _usage_guide_id(product_key)
+    guide_id = product_usage_guide_id(product_key)
     await database.execute(
         """
         INSERT INTO beauty_usage_guides (
