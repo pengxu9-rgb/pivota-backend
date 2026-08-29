@@ -694,13 +694,6 @@ async def _finalize_stripe_refund_failure(
     metadata_patch = {
         "stripe_last_refund_failure": failure_payload,
     }
-    # The finalizer drops this refund from psp_refund_records on rollback; the
-    # ledger must lose it too, or the next refund's cumulative would resurrect it.
-    pruned_ledger = _stripe_refund_ledger_without(
-        existing_metadata, refund_id=refund_reference
-    )
-    if pruned_ledger is not None:
-        metadata_patch[_STRIPE_REFUND_LEDGER_KEY] = pruned_ledger
     if refund_snapshot:
         metadata_patch.update(
             stripe_refund_metadata_patch(
@@ -993,6 +986,7 @@ def _stripe_event_refund_matches_order(
     *,
     refund_amount_minor: Any,
     currency: Optional[str],
+    cumulative_total: Optional[Decimal] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Verify the signed Stripe refund event's amount + currency are consistent
     with the order it claims to refund.
@@ -1004,13 +998,13 @@ def _stripe_event_refund_matches_order(
     a different currency) writes a bogus `total_refunded` and flips the order to
     `refunded`/`partially_refunded` on an amount we never charged.
 
-    Both refund success paths feed `refund_total` to `finalize_refund_success`,
-    which takes `max(current_total_refunded, refund_total)` — a monotonic
-    ceiling, NOT accumulation. The order total is therefore the right bound for
-    either a cumulative `charge.refunded.amount_refunded` or a single
-    `refund.amount`. (Note that `max()` also means two sequential $300 and $200
-    `refund.updated` events on a $500 order leave total_refunded at 300, not
-    500. That is pre-existing and NOT fixed here.)
+    `cumulative_total`, when given, is the total that will actually be WRITTEN —
+    the sum across this order's individual refunds. It, not the single amount, is
+    what must fit inside the order total. Bounding only the single amount was
+    correct while `refund_total` was a monotonic ceiling; once refund-level events
+    started contributing a SUM, two $400 refunds on a $500 order each passed the
+    per-refund check and wrote total_refunded=800 — a number that feeds
+    `attach_refund_to_attribution_edge` and the merchant's statement.
 
     Returns (ok, reason_if_not).
     """
@@ -1035,93 +1029,88 @@ def _stripe_event_refund_matches_order(
 
     if observed <= Decimal("0"):
         return False, f"refund_amount_not_positive:observed={observed}"
-    if observed > max_refundable:
+
+    bounded = observed if cumulative_total is None else cumulative_total
+    if bounded > max_refundable:
         return (
             False,
-            f"refund_exceeds_order_total:order_total={max_refundable},observed={observed}",
+            f"refund_exceeds_order_total:order_total={max_refundable},observed={bounded}",
         )
     return True, None
 
 
-_STRIPE_REFUND_LEDGER_KEY = "stripe_refund_ledger"
+_STRIPE_REFUND_LEVEL_SOURCE_EVENTS = frozenset({"refund.updated"})
 
 
-def _stripe_refund_ledger(existing_metadata: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """The per-refund amount ledger stored on the order, as {refund_id: amount}."""
-    meta = existing_metadata if isinstance(existing_metadata, dict) else {}
-    raw = meta.get(_STRIPE_REFUND_LEDGER_KEY)
-    if not isinstance(raw, dict):
-        return {}
-    return {str(k): str(v) for k, v in raw.items() if str(k).strip()}
-
-
-def _stripe_refund_ledger_cumulative(
+def _stripe_refund_level_cumulative(
     existing_metadata: Optional[Dict[str, Any]],
     *,
     refund_id: Optional[str],
     refund_total: Decimal,
-) -> Tuple[Decimal, Dict[str, str]]:
-    """Fold one refund's amount into the ledger and return (cumulative, ledger).
+) -> Decimal:
+    """Total refunded across INDIVIDUAL refunds, folding in the one just received.
 
-    WHY A LEDGER, and not either obvious one-liner:
-
-    `finalize_refund_success` applies `refund_total` as a MONOTONIC CEILING —
-    `max(current_total_refunded, refund_total)` — not as an accumulator. That is
-    right for `charge.refunded`, whose `amount_refunded` is the charge's
-    cumulative total. `refund.updated` carries ONE refund's amount, so:
+    WHY THIS EXISTS. `finalize_refund_success` applies `refund_total` as a
+    MONOTONIC CEILING — `max(current_total_refunded, refund_total)` — not an
+    accumulator. That suits `charge.refunded`, whose `amount_refunded` is the
+    charge's cumulative total. `refund.updated` carries ONE refund's amount, so:
 
       - passing that single amount under-counts sequential partials: $300 then
         $200 on a $500 order lands at 300, and the order stays
-        `partially_refunded`. That is the bug this fixes.
-      - passing a naive running sum instead DOUBLE-counts, because
-        `charge.refunded` may already have contributed the same money under a
-        DIFFERENT refund key (`stripe:ch_…` vs `stripe:re_…`), which the
-        `psp_refund_refs` duplicate guard therefore does not catch. Verified
-        against the real finalizer: charge.refunded($300) then
-        refund.updated($300) for that same refund lands at 600.
+        `partially_refunded`.
+      - passing a naive running sum DOUBLE-counts, because `charge.refunded` may
+        already have contributed the same money under a different refund key
+        (`stripe:ch_…` vs `stripe:re_…`), which the `psp_refund_refs` duplicate
+        guard therefore does not catch — verified to land at 600.
 
-    So: sum a ledger keyed by Stripe refund id, and still hand the result to the
-    ceiling. The sum is correct across sequential partials, and `max()` keeps a
-    charge-level cumulative from being stacked on top of the refund-level rows.
-    Re-delivery of the same refund id is idempotent — it overwrites its own key.
+    So sum only the REFUND-LEVEL rows and hand the result to the ceiling.
 
-    The ledger is pruned by `_finalize_stripe_refund_failure` when a refund is
-    rolled back, mirroring what the finalizer already does to
-    `psp_refund_records`; otherwise a later refund would resurrect the failed
-    amount through this sum.
+    WHY psp_refund_records AND NOT A DEDICATED KEY. A first cut kept its own
+    `stripe_refund_ledger` blob. That is the wrong home for money-bearing state:
+    `update_order` REPLACES the whole metadata column from a request-start
+    snapshot (db/orders.py), and `_persist_stripe_refund_observability` calls it
+    on the `refund.created` path — so a concurrent `refund.created` silently wiped
+    the ledger and reinstated the exact under-count this fixes. psp_refund_records
+    is maintained by `update_order_status`, which merges additively against a
+    fresh read, and it is ALREADY pruned on rollback, so this needs no bookkeeping
+    of its own. (That `update_order` full-replace remains a hazard for
+    psp_refund_records itself — pre-existing, tracked separately.)
     """
-    ledger = _stripe_refund_ledger(existing_metadata)
-    key = str(refund_id or "").strip()
-    if key:
-        ledger[key] = str(refund_total)
+    records: Dict[str, Any] = {}
+    meta = existing_metadata if isinstance(existing_metadata, dict) else {}
+    raw = meta.get("psp_refund_records")
+    if isinstance(raw, dict):
+        records = raw
 
-    cumulative = Decimal("0")
-    for value in ledger.values():
+    this_refund = str(refund_id or "").strip()
+    cumulative = refund_total
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("source_event") or "") not in _STRIPE_REFUND_LEVEL_SOURCE_EVENTS:
+            continue
+        # This refund's own prior row is superseded by the amount just received.
+        if this_refund and str(record.get("refund_reference") or "").strip() == this_refund:
+            continue
+        # `amount_minor` is the event's FACE amount, passed straight through by the
+        # finalizer. Do NOT use `amount`: that is the delta actually applied, which
+        # the cumulative branch recomputes as
+        # `next_total_refunded - current_total_refunded` and therefore ZEROES on a
+        # redelivery — summing it silently loses that refund's money.
+        raw_minor = record.get("amount_minor")
+        if raw_minor is None:
+            continue
         try:
-            cumulative += Decimal(str(value))
+            record_factor = _stripe_minor_unit_factor(str(record.get("currency") or ""))
+            cumulative += Decimal(str(raw_minor)) / record_factor
         except Exception:  # noqa: BLE001 - a malformed row must not wedge refunds
             logger.warning(
                 {
-                    "alert": "stripe_refund_ledger_unparsable_entry",
-                    "refund_id": key,
-                    "value": str(value)[:64],
+                    "alert": "stripe_refund_record_unparsable_amount",
+                    "refund_reference": str(record.get("refund_reference") or "")[:64],
                 }
             )
-    # Never report less than the amount we were just handed: a corrupt or
-    # truncated ledger must not silently shrink an order's refunded total.
-    return max(cumulative, refund_total), ledger
-
-
-def _stripe_refund_ledger_without(
-    existing_metadata: Optional[Dict[str, Any]], *, refund_id: Optional[str]
-) -> Optional[Dict[str, str]]:
-    """Drop a rolled-back refund from the ledger. None when nothing changes."""
-    ledger = _stripe_refund_ledger(existing_metadata)
-    key = str(refund_id or "").strip()
-    if not key or key not in ledger:
-        return None
-    ledger.pop(key)
-    return ledger
+    return cumulative
 
 
 # Refusal reasons that can NEVER succeed on redelivery. Everything else is
@@ -1135,6 +1124,10 @@ _STRIPE_PERMANENT_REFUSAL_PREFIXES = (
     "refund_amount_not_positive",
     "event_amount_missing",
     "refund_amount_missing",
+    # Deterministic in the signed bytes plus the order row: an identical
+    # redelivery reproduces them exactly, so retrying can only burn the schedule.
+    "amount_parse_error",
+    "refund_amount_parse_error",
 )
 
 
@@ -1154,7 +1147,12 @@ def _stripe_refusal_is_permanent(reason: Optional[str]) -> bool:
     return text.startswith(_STRIPE_PERMANENT_REFUSAL_PREFIXES)
 
 
-def _stripe_unmatched_response(*, event_type: Optional[str], reason: Optional[str]) -> Dict[str, Any]:
+def _stripe_unmatched_response(
+    *,
+    event_type: Optional[str],
+    reason: Optional[str],
+    claims_our_order: bool = False,
+) -> Dict[str, Any]:
     """The delivery outcome for a refused event.
 
     Permanent refusal -> 200 + 'unmatched'. Retrying cannot help, and a 200 stops
@@ -1164,10 +1162,22 @@ def _stripe_unmatched_response(*, event_type: Optional[str], reason: Optional[st
     recovery net: `webhook_events.status = 'unmatched'` has no consumer in this
     repo, so a 200 here means a real charge or refund is dropped for good. Stripe
     already retries with backoff for ~3 days; using that beats inventing a sweep
-    that does not exist. If the order never materialises the event ends up
-    failed-and-visible rather than silently swept up as handled.
+    that does not exist.
+
+    `claims_our_order` GATES that deferral, and it is not optional. A per-psp
+    endpoint is created on the MERCHANT'S OWN Stripe account
+    (`_ensure_stripe_webhook_endpoint`, `stripe_account=account_id`) and
+    subscribes to `payment_intent.succeeded` among others. Stripe endpoints are
+    account-wide, not order-scoped, so every charge that merchant takes OUTSIDE
+    Pivota — their own storefront, invoices, subscriptions — is delivered here and
+    resolves to no order. Deferring those would answer 503 to events that can
+    never resolve, on the full retry schedule, and Stripe disables endpoints that
+    fail continuously. Losing the endpoint would take down payment finalization
+    AND refunds for that merchant: strictly worse than the dropped event this is
+    meant to fix. So only an event that names one of our orders is deferred;
+    anything with no Pivota provenance keeps the historical 200.
     """
-    if _stripe_refusal_is_permanent(reason):
+    if _stripe_refusal_is_permanent(reason) or not claims_our_order:
         return {"status": "unmatched", "event": event_type, "reason": reason}
     logger.error(
         {
@@ -1242,7 +1252,7 @@ async def _flag_unmatched_stripe_payment_event(
             "payment_intent_id": payment_intent_id,
             "metadata_order_id": meta_order_id,
             "reason": reason,
-            "impact": "charge may have succeeded with no finalizable order; reconcile sweep will retry",
+            "impact": "charge may have succeeded with no finalizable order; NO automated sweep exists — if this was not deferred for Stripe redelivery it needs manual follow-up",
         }
     )
     await _mark_stripe_webhook_event_status_best_effort(event_id, "unmatched", reason)
@@ -1381,6 +1391,12 @@ async def handle_stripe_webhook(
                 return _stripe_unmatched_response(
                     event_type=event_type,
                     reason=payment_reject or "no_order_resolved",
+                    # Only defer when the event names one of OUR orders; see the
+                    # account-wide-endpoint note in _stripe_unmatched_response.
+                    claims_our_order=bool(
+                        isinstance(payment_meta, dict)
+                        and str(payment_meta.get("order_id") or "").strip()
+                    ),
                 )
 
             # Integrity: the signed charge amount/currency must match the order.
@@ -1523,6 +1539,18 @@ async def handle_stripe_webhook(
                 allow_repoint=True,
                 psp_id=psp_id,
             )
+            if _payment_reject:
+                await _flag_unmatched_stripe_payment_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                    reason=_payment_reject,
+                )
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=_payment_reject
+                )
+
             if result:
                 from routes.order_routes import finalize_authorized_payment_order
 
@@ -1563,6 +1591,18 @@ async def handle_stripe_webhook(
                 )
             else:
                 result = None
+                _payment_reject = None
+            if _payment_reject:
+                await _flag_unmatched_stripe_payment_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=session_id,
+                    payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                    reason=_payment_reject,
+                )
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=_payment_reject
+                )
             if result:
                 from routes.order_routes import (
                     finalize_authorized_payment_order,
@@ -1599,6 +1639,18 @@ async def handle_stripe_webhook(
                 allow_repoint=False,
                 psp_id=psp_id,
             )
+
+            if _payment_reject:
+                await _flag_unmatched_stripe_payment_event(
+                    event_id=stripe_webhook_event_id,
+                    event_type=event_type,
+                    payment_intent_id=payment_intent_id,
+                    payment_meta=payment_meta if isinstance(payment_meta, dict) else None,
+                    reason=_payment_reject,
+                )
+                return _stripe_unmatched_response(
+                    event_type=event_type, reason=_payment_reject
+                )
 
             if result:
                 order_id = result["order_id"]
@@ -1783,13 +1835,30 @@ async def handle_stripe_webhook(
                     existing_meta = {}
 
                 if refund_status == "succeeded":
-                    # Same integrity check the charge.refunded path applies: this
-                    # is the other branch that writes total_refunded from an
-                    # event-supplied amount.
+                    refund_factor = _stripe_minor_unit_factor(
+                        currency or str(result.get("currency") or "")
+                    )
+                    try:
+                        this_refund_total = (
+                            Decimal(str(refund_amount)) / refund_factor
+                            if refund_amount is not None
+                            else Decimal("0")
+                        )
+                    except Exception:
+                        this_refund_total = Decimal("0")
+                    # This event carries ONE refund's amount, but refund_total is
+                    # applied as a ceiling, so send the sum across this order's
+                    # individual refunds — and bound THAT, not the single amount.
+                    cumulative_refunded = _stripe_refund_level_cumulative(
+                        existing_meta,
+                        refund_id=refund_id,
+                        refund_total=this_refund_total,
+                    )
                     amount_ok, amount_reason = _stripe_event_refund_matches_order(
                         result,
                         refund_amount_minor=refund_amount,
                         currency=currency,
+                        cumulative_total=cumulative_refunded,
                     )
                     if not amount_ok:
                         await _flag_unmatched_stripe_refund_event(
@@ -1803,23 +1872,6 @@ async def handle_stripe_webhook(
                             event_type=event_type, reason=amount_reason or "refund_amount_verification_failed"
                         )
 
-                    try:
-                        refunded_minor = Decimal(str(refund_amount)) if refund_amount is not None else Decimal("0")
-                    except Exception:
-                        refunded_minor = Decimal("0")
-                    factor = _stripe_minor_unit_factor(currency or str(result.get("currency") or ""))
-                    try:
-                        refunded_total = refunded_minor / factor
-                    except Exception:
-                        refunded_total = Decimal("0")
-                    # This event carries ONE refund's amount, but refund_total is
-                    # applied as a ceiling. Fold it into the per-refund ledger and
-                    # send the cumulative, or sequential partials under-count.
-                    cumulative_refunded, refund_ledger = _stripe_refund_ledger_cumulative(
-                        existing_meta,
-                        refund_id=refund_id,
-                        refund_total=refunded_total,
-                    )
                     await _finalize_stripe_refund_success(
                         result,
                         refund_reference=refund_id,
@@ -1838,7 +1890,6 @@ async def handle_stripe_webhook(
                                 refund_snapshot,
                                 existing_metadata=existing_meta,
                             ),
-                            _STRIPE_REFUND_LEDGER_KEY: refund_ledger,
                             "stripe_refund_updated": {
                                 "refund_id": refund_id,
                                 "amount_minor": refund_amount,

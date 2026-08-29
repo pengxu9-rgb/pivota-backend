@@ -237,10 +237,47 @@ async def test_a_cross_tenant_blocked_refund_is_not_retried(
 # --------------------------------------------------------------------------
 
 
+def test_every_reason_the_handler_produces_is_classified() -> None:
+    """Guards producer/allowlist drift.
+
+    The table below is hand-written, so on its own it proves nothing about the
+    reasons the code ACTUALLY emits — its apparent completeness is unearned, and
+    the first version of it silently omitted the two `*_parse_error` producers.
+    Harvest the real reason strings from the source and require each to be
+    classified deliberately, so a new producer cannot slip in unclassified."""
+    import re
+    from pathlib import Path
+
+    src = Path("routes/webhook_routes.py").read_text(encoding="utf-8")
+    # Every `return False, f"..."` / `return False, "..."` reason literal.
+    produced = set(re.findall(r'return\s+False,\s+f?"([a-z_]+)', src))
+    produced |= set(re.findall(r'return\s+\(\s*\n\s*False,\s*\n\s*f"([a-z_]+)', src))
+    assert produced, "harvest found nothing — the regex has drifted from the source"
+
+    from routes.webhook_routes import _stripe_refusal_is_permanent
+
+    unclassified = {
+        r for r in produced if not _stripe_refusal_is_permanent(r) and r not in _KNOWN_TRANSIENT
+    }
+    assert not unclassified, (
+        f"these refusal reasons are produced but not classified: {sorted(unclassified)}. "
+        "Add each to _STRIPE_PERMANENT_REFUSAL_PREFIXES, or to _KNOWN_TRANSIENT here "
+        "with a reason why redelivery could succeed."
+    )
+
+
+# Reasons deliberately left transient: redelivering could plausibly succeed.
+_KNOWN_TRANSIENT = {
+    "order_total_missing",  # the order could gain a total (auth-first paths)
+}
+
+
 @pytest.mark.parametrize(
     "reason,permanent",
     [
         ("cross_tenant_blocked", True),
+        ("amount_parse_error:invalid literal", True),
+        ("refund_amount_parse_error:invalid literal", True),
         ("amount_mismatch:expected_minor=50000,observed_minor=100", True),
         ("currency_mismatch:order=usd,event=eur", True),
         ("refund_currency_mismatch:order=usd,event=eur", True),
@@ -295,3 +332,81 @@ async def test_a_forged_metadata_hint_on_the_payment_path_is_not_retried(
     assert resp.status_code == 200
     assert resp.json()["reason"] == "cross_tenant_blocked"
     assert h.mutations == []
+
+
+# --------------------------------------------------------------------------
+# Blast radius: a per-psp endpoint lives on the MERCHANT'S OWN Stripe account
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_unrelated_charge_on_the_merchants_account_is_not_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_ensure_stripe_webhook_endpoint` creates the endpoint with
+    `stripe_account=<merchant account>` and subscribes it to
+    `payment_intent.succeeded` (`_STRIPE_AFTERCARE_EVENTS`). Stripe endpoints are
+    account-wide, so every charge the merchant takes OUTSIDE Pivota — their own
+    storefront, invoices, subscriptions — arrives here and resolves to no order.
+
+    Deferring those would 503 on the full ~3-day retry schedule for events that
+    can never resolve, and Stripe disables endpoints that fail continuously.
+    Losing the endpoint takes down payment finalization AND refunds for that
+    merchant — strictly worse than the dropped event we are fixing. An event with
+    no Pivota provenance must keep its 200."""
+    event = {
+        "type": "payment_intent.succeeded",
+        "data": {
+            "object": {
+                "id": "pi_merchants_own_storefront",
+                "amount": 12345,
+                "amount_received": 12345,
+                "currency": "usd",
+                "metadata": {},  # no order_id: not ours
+            }
+        },
+    }
+    h = _install(monkeypatch, event=event, order_row=None)
+
+    resp = await _post()
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "unmatched",
+        "event": "payment_intent.succeeded",
+        "reason": "no_order_resolved",
+    }
+    assert h.mutations == []
+
+
+@pytest.mark.asyncio
+async def test_a_cross_tenant_block_on_the_auth_first_branch_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`payment_intent.amount_capturable_updated` drives
+    `finalize_authorized_payment_order` — a money event. It unpacked the reject
+    reason and discarded it, so a cross-tenant block answered 200 `success` and
+    was recorded `processed`: silently gone."""
+    event = {
+        "type": "payment_intent.amount_capturable_updated",
+        "data": {
+            "object": {
+                "id": "pi_auth_foreign",
+                "amount": 50000,
+                "currency": "usd",
+                "metadata": {"order_id": "ORD_HINT"},
+            }
+        },
+    }
+    h = _install(monkeypatch, event=event, order_row=_order(OTHER))
+
+    resp = await _post()
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "unmatched",
+        "event": "payment_intent.amount_capturable_updated",
+        "reason": "cross_tenant_blocked",
+    }
+    assert h.mutations == []
+    assert ("unmatched", "cross_tenant_blocked") in [(s, r) for _e, s, r in h.event_status]

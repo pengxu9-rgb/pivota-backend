@@ -56,8 +56,19 @@ class _StatefulOrder:
         return Decimal(str(self.row["total_refunded"]))
 
     @property
-    def ledger(self) -> Dict[str, str]:
-        return dict((self.row.get("metadata") or {}).get("stripe_refund_ledger") or {})
+    def refund_rows(self) -> Dict[str, str]:
+        """The REFUND-LEVEL rows of psp_refund_records, as {refund_id: amount}.
+
+        This is the state the cumulative is derived from — maintained by
+        finalize_refund_success through update_order_status (an additive merge
+        against a fresh read), and pruned by the failure path.
+        """
+        records = (self.row.get("metadata") or {}).get("psp_refund_records") or {}
+        return {
+            str(r.get("refund_reference") or ""): str(r.get("amount_minor") or "")
+            for r in records.values()
+            if isinstance(r, dict) and r.get("source_event") == "refund.updated"
+        }
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, order: _StatefulOrder) -> None:
@@ -127,6 +138,9 @@ async def _send(monkeypatch: pytest.MonkeyPatch, event_type: str, obj: Dict[str,
             content=b'{"id":"evt_partial"}',
             headers={"stripe-signature": "sig_partial"},
         )
+    # These flows must never 5xx; a deferral here would silently look like a
+    # no-op to every caller below.
+    assert resp.status_code == 200, (resp.status_code, resp.text)
     return resp.json()
 
 
@@ -158,7 +172,7 @@ async def test_two_sequential_partial_refunds_reach_the_full_total(
     await _send(monkeypatch, "refund.updated", _refund_updated("re_second", 20000))
     assert order.total_refunded == Decimal("500")
     assert order.statuses[-1] == "refunded"
-    assert order.ledger == {"re_first": "300", "re_second": "200"}
+    assert order.refund_rows == {"re_first": "30000", "re_second": "20000"}
 
 
 @pytest.mark.asyncio
@@ -184,7 +198,11 @@ async def test_charge_refunded_first_does_not_double_count_the_same_refund(
     )
     assert order.total_refunded == Decimal("300")
 
-    await _send(monkeypatch, "refund.updated", _refund_updated("re_same_money", 30000))
+    body = await _send(monkeypatch, "refund.updated", _refund_updated("re_same_money", 30000))
+    # Positive evidence the refund.updated was actually HANDLED — without this,
+    # "still 300" passes just as well if the event was refused or never ran.
+    assert body == {"status": "success", "event": "refund.updated"}
+    assert order.refund_rows == {"re_same_money": "30000"}
     assert order.total_refunded == Decimal("300")
 
 
@@ -192,15 +210,23 @@ async def test_charge_refunded_first_does_not_double_count_the_same_refund(
 async def test_redelivered_refund_updated_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stripe re-delivers; the same refund id must not add twice."""
+    """Stripe re-delivers; the same refund id must not add twice.
+
+    The amount is deliberately SMALL relative to the order total. At $300 a
+    double-count would sum to $600, trip the over-refund bound, and be refused —
+    so the total would read correctly for the wrong reason and the test would
+    pass against a broken exclusion. At $100 the double-count is visible as $200.
+    """
     order = _StatefulOrder()
     _install(monkeypatch, order)
 
-    await _send(monkeypatch, "refund.updated", _refund_updated("re_dupe", 30000))
-    await _send(monkeypatch, "refund.updated", _refund_updated("re_dupe", 30000))
+    first = await _send(monkeypatch, "refund.updated", _refund_updated("re_dupe", 10000))
+    second = await _send(monkeypatch, "refund.updated", _refund_updated("re_dupe", 10000))
 
-    assert order.total_refunded == Decimal("300")
-    assert order.ledger == {"re_dupe": "300"}
+    assert first == {"status": "success", "event": "refund.updated"}
+    assert second == {"status": "success", "event": "refund.updated"}
+    assert order.total_refunded == Decimal("100")
+    assert order.refund_rows == {"re_dupe": "10000"}
 
 
 @pytest.mark.asyncio
@@ -229,7 +255,7 @@ async def test_a_rolled_back_refund_is_not_resurrected_by_the_next_one(
         },
     )
     assert order.total_refunded == Decimal("0")
-    assert "re_will_fail" not in order.ledger
+    assert "re_will_fail" not in order.refund_rows
 
     await _send(monkeypatch, "refund.updated", _refund_updated("re_retry", 20000))
     assert order.total_refunded == Decimal("200")
@@ -250,13 +276,22 @@ async def test_single_full_refund_is_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_a_corrupt_ledger_entry_cannot_shrink_the_refunded_total(
+async def test_a_corrupt_refund_row_cannot_shrink_the_refunded_total(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed stored value is skipped, and the amount just received still
-    forms a floor — a bad row must never quietly reduce what was refunded."""
+    """A malformed stored amount is skipped rather than wedging the refund, and
+    the amount just received is still applied in full."""
     order = _StatefulOrder()
-    order.row["metadata"] = {"stripe_refund_ledger": {"re_old": "not-a-number"}}
+    order.row["metadata"] = {
+        "psp_refund_records": {
+            "stripe:re_old": {
+                "refund_reference": "re_old",
+                "amount_minor": "not-a-number",
+                "currency": "usd",
+                "source_event": "refund.updated",
+            }
+        }
+    }
     _install(monkeypatch, order)
 
     await _send(monkeypatch, "refund.updated", _refund_updated("re_new", 20000))
@@ -268,10 +303,8 @@ async def test_a_corrupt_ledger_entry_cannot_shrink_the_refunded_total(
 async def test_a_refund_without_an_id_still_applies_its_amount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A refund with no id cannot be keyed into the ledger, so the ledger sum
-    does not include it. Without the floor, the event would apply a STALE
-    cumulative — here 0 — and silently drop a real refund. The floor is what
-    keeps the amount just received from being lost."""
+    """A refund with no id cannot be matched against a prior row, so it must
+    still contribute its own amount rather than resolving to a stale total."""
     order = _StatefulOrder()
     _install(monkeypatch, order)
 
@@ -288,4 +321,63 @@ async def test_a_refund_without_an_id_still_applies_its_amount(
     )
 
     assert order.total_refunded == Decimal("200")
-    assert order.ledger == {}
+
+
+@pytest.mark.asyncio
+async def test_a_redelivery_does_not_erase_that_refund_from_the_cumulative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression on the derivation itself.
+
+    `psp_refund_records[...]["amount"]` is the DELTA applied, which the
+    cumulative branch recomputes as `next_total_refunded - current_total_refunded`
+    and so zeroes on a redelivery. Summing that field made a redelivered refund
+    contribute 0, and the NEXT refund then under-counted by the whole redelivered
+    amount. The face amount (`amount_minor`) is what stays stable."""
+    order = _StatefulOrder()
+    _install(monkeypatch, order)
+
+    await _send(monkeypatch, "refund.updated", _refund_updated("re_a", 30000))
+    await _send(monkeypatch, "refund.updated", _refund_updated("re_a", 30000))  # redelivered
+    assert order.total_refunded == Decimal("300")
+
+    await _send(monkeypatch, "refund.updated", _refund_updated("re_b", 20000))
+    assert order.total_refunded == Decimal("500")
+
+
+@pytest.mark.asyncio
+async def test_refunds_summing_past_the_order_total_are_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The amount guard bounded ONE refund by the order total, which was correct
+    only while refund_total was a monotonic ceiling. Once refund-level events
+    contribute a SUM, two $400 refunds on a $500 order each pass individually and
+    would write total_refunded=800 — a number that feeds the attribution edge and
+    the merchant's statement."""
+    order = _StatefulOrder()
+    _install(monkeypatch, order)
+
+    first = await _send(monkeypatch, "refund.updated", _refund_updated("re_big_1", 40000))
+    assert first == {"status": "success", "event": "refund.updated"}
+    assert order.total_refunded == Decimal("400")
+
+    second = await _send(monkeypatch, "refund.updated", _refund_updated("re_big_2", 40000))
+    assert second["status"] == "unmatched"
+    assert second["reason"].startswith("refund_exceeds_order_total:")
+    # Refused before any write: the order keeps the total it legitimately had.
+    assert order.total_refunded == Decimal("400")
+
+
+@pytest.mark.asyncio
+async def test_partials_that_exactly_reach_the_order_total_are_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound is inclusive — a fully refunded order must not be refused."""
+    order = _StatefulOrder()
+    _install(monkeypatch, order)
+
+    await _send(monkeypatch, "refund.updated", _refund_updated("re_x", 30000))
+    await _send(monkeypatch, "refund.updated", _refund_updated("re_y", 20000))
+
+    assert order.total_refunded == Decimal("500")
+    assert order.statuses[-1] == "refunded"
