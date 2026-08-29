@@ -593,7 +593,21 @@ def _extract_raw_inci(metadata: Dict[str, Any], ingredient_ids: List[str]) -> Op
     return None
 
 
-def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_tutorial_assets(product_key: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Child-row identities are derived from `product_key`, which is
+    merchant-scoped (`make_catalog_product_key`) — NOT from the platform's own
+    product id, which two merchants selling the same platform product share.
+
+    The rows are replaced by a DELETE scoped to this merchant's `product_key`,
+    so a key derived off the bare platform id made the second merchant's INSERT
+    collide with the FIRST merchant's surviving row: prod 2026-08-29,
+    `duplicate key value violates unique constraint "beauty_content_assets_pkey"`,
+    aborting the whole ingest transaction and leaving that merchant zero
+    catalog_products rows. A merchant-supplied `asset_id` is namespaced for the
+    same reason — two merchants carrying one platform product carry one
+    platform-supplied asset id too. `beauty_usage_guides.guide_id` already had
+    this shape and never collided; this is that shape.
+    """
     tutorials = _json_list(_extract_metadata_values(metadata, "tutorials", "tutorial_assets", "media_assets"))
     assets: List[Dict[str, Any]] = []
     for idx, item in enumerate(tutorials):
@@ -602,9 +616,14 @@ def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any])
         url = str(item.get("url") or item.get("href") or "").strip()
         if not url:
             continue
+        declared_asset_id = str(item.get("asset_id") or "").strip()
         assets.append(
             {
-                "asset_id": item.get("asset_id") or _stable_key("beauty_asset", product.id, idx, url),
+                "asset_id": (
+                    _stable_key("beauty_asset", product_key, "declared", declared_asset_id)
+                    if declared_asset_id
+                    else _stable_key("beauty_asset", product_key, idx, url)
+                ),
                 "asset_type": str(item.get("asset_type") or item.get("type") or "tutorial"),
                 "title": item.get("title"),
                 "url": url,
@@ -616,7 +635,10 @@ def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any])
     return assets
 
 
-def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+def _extract_shades(product_key: str, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+    """`product_key`, not `product.id` — see `_extract_tutorial_assets`. This is
+    the derivation that actually fired in prod on 2026-08-29
+    (`beauty_shades_pkey`)."""
     shades: List[Dict[str, Any]] = []
     labels = list(variant.visible_option_labels or [])
     for idx, label in enumerate(labels):
@@ -627,7 +649,7 @@ def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -
             continue
         shades.append(
             {
-                "shade_id": _stable_key("beauty_shade", product.id, variant.variant_id or variant.id, shade_name),
+                "shade_id": _stable_key("beauty_shade", product_key, variant.variant_id or variant.id, shade_name),
                 "shade_name": shade_name,
                 "shade_code": None,
                 "shade_family": _shade_family_from_name(shade_name),
@@ -859,19 +881,45 @@ async def _replace_child_rows(table: Any, match_column: str, match_value: Any, r
     return count
 
 
-async def _replace_child_rows_multi(table: Any, where_clauses: List[Any], rows: Iterable[Dict[str, Any]]) -> int:
+async def _replace_child_rows_multi(
+    table: Any,
+    where_clauses: List[Any],
+    rows: Iterable[Dict[str, Any]],
+    *,
+    pk_name: str,
+) -> int:
+    """Replace one scope's child rows — DELETE the scope, then write `rows`.
+
+    The DELETE is scoped (this merchant's `product_key`); the write is keyed by
+    primary key, and those two scopes are not the same set. Two independent ways
+    a key can already be present when we go to write it, both of which used to
+    raise `UniqueViolation` out of a plain INSERT and abort the ENTIRE ingest
+    transaction — one bad child row cost the merchant every catalog_products row
+    in the run (prod 2026-08-29):
+
+      1. WITHIN this batch. Product-level payloads are collected once per
+         variant — `beauty_content_assets` rows are appended inside the variant
+         loop from product-level metadata — so a two-variant product hands the
+         same asset id in twice, legitimately. Dedupe on the PK, last wins.
+
+      2. OUTSIDE the delete scope. Every derivation is merchant-scoped now, so
+         this can only be residue written under an older, unscoped derivation.
+         Upsert rather than INSERT so that residue degrades to a row rewrite
+         instead of costing the merchant their whole catalog.
+
+    Returns the number of DISTINCT rows written, which is what the caller's
+    `*_upserted` stat means.
+    """
     stmt = table.delete()
     for clause in where_clauses:
         stmt = stmt.where(clause)
     await database.execute(stmt)
-    count = 0
+    deduped: Dict[Any, Dict[str, Any]] = {}
     for row in rows:
-        payload = dict(row)
-        payload.setdefault("created_at", _utcnow())
-        payload.setdefault("updated_at", _utcnow())
-        await database.execute(table.insert().values(**payload))
-        count += 1
-    return count
+        deduped[row.get(pk_name)] = dict(row)
+    for payload in deduped.values():
+        await _upsert_by_pk(table, pk_name, payload)
+    return len(deduped)
 
 
 async def _append_snapshot(table: Any, values: Dict[str, Any]) -> None:
@@ -1929,7 +1977,7 @@ async def ingest_standard_products(
                                 "product_key": product_key,
                                 "merchant_id": merchant_id,
                             }
-                            for shade in _extract_shades(product, variant)
+                            for shade in _extract_shades(product_key, variant)
                         ]
                     )
                     beauty_asset_rows.extend(
@@ -1940,7 +1988,7 @@ async def ingest_standard_products(
                                 "sku_key": sku_key,
                                 "merchant_id": merchant_id,
                             }
-                            for asset in _extract_tutorial_assets(product, metadata)
+                            for asset in _extract_tutorial_assets(product_key, metadata)
                         ]
                     )
                     beauty_compat_rows.extend(
@@ -1974,21 +2022,25 @@ async def ingest_standard_products(
                     beauty_usage_guides,
                     [beauty_usage_guides.c.product_key == product_key],
                     beauty_usage_rows,
+                    pk_name="guide_id",
                 )
                 stats["beauty_shades_upserted"] += await _replace_child_rows_multi(
                     beauty_shades,
                     [beauty_shades.c.product_key == product_key],
                     beauty_shade_rows,
+                    pk_name="shade_id",
                 )
                 stats["beauty_content_assets_upserted"] += await _replace_child_rows_multi(
                     beauty_content_assets,
                     [beauty_content_assets.c.product_key == product_key],
                     beauty_asset_rows,
+                    pk_name="asset_id",
                 )
                 stats["beauty_compatibility_rules_upserted"] += await _replace_child_rows_multi(
                     beauty_compatibility_rules,
                     [beauty_compatibility_rules.c.product_key == product_key],
                     beauty_compat_rows,
+                    pk_name="compatibility_rule_id",
                 )
 
         if content_key:
@@ -2601,6 +2653,18 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
             "stats_json": stats,
         }
     except Exception as exc:
+        # Log BEFORE the re-raise. This runs under a FastAPI BackgroundTask
+        # (routes/merchant_store_connections.py), i.e. after the response has
+        # been sent, so nothing in the request window reports it and the caller
+        # has already been told `catalog_ingest_queued: true` with a 200. On
+        # 2026-08-29 that left `catalog_sync_jobs.status='failed'` as the ONLY
+        # trace of a sync that wrote zero rows. The re-raise alone is not a log
+        # line: it lands in the ASGI server's handler, outside this service's
+        # structured logging.
+        logger.exception(
+            "catalog_sync: job FAILED job_id=%s merchant=%s connector=%s mode=%s err=%s",
+            job_id, merchant_id, connector, mode, exc,
+        )
         await _upsert_by_pk(
             catalog_sync_jobs,
             "job_id",
