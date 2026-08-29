@@ -379,6 +379,7 @@ from routes.attribution_conversions import router as attribution_conversions_rou
 from routes.merchant_events import router as merchant_events_router
 from routes.cafe24_integration import router as cafe24_integration_router
 from routes.magento_integration import router as magento_integration_router
+from routes.adobe_commerce_events import router as adobe_commerce_events_router
 from routes.cafe24_webhooks import router as cafe24_webhooks_router
 from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
 from routes.sfcc_integration import router as sfcc_integration_router
@@ -1289,6 +1290,7 @@ app.include_router(attribution_conversions_router)  # Non-custodial conversion-r
 app.include_router(merchant_events_router)  # Platform-neutral Agent Commerce event ingestion
 app.include_router(cafe24_integration_router)  # Cafe24 OAuth/manual connection and catalog adapter
 app.include_router(magento_integration_router)  # Magento/Adobe Commerce native REST catalog adapter
+app.include_router(adobe_commerce_events_router)  # Signed Adobe I/O order/payment/refund events
 app.include_router(cafe24_webhooks_router)  # Cafe24 Data Bridge + order lifecycle events
 app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order lifecycle events
 app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
