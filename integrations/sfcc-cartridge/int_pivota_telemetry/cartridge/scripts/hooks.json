@@ -1,0 +1,24 @@
+{
+  "hooks": [
+    {
+      "name": "dw.ocapi.shop.basket.afterPOST",
+      "script": "./hooks/BasketCreated.js"
+    },
+    {
+      "name": "dw.ocapi.shop.basket.items.afterPOST",
+      "script": "./hooks/BasketItemsAdded.js"
+    },
+    {
+      "name": "dw.ocapi.shop.order.beforePOST",
+      "script": "./hooks/CheckoutSubmitted.js"
+    },
+    {
+      "name": "dw.ocapi.shop.order.afterPOST",
+      "script": "./hooks/OrderCreated.js"
+    },
+    {
+      "name": "dw.ocapi.shop.order.payment_instrument.afterPOST",
+      "script": "./hooks/PaymentAuthorization.js"
+    }
+  ]
+}

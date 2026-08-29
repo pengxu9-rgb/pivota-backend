@@ -1,0 +1,42 @@
+{
+  "step-types": {
+    "script-module-step": [
+      {
+        "@type-id": "custom.PivotaTelemetryDrain",
+        "@supports-site-context": true,
+        "@supports-organization-context": false,
+        "@supports-parallel-execution": false,
+        "description": "Delivers the local Pivota telemetry outbox asynchronously.",
+        "module": "int_pivota_telemetry/cartridge/scripts/jobs/DrainPivotaTelemetry.js",
+        "function": "execute",
+        "transactional": false,
+        "timeout-in-seconds": 300,
+        "parameters": {
+          "parameter": [
+            {
+              "@name": "BatchSize",
+              "@type": "long",
+              "description": "Events per signed request (1-100).",
+              "@required": false,
+              "default-value": 50,
+              "min-value": 1,
+              "max-value": 100
+            }
+          ]
+        },
+        "status-codes": {
+          "status": [
+            {
+              "@code": "OK",
+              "description": "The due events were delivered or the outbox was empty."
+            },
+            {
+              "@code": "ERROR",
+              "description": "Delivery failed and the events remain queued for retry."
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

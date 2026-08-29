@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns="http://www.demandware.com/xml/impex/services/2014-09-26">
+    <service-credential service-credential-id="pivota.telemetry.RefArch">
+        <url>https://YOUR-PIVOTA-ORIGIN/webhooks/salesforce-commerce-cloud/YOUR-STORE-ID</url>
+        <user-id>unused</user-id>
+        <password>YOUR-PROVISIONED-SIGNING-SECRET</password>
+    </service-credential>
+    <service-profile service-profile-id="pivota.telemetry.profile">
+        <timeout-millis>10000</timeout-millis>
+        <rate-limit-enabled>true</rate-limit-enabled>
+        <rate-limit-calls>60</rate-limit-calls>
+        <rate-limit-millis>60000</rate-limit-millis>
+        <cb-enabled>true</cb-enabled>
+        <cb-calls>3</cb-calls>
+        <cb-millis>60000</cb-millis>
+    </service-profile>
+    <service service-id="pivota.telemetry.events">
+        <service-type>HTTP</service-type>
+        <enabled>true</enabled>
+        <log-prefix>Pivota Telemetry</log-prefix>
+        <comm-log-enabled>false</comm-log-enabled>
+        <force-prd-enabled>false</force-prd-enabled>
+        <mock-mode-enabled>false</mock-mode-enabled>
+        <profile-id>pivota.telemetry.profile</profile-id>
+        <credential-id>pivota.telemetry.RefArch</credential-id>
+    </service>
+</services>

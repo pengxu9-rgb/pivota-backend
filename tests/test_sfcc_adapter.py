@@ -198,8 +198,8 @@ async def test_sfcc_connect_persists_secret_but_never_returns_it(monkeypatch):
     writes = []
 
     class FakeDB:
-        async def fetch_one(self, *args, **kwargs):
-            return None
+        async def fetch_all(self, *args, **kwargs):
+            return []
 
         async def execute(self, query, values):
             writes.append(values)
@@ -243,6 +243,198 @@ async def test_sfcc_connect_persists_secret_but_never_returns_it(monkeypatch):
     assert "secret" not in json.dumps(result)
     assert result["platform"] == "salesforce_commerce_cloud"
     assert lifecycle == [("merchant-1", "salesforce_commerce_cloud_connect")]
+
+
+@pytest.mark.asyncio
+async def test_sfcc_reconnect_preserves_telemetry_secret(monkeypatch):
+    from routes import sfcc_integration as route
+
+    writes = []
+
+    class FakeDB:
+        async def fetch_all(self, *args, **kwargs):
+            return [{
+                "store_id": "store-sfcc",
+                "api_key": json.dumps(
+                    {
+                        "organization_id": "f_ecom_abcd_dev",
+                        "site_id": "RefArchGlobal",
+                        "telemetry_signing_secret": "keep-me",
+                    }
+                ),
+            }]
+
+        async def fetch_one(self, query, values):
+            if query.lstrip().startswith("UPDATE"):
+                writes.append(values)
+                return {"store_id": "store-sfcc"}
+            return None
+
+    class Adapter:
+        def __init__(self, config):
+            self.short_code = "kv7kzm70"
+            self.organization_id = "f_ecom_abcd_dev"
+            self.site_id = "RefArchGlobal"
+            self.client_id = "client-123"
+
+        def validate_config(self):
+            return True, None
+
+        async def test_connection(self):
+            return {"success": True}
+
+    async def fake_lifecycle(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(route, "database", FakeDB())
+    monkeypatch.setattr(route, "SalesforceCommerceCloudAdapter", Adapter)
+    monkeypatch.setattr(route, "sync_catalog_merchant_status", fake_lifecycle)
+    result = await route.connect_salesforce_commerce_cloud(
+        route.SalesforceCommerceCloudConnectRequest(
+            merchant_id="merchant-1",
+            short_code="kv7kzm70",
+            organization_id="f_ecom_abcd_dev",
+            site_id="RefArchGlobal",
+            client_id="client-123",
+            client_secret="new-slas-secret",
+        ),
+        current_user={"role": "merchant", "merchant_id": "merchant-1"},
+    )
+
+    persisted = json.loads(writes[0]["api_key"])
+    assert persisted["telemetry_signing_secret"] == "keep-me"
+    assert persisted["client_secret"] == "new-slas-secret"
+    assert result["telemetry_configured"] is True
+    assert "keep-me" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_sfcc_reconnect_retries_cas_and_preserves_concurrently_provisioned_secret(
+    monkeypatch,
+):
+    from routes import sfcc_integration as route
+
+    stale = json.dumps(
+        {"organization_id": "f_ecom_abcd_dev", "site_id": "RefArchGlobal"}
+    )
+    concurrent = json.dumps(
+        {
+            "organization_id": "f_ecom_abcd_dev",
+            "site_id": "RefArchGlobal",
+            "telemetry_signing_secret": "concurrent-secret",
+        }
+    )
+    update_attempts = []
+
+    class FakeDB:
+        async def fetch_all(self, *args, **kwargs):
+            return [{"store_id": "store-sfcc", "api_key": stale}]
+
+        async def fetch_one(self, query, values):
+            if query.lstrip().startswith("SELECT"):
+                return {"api_key": concurrent}
+            update_attempts.append(values)
+            if len(update_attempts) == 1:
+                return None
+            return {"store_id": "store-sfcc"}
+
+    class Adapter:
+        def __init__(self, config):
+            self.short_code = "kv7kzm70"
+            self.organization_id = "f_ecom_abcd_dev"
+            self.site_id = "RefArchGlobal"
+            self.client_id = "client-123"
+
+        def validate_config(self):
+            return True, None
+
+        async def test_connection(self):
+            return {"success": True}
+
+    async def fake_lifecycle(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(route, "database", FakeDB())
+    monkeypatch.setattr(route, "SalesforceCommerceCloudAdapter", Adapter)
+    monkeypatch.setattr(route, "sync_catalog_merchant_status", fake_lifecycle)
+    result = await route.connect_salesforce_commerce_cloud(
+        route.SalesforceCommerceCloudConnectRequest(
+            merchant_id="merchant-1",
+            short_code="kv7kzm70",
+            organization_id="f_ecom_abcd_dev",
+            site_id="RefArchGlobal",
+            client_id="client-123",
+            client_secret="new-slas-secret",
+        ),
+        current_user={"role": "merchant", "merchant_id": "merchant-1"},
+    )
+
+    persisted = json.loads(update_attempts[-1]["api_key"])
+    assert persisted["telemetry_signing_secret"] == "concurrent-secret"
+    assert result["telemetry_configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_sfcc_connect_keeps_same_origin_sites_as_separate_stores(monkeypatch):
+    from routes import sfcc_integration as route
+
+    writes = []
+
+    class FakeDB:
+        async def fetch_all(self, query, *args, **kwargs):
+            assert "LIMIT 1" not in query.upper()
+            return [
+                {
+                    "store_id": "store-site-a",
+                    "api_key": json.dumps(
+                        {
+                            "organization_id": "f_ecom_abcd_dev",
+                            "site_id": "SiteA",
+                            "telemetry_signing_secret": "site-a-secret",
+                        }
+                    ),
+                }
+            ]
+
+        async def execute(self, query, values):
+            writes.append((query, values))
+
+    class Adapter:
+        def __init__(self, config):
+            self.short_code = "kv7kzm70"
+            self.organization_id = "f_ecom_abcd_dev"
+            self.site_id = "SiteB"
+            self.client_id = "client-123"
+
+        def validate_config(self):
+            return True, None
+
+        async def test_connection(self):
+            return {"success": True}
+
+    async def fake_lifecycle(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(route, "database", FakeDB())
+    monkeypatch.setattr(route, "SalesforceCommerceCloudAdapter", Adapter)
+    monkeypatch.setattr(route, "sync_catalog_merchant_status", fake_lifecycle)
+    result = await route.connect_salesforce_commerce_cloud(
+        route.SalesforceCommerceCloudConnectRequest(
+            merchant_id="merchant-1",
+            short_code="kv7kzm70",
+            organization_id="f_ecom_abcd_dev",
+            site_id="SiteB",
+            client_id="client-123",
+            client_secret="site-b-secret",
+        ),
+        current_user={"role": "merchant", "merchant_id": "merchant-1"},
+    )
+
+    assert "INSERT INTO merchant_stores" in writes[0][0]
+    assert writes[0][1]["store_id"] != "store-site-a"
+    assert len(writes[0][1]["store_id"]) <= 50
+    assert result["telemetry_configured"] is False
+    assert "site-a-secret" not in json.dumps(writes[0][1])
 
 
 def test_sfcc_registry_is_catalog_pull_only():

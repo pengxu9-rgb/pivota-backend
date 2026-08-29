@@ -61,6 +61,7 @@ ALLOWED_MERCHANT_METADATA_KEYS = frozenset(
         "native_transaction_kind",
         "native_transaction_status",
         "native_event_name",
+        "native_site_id",
         "native_event_no",
         "native_event_code",
         "native_mall_id",
