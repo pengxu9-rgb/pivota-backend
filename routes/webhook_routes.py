@@ -686,6 +686,13 @@ async def _finalize_stripe_refund_failure(
     metadata_patch = {
         "stripe_last_refund_failure": failure_payload,
     }
+    # The finalizer drops this refund from psp_refund_records on rollback; the
+    # ledger must lose it too, or the next refund's cumulative would resurrect it.
+    pruned_ledger = _stripe_refund_ledger_without(
+        existing_metadata, refund_id=refund_reference
+    )
+    if pruned_ledger is not None:
+        metadata_patch[_STRIPE_REFUND_LEDGER_KEY] = pruned_ledger
     if refund_snapshot:
         metadata_patch.update(
             stripe_refund_metadata_patch(
@@ -1026,6 +1033,87 @@ def _stripe_event_refund_matches_order(
             f"refund_exceeds_order_total:order_total={max_refundable},observed={observed}",
         )
     return True, None
+
+
+_STRIPE_REFUND_LEDGER_KEY = "stripe_refund_ledger"
+
+
+def _stripe_refund_ledger(existing_metadata: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """The per-refund amount ledger stored on the order, as {refund_id: amount}."""
+    meta = existing_metadata if isinstance(existing_metadata, dict) else {}
+    raw = meta.get(_STRIPE_REFUND_LEDGER_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if str(k).strip()}
+
+
+def _stripe_refund_ledger_cumulative(
+    existing_metadata: Optional[Dict[str, Any]],
+    *,
+    refund_id: Optional[str],
+    refund_total: Decimal,
+) -> Tuple[Decimal, Dict[str, str]]:
+    """Fold one refund's amount into the ledger and return (cumulative, ledger).
+
+    WHY A LEDGER, and not either obvious one-liner:
+
+    `finalize_refund_success` applies `refund_total` as a MONOTONIC CEILING —
+    `max(current_total_refunded, refund_total)` — not as an accumulator. That is
+    right for `charge.refunded`, whose `amount_refunded` is the charge's
+    cumulative total. `refund.updated` carries ONE refund's amount, so:
+
+      - passing that single amount under-counts sequential partials: $300 then
+        $200 on a $500 order lands at 300, and the order stays
+        `partially_refunded`. That is the bug this fixes.
+      - passing a naive running sum instead DOUBLE-counts, because
+        `charge.refunded` may already have contributed the same money under a
+        DIFFERENT refund key (`stripe:ch_…` vs `stripe:re_…`), which the
+        `psp_refund_refs` duplicate guard therefore does not catch. Verified
+        against the real finalizer: charge.refunded($300) then
+        refund.updated($300) for that same refund lands at 600.
+
+    So: sum a ledger keyed by Stripe refund id, and still hand the result to the
+    ceiling. The sum is correct across sequential partials, and `max()` keeps a
+    charge-level cumulative from being stacked on top of the refund-level rows.
+    Re-delivery of the same refund id is idempotent — it overwrites its own key.
+
+    The ledger is pruned by `_finalize_stripe_refund_failure` when a refund is
+    rolled back, mirroring what the finalizer already does to
+    `psp_refund_records`; otherwise a later refund would resurrect the failed
+    amount through this sum.
+    """
+    ledger = _stripe_refund_ledger(existing_metadata)
+    key = str(refund_id or "").strip()
+    if key:
+        ledger[key] = str(refund_total)
+
+    cumulative = Decimal("0")
+    for value in ledger.values():
+        try:
+            cumulative += Decimal(str(value))
+        except Exception:  # noqa: BLE001 - a malformed row must not wedge refunds
+            logger.warning(
+                {
+                    "alert": "stripe_refund_ledger_unparsable_entry",
+                    "refund_id": key,
+                    "value": str(value)[:64],
+                }
+            )
+    # Never report less than the amount we were just handed: a corrupt or
+    # truncated ledger must not silently shrink an order's refunded total.
+    return max(cumulative, refund_total), ledger
+
+
+def _stripe_refund_ledger_without(
+    existing_metadata: Optional[Dict[str, Any]], *, refund_id: Optional[str]
+) -> Optional[Dict[str, str]]:
+    """Drop a rolled-back refund from the ledger. None when nothing changes."""
+    ledger = _stripe_refund_ledger(existing_metadata)
+    key = str(refund_id or "").strip()
+    if not key or key not in ledger:
+        return None
+    ledger.pop(key)
+    return ledger
 
 
 async def _flag_unmatched_stripe_refund_event(
@@ -1640,12 +1728,20 @@ async def handle_stripe_webhook(
                         refunded_total = refunded_minor / factor
                     except Exception:
                         refunded_total = Decimal("0")
+                    # This event carries ONE refund's amount, but refund_total is
+                    # applied as a ceiling. Fold it into the per-refund ledger and
+                    # send the cumulative, or sequential partials under-count.
+                    cumulative_refunded, refund_ledger = _stripe_refund_ledger_cumulative(
+                        existing_meta,
+                        refund_id=refund_id,
+                        refund_total=refunded_total,
+                    )
                     await _finalize_stripe_refund_success(
                         result,
                         refund_reference=refund_id,
                         refund_amount_minor=refund_amount,
                         currency=currency or str(result.get("currency") or ""),
-                        refund_total=refunded_total,
+                        refund_total=cumulative_refunded,
                         metadata_extra={
                             "refund_id": refund_id,
                             "refund_amount": refund_amount,
@@ -1658,6 +1754,7 @@ async def handle_stripe_webhook(
                                 refund_snapshot,
                                 existing_metadata=existing_meta,
                             ),
+                            _STRIPE_REFUND_LEDGER_KEY: refund_ledger,
                             "stripe_refund_updated": {
                                 "refund_id": refund_id,
                                 "amount_minor": refund_amount,
