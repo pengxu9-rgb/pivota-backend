@@ -2,10 +2,16 @@
 
 The visible merchant sync button used to write ONLY products_cache, never the
 catalog — so a merchant's own action left catalog tables empty and the first v3
-audit came back blocked. This wires it to also kick a catalog ingest (in the
-background, to keep the response fast); run_catalog_sync_job then enqueues the
-quality backfill (WS-A.1). This test drives the real handler with mocked
-dependencies and asserts a catalog-sync background task is scheduled.
+audit came back blocked. This wires it to also kick a catalog ingest, which then
+enqueues the quality backfill (WS-A.1).
+
+The ingest is ENQUEUED, not run here. It used to be handed to FastAPI's
+`BackgroundTasks`, which runs it in the API process after the response is
+already sent — unsupervised, unretried, and lost on a revision swap, with the
+only trace of a failure being `catalog_sync_jobs.status='failed'` in the
+database (2026-08-29). This test drives the real handler with mocked
+dependencies and asserts the handler leaves behind a pollable job row and runs
+NOTHING itself.
 """
 from __future__ import annotations
 
@@ -21,15 +27,7 @@ import services.catalog_sync_service as css
 import adapters.product_adapters as adapters
 
 
-class _FakeBG:
-    def __init__(self) -> None:
-        self.tasks: List[Dict[str, Any]] = []
-
-    def add_task(self, func, *args, **kwargs) -> None:
-        self.tasks.append({"func": func, "args": args, "kwargs": kwargs})
-
-
-async def test_merchant_sync_backgrounds_catalog_ingest(monkeypatch) -> None:
+async def test_merchant_sync_enqueues_catalog_ingest_and_returns_job_id(monkeypatch) -> None:
     # One row satisfies both the store query and the credentials query (the
     # handler subscripts cred_row["api_key"] etc.; resolve_token is mocked).
     store = {"store_id": "st1", "platform": "shopify", "domain": "ownist.myshopify.com",
@@ -57,7 +55,10 @@ async def test_merchant_sync_backgrounds_catalog_ingest(monkeypatch) -> None:
         created.append({"merchant_id": merchant_id, "connector": connector, "requested_by": requested_by})
         return {"job_id": "cj_test"}
 
-    async def _run_catalog_sync_job(job_id):  # sentinel target for the bg task
+    ran: List[str] = []
+
+    async def _run_catalog_sync_job(job_id):  # must NOT be reached from the request
+        ran.append(job_id)
         return {"job_id": job_id, "status": "completed"}
 
     monkeypatch.setattr(msc.database, "fetch_one", _fetch_one)
@@ -68,16 +69,37 @@ async def test_merchant_sync_backgrounds_catalog_ingest(monkeypatch) -> None:
     monkeypatch.setattr(css, "create_catalog_sync_job", _create_catalog_sync_job)
     monkeypatch.setattr(css, "run_catalog_sync_job", _run_catalog_sync_job)
 
-    bg = _FakeBG()
     resp = await msc.merchant_sync_shopify_products(
         request=msc.ShopifySyncRequest(merchant_id="m1"),
-        background_tasks=bg,
         current_user={"role": "merchant", "merchant_id": "m1"},
     )
 
     # A catalog-sync job was created for the merchant...
     assert created and created[0]["merchant_id"] == "m1"
     assert created[0]["connector"] == "shopify"
-    # ...and scheduled as a BACKGROUND task (fast response), targeting run_catalog_sync_job.
-    assert any(t["func"] is _run_catalog_sync_job and t["args"] == ("cj_test",) for t in bg.tasks)
+
+    # ...and the request ran NO part of the ingest itself. This is the whole
+    # point of the change: the work belongs to the out-of-band drain tick
+    # (services.catalog_sync_drain), which retries and survives this process.
+    assert ran == [], f"the request ran the ingest in-process: {ran}"
+
+    # The caller gets a HANDLE, so the outcome is pollable rather than assumed
+    # from a 200. Before this, `catalog_ingest_queued: true` was all they got —
+    # returned identically whether the ingest later succeeded or failed.
     assert resp["data"]["catalog_ingest_queued"] is True
+    assert resp["data"]["catalog_ingest_job_id"] == "cj_test"
+    assert resp["data"]["catalog_ingest_status_url"] == "/v1/catalog/sync/jobs/cj_test"
+
+
+async def test_merchant_sync_handler_takes_no_background_tasks(monkeypatch) -> None:
+    """The handler must not be able to schedule post-response work at all.
+
+    Pinned on the SIGNATURE rather than on behaviour: FastAPI injects
+    `BackgroundTasks` purely from the annotation, so re-adding the parameter is
+    the one edit that silently makes `add_task` available again here.
+    """
+    import inspect
+
+    params = inspect.signature(msc.merchant_sync_shopify_products).parameters
+    annotations = [str(p.annotation) for p in params.values()]
+    assert not any("BackgroundTasks" in a for a in annotations), annotations

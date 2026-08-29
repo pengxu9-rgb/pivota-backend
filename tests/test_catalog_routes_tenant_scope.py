@@ -78,7 +78,6 @@ def sinks(monkeypatch) -> Dict[str, List[Dict[str, Any]]]:
     """Record every service call the routes can make, and fake a success."""
     calls: Dict[str, List[Dict[str, Any]]] = {
         "create_catalog_sync_job": [],
-        "background": [],
         "record_catalog_sync_event": [],
         "rebuild_beauty_verticals_for_merchant": [],
         "reconcile_catalog_incentives_for_merchant": [],
@@ -98,9 +97,6 @@ def sinks(monkeypatch) -> Dict[str, List[Dict[str, Any]]]:
             "created_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
         }
-
-    async def fake_background(**kwargs):
-        calls["background"].append(kwargs)
 
     async def fake_record_catalog_sync_event(**kwargs):
         calls["record_catalog_sync_event"].append(kwargs)
@@ -145,7 +141,6 @@ def sinks(monkeypatch) -> Dict[str, List[Dict[str, Any]]]:
         }
 
     monkeypatch.setattr(module, "create_catalog_sync_job", fake_create_catalog_sync_job)
-    monkeypatch.setattr(module, "_run_catalog_job_background", fake_background)
     monkeypatch.setattr(module, "record_catalog_sync_event", fake_record_catalog_sync_event)
     monkeypatch.setattr(module, "rebuild_beauty_verticals_for_merchant", fake_rebuild)
     monkeypatch.setattr(module, "reconcile_catalog_incentives_for_merchant", fake_reconcile_incentives)
@@ -214,7 +209,6 @@ def test_non_admin_cannot_write_another_merchants_catalog(sinks, spec, sink_key,
     assert response.json()["detail"] == "cannot run catalog jobs for another merchant"
     # The refusal must land BEFORE the write, not after it.
     assert sinks[sink_key] == []
-    assert sinks["background"] == []
 
 
 @pytest.mark.parametrize("spec,sink_key", WRITE_ROUTES)
@@ -279,9 +273,6 @@ def test_the_id_that_was_authorized_is_the_id_that_is_written(sinks, spec, sink_
 
     assert response.status_code == 200, response.text
     assert sinks[sink_key][0]["merchant_id"] == VICTIM
-    if sink_key == "create_catalog_sync_job":
-        # The BackgroundTask carries its own copy of the id.
-        assert sinks["background"][0]["merchant_id"] == VICTIM
 
 
 def test_whitespace_padding_does_not_defeat_the_comparison(sinks) -> None:

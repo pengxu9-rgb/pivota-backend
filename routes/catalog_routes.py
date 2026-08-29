@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from models.catalog import (
     CatalogSyncJobCreateRequest,
@@ -18,9 +18,7 @@ from services.catalog_sync_service import (
     rebuild_beauty_verticals_for_merchant,
     reconcile_catalog_incentives_for_merchant,
     record_catalog_sync_event,
-    run_catalog_sync_job,
 )
-from services.shopify_products_sync import sync_shopify_products_for_merchant
 from utils.auth import ADMIN_ROLES, get_current_user
 
 
@@ -100,30 +98,9 @@ def _job_response(job: Dict[str, Any]) -> CatalogSyncJobResponse:
     )
 
 
-async def _run_catalog_job_background(
-    *,
-    job_id: str,
-    merchant_id: str,
-    connector: str,
-    limit: int,
-    force_refresh: bool,
-) -> None:
-    try:
-        if force_refresh and connector == "shopify":
-            await sync_shopify_products_for_merchant(
-                merchant_id=merchant_id,
-                limit=limit,
-                ingest_catalog=False,
-            )
-        await run_catalog_sync_job(job_id)
-    except Exception as exc:  # pragma: no cover - background task
-        logger.exception("Catalog job background execution failed job_id=%s merchant_id=%s err=%s", job_id, merchant_id, exc)
-
-
 @router.post("/sync/jobs", response_model=CatalogSyncJobResponse)
 async def create_sync_job(
     req: CatalogSyncJobCreateRequest,
-    background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> CatalogSyncJobResponse:
     merchant_id = _require_catalog_scope(req.merchant_id, current_user)
@@ -144,14 +121,15 @@ async def create_sync_job(
         scope=scope,
         requested_by=_requested_by(current_user, req.requested_by),
     )
-    background_tasks.add_task(
-        _run_catalog_job_background,
-        job_id=str(job.get("job_id") or ""),
-        merchant_id=merchant_id,
-        connector=req.connector,
-        limit=req.limit,
-        force_refresh=req.force_refresh,
-    )
+    # ENQUEUE ONLY — the job row above is the whole deliverable of this request.
+    # It used to be handed to FastAPI's `BackgroundTasks`, which runs after the
+    # response inside this API process: no retry, no supervision, and nothing
+    # survives a revision swap, so a dropped ingest left a `pending` row nobody
+    # would ever look at again while the caller had a 200 in hand. Both inputs
+    # the background task needed (`limit`, `force_refresh`) are already in
+    # `scope`, so the stored row now fully describes the work;
+    # `services.catalog_sync_drain.run_catalog_sync_drain_tick` runs it and the
+    # caller polls GET /v1/catalog/sync/jobs/{job_id} for the outcome.
     return _job_response(job)
 
 
@@ -200,7 +178,6 @@ async def ingest_shopify_catalog_event(
 @router.post("/reconcile/merchants/{merchant_id}", response_model=CatalogSyncJobResponse)
 async def reconcile_catalog_for_merchant(
     merchant_id: str,
-    background_tasks: BackgroundTasks,
     connector: str = Query(default="shopify"),
     platform: Optional[str] = Query(default="shopify"),
     limit: int = Query(default=500, ge=1, le=5000),
@@ -221,14 +198,9 @@ async def reconcile_catalog_for_merchant(
         },
         requested_by=_requested_by(current_user, None),
     )
-    background_tasks.add_task(
-        _run_catalog_job_background,
-        job_id=str(job.get("job_id") or ""),
-        merchant_id=merchant_id,
-        connector=connector,
-        limit=limit,
-        force_refresh=force_refresh,
-    )
+    # ENQUEUE ONLY — see the note in `create_sync_job` above. `scope` already
+    # carries platform/limit/force_refresh, so the drain tick can run this row
+    # without the request process staying alive to do it.
     return _job_response(job)
 
 

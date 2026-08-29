@@ -46,6 +46,11 @@ Job registration happens at start-up time. Currently registers:
   CATALOG_IMPORT_DRAIN_ENABLED=false stops it (scheduler lane only — the Sync
   endpoint's BackgroundTask does not consult it). The reaper is NOT gated on
   that flag, so pulling the switch mid-run does not strand the in-flight row.
+- `catalog_sync_drain_tick` — every 30 seconds, claims and runs one pending
+  catalog_sync_jobs row (the catalog ingest behind merchant "Sync products",
+  the Shopify catalog webhook and /v1/catalog/sync/jobs), which a request
+  handler enqueued. Paired with `catalog_sync_stale_reaper` every 5 minutes.
+  CATALOG_SYNC_DRAIN_ENABLED=false stops the drain (not the reaper).
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
@@ -182,6 +187,22 @@ _JOB_RUN_DEADLINES = {
     # last page and never elapses while a run is making progress. The heartbeat
     # is what reconciles the two numbers; see db/platform_import_tasks.py.
     "catalog_import_drain_tick": 1800,
+    # Catalog sync drain (catalog_sync_jobs): ONE job per tick — an optional
+    # Shopify re-pull (force_refresh: webhook, admin reconcile) and then an
+    # ingest of the merchant's products_cache into the catalog tree. Production
+    # runs so far took ~1s on small catalogs; the bound here is the quality
+    # backfill's, the same order of work. A cut run requeues its own row on
+    # CancelledError (services.catalog_sync_service.requeue_catalog_sync_job),
+    # and a job still unfinished CATALOG_SYNC_GIVE_UP_AFTER_SECONDS after it was
+    # created is failed instead of re-run forever.
+    #
+    # The stale reaper's window (services.catalog_sync_drain.
+    # DEFAULT_STALE_AFTER_SECONDS, 7200) is measured from the claim with NO
+    # heartbeat, so it must exceed this deadline plus the cancel grace, or the
+    # reaper would requeue a run the scheduler still permits and a second
+    # runner would ingest the same merchant concurrently. Raise this and that
+    # must move with it; tests/services/test_catalog_sync_drain.py pins it.
+    "catalog_sync_drain_tick": 3600,
     # DB-only reapers (60s / 5min cadence)
     "audit_run_lease_reaper": 120,
     "audit_run_abandoned_reaper": 120,
@@ -190,6 +211,7 @@ _JOB_RUN_DEADLINES = {
     "metering_expire_reservations": 120,
     "stamp_attribution_reaper": 120,
     "catalog_import_stale_reaper": 120,
+    "catalog_sync_stale_reaper": 120,
     # money path: 50 orders x (PSP verify + finalize + Shopify order); 2 ticks'
     # worth so a slow PSP is not cut off, but a wedge is bounded at 10 min.
     "payment_reconcile_tick": 600,
@@ -1219,6 +1241,46 @@ async def start_scheduler() -> None:
             "interval",
             seconds=300,
             id="catalog_import_stale_reaper",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+        )
+
+        # Catalog sync drain (catalog_sync_jobs): the step BEFORE the quality
+        # backfill above. `create_catalog_sync_job` writes a pending row from a
+        # request handler — POST /integrations/shopify/products/sync, the Shopify
+        # products/* + inventory_levels/update webhook, POST /v1/catalog/sync/jobs
+        # and the admin reconcile route — and this tick runs it. Those rows used
+        # to be run by a FastAPI BackgroundTask in the `web` process instead: no
+        # retry, no supervision, and a revision swap between the 200 and the
+        # task's end dropped the ingest with a `pending`/`running` row as the
+        # only trace. (2026-08-29: a second merchant's ingest failed inside
+        # that task after the endpoint had answered 200
+        # catalog_ingest_queued=true; the `failed` row was the only record.)
+        #
+        # Same shape as catalog_import_drain_tick above: one job per fire, 30s,
+        # max_instances=1, a code-default-ON kill switch checked inside the
+        # tick (CATALOG_SYNC_DRAIN_ENABLED=false), and a separate stale reaper
+        # that is NOT gated on that switch.
+        from services.catalog_sync_drain import (
+            run_catalog_sync_drain_tick,
+            run_catalog_sync_stale_reaper_tick,
+        )
+        _add_job(
+            run_catalog_sync_drain_tick,
+            "interval",
+            seconds=30,
+            id="catalog_sync_drain_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+        _add_job(
+            run_catalog_sync_stale_reaper_tick,
+            "interval",
+            seconds=300,
+            id="catalog_sync_stale_reaper",
             replace_existing=True,
             coalesce=True,
             max_instances=1,
