@@ -103,11 +103,9 @@ from routes.agent_checkout_intents import router as agent_checkout_intents_route
 from routes.employee_settlement_rules import employee_router as employee_settlement_router
 
 # Dashboard routers
-from routes.dashboard_routes import router as dashboard_router
 from routes.dashboard_api import router as dashboard_api_router
 # payment_routes already imported above, removed duplicate
 from routes.demo_data_routes import router as demo_data_router
-from routes.simple_ws_routes import router as simple_ws_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
@@ -1384,12 +1382,10 @@ app.include_router(agent_metrics_v1_router)  # Stable /agent/v1/metrics aliases
 app.include_router(prometheus_metrics_router)  # /metrics (Prometheus scrape)
 app.include_router(shopify_setup_router)  # Shopify setup endpoints
 app.include_router(shopify_manual_router)  # Shopify manual trigger endpoints
-app.include_router(dashboard_router)  # Dashboard API
 app.include_router(dashboard_api_router)  # New Dashboard API
 # payment_routes_router is same as payment_router, already included above
 app.include_router(demo_data_router)  # Demo data management
 # [DELETED] test_data_router router registration removed (file not in Git)
-app.include_router(simple_ws_router)  # Simple WebSocket
 app.include_router(product_quality_router)  # Internal product quality preview (Merchant Portal)
 
 if OPERATIONS_AVAILABLE:
@@ -2110,15 +2106,6 @@ async def app_lifespan(_app: FastAPI):
 
 
 app.router.lifespan_context = app_lifespan
-
-# Global event publisher function for easy access
-async def publish_event_to_ws(event: dict):
-    """Global function to publish events to WebSocket clients"""
-    from realtime.metrics_store import record_event
-    from realtime.ws_manager import publish_event_to_ws as ws_publish
-    
-    record_event(event)
-    await ws_publish(event)
 
 @app.get("/")
 async def root():

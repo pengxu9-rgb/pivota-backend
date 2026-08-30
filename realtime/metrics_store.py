@@ -11,6 +11,14 @@ import logging
 
 logger = logging.getLogger("metrics_store")
 
+# Roles that see the whole platform rather than their own slice. `employee` and
+# `outsourced` are here on the evidence of this repo's own permission model —
+# utils/auth.py:331 grants both "view_dashboard" and "view_transactions" — not a
+# judgement made here.
+PLATFORM_WIDE_ROLES = frozenset(
+    {"admin", "super_admin", "operator", "viewer", "employee", "outsourced"}
+)
+
 class MetricsStore:
     """Real-time metrics store with rolling windows and snapshots"""
     
@@ -146,8 +154,13 @@ class MetricsStore:
         while self.events and self.events[0]["recorded_at"] < cutoff_time:
             self.events.popleft()
 
-    def get_snapshot(self, role: str = "admin", entity_id: Optional[str] = None) -> Dict[str, Any]:
-        """Generate a snapshot of current metrics with optional filtering"""
+    def get_snapshot(self, role: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
+        """Generate a snapshot of current metrics, scoped to `role`.
+
+        `role` is REQUIRED and has no default. It defaulted to "admin", and the
+        only remaining caller took that default, so a caller that had not
+        decided whose data this is received everyone's.
+        """
         
         # Calculate average latencies
         def calc_avg_latency(samples):
@@ -191,41 +204,43 @@ class MetricsStore:
         # Build PSP usage
         psp_usage_data = dict(self.psp_usage)
         
-        # Apply role-based filtering
-        filtered_summary = self.counters.copy()
-        
-        if role in ["admin", "operator", "viewer"]:
-            # Admin, operator, and viewer see full system data
-            pass
-        elif role == "agent" and entity_id:
-            # Filter to only show data for this agent
-            agent_data = {entity_id: agent_data.get(entity_id, {})}
-            # Calculate filtered summary for this agent
-            if entity_id in agent_data:
-                agent_metrics = agent_data[entity_id]
-                filtered_summary = {
-                    "total": agent_metrics.get("total", 0),
-                    "success": agent_metrics.get("success_count", 0),
-                    "fail": agent_metrics.get("fail_count", 0),
-                    "retries": agent_metrics.get("retry_count", 0)
-                }
-            else:
-                filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
-        elif role == "merchant" and entity_id:
-            # Filter to only show data for this merchant
-            merchant_data = {entity_id: merchant_data.get(entity_id, {})}
-            # Calculate filtered summary for this merchant
-            if entity_id in merchant_data:
-                merchant_metrics = merchant_data[entity_id]
-                filtered_summary = {
-                    "total": merchant_metrics.get("total", 0),
-                    "success": merchant_metrics.get("success_count", 0),
-                    "fail": merchant_metrics.get("fail_count", 0),
-                    "retries": merchant_metrics.get("retry_count", 0)
-                }
-            else:
-                filtered_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
-        
+        # Apply role-based filtering.
+        #
+        # One exhaustive decision, not an if/elif chain with a fall-through. The
+        # old `elif role == "agent" and entity_id:` simply did not match when a
+        # caller had no entity_id, and execution fell past every branch with all
+        # three datasets and the platform totals intact — so "cannot be scoped"
+        # silently meant "sees everything". Every path below assigns. The old
+        # branches also narrowed only their OWN dimension, leaving the other
+        # whole.
+        empty_summary = {"total": 0, "success": 0, "fail": 0, "retries": 0}
+
+        def _summary_from(metrics: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "total": metrics.get("total", 0),
+                "success": metrics.get("success_count", 0),
+                "fail": metrics.get("fail_count", 0),
+                "retries": metrics.get("retry_count", 0),
+            }
+
+        if role in PLATFORM_WIDE_ROLES:
+            filtered_summary = self.counters.copy()
+        elif role in ("agent", "merchant") and entity_id:
+            own = agent_data if role == "agent" else merchant_data
+            mine = own.get(entity_id, {})
+            filtered_summary = _summary_from(mine) if mine else dict(empty_summary)
+            agent_data = {entity_id: mine} if role == "agent" else {}
+            merchant_data = {entity_id: mine} if role == "merchant" else {}
+            # PSP figures describe our processors, not the caller's traffic.
+            psp_data = {}
+            psp_usage_data = {}
+        else:
+            filtered_summary = dict(empty_summary)
+            agent_data = {}
+            merchant_data = {}
+            psp_data = {}
+            psp_usage_data = {}
+
         snapshot = {
             "summary": filtered_summary,
             "psp": psp_data,
@@ -234,7 +249,13 @@ class MetricsStore:
             "psp_usage": psp_usage_data,
             "timestamp": time.time(),
             "window_size_seconds": self.window_size_seconds,
-            "total_events": len(self.events)
+            # Scoped too. This sat outside the branch and reported the platform's
+            # event count to every caller regardless of what it could see.
+            "total_events": (
+                len(self.events)
+                if role in PLATFORM_WIDE_ROLES
+                else filtered_summary["total"]
+            ),
         }
         
         return snapshot
@@ -264,6 +285,6 @@ def record_event(event: Dict[str, Any]) -> None:
     """Record an event in the global metrics store"""
     _metrics_store.record_event(event)
 
-def snapshot(role: str = "admin", entity_id: Optional[str] = None) -> Dict[str, Any]:
-    """Generate a snapshot from the global metrics store"""
+def snapshot(role: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
+    """Generate a snapshot from the global metrics store, scoped to `role`."""
     return _metrics_store.get_snapshot(role, entity_id)

@@ -14,11 +14,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from realtime.metrics_store import record_event
-    from realtime.ws_manager import publish_event_to_ws
 except ImportError:
     # Fallback for when running as standalone
     record_event = None
-    publish_event_to_ws = None
 
 logger = logging.getLogger("event_publisher")
 
@@ -62,11 +60,9 @@ class EventPublisher:
         if additional_data:
             event.update(additional_data)
         
-        # Record in metrics store and broadcast
+        # Record in metrics store
         if record_event:
             record_event(event)
-        if publish_event_to_ws:
-            await publish_event_to_ws(event)
         
         logger.info(f"Published payment result: {order_id} -> {status} via {psp} ({latency_ms}ms)")
     
@@ -101,11 +97,9 @@ class EventPublisher:
         if additional_data:
             event.update(additional_data)
         
-        # Record in metrics store and broadcast
+        # Record in metrics store
         if record_event:
             record_event(event)
-        if publish_event_to_ws:
-            await publish_event_to_ws(event)
         
         logger.info(f"Published order event: {order_id} -> {event_type} ({status})")
     
@@ -134,11 +128,9 @@ class EventPublisher:
         if additional_data:
             event.update(additional_data)
         
-        # Record in metrics store and broadcast
+        # Record in metrics store
         if record_event:
             record_event(event)
-        if publish_event_to_ws:
-            await publish_event_to_ws(event)
         
         logger.info(f"Published PSP event: {psp} -> {event_type} for {order_id}")
     
@@ -171,11 +163,9 @@ class EventPublisher:
         if additional_data:
             event.update(additional_data)
         
-        # Record in metrics store and broadcast
+        # Record in metrics store
         if record_event:
             record_event(event)
-        if publish_event_to_ws:
-            await publish_event_to_ws(event)
         
         logger.info(f"Published inventory event: {merchant} -> {event_type} for {sku}")
 
@@ -184,7 +174,7 @@ async def publish_custom_event(event: Dict[str, Any]) -> None:
     """Publish a custom event to WebSocket clients"""
     if record_event:
         record_event(event)
-    # Note: We don't call publish_event_to_ws here to avoid recursion
+    # Note: nothing broadcasts this; the WebSocket surface was removed
     # The WebSocket publishing should be handled by the caller
 
 # Global event publisher instance
