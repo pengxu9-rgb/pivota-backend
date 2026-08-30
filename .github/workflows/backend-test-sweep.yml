@@ -56,14 +56,15 @@ on:
       - 'core/**'
       - 'catalog/**'
       - 'observability/**'
-      # realtime/ holds the WebSocket admission ceiling (realtime/ws_guard.py):
-      # the process-wide slot budget, release(), and the env fallback that stops
-      # a typo from disabling it. It was missing here, and the derivation above
-      # would not have caught it — the tests that cover it import it from
-      # tests/, so the package looked watched via a path that only matches when
-      # the TESTS change. A PR editing ws_guard.py alone matched no filter, so
-      # the sweep never ran and `CI Entrypoint` - the required check - went
-      # green having executed nothing against the guarantee. Same shape as the
+      # realtime/ was added for ws_guard.py's admission ceiling, which has since
+      # been deleted along with the WebSocket surface it guarded. The line stays
+      # because the reason generalises and still applies: realtime/metrics_store.py
+      # now holds the role-scoping decision for /api/operations/dashboard-summary,
+      # and the derivation above would not catch it — the tests that cover it
+      # live in tests/, so the package looks watched via a path that only matches
+      # when the TESTS change. A PR editing metrics_store.py alone would match no
+      # filter, the sweep would not run, and `CI Entrypoint` - the required check
+      # - would go green having executed nothing against it. Same shape as the
       # infra/ and .github/ entries below.
       - 'realtime/**'
       # infra/ is here for a test that IMPORTS nothing from it. The derivation

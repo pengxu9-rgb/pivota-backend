@@ -1,12 +1,19 @@
 """The unused metrics dashboard surface must stay deleted.
 
-Eight endpoints (five REST, two WebSocket, one status) served an in-memory
-metrics store to anonymous callers. They came from a bulk scaffold commit, were
-never developed — `routes/dashboard_routes.py` had four commits ever, three of
-them the security fixes that preceded this deletion — and prod request logs show
-ZERO calls to any of them in 30 days. They cost a Cloud Run concurrency-slot DoS
-(#1950), an unauthenticated POST that wiped the store, and an anonymous read of
-raw enrichment events.
+SEVEN endpoints (five REST — `/api/ws/status` is one of them — and two
+WebSocket) served an in-memory metrics store to anonymous callers. They came
+from a bulk scaffold commit and were never developed: `routes/dashboard_routes.py`
+had TWO commits before this one, `bc4d01e02` (a bulk "add all missing backend
+modules" dump) and `eab05fc8a` (#1950), of which one was a security fix.
+
+Nothing called them. Cloud Run request logs for the prod `web` service show no
+organic requests to any of the seven — over the ~10 days of logs that EXIST,
+which is the honest window: the oldest entry for that service is 2026-08-20,
+the GCP cutover, and Railway before it is decommissioned. The only hits are a
+handful of `curl` probes from this investigation on 2026-08-30.
+
+They cost a Cloud Run concurrency-slot DoS (#1950), an unauthenticated POST that
+wiped the store, and an anonymous read of raw enrichment events.
 
 This file is a ratchet, not a unit test: it fails if any of them comes back
 without someone deliberately changing it here.
@@ -44,8 +51,20 @@ REMOVED_PATHS = [
 
 @pytest.mark.parametrize("module", REMOVED_MODULES)
 def test_the_removed_modules_are_not_importable(module):
-    with pytest.raises(ModuleNotFoundError):
+    """Pinned to the module that is actually missing.
+
+    A bare `pytest.raises(ModuleNotFoundError)` passes for the WRONG reason on a
+    partial revert: restore `routes/dashboard_routes.py` alone and it still
+    raises, because its own `from realtime.ws_manager import ...` fails — so the
+    file is back on disk with its routes defined and this test stays green.
+    Checking `.name` makes the assertion about THIS module.
+    """
+    with pytest.raises(ModuleNotFoundError) as excinfo:
         importlib.import_module(module)
+    assert excinfo.value.name == module, (
+        f"{module} imported far enough to fail on {excinfo.value.name} — it is "
+        "back on disk"
+    )
 
 
 @pytest.mark.parametrize("path", REMOVED_PATHS)

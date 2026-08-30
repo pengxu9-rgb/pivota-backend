@@ -171,11 +171,15 @@ class EventPublisher:
 
 # Convenience functions for backward compatibility
 async def publish_custom_event(event: Dict[str, Any]) -> None:
-    """Publish a custom event to WebSocket clients"""
+    """Record a custom event in the metrics store.
+
+    Was "publish to WebSocket clients"; there are no WebSocket clients any more.
+    This is the ONLY publisher with a live caller
+    (services/product_enrichment_pipeline.run_enrichment_for_product).
+    """
     if record_event:
         record_event(event)
-    # Note: nothing broadcasts this; the WebSocket surface was removed
-    # The WebSocket publishing should be handled by the caller
+    # Note: nothing broadcasts this; the WebSocket surface was removed.
 
 # Global event publisher instance
 event_publisher = EventPublisher()

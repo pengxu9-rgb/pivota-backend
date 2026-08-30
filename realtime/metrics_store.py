@@ -11,10 +11,23 @@ import logging
 
 logger = logging.getLogger("metrics_store")
 
-# Roles that see the whole platform rather than their own slice. `employee` and
-# `outsourced` are here on the evidence of this repo's own permission model —
-# utils/auth.py:331 grants both "view_dashboard" and "view_transactions" — not a
-# judgement made here.
+# Roles that see the whole platform rather than their own slice. The evidence
+# differs per entry and the earlier version of this comment blurred that:
+#
+#   employee, outsourced — utils/auth.py:356,359 grant both "view_dashboard"
+#     and "view_transactions" in `permission_map`. Added here because omitting
+#     them regressed every internal viewer to an all-zero dashboard once the
+#     admin default was removed.
+#   super_admin, admin, employee, operator, viewer — utils/auth.py:448, the
+#     global-access list in `validate_entity_access`. NOTE that `operator` and
+#     `viewer` appear in no key of `permission_map` at all, so
+#     `check_permission` returns False for them for every permission. They are
+#     carried over from the list this replaced rather than independently
+#     grounded, and :448 is the only place the system says they see everything.
+#
+# Not a widening either way: the previous code called get_snapshot() with no
+# arguments and took its role="admin" default, so every caller already received
+# everything. Every entry here is a narrowing or a wash.
 PLATFORM_WIDE_ROLES = frozenset(
     {"admin", "super_admin", "operator", "viewer", "employee", "outsourced"}
 )
@@ -225,21 +238,32 @@ class MetricsStore:
 
         if role in PLATFORM_WIDE_ROLES:
             filtered_summary = self.counters.copy()
+            scoped_event_count = len(self.events)
         elif role in ("agent", "merchant") and entity_id:
+            dimension = "agent" if role == "agent" else "merchant"
             own = agent_data if role == "agent" else merchant_data
             mine = own.get(entity_id, {})
             filtered_summary = _summary_from(mine) if mine else dict(empty_summary)
-            agent_data = {entity_id: mine} if role == "agent" else {}
-            merchant_data = {entity_id: mine} if role == "merchant" else {}
+            # `{entity_id: mine}` only when there IS something — echoing the
+            # requested id back inside an otherwise empty dict discloses nothing
+            # but confirms nothing either, and differs from every other
+            # unscopeable path here, which returns {}.
+            own_slice = {entity_id: mine} if mine else {}
+            agent_data = own_slice if role == "agent" else {}
+            merchant_data = own_slice if role == "merchant" else {}
             # PSP figures describe our processors, not the caller's traffic.
             psp_data = {}
             psp_usage_data = {}
+            scoped_event_count = sum(
+                1 for e in self.events if e.get(dimension) == entity_id
+            )
         else:
             filtered_summary = dict(empty_summary)
             agent_data = {}
             merchant_data = {}
             psp_data = {}
             psp_usage_data = {}
+            scoped_event_count = 0
 
         snapshot = {
             "summary": filtered_summary,
@@ -249,13 +273,15 @@ class MetricsStore:
             "psp_usage": psp_usage_data,
             "timestamp": time.time(),
             "window_size_seconds": self.window_size_seconds,
-            # Scoped too. This sat outside the branch and reported the platform's
-            # event count to every caller regardless of what it could see.
-            "total_events": (
-                len(self.events)
-                if role in PLATFORM_WIDE_ROLES
-                else filtered_summary["total"]
-            ),
+            # Scoped too — it sat outside the branch and reported the
+            # platform's event count to every caller regardless of what it
+            # could see. Counted from the window rather than from
+            # filtered_summary["total"]: `counters` are LIFETIME totals that
+            # `_cleanup_old_events` never decrements, so reusing them here would
+            # put a lifetime number under a key the platform branch fills with a
+            # rolling-window one, and the two would silently diverge after an
+            # hour.
+            "total_events": scoped_event_count,
         }
         
         return snapshot
