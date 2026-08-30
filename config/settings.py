@@ -822,8 +822,39 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+_jwt_secret_verified = False
+
+
+def require_jwt_secret() -> str:
+    """Return the signing secret, refusing on a real server if it is forgeable.
+
+    THE TRIGGER IS USE, NOT IMPORT, and that distinction is the whole point.
+    This check first ran at the bottom of this module, so merely importing
+    `config.settings` enforced it — and `db/database.py` imports it, so every
+    Cloud Run JOB inherited it. Jobs carry CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION and
+    set PIVOTA_ENV=production, so both platform predicates fire; none of the 19
+    jobs in pivota-prod mounts JWT_SECRET_KEY, and none of them verifies a
+    token. Nine of the eleven Python job entrypoints died at import on a check
+    for a secret they never use — silently, since a cron job that stops running
+    pages nobody.
+
+    Import-time enforcement in utils/auth.py would not have fixed it either:
+    jobs/external_referral_refresh.py loads that module transitively. The only
+    boundary that separates "issues or verifies tokens" from "runs a batch job"
+    is reading the secret, so that is where the check lives.
+
+    Verified once per process. A failure does not latch, so it raises on every
+    subsequent attempt rather than passing the second time.
+    """
+    global _jwt_secret_verified
+    if not _jwt_secret_verified:
+        _enforce_jwt_secret_strength(settings)
+        _jwt_secret_verified = True
+    return settings.jwt_secret_key
+
+
 def _enforce_jwt_secret_strength(current: "Settings") -> None:
-    """Refuse to boot on a real server with a forgeable JWT secret.
+    """Refuse to run on a real server with a forgeable JWT secret.
 
     A deleted config/production.py used to declare `Field(...,
     env="JWT_SECRET_KEY", min_length=32)`, which read like this was already
@@ -854,7 +885,7 @@ def _enforce_jwt_secret_strength(current: "Settings") -> None:
 
     if is_deployed() or is_production():
         raise RuntimeError(
-            f"Refusing to start: {problem}. "
+            f"Refusing to sign or verify tokens: {problem}. "
             f"Set JWT_SECRET_KEY to at least {JWT_SECRET_MIN_LENGTH} bytes of "
             "random data on this revision "
             "(e.g. `python -c 'import secrets;print(secrets.token_urlsafe(48))'`)."
@@ -867,5 +898,3 @@ def _enforce_jwt_secret_strength(current: "Settings") -> None:
         "deployed and not production.", problem,
     )
 
-
-_enforce_jwt_secret_strength(settings)

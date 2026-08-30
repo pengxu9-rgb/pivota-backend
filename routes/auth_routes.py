@@ -34,8 +34,8 @@ security = HTTPBearer()
 logger = logging.getLogger("auth_routes")
 
 # JWT Configuration - Import from config for consistency
-from config.settings import settings
-JWT_SECRET = settings.jwt_secret_key
+from config.settings import require_jwt_secret, settings
+# See utils/auth.py: read at use, not at import.
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
@@ -88,13 +88,13 @@ def create_jwt_token(
     }
     if extra_claims:
         payload.update(extra_claims)
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, require_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify JWT token and return user info"""
     try:
         token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, require_jwt_secret(), algorithms=[JWT_ALGORITHM])
         user_id = payload.get("user_id")
         role = payload.get("role")
         
@@ -340,7 +340,7 @@ async def signin(login_data: UserLogin):
                 # Don't fail login if agent creation fails
                 print(f"⚠️ Could not create agent record: {e}")
         
-        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        token = jwt.encode(token_payload, require_jwt_secret(), algorithm=JWT_ALGORITHM)
         
         user_data = {
             "id": normalized_email,

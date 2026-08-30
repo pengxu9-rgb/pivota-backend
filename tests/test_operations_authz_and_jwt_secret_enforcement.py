@@ -55,6 +55,13 @@ def _token(role):
 
 # Every route in the file, so a newly added one that forgets the guard is caught
 # by the DENIED cases below rather than shipping open.
+#
+# This list said that while covering EIGHT of the ten. Deleting the guard from
+# the two it missed left all 83 tests green. They were almost certainly skipped
+# because a naive body makes FastAPI answer 422 before the handler runs, so the
+# guard is never reached: the PUT needs its two query params, and the welcome
+# email needs a `status` body. Getting the request shape right is the whole
+# difference between covering a route and appearing to.
 OPS_REQUESTS = [
     ("POST", "/api/operations/agents/onboard",
      {"agent_name": "A", "contact_email": "a@x.com"}),
@@ -69,6 +76,12 @@ OPS_REQUESTS = [
     ("GET", "/api/operations/analytics", None),
     ("GET", "/api/operations/operations-log", None),
     ("GET", "/api/operations/dashboard-summary", None),
+    ("PUT", "/api/operations/onboarding/AGENT_1/status?entity_id=AGENT_1&entity_type=agent",
+     {"status": "pending"}),
+    # entity_id/entity_type are bare annotations on the handler, so FastAPI
+    # makes them QUERY params — a JSON body gets 422 before the guard runs.
+    ("POST", "/api/operations/send-welcome-email?entity_id=AGENT_1&entity_type=agent",
+     None),
 ]
 
 
@@ -186,6 +199,27 @@ def _publisher_calls():
     return calls
 
 
+def _publisher_call(name):
+    """The ast.Call node for one `event_publisher.<name>(...)` site.
+
+    Returns the NODE, not a summary of it, so a test can assert on what an
+    argument is actually set to rather than searching the file for a string
+    that may well appear somewhere else entirely.
+    """
+    path = REPO_ROOT / "orchestrator" / "payment_orchestrator.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "event_publisher"
+            and node.func.attr == name
+        ):
+            return node
+    raise AssertionError(f"no event_publisher.{name}(...) call found")
+
+
 def test_orchestrator_publisher_calls_are_found():
     """Guards the test below: an AST query that matches nothing passes vacuously."""
     assert len(_publisher_calls()) == 2, _publisher_calls()
@@ -216,29 +250,59 @@ def test_orchestrator_publisher_calls_bind_to_the_real_signature(name, kwargs, l
 def test_payment_result_status_uses_the_vocabulary_metrics_store_counts():
     """realtime/metrics_store.py compares status against the literal
     "succeeded". A bool (what the old call passed as `success=`) never matched,
-    so a successful payment would have been recorded as a failure."""
-    src = (REPO_ROOT / "orchestrator" / "payment_orchestrator.py").read_text(
-        encoding="utf-8"
+    so a successful payment would have been recorded as a failure.
+
+    Asserted on the `status` KEYWORD of the publish_payment_result call. The
+    first version searched the whole file for that ternary as a substring — and
+    the identical string already exists on origin/main inside the Payment(...)
+    constructor, on a line this change never touches, so the test passed with
+    the entire orchestrator reverted. Same literal, wrong call.
+    """
+    call = _publisher_call("publish_payment_result")
+    status = next(
+        (kw for kw in call.keywords if kw.arg == "status"), None
     )
-    assert '"succeeded" if payment_response.success else "failed"' in src
+    assert status is not None, "publish_payment_result is called without status="
+    rendered = ast.unparse(status.value)
+    assert "succeeded" in rendered and "failed" in rendered, rendered
+    assert "payment_response.success" in rendered, rendered
 
 
 # ---------------------------------------------------------------------------
 # 3. The JWT secret length is enforced where the secret actually lives
 # ---------------------------------------------------------------------------
 
-def _boot(extra_env):
+def _run(snippet, extra_env):
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_", "JWT_"))
+        # CLOUD_RUN_* is scrubbed too. It was not, and that is the same blind
+        # spot that let the Jobs shape through: a stray marker in the parent
+        # environment would silently change which platform the child thinks it
+        # is on.
+        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_", "JWT_", "CLOUD_RUN_"))
     }
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.update(extra_env)
     return subprocess.run(
-        [sys.executable, "-c", "import config.settings"],
+        [sys.executable, "-c", snippet],
         cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=180,
     )
+
+
+# Signing a token is what the guard protects, so that is what these drive.
+# They used to run `import config.settings`, because the check ran at import —
+# which is exactly the defect being fixed here, so testing it that way would
+# have pinned the bug rather than the behaviour.
+_SIGN_A_TOKEN = "from utils.auth import create_access_token; create_access_token({'sub': 'x'})"
+
+# Importing the modules a batch job pulls in, and touching no token. This must
+# SUCCEED on every deployed shape with no secret at all.
+_BOOT_A_JOB = "import config.settings, db.database, utils.auth"
+
+
+def _boot(extra_env):
+    return _run(_SIGN_A_TOKEN, extra_env)
 
 
 DEPLOYED_SHAPES = [
@@ -246,6 +310,13 @@ DEPLOYED_SHAPES = [
     ({"PIVOTA_ENV": "production"}, "pivota_env_prod_unmanaged"),
     ({"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "staging"}, "cloud_run_staging"),
     ({"K_SERVICE": "pivota-backend"}, "cloud_run_unresolved"),
+    # The shape that was missing, and the one that mattered: every Cloud Run
+    # JOB in pivota-prod carries these two markers AND PIVOTA_ENV=production.
+    # config/platform.py's own docstring records this host family as having
+    # been blind before 2026-08-26; the matrix reproduced the blindness.
+    ({"CLOUD_RUN_JOB": "content-canonical-election",
+      "CLOUD_RUN_EXECUTION": "exec-1",
+      "PIVOTA_ENV": "production"}, "cloud_run_job"),
 ]
 
 
@@ -264,9 +335,9 @@ def test_weak_jwt_secret_refuses_to_boot_on_a_real_server(shape, secret, ids):
         env["JWT_SECRET_KEY"] = secret
     result = _boot(env)
     assert result.returncode != 0, (
-        f"booted with a weak JWT secret on {shape}: {result.stdout[-2000:]}"
+        f"signed a token with a weak JWT secret on {shape}: {result.stdout[-2000:]}"
     )
-    assert "Refusing to start" in result.stderr, result.stderr[-2000:]
+    assert "Refusing to sign or verify tokens" in result.stderr, result.stderr[-2000:]
 
 
 @pytest.mark.parametrize(
@@ -284,6 +355,42 @@ def test_a_weak_secret_is_still_allowed_on_an_unmanaged_dev_host():
     turn that into a hard failure."""
     result = _boot({})
     assert result.returncode == 0, result.stderr[-2000:]
+
+
+@pytest.mark.parametrize(
+    "shape", [s for s, _ in DEPLOYED_SHAPES], ids=[i for _, i in DEPLOYED_SHAPES]
+)
+def test_a_process_that_never_touches_a_token_starts_without_a_secret(shape):
+    """The regression this guard shipped with, and the reason it now triggers
+    on USE rather than on import.
+
+    The check ran at the bottom of config/settings.py, and db/database.py
+    imports that module — so every Cloud Run Job inherited it. All 19 jobs in
+    pivota-prod set PIVOTA_ENV=production and none mounts JWT_SECRET_KEY, so
+    nine of the eleven Python job entrypoints died at import on a check for a
+    secret they never use. Silently: a cron job that stops running pages no one,
+    and the jobs pin image SHAs, so the breakage would have landed on whatever
+    later deploy rolled them rather than on the change that caused it.
+
+    Moving it to utils/auth.py's import would not have helped either —
+    jobs/external_referral_refresh.py loads that module transitively.
+    """
+    result = _run(_BOOT_A_JOB, shape)
+    assert result.returncode == 0, (
+        "a batch job that never signs or verifies a token must start without "
+        f"JWT_SECRET_KEY on {shape}: {result.stderr[-2000:]}"
+    )
+
+
+def test_the_guard_still_fires_for_a_job_shape_that_does_touch_tokens():
+    """The positive counterpart: exempting jobs by PLATFORM would have been the
+    wrong fix. Nothing is exempt — only not-reading-the-secret is."""
+    result = _run(_SIGN_A_TOKEN, {
+        "CLOUD_RUN_JOB": "some-job", "CLOUD_RUN_EXECUTION": "e",
+        "PIVOTA_ENV": "production",
+    })
+    assert result.returncode != 0
+    assert "Refusing to sign or verify tokens" in result.stderr
 
 
 def test_config_production_is_gone():

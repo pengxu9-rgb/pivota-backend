@@ -10,11 +10,13 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
 from config.platform import pytest_bypass_allowed
-from config.settings import settings
+from config.settings import require_jwt_secret, settings
 import os
 
 # JWT Configuration
-JWT_SECRET = settings.jwt_secret_key
+# No module-level JWT_SECRET. Binding it here read the secret at IMPORT, which
+# is what dragged every importer — including batch jobs that never touch a
+# token — into the strength check. require_jwt_secret() reads it at use.
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
@@ -71,7 +73,7 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
         "iat": datetime.utcnow()
     })
     
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, require_jwt_secret(), algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
 
@@ -91,7 +93,7 @@ def decode_token(token: str) -> Dict[str, Any]:
     try:
         payload = jwt.decode(
             token,
-            JWT_SECRET,
+            require_jwt_secret(),
             algorithms=[JWT_ALGORITHM],
             options={"verify_aud": False},
         )

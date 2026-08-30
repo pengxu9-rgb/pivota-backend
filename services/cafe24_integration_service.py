@@ -43,7 +43,7 @@ class Cafe24OAuthConfig:
 
 
 def get_cafe24_oauth_config() -> Cafe24OAuthConfig:
-    from config.settings import settings
+    from config.settings import require_jwt_secret as _require_jwt_secret, settings
 
     return Cafe24OAuthConfig(
         client_id=os.getenv("CAFE24_CLIENT_ID", "").strip(),
@@ -54,7 +54,7 @@ def get_cafe24_oauth_config() -> Cafe24OAuthConfig:
         webhook_api_key=os.getenv("CAFE24_WEBHOOK_API_KEY", "").strip(),
         state_secret=(
             os.getenv("CAFE24_OAUTH_STATE_SECRET", "").strip()
-            or str(settings.jwt_secret_key or "").strip()
+            or str(_require_jwt_secret() or "").strip()
         ),
     )
 
