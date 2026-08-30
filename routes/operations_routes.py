@@ -511,7 +511,23 @@ async def get_dashboard_summary(
     
     # Get metrics from the main system
     metrics_store = get_metrics_store()
-    system_metrics = metrics_store.get_snapshot() if metrics_store else {}
+    # `role` is required now, and there is NO fallback here on purpose. A
+    # default of "admin" (what this used to take) or "operator" is platform-wide,
+    # so a token carrying no role claim would receive everyone's figures.
+    #
+    # This does NOT claim the caller is authorized: the `check_permission` call
+    # above RETURNS a bool and never raises, so it is a discarded expression —
+    # and it asks for the permission string "operator", which appears in no
+    # role's list in utils/auth.py:331, so it would deny every caller including
+    # admin if its result were ever read. Both halves are wrong, the same shape
+    # repeats at :93, :150, :210, :246, and fixing them changes five untouched
+    # routes' access. What this line can do is stop handing platform figures to
+    # whoever gets through.
+    system_metrics = (
+        metrics_store.get_snapshot(role=str(credentials.get("role") or ""))
+        if metrics_store
+        else {}
+    )
     
     # Calculate onboarding metrics
     pending_agents = len([a for a in operations_store["agents"].values() 
