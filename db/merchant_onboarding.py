@@ -139,6 +139,20 @@ async def update_kyc_status(merchant_id: str, status: str, reason: Optional[str]
         "status": status,
         "updated_at": datetime.now()
     }
+    if status != "approved":
+        # `auto_approved` records that the AUTOMATIC path approved this merchant.
+        # It was set True at signup and never cleared, while the one gate that
+        # reads status — the PSP setup check in
+        # routes/merchant_onboarding_routes.py — passes when EITHER the status is
+        # approved OR auto_approved is set. Since registration auto-approves
+        # everyone, every merchant carried auto_approved=True, so rejecting one
+        # left it able to connect a payment provider exactly as before. Rejection
+        # was a no-op at the only place it was checked.
+        #
+        # Not restored on a later approval: an admin approving a rejected
+        # merchant is a manual decision, not an automatic one, and the gate
+        # passes on status alone.
+        update_data["auto_approved"] = False
     if status == "approved":
         update_data["verified_at"] = datetime.now()
         # Clear rejection reason on approval unless explicitly provided

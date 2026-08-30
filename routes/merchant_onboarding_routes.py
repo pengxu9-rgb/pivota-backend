@@ -873,9 +873,17 @@ async def setup_psp(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    # Allow PSP setup if merchant is approved OR auto-approved
+    # Allow PSP setup if merchant is approved OR auto-approved.
+    #
+    # An explicit rejection is checked on its own rather than relying on
+    # `auto_approved` having been cleared. update_kyc_status does clear it now,
+    # so the second condition below is no longer a way past a rejection — but
+    # the two must not depend on each other to be safe, and this is the line
+    # that decides whether a rejected merchant can take money.
     is_auto_approved = merchant.get("auto_approved", False)
-    if merchant["status"] != "approved" and not is_auto_approved:
+    if merchant["status"] == "rejected" or (
+        merchant["status"] != "approved" and not is_auto_approved
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"KYC must be approved first. Current status: {merchant['status']}, auto_approved: {is_auto_approved}"
