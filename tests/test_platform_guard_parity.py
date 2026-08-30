@@ -754,6 +754,14 @@ def _import_db_database(extra_env: dict):
             "DATABASE_URL": "postgresql://u:p@db.invalid:5432/pivota",
             "DB_SSL_NO_VERIFY": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
+            # Isolates the guard under test. `db.database` pulls in
+            # config.settings, whose _enforce_jwt_secret_strength() also refuses
+            # to boot on a deployed shape when JWT_SECRET_KEY is unset — and it
+            # runs first, so without a valid secret here every parametrized case
+            # below would fail on the JWT message and stop exercising the
+            # DB_SSL_NO_VERIFY guard at all. Any value >= 32 bytes will do; this
+            # test asserts nothing about JWT.
+            "JWT_SECRET_KEY": "x" * 64,
         }
     )
     env.update(extra_env)

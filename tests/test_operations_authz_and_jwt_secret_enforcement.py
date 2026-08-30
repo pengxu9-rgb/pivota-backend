@@ -1,0 +1,394 @@
+"""Regression tests for three guards that read like protection but never ran.
+
+1. routes/operations_routes.py called `check_permission(credentials, "operator")`
+   as a bare statement at all ten call sites. `check_permission` RETURNS a bool
+   and never raises, so the result was discarded and every route answered any
+   authenticated caller. Separately, "operator" is a ROLE name and the map it is
+   looked up in is keyed by role with PERMISSION values, so the string matched
+   nothing and only the admin/super_admin early-returns would have passed.
+2. orchestrator/payment_orchestrator.py called event_publisher with kwargs the
+   publishers do not accept; the TypeError was swallowed by `except Exception`.
+3. config/production.py declared min_length=32 on the JWT secret, but nothing
+   instantiated ProductionSettings (and it could not even be imported under
+   Pydantic v2), so the live secret in config/settings.py was unchecked. That
+   file is now deleted and the check lives where the secret does.
+"""
+
+import ast
+import inspect
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+STRONG_SECRET = "x" * 64
+
+
+# ---------------------------------------------------------------------------
+# 1. Operations routes actually enforce authorization
+# ---------------------------------------------------------------------------
+
+ALLOWED_ROLES = ["super_admin", "admin", "employee", "operator"]
+DENIED_ROLES = ["merchant", "agent", "outsourced", "viewer", "", "not_a_role"]
+
+
+@pytest.fixture(scope="module")
+def ops_client():
+    from routes.operations_routes import router
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app)
+
+
+def _token(role):
+    from utils.auth import create_jwt_token
+
+    return create_jwt_token("user-1", role)
+
+
+# Every route in the file, so a newly added one that forgets the guard is caught
+# by the DENIED cases below rather than shipping open.
+OPS_REQUESTS = [
+    ("POST", "/api/operations/agents/onboard",
+     {"agent_name": "A", "contact_email": "a@x.com"}),
+    ("POST", "/api/operations/merchants/onboard",
+     {"merchant_name": "M", "contact_email": "m@x.com",
+      "store_url": "https://m.example", "platform": "shopify"}),
+    ("GET", "/api/operations/onboarding-queue", None),
+    ("POST", "/api/operations/verify",
+     {"entity_id": "AGENT_1", "entity_type": "agent",
+      "verification_type": "api_test"}),
+    ("GET", "/api/operations/verification-tasks", None),
+    ("GET", "/api/operations/analytics", None),
+    ("GET", "/api/operations/operations-log", None),
+    ("GET", "/api/operations/dashboard-summary", None),
+]
+
+
+@pytest.mark.parametrize("role", DENIED_ROLES)
+@pytest.mark.parametrize("method,path,body", OPS_REQUESTS)
+def test_operations_routes_deny_unprivileged_roles(ops_client, role, method, path, body):
+    """The defect: all of these answered 200 for every one of these roles."""
+    resp = ops_client.request(
+        method, path, params={"token": _token(role)}, json=body
+    )
+    assert resp.status_code == 403, (
+        f"{method} {path} answered {resp.status_code} for role={role!r}; "
+        "the operations surface is open again"
+    )
+
+
+@pytest.mark.parametrize("role", ALLOWED_ROLES)
+def test_operations_routes_still_admit_staff(ops_client, role):
+    """The mutant this kills: denying everyone, which would 'pass' the test
+    above while breaking the operators the routes exist for."""
+    resp = ops_client.get(
+        "/api/operations/dashboard-summary", params={"token": _token(role)}
+    )
+    assert resp.status_code == 200, (
+        f"role={role!r} got {resp.status_code}; staff locked out of operations"
+    )
+
+
+def test_require_permission_raises_and_check_permission_does_not():
+    """The heart of the bug: one of these is a guard, the other is a predicate."""
+    from utils.auth import (
+        MANAGE_OPERATIONS,
+        check_permission,
+        require_permission,
+    )
+
+    # check_permission returns; used as a bare statement it enforces nothing.
+    assert check_permission({"role": "merchant"}, MANAGE_OPERATIONS) is False
+
+    with pytest.raises(HTTPException) as exc:
+        require_permission({"role": "merchant"}, MANAGE_OPERATIONS)
+    assert exc.value.status_code == 403
+
+
+def test_a_role_name_never_resolves_as_a_permission():
+    """The second half of the defect: "operator" was passed as a permission but
+    is a ROLE name, and permission_map is keyed by role with permission values.
+    It matched nothing, so only the admin/super_admin early-returns passed.
+
+    Checked behaviourally against every role, because the map is a local.
+    """
+    from utils.auth import MANAGE_OPERATIONS, check_permission
+
+    assert MANAGE_OPERATIONS == "manage_operations"
+
+    every_role = ALLOWED_ROLES + ["merchant", "agent", "outsourced", "viewer"]
+    for role_name in every_role:
+        for caller in every_role:
+            if caller in ("admin", "super_admin"):
+                continue  # these early-return True for any non-super_admin string
+            assert not check_permission({"role": caller}, role_name), (
+                f"role name {role_name!r} resolved as a permission for "
+                f"caller {caller!r} — roles and permissions are being conflated"
+            )
+
+    # And the real permission does resolve, for exactly the intended roles.
+    for caller in ALLOWED_ROLES:
+        assert check_permission({"role": caller}, MANAGE_OPERATIONS)
+    for caller in ["merchant", "agent", "outsourced", "viewer"]:
+        assert not check_permission({"role": caller}, MANAGE_OPERATIONS)
+
+
+def test_no_bare_check_permission_statements_remain():
+    """A bare `check_permission(...)` expression is authorization theatre."""
+    offenders = []
+    for path in (REPO_ROOT / "routes").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "check_permission"
+            ):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT)}:{node.lineno}"
+                )
+    assert not offenders, (
+        "check_permission called as a statement (its bool return is discarded "
+        "— use require_permission):\n  " + "\n  ".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. payment_orchestrator's event_publisher calls actually bind
+# ---------------------------------------------------------------------------
+
+def _publisher_calls():
+    """Every `event_publisher.<name>(...)` call in the orchestrator, as
+    (name, set_of_keyword_names, lineno). Read from source so the test checks
+    the real call sites rather than a re-typed copy of them."""
+    path = REPO_ROOT / "orchestrator" / "payment_orchestrator.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "event_publisher"
+        ):
+            calls.append(
+                (node.func.attr, {kw.arg for kw in node.keywords}, node.lineno)
+            )
+    return calls
+
+
+def test_orchestrator_publisher_calls_are_found():
+    """Guards the test below: an AST query that matches nothing passes vacuously."""
+    assert len(_publisher_calls()) == 2, _publisher_calls()
+
+
+@pytest.mark.parametrize("name,kwargs,lineno", _publisher_calls())
+def test_orchestrator_publisher_calls_bind_to_the_real_signature(name, kwargs, lineno):
+    """The defect: both calls raised TypeError on every invocation.
+
+    publish_payment_result was missing `status` and passed five unknown kwargs;
+    publish_order_event was missing agent/agent_name/merchant/merchant_name/
+    event_type and passed six unknown ones.
+    """
+    from utils.event_publisher import event_publisher
+
+    sig = inspect.signature(getattr(event_publisher, name))
+    try:
+        sig.bind(**{k: None for k in kwargs})
+    except TypeError as exc:
+        accepted = set(sig.parameters)
+        pytest.fail(
+            f"payment_orchestrator.py:{lineno} {name}(...) does not bind: {exc}\n"
+            f"  unexpected: {sorted(kwargs - accepted)}\n"
+            f"  missing:    {sorted(p for p in accepted if p not in kwargs)}"
+        )
+
+
+def test_payment_result_status_uses_the_vocabulary_metrics_store_counts():
+    """realtime/metrics_store.py compares status against the literal
+    "succeeded". A bool (what the old call passed as `success=`) never matched,
+    so a successful payment would have been recorded as a failure."""
+    src = (REPO_ROOT / "orchestrator" / "payment_orchestrator.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"succeeded" if payment_response.success else "failed"' in src
+
+
+# ---------------------------------------------------------------------------
+# 3. The JWT secret length is enforced where the secret actually lives
+# ---------------------------------------------------------------------------
+
+def _boot(extra_env):
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_", "JWT_"))
+    }
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-c", "import config.settings"],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=180,
+    )
+
+
+DEPLOYED_SHAPES = [
+    ({"RAILWAY_ENVIRONMENT": "production"}, "railway_prod"),
+    ({"PIVOTA_ENV": "production"}, "pivota_env_prod_unmanaged"),
+    ({"K_SERVICE": "pivota-backend", "PIVOTA_ENV": "staging"}, "cloud_run_staging"),
+    ({"K_SERVICE": "pivota-backend"}, "cloud_run_unresolved"),
+]
+
+
+@pytest.mark.parametrize(
+    "shape", [s for s, _ in DEPLOYED_SHAPES], ids=[i for _, i in DEPLOYED_SHAPES]
+)
+@pytest.mark.parametrize(
+    "secret,ids", [(None, "unset"), ("short", "too_short"),
+                   ("your-super-secret-key", "repo_default")],
+)
+def test_weak_jwt_secret_refuses_to_boot_on_a_real_server(shape, secret, ids):
+    """Both platform conjuncts: staging and an unmanaged PIVOTA_ENV=production
+    host are covered too, not just Railway prod."""
+    env = dict(shape)
+    if secret is not None:
+        env["JWT_SECRET_KEY"] = secret
+    result = _boot(env)
+    assert result.returncode != 0, (
+        f"booted with a weak JWT secret on {shape}: {result.stdout[-2000:]}"
+    )
+    assert "Refusing to start" in result.stderr, result.stderr[-2000:]
+
+
+@pytest.mark.parametrize(
+    "shape", [s for s, _ in DEPLOYED_SHAPES], ids=[i for _, i in DEPLOYED_SHAPES]
+)
+def test_a_strong_secret_boots_on_every_deployed_shape(shape):
+    """The mutant this kills: raising unconditionally, which would take prod
+    down rather than protect it."""
+    result = _boot({**shape, "JWT_SECRET_KEY": STRONG_SECRET})
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_a_weak_secret_is_still_allowed_on_an_unmanaged_dev_host():
+    """The suite and local dev run without secrets; the guard must not
+    turn that into a hard failure."""
+    result = _boot({})
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_config_production_is_gone():
+    """config/production.py declared `min_length=32` on the JWT secret and so
+    read like the enforcement point, but nothing instantiated ProductionSettings
+    and the module could not even be imported under Pydantic v2. It was a second
+    answer to a question config/settings.py already answers, with the wrong one
+    easier to find. Deleted; this test stops it coming back."""
+    with pytest.raises(ModuleNotFoundError):
+        __import__("config.production")
+
+    assert not (REPO_ROOT / "config" / "production.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# 4. dashboard.core's models support the shape their callers actually use
+# ---------------------------------------------------------------------------
+# Discovered while fixing (2): the event publishing above was unreachable.
+# process_order_payment died ~15 lines earlier on OrderStatus.PAID and then on
+# Order(...)/Payment(...), whose implemented signatures were (id, user_id,
+# amount, currency) and (id, order_id, amount, psp).
+
+def test_order_status_has_paid():
+    from dashboard.core import OrderStatus
+
+    assert OrderStatus.PAID.value == "paid"
+
+
+def test_order_supports_both_construction_shapes():
+    from dashboard.core import Order, OrderStatus
+
+    # Legacy positional shape, used by DashboardCore.create_order.
+    legacy = Order("o1", "u1", 12.5, "EUR")
+    assert (legacy.user_id, legacy.amount, legacy.currency) == ("u1", 12.5, "EUR")
+    # amount and total_amount are the same number under two names; both are read.
+    assert legacy.total_amount == 12.5
+
+    # Commerce shape, used by payment_orchestrator and demo_data_routes.
+    rich = Order(
+        id="o2", merchant_id="M1", agent_id="A1", customer_email="c@x.com",
+        total_amount=29.99, currency="USD", status=OrderStatus.PAID,
+        items=[{"name": "T-Shirt", "quantity": 1}], payment_method="card",
+        psp_used="stripe", metadata={"source": "demo"},
+    )
+    assert rich.total_amount == 29.99 and rich.amount == 29.99
+    assert rich.status is OrderStatus.PAID
+
+
+def test_payment_supports_both_construction_shapes():
+    from dashboard.core import Payment, PSPType
+
+    legacy = Payment("p1", "o1", 12.5, PSPType.STRIPE)
+    assert legacy.fees == 0.0 and legacy.transaction_id is None
+
+    rich = Payment(
+        id="p2", order_id="o2", amount=29.99, currency="USD",
+        psp=PSPType.STRIPE, status="succeeded", transaction_id="pi_1",
+        fees=1.17, metadata={"source": "demo"},
+    )
+    assert rich.status == "succeeded" and rich.fees == 1.17
+
+
+@pytest.mark.parametrize(
+    "model,attrs",
+    [
+        ("Order", ["id", "merchant_id", "agent_id", "customer_email",
+                   "total_amount", "amount", "currency", "status", "items",
+                   "payment_method", "psp_used", "user_id",
+                   "created_at", "updated_at", "metadata"]),
+        ("Payment", ["id", "order_id", "amount", "currency", "psp", "status",
+                     "transaction_id", "fees", "created_at", "updated_at",
+                     "metadata"]),
+    ],
+)
+def test_every_attribute_the_readers_access_exists(model, attrs):
+    """routes/dashboard_api.py and routes/payment_routes.py read these back off
+    instances. Each missing one was a latent AttributeError."""
+    import dashboard.core as core
+
+    inst = (core.Order(id="o") if model == "Order"
+            else core.Payment(id="p", order_id="o", amount=1.0,
+                              psp=core.PSPType.STRIPE))
+    missing = [a for a in attrs if not hasattr(inst, a)]
+    assert not missing, f"{model} is missing {missing}"
+
+
+def test_demo_data_fixtures_construct():
+    """routes/demo_data_routes.py builds three Orders and three Payments in the
+    commerce shape; every one raised TypeError before the models were widened."""
+    from datetime import datetime
+    from dashboard.core import Order, OrderStatus, Payment, PSPType
+
+    order = Order(
+        id="order_demo_001", merchant_id="MERCH_001", agent_id="AGENT_001",
+        customer_email="customer1@example.com", total_amount=29.99,
+        currency="USD", status=OrderStatus.PAID,
+        items=[{"name": "T-Shirt", "quantity": 1, "price": 29.99}],
+        payment_method="card", psp_used="stripe",
+        created_at=datetime.now(), updated_at=datetime.now(),
+        metadata={"source": "demo"},
+    )
+    payment = Payment(
+        id="payment_demo_001", order_id="order_demo_001", amount=29.99,
+        currency="USD", psp=PSPType.STRIPE, status="succeeded",
+        transaction_id="pi_stripe_demo_001", fees=1.17,
+        created_at=datetime.now(), metadata={"source": "demo"},
+    )
+    assert order.status.value == "paid" and payment.transaction_id

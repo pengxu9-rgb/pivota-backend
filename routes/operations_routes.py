@@ -7,7 +7,11 @@ from pydantic import BaseModel
 from enum import Enum
 from datetime import datetime, timedelta
 
-from utils.auth import verify_jwt_token, check_permission
+from utils.auth import (
+    verify_jwt_token,
+    require_permission,
+    MANAGE_OPERATIONS,
+)
 from realtime.metrics_store import get_metrics_store
 
 logger = logging.getLogger("operations_routes")
@@ -90,7 +94,7 @@ async def onboard_agent(
     credentials: dict = Depends(verify_jwt_token)
 ):
     """Onboard a new agent - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     agent_id = f"AGENT_{int(time.time())}"
     agent_data = {
@@ -147,7 +151,7 @@ async def onboard_merchant(
     credentials: dict = Depends(verify_jwt_token)
 ):
     """Onboard a new merchant - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     merchant_id = f"MERCH_{int(time.time())}"
     merchant_data = {
@@ -207,7 +211,7 @@ async def get_onboarding_queue(
     limit: int = Query(20, description="Number of items to return")
 ):
     """Get the onboarding queue - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     queue_items = []
     for item in operations_store["onboarding_queue"][:limit]:
@@ -243,7 +247,7 @@ async def update_onboarding_status(
     credentials: dict = Depends(verify_jwt_token)
 ):
     """Update onboarding status - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     # Find entity in agents or merchants
     entity_data = None
@@ -299,7 +303,7 @@ async def start_verification(
     credentials: dict = Depends(verify_jwt_token)
 ):
     """Start verification process - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     verification_id = f"VERIFY_{int(time.time())}"
     
@@ -348,7 +352,7 @@ async def get_verification_tasks(
     status: Optional[VerificationStatus] = Query(None)
 ):
     """Get verification tasks - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     tasks = list(operations_store["verification_tasks"].values())
     
@@ -372,7 +376,7 @@ async def get_operations_analytics(
     days: int = Query(30, description="Number of days to analyze")
 ):
     """Get operations analytics - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     cutoff_time = time.time() - (days * 86400)
     
@@ -437,7 +441,7 @@ async def send_welcome_email(
     credentials: dict = Depends(verify_jwt_token)
 ):
     """Send welcome email to new client - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     # Get entity data
     if entity_type == EntityType.AGENT:
@@ -485,7 +489,7 @@ async def get_operations_log(
     operation_type: Optional[str] = Query(None, description="Filter by operation type")
 ):
     """Get operations audit log - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     logs = operations_store["operations_log"]
     
@@ -507,7 +511,7 @@ async def get_dashboard_summary(
     credentials: dict = Depends(verify_jwt_token)
 ):
     """Get operations dashboard summary - requires operator or admin role"""
-    check_permission(credentials, "operator")
+    require_permission(credentials, MANAGE_OPERATIONS)
     
     # Get metrics from the main system
     metrics_store = get_metrics_store()
@@ -515,14 +519,12 @@ async def get_dashboard_summary(
     # default of "admin" (what this used to take) or "operator" is platform-wide,
     # so a token carrying no role claim would receive everyone's figures.
     #
-    # This does NOT claim the caller is authorized: the `check_permission` call
-    # above RETURNS a bool and never raises, so it is a discarded expression —
-    # and it asks for the permission string "operator", which appears in no
-    # role's list in utils/auth.py:331, so it would deny every caller including
-    # admin if its result were ever read. Both halves are wrong, the same shape
-    # repeats at :93, :150, :210, :246, and fixing them changes five untouched
-    # routes' access. What this line can do is stop handing platform figures to
-    # whoever gets through.
+    # The caller IS authorized by this point: the guard above is now
+    # `require_permission`, which raises 403, rather than the old
+    # `check_permission` whose bool return was discarded at all ten call sites
+    # in this file. Passing `role` through stays correct regardless — the
+    # permission answers "may you call this route", the role still scopes which
+    # figures come back.
     system_metrics = (
         metrics_store.get_snapshot(role=str(credentials.get("role") or ""))
         if metrics_store

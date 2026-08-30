@@ -1,10 +1,24 @@
 """
 Configuration settings for Pivota Infrastructure
 """
+import logging
 import os
 from typing import Optional
 from urllib.parse import urlparse
 from pydantic_settings import BaseSettings
+
+from config.platform import is_deployed, is_production
+
+logger = logging.getLogger(__name__)
+
+# The value jwt_secret_key falls back to when JWT_SECRET_KEY is unset. Named so
+# the boot guard below can reject it by identity rather than by re-typing it.
+DEFAULT_JWT_SECRET_KEY = "your-super-secret-key"
+
+# RFC 7518 §3.2: an HMAC key for HS256 must be at least as long as the hash
+# output (32 bytes). PyJWT emits InsecureKeyLengthWarning below this; we refuse
+# outright on a real server.
+JWT_SECRET_MIN_LENGTH = 32
 
 DEFAULT_PUBLIC_API_BASE_URL = "https://api.pivota.cc"
 LEGACY_PUBLIC_API_HOSTS = {
@@ -620,7 +634,12 @@ class Settings(BaseSettings):
     platform_signing_key: Optional[str] = os.getenv("PLATFORM_SIGNING_KEY")  # For receipt signing
     
     # JWT
-    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "your-super-secret-key")
+    # The default is a REPO LITERAL: anyone who can read this file can forge a
+    # token for any role if JWT_SECRET_KEY is unset. That is why
+    # _enforce_jwt_secret_strength() at the bottom of this module refuses to let
+    # the process boot on a real server while this default (or any secret under
+    # JWT_SECRET_MIN_LENGTH bytes) is in effect.
+    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", DEFAULT_JWT_SECRET_KEY)
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 60 * 24  # 24 hours
     
@@ -801,3 +820,52 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+
+
+def _enforce_jwt_secret_strength(current: "Settings") -> None:
+    """Refuse to boot on a real server with a forgeable JWT secret.
+
+    A deleted config/production.py used to declare `Field(...,
+    env="JWT_SECRET_KEY", min_length=32)`, which read like this was already
+    enforced. It never was: nothing instantiated that ProductionSettings, and
+    the module could not even be imported under Pydantic v2. The secret that
+    actually signs tokens is the one bound here and read by utils/auth.py, and
+    it had no length check at all until this guard.
+
+    BOTH platform conjuncts, deliberately: is_deployed() and is_production() are
+    independent. is_production() alone would exempt every staging revision;
+    is_deployed() alone would exempt a PIVOTA_ENV=production host that injects
+    no platform markers. A weak signing key is unacceptable on either.
+    """
+    secret = current.jwt_secret_key or ""
+    if secret == DEFAULT_JWT_SECRET_KEY:
+        problem = (
+            "JWT_SECRET_KEY is unset, so the signing key is the default literal "
+            "committed in config/settings.py — every token is forgeable from a "
+            "checkout of this repo"
+        )
+    elif len(secret.encode("utf-8")) < JWT_SECRET_MIN_LENGTH:
+        problem = (
+            f"JWT_SECRET_KEY is {len(secret.encode('utf-8'))} bytes; HS256 "
+            f"requires at least {JWT_SECRET_MIN_LENGTH} (RFC 7518 §3.2)"
+        )
+    else:
+        return
+
+    if is_deployed() or is_production():
+        raise RuntimeError(
+            f"Refusing to start: {problem}. "
+            f"Set JWT_SECRET_KEY to at least {JWT_SECRET_MIN_LENGTH} bytes of "
+            "random data on this revision "
+            "(e.g. `python -c 'import secrets;print(secrets.token_urlsafe(48))'`)."
+        )
+
+    # Local/dev/test: allowed, so the suite runs without secrets — but say so,
+    # because the same weak key silently signs real-looking tokens here too.
+    logger.warning(
+        "JWT secret is weak (%s). Permitted only because this host is not "
+        "deployed and not production.", problem,
+    )
+
+
+_enforce_jwt_secret_strength(settings)
