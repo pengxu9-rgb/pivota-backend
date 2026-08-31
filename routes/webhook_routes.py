@@ -28,6 +28,7 @@ from config.settings import settings
 from utils.logger import logger
 from services.dispute_records_service import stripe_dispute_pack_status
 from services.shopify_webhook_ingest import verify_shopify_hmac, ingest_shopify_webhook
+from services.shopify_commerce_event_ingest import ingest_shopify_commerce_event_best_effort
 from services.commerce_attribution_service import (
     close_external_order_conversion,
     extract_click_id_from_note_attributes,
@@ -48,6 +49,7 @@ from services.psp_payment_finalizer import (
     finalize_refund_failure,
     finalize_refund_success,
 )
+from services.psp_commerce_event_ingest import ingest_stripe_commerce_event_best_effort
 from services.refund_observability import (
     extract_stripe_refund_snapshot,
     merge_refund_metadata,
@@ -1029,6 +1031,34 @@ async def _emit_stripe_merchant_webhook_best_effort(
         )
 
 
+async def _record_stripe_canonical_event_best_effort(
+    *,
+    event_type: str,
+    stripe_event_id: str,
+    event_created: Any,
+    data: Dict[str, Any],
+    order: Dict[str, Any],
+) -> None:
+    """Keep optional canonical analytics outside Stripe acknowledgement semantics."""
+    try:
+        await ingest_stripe_commerce_event_best_effort(
+            event_type=event_type,
+            stripe_event_id=stripe_event_id,
+            event_created=event_created,
+            data=data,
+            order=order,
+            signature_verified=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Stripe canonical event bridge escaped best-effort boundary "
+            "event_id=%s event_type=%s: %s",
+            stripe_event_id,
+            event_type,
+            exc,
+        )
+
+
 def _stripe_event_payment_matches_order(
     order: Dict[str, Any], data: Dict[str, Any]
 ) -> Tuple[bool, Optional[str]]:
@@ -1563,6 +1593,13 @@ async def handle_stripe_webhook(
                 payment_intent_id=payment_intent_id,
                 data=data,
             )
+            await _record_stripe_canonical_event_best_effort(
+                event_type=event_type,
+                stripe_event_id=stripe_webhook_event_id,
+                event_created=event.get("created"),
+                data=data,
+                order=result,
+            )
             # Gate one-time side effects on `transitioned`: only the finalizer call
             # that actually flipped this order to paid (atomic in mark_order_paid)
             # fulfills + notifies the merchant, so a concurrent finalize (sync
@@ -1702,6 +1739,13 @@ async def handle_stripe_webhook(
                     order=result,
                     source_event="stripe_amount_capturable_webhook",
                 )
+                await _record_stripe_canonical_event_best_effort(
+                    event_type=event_type,
+                    stripe_event_id=stripe_webhook_event_id,
+                    event_created=event.get("created"),
+                    data=data,
+                    order=result,
+                )
                 logger.info(
                     "Stripe auth-first finalization for order %s returned %s",
                     result["order_id"],
@@ -1804,6 +1848,13 @@ async def handle_stripe_webhook(
                 )
                 if finalization.get("applied"):
                     logger.warning(f"Order {order_id} payment failed: {error_message}")
+                    await _record_stripe_canonical_event_best_effort(
+                        event_type=event_type,
+                        stripe_event_id=stripe_webhook_event_id,
+                        event_created=event.get("created"),
+                        data=data,
+                        order=result,
+                    )
                     await _emit_stripe_merchant_webhook_best_effort(
                         result,
                         event_type="payment.failed",
@@ -1892,6 +1943,13 @@ async def handle_stripe_webhook(
                         "source_event": "charge.refunded",
                     },
                 )
+                await _record_stripe_canonical_event_best_effort(
+                    event_type=event_type,
+                    stripe_event_id=stripe_webhook_event_id,
+                    event_created=event.get("created"),
+                    data=data,
+                    order=result,
+                )
                 logger.info(f"Order {order_id} refunded: {refund_amount}")
         elif event_type == "refund.created":
             refund_id = data.get("id")
@@ -1939,6 +1997,13 @@ async def handle_stripe_webhook(
                         "reference_type": refund_snapshot.get("reference_type"),
                         "reference": refund_snapshot.get("reference"),
                     },
+                )
+                await _record_stripe_canonical_event_best_effort(
+                    event_type=event_type,
+                    stripe_event_id=stripe_webhook_event_id,
+                    event_created=event.get("created"),
+                    data=data,
+                    order=result,
                 )
 
         elif event_type == "refund.updated":
@@ -2048,6 +2113,13 @@ async def handle_stripe_webhook(
                                 "received_at": datetime.now().isoformat(),
                             }
                         },
+                    )
+                    await _record_stripe_canonical_event_best_effort(
+                        event_type=event_type,
+                        stripe_event_id=stripe_webhook_event_id,
+                        event_created=event.get("created"),
+                        data=data,
+                        order=result,
                     )
                 elif refund_status == "failed":
                     failure_reason = data.get("failure_reason") or refund_status or "unknown"
@@ -2908,6 +2980,7 @@ async def _process_shopify_webhook_event(
     is_prod_runtime = _shopify_prod_runtime()
     try:
         # Persist event (append-only) with idempotency guard
+        is_dup = False
         try:
             is_dup, _row = await ingest_shopify_webhook(
                 merchant_id=merchant_id,
@@ -2918,15 +2991,35 @@ async def _process_shopify_webhook_event(
                 occurred_at=occurred_at,
                 signature_verified=signature_verified,
             )
-            if is_dup:
-                record_shopify_webhook(result="success", reason="duplicate", topic=topic)
-                return {"status": "success", "topic": topic, "duplicate": True}
         except Exception as e:
             # In production, fail so Shopify will retry and we don't lose the audit trail.
             logger.warning(f"PCS webhook event persistence failed merchant={merchant_id} topic={topic}: {e}")
             if is_prod_runtime:
                 record_shopify_webhook(result="error", reason="persist_failed", topic=topic)
                 raise HTTPException(status_code=500, detail="Webhook event persistence unavailable")
+
+        # Canonical telemetry is a non-blocking dual-write. It is attempted for
+        # legacy PCS duplicates too, allowing safe replay/backfill after rollout.
+        try:
+            await ingest_shopify_commerce_event_best_effort(
+                merchant_id=merchant_id,
+                shop_domain=got_canon or shop_domain,
+                topic=topic,
+                payload=data,
+                webhook_id=x_shopify_webhook_id,
+                occurred_at=occurred_at,
+                signature_verified=signature_verified,
+            )
+        except Exception as exc:
+            # Preserve Shopify acknowledgement/retry semantics even if the
+            # optional bridge itself regresses before its own safety boundary.
+            logger.warning(
+                "Shopify canonical event bridge escaped best-effort boundary "
+                f"merchant={merchant_id} topic={topic}: {exc}"
+            )
+        if is_dup:
+            record_shopify_webhook(result="success", reason="duplicate", topic=topic)
+            return {"status": "success", "topic": topic, "duplicate": True}
 
         record_shopify_webhook(result="success", reason="ok", topic=topic)
         logger.info(f"Received Shopify webhook for {merchant_id}: {topic}")

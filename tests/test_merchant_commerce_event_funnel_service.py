@@ -307,6 +307,69 @@ async def test_same_native_order_id_is_distinct_across_stores(
 
 
 @pytest.mark.asyncio
+async def test_refund_amount_uses_largest_authority_total_per_order(monkeypatch):
+    import services.merchant_commerce_event_funnel_service as module
+
+    rows = [
+        _event(
+            "evt_psp_a",
+            "int_order",
+            "refund.succeeded",
+            platform="shopify",
+            store_id="store_1",
+            payload={
+                "order_id": "ORDER_1",
+                "refund_id": "re_psp_a",
+                "amount_cents": 300,
+                "currency": "USD",
+            },
+        ),
+        _event(
+            "evt_psp_b",
+            "int_order",
+            "refund.succeeded",
+            platform="shopify",
+            store_id="store_1",
+            payload={
+                "order_id": "ORDER_1",
+                "refund_id": "re_psp_b",
+                "amount_cents": 200,
+                "currency": "USD",
+            },
+        ),
+        _event(
+            "evt_store",
+            "int_order",
+            "refund.succeeded",
+            platform="shopify",
+            store_id="store_1",
+            payload={
+                "order_id": "ORDER_1",
+                "refund_id": "shopify_refund_unrelated_id",
+                "amount_cents": 500,
+                "currency": "USD",
+            },
+        ),
+    ]
+    rows[0]["surface"] = "psp"
+    rows[0]["source"] = "stripe_webhook"
+    rows[1]["surface"] = "psp"
+    rows[1]["source"] = "stripe_webhook"
+    rows[2]["source"] = "shopify_webhook"
+
+    async def fake_fetch(**_kwargs):
+        return rows, False
+
+    monkeypatch.setattr(module, "_fetch_event_rows", fake_fetch)
+    result = await module.get_merchant_commerce_event_funnel(
+        merchant_id="merch_1",
+        group_by="store",
+    )
+
+    assert result.payload["summary"]["refunded_amount_cents_by_currency"] == {"USD": 500}
+
+
+@pytest.mark.asyncio
 async def test_commerce_surface_does_not_pre_filter_physical_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

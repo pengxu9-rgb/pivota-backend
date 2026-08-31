@@ -99,6 +99,22 @@ def _event_scope(row: Dict[str, Any]) -> tuple[str, str]:
     )
 
 
+def _refund_authority(row: Dict[str, Any]) -> str:
+    """Separate PSP and store observations of the same underlying refund."""
+    surface = _text(row.get("surface")).lower()
+    source = _text(row.get("source")).lower()
+    if surface == "psp" or source in {
+        "stripe_webhook",
+        "adyen_webhook",
+        "checkout_webhook",
+        "paypal_webhook",
+    }:
+        return "psp"
+    if source.endswith("_webhook") or source.endswith("_adapter"):
+        return "store"
+    return source or surface or "unknown"
+
+
 def _attach_resolved_order_ids(rows: List[Dict[str, Any]]) -> None:
     interaction_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
     payment_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
@@ -169,7 +185,7 @@ class _Accumulator:
     paid_amounts: Dict[str, Dict[tuple[str, str, str], int]] = field(
         default_factory=lambda: defaultdict(dict)
     )
-    refund_amounts: Dict[str, Dict[tuple[str, str, str], int]] = field(
+    refund_amounts: Dict[str, Dict[tuple[str, str, str, str, str], int]] = field(
         default_factory=lambda: defaultdict(dict)
     )
     order_keys: Set[tuple[str, str, str]] = field(default_factory=set)
@@ -251,13 +267,34 @@ class _Accumulator:
             current = self.paid_amounts[currency].get(order_key, 0)
             self.paid_amounts[currency][order_key] = max(current, amount_cents)
         if event_type == "refund.succeeded":
+            order_reference = resolved_order_id or f"interaction:{interaction_id}"
             refund_key = (
                 platform,
                 store_id,
+                order_reference,
+                _refund_authority(row),
                 _text(row.get("refund_id")) or event_id or interaction_id,
             )
             current = self.refund_amounts[currency].get(refund_key, 0)
             self.refund_amounts[currency][refund_key] = max(current, amount_cents)
+
+    def _refunded_amounts_by_currency(self) -> Dict[str, int]:
+        totals: Dict[str, int] = {}
+        for currency, amounts in self.refund_amounts.items():
+            by_order_authority: Dict[tuple[str, str, str], Dict[str, int]] = defaultdict(
+                lambda: defaultdict(int)
+            )
+            for (platform, store_id, order_reference, authority, _refund_id), amount in amounts.items():
+                by_order_authority[(platform, store_id, order_reference)][authority] += amount
+            # A PSP and a store platform can both report the same refund with
+            # unrelated native IDs. Sum partial refunds inside each authority,
+            # then take the largest authority total per order to avoid counting
+            # the same money twice.
+            totals[currency] = sum(
+                max(authority_totals.values(), default=0)
+                for authority_totals in by_order_authority.values()
+            )
+        return dict(sorted(totals.items()))
 
     def public_summary(self) -> Dict[str, Any]:
         return {
@@ -274,10 +311,7 @@ class _Accumulator:
                 currency: sum(amounts.values())
                 for currency, amounts in sorted(self.paid_amounts.items())
             },
-            "refunded_amount_cents_by_currency": {
-                currency: sum(amounts.values())
-                for currency, amounts in sorted(self.refund_amounts.items())
-            },
+            "refunded_amount_cents_by_currency": self._refunded_amounts_by_currency(),
         }
 
 
