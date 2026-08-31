@@ -3,7 +3,9 @@
 `POST /merchant-events/v1/batch` is the platform-neutral write contract for store
 adapters and Universal Server Collectors. It appends normalized events to the
 existing `commerce_interactions` / `commerce_interaction_events` ledger; it is not
-a second analytics pipeline.
+a second analytics pipeline. Browser storefronts use the origin-bound public
+write path documented in `docs/UNIVERSAL_WEB_COLLECTOR.md`; the browser never
+receives the merchant HMAC key.
 
 ## Authentication and retries
 
@@ -28,6 +30,53 @@ accepted and duplicate counts per event.
 
 Platform-native webhook names must be mapped to these values in the adapter, not
 sent as new event names.
+
+## Shopify native webhook bridge
+
+Verified Shopify `orders/create`, `orders/paid`, `orders/cancelled`, and
+`refunds/create` deliveries are dual-written into this contract by
+`services/shopify_commerce_event_adapter.py`. The existing append-only Shopify
+webhook record and operational order/refund handlers remain authoritative and
+unchanged. Canonical ingestion is best effort so analytics availability cannot
+change Shopify acknowledgement or retry behavior; a duplicate legacy delivery
+still retries the idempotent canonical write for safe rollout backfill.
+
+`refunds/create` emits `refund.created`, but emits `refund.succeeded` only for an
+embedded Shopify transaction whose kind is `refund` and status is `success`.
+The adapter never treats refund-object creation alone as proof that funds moved.
+
+## PSP terminal-event bridge
+
+After the existing Stripe handler has verified the webhook signature, resolved
+the tenant-scoped Pivota order, checked amount/currency integrity, and completed
+its operational finalizer, `services/stripe_commerce_event_adapter.py` maps:
+
+- `payment_intent.amount_capturable_updated` to `payment.authorized`
+- `payment_intent.succeeded` to `payment.succeeded`
+- an applicable `payment_intent.payment_failed` to `payment.failed`
+- `refund.created` to `refund.created`
+- a succeeded `refund.updated` to `refund.succeeded`
+
+The bridge scopes each event to the connected store selected by the Pivota order,
+so `payment_id + order_id` and `payment_id + order_id + refund_id` close the same
+store-level interaction graph as native order webhooks. `amount_cents` carries the
+PSP minor-unit integer; `native_amount_semantics=psp_minor_units` makes that
+explicit for zero-decimal currencies.
+
+Stripe `charge.refunded.amount_refunded` is cumulative and is therefore never
+written as an additional refund amount. The adapter emits only embedded successful
+refund objects with their individual refund IDs. Their entity-stable canonical
+IDs deduplicate against a later `refund.updated` delivery. Canonical PSP ingestion
+is best effort and cannot change payment/refund acknowledgement behavior.
+
+For aggregate refund GMV, the funnel sums partial refunds inside each reporting
+authority (PSP or store platform), then uses the largest authority total per
+store-scoped order. This prevents a Stripe refund and its Shopify/Cafe24/etc.
+mirror—with unrelated native refund IDs—from counting the same money twice while
+still preserving multiple legitimate partial refunds.
+
+Stripe is the first native PSP bridge. Other PSP handlers remain operational
+sources of truth but do not yet publish terminal facts into this canonical ledger.
 
 ## Stitching contract
 

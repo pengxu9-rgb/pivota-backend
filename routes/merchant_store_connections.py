@@ -11,8 +11,8 @@ from services.wix_connection import WixConnectionValidationError, validate_wix_c
 from services.store_lifecycle_service import sync_catalog_merchant_status
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
-from typing import Dict, Any, Optional
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 import asyncio
@@ -31,6 +31,15 @@ from db.database import IS_POSTGRES, database
 from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
 from utils.auth import get_current_user, hash_password, verify_password as verify_bcrypt_password
 from config.settings import settings
+from config.settings import resolve_public_api_base_url
+from services.merchant_web_collector_service import (
+    MAX_ALLOWED_ORIGINS,
+    MAX_TOKEN_TTL_DAYS,
+    WebCollectorError,
+    issue_web_collector_token,
+    normalize_allowed_origins,
+    normalize_collector_origin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1557,6 +1566,14 @@ class ConnectPrestaShopRequest(BaseModel):
     api_key: str
 
 
+class ConnectCustomStoreRequest(BaseModel):
+    merchant_id: str = Field(min_length=1, max_length=128)
+    store_url: str = Field(min_length=1, max_length=2048)
+    store_name: Optional[str] = Field(default=None, max_length=255)
+    allowed_origins: List[str] = Field(default_factory=list, max_length=MAX_ALLOWED_ORIGINS)
+    collector_token_ttl_days: int = Field(default=90, ge=1, le=MAX_TOKEN_TTL_DAYS)
+
+
 class UpdateStoreSupportEmailRequest(BaseModel):
     merchant_id: Optional[str] = None
     support_email: Optional[str] = None
@@ -1568,6 +1585,157 @@ class GetStoreSupportEmailResponse(BaseModel):
     store_id: str
     support_email: Optional[str] = None
     effective_support_email: Optional[str] = None
+
+
+@router.post("/custom/connect")
+async def merchant_connect_custom_store(
+    request: ConnectCustomStoreRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a credential-free store scope for custom/headless telemetry."""
+    if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if (
+        current_user.get("role") == "merchant"
+        and str(current_user.get("merchant_id") or "") != str(request.merchant_id)
+    ):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    try:
+        storefront_origin = normalize_collector_origin(request.store_url)
+        origins = normalize_allowed_origins(
+            request.allowed_origins or [storefront_origin]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if storefront_origin not in origins:
+        try:
+            origins = normalize_allowed_origins([storefront_origin, *origins])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    merchant_id = str(request.merchant_id).strip()
+    store_id = "store_custom_" + hashlib.sha256(
+        f"{merchant_id}\n{storefront_origin}".encode("utf-8")
+    ).hexdigest()[:24]
+    store_name = str(request.store_name or "").strip()[:255] or (
+        urlparse(storefront_origin).hostname or "Custom storefront"
+    )
+
+    # Provision before mutating the store so a missing signing secret fails
+    # closed without leaving a half-connected record.
+    try:
+        collector = issue_web_collector_token(
+            merchant_id=merchant_id,
+            store_id=store_id,
+            platform="custom",
+            allowed_origins=origins,
+            ttl_days=request.collector_token_ttl_days,
+        )
+    except WebCollectorError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    existing = await database.fetch_one(
+        """
+        SELECT store_id
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND platform = 'custom'
+          AND domain = :domain
+        """,
+        {"merchant_id": merchant_id, "domain": storefront_origin},
+    )
+    if existing:
+        store_id = str(existing["store_id"])
+        # Reissue with the persisted ID in case this row predates deterministic IDs.
+        try:
+            collector = issue_web_collector_token(
+                merchant_id=merchant_id,
+                store_id=store_id,
+                platform="custom",
+                allowed_origins=origins,
+                ttl_days=request.collector_token_ttl_days,
+            )
+        except WebCollectorError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET name = :name,
+                status = 'active',
+                connected_at = CURRENT_TIMESTAMP
+            WHERE store_id = :store_id
+              AND merchant_id = :merchant_id
+            """,
+            {
+                "store_id": store_id,
+                "merchant_id": merchant_id,
+                "name": store_name,
+            },
+        )
+        reused_existing = True
+    else:
+        await database.execute(
+            """
+            INSERT INTO merchant_stores
+                (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+            VALUES
+                (:store_id, :merchant_id, 'custom', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
+            """,
+            {
+                "store_id": store_id,
+                "merchant_id": merchant_id,
+                "domain": storefront_origin,
+                "name": store_name,
+                "api_key": json.dumps(
+                    {"collector_only": True, "credential_version": 1},
+                    separators=(",", ":"),
+                ),
+            },
+        )
+        try:
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET is_primary = TRUE
+                WHERE store_id = :store_id
+                  AND merchant_id = :merchant_id
+                  AND NOT EXISTS (
+                    SELECT 1 FROM merchant_stores
+                    WHERE merchant_id = :merchant_id
+                      AND store_id != :store_id
+                      AND is_primary = TRUE
+                      AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                  )
+                """,
+                {"store_id": store_id, "merchant_id": merchant_id},
+            )
+        except Exception:
+            # Older local schemas can lack is_primary; connection remains valid.
+            pass
+        reused_existing = False
+
+    base_url = resolve_public_api_base_url().rstrip("/")
+    script_src = f"{base_url}/merchant-events/v1/collector.js"
+    install_snippet = (
+        f'<script async src="{script_src}" '
+        f'data-pivota-token="{collector["token"]}" '
+        'data-pivota-consent="pending"></script>'
+    )
+    return {
+        "status": "success",
+        "platform": "custom",
+        "merchant_id": merchant_id,
+        "store_id": store_id,
+        "storefront_origin": storefront_origin,
+        "allowed_origins": origins,
+        "reused_existing": reused_existing,
+        "collector_token": collector["token"],
+        "collector_token_expires_at": collector["expires_at"],
+        "collector_script_src": script_src,
+        "install_snippet": install_snippet,
+        "server_collector_path": "/merchant-events/v1/batch",
+    }
 
 
 @router.post("/shopify/connect")
