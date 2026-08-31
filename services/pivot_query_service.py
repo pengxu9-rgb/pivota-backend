@@ -843,17 +843,23 @@ async def _fetch_canonical_search_rows(
     if merchant_id:
         merchant_clause = "AND p.merchant_id = :merchant_id"
         params["merchant_id"] = merchant_id
-    # Phase O-5: hard-filter the global recall pool to live lifecycle
-    # stages so draft/candidate rows (no description, no taxonomy,
-    # not user-ready) don't surface in recall just because the title
-    # matched. The IS NULL clause is a grandfather for the rollout
-    # window between O-4 deploy and the O-6b backfill running — once
-    # backfill confirms 0 NULL rows in prod, the IS NULL branch can
-    # be removed in a follow-up PR. Merchant-scoped queries skip the
-    # filter: a merchant should always see their own products even
-    # while LabelAgent is still ramping their content quality.
+    # Phase O-5: hard-filter the broad, content-led global recall pool to
+    # live lifecycle stages so draft/candidate rows don't surface merely
+    # because their title matched. This is *not* a commerce-sellability
+    # property, though: a canonical SIG row with a live, unsuppressed offer
+    # is already governed by the product/SKU/offer and seller gates below.
+    #
+    # Merchant synchronisation writes those rows as ``candidate`` until a
+    # separate content-enrichment pass adds taxonomy. Applying this content
+    # workflow gate to ``canonical_entities_only`` therefore made immediately
+    # buyable SIG products disappear after every sync (for example, Knight
+    # Unicorn), despite a priced in-stock offer. Canonical product-card recall
+    # intentionally bypasses this clause; it still requires a sig identity,
+    # sync_status=live, non-suppressed product/SKU/offer and an active,
+    # indexable offer seller. Merchant-scoped queries also skip it so a
+    # merchant can see its own inventory while LabelAgent ramps.
     lifecycle_clause = ""
-    if not merchant_id:
+    if not merchant_id and not require_signature:
         lifecycle_clause = (
             "AND (p.pdp_lifecycle_stage IN ('validated', 'published') "
             "OR p.pdp_lifecycle_stage IS NULL)"
@@ -900,7 +906,11 @@ async def _fetch_canonical_search_rows(
 
     signature_clause = ""
     if require_signature:
-        signature_clause = "AND LEFT(p.pivota_signature_id, 4) = 'sig_'"
+        # SUBSTR is supported by both production PostgreSQL and the SQLite
+        # integration harness. Keep the exact four-character test rather than
+        # LIKE 'sig_%': underscore is a wildcard in LIKE and would admit
+        # malformed non-SIG ids.
+        signature_clause = "AND SUBSTR(p.pivota_signature_id, 1, 4) = 'sig_'"
 
     # #1648: honor catalog_merchants.indexable in cross-merchant recall. It was
     # the ONE fence set correctly on the retired test rig (migration 139 set
