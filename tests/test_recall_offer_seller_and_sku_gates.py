@@ -92,6 +92,8 @@ async def _product_with_offer(
     owner: str,
     seller: str,
     title: str = "Hydrating Serum",
+    brand: str = "TestBrand",
+    category_path: Optional[str] = None,
     lifecycle_stage: str = "published",
     pivota_signature_id: Optional[str] = None,
     sku_suppressed_at: Optional[str] = None,
@@ -108,10 +110,11 @@ async def _product_with_offer(
         """
         INSERT INTO catalog_products
             (product_key, merchant_id, platform, source_product_id, catalog_track,
-             truth_tier, readiness_tier, title, brand, pivota_signature_id, pdp_lifecycle_stage,
+             truth_tier, readiness_tier, title, brand, category_path,
+             pivota_signature_id, pdp_lifecycle_stage,
              sync_status, created_at, updated_at)
         VALUES (:k, :m, 'shopify', :spi, 'internal_merchant', 'primary',
-                'commerce_ready', :t, 'TestBrand', :sig, :stage, 'live',
+                'commerce_ready', :t, :brand, :category_path, :sig, :stage, 'live',
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         {
@@ -119,6 +122,8 @@ async def _product_with_offer(
             "m": owner,
             "spi": f"src-{key}",
             "t": title,
+            "brand": brand,
+            "category_path": category_path,
             "sig": pivota_signature_id,
             "stage": lifecycle_stage,
         },
@@ -259,6 +264,56 @@ async def test_canonical_sig_candidate_with_a_live_offer_serves():
         query="knight unicorn",
         require_signature=True,
     ) == [f"{_PREFIX}_p1"]
+
+
+@pytest.mark.asyncio
+async def test_brand_category_anchor_outranks_generic_category_rows():
+    """A category OR-clause must not truncate the explicit brand result.
+
+    The query phrase is deliberately non-contiguous in the product title; this
+    reproduces the production ``knight unicorn blush`` failure while the broad
+    token-recall feature flag is off.
+    """
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_seller")
+    for suffix, title, brand in (
+        ("generic1", "Soft Pinch Liquid Blush", "Generic One"),
+        ("generic2", "Cloud Paint Blush", "Generic Two"),
+        ("knight", "Knight Unicorn Satin Blush", "Knight Unicorn"),
+    ):
+        await _product_with_offer(
+            f"{_PREFIX}_{suffix}",
+            owner=f"{_PREFIX}_owner",
+            seller=f"{_PREFIX}_seller",
+            title=title,
+            brand=brand,
+            category_path="beauty/makeup/face/blush",
+        )
+
+    rows = await svc._fetch_canonical_search_rows(
+        query="knight unicorn blush",
+        merchant_id=None,
+        limit=20,
+    )
+    recalled = [
+        str(row.get("product_key"))
+        for row in rows
+        if str(row.get("product_key") or "").startswith(_PREFIX)
+    ]
+
+    assert svc._category_brand_anchor_terms("knight unicorn blush") == [
+        "knight",
+        "unicorn",
+    ]
+    assert svc._category_brand_anchor_terms("please find knight unicorn blush") == [
+        "knight",
+        "unicorn",
+    ]
+    assert recalled[0] == f"{_PREFIX}_knight"
+
+
+def test_category_brand_anchor_is_not_created_from_a_single_descriptor():
+    assert svc._category_brand_anchor_terms("brightening blush") == []
 
 
 @pytest.mark.asyncio

@@ -55,7 +55,10 @@ from services.external_seed_search import (
     build_seed_quarantine_anti_join as _seed_quarantine_clause,
     fetch_external_seed_rows,
 )
-from services.pivot_query_service import search_pivot_catalog
+from services.pivot_query_service import (
+    _category_brand_anchor_terms,
+    search_pivot_catalog,
+)
 from services.query_semantic_class import classify_query_semantic_class
 from services.similarity_service import (
     SimilarityService,
@@ -6395,6 +6398,7 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
                 ) or item.merchant.merchant_name,
                 "title": item.product.title,
                 "description": item.product.description or "",
+                "brand": item.product.brand,
                 "price": _pivot_price_value(primary_offer),
                 "currency": getattr(primary_offer.pricing, "currency", None) if primary_offer else None,
                 "image_url": image_url,
@@ -6977,6 +6981,27 @@ async def _handle_find_products_multi_via_pivot(
 
     products = _pivot_items_to_multi_products(pivot_result.items)
 
+    # Category recall is intentionally broad.  When its residual query tokens
+    # match a real catalog brand/merchant, preserve the user's explicit brand
+    # constraint instead of returning unrelated products from the same
+    # category.  If no real identity matches, keep broad category behaviour.
+    brand_anchor_terms = _category_brand_anchor_terms(query)
+    brand_anchor_matched = False
+    if products and brand_anchor_terms:
+        anchored_products = []
+        for product in products:
+            identity_blob = _strip_accents(
+                " ".join(
+                    str(product.get(key) or "").lower()
+                    for key in ("brand", "merchant_name")
+                )
+            )
+            if all(term in identity_blob for term in brand_anchor_terms):
+                anchored_products.append(product)
+        if anchored_products:
+            products = anchored_products
+            brand_anchor_matched = True
+
     if products and (
         active_visible_category_intents
         or active_visible_attribute_intents
@@ -7144,6 +7169,8 @@ async def _handle_find_products_multi_via_pivot(
             "canonical_identity_required": canonical_sig_mode,
             "direct_external_seed_lane": not canonical_sig_mode,
             "query_semantic_class": query_semantic_class,
+            "brand_category_anchor_terms": brand_anchor_terms,
+            "brand_category_anchor_matched": brand_anchor_matched,
             "fetched_at": datetime.utcnow().isoformat(),
             "pivot_rollout_mode": "serve",
             "pivot_rollout_guard_passed": True,
