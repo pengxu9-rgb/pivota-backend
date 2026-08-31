@@ -23,6 +23,7 @@ def _sample_pivot_item(
     variant_id: str,
     sku: str,
     title: str,
+    brand: str = "Demo",
     product_id: str = "111",
     product_type: str = "serum",
     description: str = "A brightening serum",
@@ -46,7 +47,7 @@ def _sample_pivot_item(
             source_product_id=product_id,
             title=title,
             description=description,
-            brand="Demo",
+            brand=brand,
             product_type=product_type,
             category=product_type,
             canonical_url=canonical_url,
@@ -294,6 +295,56 @@ async def test_canonical_sig_mode_forces_catalog_recall_and_keeps_supply_in_offe
     assert product["merchant_id"] == "seller_1"
     assert product["in_stock"] is True
     assert product["offers"][0]["catalog_track"] == "external_referral"
+
+
+@pytest.mark.asyncio
+async def test_brand_category_query_prunes_unrelated_same_category_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_search(req):
+        return PivotQueryResponse(
+            query=req.query,
+            total=2,
+            items=[
+                _sample_pivot_item(
+                    sku_key="sku::generic",
+                    variant_id="var_generic",
+                    sku="GEN-1",
+                    title="Soft Liquid Blush",
+                    brand="Generic Beauty",
+                    product_id="generic",
+                    product_type="blush",
+                ),
+                _sample_pivot_item(
+                    sku_key="sku::knight",
+                    variant_id="var_knight",
+                    sku="KU-1",
+                    title="Knight Unicorn Satin Blush",
+                    brand="Knight Unicorn",
+                    product_id="knight",
+                    product_type="blush",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(gateway, "search_pivot_catalog", fake_search)
+
+    result = await gateway._handle_find_products_multi_via_pivot(
+        gateway.FindProductsMultiPayload(
+            search=gateway.MultiSearchFilters(
+                query="knight unicorn blush",
+                page=1,
+                limit=10,
+                in_stock_only=False,
+            ),
+            metadata=gateway.RequestMetadata(source="shopping_agent"),
+        ),
+        {"source": "shopping_agent"},
+    )
+
+    assert [product["product_id"] for product in result["products"]] == ["knight"]
+    assert result["products"][0]["brand"] == "Knight Unicorn"
+    assert result["metadata"]["brand_category_anchor_matched"] is True
 
 
 def test_build_pivot_multi_shadow_diff_summary_reports_overlap() -> None:

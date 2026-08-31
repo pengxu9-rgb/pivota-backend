@@ -184,6 +184,63 @@ def _filter_relevance_terms(terms: List[str]) -> List[str]:
     return deduped
 
 
+_CATEGORY_REFINEMENT_TERMS = frozenset(
+    {
+        "blush",
+        "blushes",
+        "cleanser",
+        "cleansers",
+        "cosmetic",
+        "cosmetics",
+        "face",
+        "find",
+        "foundation",
+        "foundations",
+        "gloss",
+        "glosses",
+        "lip",
+        "lipstick",
+        "lipsticks",
+        "looking",
+        "makeup",
+        "need",
+        "moisturiser",
+        "moisturisers",
+        "moisturizer",
+        "moisturizers",
+        "only",
+        "please",
+        "product",
+        "products",
+        "recommend",
+        "search",
+        "searching",
+        "serum",
+        "serums",
+        "show",
+        "toner",
+        "toners",
+        "want",
+    }
+)
+
+
+def _category_brand_anchor_terms(query: str) -> List[str]:
+    """Return a conservative possible-brand anchor for category queries.
+
+    Category recall intentionally broadens the candidate WHERE.  Without a
+    separate anchor, that broad lane can fill the candidate limit with generic
+    category rows before a non-contiguous brand phrase (``knight unicorn
+    blush``) is ever ranked.  Two residual terms are required so common
+    one-word descriptors do not become accidental brand gates.
+    """
+    if not category_path_prefix_for_query(query):
+        return []
+    terms = _filter_relevance_terms(_tokenize_relevance(query))
+    residual = [term for term in terms if term not in _CATEGORY_REFINEMENT_TERMS]
+    return residual[:4] if len(residual) >= 2 else []
+
+
 def _vertical_intent(query: str) -> bool:
     lowered = _normalize_query(query)
     if not lowered:
@@ -1000,6 +1057,30 @@ async def _fetch_canonical_search_rows(
             + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
         """
 
+    # A multi-token residual next to a known category is a possible brand
+    # anchor.  This is deliberately independent of the broad token-recall flag:
+    # it does not widen arbitrary queries, and category recall already admits
+    # these rows.  It only ensures a real brand match is not truncated behind a
+    # large set of same-category rows before the gateway can validate it.
+    brand_anchor_score = ""
+    brand_anchor_terms = _category_brand_anchor_terms(query)
+    if brand_anchor_terms:
+        anchor_matches = []
+        for anchor_index, anchor_term in enumerate(brand_anchor_terms):
+            param_name = f"brand_anchor_{anchor_index}"
+            params[param_name] = f"%{anchor_term}%"
+            anchor_matches.append(
+                "(LOWER(COALESCE(p.brand, '')) LIKE :" + param_name
+                + " OR LOWER(COALESCE(m.merchant_name, '')) LIKE :" + param_name
+                + " OR LOWER(COALESCE(p.title, '')) LIKE :" + param_name + ")"
+            )
+        anchor_expression = " AND ".join(anchor_matches)
+        brand_anchor_score = (
+            "\n                    + CASE WHEN ("
+            + anchor_expression
+            + ") THEN 180 ELSE 0 END\n"
+        )
+
     # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
     # clause above only matches the verbatim phrase, so multi-word queries whose
     # words appear non-contiguously ("hydrating cleanser", "snail mucin essence")
@@ -1097,6 +1178,7 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN p.pdp_lifecycle_stage = 'published' THEN 60 ELSE 0 END +
                     CASE WHEN p.pdp_lifecycle_stage = 'validated' THEN 20 ELSE 0 END
                     {category_score}
+                    {brand_anchor_score}
                     {vertical_score}
                     {token_score}
                 ) AS rank_score,
@@ -1119,6 +1201,7 @@ async def _fetch_canonical_search_rows(
                     CASE WHEN LOWER(COALESCE(s.title, '')) LIKE :query_like THEN 60 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(m.merchant_name, '')) LIKE :query_like THEN 50 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(p.source_product_id, '')) LIKE :query_like THEN 40 ELSE 0 END
+                    {brand_anchor_score}
                     {vertical_score}
                     {token_score}
                 ) AS text_score,
