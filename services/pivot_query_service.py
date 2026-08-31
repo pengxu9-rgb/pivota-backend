@@ -734,6 +734,8 @@ def _build_canonical_offer_node(
         )
     return OfferNode(
         offer_id=str(row.get("offer_id") or ""),
+        merchant_id=row.get("offer_merchant_id"),
+        merchant_name=row.get("offer_merchant_name"),
         catalog_track=catalog_track,
         truth_tier=str(row.get("offer_truth_tier") or row.get("truth_tier") or "primary"),
         readiness_tier=str(row.get("offer_readiness_tier") or row.get("readiness_tier") or "commerce_ready"),
@@ -815,6 +817,7 @@ async def _fetch_canonical_search_rows(
     query: str,
     merchant_id: Optional[str],
     limit: int,
+    require_signature: bool = False,
 ) -> List[Dict[str, Any]]:
     lowered = _normalize_query(query)
     if not lowered:
@@ -894,6 +897,10 @@ async def _fetch_canonical_search_rows(
         suppression_clause = (
             "AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL"
         )
+
+    signature_clause = ""
+    if require_signature:
+        signature_clause = "AND LEFT(p.pivota_signature_id, 4) = 'sig_'"
 
     # #1648: honor catalog_merchants.indexable in cross-merchant recall. It was
     # the ONE fence set correctly on the retired test rig (migration 139 set
@@ -1022,6 +1029,9 @@ async def _fetch_canonical_search_rows(
                 m.merchant_name AS merchant_name,
                 m.primary_platform AS merchant_primary_platform,
                 p.product_key,
+                p.content_key,
+                p.pivota_signature_id,
+                p.pivota_canonical_url,
                 p.source_product_id,
                 p.title AS product_title,
                 p.description AS product_description,
@@ -1130,6 +1140,7 @@ async def _fetch_canonical_search_rows(
             {sync_status_clause}
             {merchant_status_clause}
             {suppression_clause}
+            {signature_clause}
             {indexable_clause}
             {sku_suppression_clause}
             ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
@@ -1140,6 +1151,9 @@ async def _fetch_canonical_search_rows(
             c.merchant_name,
             c.merchant_primary_platform,
             c.product_key,
+            c.content_key,
+            c.pivota_signature_id,
+            c.pivota_canonical_url,
             c.source_product_id,
             c.product_title,
             c.product_description,
@@ -1166,6 +1180,8 @@ async def _fetch_canonical_search_rows(
             c.ingredient_ids,
             c.sku_image_url,
             o.offer_id,
+            o.merchant_id AS offer_merchant_id,
+            bm.merchant_name AS offer_merchant_name,
             o.catalog_track AS offer_catalog_track,
             o.truth_tier AS offer_truth_tier,
             o.readiness_tier AS offer_readiness_tier,
@@ -1895,13 +1911,17 @@ async def _build_canonical_items(
                 ),
                 product=ProductNode(
                     product_key=first.get("product_key"),
+                    pivota_signature_id=first.get("pivota_signature_id"),
                     source_product_id=first.get("source_product_id"),
                     title=first.get("product_title"),
                     description=first.get("product_description"),
                     brand=first.get("brand"),
                     product_type=first.get("product_type"),
                     category=first.get("category"),
-                    canonical_url=first.get("canonical_url"),
+                    canonical_url=(
+                        first.get("pivota_canonical_url")
+                        or first.get("canonical_url")
+                    ),
                     image_url=first.get("product_image_url"),
                 ),
                 sku=SkuNode(
@@ -2224,6 +2244,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
         query=request.query,
         merchant_id=request.merchant_id,
         limit=request.limit,
+        require_signature=request.canonical_entities_only,
     )
     canonical_items = await _build_canonical_items(
         canonical_rows,
@@ -2237,6 +2258,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
     external_items: List[PivotResultItem] = []
     if (
         request.include_external
+        and not request.canonical_entities_only
         and query_semantic_class in {"beauty", "fragrance"}
         and len(canonical_items) < max(3, request.limit)
     ):
