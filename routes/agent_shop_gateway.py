@@ -2930,6 +2930,11 @@ class MultiSearchFilters(BaseModel):
     # Front-ends may request above 200; we clamp internally to 200.
     limit: int = Field(20, ge=1, description="Page size (internally clamped to max 200)")
     in_stock_only: bool = Field(False, description="Return only in-stock products when true")
+    catalog_entity_mode: Optional[str] = Field(
+        None,
+        alias="catalogEntityMode",
+        description="canonical_sig returns sig products with internal/external supply in offers",
+    )
     commerce_surface: Optional[str] = Field(
         None,
         alias="commerceSurface",
@@ -3046,6 +3051,8 @@ def _normalize_find_products_multi_payload(raw_payload: Dict[str, Any]) -> Dict[
             "in_stock_only",
             "commerce_surface",
             "commerceSurface",
+            "catalog_entity_mode",
+            "catalogEntityMode",
         ):
             if key in payload:
                 search[key] = payload.get(key)
@@ -6318,8 +6325,10 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
 
     for item in items:
         primary_offer = _pivot_primary_offer(item)
+        signature_id = str(item.product.pivota_signature_id or "").strip()
         product_id = (
-            item.product.source_product_id
+            signature_id
+            or item.product.source_product_id
             or item.product.product_key
             or (primary_offer.offer_id if primary_offer else None)
             or item.sku.sku_key
@@ -6365,8 +6374,25 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
             group = {
                 "id": product_id,
                 "product_id": product_id,
-                "merchant_id": item.merchant.merchant_id,
-                "merchant_name": item.merchant.merchant_name,
+                **({"pivota_signature_id": signature_id} if signature_id else {}),
+                "merchant_id": (
+                    (
+                        getattr(primary_offer, "merchant_id", None)
+                        if primary_offer
+                        else None
+                    )
+                    if signature_id
+                    else None
+                ) or item.merchant.merchant_id,
+                "merchant_name": (
+                    (
+                        getattr(primary_offer, "merchant_name", None)
+                        if primary_offer
+                        else None
+                    )
+                    if signature_id
+                    else None
+                ) or item.merchant.merchant_name,
                 "title": item.product.title,
                 "description": item.product.description or "",
                 "price": _pivot_price_value(primary_offer),
@@ -6374,6 +6400,7 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
                 "image_url": image_url,
                 "product_type": item.product.product_type,
                 "inventory_quantity": 0,
+                "in_stock": False,
                 "sku": item.sku.sku,
                 "platform": item.merchant.primary_platform,
                 "catalog_track": item.catalog_track,
@@ -6384,6 +6411,7 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
                 "visible_option_labels": list(item.sku.visible_option_labels or []),
                 "ingredient_ids": list(item.sku.ingredient_ids or []),
                 "variants": [],
+                "offers": [],
             }
             if best_deal_payload:
                 group["best_deal"] = best_deal_payload
@@ -6398,6 +6426,20 @@ def _pivot_items_to_multi_products(items: List[PivotResultItem]) -> List[Dict[st
         inventory_quantity = getattr(primary_offer, "inventory_quantity", None) if primary_offer else None
         if isinstance(inventory_quantity, int) and inventory_quantity > 0:
             group["inventory_quantity"] = int(group.get("inventory_quantity") or 0) + inventory_quantity
+        availability_token = str(availability or "").strip().lower()
+        if availability_token in {"in_stock", "instock", "available", "active"}:
+            group["in_stock"] = True
+
+        existing_offer_ids = {
+            str(offer.get("offer_id") or "")
+            for offer in group["offers"]
+            if isinstance(offer, dict)
+        }
+        for offer in item.offers:
+            offer_id = str(offer.offer_id or "")
+            if offer_id and offer_id not in existing_offer_ids:
+                group["offers"].append(offer.model_dump())
+                existing_offer_ids.add(offer_id)
 
         variant_id = item.sku.source_variant_id or item.sku.sku_key or item.sku.sku or product_id
         variant = {
@@ -6724,6 +6766,9 @@ async def _handle_find_products_multi_via_pivot(
     request_metadata: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     filters = payload.search
+    canonical_sig_mode = (
+        str(filters.catalog_entity_mode or "").strip().lower() == "canonical_sig"
+    )
     query = str(filters.query or "").strip()
     if not query:
         return None
@@ -6919,7 +6964,10 @@ async def _handle_find_products_multi_via_pivot(
             merchant_id=None,
             market=_pivot_market_from_payload(payload, request_metadata),
             limit=raw_limit,
-            include_external=PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL,
+            include_external=(
+                False if canonical_sig_mode else PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL
+            ),
+            canonical_entities_only=canonical_sig_mode,
             include_incentives=PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES,
             payment_context=payload.payment_context,
             # ADR-007 SLICE 3: suppress the citable lane for shopping intent.
@@ -7052,7 +7100,8 @@ async def _handle_find_products_multi_via_pivot(
         products = [
             product
             for product in products
-            if int(product.get("inventory_quantity") or 0) > 0
+            if bool(product.get("in_stock"))
+            or int(product.get("inventory_quantity") or 0) > 0
         ]
 
     total = len(products)
@@ -7060,7 +7109,22 @@ async def _handle_find_products_multi_via_pivot(
     end_idx = start_idx + limit
     page_items = products[start_idx:end_idx]
     if not page_items:
-        return None
+        if not canonical_sig_mode:
+            return None
+        return {
+            "products": [],
+            "total": total,
+            "page": page,
+            "page_size": 0,
+            "reply": None,
+            "metadata": {
+                "query_source": "pivot_catalog_sig_multi",
+                "catalog_entity_mode": "canonical_sig",
+                "canonical_identity_required": True,
+                "direct_external_seed_lane": False,
+                "fallback_triggered": False,
+            },
+        }
 
     internal_count = sum(1 for item in pivot_result.items if item.catalog_track == "internal_merchant")
     external_count = sum(1 for item in pivot_result.items if item.catalog_track == "external_referral")
@@ -7071,12 +7135,21 @@ async def _handle_find_products_multi_via_pivot(
         "page_size": len(page_items),
         "reply": None,
         "metadata": {
-            "query_source": "pivot_semantic_core_multi",
+            "query_source": (
+                "pivot_catalog_sig_multi"
+                if canonical_sig_mode
+                else "pivot_semantic_core_multi"
+            ),
+            "catalog_entity_mode": "canonical_sig" if canonical_sig_mode else None,
+            "canonical_identity_required": canonical_sig_mode,
+            "direct_external_seed_lane": not canonical_sig_mode,
             "query_semantic_class": query_semantic_class,
             "fetched_at": datetime.utcnow().isoformat(),
             "pivot_rollout_mode": "serve",
             "pivot_rollout_guard_passed": True,
-            "pivot_include_external": PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL,
+            "pivot_include_external": (
+                False if canonical_sig_mode else PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL
+            ),
             "pivot_include_incentives": PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES,
             "pivot_internal_item_count": internal_count,
             "pivot_external_item_count": external_count,
@@ -8816,6 +8889,9 @@ async def _handle_find_products_multi_inner(
     strict_serving_mode = bool(commerce_surface_explicit)
     page = filters.page or 1
     limit = _clamp_search_limit(filters.limit, fallback=20)
+    canonical_sig_mode = (
+        str(filters.catalog_entity_mode or "").strip().lower() == "canonical_sig"
+    )
 
     if (
         not pivot_shadow_schedule_suppressed
@@ -8835,12 +8911,15 @@ async def _handle_find_products_multi_inner(
         )
 
     if (
-        PIVOT_MULTI_SERVE_ENABLED
+        (canonical_sig_mode or PIVOT_MULTI_SERVE_ENABLED)
         and str(filters.query or "").strip()
-        and _pivot_multi_rollout_allowed(
-            source_normalized=source_normalized,
-            page=page,
-            mode="serve",
+        and (
+            canonical_sig_mode
+            or _pivot_multi_rollout_allowed(
+                source_normalized=source_normalized,
+                page=page,
+                mode="serve",
+            )
         )
     ):
         pivot_result = await _handle_find_products_multi_via_pivot(

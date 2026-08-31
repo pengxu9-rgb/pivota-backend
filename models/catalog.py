@@ -99,6 +99,10 @@ class PivotQueryRequest(BaseModel):
     market: str = "US"
     limit: int = Field(default=20, ge=1, le=100)
     include_external: bool = True
+    # Canonical catalog mode: product identity must be a public sig_*. Supply
+    # provenance remains offer-scoped, so this disables the legacy direct-seed
+    # result lane without excluding external referral offers in catalog_offers.
+    canonical_entities_only: bool = False
     include_incentives: bool = True
     payment_context: Optional[PivotPaymentContext] = None
     # ADR-007 SLICE 3: the intent signal threaded down from the gateway. When the
@@ -214,6 +218,7 @@ class MerchantNode(BaseModel):
 
 class ProductNode(BaseModel):
     product_key: Optional[str] = None
+    pivota_signature_id: Optional[str] = None
     source_product_id: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
@@ -264,6 +269,8 @@ class SkuNode(BaseModel):
 
 class OfferNode(BaseModel):
     offer_id: str
+    merchant_id: Optional[str] = None
+    merchant_name: Optional[str] = None
     catalog_track: str
     truth_tier: str
     readiness_tier: str

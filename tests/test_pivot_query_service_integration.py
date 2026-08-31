@@ -104,6 +104,40 @@ async def test_search_pivot_catalog_skips_external_fetch_when_disabled(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_canonical_entities_only_requires_sig_and_disables_direct_seed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def fake_fetch_rows(**kwargs):
+        observed.update(kwargs)
+        return []
+
+    async def fake_build_items(*_args, **_kwargs):
+        return []
+
+    async def fail_fetch_external_seed_rows(**_kwargs):
+        raise AssertionError("canonical catalog mode must not read direct external seeds")
+
+    monkeypatch.setattr(module, "_fetch_canonical_search_rows", fake_fetch_rows)
+    monkeypatch.setattr(module, "_build_canonical_items", fake_build_items)
+    monkeypatch.setattr(module, "fetch_external_seed_rows", fail_fetch_external_seed_rows)
+
+    result = await module.search_pivot_catalog(
+        PivotQueryRequest(
+            query="ordinary",
+            limit=5,
+            include_external=True,
+            canonical_entities_only=True,
+            include_incentives=False,
+        )
+    )
+
+    assert observed["require_signature"] is True
+    assert result.items == []
+
+
+@pytest.mark.asyncio
 async def test_search_pivot_catalog_skips_external_fetch_when_canonical_results_fill_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

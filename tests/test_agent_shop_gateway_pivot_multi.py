@@ -30,6 +30,9 @@ def _sample_pivot_item(
     visible_attributes: dict | None = None,
     visible_option_labels: list[str] | None = None,
     ingredient_ids: list[str] | None = None,
+    signature_id: str | None = None,
+    inventory_quantity: int | None = 5,
+    offer_catalog_track: str = "internal_merchant",
 ) -> PivotResultItem:
     return PivotResultItem(
         merchant=MerchantNode(
@@ -39,6 +42,7 @@ def _sample_pivot_item(
         ),
         product=ProductNode(
             product_key=f"prod::merch_1::shopify::{product_id}",
+            pivota_signature_id=signature_id,
             source_product_id=product_id,
             title=title,
             description=description,
@@ -60,13 +64,15 @@ def _sample_pivot_item(
         offers=[
             OfferNode(
                 offer_id=f"offer::{sku_key}",
-                catalog_track="internal_merchant",
+                merchant_id="seller_1",
+                merchant_name="Seller One",
+                catalog_track=offer_catalog_track,
                 truth_tier="primary",
                 readiness_tier="knowledge_ready",
                 offer_mode="merchant_checkout",
                 source_system="shopify_products_sync",
                 availability="in_stock",
-                inventory_quantity=5,
+                inventory_quantity=inventory_quantity,
                 pricing=PivotPricing(
                     currency="USD",
                     list_price=Decimal("32.00"),
@@ -228,6 +234,66 @@ async def test_handle_find_products_multi_can_serve_from_pivot_semantic_core(
     assert product["inventory_quantity"] == 10
     assert len(product["variants"]) == 2
     assert product["best_deal"]["estimated_best_price"] == Decimal("27.55")
+
+
+@pytest.mark.asyncio
+async def test_canonical_sig_mode_forces_catalog_recall_and_keeps_supply_in_offers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def fake_search(req):
+        observed["include_external"] = req.include_external
+        observed["canonical_entities_only"] = req.canonical_entities_only
+        return PivotQueryResponse(
+            query="ordinary",
+            total=1,
+            items=[
+                _sample_pivot_item(
+                    sku_key="sku::ordinary",
+                    variant_id="var_ordinary",
+                    sku="ORD-1",
+                    title="The Ordinary Niacinamide 10% + Zinc 1%",
+                    signature_id="sig_ordinary_niacinamide",
+                    inventory_quantity=None,
+                    offer_catalog_track="external_referral",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(gateway, "PIVOT_MULTI_SERVE_ENABLED", False)
+    monkeypatch.setattr(gateway, "PIVOT_MULTI_SHADOW_ENABLED", False)
+    monkeypatch.setattr(gateway, "PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL", True)
+    monkeypatch.setattr(gateway, "search_pivot_catalog", fake_search)
+
+    result = await gateway._handle_find_products_multi(
+        gateway.FindProductsMultiPayload(
+            search=gateway.MultiSearchFilters(
+                query="ordinary",
+                page=1,
+                limit=10,
+                in_stock_only=True,
+                catalog_entity_mode="canonical_sig",
+            ),
+            metadata=gateway.RequestMetadata(source="shopping_agent"),
+        ),
+        {"source": "shopping_agent"},
+        BackgroundTasks(),
+    )
+
+    assert observed == {
+        "include_external": False,
+        "canonical_entities_only": True,
+    }
+    assert result["metadata"]["query_source"] == "pivot_catalog_sig_multi"
+    assert result["metadata"]["direct_external_seed_lane"] is False
+    assert len(result["products"]) == 1
+    product = result["products"][0]
+    assert product["product_id"] == "sig_ordinary_niacinamide"
+    assert product["pivota_signature_id"] == "sig_ordinary_niacinamide"
+    assert product["merchant_id"] == "seller_1"
+    assert product["in_stock"] is True
+    assert product["offers"][0]["catalog_track"] == "external_referral"
 
 
 def test_build_pivot_multi_shadow_diff_summary_reports_overlap() -> None:
