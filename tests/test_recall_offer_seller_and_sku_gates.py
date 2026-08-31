@@ -92,6 +92,8 @@ async def _product_with_offer(
     owner: str,
     seller: str,
     title: str = "Hydrating Serum",
+    lifecycle_stage: str = "published",
+    pivota_signature_id: Optional[str] = None,
     sku_suppressed_at: Optional[str] = None,
     sku_suppression_reason: Optional[str] = None,
 ) -> None:
@@ -106,13 +108,20 @@ async def _product_with_offer(
         """
         INSERT INTO catalog_products
             (product_key, merchant_id, platform, source_product_id, catalog_track,
-             truth_tier, readiness_tier, title, brand, pdp_lifecycle_stage,
+             truth_tier, readiness_tier, title, brand, pivota_signature_id, pdp_lifecycle_stage,
              sync_status, created_at, updated_at)
         VALUES (:k, :m, 'shopify', :spi, 'internal_merchant', 'primary',
-                'commerce_ready', :t, 'TestBrand', 'published', 'live',
+                'commerce_ready', :t, 'TestBrand', :sig, :stage, 'live',
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
-        {"k": key, "m": owner, "spi": f"src-{key}", "t": title},
+        {
+            "k": key,
+            "m": owner,
+            "spi": f"src-{key}",
+            "t": title,
+            "sig": pivota_signature_id,
+            "stage": lifecycle_stage,
+        },
     )
     await database.execute(
         """
@@ -149,9 +158,16 @@ async def _product_with_offer(
     )
 
 
-async def _recall(query: str = "Hydrating Serum", merchant_id: Optional[str] = None) -> List[str]:
+async def _recall(
+    query: str = "Hydrating Serum",
+    merchant_id: Optional[str] = None,
+    require_signature: bool = False,
+) -> List[str]:
     rows = await svc._fetch_canonical_search_rows(
-        query=query, merchant_id=merchant_id, limit=20
+        query=query,
+        merchant_id=merchant_id,
+        limit=20,
+        require_signature=require_signature,
     )
     return [str(r.get("product_key")) for r in rows if str(r.get("product_key", "")).startswith(_PREFIX)]
 
@@ -217,6 +233,47 @@ async def test_baseline_offer_from_a_healthy_seller_serves():
     await _product_with_offer(f"{_PREFIX}_p1", owner=f"{_PREFIX}_owner", seller=f"{_PREFIX}_seller")
 
     assert await _recall() == [f"{_PREFIX}_p1"]
+
+
+@pytest.mark.asyncio
+async def test_canonical_sig_candidate_with_a_live_offer_serves():
+    """Content enrichment is not a sellability gate for canonical cards.
+
+    A merchant sync deliberately writes candidate first, then later enriches
+    taxonomy. Once the product has a stable SIG and the normal live,
+    non-suppressed, indexable offer chain, strict canonical search must not
+    make it disappear during that interval.
+    """
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_seller")
+    await _product_with_offer(
+        f"{_PREFIX}_p1",
+        owner=f"{_PREFIX}_owner",
+        seller=f"{_PREFIX}_seller",
+        title="Knight Unicorn Satin Blush",
+        lifecycle_stage="candidate",
+        pivota_signature_id="sig_knight_unicorn",
+    )
+
+    assert await _recall(
+        query="knight unicorn",
+        require_signature=True,
+    ) == [f"{_PREFIX}_p1"]
+
+
+@pytest.mark.asyncio
+async def test_noncanonical_candidate_stays_out_of_global_content_recall():
+    """The widening is restricted to canonical SIG product-card recall."""
+    await _merchant(f"{_PREFIX}_owner")
+    await _merchant(f"{_PREFIX}_seller")
+    await _product_with_offer(
+        f"{_PREFIX}_p1",
+        owner=f"{_PREFIX}_owner",
+        seller=f"{_PREFIX}_seller",
+        lifecycle_stage="candidate",
+    )
+
+    assert await _recall() == []
 
 
 @pytest.mark.asyncio
