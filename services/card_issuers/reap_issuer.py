@@ -61,6 +61,94 @@ class ReapIssuer:
         reveal = card.get("reveal_url") or card.get("secure_details_url") or card.get("reveal_token")
         return IssuedCard(issuer_card_ref=ref, reveal_handle=str(reveal) if reveal else None)
 
+    @staticmethod
+    def _verify_constraints(body: Dict[str, Any], request: IssueRequest) -> None:
+        """Refuse unless the issuer CONFIRMS the constraints we asked for.
+
+        WHY THIS EXISTS. Without it, "constrain-at-mint" is an assumption, not a mechanism. A
+        REST API that does not recognise a field name normally ignores it and answers 2xx — so a
+        wrong spelling of `spend_limit` or `merchant_restriction` produces a successful mint of
+        an UNCAPPED, UNLOCKED card, while we write `amount_cap_minor` into `agent_issued_cards`
+        and hand the agent a working reveal handle. Every alarm downstream is keyed on that cap,
+        so nothing would ever fire. The wire format here is explicitly UNVERIFIED against Reap
+        (see the module docstring), which is exactly the condition under which a silent
+        constraint drop is likely rather than hypothetical.
+
+        SO THIS FAILS CLOSED IN BOTH DIRECTIONS — contradicted AND merely unconfirmed. An
+        issuer that does not echo the constraints leaves us unable to state the one fact this
+        rail is built on, and "we could not tell" must not read as "it is capped". During
+        sandbox verification this is a feature: the first real Reap call reports precisely which
+        constraint it would not confirm, instead of appearing to work.
+
+        ⚠️ A REFUSAL HERE DOES NOT UN-MINT THE CARD. We are past a 2xx, so the card may exist at
+        the issuer — possibly the uncapped one this check is about. The caller marks its row
+        failed and therefore never stores `issuer_card_ref`, so the id is logged below or the
+        orphan becomes unreachable for revocation. Wiring the revocation sweep to these two codes
+        is the follow-up; until then treat either as a page-worthy alarm, not a retry.
+
+        NOTHING FROM THE BODY IS ECHOED into the message or the log — rule 1 of this module. That
+        includes the observed amounts: a mis-mapped field could put a PAN where an integer was
+        expected, and digits are exactly what we would be tempted to print. The constraint NAME
+        plus our own expected value is enough to act on.
+        """
+        card = body.get("card") if isinstance(body.get("card"), dict) else body
+
+        def _fail(code: str, constraint: str) -> None:
+            raise CardIssuerError(code, f"issuer did not confirm the {constraint} we requested")
+
+        # Spelling sets are deliberately TIGHT — the same tolerance `_parse_response` allows for
+        # `id`/`card_id`, and no more. A wide search is how a check starts matching a field that
+        # means something else and reporting a confirmation nobody made.
+        limit = None
+        for key in ("spend_limit", "spending_limit", "limit"):
+            if isinstance(card.get(key), dict):
+                limit = card[key]
+                break
+        if limit is None:
+            _fail("REAP_CONSTRAINTS_UNCONFIRMED", "spend cap")
+
+        # STRICT equality against the integer we sent. A decimal string ("23.00") is NOT coerced:
+        # whether that means 23 or 2300 is exactly the ambiguity that must not be resolved by
+        # guessing on a spending cap.
+        observed = limit.get("amount")
+        if isinstance(observed, bool) or not isinstance(observed, int):
+            if isinstance(observed, str) and observed.strip().isdigit():
+                observed = int(observed.strip())
+            else:
+                _fail("REAP_CONSTRAINTS_UNCONFIRMED", "spend cap")
+        if observed != request.amount_cap_minor:
+            _fail("REAP_CONSTRAINTS_MISMATCH", "spend cap")
+
+        observed_currency = limit.get("currency")
+        if not isinstance(observed_currency, str) or not observed_currency.strip():
+            _fail("REAP_CONSTRAINTS_UNCONFIRMED", "cap currency")
+        if observed_currency.strip().upper() != str(request.currency).strip().upper():
+            _fail("REAP_CONSTRAINTS_MISMATCH", "cap currency")
+
+        # The merchant lock is what bounds the blast radius to ONE merchant. An unlocked card
+        # carrying our cap is still a card an agent can spend anywhere.
+        restriction = None
+        for key in ("merchant_restriction", "merchant_restrictions"):
+            if isinstance(card.get(key), dict):
+                restriction = card[key]
+                break
+        if restriction is None:
+            _fail("REAP_CONSTRAINTS_UNCONFIRMED", "merchant restriction")
+        domains = restriction.get("domains")
+        if not isinstance(domains, list) or not domains:
+            _fail("REAP_CONSTRAINTS_UNCONFIRMED", "merchant restriction")
+        wanted = str(request.merchant_domain).strip().lower()
+        if [d for d in domains if isinstance(d, str) and d.strip().lower() == wanted] == []:
+            _fail("REAP_CONSTRAINTS_MISMATCH", "merchant restriction")
+        # A lock that ALSO admits other merchants is not the lock we asked for.
+        if len(domains) != 1:
+            _fail("REAP_CONSTRAINTS_MISMATCH", "merchant restriction")
+
+        # Only asserted when we ASKED for single-use: a card we never scoped that way has no
+        # confirmation to give, and demanding one would refuse a correct response.
+        if request.single_use and card.get("single_use") is not True:
+            _fail("REAP_CONSTRAINTS_UNCONFIRMED", "single-use scope")
+
     async def issue(self, request: IssueRequest) -> IssuedCard:
         url = f"{self.base_url}{self.issue_path}"
         try:
@@ -78,8 +166,27 @@ class ReapIssuer:
             logger.warning(f"reap issue refused card_id={request.card_id} status={resp.status_code}")
             raise CardIssuerError("REAP_REFUSED", f"issuer returned HTTP {resp.status_code}")
         try:
-            return self._parse_response(resp.json())
+            body = resp.json()
+            issued = self._parse_response(body)
         except CardIssuerError:
             raise
         except Exception as err:
             raise CardIssuerError("REAP_BAD_RESPONSE", "issuer response was not parseable") from err
+
+        # PARSE FIRST, VERIFY SECOND — deliberately in this order. A card that fails verification
+        # may exist at the issuer, and `issuer_card_ref` is the only handle anything has to go
+        # revoke it. The caller marks its row failed without storing the ref, so if we refused
+        # before extracting it the orphan would be unreachable. The ref is already persisted on
+        # the success path, so logging it here reveals nothing new.
+        try:
+            self._verify_constraints(body, request)
+        except CardIssuerError as err:
+            logger.error(
+                "reap issue CONSTRAINTS UNCONFIRMED card_id=%s issuer_card_ref=%s code=%s — "
+                "a card may exist at the issuer with constraints we could not confirm; revoke it",
+                request.card_id,
+                issued.issuer_card_ref,
+                err.code,
+            )
+            raise
+        return issued
