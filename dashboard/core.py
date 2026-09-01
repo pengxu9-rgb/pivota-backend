@@ -12,10 +12,11 @@ class OrderStatus(str, Enum):
     """Order status enumeration"""
     PENDING = "pending"
     PROCESSING = "processing"
-    # PAID is referenced by orchestrator/payment_orchestrator.py and
-    # routes/demo_data_routes.py and was simply absent here, so both raised
-    # AttributeError("PAID") before reaching anything else. It is a distinct
-    # state from COMPLETED: money captured vs order fulfilled.
+    # PAID is referenced by routes/demo_data_routes.py (and, until it was
+    # deleted on 2026-08-31, orchestrator/payment_orchestrator.py) and was
+    # simply absent here, so those raised AttributeError("PAID") before
+    # reaching anything else. It is a distinct state from COMPLETED: money
+    # captured vs order fulfilled.
     PAID = "paid"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -54,12 +55,13 @@ class Order:
             customer_email=..., total_amount=..., items=[...], ...)
 
     Only the first was implemented. The second is what
-    orchestrator/payment_orchestrator.py and routes/demo_data_routes.py have
-    always passed, and what routes/dashboard_api.py and routes/payment_routes.py
-    have always READ back (`order.total_amount`, `order.merchant_id`,
-    `order.agent_id`, `order.customer_email`) — so construction raised TypeError
-    and every reader would have raised AttributeError. The keyword fields below
-    are what those four modules require; none is new invention.
+    routes/demo_data_routes.py has always passed (and, until it was deleted on
+    2026-08-31, orchestrator/payment_orchestrator.py), and what
+    routes/dashboard_api.py has always READ back (`order.total_amount`,
+    `order.merchant_id`, `order.agent_id`, `order.customer_email`) — so
+    construction raised TypeError and every reader would have raised
+    AttributeError. The keyword fields below are what those modules require;
+    none is new invention.
 
     `amount` and `total_amount` are the same number under two names, because
     both are already read in the codebase. Setting either sets both.
@@ -105,9 +107,9 @@ class Payment:
     """Payment model.
 
     Same story as Order: the positional shape below is DashboardCore's, the
-    keyword fields are what payment_orchestrator.py and demo_data_routes.py pass
-    and what dashboard_api.py reads back (`payment.currency`, `.transaction_id`,
-    `.fees`).
+    keyword fields are what demo_data_routes.py passes (and payment_orchestrator.py
+    passed until it was deleted on 2026-08-31) and what dashboard_api.py reads
+    back (`payment.currency`, `.transaction_id`, `.fees`).
 
     `status` is intentionally untyped: DashboardCore sets an OrderStatus, while
     the payment path sets the PSP vocabulary ("succeeded"/"failed") that
