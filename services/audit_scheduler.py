@@ -117,6 +117,11 @@ _JOB_RUN_DEADLINES = {
     "catalog_onboard_queue_drain": 1500,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
+    # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
+    # a serial issuer call bounded by the adapter's 15s timeout => 1500s worst case. 1800 covers
+    # that and still lands well inside the hourly cadence, so a wedged run cannot overlap the
+    # next one. Idle runs are a single indexed query.
+    "agent_card_revocation_sweep": 1800,
     # queue drainers: MAX_RUNS_PER_TICK runs each, serial. Audits routinely
     # run >15 min each (a cut run loses its LLM spend and re-runs after the
     # 15-min lease expires) so 3 get 2h; executor agents (sitemap fetch, GSC
