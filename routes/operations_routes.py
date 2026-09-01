@@ -8,7 +8,7 @@ from enum import Enum
 from datetime import datetime, timedelta
 
 from utils.auth import (
-    verify_jwt_token,
+    get_current_user,
     require_permission,
     MANAGE_OPERATIONS,
 )
@@ -91,7 +91,7 @@ def log_operation(operation: str, details: Dict[str, Any], operator: str):
 @router.post("/agents/onboard")
 async def onboard_agent(
     request: AgentOnboardingRequest,
-    credentials: dict = Depends(verify_jwt_token)
+    credentials: dict = Depends(get_current_user)
 ):
     """Onboard a new agent - requires operator or admin role"""
     require_permission(credentials, MANAGE_OPERATIONS)
@@ -148,7 +148,7 @@ async def onboard_agent(
 @router.post("/merchants/onboard")
 async def onboard_merchant(
     request: MerchantOnboardingRequest,
-    credentials: dict = Depends(verify_jwt_token)
+    credentials: dict = Depends(get_current_user)
 ):
     """Onboard a new merchant - requires operator or admin role"""
     require_permission(credentials, MANAGE_OPERATIONS)
@@ -207,7 +207,7 @@ async def onboard_merchant(
 # Onboarding Queue Management
 @router.get("/onboarding-queue")
 async def get_onboarding_queue(
-    credentials: dict = Depends(verify_jwt_token),
+    credentials: dict = Depends(get_current_user),
     limit: int = Query(20, description="Number of items to return")
 ):
     """Get the onboarding queue - requires operator or admin role"""
@@ -244,7 +244,7 @@ async def get_onboarding_queue(
 async def update_onboarding_status(
     entity_id: str,
     update: OnboardingUpdate,
-    credentials: dict = Depends(verify_jwt_token)
+    credentials: dict = Depends(get_current_user)
 ):
     """Update onboarding status - requires operator or admin role"""
     require_permission(credentials, MANAGE_OPERATIONS)
@@ -300,7 +300,7 @@ async def update_onboarding_status(
 @router.post("/verify")
 async def start_verification(
     request: VerificationRequest,
-    credentials: dict = Depends(verify_jwt_token)
+    credentials: dict = Depends(get_current_user)
 ):
     """Start verification process - requires operator or admin role"""
     require_permission(credentials, MANAGE_OPERATIONS)
@@ -348,7 +348,7 @@ async def start_verification(
 
 @router.get("/verification-tasks")
 async def get_verification_tasks(
-    credentials: dict = Depends(verify_jwt_token),
+    credentials: dict = Depends(get_current_user),
     status: Optional[VerificationStatus] = Query(None)
 ):
     """Get verification tasks - requires operator or admin role"""
@@ -372,7 +372,7 @@ async def get_verification_tasks(
 # Analytics and Reporting
 @router.get("/analytics")
 async def get_operations_analytics(
-    credentials: dict = Depends(verify_jwt_token),
+    credentials: dict = Depends(get_current_user),
     days: int = Query(30, description="Number of days to analyze")
 ):
     """Get operations analytics - requires operator or admin role"""
@@ -438,7 +438,7 @@ async def get_operations_analytics(
 async def send_welcome_email(
     entity_id: str,
     entity_type: EntityType,
-    credentials: dict = Depends(verify_jwt_token)
+    credentials: dict = Depends(get_current_user)
 ):
     """Send welcome email to new client - requires operator or admin role"""
     require_permission(credentials, MANAGE_OPERATIONS)
@@ -484,7 +484,7 @@ async def send_welcome_email(
 
 @router.get("/operations-log")
 async def get_operations_log(
-    credentials: dict = Depends(verify_jwt_token),
+    credentials: dict = Depends(get_current_user),
     limit: int = Query(50, description="Number of log entries to return"),
     operation_type: Optional[str] = Query(None, description="Filter by operation type")
 ):
@@ -508,7 +508,7 @@ async def get_operations_log(
 # Dashboard Summary
 @router.get("/dashboard-summary")
 async def get_dashboard_summary(
-    credentials: dict = Depends(verify_jwt_token)
+    credentials: dict = Depends(get_current_user)
 ):
     """Get operations dashboard summary - requires operator or admin role"""
     require_permission(credentials, MANAGE_OPERATIONS)

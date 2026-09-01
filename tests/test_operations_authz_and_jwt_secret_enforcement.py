@@ -48,9 +48,24 @@ def ops_client():
 
 
 def _token(role):
-    from utils.auth import create_jwt_token
+    """Mint the claim set the REAL staff issuers emit.
 
-    return create_jwt_token("user-1", role)
+    create_jwt_token(user_id, role) omits `email`, and no issuer in this system
+    produces that shape: scripts/mint_employee_jwt writes sub/email/role/user_id,
+    and routes/auth_routes writes the same at login. Using the thin helper meant
+    these tests exercised a token production never mints — and it 401s against
+    the header dependency, which is how the discrepancy surfaced.
+    """
+    from utils.auth import create_access_token
+
+    return create_access_token(
+        {"sub": f"{role}@pivota.cc", "email": f"{role}@pivota.cc", "role": role}
+    )
+
+
+def _auth(role):
+    """The credential goes in the HEADER now, not the query string."""
+    return {"Authorization": f"Bearer {_token(role)}"}
 
 
 # Every route in the file, so a newly added one that forgets the guard is caught
@@ -90,7 +105,7 @@ OPS_REQUESTS = [
 def test_operations_routes_deny_unprivileged_roles(ops_client, role, method, path, body):
     """The defect: all of these answered 200 for every one of these roles."""
     resp = ops_client.request(
-        method, path, params={"token": _token(role)}, json=body
+        method, path, headers=_auth(role), json=body
     )
     assert resp.status_code == 403, (
         f"{method} {path} answered {resp.status_code} for role={role!r}; "
@@ -103,7 +118,7 @@ def test_operations_routes_still_admit_staff(ops_client, role):
     """The mutant this kills: denying everyone, which would 'pass' the test
     above while breaking the operators the routes exist for."""
     resp = ops_client.get(
-        "/api/operations/dashboard-summary", params={"token": _token(role)}
+        "/api/operations/dashboard-summary", headers=_auth(role)
     )
     assert resp.status_code == 200, (
         f"role={role!r} got {resp.status_code}; staff locked out of operations"
@@ -723,7 +738,7 @@ def test_every_operations_route_still_admits_staff(ops_client, role, method, pat
     broken as one that denies no one.
     """
     resp = ops_client.request(
-        method, path, params={"token": _token(role)}, json=body
+        method, path, headers=_auth(role), json=body
     )
     assert resp.status_code != 403, (
         f"{method} {path} denied {role!r}, who should be admitted"
@@ -787,3 +802,73 @@ async def test_the_repaired_publisher_actually_reaches_the_metrics_store():
         "store counts on"
     )
     assert "stripe" in store.psp_metrics, "the psp was not recorded"
+
+
+# ---------------------------------------------------------------------------
+# 6. The credential travels in a header, not the URL
+# ---------------------------------------------------------------------------
+#
+# utils.auth.verify_jwt_token has the signature `verify_jwt_token(token: str)`,
+# so `Depends(verify_jwt_token)` made FastAPI bind `token` as a required QUERY
+# parameter. Every call to these ten staff routes therefore wrote a live,
+# admin-capable 24-hour JWT into the URL — and Cloud Run records
+# httpRequest.requestUrl, the load balancer logs it, and browsers put it in
+# Referer. An unauthenticated request also got 422 (a validation error) rather
+# than a credential error.
+
+@pytest.mark.parametrize("method,path,body", OPS_REQUESTS)
+def test_a_query_string_token_is_no_longer_accepted(ops_client, method, path, body):
+    """The old channel must be closed, not merely supplemented.
+
+    Leaving it working "for compatibility" would keep writing credentials into
+    every access log line, which is the entire problem. Prod request logs show
+    zero calls to /api/operations over 30 days, so there is nothing to keep
+    compatible with.
+    """
+    resp = ops_client.request(
+        method, path, params={"token": _token("admin")}, json=body
+    )
+    assert resp.status_code in (401, 403), (
+        f"{method} {path} still accepts a credential in the query string "
+        f"({resp.status_code})"
+    )
+
+
+@pytest.mark.parametrize("method,path,body", OPS_REQUESTS)
+def test_the_token_is_not_a_declared_query_parameter(method, path, body):
+    """Asserted against the generated OpenAPI, because that is what the query
+    binding actually shows up in — and what a client would be told to send."""
+    from fastapi import FastAPI
+
+    import routes.operations_routes as ops
+
+    app = FastAPI()
+    app.include_router(ops.router)
+    spec = app.openapi()
+
+    for spec_path, operations in spec["paths"].items():
+        for verb, operation in operations.items():
+            names = {p["name"] for p in operation.get("parameters", [])}
+            assert "token" not in names, (
+                f"{verb.upper()} {spec_path} declares `token` as a query "
+                "parameter; the credential is back in the URL"
+            )
+            assert operation.get("security"), (
+                f"{verb.upper()} {spec_path} declares no security scheme"
+            )
+
+
+def test_no_operations_route_depends_on_the_query_string_verifier():
+    """The root cause, pinned by name.
+
+    utils.auth.verify_jwt_token takes a bare `token: str`. Anything using it as
+    a dependency puts the credential back in the URL, and the failure is silent
+    — the route keeps working, it just leaks. routes/auth_routes.py defines its
+    OWN bearer-based function of the same name, which is easy to confuse at an
+    import site.
+    """
+    src = (REPO_ROOT / "routes" / "operations_routes.py").read_text(encoding="utf-8")
+    assert "Depends(verify_jwt_token)" not in src, (
+        "an operations route is binding the credential as a query parameter again"
+    )
+    assert "Depends(get_current_user)" in src
