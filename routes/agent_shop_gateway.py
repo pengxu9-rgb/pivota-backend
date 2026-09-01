@@ -13269,12 +13269,36 @@ async def _handle_get_product_detail(
         # so treat it as PRODUCT_NOT_FOUND.
         # Final fallback for Shopify: the product may exist in the merchant's
         # Shopify store but not be present in our cache/hybrid slice yet.
+        # Shopify Admin REST addresses products by NUMERIC id
+        # (/admin/api/<v>/products/<id>.json). Handing it anything else — a
+        # Pivota signature (sig_...), an ext_ seed id, a GID — is not a lookup
+        # that can succeed: Shopify answers a non-404, so `fetch_error` is not
+        # "NOT_FOUND", and the branch below raises 502
+        # SHOPIFY_PRODUCT_FETCH_FAILED. The gateway's error mapping has no arm
+        # for that code, so it lands on MERCHANT_UNAVAILABLE / retriable:true —
+        # a healthy merchant reported as temporarily unreachable, and a chaining
+        # agent told to retry an id that will never resolve. Measured live on
+        # prod 2026-08-31.
+        #
+        # A non-numeric id therefore skips the storefront round trip entirely and
+        # falls through to PRODUCT_NOT_FOUND below, which is both the honest
+        # answer and a TERMINAL one. The gateway now translates sig_ ids to this
+        # merchant's own platform id before ever calling here; this guard is the
+        # backstop for every other id shape, and it must not be removed on the
+        # grounds that the caller "already" translates.
+        shopify_lookup_id = str(product_id or "").strip()
+        if not shopify_lookup_id.isdigit():
+            shopify_lookup_id = ""
+
         try:
             from services.merchant_store_service import get_merchant_active_stores
             from adapters.product_adapters import ShopifyProductAdapter
             from db.products import upsert_product_cache
 
-            stores = await get_merchant_active_stores(merchant_id)
+            # No usable id -> no stores to consider -> no round trip. The
+            # `if shopify_store:` block below is skipped and the request falls
+            # through to PRODUCT_NOT_FOUND.
+            stores = await get_merchant_active_stores(merchant_id) if shopify_lookup_id else []
             shopify_store = next(
                 (
                     s
@@ -13293,7 +13317,7 @@ async def _handle_get_product_detail(
                     shop_domain=shop_domain,
                     access_token=access_token,
                     merchant_id=merchant_id,
-                    product_id=product_id,
+                    product_id=shopify_lookup_id,
                 )
                 if fetched:
                     match = fetched
