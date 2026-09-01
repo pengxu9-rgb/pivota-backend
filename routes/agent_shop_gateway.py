@@ -13286,8 +13286,13 @@ async def _handle_get_product_detail(
         # merchant's own platform id before ever calling here; this guard is the
         # backstop for every other id shape, and it must not be removed on the
         # grounds that the caller "already" translates.
+        # isascii() is load-bearing: str.isdigit() alone is True for non-ASCII
+        # Unicode digits and superscripts ('12³'.isdigit() is True), which would
+        # sail through this guard, reach Shopify as a malformed URL and raise the
+        # very 502 -> MERCHANT_UNAVAILABLE it exists to prevent. isdecimal() is
+        # not sufficient either -- Arabic-Indic digits are decimal.
         shopify_lookup_id = str(product_id or "").strip()
-        if not shopify_lookup_id.isdigit():
+        if not (shopify_lookup_id.isascii() and shopify_lookup_id.isdigit()):
             shopify_lookup_id = ""
 
         try:

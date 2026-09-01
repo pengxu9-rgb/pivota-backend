@@ -65,6 +65,8 @@ def _arrange(monkeypatch: pytest.MonkeyPatch) -> List[str]:
         "gid://shopify/Product/9854988910809",    # a GID is not a REST id either
         "prod::merch_x::shopify::9854988910809",  # a catalog product_key
         "9854988910809abc",                       # numeric prefix, still not numeric
+        "12³",                                    # str.isdigit() is True for superscripts
+        "٩٨٥٤",                                   # ...and for Arabic-Indic digits
     ],
 )
 async def test_non_numeric_id_never_reaches_shopify_and_is_terminal(
