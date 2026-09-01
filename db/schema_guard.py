@@ -381,6 +381,66 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Migration 208: `orders.psp_used` must accept every provider this
+            # code WRITES. Migration 006 froze the list at five names
+            # ('stripe','adyen','checkout','paypal','braintree'); the code moved
+            # on. `_resolve_active_order_psp` copies merchant_psps.provider into
+            # orders.psp_used, and that column can hold 'antom'
+            # (SUPPORTED_CANONICAL_PSPS) — so onboarding succeeded and then EVERY
+            # order creation 500'd on the CHECK. 'protocol_deferred' is the
+            # capability-gated deferred lane's sentinel and was the same defect a
+            # feature flag away. Prod fast mode skips db/migrations/, so own the
+            # apply here too.
+            #
+            # NOT VALID: enforce every new INSERT/UPDATE without scanning the
+            # existing rows. The new list is a strict superset of 006's, so a
+            # widen cannot fail — but on a database where 006 never ran this is
+            # an ADD, and a validating one would scan years of an unconstrained
+            # vocabulary and abort the boot.
+            #
+            # The definition guard is load-bearing: `orders` is the table every
+            # checkout writes, and an unconditional DROP+ADD would take an ACCESS
+            # EXCLUSIVE lock on it once per instance start. Matching on the two
+            # NEW tokens (rather than the exact text) also re-widens if something
+            # re-narrows the constraint.
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF to_regclass('orders') IS NULL THEN
+                        RETURN;
+                      END IF;
+                      IF EXISTS (
+                        SELECT 1
+                          FROM pg_constraint
+                         WHERE conname = 'check_psp_used_valid_provider'
+                           AND conrelid = to_regclass('orders')
+                           AND pg_get_constraintdef(oid) LIKE '%antom%'
+                           AND pg_get_constraintdef(oid) LIKE '%protocol_deferred%'
+                      ) THEN
+                        RETURN;
+                      END IF;
+                      ALTER TABLE orders
+                        DROP CONSTRAINT IF EXISTS check_psp_used_valid_provider;
+                      ALTER TABLE orders
+                        ADD CONSTRAINT check_psp_used_valid_provider
+                        CHECK (
+                          psp_used IS NULL OR psp_used IN (
+                            'stripe',
+                            'adyen',
+                            'checkout',
+                            'paypal',
+                            'braintree',
+                            'antom',
+                            'protocol_deferred'
+                          )
+                        )
+                        NOT VALID;
+                    END $$;
+                    """
+                )
+            )
             # Multi-use partner invite links (migration 171). Production fast
             # mode skips db/migrations/, so ensure the columns the invite-token
             # service reads/writes (use_count, max_uses) exist at startup —
