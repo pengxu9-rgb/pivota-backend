@@ -10,6 +10,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
 from config.platform import pytest_bypass_allowed
+import logging
+
 from config.settings import require_jwt_secret, settings
 import os
 
@@ -18,6 +20,8 @@ import os
 # is what dragged every importer — including batch jobs that never touch a
 # token — into the strength check. require_jwt_secret() reads it at use.
 JWT_ALGORITHM = "HS256"
+
+logger = logging.getLogger("utils.auth")
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
 # Security scheme
@@ -166,6 +170,19 @@ async def get_current_user(
         
     except HTTPException:
         raise
+    except RuntimeError:
+        # require_jwt_secret() refuses on a weak secret, and its message names
+        # the secret's exact byte length. The generic handler below echoed that
+        # into a 401 body, so an anonymous request published how long the shared
+        # signing key is. Logged, never returned.
+        logger.error(
+            "authentication unavailable: the JWT signing secret is not usable "
+            "on this host", exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is temporarily unavailable",
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -382,6 +399,12 @@ def check_permission(user_info: Dict[str, Any], required_permission: str) -> boo
         "outsourced": ["view_dashboard", "view_transactions"]
     }
     
+    if not isinstance(role, str):
+        # permission_map.get(role, []) raises TypeError on a list or dict, which
+        # escaped require_permission as an unhandled 500 rather than a 403. It
+        # denied either way, but a malformed claim is a refusal, not a crash.
+        return False
+
     allowed_permissions = permission_map.get(role, [])
     return required_permission in allowed_permissions
 

@@ -58,12 +58,23 @@ def _b64url_decode(raw: str) -> bytes:
 
 
 def _signing_secret() -> str:
-    return (
-        os.getenv("OUTBOUND_LINKS_SIGNING_SECRET")
-        or os.getenv("ADMIN_API_KEY")  # fallback in dev; not recommended for prod
-        or os.getenv("JWT_SECRET_KEY")
-        or "dev-insecure-secret"
-    )
+    """HMAC key for /r redirect tokens.
+
+    The JWT fallback goes through require_jwt_secret() rather than reading
+    os.environ. Reading the env var directly meant this signer escaped the
+    strength guard entirely: on a host with no JWT_SECRET_KEY, authentication
+    refused loudly while these tokens kept being signed with a literal from this
+    repo. Only the fallback is guarded — a deployment that sets its own
+    OUTBOUND_LINKS_SIGNING_SECRET never reads the JWT key and should not be held
+    to its strength.
+    """
+    explicit = os.getenv("OUTBOUND_LINKS_SIGNING_SECRET") or os.getenv("ADMIN_API_KEY")
+    if explicit:
+        return explicit
+
+    from config.settings import require_jwt_secret
+
+    return require_jwt_secret() or "dev-insecure-secret"
 
 def _reports_signing_secret() -> str:
     # Prefer a dedicated secret so outbound report-share links can be rotated independently.

@@ -853,6 +853,19 @@ def require_jwt_secret() -> str:
     return settings.jwt_secret_key
 
 
+def reset_jwt_secret_verification() -> None:
+    """Forget that this process already verified the secret.
+
+    A test seam, mirroring config.platform.reset_platform_state(). Without it
+    the memo latches for the life of a pytest worker, so any future IN-PROCESS
+    test of the guard would silently depend on whether something else had
+    already tripped it. The suite currently sidesteps this with subprocesses;
+    this is so the next person does not have to.
+    """
+    global _jwt_secret_verified
+    _jwt_secret_verified = False
+
+
 def _enforce_jwt_secret_strength(current: "Settings") -> None:
     """Refuse to run on a real server with a forgeable JWT secret.
 

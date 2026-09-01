@@ -499,3 +499,139 @@ def test_demo_data_fixtures_construct():
         created_at=datetime.now(), metadata={"source": "demo"},
     )
     assert order.status.value == "paid" and payment.transaction_id
+
+
+# ---------------------------------------------------------------------------
+# 4. Nothing reads the signing secret without going through the guard
+# ---------------------------------------------------------------------------
+#
+# The authz half has test_no_bare_check_permission_statements_remain as its
+# completeness guard; this is its counterpart. Three of the five use-site
+# conversions were pinned by nothing — reverting merchant_store_connections,
+# cafe24 or reviews_service to a raw `settings.jwt_secret_key` read left every
+# suite green. A grep-shaped test kills all three at once, and would have caught
+# services/outbound_links_service reading os.getenv("JWT_SECRET_KEY") directly,
+# which escaped the guard entirely.
+
+_SECRET_READ_ALLOWLIST = {
+    # Defines the guard and the fallback it protects.
+    "config/settings.py",
+    # Has its OWN stricter inline guard: refuses unconditionally under 32 bytes
+    # or on the repo literal, not only when deployed. Fails closed, so it is a
+    # second correct answer rather than a bypass.
+    "services/merchant_web_collector_service.py",
+    # An operator CLI, not imported by the app (grep: no importers in routes/,
+    # services/ or main.py). It sources the secret deliberately — from the env
+    # or from Secret Manager via --secret — and runs on a laptop, where the
+    # guard is a no-op anyway. Minting a token is its whole purpose.
+    "scripts/mint_employee_jwt.py",
+}
+
+
+def _secret_readers():
+    """Every module reading the signing secret other than through the guard.
+
+    AST, not grep. A string search over the source flagged this test's own
+    prose and a docstring mentioning the env var, and — worse in the other
+    direction — a needle of "settings.jwt_secret_key" missed
+    `getattr(settings, "jwt_secret_key", "")`, which is how one of these sites
+    was actually written. Matching real attribute accesses and real getenv
+    calls avoids both.
+    """
+    offenders = []
+    for path in REPO_ROOT.rglob("*.py"):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel.startswith((".venv/", "tests/", ".claude/")) or rel in _SECRET_READ_ALLOWLIST:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            # settings.jwt_secret_key
+            if isinstance(node, ast.Attribute) and node.attr == "jwt_secret_key":
+                offenders.append(f"{rel}:{node.lineno}  attribute read")
+            elif isinstance(node, ast.Call):
+                args = [a for a in node.args if isinstance(a, ast.Constant)]
+                # getattr(settings, "jwt_secret_key", ...)
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and any(a.value == "jwt_secret_key" for a in args)
+                ):
+                    offenders.append(f"{rel}:{node.lineno}  getattr read")
+                # os.getenv("JWT_SECRET_KEY") / os.environ.get(...)
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("getenv", "get")
+                    and any(a.value == "JWT_SECRET_KEY" for a in args)
+                ):
+                    offenders.append(f"{rel}:{node.lineno}  env read")
+            # os.environ["JWT_SECRET_KEY"]
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "JWT_SECRET_KEY"
+            ):
+                offenders.append(f"{rel}:{node.lineno}  env subscript")
+    return sorted(set(offenders))
+
+
+def test_the_signing_secret_is_only_read_through_the_guard():
+    """A raw read signs or verifies with a key the guard never inspected.
+
+    If you are adding a legitimate one, put it in _SECRET_READ_ALLOWLIST with
+    the reason — do not widen the needles.
+    """
+    offenders = _secret_readers()
+    assert not offenders, (
+        "these read the JWT signing secret without require_jwt_secret():\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_a_failed_verification_does_not_latch():
+    """require_jwt_secret's docstring asserts this and nothing pinned it.
+
+    Setting `_jwt_secret_verified = True` before the enforcement call — an easy
+    refactor — makes the FIRST weak-secret call raise and every later one
+    succeed, so a process that lost a race at startup would sign forgeable
+    tokens for the rest of its life.
+    """
+    import config.settings as cs
+
+    cs.reset_jwt_secret_verification()
+    original = cs.settings.jwt_secret_key
+    try:
+        cs.settings.jwt_secret_key = cs.DEFAULT_JWT_SECRET_KEY
+        for attempt in range(3):
+            with pytest.raises(RuntimeError):
+                with _deployed_host():
+                    cs.require_jwt_secret()
+            assert cs._jwt_secret_verified is False, (
+                f"the failure latched on attempt {attempt + 1}"
+            )
+    finally:
+        cs.settings.jwt_secret_key = original
+        cs.reset_jwt_secret_verification()
+
+
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def _deployed_host():
+    """Make config.platform report a deployed, production host in-process."""
+    from config import platform
+
+    previous = os.environ.get("PIVOTA_ENV")
+    os.environ["PIVOTA_ENV"] = "production"
+    platform.reset_platform_state()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PIVOTA_ENV", None)
+        else:
+            os.environ["PIVOTA_ENV"] = previous
+        platform.reset_platform_state()
