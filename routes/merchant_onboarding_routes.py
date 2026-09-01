@@ -1314,11 +1314,21 @@ async def manual_approve_kyc(
     
     # Clear rejection reason when approving
     await update_kyc_status(merchant_id, "approved", rejection_reason=None)
-    
+
+    # Symmetry with rejection: approving must let them serve again. Re-derived
+    # from the stores, so a merchant with no active store stays inactive —
+    # approval restores eligibility, not visibility.
+    from services.store_lifecycle_service import sync_catalog_merchant_status
+
+    restored = await sync_catalog_merchant_status(
+        merchant_id, reason="merchant_approved"
+    )
+
     return {
         "status": "success",
         "message": f"Merchant {merchant['business_name']} approved",
-        "merchant_id": merchant_id
+        "merchant_id": merchant_id,
+        "serving_restored": restored,
     }
 
 @router.post("/reject/{merchant_id}", response_model=Dict[str, Any])
@@ -1335,10 +1345,22 @@ async def reject_kyc(
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     await update_kyc_status(merchant_id, "rejected", reason)
-    
+
+    # Close the public-search door. Recall gates on catalog_merchants.status,
+    # which no merchant-lifecycle path wrote — so a rejected merchant kept
+    # serving on public search and agent recall exactly as before. Re-derived
+    # rather than written here: store_lifecycle_service owns that column, and a
+    # direct write would be undone by the next store event.
+    from services.store_lifecycle_service import sync_catalog_merchant_status
+
+    suppression = await sync_catalog_merchant_status(
+        merchant_id, reason="merchant_rejected"
+    )
+
     return {
         "status": "success",
         "message": f"Merchant {merchant['business_name']} rejected",
+        "serving_suppressed": suppression,
         "merchant_id": merchant_id,
         "reason": reason
     }

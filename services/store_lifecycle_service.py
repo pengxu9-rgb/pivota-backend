@@ -186,10 +186,17 @@ def _min_fleet_for_ratio_breaker() -> int:
 # ---------------------------------------------------------------------------
 
 
+# Onboarding statuses that must not serve, whatever the merchant's stores say.
+# `deleted` is the existing soft-delete; `rejected` is an employee's decision
+# after the registration-first auto-approval.
+SUPPRESSED_ONBOARDING_STATUSES = frozenset({"rejected", "deleted"})
+
+
 def derive_merchant_status(
     store_statuses: List[str],
     *,
     no_rows_means_inactive: bool = False,
+    onboarding_status: Optional[str] = None,
 ) -> Optional[str]:
     """Pure: what should catalog_merchants.status be, given this merchant's
     merchant_stores statuses?
@@ -227,6 +234,17 @@ def derive_merchant_status(
     `sync_catalog_merchant_status` on why nothing later repairs it. Narrower
     than the DELETE hole, not closed. Treat this as a known gap, not a proof.
     """
+    # An explicitly rejected or soft-deleted merchant does not serve, whatever
+    # its stores say. Checked FIRST, and deliberately ahead of the no-rows
+    # short-circuit: a rejected merchant with no store rows would otherwise
+    # return None ("don't touch it") and keep serving. The corpus-wide danger
+    # the docstring warns about does not apply, because this fires only on an
+    # explicit merchant_onboarding status — crawl-observed brands and every
+    # merchant that never onboarded have no such row, so they pass through with
+    # onboarding_status=None and the store rule below decides as before.
+    if str(onboarding_status or "").strip().lower() in SUPPRESSED_ONBOARDING_STATUSES:
+        return "inactive"
+
     rows = [str(s or "").strip().lower() for s in store_statuses]
     if not rows:
         return "inactive" if no_rows_means_inactive else None
@@ -281,9 +299,21 @@ async def sync_catalog_merchant_status(
             "SELECT status FROM merchant_stores WHERE merchant_id = :merchant_id",
             {"merchant_id": mid},
         )
+        # The merchant's own lifecycle is an input to the derivation, not a
+        # second writer of this column. Writing catalog_merchants.status from
+        # the rejection route directly would be undone the next time any store
+        # event re-derived it.
+        onboarding_row = await database.fetch_one(
+            "SELECT status FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+            {"merchant_id": mid},
+        )
+        onboarding_status = (
+            str(dict(onboarding_row).get("status") or "") if onboarding_row else None
+        )
         desired = derive_merchant_status(
             [dict(r).get("status") for r in store_rows],
             no_rows_means_inactive=last_store_removed,
+            onboarding_status=onboarding_status,
         )
         if desired is None:
             result["skipped"] = "no_store_rows"

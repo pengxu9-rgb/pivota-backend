@@ -131,3 +131,102 @@ def test_the_billing_gate_reads_status_alone():
     src = (BACKEND_ROOT / "routes" / "billing_routes.py").read_text(encoding="utf-8")
     assert 'if merchant_status != "approved":' in src
     assert "auto_approved" not in src
+
+
+# --- serving: public search and agent recall --------------------------------
+
+from services.store_lifecycle_service import (  # noqa: E402
+    SUPPRESSED_ONBOARDING_STATUSES,
+    derive_merchant_status,
+)
+
+
+@pytest.mark.parametrize("status", sorted(SUPPRESSED_ONBOARDING_STATUSES))
+def test_a_suppressed_merchant_stops_serving_even_with_an_active_store(status):
+    """Public recall gates on catalog_merchants.status, which is derived from
+    store connectivity — so a rejected merchant with a live store kept serving.
+    The onboarding status is now an input to that derivation."""
+    assert derive_merchant_status(["active"], onboarding_status=status) == "inactive"
+    assert derive_merchant_status(["active", "connected"], onboarding_status=status) == "inactive"
+
+
+@pytest.mark.parametrize("status", sorted(SUPPRESSED_ONBOARDING_STATUSES))
+def test_suppression_beats_the_no_store_rows_short_circuit(status):
+    """The ordering that matters. `derive_merchant_status` returns None — "don't
+    touch it" — for a merchant with no store rows, which is 471 of 483 rows in
+    prod. A rejected merchant with no stores would have kept serving on that
+    branch, so the suppression check runs BEFORE it."""
+    assert derive_merchant_status([], onboarding_status=status) == "inactive"
+
+
+def test_the_crawl_corpus_is_untouched():
+    """The danger the derivation's own docstring warns about: a rule of "no
+    active store => inactive" applied corpus-wide empties public search.
+    Crawl-observed brands have no merchant_onboarding row at all, so they arrive
+    with onboarding_status=None and the store rule decides exactly as before."""
+    assert derive_merchant_status([], onboarding_status=None) is None
+    assert derive_merchant_status([], onboarding_status="") is None
+    assert derive_merchant_status([]) is None
+
+
+@pytest.mark.parametrize("status", ["approved", "pending_verification", None])
+def test_a_merchant_in_good_standing_still_serves(status):
+    """The positive counterpart — suppression must key on the REJECTION, not on
+    being checked at all."""
+    assert derive_merchant_status(["active"], onboarding_status=status) == "active"
+    assert derive_merchant_status(["inactive"], onboarding_status=status) == "inactive"
+
+
+def test_approving_restores_eligibility_not_visibility():
+    """Re-approval re-derives from the stores rather than forcing 'active': a
+    merchant whose stores are all gone must not be resurrected into search."""
+    assert derive_merchant_status(["active"], onboarding_status="approved") == "active"
+    assert derive_merchant_status(["inactive"], onboarding_status="approved") == "inactive"
+    assert derive_merchant_status([], onboarding_status="approved") is None
+
+
+# --- orders -----------------------------------------------------------------
+
+def _order_gate_blocks(status):
+    """The decision from routes/order_routes.py's order-creation gate, read off
+    the real source so it cannot drift from a re-typed copy."""
+    import re
+
+    src = (BACKEND_ROOT / "routes" / "order_routes.py").read_text(encoding="utf-8")
+    assert 'merchant_status = str(merchant.get("status") or "").strip().lower()' in src, (
+        "the order-creation merchant status gate moved; re-point this test"
+    )
+    match = re.search(
+        r"merchant_status = str\(merchant\.get\(\"status\"\) or \"\"\)\.strip\(\)\.lower\(\)\n"
+        r"\s*if (.+?):\n",
+        src,
+    )
+    assert match
+    return eval(  # noqa: S307 - this repo's own gate expression
+        match.group(1),
+        {"merchant_status": status,
+         "SUPPRESSED_ONBOARDING_STATUSES": SUPPRESSED_ONBOARDING_STATUSES},
+    )
+
+
+@pytest.mark.parametrize(
+    "status,blocked",
+    [("rejected", True), ("deleted", True), ("approved", False),
+     ("pending_verification", False), ("", False)],
+)
+def test_order_creation_refuses_a_rejected_merchant(status, blocked):
+    """routes/order_routes.py:3494 checked that the merchant EXISTED and nothing
+    else, so a rejected merchant kept taking orders. Both entry points funnel
+    here — routes/agent_v2.create_order_v2 builds a CreateOrderRequest and calls
+    this handler — so one gate covers both."""
+    assert _order_gate_blocks(status) is blocked
+
+
+def test_both_order_entry_points_reach_the_same_handler():
+    """The claim the single gate rests on. If agent_v2 ever stops delegating,
+    it needs its own check and this is the test that says so."""
+    src = (BACKEND_ROOT / "routes" / "agent_v2.py").read_text(encoding="utf-8")
+    assert "agent_v1_create_order(" in src, (
+        "agent_v2 no longer delegates to the order_routes handler; the order "
+        "gate must be duplicated there or moved deeper"
+    )

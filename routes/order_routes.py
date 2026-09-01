@@ -31,6 +31,7 @@ from db.orders import (
 )
 from db.orders import orders as orders_table
 from db.merchant_onboarding import get_merchant_onboarding
+from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
 from db.products import log_order_event
 from db.database import database, IS_POSTGRES
 from utils.auth import require_admin, require_admin_or_key, get_current_user
@@ -3505,6 +3506,27 @@ async def create_new_order(
             raise merchant
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
+
+        # A rejected merchant must not take new orders. Registration
+        # auto-approves everyone, so rejection is the only lever an employee
+        # has, and until now it reached neither this path nor public serving —
+        # order creation checked that the merchant EXISTED and nothing else.
+        # Checked here rather than deeper because `merchant` is already loaded:
+        # no extra query, and both order entry points funnel through this
+        # handler (routes/agent_v2.create_order_v2 builds a CreateOrderRequest
+        # and calls it).
+        merchant_status = str(merchant.get("status") or "").strip().lower()
+        if merchant_status in SUPPRESSED_ONBOARDING_STATUSES:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "MERCHANT_NOT_ACCEPTING_ORDERS",
+                    "message": (
+                        "This merchant is not currently able to accept orders."
+                    ),
+                    "merchant_id": order_request.merchant_id,
+                },
+            )
 
         if _is_checkout_ui_order_create(order_request.metadata) and not order_request.quote_id:
             raise HTTPException(
