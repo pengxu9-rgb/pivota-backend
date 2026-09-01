@@ -144,50 +144,79 @@ class PaymentOrchestrator:
         payment_response: PaymentResponse
     ):
         """Publish payment events to dashboard and external systems"""
+        # `agent`/`merchant` are REQUIRED positionally-named args of both
+        # publishers; the old call passed `agent_id`/`merchant_id` instead, which
+        # is why neither event ever reached the metrics store (see below).
+        agent = order.agent_id or "system"
+        agent_name = f"Agent {order.agent_id}" if order.agent_id else "System"
+        merchant = order.merchant_id
+        merchant_name = f"Merchant {order.merchant_id}"
+
         try:
-            # Publish payment result event
+            # Publish payment result event.
+            # `status` is the field realtime/metrics_store.py counts on, and it
+            # compares against the literal "succeeded" — a bare bool never
+            # matched, so success would have been recorded as a failure even if
+            # the call had bound.
             await event_publisher.publish_payment_result(
                 order_id=order.id,
-                payment_id=payment.id,
-                success=payment_response.success,
+                agent=agent,
+                agent_name=agent_name,
+                merchant=merchant,
+                merchant_name=merchant_name,
                 psp=payment.psp.value,
-                amount=payment.amount,
-                currency=payment.currency,
-                fees=payment.fees,
-                transaction_id=payment.transaction_id,
-                error_message=payment_response.error_message,
-                agent=order.agent_id or "system",
-                agent_name=f"Agent {order.agent_id}" if order.agent_id else "System",
-                merchant=order.merchant_id,
-                merchant_name=f"Merchant {order.merchant_id}",
+                status="succeeded" if payment_response.success else "failed",
                 latency_ms=100,  # Simulated latency
                 attempt=1,
+                amount=payment.amount,
+                currency=payment.currency,
                 additional_data={
                     "order_status": order.status.value,
                     "payment_method": order.payment_method,
-                    "customer_email": order.customer_email
+                    "customer_email": order.customer_email,
+                    # These five were passed as top-level kwargs the publisher
+                    # does not accept. They carry real data, so they move into
+                    # additional_data (which the publisher merges into the
+                    # event) rather than being dropped.
+                    "payment_id": payment.id,
+                    "success": payment_response.success,
+                    "fees": payment.fees,
+                    "transaction_id": payment.transaction_id,
+                    "error_message": payment_response.error_message,
                 }
             )
             
             # Publish order event
             await event_publisher.publish_order_event(
                 order_id=order.id,
-                merchant_id=order.merchant_id,
-                agent_id=order.agent_id,
+                agent=agent,
+                agent_name=agent_name,
+                merchant=merchant,
+                merchant_name=merchant_name,
+                event_type=(
+                    "order_completed" if payment_response.success else "order_failed"
+                ),
                 status=order.status.value,
-                total_amount=order.total_amount,
-                currency=order.currency,
-                items_count=len(order.items),
-                customer_email=order.customer_email,
                 additional_data={
                     "payment_id": payment.id,
                     "psp_used": payment.psp.value,
-                    "transaction_id": payment.transaction_id
+                    "transaction_id": payment.transaction_id,
+                    # Same story as above: not accepted as top-level kwargs.
+                    "total_amount": order.total_amount,
+                    "currency": order.currency,
+                    "items_count": len(order.items),
+                    "customer_email": order.customer_email,
                 }
             )
             
         except Exception as e:
-            logger.error(f"Failed to publish payment events: {e}")
+            # Event publishing must never fail a payment, so this stays broad.
+            # But it swallowed a TypeError on every single call for as long as
+            # this function has existed, and the one-line `{e}` render made that
+            # look like a transient publish failure rather than a signature that
+            # never matched. exc_info gives the traceback that would have named
+            # the bad kwarg on the first occurrence.
+            logger.error(f"Failed to publish payment events: {e}", exc_info=True)
     
     async def retry_failed_payment(
         self, 

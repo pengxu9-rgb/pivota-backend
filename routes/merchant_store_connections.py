@@ -258,7 +258,9 @@ _SHOPIFY_CLAIM_TOKEN_TTL_SECONDS = 60 * 60
 
 
 def _claim_signing_key() -> str:
-    return (settings.jwt_secret_key or "").strip()
+    from config.settings import require_jwt_secret
+
+    return (require_jwt_secret() or "").strip()
 
 
 def _b64url(data: bytes) -> str:

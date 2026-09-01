@@ -55,6 +55,15 @@ on:
       - 'middleware/**'
       - 'core/**'
       - 'catalog/**'
+      # dashboard/ and orchestrator/ matched NO filter, and two of the tests in
+      # tests/test_operations_authz_and_jwt_secret_enforcement.py exist to guard
+      # exactly those two files — the orchestrator's publisher call signatures
+      # and dashboard/core.py's model shapes. A PR touching only one of them ran
+      # the sweep zero times while `CI Entrypoint`, the required check, went
+      # green having executed nothing against it. Same shape as the realtime/,
+      # infra/ and .github/ entries.
+      - 'dashboard/**'
+      - 'orchestrator/**'
       - 'observability/**'
       # realtime/ was added for ws_guard.py's admission ceiling, which has since
       # been deleted along with the WebSocket surface it guarded. The line stays

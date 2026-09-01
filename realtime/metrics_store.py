@@ -18,12 +18,14 @@ logger = logging.getLogger("metrics_store")
 #     and "view_transactions" in `permission_map`. Added here because omitting
 #     them regressed every internal viewer to an all-zero dashboard once the
 #     admin default was removed.
-#   super_admin, admin, employee, operator, viewer — utils/auth.py:448, the
-#     global-access list in `validate_entity_access`. NOTE that `operator` and
-#     `viewer` appear in no key of `permission_map` at all, so
-#     `check_permission` returns False for them for every permission. They are
-#     carried over from the list this replaced rather than independently
-#     grounded, and :448 is the only place the system says they see everything.
+#   super_admin, admin, employee, operator, viewer — the global-access list in
+#     `validate_entity_access`. `operator` also has a `permission_map` entry as
+#     of the authz fix; `viewer` still has none, so `check_permission` returns
+#     False for it for every permission and that list is the only place the
+#     system says a viewer sees everything. Note `viewer` and `outsourced` are
+#     now denied at /api/operations/dashboard-summary, the sole caller of
+#     get_snapshot(role=...), which makes their entries here unreachable in
+#     practice until some other reader appears.
 #
 # Not a widening either way: the previous code called get_snapshot() with no
 # arguments and took its role="admin" default, so every caller already received

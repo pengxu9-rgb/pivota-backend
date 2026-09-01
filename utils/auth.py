@@ -10,12 +10,18 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import bcrypt
 from config.platform import pytest_bypass_allowed
-from config.settings import settings
+import logging
+
+from config.settings import require_jwt_secret, settings
 import os
 
 # JWT Configuration
-JWT_SECRET = settings.jwt_secret_key
+# No module-level JWT_SECRET. Binding it here read the secret at IMPORT, which
+# is what dragged every importer — including batch jobs that never touch a
+# token — into the strength check. require_jwt_secret() reads it at use.
 JWT_ALGORITHM = "HS256"
+
+logger = logging.getLogger("utils.auth")
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
 # Security scheme
@@ -71,7 +77,7 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
         "iat": datetime.utcnow()
     })
     
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, require_jwt_secret(), algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
 
@@ -91,7 +97,7 @@ def decode_token(token: str) -> Dict[str, Any]:
     try:
         payload = jwt.decode(
             token,
-            JWT_SECRET,
+            require_jwt_secret(),
             algorithms=[JWT_ALGORITHM],
             options={"verify_aud": False},
         )
@@ -164,6 +170,19 @@ async def get_current_user(
         
     except HTTPException:
         raise
+    except RuntimeError:
+        # require_jwt_secret() refuses on a weak secret, and its message names
+        # the secret's exact byte length. The generic handler below echoed that
+        # into a 401 body, so an anonymous request published how long the shared
+        # signing key is. Logged, never returned.
+        logger.error(
+            "authentication unavailable: the JWT signing secret is not usable "
+            "on this host", exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is temporarily unavailable",
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -317,6 +336,11 @@ async def get_current_employee(current_user: Dict[str, Any] = Depends(get_curren
 EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
 ADMIN_ROLES = ["super_admin", "admin"]
 
+# Permission guarding /api/operations/* (merchant & agent onboarding, approval,
+# verification, API-key issuance, audit log). A named permission, not a role
+# name — see the note in check_permission's permission_map.
+MANAGE_OPERATIONS = "manage_operations"
+
 
 def is_employee(role: str) -> bool:
     """Check if role is an employee role"""
@@ -351,16 +375,52 @@ def check_permission(user_info: Dict[str, Any], required_permission: str) -> boo
         if "super_admin" not in required_permission:
             return True
     
-    # Define permission mappings
+    # Define permission mappings.
+    #
+    # NOTE: this map is keyed by ROLE and its values are PERMISSION strings.
+    # Passing a role name (e.g. "operator") as `required_permission` matches
+    # nothing here and silently denies — which is what every caller in
+    # routes/operations_routes.py used to do. Permissions are the vocabulary;
+    # add one here rather than passing a role name through.
     permission_map = {
-        "employee": ["view_dashboard", "view_transactions", "view_merchants", "view_agents"],
+        "employee": [
+            "view_dashboard", "view_transactions", "view_merchants",
+            "view_agents", MANAGE_OPERATIONS,
+        ],
+        # "operator" is a real role token elsewhere in the system (see
+        # UserRole.OPERATOR in dashboard/core.py, the staff list at
+        # validate_entity_access below, and realtime/metrics_store.py) but had
+        # no entry here at all, so an operator held zero permissions.
+        "operator": ["view_dashboard", "view_transactions", MANAGE_OPERATIONS],
         "merchant": ["view_own_orders", "view_own_transactions", "manage_own_products"],
         "agent": ["create_orders", "view_own_orders", "view_own_analytics"],
+        # Deliberately NOT granted MANAGE_OPERATIONS: the operations routes
+        # approve merchants and issue API keys.
         "outsourced": ["view_dashboard", "view_transactions"]
     }
     
+    if not isinstance(role, str):
+        # permission_map.get(role, []) raises TypeError on a list or dict, which
+        # escaped require_permission as an unhandled 500 rather than a 403. It
+        # denied either way, but a malformed claim is a refusal, not a crash.
+        return False
+
     allowed_permissions = permission_map.get(role, [])
     return required_permission in allowed_permissions
+
+
+def require_permission(user_info: Dict[str, Any], required_permission: str) -> None:
+    """Raise 403 unless the caller holds `required_permission`.
+
+    `check_permission` RETURNS a bool and never raises, so calling it as a bare
+    statement authorizes nothing. Use this at route call sites; it is the only
+    one of the two that is a guard.
+    """
+    if not check_permission(user_info, required_permission):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Missing required permission: {required_permission}",
+        )
 
 
 def can_access_merchant(user_info: Dict[str, Any], merchant_id: str) -> bool:

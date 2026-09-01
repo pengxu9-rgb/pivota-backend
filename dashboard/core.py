@@ -12,6 +12,11 @@ class OrderStatus(str, Enum):
     """Order status enumeration"""
     PENDING = "pending"
     PROCESSING = "processing"
+    # PAID is referenced by orchestrator/payment_orchestrator.py and
+    # routes/demo_data_routes.py and was simply absent here, so both raised
+    # AttributeError("PAID") before reaching anything else. It is a distinct
+    # state from COMPLETED: money captured vs order fulfilled.
+    PAID = "paid"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -40,26 +45,101 @@ class User:
         self.created_at = datetime.utcnow()
 
 class Order:
-    """Order model"""
-    def __init__(self, id: str, user_id: str, amount: float, currency: str = "USD"):
+    """Order model.
+
+    Two call shapes exist and both are supported deliberately:
+
+      Order(order_id, user_id, amount, currency)      # positional, DashboardCore
+      Order(id=..., merchant_id=..., agent_id=...,    # keyword, the commerce path
+            customer_email=..., total_amount=..., items=[...], ...)
+
+    Only the first was implemented. The second is what
+    orchestrator/payment_orchestrator.py and routes/demo_data_routes.py have
+    always passed, and what routes/dashboard_api.py and routes/payment_routes.py
+    have always READ back (`order.total_amount`, `order.merchant_id`,
+    `order.agent_id`, `order.customer_email`) — so construction raised TypeError
+    and every reader would have raised AttributeError. The keyword fields below
+    are what those four modules require; none is new invention.
+
+    `amount` and `total_amount` are the same number under two names, because
+    both are already read in the codebase. Setting either sets both.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        user_id: Optional[str] = None,
+        amount: Optional[float] = None,
+        currency: str = "USD",
+        *,
+        merchant_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        customer_email: Optional[str] = None,
+        total_amount: Optional[float] = None,
+        status: OrderStatus = OrderStatus.PENDING,
+        items: Optional[List[Dict[str, Any]]] = None,
+        payment_method: Optional[str] = None,
+        psp_used: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+        updated_at: Optional[datetime] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = id
         self.user_id = user_id
-        self.amount = amount
+        resolved_amount = amount if amount is not None else total_amount
+        self.amount = resolved_amount if resolved_amount is not None else 0.0
+        self.total_amount = self.amount
         self.currency = currency
-        self.status = OrderStatus.PENDING
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.merchant_id = merchant_id
+        self.agent_id = agent_id
+        self.customer_email = customer_email
+        self.status = status
+        self.items = items if items is not None else []
+        self.payment_method = payment_method
+        self.psp_used = psp_used
+        self.created_at = created_at or datetime.utcnow()
+        self.updated_at = updated_at or datetime.utcnow()
+        self.metadata = metadata if metadata is not None else {}
 
 class Payment:
-    """Payment model"""
-    def __init__(self, id: str, order_id: str, amount: float, psp: PSPType):
+    """Payment model.
+
+    Same story as Order: the positional shape below is DashboardCore's, the
+    keyword fields are what payment_orchestrator.py and demo_data_routes.py pass
+    and what dashboard_api.py reads back (`payment.currency`, `.transaction_id`,
+    `.fees`).
+
+    `status` is intentionally untyped: DashboardCore sets an OrderStatus, while
+    the payment path sets the PSP vocabulary ("succeeded"/"failed") that
+    realtime/metrics_store.py counts on. Narrowing it would break one of them.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        order_id: str,
+        amount: float,
+        psp: PSPType,
+        *,
+        currency: str = "USD",
+        status: Any = OrderStatus.PENDING,
+        transaction_id: Optional[str] = None,
+        fees: float = 0.0,
+        created_at: Optional[datetime] = None,
+        updated_at: Optional[datetime] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = id
         self.order_id = order_id
         self.amount = amount
         self.psp = psp
-        self.status = OrderStatus.PENDING
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.currency = currency
+        self.status = status
+        self.transaction_id = transaction_id
+        self.fees = fees
+        self.created_at = created_at or datetime.utcnow()
+        self.updated_at = updated_at or datetime.utcnow()
+        self.metadata = metadata if metadata is not None else {}
 
 class PSPConfig:
     """PSP Configuration model"""
