@@ -8,6 +8,11 @@
    nothing and only the admin/super_admin early-returns would have passed.
 2. orchestrator/payment_orchestrator.py called event_publisher with kwargs the
    publishers do not accept; the TypeError was swallowed by `except Exception`.
+   That whole module was DELETED on 2026-08-31 -- it stood on the empty
+   `psp.connectors.psp_manager` registry and could never reach a PSP -- so the
+   section that pinned its two publisher call sites is gone with it. See
+   tests/test_dead_psp_connectors_removed.py. dashboard.core's model repair
+   (section 4 below) is NOT affected: routes/demo_data_routes.py still uses it.
 3. config/production.py declared min_length=32 on the JWT secret, but nothing
    instantiated ProductionSettings (and it could not even be imported under
    Pydantic v2), so the live secret in config/settings.py was unchecked. That
@@ -15,7 +20,6 @@
 """
 
 import ast
-import inspect
 import os
 import subprocess
 import sys
@@ -201,99 +205,6 @@ def test_no_bare_check_permission_statements_remain():
 
 
 # ---------------------------------------------------------------------------
-# 2. payment_orchestrator's event_publisher calls actually bind
-# ---------------------------------------------------------------------------
-
-def _publisher_calls():
-    """Every `event_publisher.<name>(...)` call in the orchestrator, as
-    (name, set_of_keyword_names, lineno). Read from source so the test checks
-    the real call sites rather than a re-typed copy of them."""
-    path = REPO_ROOT / "orchestrator" / "payment_orchestrator.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    calls = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "event_publisher"
-        ):
-            calls.append(
-                (node.func.attr, {kw.arg for kw in node.keywords}, node.lineno)
-            )
-    return calls
-
-
-def _publisher_call(name):
-    """The ast.Call node for one `event_publisher.<name>(...)` site.
-
-    Returns the NODE, not a summary of it, so a test can assert on what an
-    argument is actually set to rather than searching the file for a string
-    that may well appear somewhere else entirely.
-    """
-    path = REPO_ROOT / "orchestrator" / "payment_orchestrator.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "event_publisher"
-            and node.func.attr == name
-        ):
-            return node
-    raise AssertionError(f"no event_publisher.{name}(...) call found")
-
-
-def test_orchestrator_publisher_calls_are_found():
-    """Guards the test below: an AST query that matches nothing passes vacuously."""
-    assert len(_publisher_calls()) == 2, _publisher_calls()
-
-
-@pytest.mark.parametrize("name,kwargs,lineno", _publisher_calls())
-def test_orchestrator_publisher_calls_bind_to_the_real_signature(name, kwargs, lineno):
-    """The defect: both calls raised TypeError on every invocation.
-
-    publish_payment_result was missing `status` and passed five unknown kwargs;
-    publish_order_event was missing agent/agent_name/merchant/merchant_name/
-    event_type and passed six unknown ones.
-    """
-    from utils.event_publisher import event_publisher
-
-    sig = inspect.signature(getattr(event_publisher, name))
-    try:
-        sig.bind(**{k: None for k in kwargs})
-    except TypeError as exc:
-        accepted = set(sig.parameters)
-        pytest.fail(
-            f"payment_orchestrator.py:{lineno} {name}(...) does not bind: {exc}\n"
-            f"  unexpected: {sorted(kwargs - accepted)}\n"
-            f"  missing:    {sorted(p for p in accepted if p not in kwargs)}"
-        )
-
-
-def test_payment_result_status_uses_the_vocabulary_metrics_store_counts():
-    """realtime/metrics_store.py compares status against the literal
-    "succeeded". A bool (what the old call passed as `success=`) never matched,
-    so a successful payment would have been recorded as a failure.
-
-    Asserted on the `status` KEYWORD of the publish_payment_result call. The
-    first version searched the whole file for that ternary as a substring — and
-    the identical string already exists on origin/main inside the Payment(...)
-    constructor, on a line this change never touches, so the test passed with
-    the entire orchestrator reverted. Same literal, wrong call.
-    """
-    call = _publisher_call("publish_payment_result")
-    status = next(
-        (kw for kw in call.keywords if kw.arg == "status"), None
-    )
-    assert status is not None, "publish_payment_result is called without status="
-    rendered = ast.unparse(status.value)
-    assert "succeeded" in rendered and "failed" in rendered, rendered
-    assert "payment_response.success" in rendered, rendered
-
-
-# ---------------------------------------------------------------------------
 # 3. The JWT secret length is enforced where the secret actually lives
 # ---------------------------------------------------------------------------
 
@@ -449,10 +360,11 @@ def test_config_production_is_gone():
 # ---------------------------------------------------------------------------
 # 4. dashboard.core's models support the shape their callers actually use
 # ---------------------------------------------------------------------------
-# Discovered while fixing (2): the event publishing above was unreachable.
-# process_order_payment died ~15 lines earlier on OrderStatus.PAID and then on
-# Order(...)/Payment(...), whose implemented signatures were (id, user_id,
-# amount, currency) and (id, order_id, amount, psp).
+# Discovered while fixing the payment_orchestrator publisher calls (that section
+# went with the module on 2026-08-31): process_order_payment died on
+# OrderStatus.PAID and then on Order(...)/Payment(...), whose implemented
+# signatures were (id, user_id, amount, currency) and (id, order_id, amount,
+# psp). routes/demo_data_routes.py still depends on the repaired shapes.
 
 def test_order_status_has_paid():
     from dashboard.core import OrderStatus
@@ -469,7 +381,7 @@ def test_order_supports_both_construction_shapes():
     # amount and total_amount are the same number under two names; both are read.
     assert legacy.total_amount == 12.5
 
-    # Commerce shape, used by payment_orchestrator and demo_data_routes.
+    # Commerce shape, used by demo_data_routes.
     rich = Order(
         id="o2", merchant_id="M1", agent_id="A1", customer_email="c@x.com",
         total_amount=29.99, currency="USD", status=OrderStatus.PAID,
@@ -761,63 +673,11 @@ def test_every_operations_route_still_admits_staff(ops_client, role, method, pat
     )
 
 
-def test_the_payment_status_ternary_has_the_right_polarity():
-    """Inverting it — "failed" if success else "succeeded" — survived, because
-    the assertion only checked that the rendered expression CONTAINED both
-    words. That inversion is precisely the defect the test's docstring names."""
-    call = _publisher_call("publish_payment_result")
-    status = next(kw for kw in call.keywords if kw.arg == "status")
-    rendered = ast.unparse(status.value)
-    assert rendered.startswith("'succeeded' if") or rendered.startswith('"succeeded" if'), (
-        f"status polarity is inverted or restructured: {rendered}"
-    )
-
-
-async def test_the_repaired_publisher_actually_reaches_the_metrics_store():
-    """The section-2 repair was verified structurally and never by calling it.
-
-    Inserting `return` as the first statement of _publish_payment_events, or
-    inverting the order event's type, both survived the whole suite — so nothing
-    proved the events reach the store, which is the thing that was broken.
-    """
-    from types import SimpleNamespace
-
-    import orchestrator.payment_orchestrator as po
-    from realtime import metrics_store
-
-    store = metrics_store.get_metrics_store()
-    store.reset_metrics()
-
-    # Exactly the attributes the publisher reads, no more: order.{id,
-    # merchant_id, agent_id, customer_email, payment_method, status},
-    # payment.{id, amount, currency, psp, fees, transaction_id},
-    # payment_response.{success, error_message}. Omitting `payment_method` made
-    # the first version of this test fail for the RIGHT reason but the wrong
-    # cause — the AttributeError was swallowed by the handler's bare
-    # `except Exception`, which is the same swallow that hid the original
-    # TypeError for however long it was there.
-    order = SimpleNamespace(
-        id="ORD_1", merchant_id="merch_a", agent_id="agent_a",
-        customer_email="b@x.com", payment_method="card",
-        status=SimpleNamespace(value="paid"),
-    )
-    payment = SimpleNamespace(
-        id="PAY_1", amount=10.0, currency="USD",
-        psp=SimpleNamespace(value="stripe"), fees=0.3, transaction_id="txn_1",
-    )
-    response = SimpleNamespace(success=True, error_message=None)
-
-    orchestrator = po.PaymentOrchestrator.__new__(po.PaymentOrchestrator)
-    await orchestrator._publish_payment_events(order, payment, response)
-
-    assert store.counters["total"] > 0, (
-        "no event reached the metrics store; the publisher repair is inert"
-    )
-    assert store.counters["success"] >= 1, (
-        'the payment event did not record as "succeeded" — the vocabulary the '
-        "store counts on"
-    )
-    assert "stripe" in store.psp_metrics, "the psp was not recorded"
+# The two orchestrator survivors that lived here -- the publish_payment_result
+# status-polarity check and the "the repaired publisher actually reaches the
+# metrics store" call -- went with orchestrator/payment_orchestrator.py on
+# 2026-08-31. Their replacement is the deletion contract in
+# tests/test_dead_psp_connectors_removed.py.
 
 
 # ---------------------------------------------------------------------------

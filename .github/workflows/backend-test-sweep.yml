@@ -64,6 +64,13 @@ on:
       # infra/ and .github/ entries.
       - 'dashboard/**'
       - 'orchestrator/**'
+      # psp/** is listed for a directory that does NOT exist: the whole
+      # package was deleted on 2026-08-31 and
+      # tests/test_dead_psp_connectors_removed.py asserts it stays gone.
+      # A PR that re-adds only psp/ files -- exactly that regression --
+      # matched none of these globs, so the sweep skipped and the
+      # required check went green having never run the guard.
+      - 'psp/**'
       - 'observability/**'
       # realtime/ was added for ws_guard.py's admission ceiling, which has since
       # been deleted along with the WebSocket surface it guarded. The line stays
