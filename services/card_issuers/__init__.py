@@ -36,15 +36,38 @@ class IssuedCard:
 
 
 class CardIssuerError(Exception):
-    def __init__(self, code: str, message: str):
+    """`issuer_card_ref` is set ONLY when a card may exist at the issuer despite the failure.
+
+    That happens on exactly one class of failure today: we got a 2xx, extracted a real card id,
+    and then refused because the issuer would not confirm the constraints. The card is real; our
+    row will say `failed`; and this ref is the only handle anything has to go revoke it. A
+    transport error or a non-2xx leaves it None, because no card was minted to orphan.
+
+    Carrying it on the exception rather than only logging it is what lets the caller PERSIST it —
+    a log line is not a work queue, and the revocation sweep reads rows.
+    """
+
+    def __init__(self, code: str, message: str, *, issuer_card_ref: Optional[str] = None):
         super().__init__(message)
         self.code = code
+        self.issuer_card_ref = issuer_card_ref
 
 
 class CardIssuer(Protocol):
     name: str
 
     async def issue(self, request: IssueRequest) -> IssuedCard: ...
+
+    async def revoke(self, issuer_card_ref: str) -> None:
+        """Kill a card at the issuer. Returns normally ONLY on confirmed revocation.
+
+        Raises CardIssuerError otherwise — including when the issuer answered 2xx but did not
+        confirm the card is dead. Same rule as issuance: an unconfirmed constraint is not a
+        constraint, and an unconfirmed revocation is not a revocation. The sweep leaves such a
+        row alone so the next run tries again, which is the correct posture for a card that may
+        be spendable and uncapped.
+        """
+        ...
 
 
 def resolve_issuer(env: Optional[Dict[str, str]] = None) -> Optional[CardIssuer]:

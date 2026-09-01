@@ -313,6 +313,24 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Orphan card revocation: kill cards that exist at the issuer but that we refused to
+        # accept because the constraints came back unconfirmed or contradicted. Runs HOURLY, not
+        # daily, and that is the point — an orphan may be an uncapped, unlocked card, so the
+        # window in which it is spendable is the thing being minimised. Cheap when idle: one
+        # indexed query that returns nothing unless a mint actually failed that way.
+        # Its own kill switch (AGENT_CARD_REVOCATION_SWEEP_ENABLED, default off) gates the
+        # provider calls, so registering it here is inert until that is set.
+        from jobs.agent_card_revocation_sweep import run_agent_card_revocation_sweep
+        _add_job(
+            run_agent_card_revocation_sweep,
+            "cron",
+            minute=17,          # off the hour, away from the :00 cron pile-up
+            id="agent_card_revocation_sweep",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+        )
+
         # Outcome aggregation: roll the decision -> order -> paid/refund loop into
         # per-merchant + per-product outcome metrics (aggregated_outcomes). Daily at
         # 05:00 UTC (after nightly_index_health). Min-sample-gated, so it surfaces

@@ -35,6 +35,11 @@ class ReapIssuer:
         self.base_url = str(env.get("REAP_API_BASE") or "").strip().rstrip("/")
         self.api_key = str(env.get("REAP_API_KEY") or "").strip()
         self.issue_path = str(env.get("REAP_ISSUE_CARD_PATH") or "/v1/cards").strip()
+        # `{card_id}` is substituted at call time. Configurable for the same reason issue_path
+        # is: the real shape is unverified and must be correctable without a code change.
+        self.revoke_path = str(
+            env.get("REAP_REVOKE_CARD_PATH") or "/v1/cards/{card_id}/cancel"
+        ).strip()
         if not self.base_url or not self.api_key:
             raise CardIssuerError(
                 "REAP_UNCONFIGURED", "REAP_API_BASE and REAP_API_KEY are required for CARD_ISSUER=reap"
@@ -81,10 +86,10 @@ class ReapIssuer:
         constraint it would not confirm, instead of appearing to work.
 
         ⚠️ A REFUSAL HERE DOES NOT UN-MINT THE CARD. We are past a 2xx, so the card may exist at
-        the issuer — possibly the uncapped one this check is about. The caller marks its row
-        failed and therefore never stores `issuer_card_ref`, so the id is logged below or the
-        orphan becomes unreachable for revocation. Wiring the revocation sweep to these two codes
-        is the follow-up; until then treat either as a page-worthy alarm, not a retry.
+        the issuer — possibly the uncapped one this check is about. So the error raised out of
+        `issue()` CARRIES the ref, the caller persists it on the failed row, and
+        jobs/agent_card_revocation_sweep.py kills it. That path only works because the ref is on
+        the row: a log line is not a work queue.
 
         NOTHING FROM THE BODY IS ECHOED into the message or the log — rule 1 of this module. That
         includes the observed amounts: a mis-mapped field could put a PAN where an integer was
@@ -188,5 +193,51 @@ class ReapIssuer:
                 issued.issuer_card_ref,
                 err.code,
             )
-            raise
+            # Re-raised CARRYING the ref so the caller can persist it. The log above is for a
+            # human; this is for the revocation sweep, which reads rows and not logs.
+            raise CardIssuerError(
+                err.code, str(err), issuer_card_ref=issued.issuer_card_ref
+            ) from err
         return issued
+
+    async def revoke(self, issuer_card_ref: str) -> None:
+        """Kill a card at the issuer, and refuse to claim success without confirmation.
+
+        ⚠️ WIRE FORMAT UNVERIFIED, same as issuance — and the failure mode here is nastier. If
+        `revoke_path` is wrong, every call 404s. Treating 404 as "already gone, nothing to do"
+        would then mark the entire orphan backlog revoked while not one card had been killed:
+        a silent success that erases the very evidence the sweep exists to act on. So a 404 is
+        a FAILURE here, deliberately, and no status code alone is ever taken as confirmation.
+
+        Only an affirmative dead-state in the body counts. Unbounded retry is intended: the
+        sweep will keep trying a card it cannot confirm dead, because giving up quietly on a
+        possibly-spendable uncapped card is the worse outcome. The alarm is the escalation path,
+        not a retry limit.
+        """
+        ref = str(issuer_card_ref or "").strip()
+        if not ref:
+            raise CardIssuerError("REAP_REVOKE_BAD_REQUEST", "no issuer card ref to revoke")
+        url = f"{self.base_url}{self.revoke_path.replace('{card_id}', ref)}"
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+                resp = await client.post(url, headers={"Authorization": f"Bearer {self.api_key}"})
+        except httpx.HTTPError as err:
+            raise CardIssuerError("REAP_UNREACHABLE", "revoke request failed in transport") from err
+        if resp.status_code >= 300:
+            # Includes 404. See the docstring: a wrong path must not read as "already revoked".
+            raise CardIssuerError("REAP_REVOKE_REFUSED", f"issuer returned HTTP {resp.status_code}")
+        try:
+            body = resp.json()
+        except Exception as err:
+            raise CardIssuerError("REAP_REVOKE_UNCONFIRMED", "revoke response was not parseable") from err
+
+        card = body.get("card") if isinstance(body.get("card"), dict) else body
+        state = card.get("status") if isinstance(card, dict) else None
+        # Both spellings: the provider's own docs are not in hand, and "cancelled"/"canceled"
+        # is the single most common way for an adapter to miss a confirmation it did receive.
+        if not isinstance(state, str) or state.strip().lower() not in (
+            "revoked", "cancelled", "canceled", "terminated", "closed"
+        ):
+            raise CardIssuerError(
+                "REAP_REVOKE_UNCONFIRMED", "issuer did not confirm the card is dead"
+            )

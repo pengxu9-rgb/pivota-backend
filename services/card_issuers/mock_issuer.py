@@ -27,6 +27,7 @@ class MockIssuer:
                     f"CARD_ISSUER=mock is forbidden where {var} says production",
                 )
         self.issued: Dict[str, IssueRequest] = {}  # test hook: what was requested, by ref
+        self.revoked: list[str] = []               # test hook: what the sweep asked us to kill
 
     async def issue(self, request: IssueRequest) -> IssuedCard:
         ref = f"mockcard_{secrets.token_hex(8)}"
@@ -35,3 +36,15 @@ class MockIssuer:
             issuer_card_ref=ref,
             reveal_handle=f"https://mock.invalid/reveal/{ref}",
         )
+
+    async def revoke(self, issuer_card_ref: str) -> None:
+        """Always succeeds — there is no real card to fail to kill.
+
+        Recorded so a test can assert the sweep actually reached the issuer. A mock that silently
+        did nothing would let a sweep that never calls revoke still look like it worked, which is
+        the same no-op-hidden-by-a-double problem the constraint check exists to prevent.
+        """
+        ref = str(issuer_card_ref or "").strip()
+        if not ref:
+            raise CardIssuerError("MOCK_REVOKE_BAD_REQUEST", "no issuer card ref to revoke")
+        self.revoked.append(ref)

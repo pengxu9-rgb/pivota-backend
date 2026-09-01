@@ -26,6 +26,7 @@ from db.agent_issued_cards import (
     create_card_guarded,
     get_card,
     mark_failed,
+    mark_failed_with_orphan,
     mark_issued,
     mint_card_id,
 )
@@ -174,8 +175,20 @@ async def issue_card(
             )
         )
     except CardIssuerError as err:
-        await mark_failed(card_id, err.code)
-        logger.warning(f"card issuance failed card_id={card_id} code={err.code}")
+        if err.issuer_card_ref:
+            # A card EXISTS at the issuer that we refused to accept (constraints unconfirmed or
+            # contradicted). Persisting the ref on the failed row is what puts it in front of
+            # jobs/agent_card_revocation_sweep.py — without it the orphan is unreachable and the
+            # only record is a log line, which nothing sweeps.
+            await mark_failed_with_orphan(card_id, err.code, err.issuer_card_ref)
+            logger.error(
+                "card issuance failed with an ORPHAN card_id=%s code=%s — queued for revocation",
+                card_id,
+                err.code,
+            )
+        else:
+            await mark_failed(card_id, err.code)
+            logger.warning(f"card issuance failed card_id={card_id} code={err.code}")
         raise HTTPException(status_code=502, detail=f"issuer refused: {err.code}")
 
     await mark_issued(card_id, issued.issuer_card_ref, issued.reveal_handle)

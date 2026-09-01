@@ -317,3 +317,155 @@ async def test_the_orphan_card_id_is_logged_when_verification_refuses(monkeypatc
     assert "reap_card_1" in line, "the orphan card ref must survive the refusal"
     assert "card_abc" in line
     assert "REAP_CONSTRAINTS_UNCONFIRMED" in line
+
+
+# --------------------------------------------------------------------------------------
+# The orphan handoff: the ref must survive the refusal, on the exception, not just in a log
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides,code",
+    [
+        ({"spend_limit": None}, "REAP_CONSTRAINTS_UNCONFIRMED"),
+        ({"spend_limit": {"amount": 999999, "currency": "USD"}}, "REAP_CONSTRAINTS_MISMATCH"),
+    ],
+)
+async def test_a_constraint_refusal_carries_the_orphan_ref(monkeypatch, overrides, code):
+    """The card is REAL. The ref on the exception is what lets the route persist it and the
+    sweep find it — a log line is not a work queue."""
+    _install(monkeypatch, _confirming_body(**overrides))
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await _issuer().issue(_request())
+
+    assert excinfo.value.code == code
+    assert excinfo.value.issuer_card_ref == "reap_card_1"
+
+
+@pytest.mark.asyncio
+async def test_failures_with_NO_card_carry_no_ref(monkeypatch):
+    """A non-2xx minted nothing, so there is no orphan and the sweep must not chase one."""
+    class _Refused:
+        status_code = 500
+
+        def json(self):
+            return {}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            return _Refused()
+
+    import services.card_issuers.reap_issuer as mod
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", _Client)
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await _issuer().issue(_request())
+
+    assert excinfo.value.code == "REAP_REFUSED"
+    assert excinfo.value.issuer_card_ref is None
+
+
+# --------------------------------------------------------------------------------------
+# revoke(): confirmation required, and a wrong path must not read as success
+# --------------------------------------------------------------------------------------
+
+def _revoke_client(monkeypatch, status, body):
+    seen = {}
+
+    class _R:
+        status_code = status
+
+        def json(self):
+            if body is None:
+                raise ValueError("not json")
+            return body
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            seen["url"] = url
+            return _R()
+
+    import services.card_issuers.reap_issuer as mod
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", _Client)
+    return seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["revoked", "cancelled", "canceled", "TERMINATED", "closed"])
+async def test_revoke_accepts_an_affirmative_dead_state(monkeypatch, state):
+    seen = _revoke_client(monkeypatch, 200, {"card": {"id": "reap_1", "status": state}})
+
+    await _issuer().revoke("reap_1")
+
+    assert seen["url"] == "https://api.reap.test/v1/cards/reap_1/cancel"
+
+
+@pytest.mark.asyncio
+async def test_a_404_is_NOT_treated_as_already_revoked(monkeypatch):
+    """The path is unverified. If it is wrong every call 404s, and calling that success would
+    mark the whole orphan backlog revoked while killing nothing."""
+    _revoke_client(monkeypatch, 404, {})
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await _issuer().revoke("reap_1")
+
+    assert excinfo.value.code == "REAP_REVOKE_REFUSED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"card": {"id": "reap_1"}},                      # says nothing about state
+        {"card": {"id": "reap_1", "status": "active"}},  # says it is still ALIVE
+        {"ok": True},                                    # a cheerful no-op
+    ],
+)
+async def test_a_2xx_without_a_dead_state_is_unconfirmed(monkeypatch, body):
+    _revoke_client(monkeypatch, 200, body)
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await _issuer().revoke("reap_1")
+
+    assert excinfo.value.code == "REAP_REVOKE_UNCONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_revoke_response_is_unconfirmed(monkeypatch):
+    _revoke_client(monkeypatch, 200, None)
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await _issuer().revoke("reap_1")
+
+    assert excinfo.value.code == "REAP_REVOKE_UNCONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_revoke_refuses_an_empty_ref_before_calling_out(monkeypatch):
+    seen = _revoke_client(monkeypatch, 200, {"card": {"status": "revoked"}})
+
+    with pytest.raises(CardIssuerError):
+        await _issuer().revoke("")
+
+    assert "url" not in seen, "an empty ref must not produce a request at all"
