@@ -296,6 +296,18 @@ def _run(snippet, extra_env):
 # have pinned the bug rather than the behaviour.
 _SIGN_A_TOKEN = "from utils.auth import create_access_token; create_access_token({'sub': 'x'})"
 
+# VERIFYING is the half that matters most, and it was asserted only as a string
+# inside the error message. Pointing decode_token back at the raw secret survived
+# every test: a deployed host with no secret would refuse to MINT tokens while
+# happily verifying ones forged from a repo checkout — the exact attack the guard
+# exists to stop. The token is signed in a separate process that HAS a secret, so
+# this drives verification and nothing else.
+_VERIFY_A_TOKEN = (
+    "import jwt, datetime;"
+    "tok = jwt.encode({'sub':'x','exp': 9999999999}, 'your-super-secret-key', algorithm='HS256');"
+    "from utils.auth import decode_token; decode_token(tok)"
+)
+
 # Importing the modules a batch job pulls in, and touching no token. This must
 # SUCCEED on every deployed shape with no secret at all.
 _BOOT_A_JOB = "import config.settings, db.database, utils.auth"
@@ -303,6 +315,10 @@ _BOOT_A_JOB = "import config.settings, db.database, utils.auth"
 
 def _boot(extra_env):
     return _run(_SIGN_A_TOKEN, extra_env)
+
+
+def _verify(extra_env):
+    return _run(_VERIFY_A_TOKEN, extra_env)
 
 
 DEPLOYED_SHAPES = [
@@ -635,3 +651,139 @@ def _deployed_host():
         else:
             os.environ["PIVOTA_ENV"] = previous
         platform.reset_platform_state()
+
+
+# ---------------------------------------------------------------------------
+# 5. Survivors found by adversarial review of 2eb4a2813
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "shape", [s for s, _ in DEPLOYED_SHAPES], ids=[i for _, i in DEPLOYED_SHAPES]
+)
+def test_verifying_a_token_also_refuses_on_a_weak_secret(shape):
+    """The guard's message says "sign OR VERIFY"; only signing was tested.
+
+    Pointing decode_token at the raw secret survived the whole suite. Under that
+    mutant a deployed host refuses to mint tokens and still accepts ones forged
+    with the repo literal, which is the attack this exists to stop.
+    """
+    result = _verify(shape)
+    assert result.returncode != 0, (
+        f"verified a forged token with a weak secret on {shape}: {result.stdout[-1500:]}"
+    )
+    assert "Refusing to sign or verify tokens" in result.stderr, result.stderr[-1500:]
+
+
+def test_every_operations_route_is_in_the_denial_matrix():
+    """OPS_REQUESTS says "every route in the file"; nothing checked that.
+
+    Appending a new unguarded route to operations_routes passed the entire
+    suite. This is the assertion that would have caught the original 8-of-10
+    gap instead of it being found by review.
+    """
+    import routes.operations_routes as ops
+
+    mounted = {
+        (method, route.path)
+        for route in ops.router.routes
+        for method in (getattr(route, "methods", None) or set())
+        if method not in ("HEAD", "OPTIONS")
+    }
+    covered = {(m, p.split("?")[0]) for m, p, _ in OPS_REQUESTS}
+    # OPS_REQUESTS carries concrete ids where the route has a path param.
+    normalised = set()
+    for method, path in mounted:
+        normalised.add((method, path))
+    missing = {
+        (m, p) for m, p in normalised
+        if not any(m == cm and _paths_match(p, cp) for cm, cp in covered)
+    }
+    assert not missing, (
+        "these operations routes are not in OPS_REQUESTS, so a missing guard on "
+        f"them would ship green: {sorted(missing)}"
+    )
+
+
+def _paths_match(mounted_path: str, covered_path: str) -> bool:
+    """`/onboarding/{entity_id}/status` vs the concrete `/onboarding/AGENT_1/status`."""
+    a = [seg for seg in mounted_path.strip("/").split("/")]
+    b = [seg for seg in covered_path.strip("/").split("/")]
+    if len(a) != len(b):
+        return False
+    return all(x.startswith("{") or x == y for x, y in zip(a, b))
+
+
+@pytest.mark.parametrize("method,path,body", OPS_REQUESTS)
+@pytest.mark.parametrize("role", ALLOWED_ROLES)
+def test_every_operations_route_still_admits_staff(ops_client, role, method, path, body):
+    """The allow side was tested on ONE route in ten.
+
+    Changing the permission string to one nobody holds locked operators out of
+    nine operations routes and shipped green. A guard that denies everyone is as
+    broken as one that denies no one.
+    """
+    resp = ops_client.request(
+        method, path, params={"token": _token(role)}, json=body
+    )
+    assert resp.status_code != 403, (
+        f"{method} {path} denied {role!r}, who should be admitted"
+    )
+
+
+def test_the_payment_status_ternary_has_the_right_polarity():
+    """Inverting it — "failed" if success else "succeeded" — survived, because
+    the assertion only checked that the rendered expression CONTAINED both
+    words. That inversion is precisely the defect the test's docstring names."""
+    call = _publisher_call("publish_payment_result")
+    status = next(kw for kw in call.keywords if kw.arg == "status")
+    rendered = ast.unparse(status.value)
+    assert rendered.startswith("'succeeded' if") or rendered.startswith('"succeeded" if'), (
+        f"status polarity is inverted or restructured: {rendered}"
+    )
+
+
+async def test_the_repaired_publisher_actually_reaches_the_metrics_store():
+    """The section-2 repair was verified structurally and never by calling it.
+
+    Inserting `return` as the first statement of _publish_payment_events, or
+    inverting the order event's type, both survived the whole suite — so nothing
+    proved the events reach the store, which is the thing that was broken.
+    """
+    from types import SimpleNamespace
+
+    import orchestrator.payment_orchestrator as po
+    from realtime import metrics_store
+
+    store = metrics_store.get_metrics_store()
+    store.reset_metrics()
+
+    # Exactly the attributes the publisher reads, no more: order.{id,
+    # merchant_id, agent_id, customer_email, payment_method, status},
+    # payment.{id, amount, currency, psp, fees, transaction_id},
+    # payment_response.{success, error_message}. Omitting `payment_method` made
+    # the first version of this test fail for the RIGHT reason but the wrong
+    # cause — the AttributeError was swallowed by the handler's bare
+    # `except Exception`, which is the same swallow that hid the original
+    # TypeError for however long it was there.
+    order = SimpleNamespace(
+        id="ORD_1", merchant_id="merch_a", agent_id="agent_a",
+        customer_email="b@x.com", payment_method="card",
+        status=SimpleNamespace(value="paid"),
+    )
+    payment = SimpleNamespace(
+        id="PAY_1", amount=10.0, currency="USD",
+        psp=SimpleNamespace(value="stripe"), fees=0.3, transaction_id="txn_1",
+    )
+    response = SimpleNamespace(success=True, error_message=None)
+
+    orchestrator = po.PaymentOrchestrator.__new__(po.PaymentOrchestrator)
+    await orchestrator._publish_payment_events(order, payment, response)
+
+    assert store.counters["total"] > 0, (
+        "no event reached the metrics store; the publisher repair is inert"
+    )
+    assert store.counters["success"] >= 1, (
+        'the payment event did not record as "succeeded" — the vocabulary the '
+        "store counts on"
+    )
+    assert "stripe" in store.psp_metrics, "the psp was not recorded"

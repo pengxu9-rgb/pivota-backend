@@ -747,7 +747,10 @@ def _import_db_database(extra_env: dict):
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_"))
+        # CLOUD_RUN_ too: a stray marker in the parent environment changes
+        # which platform the child thinks it is on, and Cloud Run JOBS are
+        # exactly the host family that was blind here before.
+        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_", "CLOUD_RUN_"))
     }
     env.update(
         {
@@ -823,7 +826,10 @@ def _import_in_a_clean_process(module: str, extra_env: dict):
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_"))
+        # CLOUD_RUN_ too: a stray marker in the parent environment changes
+        # which platform the child thinks it is on, and Cloud Run JOBS are
+        # exactly the host family that was blind here before.
+        if not k.startswith(("RAILWAY_", "PIVOTA_", "K_", "CLOUD_RUN_"))
         and k not in ("ENVIRONMENT", "APP_ENV")
     }
     env.update(
