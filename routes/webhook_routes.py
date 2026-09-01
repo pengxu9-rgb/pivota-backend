@@ -36,11 +36,8 @@ from services.commerce_attribution_service import (
 )
 from services.catalog_sync_service import (
     create_catalog_sync_job,
-    mark_catalog_sync_event_processed,
     record_catalog_sync_event,
-    run_catalog_sync_job,
 )
-from services.shopify_products_sync import sync_shopify_products_for_merchant
 from services.pcs_evidence_pack_service import create_order_snapshot_evidence_pack
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from services.psp_payment_finalizer import (
@@ -113,33 +110,6 @@ def _shopify_prod_runtime() -> bool:
         or is_deployed()
     )
 
-
-async def _run_shopify_catalog_webhook_reconcile(
-    *,
-    merchant_id: str,
-    job_id: str,
-    event_id: Optional[str],
-    limit: int = 5000,
-) -> None:
-    try:
-        await sync_shopify_products_for_merchant(
-            merchant_id=merchant_id,
-            limit=limit,
-            ingest_catalog=False,
-        )
-        await run_catalog_sync_job(job_id)
-        if event_id:
-            await mark_catalog_sync_event_processed(event_id, status="processed")
-    except Exception as exc:  # pragma: no cover - background task
-        if event_id:
-            await mark_catalog_sync_event_processed(event_id, status="failed", error_message=str(exc))
-        logger.exception(
-            "Shopify catalog webhook reconcile failed merchant=%s job_id=%s event_id=%s err=%s",
-            merchant_id,
-            job_id,
-            event_id,
-            exc,
-        )
 
 def _reviews_invitation_auto_send_on_shopify_fulfillment_enabled() -> bool:
     raw = (os.getenv("REVIEWS_INVITATION_AUTO_SEND_ON_SHOPIFY_FULFILLMENT") or "").strip().lower()
@@ -3034,7 +3004,18 @@ async def _process_shopify_webhook_event(
                 source_ref=x_shopify_webhook_id or f"{merchant_id}:{topic}",
                 occurred_at=occurred_at,
             )
-            catalog_job = await create_catalog_sync_job(
+            # ENQUEUE ONLY. Shopify gives a webhook ~5s and retries on
+            # timeout, so the reconcile can never run inline here — but it must
+            # not run in a `BackgroundTasks` task either: that task dies with
+            # the process, and a dropped one left the merchant's catalog stale
+            # AND the `catalog_sync_events` row stuck on `pending`, with a 200
+            # already returned to Shopify so no retry was ever coming.
+            #
+            # Everything the reconcile needs is in `scope` now — `force_refresh`
+            # re-pulls from Shopify before ingest (what the background task did
+            # by hand) and `catalog_sync_event_id` lets the runner close the
+            # event row. `services.catalog_sync_drain` picks it up.
+            await create_catalog_sync_job(
                 merchant_id=merchant_id,
                 connector="shopify",
                 mode="webhook",
@@ -3045,15 +3026,10 @@ async def _process_shopify_webhook_event(
                     "source_system": "products_cache",
                     "source_ref": x_shopify_webhook_id or f"{merchant_id}:{topic}",
                     "trigger_topic": topic,
+                    "force_refresh": True,
+                    "catalog_sync_event_id": str(catalog_event.get("event_id") or ""),
                 },
                 requested_by="shopify_webhook",
-            )
-            background_tasks.add_task(
-                _run_shopify_catalog_webhook_reconcile,
-                merchant_id=merchant_id,
-                job_id=str(catalog_job.get("job_id") or ""),
-                event_id=str(catalog_event.get("event_id") or ""),
-                limit=5000,
             )
 
         if topic == "app/uninstalled":

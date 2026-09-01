@@ -380,19 +380,11 @@ async def test_shopify_product_inventory_webhooks_enqueue_catalog_reconcile(
         catalog_jobs.append(kwargs)
         return {"job_id": "cat_job_1"}
 
-    async def noop_run_shopify_catalog_webhook_reconcile(**kwargs: Any):
-        return None
-
     monkeypatch.setattr(webhook_routes_module, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(webhook_routes_module, "get_merchant_active_stores", fake_get_merchant_active_stores)
     monkeypatch.setattr(webhook_routes_module, "ingest_shopify_webhook", fake_ingest_shopify_webhook)
     monkeypatch.setattr(webhook_routes_module, "record_catalog_sync_event", fake_record_catalog_sync_event)
     monkeypatch.setattr(webhook_routes_module, "create_catalog_sync_job", fake_create_catalog_sync_job)
-    monkeypatch.setattr(
-        webhook_routes_module,
-        "_run_shopify_catalog_webhook_reconcile",
-        noop_run_shopify_catalog_webhook_reconcile,
-    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -413,6 +405,15 @@ async def test_shopify_product_inventory_webhooks_enqueue_catalog_reconcile(
     assert catalog_events[0]["topic"] == topic
     assert catalog_jobs[0]["mode"] == "webhook"
     assert catalog_jobs[0]["scope"]["trigger_topic"] == topic
+
+    # The webhook ENQUEUES and returns; the reconcile is no longer run from a
+    # BackgroundTask in this process (it died with the process, leaving the
+    # merchant's catalog stale and the sync EVENT stuck on `pending`, with a 200
+    # already given to Shopify so no retry was coming). Everything the
+    # out-of-band drain needs must therefore be in the stored scope.
+    assert catalog_jobs[0]["scope"]["force_refresh"] is True
+    assert catalog_jobs[0]["scope"]["catalog_sync_event_id"] == "cat_evt_1"
+    assert not hasattr(webhook_routes_module, "_run_shopify_catalog_webhook_reconcile")
 
 
 @pytest.mark.asyncio

@@ -2209,12 +2209,15 @@ async def list_shopify_webhook_events(
 @router.post("/shopify/products/sync")
 async def merchant_sync_shopify_products(
     request: ShopifySyncRequest,
-    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """
     Sync Shopify products for a merchant.
     Mirrors /merchant/integrations/shopify/sync so legacy front-ends keep working.
+
+    Takes no `BackgroundTasks`, deliberately: the catalog ingest this triggers is
+    ENQUEUED here and run by `services.catalog_sync_drain`, never in this
+    process after the response. See the enqueue block below.
     """
     if current_user["role"] not in ["merchant", "employee", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -2344,16 +2347,24 @@ async def merchant_sync_shopify_products(
 
         # Onboarding→audit readiness (WS-A.2): the sync above populated
         # products_cache. Ingest it into the catalog so the merchant's OWN sync
-        # action produces an auditable catalog — run_catalog_sync_job then
-        # enqueues the quality backfill (WS-A.1), so the merchant becomes
-        # v3-audit-ready without any admin/webhook step. Run as a BACKGROUND task
-        # to keep this response fast; best-effort so it never breaks the sync.
+        # action produces an auditable catalog — the ingest then enqueues the
+        # quality backfill (WS-A.1), so the merchant becomes v3-audit-ready
+        # without any admin/webhook step.
+        #
+        # ENQUEUE ONLY. This used to hand `run_catalog_sync_job` to FastAPI's
+        # `BackgroundTasks`, which runs the ingest in THIS process after the
+        # response has already gone out: nothing retried it, nothing survived a
+        # revision swap, and a failure surfaced only as
+        # `catalog_sync_jobs.status='failed'` in the database long after the
+        # caller had been told 200 / catalog_ingest_queued=true (2026-08-29: a
+        # second merchant's sync wrote zero catalog rows exactly this way).
+        # The pending row is now drained out of band by
+        # `services.catalog_sync_drain.run_catalog_sync_drain_tick`, and the
+        # caller gets the job_id so the OUTCOME is pollable rather than assumed.
         catalog_ingest_queued = False
+        catalog_ingest_job_id: Optional[str] = None
         try:
-            from services.catalog_sync_service import (
-                create_catalog_sync_job,
-                run_catalog_sync_job,
-            )
+            from services.catalog_sync_service import create_catalog_sync_job
             cjob = await create_catalog_sync_job(
                 merchant_id=target_merchant_id,
                 connector="shopify",
@@ -2361,8 +2372,8 @@ async def merchant_sync_shopify_products(
                 scope={"platform": "shopify"},
                 requested_by="merchant_products_sync",
             )
-            background_tasks.add_task(run_catalog_sync_job, cjob["job_id"])
-            catalog_ingest_queued = True
+            catalog_ingest_job_id = str(cjob.get("job_id") or "") or None
+            catalog_ingest_queued = catalog_ingest_job_id is not None
         except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
             logger.warning(
                 "merchant sync: catalog ingest enqueue failed merchant=%s: %s",
@@ -2377,7 +2388,14 @@ async def merchant_sync_shopify_products(
                 "store_domain": store["domain"],
                 "pages_fetched": pages_fetched,
                 "synced_at": datetime.now().isoformat(),
-                "catalog_ingest_queued": catalog_ingest_queued
+                # `queued` means a pending job row exists — NOT that the catalog
+                # was written. Poll catalog_ingest_status_url for the outcome.
+                "catalog_ingest_queued": catalog_ingest_queued,
+                "catalog_ingest_job_id": catalog_ingest_job_id,
+                "catalog_ingest_status_url": (
+                    f"/v1/catalog/sync/jobs/{catalog_ingest_job_id}"
+                    if catalog_ingest_job_id else None
+                ),
             }
         }
     except HTTPException:
