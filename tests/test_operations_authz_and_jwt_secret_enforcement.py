@@ -360,10 +360,11 @@ def test_config_production_is_gone():
 # ---------------------------------------------------------------------------
 # 4. dashboard.core's models support the shape their callers actually use
 # ---------------------------------------------------------------------------
-# Discovered while fixing (2): the event publishing above was unreachable.
-# process_order_payment died ~15 lines earlier on OrderStatus.PAID and then on
-# Order(...)/Payment(...), whose implemented signatures were (id, user_id,
-# amount, currency) and (id, order_id, amount, psp).
+# Discovered while fixing the payment_orchestrator publisher calls (that section
+# went with the module on 2026-08-31): process_order_payment died on
+# OrderStatus.PAID and then on Order(...)/Payment(...), whose implemented
+# signatures were (id, user_id, amount, currency) and (id, order_id, amount,
+# psp). routes/demo_data_routes.py still depends on the repaired shapes.
 
 def test_order_status_has_paid():
     from dashboard.core import OrderStatus

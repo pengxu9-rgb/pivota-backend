@@ -8,10 +8,12 @@ available".
 
 orchestrator/payment_orchestrator.py and five `/api/payments/*` endpoints sat on
 top of that empty registry -- mounted in main.py, reachable over HTTP, and
-unable to reach a PSP on any input. What they DID do on every call was write an
-Order and a Payment into the in-memory `dashboard_core` maps, which
-`GET /api/payments/orders/{order_id}` served back and routes/dashboard_api.py
-counted. Nothing in the repo called any of the five, and
+unable to reach a PSP on any input. A call that supplied `preferred_psp` went on
+to write a FAILED Order and Payment into the in-memory `dashboard_core` maps,
+which `GET /api/payments/orders/{order_id}` served back and
+routes/dashboard_api.py counted. (Without `preferred_psp` the orchestrator-level
+`select_psp` raised ~15 lines earlier, before `Order(...)` was built, so that
+path wrote nothing -- the fabrication needed the caller to name a PSP.) Nothing in the repo called any of the five, and
 docs/monetization/T1_stripe_codebase_audit.md had already recorded them as
 legacy rather than the Stripe flow.
 
@@ -41,9 +43,10 @@ from fastapi.testclient import TestClient
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Every module of the deleted package.
+# Every module of the deleted package. Bare "psp" is deliberately NOT here --
+# see test_the_psp_package_has_no_source_left for why importability is the wrong
+# question for the package root.
 DELETED_PSP_MODULES = [
-    "psp",
     "psp.connectors",
     "psp.production_connectors",
     "psp.production_config",
@@ -94,13 +97,25 @@ def _payment_route_paths():
 @pytest.mark.parametrize("module", DELETED_PSP_MODULES)
 def test_the_psp_package_is_deleted_not_merely_unused(module):
     """An unused module can be imported again by a one-line mistake -- the
-    precedent tests/test_platform_connectors_prefix.py sets for this repo.
-
-    `psp` itself is listed: leaving the package __init__ behind would keep
-    `import psp` working and give the deleted modules somewhere to come back to.
-    """
+    precedent tests/test_platform_connectors_prefix.py sets for this repo."""
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module(module)
+
+
+def test_the_psp_package_has_no_source_left():
+    """The package ROOT is asserted on disk, not by importing it.
+
+    `git rm` does not remove an untracked `psp/__pycache__/`, and a directory
+    holding nothing but `__pycache__` still imports as a PEP-420 NAMESPACE
+    package -- `import psp` succeeds and returns a NamespaceLoader module. So
+    `pytest.raises(ModuleNotFoundError)` on bare "psp" reds on any working copy
+    that ever ran the old code, while passing in CI's fresh clone: a failure
+    that tracks the developer's __pycache__ rather than the tree. Checking for
+    source is what actually answers "is the package gone".
+    """
+    psp_dir = REPO_ROOT / "psp"
+    leftover = sorted(p.name for p in psp_dir.glob("*.py")) if psp_dir.is_dir() else []
+    assert not leftover, f"psp/ still has source: {leftover}"
 
 
 THIS_FILE = "tests/test_dead_psp_connectors_removed.py"
