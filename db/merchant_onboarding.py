@@ -139,6 +139,20 @@ async def update_kyc_status(merchant_id: str, status: str, reason: Optional[str]
         "status": status,
         "updated_at": datetime.now()
     }
+    if status != "approved":
+        # `auto_approved` records that the AUTOMATIC path approved this merchant.
+        # It was set True at signup and never cleared, while the one gate that
+        # reads status — the PSP setup check in
+        # routes/merchant_onboarding_routes.py — passes when EITHER the status is
+        # approved OR auto_approved is set. Since registration auto-approves
+        # everyone, every merchant carried auto_approved=True, so rejecting one
+        # left it able to connect a payment provider exactly as before. Rejection
+        # was a no-op at the only place it was checked.
+        #
+        # Not restored on a later approval: an admin approving a rejected
+        # merchant is a manual decision, not an automatic one, and the gate
+        # passes on status alone.
+        update_data["auto_approved"] = False
     if status == "approved":
         update_data["verified_at"] = datetime.now()
         # Clear rejection reason on approval unless explicitly provided
@@ -243,10 +257,11 @@ async def get_all_merchant_onboardings(status: Optional[str] = None, include_del
 async def soft_delete_merchant_onboarding(merchant_id: str) -> bool:
     """Soft delete onboarding merchant by setting status='deleted' and removing user account"""
     # 1. Soft delete merchant onboarding record
-    query = merchant_onboarding.update().where(
-        merchant_onboarding.c.merchant_id == merchant_id
-    ).values(status="deleted", updated_at=datetime.now())
-    await database.execute(query)
+    # Through update_kyc_status, not a direct write. Setting status here on its
+    # own left `auto_approved` True, and the PSP gate passes on that flag — so a
+    # soft-deleted merchant could still connect a payment provider. The
+    # rejection path had exactly this bug; this is the same door one table over.
+    await update_kyc_status(merchant_id, "deleted")
     
     # 2. Also delete the user account to allow re-registration with same email
     try:

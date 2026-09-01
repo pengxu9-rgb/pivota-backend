@@ -570,6 +570,24 @@ def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypa
         fake_execute,
     )
 
+    # The route now LOADS the merchant instead of fabricating one with
+    # status="approved" hardcoded — that fabrication skipped this very loader's
+    # "Only approved merchants can process payments" check while creating a real
+    # order and running a real PSP payment. Stubbed rather than removed, so the
+    # assertions below still prove the route uses the AUTHENTICATED merchant_id.
+    loaded_for = {}
+
+    async def fake_load(merchant_id):
+        loaded_for["merchant_id"] = merchant_id
+        return {
+            "merchant_id": merchant_id,
+            "business_name": "Test Integrations",
+            "contact_email": "merchant@example.com",
+            "status": "approved",
+        }
+
+    monkeypatch.setattr(payment_execution_module, "_load_canary_merchant", fake_load)
+
     response = client.post(
         "/merchant/payment-canary/order-backed",
         json={
@@ -585,6 +603,8 @@ def test_merchant_order_backed_canary_route_uses_authenticated_merchant(monkeypa
     assert body["order_id"] == "ORD_HIDDEN_CANARY"
     assert captured["merchant"]["merchant_id"] == "merch_test_integrations"
     assert captured["merchant"]["contact_email"] == "merchant@example.com"
+    # …and it looked that merchant up rather than inventing it.
+    assert loaded_for["merchant_id"] == "merch_test_integrations"
     assert captured["payment_request"].order_id.startswith("merchant_canary_")
     assert captured["payment_request"].enforce_live_readiness is True
     assert captured["payment_request"].preferred_provider is None
@@ -628,6 +648,24 @@ def test_merchant_order_backed_canary_route_passes_preferred_provider(monkeypatc
         "_execute_order_backed_payment_canary",
         fake_execute,
     )
+
+    # The route now LOADS the merchant instead of fabricating one with
+    # status="approved" hardcoded — that fabrication skipped this very loader's
+    # "Only approved merchants can process payments" check while creating a real
+    # order and running a real PSP payment. Stubbed rather than removed, so the
+    # assertions below still prove the route uses the AUTHENTICATED merchant_id.
+    loaded_for = {}
+
+    async def fake_load(merchant_id):
+        loaded_for["merchant_id"] = merchant_id
+        return {
+            "merchant_id": merchant_id,
+            "business_name": "Test Integrations",
+            "contact_email": "merchant@example.com",
+            "status": "approved",
+        }
+
+    monkeypatch.setattr(payment_execution_module, "_load_canary_merchant", fake_load)
 
     response = client.post(
         "/merchant/payment-canary/order-backed",

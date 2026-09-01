@@ -2073,6 +2073,28 @@ async def connect_psp(
     """Connect a PSP provider"""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    # A rejected merchant must not connect a payment provider. The gate in
+    # merchant_onboarding_routes' PSP setup route is NOT the only door, despite
+    # a comment there that used to say so: this route takes the merchant_id
+    # from the caller's own session and had no onboarding-status check of any
+    # kind, so a rejected merchant — who can still log in — connected a PSP
+    # here exactly as before.
+    from db.merchant_onboarding import get_merchant_onboarding
+    from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
+
+    _merchant_id = current_user.get("merchant_id")
+    _onboarding = await get_merchant_onboarding(_merchant_id) if _merchant_id else None
+    if _onboarding and str(_onboarding.get("status") or "").strip().lower() in (
+        SUPPRESSED_ONBOARDING_STATUSES
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Merchant account is {_onboarding.get('status')}. "
+                "Only approved merchants can connect a payment provider."
+            ),
+        )
     
     merchant_id = await get_merchant_id_from_user(current_user)
     provider = str(psp_data.get("provider", "")).strip().lower()

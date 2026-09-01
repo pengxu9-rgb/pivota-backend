@@ -6,9 +6,10 @@ Handles merchant registration, KYC, PSP setup, and API key issuance
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr, validator
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Literal, Tuple
 from datetime import datetime, timedelta
 import asyncio
+import logging
 import re
 import stripe
 import httpx
@@ -36,6 +37,8 @@ from fastapi.responses import StreamingResponse
 import io
 
 router = APIRouter(prefix="/merchant/onboarding", tags=["merchant-onboarding"])
+
+logger = logging.getLogger("merchant_onboarding_routes")
 
 INTERNAL_ACCOUNT_ROLES = {"super_admin", "admin", "employee", "outsourced"}
 PUBLIC_MERGEABLE_ACCOUNT_ROLES = {"agent"}
@@ -104,7 +107,11 @@ class PSPSetupRequest(BaseModel):
 
 class KYBUpdateRequest(BaseModel):
     """Request model for updating KYB status via JSON body"""
-    status: str  # approved or rejected
+    # Constrained, not free text. This accepted any string and wrote it straight
+    # to merchant_onboarding.status, so a typo produced a status that is neither
+    # approved nor suppressed — which every gate treats as "not approved" but
+    # which the serving suppression does not recognise either.
+    status: Literal["approved", "rejected", "pending_verification"]
     reason: Optional[str] = None  # rejection reason (optional)
 
 # ============================================================================
@@ -853,6 +860,17 @@ async def update_kyb_status_alias(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     await update_kyc_status(merchant_id, kyb_update.status, kyb_update.reason)
+
+    # This alias writes the same column /approve and /reject do, so it owes the
+    # same re-derivation. Without it an admin rejecting through /kyb blocked the
+    # PSP and orders while the merchant kept serving in public search.
+    from services.store_lifecycle_service import sync_catalog_merchant_status
+
+    await sync_catalog_merchant_status(
+        merchant_id,
+        reason=f"kyb_{kyb_update.status}",
+        merchant_reinstated=(kyb_update.status == "approved"),
+    )
     return {"status": "success", "merchant_id": merchant_id, "new_status": kyb_update.status}
 
 @router.post("/psp/setup", response_model=Dict[str, Any])
@@ -873,9 +891,20 @@ async def setup_psp(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
     
-    # Allow PSP setup if merchant is approved OR auto-approved
+    # Allow PSP setup if merchant is approved OR auto-approved.
+    #
+    # An explicit rejection is checked on its own rather than relying on
+    # `auto_approved` having been cleared. update_kyc_status does clear it now,
+    # so the second condition below is no longer a way past a rejection — but
+    # the two must not depend on each other to be safe, and this is the line
+    # that decides whether a rejected merchant can take money.
+    from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
+
     is_auto_approved = merchant.get("auto_approved", False)
-    if merchant["status"] != "approved" and not is_auto_approved:
+    _status = str(merchant.get("status") or "").strip().lower()
+    if _status in SUPPRESSED_ONBOARDING_STATUSES or (
+        _status != "approved" and not is_auto_approved
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"KYC must be approved first. Current status: {merchant['status']}, auto_approved: {is_auto_approved}"
@@ -1306,11 +1335,21 @@ async def manual_approve_kyc(
     
     # Clear rejection reason when approving
     await update_kyc_status(merchant_id, "approved", rejection_reason=None)
-    
+
+    # Symmetry with rejection: approving must let them serve again. Re-derived
+    # from the stores, so a merchant with no active store stays inactive —
+    # approval restores eligibility, not visibility.
+    from services.store_lifecycle_service import sync_catalog_merchant_status
+
+    restored = await sync_catalog_merchant_status(
+        merchant_id, reason="merchant_approved", merchant_reinstated=True
+    )
+
     return {
         "status": "success",
         "message": f"Merchant {merchant['business_name']} approved",
-        "merchant_id": merchant_id
+        "merchant_id": merchant_id,
+        "serving_restored": restored,
     }
 
 @router.post("/reject/{merchant_id}", response_model=Dict[str, Any])
@@ -1327,10 +1366,33 @@ async def reject_kyc(
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     await update_kyc_status(merchant_id, "rejected", reason)
-    
+
+    # Close the public-search door. Recall gates on catalog_merchants.status,
+    # which no merchant-lifecycle path wrote — so a rejected merchant kept
+    # serving on public search and agent recall exactly as before. Re-derived
+    # rather than written here: store_lifecycle_service owns that column, and a
+    # direct write would be undone by the next store event.
+    from services.store_lifecycle_service import sync_catalog_merchant_status
+
+    suppression = await sync_catalog_merchant_status(
+        merchant_id, reason="merchant_rejected"
+    )
+    if suppression.get("skipped"):
+        # Loud, because this one is not self-healing. The convergent sweep
+        # drives off SELECT DISTINCT merchant_id FROM merchant_stores, so a
+        # merchant with no store rows is invisible to it and nothing retries.
+        # Returning "success" while the merchant keeps serving is the failure
+        # mode worth shouting about.
+        logger.error(
+            "merchant %s rejected but serving suppression was SKIPPED (%s) — "
+            "it may still appear in public search and agent recall",
+            merchant_id, suppression.get("skipped"),
+        )
+
     return {
         "status": "success",
         "message": f"Merchant {merchant['business_name']} rejected",
+        "serving_suppressed": suppression,
         "merchant_id": merchant_id,
         "reason": reason
     }
@@ -1370,6 +1432,13 @@ async def delete_onboarding_merchant(
         raise HTTPException(status_code=404, detail=f"Merchant {merchant_id} not found")
     
     success = await soft_delete_merchant_onboarding(merchant_id)
+    if success:
+        # Soft delete suppresses orders and the PSP through the shared status
+        # set, but nothing re-derived serving — a deleted merchant kept
+        # appearing in public search and agent recall.
+        from services.store_lifecycle_service import sync_catalog_merchant_status
+
+        await sync_catalog_merchant_status(merchant_id, reason="merchant_soft_deleted")
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete merchant")
     
@@ -1392,6 +1461,13 @@ async def delete_onboarding_merchant_alias(
     if not merchant:
         raise HTTPException(status_code=404, detail=f"Merchant {merchant_id} not found")
     success = await soft_delete_merchant_onboarding(merchant_id)
+    if success:
+        # Soft delete suppresses orders and the PSP through the shared status
+        # set, but nothing re-derived serving — a deleted merchant kept
+        # appearing in public search and agent recall.
+        from services.store_lifecycle_service import sync_catalog_merchant_status
+
+        await sync_catalog_merchant_status(merchant_id, reason="merchant_soft_deleted")
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete merchant")
     return {

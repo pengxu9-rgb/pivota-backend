@@ -31,6 +31,7 @@ from db.orders import (
 )
 from db.orders import orders as orders_table
 from db.merchant_onboarding import get_merchant_onboarding
+from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
 from db.products import log_order_event
 from db.database import database, IS_POSTGRES
 from utils.auth import require_admin, require_admin_or_key, get_current_user
@@ -3505,6 +3506,35 @@ async def create_new_order(
             raise merchant
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
+
+        # A rejected merchant must not take new orders. Registration
+        # auto-approves everyone, so rejection is the only lever an employee
+        # has, and until now it reached neither this path nor public serving —
+        # order creation checked that the merchant EXISTED and nothing else.
+        # Checked here because `merchant` is already loaded — no extra query —
+        # and because this handler is the convergence point for the agent order
+        # surfaces. An earlier version of this comment said "both order entry
+        # points" and named agent_v2 as calling this directly; both halves were
+        # wrong. There are several entrants and the hop is indirect:
+        # agent_v2 -> routes/agent_api.agent_create_order -> here, with
+        # agent_commerce, agent_checkout_intents (ACP complete) and the
+        # agent_shop_gateway proxy arriving the same way.
+        #
+        # It is NOT the only way to create an order in this codebase, and this
+        # gate does not claim to be. See the PR for the paths that reach a
+        # charge without passing here.
+        merchant_status = str(merchant.get("status") or "").strip().lower()
+        if merchant_status in SUPPRESSED_ONBOARDING_STATUSES:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "MERCHANT_NOT_ACCEPTING_ORDERS",
+                    "message": (
+                        "This merchant is not currently able to accept orders."
+                    ),
+                    "merchant_id": order_request.merchant_id,
+                },
+            )
 
         if _is_checkout_ui_order_create(order_request.metadata) and not order_request.quote_id:
             raise HTTPException(
