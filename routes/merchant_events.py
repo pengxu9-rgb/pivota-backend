@@ -11,8 +11,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from config.settings import resolve_public_api_base_url
 from db.database import database
-from services.merchant_event_ingest_service import MerchantEventBatch, ingest_merchant_event_batch
-from services.merchant_hmac_auth import MerchantHMACAuthError, authenticate_hmac_merchant
+from services.merchant_event_ingest_service import (
+    MerchantEventBatch,
+    ingest_merchant_event_batch,
+)
+from services.merchant_hmac_auth import (
+    MerchantHMACAuthError,
+    authenticate_hmac_merchant,
+)
 from services.merchant_web_collector_service import (
     MAX_ALLOWED_ORIGINS,
     MAX_TOKEN_TTL_DAYS,
@@ -21,11 +27,12 @@ from services.merchant_web_collector_service import (
     collector_request_origin,
     default_origin_from_store_domain,
     issue_web_collector_token,
+    issue_shopify_pixel_token,
+    verify_shopify_pixel_token,
     normalize_allowed_origins,
     verify_web_collector_token,
 )
 from utils.auth import get_current_user
-
 
 router = APIRouter(prefix="/merchant-events/v1", tags=["Merchant Events"])
 
@@ -42,7 +49,16 @@ class WebCollectorProvisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     store_id: str = Field(min_length=1, max_length=128)
-    allowed_origins: List[str] = Field(default_factory=list, max_length=MAX_ALLOWED_ORIGINS)
+    allowed_origins: List[str] = Field(
+        default_factory=list, max_length=MAX_ALLOWED_ORIGINS
+    )
+    ttl_days: int = Field(default=90, ge=1, le=MAX_TOKEN_TTL_DAYS)
+
+
+class ShopifyPixelProvisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    store_id: str = Field(min_length=1, max_length=128)
     ttl_days: int = Field(default=90, ge=1, le=MAX_TOKEN_TTL_DAYS)
 
 
@@ -54,10 +70,9 @@ def _collector_javascript() -> str:
 def _authorize_store(current_user: dict, merchant_id: str) -> None:
     if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if (
-        current_user.get("role") == "merchant"
-        and str(current_user.get("merchant_id") or "") != str(merchant_id)
-    ):
+    if current_user.get("role") == "merchant" and str(
+        current_user.get("merchant_id") or ""
+    ) != str(merchant_id):
         raise HTTPException(status_code=403, detail="Can only manage your own store")
 
 
@@ -80,7 +95,9 @@ async def web_collector_javascript():
     try:
         content = _collector_javascript()
     except OSError as exc:
-        raise HTTPException(status_code=503, detail="Web collector asset is unavailable") from exc
+        raise HTTPException(
+            status_code=503, detail="Web collector asset is unavailable"
+        ) from exc
     return Response(
         content=content,
         media_type="application/javascript",
@@ -144,6 +161,40 @@ async def provision_web_collector_token(
     }
 
 
+@router.post("/shopify-pixel/install-token")
+async def provision_shopify_pixel_token(
+    body: ShopifyPixelProvisionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    store = await _connected_store(body.store_id)
+    if not store or str(store.get("platform") or "").lower() != "shopify":
+        raise HTTPException(status_code=404, detail="Connected Shopify store not found")
+    _authorize_store(current_user, str(store["merchant_id"]))
+    try:
+        issued = issue_shopify_pixel_token(
+            merchant_id=str(store["merchant_id"]),
+            store_id=str(store["store_id"]),
+            ttl_days=body.ttl_days,
+        )
+    except WebCollectorError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    endpoint = (
+        resolve_public_api_base_url().rstrip("/")
+        + "/merchant-events/v1/shopify-pixel/batch"
+    )
+    return {
+        "status": "provisioned",
+        "store_id": str(store["store_id"]),
+        "collector_token": issued["token"],
+        "expires_at": issued["expires_at"],
+        "web_pixel_settings": {
+            "collectorToken": issued["token"],
+            "endpoint": endpoint,
+        },
+        "required_scopes": ["read_customer_events", "write_pixels"],
+    }
+
+
 @router.post("/web/batch")
 async def ingest_web_collector_batch(request: Request):
     """Accept non-authoritative browser funnel events from an origin-bound token."""
@@ -175,7 +226,9 @@ async def ingest_web_collector_batch(request: Request):
         or str(store.get("merchant_id") or "") != str(claims["merchant_id"])
         or str(store.get("platform") or "").strip().lower() != str(claims["platform"])
     ):
-        raise HTTPException(status_code=403, detail="Web collector store is no longer active")
+        raise HTTPException(
+            status_code=403, detail="Web collector store is no longer active"
+        )
     try:
         batch = build_web_collector_batch(payload, claims=claims)
     except WebCollectorError as exc:
@@ -195,11 +248,52 @@ async def ingest_web_collector_batch(request: Request):
     )
 
 
+@router.post("/shopify-pixel/batch")
+async def ingest_shopify_pixel_batch(request: Request):
+    """Accept consent-gated Shopify standard events from its strict pixel sandbox."""
+    raw_body = await request.body()
+    if len(raw_body) > MAX_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="Request body exceeds 1 MB")
+    try:
+        payload = json.loads(raw_body or b"{}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    try:
+        claims = verify_shopify_pixel_token(payload.get("collector_token"))
+        batch = build_web_collector_batch(
+            payload, claims=claims, source="shopify_web_pixel"
+        )
+    except WebCollectorError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    store = await _connected_store(str(claims["store_id"]))
+    if (
+        not store
+        or str(store.get("merchant_id") or "") != str(claims["merchant_id"])
+        or str(store.get("platform") or "").lower() != "shopify"
+    ):
+        raise HTTPException(
+            status_code=403, detail="Shopify pixel store is no longer active"
+        )
+    result = await ingest_merchant_event_batch(
+        merchant_id=str(claims["merchant_id"]), batch=batch
+    )
+    return JSONResponse(
+        {"status": "recorded", **result},
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"},
+    )
+
+
 @router.post("/batch")
 async def ingest_event_batch(
     request: Request,
-    x_pivota_merchant_id: Optional[str] = Header(default=None, alias="X-Pivota-Merchant-Id"),
-    x_pivota_signature: Optional[str] = Header(default=None, alias="X-Pivota-Signature"),
+    x_pivota_merchant_id: Optional[str] = Header(
+        default=None, alias="X-Pivota-Merchant-Id"
+    ),
+    x_pivota_signature: Optional[str] = Header(
+        default=None, alias="X-Pivota-Signature"
+    ),
 ):
     """Ingest up to 100 canonical commerce events from any store adapter.
 
@@ -226,9 +320,13 @@ async def ingest_event_batch(
     try:
         payload = json.loads(raw_body or b"{}")
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body") from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body"
+        ) from exc
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Body must be a JSON object")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Body must be a JSON object"
+        )
 
     try:
         batch = MerchantEventBatch.model_validate(payload)
