@@ -183,15 +183,23 @@ class _FakeClient:
 
 
 async def _quote_from(monkeypatch, payload):
-    """Drive the REAL resolve_merchant_quote, faking only the HTTP transport."""
+    """Drive the REAL resolve_merchant_quote, faking only the HTTP transport.
+
+    The transport now lives in services/merchant_ucp_checkout.py, so the stubs go THERE — patching
+    `agent_card_issuance.resolves_only_public` would silently miss, because the call is resolved
+    in the other module's namespace. The profile env is required for the same reason the real
+    call needs it: without `meta["ucp-agent"]["profile"]` the merchant refuses outright.
+    """
     import httpx
 
     from services import agent_card_issuance as mod
+    from services import merchant_ucp_checkout as transport
 
+    monkeypatch.setenv("UCP_AGENT_PROFILE_URL", "https://ucp.pivota.cc/.well-known/ucp-agent")
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeClient(payload))
     # The SSRF guard is a live-DNS dependency, not the thing under test here, and it makes these
     # rows flaky. It keeps its own coverage in tests/test_agent_card_issuance.py.
-    monkeypatch.setattr(mod, "resolves_only_public", lambda domain: True)
+    monkeypatch.setattr(transport, "resolves_only_public", lambda domain: True)
     return await mod.resolve_merchant_quote("shop.example.com", "chk_1")
 
 
