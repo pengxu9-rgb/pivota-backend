@@ -525,12 +525,14 @@ async def execute_merchant_order_backed_canary(
         _execute_order_backed_payment_canary,
     )
 
-    merchant = {
-        "merchant_id": merchant_id,
-        "business_name": current_user.get("business_name"),
-        "contact_email": current_user.get("email"),
-        "status": "approved",
-    }
+    # Loaded, not fabricated. This dict used to hardcode status="approved" and
+    # hand it to the executor, which creates a REAL order row and runs a REAL
+    # PSP payment — so it bypassed both the order-creation gate and
+    # _load_canary_merchant's own "Only approved merchants can process
+    # payments" check. A rejected merchant took money through here.
+    from routes.payment_execution_routes import _load_canary_merchant
+
+    merchant = await _load_canary_merchant(merchant_id)
     requested_order_id = payload.order_id or (
         f"merchant_canary_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
     )

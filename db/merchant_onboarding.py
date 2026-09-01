@@ -257,10 +257,11 @@ async def get_all_merchant_onboardings(status: Optional[str] = None, include_del
 async def soft_delete_merchant_onboarding(merchant_id: str) -> bool:
     """Soft delete onboarding merchant by setting status='deleted' and removing user account"""
     # 1. Soft delete merchant onboarding record
-    query = merchant_onboarding.update().where(
-        merchant_onboarding.c.merchant_id == merchant_id
-    ).values(status="deleted", updated_at=datetime.now())
-    await database.execute(query)
+    # Through update_kyc_status, not a direct write. Setting status here on its
+    # own left `auto_approved` True, and the PSP gate passes on that flag — so a
+    # soft-deleted merchant could still connect a payment provider. The
+    # rejection path had exactly this bug; this is the same door one table over.
+    await update_kyc_status(merchant_id, "deleted")
     
     # 2. Also delete the user account to allow re-registration with same email
     try:

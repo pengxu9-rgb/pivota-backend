@@ -197,6 +197,7 @@ def derive_merchant_status(
     *,
     no_rows_means_inactive: bool = False,
     onboarding_status: Optional[str] = None,
+    no_rows_means_active: bool = False,
 ) -> Optional[str]:
     """Pure: what should catalog_merchants.status be, given this merchant's
     merchant_stores statuses?
@@ -247,7 +248,23 @@ def derive_merchant_status(
 
     rows = [str(s or "").strip().lower() for s in store_statuses]
     if not rows:
-        return "inactive" if no_rows_means_inactive else None
+        if no_rows_means_inactive:
+            return "inactive"
+        # `no_rows_means_active` is the counterpart the suppression above made
+        # necessary, and without it rejection is a ONE-WAY DOOR. Suppression
+        # returns 'inactive' for a store-less merchant; re-approval would return
+        # None ("don't touch it") and leave it dark forever — and nothing
+        # repairs that, because reconcile_catalog_merchant_statuses drives off
+        # SELECT DISTINCT merchant_id FROM merchant_stores and a zero-store
+        # merchant is invisible to it. On prod that is 471 of 483 rows, so the
+        # common case was unrecoverable.
+        #
+        # Same discipline as no_rows_means_inactive: only a caller that itself
+        # knows the merchant's lifecycle just changed may pass it. The approve
+        # route does; nothing else should.
+        if no_rows_means_active:
+            return "active"
+        return None
     if any(s in ACTIVE_STORE_STATUSES for s in rows):
         return "active"
     return "inactive"
@@ -258,6 +275,7 @@ async def sync_catalog_merchant_status(
     *,
     reason: str = "store_lifecycle",
     last_store_removed: bool = False,
+    merchant_reinstated: bool = False,
 ) -> Dict[str, Any]:
     """Re-derive one merchant's catalog_merchants.status from its stores.
 
@@ -303,17 +321,32 @@ async def sync_catalog_merchant_status(
         # second writer of this column. Writing catalog_merchants.status from
         # the rejection route directly would be undone the next time any store
         # event re-derived it.
-        onboarding_row = await database.fetch_one(
-            "SELECT status FROM merchant_onboarding WHERE merchant_id = :merchant_id",
-            {"merchant_id": mid},
-        )
-        onboarding_status = (
-            str(dict(onboarding_row).get("status") or "") if onboarding_row else None
-        )
+        #
+        # In its OWN try: this query was added by the rejection work, and the
+        # store-derived active<->inactive write-through (#1648) predates it. A
+        # missing table, a permission error or a statement timeout here must not
+        # take that older mechanism down with it — an unknown onboarding status
+        # simply means "no opinion", which is what the pre-existing behaviour
+        # already was.
+        onboarding_status = None
+        try:
+            onboarding_row = await database.fetch_one(
+                "SELECT status FROM merchant_onboarding WHERE merchant_id = :merchant_id",
+                {"merchant_id": mid},
+            )
+            if onboarding_row:
+                onboarding_status = str(dict(onboarding_row).get("status") or "")
+        except Exception as exc:  # noqa: BLE001 - see above
+            logger.warning(
+                "catalog_merchant_status: onboarding lookup failed for %s (%s); "
+                "deriving from stores alone", mid, exc,
+            )
+
         desired = derive_merchant_status(
             [dict(r).get("status") for r in store_rows],
             no_rows_means_inactive=last_store_removed,
             onboarding_status=onboarding_status,
+            no_rows_means_active=merchant_reinstated,
         )
         if desired is None:
             result["skipped"] = "no_store_rows"

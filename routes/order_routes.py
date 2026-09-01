@@ -3511,10 +3511,18 @@ async def create_new_order(
         # auto-approves everyone, so rejection is the only lever an employee
         # has, and until now it reached neither this path nor public serving —
         # order creation checked that the merchant EXISTED and nothing else.
-        # Checked here rather than deeper because `merchant` is already loaded:
-        # no extra query, and both order entry points funnel through this
-        # handler (routes/agent_v2.create_order_v2 builds a CreateOrderRequest
-        # and calls it).
+        # Checked here because `merchant` is already loaded — no extra query —
+        # and because this handler is the convergence point for the agent order
+        # surfaces. An earlier version of this comment said "both order entry
+        # points" and named agent_v2 as calling this directly; both halves were
+        # wrong. There are several entrants and the hop is indirect:
+        # agent_v2 -> routes/agent_api.agent_create_order -> here, with
+        # agent_commerce, agent_checkout_intents (ACP complete) and the
+        # agent_shop_gateway proxy arriving the same way.
+        #
+        # It is NOT the only way to create an order in this codebase, and this
+        # gate does not claim to be. See the PR for the paths that reach a
+        # charge without passing here.
         merchant_status = str(merchant.get("status") or "").strip().lower()
         if merchant_status in SUPPRESSED_ONBOARDING_STATUSES:
             raise HTTPException(
