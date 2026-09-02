@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON, String, Table
@@ -294,7 +294,7 @@ _REQUEUE_STALE_SQL = """
         FROM product_quality_backfill_jobs
         WHERE status = 'running'
           AND started_at IS NOT NULL
-          AND started_at < :cutoff
+          AND started_at < CURRENT_TIMESTAMP - (:stale_seconds * INTERVAL '1 second')
         ORDER BY started_at ASC
         LIMIT :limit
     )
@@ -316,7 +316,7 @@ _REQUEUE_STALE_SQL_SQLITE = """
         FROM product_quality_backfill_jobs
         WHERE status = 'running'
           AND started_at IS NOT NULL
-          AND started_at < :cutoff
+          AND started_at < datetime('now', :stale_window)
         ORDER BY started_at ASC
         LIMIT :limit
     )
@@ -388,18 +388,43 @@ async def requeue_stale_quality_backfill_jobs(
     itself was always correct — only the number was wrong, and the number is
     the only thing anyone reads: `jobs/product_quality_backfill_worker.py` gates
     its "Requeued %s stale quality backfill job(s)" warning on it, so a falsy
-    count does not misreport the requeue, it deletes the log line.
+    count does not misreport the requeue, it deletes the log line. That warning
+    does not fire in production today for a simpler reason —
+    `start_product_quality_backfill_loop` has no callers anywhere — so the wrong
+    count is what would greet whoever revives that loop.
 
-    BE PRECISE ABOUT THE BLAST RADIUS. That warning does not fire in production
-    today for a simpler reason — `start_product_quality_backfill_loop` has no
-    callers anywhere, so this function only runs from tests and from a manual
-    invocation of that job module. The count being wrong is what would greet
-    whoever revives the loop, not something production is losing now.
+    THE CUTOFF IS COMPUTED BY THE SERVER, NOT BOUND FROM PYTHON. It used to be
+    `_utcnow() - timedelta(...)`, a NAIVE datetime, and asyncpg encodes a naive
+    datetime for a `timestamptz` parameter as local wall time — local to THIS
+    PROCESS, from its `TZ`, not to the database session. Measured on PG 15 with
+    the database and session both UTC, from a process on Pacific time, a
+    `utcnow()` bound as `$1::timestamptz` lands SEVEN HOURS in the future. (The
+    same probe before and after `SET TIME ZONE` on the connection returns the
+    same value, which is how the session was ruled out as the cause.)
+
+    THAT CONVERSION ONLY HAPPENS FOR A `timestamptz` PARAMETER, and `started_at`
+    is NOT one in the deployed database, so the old form was not wrong for THAT
+    reason. main.py runs its final `metadata.create_all` before
+    `run_sql_migrations` and this module is in metadata by then, so the table is
+    built from the bare `DateTime` Column as naive `timestamp` and migration
+    054's `CREATE TABLE IF NOT EXISTS` — which does say TIMESTAMPTZ — never
+    runs. Verified by building a database in that order.
+
+    IT WAS STILL WRONG, FOR A DIFFERENT REASON, AND STILL IS ON ANY NON-UTC
+    SESSION. Against the naive column production has, `started_at` is written by
+    `CURRENT_TIMESTAMP` (see `claim_quality_backfill_job`) in SESSION-local time,
+    while the old `:cutoff` was a client-UTC value — two clocks, compared. The
+    server-side form promotes `started_at` with the same session timezone that
+    wrote it, so the comparison is self-consistent whatever that timezone is.
+    Binding a tz-AWARE datetime would fix the arithmetic only after the
+    model/migration drift is resolved: asyncpg REFUSES an aware datetime against
+    a plain `timestamp` column (`DataError`), which is what the column is today.
+    `CURRENT_TIMESTAMP - interval` binds no datetime at all, so it is correct
+    under either declaration and under any session timezone.
     """
     await ensure_product_quality_backfill_jobs_table()
-    cutoff = _utcnow() - timedelta(seconds=max(30, stale_after_seconds))
+    seconds = max(30, stale_after_seconds)
     values: Dict[str, Any] = {
-        "cutoff": cutoff,
         "limit": max(1, limit),
         "errors_sample": _json_param(
             [
@@ -411,9 +436,13 @@ async def requeue_stale_quality_backfill_jobs(
         ),
     }
     if IS_POSTGRES:
-        rows = await database.fetch_all(_REQUEUE_STALE_SQL, values)
+        rows = await database.fetch_all(
+            _REQUEUE_STALE_SQL, {**values, "stale_seconds": seconds}
+        )
     else:
-        rows = await database.fetch_all(_REQUEUE_STALE_SQL_SQLITE, values)
+        rows = await database.fetch_all(
+            _REQUEUE_STALE_SQL_SQLITE, {**values, "stale_window": f"-{seconds} seconds"}
+        )
     return len(rows)
 
 
