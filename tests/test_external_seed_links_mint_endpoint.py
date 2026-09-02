@@ -71,6 +71,22 @@ def client():
         app.dependency_overrides.pop(get_agent_context, None)
 
 
+_SHOPIFY_SNAPSHOT = {
+    "snapshot": {
+        "storefront_platform": "shopify",
+        "variants": [{"shopify_variant_id": "46123456789", "title": "Default"}],
+    }
+}
+
+
+def _strip(url: str) -> Dict[str, Any]:
+    q = _query(url)
+    q.pop(REFERRAL_CLICK_PARAM, None)
+    q.pop("utm_content", None)
+    q.pop(SHOPIFY_CART_CLICK_ATTRIBUTE, None)
+    return {"path": urlparse(url).path, "host": urlparse(url).netloc, "q": q}
+
+
 def _candidate(**over: Any) -> Dict[str, Any]:
     base = {
         "external_seed_id": "seed_1",
@@ -116,16 +132,19 @@ def test_minted_entry_is_identical_in_shape_to_a_card_this_backend_builds(client
     `_build_prefetched_external_seed_wrappers` builds from the same seed."""
     import asyncio
 
-    res = client.post(PATH, json={"candidates": [_candidate()]})
+    # WITH the seed's snapshot: a standalone Shopify seed on a custom domain can only build a
+    # cart permalink from `seed_data.snapshot`, so parity is only meaningful when it is present.
+    candidate = _candidate(
+        destination_url="https://teststore.com/products/widget",
+        canonical_url="https://teststore.com/products/widget",
+        seed_data=_SHOPIFY_SNAPSHOT,
+    )
+    res = client.post(PATH, json={"candidates": [candidate]})
     link = res.json()["links"][0]
-    wrappers = asyncio.run(gw._build_prefetched_external_seed_wrappers({"external_seed_candidates": [_candidate()]}))
+    wrappers = asyncio.run(gw._build_prefetched_external_seed_wrappers({"external_seed_candidates": [candidate]}))
     product = wrappers[0]["product"]
-
-    def _strip(url: str) -> Dict[str, Any]:
-        q = _query(url)
-        q.pop(REFERRAL_CLICK_PARAM, None)
-        q.pop("utm_content", None)
-        return {"path": urlparse(url).path, "host": urlparse(url).netloc, "q": q}
+    assert link["cart_url"] is not None and product["cart_url"] is not None
+    assert _strip(link["cart_url"]) == _strip(product["cart_url"])
 
     assert _strip(link["destination_url"]) == _strip(product["destination_url"])
     assert link["tracking"]["param"] == product["tracking"]["param"]
@@ -178,16 +197,93 @@ def test_a_candidate_off_the_allowlist_is_absent_not_wrong(client: TestClient):
 
 
 def test_a_candidate_with_an_unusable_url_is_absent(client: TestClient):
+    # Held by the mint itself (`_make_external_redirect_url` answers None for a non-http URL,
+    # and the allowlist refuses an empty host), not by a check in this endpoint.
     res = client.post(PATH, json={"candidates": [_candidate(destination_url="javascript:alert(1)")]})
     assert res.status_code == 200, res.text
     assert res.json()["links"] == []
 
 
-def test_two_cards_for_one_seed_destination_share_one_link(client: TestClient):
-    res = client.post(PATH, json={"candidates": [_candidate(external_seed_id="a"), _candidate(external_seed_id="b")]})
-    links = res.json()["links"]
-    assert [l["external_seed_id"] for l in links] == ["a", "b"]
-    assert links[0]["external_redirect_url"] == links[1]["external_redirect_url"]
+def test_two_cards_on_one_destination_get_two_links_each_naming_its_own_seed(client: TestClient):
+    # The signed token carries per-seed context. Review of the first cut caught a
+    # destination-keyed cache handing card b a token whose ctx named seed a — clicks from b
+    # would have been logged under a. One mint per candidate, and the ctx proves it.
+    res = client.post(
+        PATH,
+        json={
+            "candidates": [
+                _candidate(external_seed_id="a", attached_product_key="prod::merch_A::woocommerce::1"),
+                _candidate(external_seed_id="b", attached_product_key="prod::merch_B::woocommerce::2"),
+            ]
+        },
+    )
+    links = {l["external_seed_id"]: l for l in res.json()["links"]}
+    assert set(links) == {"a", "b"}
+    assert links["a"]["external_redirect_url"] != links["b"]["external_redirect_url"]
+    for seed_id, link in links.items():
+        ctx = _token_payload(link["external_redirect_url"])["ctx"]
+        assert ctx["seedId"] == seed_id
+        assert ctx["merchant_id"] == ("merch_A" if seed_id == "a" else "merch_B")
+    assert links["a"]["tracking"]["click_id"] != links["b"]["tracking"]["click_id"]
+
+
+def test_same_destination_two_shop_domains_never_share_a_cart(client: TestClient):
+    # The worst shape from review: same product page, two shop domains with a numeric
+    # variant. Each card's signed destination must be a cart on ITS OWN domain.
+    base = dict(
+        destination_url="https://example.com/products/widget",
+        canonical_url="https://example.com/products/widget",
+        attached_product_key="prod::merch_x::shopify::999",
+        attached_variant_id="46123456789",
+    )
+    res = client.post(
+        PATH,
+        json={
+            "candidates": [
+                _candidate(external_seed_id="shop_a", domain="teststore.com", **base),
+                _candidate(external_seed_id="shop_b", domain="example.com", **base),
+            ]
+        },
+    )
+    links = {l["external_seed_id"]: l for l in res.json()["links"]}
+    assert set(links) == {"shop_a", "shop_b"}
+    assert _token_payload(links["shop_a"]["external_redirect_url"])["dest"].startswith("https://teststore.com/cart/")
+    assert _token_payload(links["shop_b"]["external_redirect_url"])["dest"].startswith("https://example.com/cart/")
+    for link in links.values():
+        assert link["tracking"] is not None
+
+
+def test_snapshot_evidence_builds_the_cart_join_for_a_standalone_seed(client: TestClient):
+    # No attached key, custom domain: the ONLY route to a Shopify cart permalink is the
+    # seed's snapshot (storefront_platform + one stamped variant). Dropping `seed_data`
+    # silently turns this into a referral — the join this endpoint exists to recover.
+    res = client.post(
+        PATH,
+        json={
+            "candidates": [
+                _candidate(
+                    external_seed_id="standalone",
+                    destination_url="https://teststore.com/products/widget",
+                    canonical_url="https://teststore.com/products/widget",
+                    seed_data=_SHOPIFY_SNAPSHOT,
+                )
+            ]
+        },
+    )
+    assert res.status_code == 200, res.text
+    link = res.json()["links"][0]
+    assert link["cart_url"] is not None and link["cart_url"].startswith("https://teststore.com/cart/46123456789:1?")
+    assert link["tracking"]["join_mode"] == "cart_permalink"
+
+
+def test_a_multi_variant_snapshot_refuses_the_cart_join(client: TestClient):
+    two = {"snapshot": {"storefront_platform": "shopify", "variants": [
+        {"shopify_variant_id": "1", "title": "S"}, {"shopify_variant_id": "2", "title": "M"}]}}
+    res = client.post(PATH, json={"candidates": [_candidate(
+        destination_url="https://teststore.com/products/widget", canonical_url=None, seed_data=two)]})
+    link = res.json()["links"][0]
+    assert link["cart_url"] is None
+    assert link["tracking"]["join_mode"] == "referral_only"
 
 
 def test_same_destination_with_and_without_a_cart_variant_are_different_links(client: TestClient):
@@ -224,11 +320,11 @@ def test_same_destination_with_and_without_a_cart_variant_are_different_links(cl
 def test_market_and_tool_default_from_the_body(client: TestClient):
     res = client.post(
         PATH,
-        json={"market": "US", "tool": "find_products_multi", "candidates": [_candidate(market=None, tool=None)]},
+        json={"market": "GB", "tool": "find_products_multi", "candidates": [_candidate(market=None, tool=None)]},
     )
     link = res.json()["links"][0]
     payload = _token_payload(link["external_redirect_url"])
-    assert payload["market"] == "US"
+    assert payload["market"] == "GB"  # not the hardcoded fallback, so the body default is proven
     assert payload["tool"] == "find_products_multi"
     assert _query(link["destination_url"])["utm_medium"] == ["find_products_multi"]
 

@@ -8341,6 +8341,11 @@ class ExternalSeedLinkCandidate(BaseModel):
     seller_ref: Optional[str] = Field(default=None, max_length=256)
     seed_kind: Optional[str] = Field(default=None, max_length=64)
     variant_id: Optional[str] = Field(default=None, max_length=128)
+    # The seed's own snapshot, when the caller has it. `storefront_is_shopify` and
+    # `sole_stamped_variant_id` read it to decide whether a Shopify cart permalink can be
+    # built for a standalone seed on a custom domain — without it that join, the order-side
+    # one this endpoint exists to recover, silently degrades to a referral.
+    seed_data: Optional[Dict[str, Any]] = None
 
 
 EXTERNAL_SEED_LINKS_MAX_CANDIDATES = 50
@@ -8379,7 +8384,11 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
     default_market = str(body.market or "US").strip().upper() or "US"
     default_tool = str(body.tool or "*").strip() or "*"
     links: List[Dict[str, Any]] = []
-    redirect_cache: Dict[str, Optional[str]] = {}
+    # ONE MINT PER CANDIDATE, DELIBERATELY NO CACHE. The signed token carries per-seed context
+    # (seedId, merchant/product/variant identity, shop domain), so two candidates that share
+    # a destination are still two different tokens. Review of the first cut reproduced a
+    # destination-keyed cache handing card B a link whose ctx named card A — and, with two
+    # shop domains, a link into another merchant's cart. Fifty HMACs are cheap; that is not.
     for candidate in body.candidates:
         # No scheme check here on purpose: `_make_external_redirect_url` refuses anything that is
         # not http(s) and answers None, which is the one path an unusable URL takes below. A
@@ -8389,35 +8398,26 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         market = str(candidate.market or default_market).strip().upper() or default_market
         tool = str(candidate.tool or default_tool).strip() or default_tool
         row = candidate.model_dump()
+        seed_data = _ensure_seed_data_obj(candidate.seed_data) or {}
         redirect_identity = _external_seed_redirect_identity(
-            row=row, seed_data={}, offer_variant_id=candidate.variant_id
+            row=row, seed_data=seed_data, offer_variant_id=candidate.variant_id
         )
-        cache_key = "||".join([
-            market, tool, destination_url, str(candidate.utm_template or ""),
-            str(redirect_identity.get("seller_ref") or ""),
-            str(redirect_identity.get("seed_kind") or ""),
-            str(redirect_identity.get("cart_variant_id") or ""),
-        ])
-        if cache_key in redirect_cache:
-            redirect_url = redirect_cache[cache_key]
-        else:
-            redirect_url = await _make_external_redirect_url(
-                market=market,
-                tool=tool,
-                destination_url=destination_url,
-                utm_template=candidate.utm_template,
-                ctx={"seedId": candidate.external_seed_id, "source": "external_seed_links"},
-                allowed_domains=None,
-                merchant_id=redirect_identity["merchant_id"],
-                product_id=redirect_identity["product_id"],
-                variant_id=redirect_identity["variant_id"],
-                cart_variant_id=redirect_identity.get("cart_variant_id"),
-                shop_domain=redirect_identity["shop_domain"],
-                platform=redirect_identity["platform"],
-                seller_ref=redirect_identity["seller_ref"],
-                seed_kind=redirect_identity["seed_kind"],
-            )
-            redirect_cache[cache_key] = redirect_url
+        redirect_url = await _make_external_redirect_url(
+            market=market,
+            tool=tool,
+            destination_url=destination_url,
+            utm_template=candidate.utm_template,
+            ctx={"seedId": candidate.external_seed_id, "source": "external_seed_links"},
+            allowed_domains=None,
+            merchant_id=redirect_identity["merchant_id"],
+            product_id=redirect_identity["product_id"],
+            variant_id=redirect_identity["variant_id"],
+            cart_variant_id=redirect_identity.get("cart_variant_id"),
+            shop_domain=redirect_identity["shop_domain"],
+            platform=redirect_identity["platform"],
+            seller_ref=redirect_identity["seller_ref"],
+            seed_kind=redirect_identity["seed_kind"],
+        )
         if not redirect_url:
             continue
         attribution = _seed_attribution_from_redirect(
@@ -8431,17 +8431,15 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
             cart_variant_id=redirect_identity.get("cart_variant_id"),
         )
         if not attribution:
-            # We minted a link but could not confirm the URL we would publish is the one it
-            # signs — the same refusal the card builders make. The link alone is still honest.
-            links.append(
-                {
-                    "external_seed_id": candidate.external_seed_id,
-                    "external_product_id": candidate.external_product_id,
-                    "external_redirect_url": redirect_url,
-                    "destination_url": None,
-                    "cart_url": None,
-                    "tracking": None,
-                }
+            # Unreachable by construction: the recompose uses exactly the inputs the mint
+            # just used. If it ever fires, the token we hold does not describe the URL we
+            # would publish, and the honest answer is NO entry — the caller keeps its raw
+            # URL — not a link with null tracking that a per-key stamp would write over the
+            # card as nulls. Loud, so a regression cannot pass as "honest degradation".
+            logger.error(
+                "external_seed_links: attribution recompose disagreed with the token just "
+                "minted external_seed_id=%s — entry dropped",
+                candidate.external_seed_id,
             )
             continue
         links.append(
