@@ -235,6 +235,23 @@ async def _db():
         await database.execute(
             f"ALTER TABLE orders DROP CONSTRAINT IF EXISTS {ORDERS_PSP_ID_CONSTRAINT}"
         )
+        # This file never ADDS merchant_psps' constraint — but
+        # test_the_schema_guard_twin_really_installs_it runs the REAL
+        # ensure_required_schema_light(), which installs migration 207's as a side
+        # effect and does not remove it.
+        #
+        # HONESTLY: no sibling fails today without this line. Every merchant_psps
+        # row the gate files insert already carries a conforming psp_id, so the
+        # constraint being left armed changes nothing right now — this is hygiene,
+        # not a guard with a test behind it. It is here because the alternative is
+        # a shared database where whether a sibling's fixture rows are checked at
+        # all depends on whether THIS file happened to run first, and that
+        # dependency is invisible until the day someone adds a short id. Drop what
+        # we armed.
+        await database.execute(
+            "ALTER TABLE merchant_psps"
+            " DROP CONSTRAINT IF EXISTS check_merchant_psps_psp_id_format"
+        )
         if not was_connected and database.is_connected:
             await database.disconnect()
 
@@ -375,6 +392,25 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
     assert installed["convalidated"] is False, (
         "the startup guard added a VALIDATING constraint — a legacy row outside the "
         "list would now abort the boot"
+    )
+
+    # Migration 207's twin rides in the same function, and prod fast mode is the
+    # ONLY thing that applies it there. tests/test_psp_id_format_constraint_postgres.py
+    # installs that constraint from the MIGRATION FILE, so it cannot tell whether
+    # the startup block also works — this is the one place the schema_guard copy is
+    # executed. Asserted here rather than left as an unclaimed side effect.
+    psps_row = await database.fetch_one(
+        "SELECT convalidated FROM pg_constraint WHERE conname = :n"
+        " AND conrelid = to_regclass('merchant_psps')",
+        {"n": "check_merchant_psps_psp_id_format"},
+    )
+    assert psps_row is not None, (
+        "the startup guard did not install migration 207's merchant_psps constraint "
+        "— on a fast-mode deploy nothing else would"
+    )
+    assert dict(psps_row)["convalidated"] is False, (
+        "the startup guard added a VALIDATING constraint — a legacy malformed "
+        "psp_id would now abort the boot"
     )
 
     # Every boot runs this. The second pass must not re-take an ACCESS EXCLUSIVE

@@ -293,10 +293,10 @@ async def test_fetch_active_merchant_psp_provider_sql_executes_and_selects_no_se
     )
     await database.execute(
         """
-        INSERT INTO merchant_psps (psp_id, merchant_id, provider, status, connected_at, secret_key)
-        VALUES ('psp_pg_old', 'merch_pgprov', 'stripe', 'active', NOW() - interval '1 day', 'sk_old'),
-               ('psp_pg_new', 'merch_pgprov', 'adyen', 'active', NOW(), 'sk_new'),
-               ('psp_pg_inactive', 'merch_pgprov', 'checkout', 'inactive', NOW() + interval '1 day', 'sk_x')
+        INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, status, connected_at, secret_key)
+        VALUES ('psp_stripe_pgold0000001', 'merch_pgprov', 'stripe', 'Stripe Account', 'active', NOW() - interval '1 day', 'sk_old'),
+               ('psp_adyen_pgnew0000001', 'merch_pgprov', 'adyen', 'Adyen Account', 'active', NOW(), 'sk_new'),
+               ('psp_checkout_pginact00001', 'merch_pgprov', 'checkout', 'Checkout Account', 'inactive', NOW() + interval '1 day', 'sk_x')
         """
     )
     out = await fetch_active_merchant_psp_provider(merchant_id="merch_pgprov")
