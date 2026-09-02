@@ -130,3 +130,87 @@ async def test_postgres_sql_binds_merchant_id_when_scoped(monkeypatch):
 
     assert ":merchant_id" in seen["sql"]
     assert seen["values"]["merchant_id"] == "merch_abc"
+
+
+@pytest.mark.asyncio
+async def test_does_not_count_an_order_whose_sync_is_still_in_flight(monkeypatch):
+    """Every dispatch path marks the order paid BEFORE dispatching the sync, so a
+    healthy order matches every other conjunct until the sync finishes. Counting
+    those gives the metric a positive resting value on any live merchant and makes
+    `page_if_greater_than_zero` unsatisfiable."""
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    just_paid = _order("ORD_IN_FLIGHT")
+    just_paid["paid_at"] = now - timedelta(seconds=5)
+    long_stuck = _order("ORD_STUCK")
+    long_stuck["paid_at"] = now - timedelta(hours=6)
+
+    async def fake_fetch(*, merchant_id, limit):
+        return [just_paid, long_stuck]
+
+    monkeypatch.setattr(order_routes, "IS_POSTGRES", False)
+    monkeypatch.setattr(
+        order_routes, "_fetch_paid_orders_missing_merchant_order", fake_fetch
+    )
+
+    result = await order_routes._count_paid_orders_missing_merchant_order_best_effort(
+        merchant_id=None
+    )
+
+    assert result["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_truncated_sample_window_reports_unknown_not_zero(monkeypatch):
+    """The fallback fetch orders by created_at DESC, clamps, and does NOT exclude
+    linked orders in SQL. A merchant with a full window of already-delivered
+    orders would otherwise yield a confident 0 while a real backlog sits behind
+    it — the worst possible answer for a paging signal."""
+    from datetime import datetime, timedelta
+
+    old = datetime.utcnow() - timedelta(days=1)
+    limit = order_routes._PAID_MISSING_MERCHANT_ORDER_SAMPLE_LIMIT
+    delivered = []
+    for i in range(limit):
+        row = _order(f"ORD_DELIVERED_{i}", platform_order_id=f"woo-{i}")
+        row["paid_at"] = old
+        delivered.append(row)
+
+    async def fake_fetch(*, merchant_id, limit):
+        return delivered
+
+    monkeypatch.setattr(order_routes, "IS_POSTGRES", False)
+    monkeypatch.setattr(
+        order_routes, "_fetch_paid_orders_missing_merchant_order", fake_fetch
+    )
+
+    result = await order_routes._count_paid_orders_missing_merchant_order_best_effort(
+        merchant_id=None
+    )
+
+    assert result["available"] is False
+    assert result["count"] is None
+    assert "1000" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_sql_carries_the_in_flight_age_floor(monkeypatch):
+    seen = {}
+
+    async def fake_count_sql(sql, values):
+        seen["sql"] = sql
+        seen["values"] = values
+        return {"count": 3, "available": True}
+
+    monkeypatch.setattr(order_routes, "IS_POSTGRES", True)
+    monkeypatch.setattr(order_routes, "_count_sql_best_effort", fake_count_sql)
+
+    await order_routes._count_paid_orders_missing_merchant_order_best_effort(
+        merchant_id=None
+    )
+
+    assert "min_age_seconds" in seen["sql"]
+    assert seen["values"]["min_age_seconds"] == 300
+    # Must exceed the recovery lanes' 120s so automated recovery runs first.
+    assert seen["values"]["min_age_seconds"] > 120

@@ -3443,6 +3443,47 @@ async def _count_paid_merchant_order_failed_best_effort(
     return {"count": count, "available": True, "sampled": len(rows) >= 1000}
 
 
+# A page must not fire on work that is still in flight. EVERY dispatch path
+# marks the order paid BEFORE the merchant-order sync is dispatched, and the sync
+# then runs asynchronously — so a perfectly healthy order matches every other
+# conjunct below for as long as that sync takes (an advisory lock plus a platform
+# Admin API round trip, longer under rate-limit backoff). Without a floor this
+# counter has a positive resting value on any merchant with a nonzero order rate,
+# and `page_if_greater_than_zero_for_live_merchants` becomes unsatisfiable by
+# construction.
+#
+# 300s deliberately EXCEEDS the 120s used by the automated recovery lanes
+# (services/payment_reconcile and
+# jobs/agentic_commerce_reconciliation.reconcile_paid_orders_missing_merchant_order),
+# so recovery gets first crack at an order before a human is woken for it.
+_PAID_MISSING_MERCHANT_ORDER_MIN_AGE_SECONDS = 300
+
+# The fallback path's sample window. See the comment at its use site: a count
+# taken from a truncated window can be a confident zero.
+_PAID_MISSING_MERCHANT_ORDER_SAMPLE_LIMIT = 1000
+
+
+def _order_effective_timestamp(order: Dict[str, Any]) -> Optional[datetime]:
+    """`paid_at` if present, else `created_at`, normalized to naive UTC.
+
+    Returns None when neither is readable; callers treat that as "old enough to
+    count", because for a paging signal a missed page is worse than an early one.
+    """
+    raw = order.get("paid_at") or order.get("created_at")
+    if isinstance(raw, datetime):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return None
+    else:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 async def _count_paid_orders_missing_merchant_order_best_effort(
     *,
     merchant_id: Optional[str],
@@ -3474,8 +3515,12 @@ async def _count_paid_orders_missing_merchant_order_best_effort(
               AND payment_status = 'paid'
               AND COALESCE(shopify_order_id, '') = ''
               AND COALESCE(metadata -> 'merchant_order' ->> 'platform_order_id', '') = ''
+              AND COALESCE(paid_at, created_at)
+                  <= (NOW() - (:min_age_seconds * INTERVAL '1 second'))
         """
-        values: Dict[str, Any] = {}
+        values: Dict[str, Any] = {
+            "min_age_seconds": int(_PAID_MISSING_MERCHANT_ORDER_MIN_AGE_SECONDS),
+        }
         if merchant_id:
             sql += " AND merchant_id = :merchant_id"
             values["merchant_id"] = merchant_id
@@ -3483,12 +3528,41 @@ async def _count_paid_orders_missing_merchant_order_best_effort(
         if result.get("available"):
             return result
 
+    limit = _PAID_MISSING_MERCHANT_ORDER_SAMPLE_LIMIT
     try:
-        rows = await _fetch_paid_orders_missing_merchant_order(merchant_id=merchant_id, limit=1000)
+        rows = await _fetch_paid_orders_missing_merchant_order(
+            merchant_id=merchant_id, limit=limit
+        )
     except Exception as exc:  # noqa: BLE001
         return {"count": None, "available": False, "error": str(exc)[:300]}
-    count = sum(1 for order in rows if not _get_linked_platform_order(order))
-    return {"count": count, "available": True, "sampled": len(rows) >= 1000}
+
+    if len(rows) >= limit:
+        # `_fetch_paid_orders_missing_merchant_order` orders by created_at DESC,
+        # clamps at `limit`, and does NOT exclude linked platform orders in SQL —
+        # that filtering happens below, in Python. So a merchant with more than
+        # `limit` recent already-delivered orders pushes the genuinely missing
+        # ones out of the window and this path would report a confident 0.
+        # Report unknown instead: for a paging signal a false all-clear is the
+        # worst answer available.
+        return {
+            "count": None,
+            "available": False,
+            "error": f"sample window of {limit} exhausted; count is not trustworthy",
+        }
+
+    cutoff = datetime.utcnow() - timedelta(
+        seconds=_PAID_MISSING_MERCHANT_ORDER_MIN_AGE_SECONDS
+    )
+    count = 0
+    for order in rows:
+        if _get_linked_platform_order(order):
+            continue
+        stamp = _order_effective_timestamp(order)
+        if stamp is not None and stamp > cutoff:
+            # Still inside the sync window; not yet evidence of anything.
+            continue
+        count += 1
+    return {"count": count, "available": True}
 
 
 # ============================================================================
