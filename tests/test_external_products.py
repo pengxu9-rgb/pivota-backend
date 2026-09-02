@@ -230,8 +230,12 @@ async def test_agent_api_build_external_seed_product_uses_canonical_url_when_des
     )
 
     assert product is not None
-    assert product["destination_url"] == "https://example.com/p/2"
-    assert product["external_url"] == "https://example.com/p/2"
+    # The canonical URL is the fallback source, and the published destination is that URL
+    # ATTRIBUTED (utm + the referral click id the /r token signs) — see
+    # tests/test_mcp_lane_destination_carries_click_id.py for the join-key assertions.
+    assert product["destination_url"].startswith("https://example.com/p/2?")
+    assert product["external_url"] == product["destination_url"]
+    assert product["canonical_url"] == "https://example.com/p/2"
     assert "/r?token=" in product["external_redirect_url"]
     assert metrics.get("build_drop_reasons", {}) == {}
 
@@ -273,7 +277,7 @@ async def test_agent_api_build_external_seed_product_uses_snapshot_fields_when_t
 
     assert product is not None
     assert product["product_id"] == "ext_snapshot_1"
-    assert product["destination_url"] == "https://example.com/p/snapshot-1"
+    assert product["destination_url"].startswith("https://example.com/p/snapshot-1?")
     assert product["title"] == "Snapshot Product"
     assert product["product_type"] == "sunscreen"
 

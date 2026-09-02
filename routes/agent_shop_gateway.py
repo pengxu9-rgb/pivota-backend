@@ -6126,6 +6126,22 @@ async def _attach_connected_product_redirects(
                 mint_cache[cache_key] = redirect_url
             if redirect_url:
                 p["external_redirect_url"] = redirect_url
+                # Same additive stamp as the external-seed lanes: the merchant URL an agent
+                # would drive checkout from carries the click id the `/r` hop will log.
+                # Never overwrites a `destination_url` the card already had.
+                attribution = _seed_attribution_from_redirect(
+                    redirect_url,
+                    destination_url=dest,
+                    utm_template=None,
+                    market=used_market,
+                    tool=used_tool,
+                    shop_domain=shop_domain,
+                    platform=platform or None,
+                    cart_variant_id=variant_id,
+                )
+                if attribution and p.get("destination_url"):
+                    attribution = {**attribution, "destination_url": None}
+                _apply_seed_attribution(p, attribution)
     except Exception as e:  # never let attribution stamping break search
         logger.warning("connected-product redirect stamping failed: %s", str(e)[:160])
 
@@ -8030,11 +8046,102 @@ async def _make_external_redirect_url(
     return f"{base}/r?token={token}"
 
 
+def _seed_attribution_from_redirect(
+    redirect_url: Optional[str],
+    *,
+    destination_url: str,
+    utm_template: Optional[str],
+    market: str,
+    tool: str,
+    shop_domain: Optional[str],
+    platform: Optional[str],
+    cart_variant_id: Optional[str],
+    quantity: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """The attributed merchant URLs for a product card, derived FROM the `/r` link it carries.
+
+    WHY THIS EXISTS. Every external-seed card already carried `external_redirect_url` (the signed
+    `/r` hop, which stamps our click id onto the destination at click time) — but the card's own
+    merchant URL was the RAW seed URL. An agent that drives a checkout from that URL (the MCP lane
+    hands it out; an agent platform that will not follow an opaque redirect uses it) generated
+    revenue we could not see. offers.resolve fixed this for offers (T2-12, `execution_spec`); this
+    is the same fix for product cards.
+
+    THE CLICK ID IS READ BACK OUT OF THE TOKEN, NOT MINTED HERE. The one property the join needs
+    is that the id on the URL we publish is the SAME id the `/r` hop will log and stamp. Reading it
+    from the signed token makes that true by construction: there is no second id to drift, no
+    cache to thread it through, and a token we did not sign (a fake in tests, a foreign link) has
+    no id to give — so the card simply carries no attribution instead of a wrong one.
+
+    THE PUBLISHED URL MUST DESCRIBE THE SIGNED DESTINATION. The token's `dest` is what the redirect
+    resolves to; we recompose from the same inputs and REFUSE (None) if the two disagree. A caller
+    that composes with different inputs than the mint used would otherwise publish a URL the
+    redirect never goes to, with our click id on it.
+
+    F1 (same guard as offers.resolve): the allowlist ran on the primary destination — the CART
+    when one exists, built on `shop_domain`. `pdp_url` comes from `destination_url`, which can be
+    a different host nothing vetted. Publish the PDP only when it is on the host the allowlist saw.
+    """
+    ref = str(redirect_url or "").strip()
+    if not ref:
+        return None
+    try:
+        token = parse_qs(urlparse(ref).query).get("token", [""])[0]
+        payload, _expired = parse_redirect_token_verified(token)
+    except Exception:
+        return None
+    ctx = payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {}
+    click_id = str(ctx.get(PVT_CLICK_ID) or "").strip()
+    signed_dest = str(payload.get("dest") or "").strip()
+    if not click_id or not signed_dest:
+        return None
+    composed = compose_attributed_destinations(
+        destination_url=destination_url,
+        utm_template=utm_template,
+        market=market,
+        tool=tool,
+        shop_domain=shop_domain,
+        platform=platform,
+        cart_variant_id=cart_variant_id,
+        click_id=click_id,
+        quantity=quantity,
+    )
+    if composed["primary"] != signed_dest:
+        return None
+    pdp_url = (
+        composed["pdp_url"]
+        if _seed_domain_from_url(composed["pdp_url"]) == _seed_domain_from_url(composed["primary_unkeyed"])
+        else None
+    )
+    return {
+        "destination_url": pdp_url,
+        "cart_url": composed["cart_url"],
+        "tracking": {
+            "click_id": click_id,
+            "param": SHOPIFY_CART_CLICK_ATTRIBUTE if composed["cart_url"] else REFERRAL_CLICK_PARAM,
+            "join_mode": composed["join_mode"],
+        },
+    }
+
+
+def _apply_seed_attribution(product: Dict[str, Any], attribution: Optional[Dict[str, Any]]) -> None:
+    """Stamp the attributed URLs onto a card, in place. Additive: a card with no attribution keeps
+    exactly the shape it had, so no consumer sees a key it did not see before this existed."""
+    if not attribution:
+        return
+    if attribution.get("destination_url"):
+        product["destination_url"] = attribution["destination_url"]
+    if attribution.get("cart_url"):
+        product["cart_url"] = attribution["cart_url"]
+    product["tracking"] = dict(attribution["tracking"])
+
+
 def _external_seed_to_shop_product(
     *,
     row: Dict[str, Any],
     seed_data: Dict[str, Any],
     redirect_url: Optional[str],
+    attribution: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     title = row.get("title") or seed_data.get("title") or row.get("canonical_url") or row.get("destination_url")
     image_url = row.get("image_url") or seed_data.get("image_url")
@@ -8118,6 +8225,10 @@ def _external_seed_to_shop_product(
         "orderable": False,
         "visible_attributes": dict(filter_product.visible_attributes or {}),
     }
+    # `external_destination_url` above stays the RAW seed URL (offer_currency_policy reads the
+    # host off it); `destination_url` — the field agents actually drive checkout from — is the
+    # ATTRIBUTED product page, carrying the same click id the `/r` link will log.
+    _apply_seed_attribution(product, attribution)
     if ingredient_ids:
         product["ingredient_ids"] = list(ingredient_ids)
     return product
@@ -8174,12 +8285,15 @@ async def _build_prefetched_external_seed_wrappers(
         tool = str(candidate.get("tool") or "*").strip() or "*"
         utm_template = candidate.get("utm_template")
         redirect_url = str(candidate.get("external_redirect_url") or "").strip() or None
+        # Hoisted out of the mint branch: the attributed `destination_url` below needs the same
+        # identity (shop_domain / platform / cart variant) whether we mint here or were handed a
+        # link the caller already minted from these same inputs.
+        redirect_identity = _external_seed_redirect_identity(
+            row=candidate,
+            seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
+            offer_variant_id=candidate.get("variant_id"),
+        )
         if not redirect_url:
-            redirect_identity = _external_seed_redirect_identity(
-                row=candidate,
-                seed_data=_ensure_seed_data_obj(candidate.get("seed_data")) or {},
-                offer_variant_id=candidate.get("variant_id"),
-            )
             # ADR-009 D3: seller_ref/seed_kind ride in the token ctx, so a cache
             # hit must not reuse a redirect built for a different seller. Include
             # them in the key (cheap — read from the already-loaded row).
@@ -8269,6 +8383,18 @@ async def _build_prefetched_external_seed_wrappers(
             row=row,
             seed_data=seed_data,
             redirect_url=redirect_url,
+            attribution=_seed_attribution_from_redirect(
+                redirect_url,
+                # The SAME inputs the mint above was given, so the URL we publish is the one the
+                # redirect signs — the helper refuses if they disagree.
+                destination_url=destination_url,
+                utm_template=utm_template,
+                market=market,
+                tool=tool,
+                shop_domain=redirect_identity.get("shop_domain"),
+                platform=redirect_identity.get("platform"),
+                cart_variant_id=redirect_identity.get("cart_variant_id"),
+            ),
         )
         filter_product = _build_external_seed_filter_product(
             row=row,
@@ -10546,6 +10672,16 @@ async def _handle_find_products_multi_inner(
                 row=row_dict,
                 seed_data=seed_data,
                 redirect_url=redirect_url,
+                attribution=_seed_attribution_from_redirect(
+                    redirect_url,
+                    destination_url=dest,
+                    utm_template=utm_template,
+                    market=market,
+                    tool=tool,
+                    shop_domain=redirect_identity.get("shop_domain"),
+                    platform=redirect_identity.get("platform"),
+                    cart_variant_id=redirect_identity.get("cart_variant_id"),
+                ),
             )
             product["visible_attributes"] = dict(candidate.filter_product.visible_attributes or {})
             product["ingredient_ids"] = list(candidate.filter_product.ingredient_ids or [])
