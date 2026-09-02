@@ -30,8 +30,19 @@ POST /merchant-events/v1/shopify-pixel/install-token
 {"store_id":"store_...","ttl_days":90}
 ```
 
-The response's `web_pixel_settings` object is the exact settings input for
-Shopify Admin GraphQL `webPixelCreate` or `webPixelUpdate`. The token has a
+After the extension has been deployed, the authenticated merchant can create
+or update the app-owned pixel idempotently without handling GraphQL settings:
+
+```text
+POST /merchant-events/v1/shopify-pixel/ensure
+{"store_id":"store_...","ttl_days":90}
+
+GET /merchant-events/v1/shopify-pixel/store_.../status
+```
+
+The ensure and status responses never expose Shopify setting values. The
+lower-level install-token response's `web_pixel_settings` object remains
+available for operator diagnostics or manual GraphQL activation. The token has a
 Shopify-pixel-specific JWT audience and is bound to one active Shopify store.
 Because strict pixel sandboxes don't provide a merchant storefront Origin that
 Pivota can reliably bind, this token is not origin-bound. Its authority is

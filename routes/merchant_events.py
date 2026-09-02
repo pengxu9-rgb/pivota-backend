@@ -32,6 +32,12 @@ from services.merchant_web_collector_service import (
     normalize_allowed_origins,
     verify_web_collector_token,
 )
+from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_web_pixel_provisioning import (
+    ShopifyWebPixelProvisioningError,
+    ensure_shopify_web_pixel,
+    get_shopify_web_pixel_status,
+)
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/merchant-events/v1", tags=["Merchant Events"])
@@ -79,7 +85,7 @@ def _authorize_store(current_user: dict, merchant_id: str) -> None:
 async def _connected_store(store_id: str) -> Optional[dict]:
     row = await database.fetch_one(
         """
-        SELECT store_id, merchant_id, platform, domain, status
+        SELECT store_id, merchant_id, platform, domain, api_key, status
         FROM merchant_stores
         WHERE store_id = :store_id
           AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
@@ -192,6 +198,89 @@ async def provision_shopify_pixel_token(
             "endpoint": endpoint,
         },
         "required_scopes": ["read_customer_events", "write_pixels"],
+    }
+
+
+async def _shopify_admin_credentials(store: dict) -> tuple[str, str]:
+    shop_domain = str(store.get("domain") or "").strip()
+    access_token, _ = await resolve_shopify_admin_access_token(
+        shop_domain=shop_domain,
+        api_key_raw=store.get("api_key"),
+        store_id=str(store["store_id"]),
+    )
+    if not shop_domain or not access_token:
+        raise HTTPException(
+            status_code=409,
+            detail="Shopify Admin API credentials are not available for this store",
+        )
+    return shop_domain, access_token
+
+
+@router.post("/shopify-pixel/ensure")
+async def ensure_shopify_pixel(
+    body: ShopifyPixelProvisionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create or update the app-owned Web Pixel without exposing its token."""
+    store = await _connected_store(body.store_id)
+    if not store or str(store.get("platform") or "").lower() != "shopify":
+        raise HTTPException(status_code=404, detail="Connected Shopify store not found")
+    _authorize_store(current_user, str(store["merchant_id"]))
+    shop_domain, access_token = await _shopify_admin_credentials(store)
+    try:
+        issued = issue_shopify_pixel_token(
+            merchant_id=str(store["merchant_id"]),
+            store_id=str(store["store_id"]),
+            ttl_days=body.ttl_days,
+        )
+        endpoint = (
+            resolve_public_api_base_url().rstrip("/")
+            + "/merchant-events/v1/shopify-pixel/batch"
+        )
+        result = await ensure_shopify_web_pixel(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            settings={"collectorToken": issued["token"], "endpoint": endpoint},
+        )
+    except WebCollectorError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ShopifyWebPixelProvisioningError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail="Shopify Web Pixel provisioning failed"
+        ) from exc
+    return {
+        **result,
+        "store_id": str(store["store_id"]),
+        "token_expires_at": issued["expires_at"],
+        "required_scopes": ["read_customer_events", "write_pixels"],
+    }
+
+
+@router.get("/shopify-pixel/{store_id}/status")
+async def shopify_pixel_status(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Report Web Pixel presence while redacting all setting values."""
+    store = await _connected_store(store_id)
+    if not store or str(store.get("platform") or "").lower() != "shopify":
+        raise HTTPException(status_code=404, detail="Connected Shopify store not found")
+    _authorize_store(current_user, str(store["merchant_id"]))
+    shop_domain, access_token = await _shopify_admin_credentials(store)
+    try:
+        result = await get_shopify_web_pixel_status(
+            shop_domain=shop_domain, access_token=access_token
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail="Shopify Web Pixel status check failed"
+        ) from exc
+    return {
+        "status": "configured" if result["configured"] else "missing",
+        "store_id": str(store["store_id"]),
+        **result,
     }
 
 
