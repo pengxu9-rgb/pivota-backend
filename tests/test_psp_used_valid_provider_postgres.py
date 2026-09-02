@@ -394,11 +394,13 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
         "list would now abort the boot"
     )
 
-    # Migration 207's twin rides in the same function, and prod fast mode is the
-    # ONLY thing that applies it there. tests/test_psp_id_format_constraint_postgres.py
-    # installs that constraint from the MIGRATION FILE, so it cannot tell whether
-    # the startup block also works — this is the one place the schema_guard copy is
-    # executed. Asserted here rather than left as an unclaimed side effect.
+    # Migration 207's twin rides in the same function and is installed by the same
+    # call, so assert it here rather than leave it an unclaimed side effect. This
+    # is deliberately belt-and-braces: tests/test_psp_id_format_constraint_postgres.py
+    # also drives ensure_required_schema_light for that constraint, and goes
+    # further by checking it ENFORCES. Two boots' worth of DDL land in one function
+    # and prod fast mode has no other applier for either, so the cheap assertion
+    # stays even though it overlaps.
     psps_row = await database.fetch_one(
         "SELECT convalidated FROM pg_constraint WHERE conname = :n"
         " AND conrelid = to_regclass('merchant_psps')",

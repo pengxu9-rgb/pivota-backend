@@ -219,18 +219,26 @@ def _order_values(psp_id: str) -> dict:
 
 async def _run_self_service_onboarding() -> str:
     """Drive the REAL self-service endpoint and return the psp_id it minted."""
+    from fastapi import HTTPException
+
     from routes.employee_store_psp_fixes import ConnectPSPRequest, setup_merchant_psp
 
-    response = await setup_merchant_psp(
-        ConnectPSPRequest(
-            merchant_id=_MERCHANT_ID,
-            psp_type="stripe",
-            api_key="sk_test_" + "a" * 24,
-            test_mode=True,
-        ),
-        # The route's own self-service case: a signed-in merchant, not an employee.
-        current_user={"role": "merchant", "merchant_id": _MERCHANT_ID},
-    )
+    try:
+        response = await setup_merchant_psp(
+            ConnectPSPRequest(
+                merchant_id=_MERCHANT_ID,
+                psp_type="stripe",
+                api_key="sk_test_" + "a" * 24,
+                test_mode=True,
+            ),
+            # The route's own self-service case: a signed-in merchant, not an employee.
+            current_user={"role": "merchant", "merchant_id": _MERCHANT_ID},
+        )
+    except HTTPException as exc:  # pragma: no cover - only on a failing build
+        # The handler wraps everything in a blanket 500 whose `detail` carries the
+        # real cause. Surface it: bare `fastapi.exceptions.HTTPException` in a
+        # traceback says nothing about WHY onboarding broke.
+        raise AssertionError(f"setup-psp failed: {exc.status_code} {exc.detail}") from exc
     assert response["status"] == "success", response
     return response["psp_id"]
 
@@ -243,6 +251,15 @@ def test_the_two_migrations_state_the_same_rule() -> None:
     psps_body = _migration("207_merchant_psps_psp_id_format.sql")
     assert PSP_ID_FORMAT_REGEX in orders_body, "migration 006 no longer states this regex"
     assert PSP_ID_FORMAT_REGEX in psps_body, "migration 207 no longer states this regex"
+
+
+async def _constraint_present(name: str) -> bool:
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT 1 AS present FROM pg_constraint WHERE conname = :n", {"n": name}
+    )
+    return row is not None
 
 
 async def test_both_constraints_are_installed() -> None:
@@ -316,6 +333,39 @@ async def test_merchant_psps_rejects_a_malformed_id_at_write_time() -> None:
                 "psp_id": "psp_stripe_30cc4106",
                 "merchant_id": _MERCHANT_ID,
             },
+        )
+    assert MERCHANT_PSPS_CONSTRAINT in str(excinfo.value), str(excinfo.value)
+
+
+async def test_startup_self_heal_installs_the_constraint_when_migrations_are_skipped() -> None:
+    """The path production actually takes.
+
+    Prod fast-mode boot skips db/migrations/ entirely, so migration 207 alone is
+    not enough — db/schema_guard.ensure_required_schema_light() owns the apply
+    there, exactly as it already does for the merchant_psps COLUMNS above it. A
+    constraint that exists only in db/migrations/ would never reach the database
+    that had the outage.
+    """
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await database.execute(
+        f"ALTER TABLE merchant_psps DROP CONSTRAINT IF EXISTS {MERCHANT_PSPS_CONSTRAINT}"
+    )
+    assert await _constraint_present(MERCHANT_PSPS_CONSTRAINT) is False
+
+    await ensure_required_schema_light()
+
+    assert await _constraint_present(MERCHANT_PSPS_CONSTRAINT) is True, (
+        "ensure_required_schema_light did not install "
+        f"{MERCHANT_PSPS_CONSTRAINT} — a fast-mode deploy would boot without it"
+    )
+    # And it enforces, rather than merely existing.
+    with pytest.raises(Exception) as excinfo:
+        await database.execute(
+            "INSERT INTO merchant_psps (psp_id, merchant_id, provider, name, status)"
+            " VALUES ('psp_stripe_30cc4106', :merchant_id, 'stripe', 'Stripe Account', 'active')",
+            {"merchant_id": _MERCHANT_ID},
         )
     assert MERCHANT_PSPS_CONSTRAINT in str(excinfo.value), str(excinfo.value)
 
