@@ -42,8 +42,8 @@ Job registration happens at start-up time. Currently registers:
 - `catalog_import_drain_tick` — every 30 seconds, claims and runs one ready
   Shopify row from platform_import_tasks (merchant "Sync products"). Paired with
   `catalog_import_stale_reaper` every 5 minutes, which returns `running` rows
-  abandoned by a revision swap to the queue. Both are DORMANT unless
-  CATALOG_IMPORT_DRAIN_ENABLED is explicitly enabled.
+  abandoned by a revision swap to the queue. Both are ON by default;
+  CATALOG_IMPORT_DRAIN_ENABLED=false is the kill switch.
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
@@ -946,11 +946,14 @@ async def start_scheduler() -> None:
         # 30s matches quality_backfill_drain_tick; one task per fire, and
         # max_instances=1 keeps a slow import from stacking ticks.
         #
-        # DORMANT unless CATALOG_IMPORT_DRAIN_ENABLED is set — same posture as
-        # catalog_onboard_queue_drain and payment_reconcile_tick above, for the
-        # same reasons plus one more: nothing has EVER drained this queue, so the
-        # backlog is unmeasured and the first armed tick starts calling merchant
-        # Shopify credentials on rows that may be months old. Measure, then arm.
+        # ON by default; CATALOG_IMPORT_DRAIN_ENABLED=false is the kill switch.
+        # It shipped dormant (#1964) while the credential resolver could still
+        # hand a disconnected merchant the PLATFORM's store; #1989 closed that,
+        # and with it closed a dormant drain protects nothing while rows keep
+        # stranding on every revision swap. Unlike catalog_onboard_queue_drain
+        # and payment_reconcile_tick above, this is not autonomous work — it
+        # drains imports merchants explicitly requested. Rationale in
+        # jobs.catalog_import_worker._catalog_import_drain_enabled.
         # Scoped to source_type='connector'/connector='shopify'; the table's
         # amazon_orders / orders_report / report rows are out of the lane.
         from jobs.catalog_import_worker import (

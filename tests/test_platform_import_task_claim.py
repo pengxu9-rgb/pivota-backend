@@ -227,17 +227,45 @@ async def test_drain_tick_processes_a_pending_task(monkeypatch):
     assert result["processed"] is True
 
 
-async def test_both_ticks_are_dormant_unless_explicitly_armed(monkeypatch):
-    """Deploying must not start draining. The backlog is unmeasured and every
-    task calls a merchant's Shopify credentials, so arming is a separate act —
-    the posture catalog_onboard_queue_drain and payment_reconcile_tick take."""
+async def test_the_drain_is_on_by_default(monkeypatch):
+    """The default IS the fix. Rows strand `pending` on every revision swap
+    until something drains them, and an env-var-armed fix can be silently
+    disarmed by the next deploy (a 2026-08-30 deploy wiped five). So the default
+    lives in code, and it is ON. The kill switch is tested separately below.
+
+    Inverts the earlier test that pinned dormant-by-default: dormant was right
+    while the credential resolver could hand a disconnected merchant the
+    platform's store (#1964), and wrong once #1989 closed that.
+    """
     import jobs.catalog_import_worker as worker
 
-    async def _record(task):  # pragma: no cover - must not run
-        raise AssertionError("the drain tick ran without being armed")
+    ran = []
+
+    async def _record(task):
+        ran.append(int(task["id"]))
+        return {"processed": True, "task_id": int(task["id"])}
 
     monkeypatch.setattr(worker, "_process_import_task_record", _record)
     monkeypatch.delenv("CATALOG_IMPORT_DRAIN_ENABLED", raising=False)
+
+    task_id = await _insert()
+    result = await worker.run_catalog_import_drain_tick()
+
+    assert ran == [task_id], "the drain must run with NO env var set"
+    assert result["processed"] is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "False", " off "])
+async def test_the_kill_switch_stops_both_ticks(monkeypatch, value):
+    """The env var is a kill switch, so every disabling spelling must work —
+    an operator reaching for it mid-incident should not have to guess."""
+    import jobs.catalog_import_worker as worker
+
+    async def _record(task):  # pragma: no cover - must not run
+        raise AssertionError(f"the drain tick ran with CATALOG_IMPORT_DRAIN_ENABLED={value!r}")
+
+    monkeypatch.setattr(worker, "_process_import_task_record", _record)
+    monkeypatch.setenv("CATALOG_IMPORT_DRAIN_ENABLED", value)
 
     await _insert()
     await _insert(status="running", updated_at=datetime.utcnow() - timedelta(hours=1))

@@ -1707,29 +1707,43 @@ async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
 def _catalog_import_drain_enabled() -> bool:
     """Whether the scheduler drain tick and its reaper may do anything.
 
-    DORMANT BY DEFAULT, matching the two closest precedents in
-    services/audit_scheduler.py — `catalog_onboard_queue_drain` ("OFF BY DEFAULT
-    ... so deploying never starts autonomous catalog writes") and
-    `payment_reconcile_tick` ("DORMANT unless ... enable deliberately"). Every
-    reason those give applies here and then some: this drains a queue nothing has
-    ever drained, so the backlog is unmeasured and may be months old; each task
-    calls a merchant's Shopify Admin API with stored credentials and rewrites
-    their products_cache; and prod and staging share one Postgres.
+    ON BY DEFAULT. CATALOG_IMPORT_DRAIN_ENABLED is a KILL SWITCH — set it to
+    false to stop the drain without a deploy — not an arming switch.
 
-    So arming it is a separate, deliberate act from deploying it. Measure the
-    backlog first:
+    It shipped dormant in #1964, and that was right at the time: the claim was
+    new, and _get_shopify_config_for_merchant still fell back to the PLATFORM's
+    own Shopify store for any merchant whose credentials did not resolve, so a
+    drain walking old rows for disconnected merchants would have overwritten
+    their catalogs with ours. #1989 closed that on the import path. With it
+    closed, the remaining backlog is benign by construction: a disconnected
+    merchant's row fails at ZERO Shopify calls (the resolver returns before any
+    fetch), and a connected merchant's row imports the LIVE catalog they clicked
+    Sync to get. There is nothing left for "dormant" to protect.
+
+    Meanwhile "dormant" had a cost the precedents it copied do not share. Those
+    guard AUTONOMOUS catalog writes the platform initiates for itself; this
+    drains work a merchant explicitly requested and was told succeeded. Every
+    day the flag stayed off, rows kept stranding `pending` on revision swaps
+    with nothing looking at them — the exact bug the drain was built to fix.
+
+    The default lives in CODE rather than in an env var deliberately: a deploy
+    on 2026-08-30 silently wiped five plain env vars on the gateway. A fix that
+    is armed by an env var can be disarmed by the next deploy without anyone
+    noticing; a fix that is armed by default cannot.
+
+    Before the first deploy that carries this, size what the first ticks will
+    chew on — one task per 30s, oldest first:
 
         SELECT status, source_type, connector, count(*), min(created_at)
         FROM platform_import_tasks GROUP BY 1, 2, 3;
 
-    then set CATALOG_IMPORT_DRAIN_ENABLED=true. Read per-run, so flipping it
-    takes effect on the next tick.
+    Read per-run, so flipping the kill switch takes effect on the next tick.
     """
-    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "false") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "true") or "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
