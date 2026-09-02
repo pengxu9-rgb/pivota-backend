@@ -381,6 +381,41 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Migration 207: merchant_psps.psp_id must satisfy the SAME regex
+            # `orders.psp_id` has enforced since migration 006. Order creation
+            # copies this column into orders.psp_id, so a malformed id written
+            # here is a 500 the merchant only meets at their first sale. Prod
+            # fast mode skips db/migrations/, so own the apply here too.
+            #
+            # NOT VALID: enforce every new INSERT/UPDATE without scanning the
+            # existing rows. A validating ADD would abort startup on the legacy
+            # malformed rows this exists to surface (see
+            # scripts/audit_malformed_psp_ids.py). The IF NOT EXISTS guard keeps
+            # this a no-op after the first boot -- a DROP+ADD every startup would
+            # take an ACCESS EXCLUSIVE lock on a table every checkout reads.
+            await database.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF to_regclass('merchant_psps') IS NULL THEN
+                        RETURN;
+                      END IF;
+                      IF NOT EXISTS (
+                        SELECT 1
+                          FROM pg_constraint
+                         WHERE conname = 'check_merchant_psps_psp_id_format'
+                           AND conrelid = to_regclass('merchant_psps')
+                      ) THEN
+                        ALTER TABLE merchant_psps
+                          ADD CONSTRAINT check_merchant_psps_psp_id_format
+                          CHECK (psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$')
+                          NOT VALID;
+                      END IF;
+                    END $$;
+                    """
+                )
+            )
             # Multi-use partner invite links (migration 171). Production fast
             # mode skips db/migrations/, so ensure the columns the invite-token
             # service reads/writes (use_count, max_uses) exist at startup —
