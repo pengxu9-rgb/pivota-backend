@@ -327,6 +327,81 @@ async def test_the_constraint_is_installed_and_widened() -> None:
         assert f"'{provider}'" in definition, (definition, provider)
 
 
+async def test_widening_does_not_downgrade_a_validated_constraint() -> None:
+    """A widen must not cost the `convalidated` flag.
+
+    Measured in production on 2026-09-02: check_psp_used_valid_provider is
+    installed AND convalidated=TRUE over a clean `orders` of 593 rows. This file's
+    migration DROPs and re-ADDs that constraint, and an unconditional `NOT VALID`
+    would therefore turn a PROVEN invariant into a merely-enforced one and leave
+    the operator a manual VALIDATE to get it back — a silent regression on the one
+    database that matters. The new list is a strict superset of 006's, so nothing
+    that satisfied the old constraint can fail the new one; the migration re-earns
+    the flag instead of discarding it.
+
+    The fixture applies 006 then 208, which is exactly production's history.
+    """
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT convalidated FROM pg_constraint WHERE conname = :n"
+        " AND conrelid = to_regclass('orders')",
+        {"n": ORDERS_PROVIDER_CONSTRAINT},
+    )
+    assert row is not None
+    assert dict(row)["convalidated"] is True, (
+        "the widen left the constraint NOT VALID over a clean table — production "
+        "had it validated before this migration ran"
+    )
+
+
+async def test_the_widen_still_survives_a_row_no_list_ever_allowed() -> None:
+    """...and the degradation path still degrades, rather than aborting the boot.
+
+    The counterpart to the test above: re-earning `convalidated` must not have
+    reintroduced the failure mode NOT VALID exists to prevent. A database where
+    006 never ran can hold a psp_used no list ever contained, and on that database
+    the migration must leave the constraint NOT VALID and CARRY ON — never raise.
+    """
+    from db.database import database
+
+    await database.execute(
+        f"ALTER TABLE orders DROP CONSTRAINT IF EXISTS {ORDERS_PROVIDER_CONSTRAINT}"
+    )
+    await database.execute(
+        "INSERT INTO orders (order_id, merchant_id, customer_email, shipping_address,"
+        " items, subtotal, total, currency, psp_used)"
+        " VALUES ('ORD_PSPPROV_LEGACY', :m, 'b@example.invalid', '{}', '[]', 1, 1, 'USD', 'worldpay')",
+        {"m": _MERCHANT_ID},
+    )
+
+    # Must not raise, even though a row violates every version of the list.
+    await database.execute(_migration(MIGRATION_208))
+
+    row = dict(
+        await database.fetch_one(
+            "SELECT convalidated FROM pg_constraint WHERE conname = :n"
+            " AND conrelid = to_regclass('orders')",
+            {"n": ORDERS_PROVIDER_CONSTRAINT},
+        )
+    )
+    assert row["convalidated"] is False, "expected the dirty table to stay NOT VALID"
+
+    # The legacy row survives untouched, and new writes are still enforced.
+    kept = await database.fetch_one(
+        "SELECT psp_used FROM orders WHERE order_id = 'ORD_PSPPROV_LEGACY'"
+    )
+    assert dict(kept)["psp_used"] == "worldpay"
+    with pytest.raises(Exception) as excinfo:
+        await database.execute(
+            "INSERT INTO orders (order_id, merchant_id, customer_email, shipping_address,"
+            " items, subtotal, total, currency, psp_used)"
+            " VALUES ('ORD_PSPPROV_NEW', :m, 'b@example.invalid', '{}', '[]', 1, 1, 'USD', 'square')",
+            {"m": _MERCHANT_ID},
+        )
+    assert ORDERS_PROVIDER_CONSTRAINT in str(excinfo.value), str(excinfo.value)
+
+
 async def test_migration_208_is_idempotent() -> None:
     # schema_guard runs this same logic on EVERY boot. Applying it twice must not
     # error, and — because `orders` is the table every checkout writes — the
@@ -386,12 +461,18 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
     installed = dict(row)
     for provider in WIDENED_PROVIDERS:
         assert f"'{provider}'" in installed["def"], (installed["def"], provider)
-    # NOT VALID is load-bearing: on a database where 006 never ran this is an ADD,
-    # and a validating ADD would scan rows written across years of an
-    # unconstrained vocabulary — aborting the boot this guard exists to protect.
-    assert installed["convalidated"] is False, (
-        "the startup guard added a VALIDATING constraint — a legacy row outside the "
-        "list would now abort the boot"
+    # On a CLEAN table the guard must end up VALIDATED. It adds NOT VALID first —
+    # load-bearing, because on a database where 006 never ran this is an ADD and a
+    # validating ADD would scan a whole unconstrained table and abort the boot —
+    # and then re-earns the flag with a bounded, swallowed VALIDATE. Production
+    # had this constraint convalidated=TRUE before the widen (measured
+    # 2026-09-02); ending NOT VALID would be a silent downgrade.
+    #
+    # The other half — a table holding a row no list ever allowed must KEEP it NOT
+    # VALID and not raise — is test_the_widen_still_survives_a_row_no_list_ever_allowed.
+    assert installed["convalidated"] is True, (
+        "the startup guard left the constraint NOT VALID over a clean table — that "
+        "downgrades the invariant production already had proven"
     )
 
     # Migration 207's twin rides in the same function and is installed by the same

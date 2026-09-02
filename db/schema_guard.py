@@ -520,6 +520,25 @@ async def ensure_required_schema_light() -> None:
                           )
                         )
                         NOT VALID;
+                      -- Earn the validated status back where it is earnable. In
+                      -- production this constraint is already convalidated=TRUE
+                      -- over a clean 593-row `orders` (measured 2026-09-02), so a
+                      -- bare DROP + ADD NOT VALID would DOWNGRADE a proven
+                      -- invariant to a merely-enforced one. The new list is a
+                      -- strict SUPERSET of the old, so nothing that passed the old
+                      -- one can fail this. Bounded and swallowed: a table too
+                      -- large to scan in time, or one with genuinely bad rows
+                      -- because 006 never ran, keeps it NOT VALID -- still
+                      -- enforcing every new INSERT/UPDATE -- and the boot
+                      -- continues. VALIDATE takes only SHARE UPDATE EXCLUSIVE and
+                      -- blocks neither reads nor writes.
+                      BEGIN
+                        SET LOCAL statement_timeout = '15s';
+                        ALTER TABLE orders
+                          VALIDATE CONSTRAINT check_psp_used_valid_provider;
+                      EXCEPTION WHEN OTHERS THEN
+                        RAISE NOTICE 'check_psp_used_valid_provider left NOT VALID: %', SQLERRM;
+                      END;
                     END $$;
                     """
                 )
