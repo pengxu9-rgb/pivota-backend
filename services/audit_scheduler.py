@@ -160,7 +160,11 @@ _JOB_RUN_DEADLINES = {
     # money path: 20 jobs x (store read + token resolve + 2 Shopify calls at a
     # 10s timeout). Comfortably over the worst realistic tick, under the 300s
     # job lease so a cut run's lease expires and a sibling re-claims it.
-    "merchant_order_sync_worker_tick": 240,
+    # 20 serial merchant-order creates, each a Shopify round trip — well past
+    # the old 240s, which was sized when this queue carried only rare refunds.
+    # Kept UNDER the 300s job lease so a cut run's job is re-claimable rather
+    # than stranded.
+    "merchant_order_sync_worker_tick": 280,
     "merchant_order_sync_lease_reaper": 120,
 }
 

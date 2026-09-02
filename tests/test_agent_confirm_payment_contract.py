@@ -386,3 +386,67 @@ async def test_agent_confirm_payment_paypal_auth_first_authorizes_before_finaliz
         "agent_confirm_payment:ORD_PAYPAL_AUTH_FIRST",
     )
     assert calls[1] == ("finalize", "ORD_PAYPAL_AUTH_FIRST", "agent_confirm_payment")
+
+
+@pytest.mark.asyncio
+async def test_agent_confirm_payment_already_paid_branch_enqueues_a_retry(monkeypatch):
+    """The already-paid branch exists ONLY to be a retry: it logs
+    `shopify_sync_retry_requested` and answers "Order already paid; Shopify sync
+    initiated". Deleting its enqueue left every suite green — and it is the site
+    where a tombstoned job would do the most damage, since the caller is
+    explicitly asking again.
+    """
+    import routes.agent_api as agent_api
+    import routes.order_routes as order_routes_module
+
+    enqueued: list[Dict[str, Any]] = []
+    order_events: list[str] = []
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_confirm",
+            "payment_status": "paid",
+            "status": "paid",
+            # already paid, and NO merchant order yet — the retry condition
+            "shopify_order_id": None,
+            "payment_intent_id": "pi_retry",
+            "total": "31.00",
+            "currency": "USD",
+            "metadata": {},
+        }
+
+    async def fake_log_order_event(*, event_type: str, **kwargs: Any) -> None:
+        order_events.append(event_type)
+
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        return {"platform": "shopify", "api_key": "shp_key"}
+
+    async def fake_validate_request(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(agent_api, "validate_request_compat", fake_validate_request)
+    monkeypatch.setattr(order_routes_module, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(
+        __import__("services.merchant_store_service", fromlist=["x"]),
+        "get_primary_store",
+        fake_get_primary_store,
+    )
+    monkeypatch.setattr(
+        agent_api, "enqueue_merchant_order_create", _recording_enqueue(enqueued)
+    )
+
+    body = await agent_api.agent_confirm_payment(
+        order_id="ORD_ALREADY_PAID_RETRY",
+        background_tasks=BackgroundTasks(),
+        context=_TestAgentContext(),
+    )
+
+    assert body["shopify_sync"] == "initiated"
+    assert "shopify_sync_retry_requested" in order_events
+    assert enqueued == [{
+        "order_id": "ORD_ALREADY_PAID_RETRY",
+        "merchant_id": "m_confirm",
+        "require_shopify_primary": False,
+    }]

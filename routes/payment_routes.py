@@ -234,7 +234,7 @@ async def checkout_webhook(
                 # guard; the worker checks it rather than widening the path.
                 await enqueue_merchant_order_create(
                     order_id=order_id,
-                    merchant_id=order["merchant_id"],
+                    merchant_id=str(order.get("merchant_id") or ""),
                     require_shopify_primary=True,
                 )
 
@@ -274,7 +274,7 @@ async def checkout_webhook(
         # Durable enqueue — see the already-paid branch above.
         await enqueue_merchant_order_create(
             order_id=order_id,
-            merchant_id=order["merchant_id"],
+            merchant_id=str(order.get("merchant_id") or ""),
             require_shopify_primary=True,
         )
         

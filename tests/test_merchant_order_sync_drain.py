@@ -913,7 +913,11 @@ async def test_enqueue_is_not_skipped_when_the_bound_store_cannot_be_resolved(mo
 # ---------------------------------------------------------------------------
 
 
-def _wire_create(monkeypatch, *, sync_returns=True, order=None, primary=None):
+def _wire_create(monkeypatch, *, sync_returns=True, order=None, primary=None,
+                 linked=True):
+    """`linked` controls whether the order carries a linked platform order after
+    a successful sync — the handler now verifies that, because every platform
+    creator returns True when another holder has the create lock."""
     import db.orders as orders_module
     import routes.order_routes as order_routes
     import services.merchant_store_service as store_svc
@@ -925,7 +929,9 @@ def _wire_create(monkeypatch, *, sync_returns=True, order=None, primary=None):
         return sync_returns
 
     async def fake_get_order(order_id):
-        return order or {}
+        if order is not None:
+            return order
+        return {"metadata": {"merchant_order": {"platform_order_id": "shop-1"}}} if linked else {}
 
     async def fake_primary(merchant_id):
         calls["primary"].append(merchant_id)
@@ -935,6 +941,20 @@ def _wire_create(monkeypatch, *, sync_returns=True, order=None, primary=None):
     monkeypatch.setattr(orders_module, "get_order", fake_get_order)
     monkeypatch.setattr(store_svc, "get_primary_store", fake_primary)
     return calls
+
+
+def _marker(*, retryable, reason, platform="shopify", fresh=True):
+    from datetime import datetime, timedelta, timezone
+
+    when = datetime.now(timezone.utc) - (
+        timedelta(seconds=5) if fresh else timedelta(hours=3)
+    )
+    return {"metadata": {"merchant_order": {
+        "retryable": retryable,
+        "last_failure_reason": reason,
+        "platform": platform,
+        "last_attempt_at": when.isoformat().replace("+00:00", "Z"),
+    }}}
 
 
 def _create_payload(**over):
@@ -959,11 +979,8 @@ async def test_create_job_retries_a_recoverable_failure(monkeypatch):
     """`sync_order_to_connected_store` returns False and writes a marker saying
     whether the condition is worth retrying."""
     _wire_create(
-        monkeypatch,
-        sync_returns=False,
-        order={"metadata": {"merchant_order": {
-            "retryable": True, "last_failure_reason": "merchant_order_create_returned_false",
-        }}},
+        monkeypatch, sync_returns=False,
+        order=_marker(retryable=True, reason="merchant_order_create_returned_false"),
     )
 
     with pytest.raises(drain._RetryableSyncError):
@@ -977,17 +994,14 @@ async def test_create_job_does_not_burn_the_budget_on_an_unretryable_failure(mon
     order stays paid with no merchant order — so completing is safe and the
     standing `paid_missing_merchant_order_count` signal keeps counting it."""
     _wire_create(
-        monkeypatch,
-        sync_returns=False,
-        order={"metadata": {"merchant_order": {
-            "retryable": False, "last_failure_reason": "wix_order_writeback_not_ready",
-        }}},
+        monkeypatch, sync_returns=False,
+        order=_marker(retryable=False, reason="bound_store_missing_or_inactive"),
     )
 
     result = await drain._run_merchant_order_create_job(_create_payload(), {}, None)
 
     assert result["created"] is False
-    assert result["skipped"] == "wix_order_writeback_not_ready"
+    assert result["skipped"] == "bound_store_missing_or_inactive"
 
 
 @pytest.mark.asyncio
@@ -1021,3 +1035,94 @@ async def test_create_job_proceeds_when_the_primary_is_shopify(monkeypatch):
 
     assert result == {"created": True}
     assert calls["sync"] == ["ORD_1"]
+
+
+@pytest.mark.asyncio
+async def test_create_job_never_retries_a_platform_without_remote_idempotency(monkeypatch):
+    """THE BLOCKER round five found, and the same class as the refund path's H1:
+    a queue adding retries to a write that was only safe because it ran once.
+
+    `sync_order_to_connected_store` collapses the adapter's own `retryable` flag
+    and hardcodes True, so `wix_physical_order_auto_fulfilled` — raised AFTER a
+    real Wix order and payment record were written, with order_id=None so
+    nothing links — read as retryable. Only Shopify looks for an existing order
+    before creating; Woo/Wix/BigCommerce would POST a brand-new one. Ten
+    attempts, ten merchant orders, ten shipments, one buyer.
+    """
+    _wire_create(
+        monkeypatch, sync_returns=False,
+        order=_marker(retryable=True, reason="wix_physical_order_auto_fulfilled",
+                      platform="wix"),
+    )
+
+    result = await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+    assert result["created"] is False
+    assert result["platform"] == "wix"
+
+
+@pytest.mark.asyncio
+async def test_create_job_still_retries_shopify(monkeypatch):
+    """Positive counterpart: Shopify's create IS remotely idempotent
+    (`_find_existing_order_id_best_effort` plus tag reuse), so it keeps the
+    retry the queue exists to provide."""
+    _wire_create(
+        monkeypatch, sync_returns=False,
+        order=_marker(retryable=True, reason="merchant_order_create_returned_false",
+                      platform="shopify"),
+    )
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_create_job_does_not_complete_on_lock_contention(monkeypatch):
+    """Every platform creator returns True when another holder has the per-order
+    advisory lock — "someone else is doing it", not "it is done". Completing
+    there records success for a merchant order that may never arrive, and the
+    constant dedupe key means nothing would re-queue it."""
+    _wire_create(monkeypatch, sync_returns=True, linked=False)
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_create_job_does_not_trust_a_stale_unretryable_marker(monkeypatch):
+    """The marker lives in ORDER metadata, not job state, and
+    `_mark_merchant_order_sync_failed_best_effort` swallows its own write
+    failure — so a `retryable: False` from an earlier attempt can still be
+    sitting there when a later attempt fails transiently."""
+    _wire_create(
+        monkeypatch, sync_returns=False,
+        order=_marker(retryable=False, reason="bound_store_missing_or_inactive",
+                      fresh=False),
+    )
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_the_tick_routes_a_create_job_to_the_create_handler(monkeypatch):
+    """Pins the `_HANDLERS` registration itself.
+
+    Every other create test calls `_run_merchant_order_create_job` directly, so
+    deleting the `OP_MERCHANT_ORDER_CREATE` entry from `_HANDLERS` left the whole
+    suite green — while in production every create job would take the
+    `no handler for op` branch, burn its attempts and land terminal `failed`,
+    stopping merchant-order creation platform-wide.
+    """
+    from db.merchant_order_sync_jobs import OP_MERCHANT_ORDER_CREATE
+
+    calls = _wire_create(monkeypatch, sync_returns=True, linked=True)
+    job = _job(op=OP_MERCHANT_ORDER_CREATE)
+    job["payload"] = _create_payload()
+    seen = _wire_drain(monkeypatch, job)  # NO handler override: real dispatch
+
+    summary = await drain.run_merchant_order_sync_worker_tick()
+
+    assert summary["done"] == 1, "the tick did not route the job to a handler"
+    assert calls["sync"] == ["ORD_1"], "the create handler never ran"
+    assert seen["failed"] == []

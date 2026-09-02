@@ -375,3 +375,74 @@ async def test_a_create_and_a_refund_job_coexist_for_one_order():
         {"o": order_id},
     )
     assert dict(row)["c"] == 2
+
+
+async def test_a_terminal_create_job_does_not_tombstone_the_order():
+    """Two call sites exist ONLY to be retries — the agent and Checkout.com
+    already-paid branches, which answer "Shopify sync initiated". Without
+    revival a `done`/`failed` job is permanent: the unique index has no status
+    column, the claim reads only pending/running, and nothing resets a terminal
+    row. Those sites would return the tombstone's id and never run again."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    first = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    await complete_merchant_order_sync_job(job_id=job["job_id"], worker_id="worker-a")
+
+    row = dict(await database.fetch_one(
+        "SELECT status FROM merchant_order_sync_jobs WHERE job_id=:j", {"j": first}))
+    assert row["status"] == "done"
+
+    # The retry site enqueues again.
+    again = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    assert again == first, "still one row per order"
+
+    revived = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert revived is not None, "the re-enqueue was a silent no-op"
+    assert str(revived["job_id"]) == first
+    assert revived["attempts"] == 1, "attempts reset, so it gets a full budget"
+    assert revived["progress"] == {}
+
+
+async def test_a_repeat_enqueue_adopts_the_newer_payload():
+    """First-writer-wins was a real failure: a PSP webhook enqueuing with
+    require_shopify_primary=True tombstoned the admin confirm-payment site,
+    which has no store guard at all — so a WooCommerce merchant's order was
+    never created."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    await enqueue_merchant_order_create(
+        order_id=order_id, merchant_id="m1", require_shopify_primary=True)
+    await enqueue_merchant_order_create(
+        order_id=order_id, merchant_id="m1", require_shopify_primary=False)
+
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    assert job["payload"]["require_shopify_primary"] is False
+
+
+async def test_a_repeat_refund_enqueue_still_does_not_revive():
+    """The refund op keys on the PSP refund id — one unrepeatable event — so a
+    repeat enqueue must NOT re-run a completed sync."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+    )
+
+    order_id = _order_id()
+    first = await _enqueue(order_id, dedupe="re_once")
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    await complete_merchant_order_sync_job(job_id=job["job_id"], worker_id="worker-a")
+
+    again = await _enqueue(order_id, dedupe="re_once")
+    assert again == first
+    assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None

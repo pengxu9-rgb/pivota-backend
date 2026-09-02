@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import socket
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from db.merchant_order_sync_jobs import (
@@ -309,6 +310,28 @@ async def _run_refund_sync_job(
     )
 
 
+# `_mark_merchant_order_sync_failed_best_effort` swallows its own write
+# failure, and the marker lives in ORDER metadata rather than job state — so it
+# survives from any earlier attempt. A stale `retryable: False` would otherwise
+# complete a transient failure. Only trust the flag while it plausibly describes
+# THIS attempt.
+_MARKER_FRESHNESS_SECONDS = 300
+
+
+def _marker_is_fresh(merchant_order: Dict[str, Any]) -> bool:
+    raw = str(merchant_order.get("last_attempt_at") or "").strip()
+    if not raw:
+        return False
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - stamp).total_seconds()
+    return 0 <= age <= _MARKER_FRESHNESS_SECONDS
+
+
 async def _run_merchant_order_create_job(
     payload: Dict[str, Any],
     progress: Optional[Dict[str, Any]] = None,
@@ -322,7 +345,10 @@ async def _run_merchant_order_create_job(
     advisory lock around the create itself.
     """
     from db.orders import get_order
-    from routes.order_routes import sync_order_to_connected_store
+    from routes.order_routes import (
+        _get_linked_platform_order as _linked_platform_order,
+        sync_order_to_connected_store,
+    )
 
     order_id = str(payload.get("order_id") or "")
     merchant_id = str(payload.get("merchant_id") or "")
@@ -342,32 +368,75 @@ async def _run_merchant_order_create_job(
             return {"skipped": "primary_store_not_shopify"}
 
     if await sync_order_to_connected_store(order_id):
-        return {"created": True}
+        # `True` is not proof of delivery. Every platform creator returns True
+        # when the per-order advisory lock is already held by someone else
+        # (the ops retry endpoint, a sibling worker, the reconcile lane) —
+        # "someone else is doing it", not "it is done". Completing on that
+        # records success for a merchant order that may never arrive, and the
+        # constant dedupe key means nothing would re-queue it.
+        order = await get_order(order_id) or {}
+        if _linked_platform_order(order):
+            return {"created": True}
+        raise _RetryableSyncError(
+            f"{order_id}: create reported success but the order carries no "
+            "linked platform order — most likely another holder has the create "
+            "lock; re-check on the next attempt"
+        )
 
-    # It returned False, and on the way it wrote a `merchant_order` marker
-    # saying whether the condition is worth retrying. Read that rather than
-    # guessing: `wix_order_writeback_not_ready` and a missing bound store are
-    # both marked retryable=False, and burning ten attempts on either only
-    # delays a page for something no retry fixes.
+    # It returned False, and on the way it wrote a `merchant_order` marker.
     order = await get_order(order_id) or {}
     metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
     merchant_order = metadata.get("merchant_order") or {}
     reason = str(merchant_order.get("last_failure_reason") or "unknown")
+    platform = str(merchant_order.get("platform") or "").strip().lower()
 
-    if merchant_order.get("retryable") is False:
-        # Completing here does NOT mean the merchant received the order — it
-        # means no retry can change that. Unlike the refund path, this failure
-        # leaves a queryable trace: the order stays paid with no merchant order,
-        # so `paid_missing_merchant_order_count` keeps counting it and the ops
-        # retry endpoint can still act on it. That standing signal is what makes
-        # completing safe here.
+    # RETRY ONLY WHERE THE REMOTE CREATE IS IDEMPOTENT.
+    #
+    # `sync_order_to_connected_store` collapses the adapter's own `retryable`
+    # flag to a bare bool and then hardcodes retryable=True, so a failure that
+    # happened AFTER the platform order was created reads as retryable here.
+    # `adapters/wix_adapter` returns retryable=False in six places; the worst is
+    # `wix_physical_order_auto_fulfilled`, raised after a real Wix order AND a
+    # payment record were written, with order_id=None so nothing links. Retrying
+    # that POSTs a brand-new order — up to 10 merchant orders and 10 shipments
+    # for one buyer.
+    #
+    # Only the Shopify path looks for an existing order before creating
+    # (`_find_existing_order_id_best_effort` plus tag reuse). Woo, Wix and
+    # BigCommerce have no remote-side idempotency, so a retry there cannot be
+    # distinguished from a fresh create.
+    #
+    # For those platforms this queue therefore gives DURABILITY OF INTENT, not
+    # retries: the job is recorded, attempted once, and left visible. That is
+    # parity with the `background_tasks` behaviour it replaced, and strictly
+    # better than duplicating a merchant order.
+    if platform and platform != "shopify":
+        logger.error(
+            "merchant_order_sync: %s failed for order %s on platform=%s "
+            "(reason=%s). NOT retrying — this platform's create is not remotely "
+            "idempotent, so a retry could duplicate the merchant order. The "
+            "order stays paid with no merchant order and is reported by "
+            "paid_missing_merchant_order_count.",
+            OP_MERCHANT_ORDER_CREATE, order_id, platform, reason,
+        )
+        return {"created": False, "skipped": reason, "platform": platform}
+
+    if merchant_order.get("retryable") is False and _marker_is_fresh(merchant_order):
+        # No retry can change this. The order stays paid with no merchant
+        # order, so it is REPORTABLE — `paid_missing_merchant_order_count` on
+        # /orders/ops/transaction-safety/metrics counts it, and the ops retry
+        # endpoint can act on it.
+        #
+        # Be precise about what that is worth: nothing scrapes that endpoint
+        # today, and `reconcile_paid_orders_missing_merchant_order` has no
+        # scheduler registration, so the trace is queryable by a human who goes
+        # looking and by nothing else. It is a weaker guarantee than the refund
+        # op's rule, which does not depend on anyone looking.
         logger.error(
             "merchant_order_sync: %s cannot be created for order %s (reason=%s, "
-            "not retryable); it remains counted by "
+            "not retryable); it remains reported by "
             "paid_missing_merchant_order_count",
-            OP_MERCHANT_ORDER_CREATE,
-            order_id,
-            reason,
+            OP_MERCHANT_ORDER_CREATE, order_id, reason,
         )
         return {"created": False, "skipped": reason}
 
@@ -505,8 +574,9 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                 )
             elif status == "failed":
                 summary["failed"] += 1
-                # Terminal on this queue means the buyer was refunded and the
-                # merchant's store was never told. That is an incident.
+                # Terminal on this queue means the buyer paid (or was refunded)
+                # and the merchant's store was never told. That is an incident.
+                # The log line carries `op`, so triage can tell which.
                 logger.error(
                     "merchant_order_sync: GAVE UP on %s job=%s order=%s after %s "
                     "attempts — merchant store not updated: %s",

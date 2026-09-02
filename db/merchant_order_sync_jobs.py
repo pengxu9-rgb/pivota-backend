@@ -134,6 +134,38 @@ def _backoff_seconds(attempts: int) -> int:
     return int(min(_BACKOFF_CAP_SECONDS, _BACKOFF_BASE_SECONDS * (2 ** exponent)))
 
 
+_IGNORE_ON_CONFLICT = "ON CONFLICT (order_id, op, dedupe_key) DO NOTHING"
+
+# Revives a terminal row and always adopts the newest payload. Written with
+# explicit CASE arms rather than a `WHERE` on the DO UPDATE so the statement
+# always RETURNS a row — the caller must be able to tell "queued" from
+# "persistence failed", and a filtered DO UPDATE returns nothing for an
+# in-flight job, which reads identically to a failure.
+_REVIVE_ON_CONFLICT = """
+            ON CONFLICT (order_id, op, dedupe_key) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                updated_at = EXCLUDED.updated_at,
+                status = CASE
+                    WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
+                    THEN 'pending' ELSE merchant_order_sync_jobs.status END,
+                attempts = CASE
+                    WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
+                    THEN 0 ELSE merchant_order_sync_jobs.attempts END,
+                next_attempt_at = CASE
+                    WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
+                    THEN EXCLUDED.next_attempt_at
+                    ELSE merchant_order_sync_jobs.next_attempt_at END,
+                progress = CASE
+                    WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
+                    THEN NULL ELSE merchant_order_sync_jobs.progress END,
+                last_error = CASE
+                    WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
+                    THEN NULL ELSE merchant_order_sync_jobs.last_error END,
+                completed_at = CASE
+                    WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
+                    THEN NULL ELSE merchant_order_sync_jobs.completed_at END"""
+
+
 async def enqueue_merchant_order_sync_job(
     *,
     order_id: str,
@@ -142,6 +174,7 @@ async def enqueue_merchant_order_sync_job(
     dedupe_key: str,
     payload: Dict[str, Any],
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    revive_terminal: bool = False,
 ) -> Optional[str]:
     """Record the intent durably. Returns the job_id, or the existing job's id if
     this (order_id, op, dedupe_key) was already queued.
@@ -152,6 +185,15 @@ async def enqueue_merchant_order_sync_job(
     succeeded — strictly worse for the caller. A None return is logged at ERROR
     so the loss is visible rather than silent, which is the property the
     `add_task` version never had.
+
+    `revive_terminal` decides what a repeat enqueue MEANS. Without it a job that
+    reached `done` or `failed` is a permanent tombstone: the unique index has no
+    status column, the claim reads only `pending`/`running`, and nothing resets a
+    terminal row — so every later enqueue returns the old id and never runs.
+    That is right for an op whose key already identifies one unrepeatable event
+    (a PSP refund), and wrong for one keyed per ORDER, where a repeat enqueue is
+    a caller explicitly asking again. It also replaces the stored payload, so the
+    latest caller's flags win instead of the first writer's.
     """
     job_id = str(uuid.uuid4())
     now = _now_utc()
@@ -168,7 +210,9 @@ async def enqueue_merchant_order_sync_job(
                 'pending', 0, :max_attempts, :now,
                 :now, :now
             )
-            ON CONFLICT (order_id, op, dedupe_key) DO NOTHING
+            """
+            + (_REVIVE_ON_CONFLICT if revive_terminal else _IGNORE_ON_CONFLICT)
+            + """
             RETURNING job_id
             """,
             {
@@ -236,6 +280,11 @@ async def enqueue_merchant_order_create(
         merchant_id=str(merchant_id),
         op=OP_MERCHANT_ORDER_CREATE,
         dedupe_key=MERCHANT_ORDER_CREATE_DEDUPE_KEY,
+        # Keyed per ORDER, and two of the call sites exist ONLY to be retries
+        # (the agent and Checkout.com already-paid branches). Without this a
+        # terminal job tombstones the order and those sites become silent
+        # no-ops that still answer "Shopify sync initiated".
+        revive_terminal=True,
         payload={
             "order_id": str(order_id),
             "merchant_id": str(merchant_id),
