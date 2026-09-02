@@ -27,7 +27,10 @@ THREE RULES.
 
 3. ONE FAILURE MUST NOT STOP THE SWEEP. Each orphan is attempted independently; a card whose
    revocation keeps failing must not block the newer ones behind it. Combined with oldest-first
-   ordering and the batch bound, every orphan is reached.
+   ordering and the batch bound, every orphan is reached. THE ROW WRITE IS INSIDE THAT GUARD
+   TOO: it used to sit outside, so a database error while advancing the row escaped and ended
+   the batch — after the issuer had already killed that card, leaving every orphan behind it
+   (the ones that may still be SPENDABLE) untouched for the rest of the run.
 
 NOT IN SCOPE: expiring or revoking healthy `issued` cards. That is a different sweep over live
 instruments and needs its own design — widening this one's guarded UPDATE to reach `issued` rows
@@ -141,7 +144,27 @@ async def run_agent_card_revocation_sweep() -> Dict[str, Any]:
             )
             continue
 
-        if await mark_revoked(card_id):
+        # THE ROW WRITE IS INSIDE THE SAME GUARD AS THE ISSUER CALL, and rule 3 is why. It used
+        # to sit outside, so a DB error here — a pool blip, a lost connection — escaped the loop
+        # and ended the whole batch AFTER the issuer had already killed this card: the remaining
+        # orphans went untouched for the rest of the run, and the one card we know is dead was
+        # the reason. This failure is also distinct from an unconfirmed revocation and is logged
+        # as such: the card IS dead upstream, only our row is behind.
+        try:
+            advanced = await mark_revoked(card_id)
+        except Exception as err:  # noqa: BLE001 — one bad row must not end the sweep
+            summary["unconfirmed"] += 1
+            summary["revoked_row_not_advanced"] = summary.get("revoked_row_not_advanced", 0) + 1
+            logger.error(
+                "card-revocation-sweep: REVOKED AT THE ISSUER BUT THE ROW WRITE FAILED "
+                "card_id=%s: %s — the card is dead, our row still says failed; it will be "
+                "retried (revoke is idempotent-by-confirmation)",
+                card_id,
+                type(err).__name__,
+            )
+            continue
+
+        if advanced:
             summary["revoked"] += 1
             logger.info(
                 "card-revocation-sweep: revoked orphan card_id=%s reason=%s",

@@ -264,13 +264,21 @@ async def mark_revoked(card_id: str) -> bool:
     Guarded on `status = 'failed'` so this can only ever advance an orphan. It must not be able
     to revoke a live `issued` card as a side effect of a sweep bug — that path needs its own
     deliberate design, not this one widened.
+
+    FETCH_ONE + RETURNING, not `execute`. On databases==0.7.0/asyncpg a non-RETURNING UPDATE
+    answers None ALWAYS — success and no-match alike — so `execute(...) is not None` was a
+    constant False. Every successful revoke reported "the row did not advance", the sweep logged
+    it as unconfirmed at ERROR and left it to be retried forever, and the one signal that says a
+    live card was killed never fired. THE ROW COMING BACK IS THE CLAIM, which is the idiom every
+    other transition in this file already uses (record_event_once, apply_auth_*, apply_settlement).
     """
-    result = await database.execute(
+    row = await database.fetch_one(
         """
         UPDATE agent_issued_cards
            SET status = 'revoked', updated_at = now()
          WHERE card_id = :card_id AND status = 'failed' AND issuer_card_ref IS NOT NULL
+        RETURNING card_id
         """,
         {"card_id": card_id},
     )
-    return result is not None
+    return row is not None

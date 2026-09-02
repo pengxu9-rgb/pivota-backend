@@ -18,7 +18,8 @@ TWO RULES THIS FILE MUST KEEP no matter how the wire format moves:
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -28,6 +29,35 @@ from utils.logger import logger
 _TIMEOUT_SECONDS = 15.0
 
 
+def _as_aware(value: datetime) -> datetime:
+    """A naive datetime is read as UTC — the only tz this rail ever mints in (`card_expiry`)."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _parse_instant(value: Any) -> Optional[datetime]:
+    """An ISO-8601 timestamp string -> an AWARE datetime, or None if it is not one.
+
+    COMPARE INSTANTS, NOT SPELLINGS. `_build_payload` sends `isoformat()` ("...+00:00") and an
+    issuer may legitimately echo "...Z", or the same moment at another offset; those are the
+    same constraint and must not read as a mismatch. What must NOT be tolerated is a different
+    moment, however small — an expiry an hour later is exactly the silent widening this check
+    exists to catch, and it looks like a formatting difference in a diff.
+
+    Strings only: an epoch number would have to be guessed as seconds or milliseconds, and this
+    file does not resolve ambiguity by guessing on a constraint.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return _as_aware(parsed)
+
+
 class ReapIssuer:
     name = "reap"
 
@@ -35,11 +65,33 @@ class ReapIssuer:
         self.base_url = str(env.get("REAP_API_BASE") or "").strip().rstrip("/")
         self.api_key = str(env.get("REAP_API_KEY") or "").strip()
         self.issue_path = str(env.get("REAP_ISSUE_CARD_PATH") or "/v1/cards").strip()
-        # `{card_id}` is substituted at call time. Configurable for the same reason issue_path
-        # is: the real shape is unverified and must be correctable without a code change.
+        # `{card_id}` is substituted at call time.
         self.revoke_path = str(
             env.get("REAP_REVOKE_CARD_PATH") or "/v1/cards/{card_id}/cancel"
         ).strip()
+        # WHAT IS AND IS NOT ENV-CORRECTABLE ON THE REVOKE PATH — stated exactly, because the
+        # comment that used to sit here claimed more than the code delivered. It said the shape
+        # was "correctable without a code change" while the verb was hardcoded POST and
+        # confirmation demanded a JSON body naming a dead state; neither matches how a delete
+        # normally answers, so the very shape most likely to be right was unreachable from env.
+        #
+        #   CORRECTABLE BY ENV: the path (REAP_REVOKE_CARD_PATH) and now the verb
+        #   (REAP_REVOKE_METHOD, POST or DELETE). Reap's own revoke is `DELETE /cards/{id}` ->
+        #   204 with no body; the alternative is `POST /cards/{id}/block` -> a Card whose status
+        #   is BLOCKED, which the dead-state vocabulary below now accepts.
+        #
+        #   NOT CORRECTABLE BY ENV, and each needs a code change here: the request sends no JSON
+        #   body, auth is a bearer header, and confirmation is either an EMPTY 200/204 on the
+        #   DELETE verb or a parseable body naming an affirmative dead state. An empty 200/204
+        #   on POST stays UNCONFIRMED on purpose — a `/cancel` that answers nothing has told us
+        #   nothing, and this file's rule is that silence is never confirmation.
+        self.revoke_method = str(env.get("REAP_REVOKE_METHOD") or "POST").strip().upper()
+        if self.revoke_method not in ("POST", "DELETE"):
+            logger.warning(
+                "REAP_REVOKE_METHOD=%r is not POST or DELETE; falling back to POST",
+                self.revoke_method,
+            )
+            self.revoke_method = "POST"
         if not self.base_url or not self.api_key:
             raise CardIssuerError(
                 "REAP_UNCONFIGURED", "REAP_API_BASE and REAP_API_KEY are required for CARD_ISSUER=reap"
@@ -154,6 +206,23 @@ class ReapIssuer:
         if request.single_use and card.get("single_use") is not True:
             _fail("REAP_CONSTRAINTS_UNCONFIRMED", "single-use scope")
 
+        # EXPIRY IS THE FOURTH CONSTRAINT, and it was the one nothing checked. `_build_payload`
+        # sends it, this module's docstring calls it part of "the product", and migration 201
+        # declares `expires_at NOT NULL` because an unexpiring cap is not a cap. Unchecked, an
+        # issuer that ignored the field minted a card outliving our row's expiry — the silent
+        # drop this whole function exists to catch, on the constraint that bounds how LONG the
+        # blast radius lasts rather than how large it is. Same tight spelling set as the others.
+        observed_expiry = None
+        for key in ("expires_at", "expiry"):
+            if card.get(key) is not None:
+                observed_expiry = card[key]
+                break
+        parsed_expiry = _parse_instant(observed_expiry)
+        if parsed_expiry is None:
+            _fail("REAP_CONSTRAINTS_UNCONFIRMED", "expiry")
+        if parsed_expiry != _as_aware(request.expires_at):
+            _fail("REAP_CONSTRAINTS_MISMATCH", "expiry")
+
     async def issue(self, request: IssueRequest) -> IssuedCard:
         url = f"{self.base_url}{self.issue_path}"
         try:
@@ -207,12 +276,17 @@ class ReapIssuer:
         `revoke_path` is wrong, every call 404s. Treating 404 as "already gone, nothing to do"
         would then mark the entire orphan backlog revoked while not one card had been killed:
         a silent success that erases the very evidence the sweep exists to act on. So a 404 is
-        a FAILURE here, deliberately, and no status code alone is ever taken as confirmation.
+        a FAILURE here, deliberately.
 
-        Only an affirmative dead-state in the body counts. Unbounded retry is intended: the
-        sweep will keep trying a card it cannot confirm dead, because giving up quietly on a
-        possibly-spendable uncapped card is the worse outcome. The alarm is the escalation path,
-        not a retry limit.
+        ONE status code counts as confirmation, and only one: an EMPTY 200/204 answered to the
+        DELETE verb, when DELETE is what REAP_REVOKE_METHOD configured. That is the shape a
+        delete has — there is no body to state a dead state in — and refusing it would make the
+        provider's own documented revoke permanently unconfirmable. Every other code, and the
+        same empty 204 on POST, still needs a body naming an affirmative dead state.
+
+        Unbounded retry is intended: the sweep will keep trying a card it cannot confirm dead,
+        because giving up quietly on a possibly-spendable uncapped card is the worse outcome.
+        The alarm is the escalation path, not a retry limit.
         """
         ref = str(issuer_card_ref or "").strip()
         if not ref:
@@ -220,12 +294,24 @@ class ReapIssuer:
         url = f"{self.base_url}{self.revoke_path.replace('{card_id}', ref)}"
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-                resp = await client.post(url, headers={"Authorization": f"Bearer {self.api_key}"})
+                resp = await client.request(
+                    self.revoke_method, url, headers={"Authorization": f"Bearer {self.api_key}"}
+                )
         except httpx.HTTPError as err:
             raise CardIssuerError("REAP_UNREACHABLE", "revoke request failed in transport") from err
         if resp.status_code >= 300:
             # Includes 404. See the docstring: a wrong path must not read as "already revoked".
             raise CardIssuerError("REAP_REVOKE_REFUSED", f"issuer returned HTTP {resp.status_code}")
+
+        # THE ONE PLACE A STATUS CODE COUNTS AS CONFIRMATION, and it is narrow on purpose. A
+        # DELETE that succeeds answers 204 No Content — there is no body to name a dead state in,
+        # so demanding one would refuse the correct response for the verb Reap actually
+        # documents. It is accepted ONLY when DELETE is what we configured and sent: the same
+        # empty 204 on POST /cancel is still silence, and silence is not confirmation.
+        empty_body = not (getattr(resp, "content", b"") or b"").strip()
+        if self.revoke_method == "DELETE" and empty_body and resp.status_code in (200, 204):
+            return
+
         try:
             body = resp.json()
         except Exception as err:
@@ -235,8 +321,10 @@ class ReapIssuer:
         state = card.get("status") if isinstance(card, dict) else None
         # Both spellings: the provider's own docs are not in hand, and "cancelled"/"canceled"
         # is the single most common way for an adapter to miss a confirmation it did receive.
+        # `blocked` is the state Reap's `POST /cards/{id}/block` answers with — the alternative
+        # shape REAP_REVOKE_METHOD/REAP_REVOKE_CARD_PATH exist to reach.
         if not isinstance(state, str) or state.strip().lower() not in (
-            "revoked", "cancelled", "canceled", "terminated", "closed"
+            "revoked", "cancelled", "canceled", "terminated", "closed", "blocked"
         ):
             raise CardIssuerError(
                 "REAP_REVOKE_UNCONFIRMED", "issuer did not confirm the card is dead"

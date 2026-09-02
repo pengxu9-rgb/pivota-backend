@@ -28,13 +28,20 @@ from utils.logger import logger
 
 
 class MerchantQuoteError(ValueError):
-    """A quote could not be resolved. `caller_fault` decides the route's 4xx-vs-502 split —
-    typed here so the route never string-matches an error message (that mapping broke the
-    moment anyone reworded an error)."""
+    """A quote could not be resolved. The FLAGS decide the route's 4xx-vs-502 split — typed here
+    so the route never string-matches an error message (that mapping broke the moment anyone
+    reworded an error).
 
-    def __init__(self, message: str, *, caller_fault: bool = False):
+    `caller_fault` = the API caller's request was bad (4xx). `our_fault` = Pivota's own
+    configuration or code was, which is a 502 with a generic detail: an agent told 422 because
+    OUR agent profile is unreachable goes looking for a bug in a request that was fine. The two
+    mirror `MerchantUcpError`, whose values are carried across the translation below unchanged.
+    """
+
+    def __init__(self, message: str, *, caller_fault: bool = False, our_fault: bool = False):
         super().__init__(message)
         self.caller_fault = caller_fault
+        self.our_fault = our_fault
 
 # Hostname allowed to receive our server-side quote request. merchant_domain is CALLER INPUT and
 # we fetch it — this is an SSRF surface. Dots-and-dashes hostnames only, no ports, no IP
@@ -261,8 +268,31 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
         payload = await get_checkout(merchant_domain, checkout_id)
     except MerchantUcpError as err:
         # Translated, not re-raised: this function's callers switch on MerchantQuoteError and its
-        # `caller_fault` flag, and that contract predates the shared client.
-        raise MerchantQuoteError(str(err), caller_fault=err.caller_fault) from err
+        # fault flags, and that contract predates the shared client. BOTH flags cross over —
+        # dropping `our_fault` here would put our own misconfiguration back in front of the agent
+        # as a 422, which is the whole reason the second flag exists.
+        raise MerchantQuoteError(
+            str(err), caller_fault=err.caller_fault, our_fault=err.our_fault
+        ) from err
+
+    # A PAYLOAD THAT SAYS IT FAILED IS NOT A QUOTE, AND IT IS CHECKED BEFORE THE TOTALS ARE READ.
+    # UCP answers a refusal with a full checkout envelope: `ucp.status` "error", the reasons in
+    # `messages[]` — and, because it is the same document shape, frequently a `totals` array
+    # too. Read totals-first, that mints a REAL, SPENDABLE card capped against a checkout the
+    # merchant has already declined; the card is the thing that cannot be un-issued, so the
+    # envelope's own verdict is consulted before anything is derived from its numbers. The
+    # transport (`_unwrap`) refuses the same shape on the isError path; this closes the door on
+    # the path where the merchant does NOT set isError, which is how it arrives without one.
+    #
+    # NOT caller_fault: the agent's request may have been perfectly well formed and the merchant
+    # still declined (sold out, unshippable). 502 tells it to look at the merchant, not itself.
+    ucp = payload.get("ucp")
+    if isinstance(ucp, dict) and "status" in ucp:
+        status = str(ucp.get("status") or "").strip().lower()
+        if status != "success":
+            raise MerchantQuoteError(
+                "merchant checkout is not in a success state; no cap may be derived from it"
+            )
 
     raw_total, currency = _pick_total(payload)
     if raw_total is None or not currency:

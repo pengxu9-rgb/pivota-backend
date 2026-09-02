@@ -258,3 +258,55 @@ def test_plain_mark_failed_does_NOT_write_a_ref():
 
     sql = inspect.getsource(mod.mark_failed)
     assert "issuer_card_ref" not in sql
+
+
+@pytest.mark.asyncio
+async def test_a_DB_error_marking_one_row_does_not_end_the_batch(monkeypatch):
+    """Rule 3 applied to the OTHER half of the loop body.
+
+    The per-row try used to wrap only `issuer.revoke`, so a database error in `mark_revoked` —
+    a pool blip, a lost connection — escaped and ended the sweep. The damage is specific: it
+    happens AFTER the issuer has already killed that card, so the run stops at the one row we
+    know is dead and every orphan behind it goes untouched for the rest of the run. Those are
+    the cards that may still be spendable, which is the entire reason this job exists.
+    """
+    issuer = _Issuer()
+    rows = [_orphan("card_1", "reap_1"), _orphan("card_2", "reap_2"), _orphan("card_3", "reap_3")]
+    marked = []
+
+    async def _list(limit=100):
+        return list(rows)
+
+    async def _mark(card_id):
+        if card_id == "card_2":
+            raise RuntimeError("connection reset by peer")
+        marked.append(card_id)
+        return True
+
+    monkeypatch.setattr(sweep, "list_orphaned_cards", _list)
+    monkeypatch.setattr(sweep, "mark_revoked", _mark)
+    monkeypatch.setattr(sweep, "resolve_issuer", lambda: issuer)
+
+    out = await sweep.run_agent_card_revocation_sweep()
+
+    assert issuer.revoked == ["reap_1", "reap_2", "reap_3"], "every orphan is still attempted"
+    assert marked == ["card_1", "card_3"], "rows either side of the failure still advance"
+    assert out["orphans"] == 3 and out["revoked"] == 2
+    # Counted, and counted DISTINCTLY: this is not "we could not confirm the card is dead" — we
+    # confirmed it is, and only our row is behind. An operator reading the summary needs that
+    # difference, because the two have opposite urgencies.
+    assert out["unconfirmed"] == 1
+    assert out["revoked_row_not_advanced"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_row_write_failure_is_reported_distinctly_from_an_unconfirmed_revoke(monkeypatch):
+    """The POSITIVE counterpart to the count above: a plain unconfirmed revocation must NOT
+    carry the new key, or the two failures are indistinguishable again."""
+    issuer = _Issuer(refuse_refs={"reap_1"})
+    _install(monkeypatch, [_orphan()], issuer)
+
+    out = await sweep.run_agent_card_revocation_sweep()
+
+    assert out["unconfirmed"] == 1
+    assert "revoked_row_not_advanced" not in out

@@ -23,10 +23,17 @@ from services.card_issuers.reap_issuer import ReapIssuer
 
 CAP = 2317  # odd and unique, so a hardcoded-cap mutant cannot pass by coincidence
 DOMAIN = "cosrx.com"
+# FIXED, not `now() + 60m`: the expiry arm compares the echoed instant against the one we sent,
+# so the request and the confirming body have to name the SAME moment. Microseconds are carried
+# deliberately — `_build_payload` sends `isoformat()`, which includes them, and an issuer that
+# truncates them is naming a different instant.
+EXPIRES_AT = datetime(2026, 9, 2, 20, 47, 13, 123456, tzinfo=timezone.utc)
 
 
-def _issuer():
-    return ReapIssuer({"REAP_API_BASE": "https://api.reap.test", "REAP_API_KEY": "k_test"})
+def _issuer(**env):
+    base = {"REAP_API_BASE": "https://api.reap.test", "REAP_API_KEY": "k_test"}
+    base.update(env)
+    return ReapIssuer(base)
 
 
 def _request(**kw):
@@ -36,7 +43,7 @@ def _request(**kw):
         currency="USD",
         merchant_domain=DOMAIN,
         single_use=True,
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=60),
+        expires_at=EXPIRES_AT,
         metadata={},
     )
     base.update(kw)
@@ -51,6 +58,7 @@ def _confirming_body(**overrides):
         "single_use": True,
         "spend_limit": {"amount": CAP, "currency": "USD"},
         "merchant_restriction": {"domains": [DOMAIN]},
+        "expires_at": EXPIRES_AT.isoformat(),
     }
     card.update(overrides)
     return {"card": card}
@@ -147,6 +155,15 @@ async def test_an_issuer_that_SILENTLY_DROPS_the_cap_is_refused(monkeypatch):
         ({"merchant_restriction": None}, "merchant restriction"),
         ({"merchant_restriction": {"domains": []}}, "merchant restriction"),
         ({"single_use": None}, "single-use scope"),
+        # THE EXPIRY ARM. `_build_payload` sends `expires_at` and migration 201 declares the
+        # column NOT NULL because an unexpiring cap is not a cap — but nothing checked that the
+        # issuer honoured it, so a card outliving our row's expiry looked exactly like a healthy
+        # mint. Absent, empty, and unparseable are all "we cannot tell", which is refused here
+        # for the same reason a missing spend cap is.
+        ({"expires_at": None}, "expiry"),
+        ({"expires_at": ""}, "expiry"),
+        ({"expires_at": "next tuesday"}, "expiry"),
+        ({"expires_at": 1788000000}, "expiry"),  # an epoch number: seconds or millis? not guessed
     ],
 )
 async def test_each_unconfirmed_constraint_is_refused(monkeypatch, overrides, constraint):
@@ -171,6 +188,13 @@ async def test_each_unconfirmed_constraint_is_refused(monkeypatch, overrides, co
         {"spend_limit": {"amount": CAP * 100, "currency": "USD"}}, # unit confusion
         {"spend_limit": {"amount": CAP, "currency": "EUR"}},       # different currency
         {"merchant_restriction": {"domains": ["evil.example"]}},   # locked elsewhere
+        # An expiry a minute later is a WIDER card than we asked for, and in a diff it reads
+        # like a formatting difference. It is not one.
+        {"expires_at": (EXPIRES_AT + timedelta(minutes=1)).isoformat()},
+        {"expires_at": (EXPIRES_AT - timedelta(hours=1)).isoformat()},
+        # Truncating the microseconds names a DIFFERENT moment; tolerated spelling differences
+        # stop at ones that do not move the instant.
+        {"expires_at": EXPIRES_AT.replace(microsecond=0).isoformat()},
     ],
 )
 async def test_a_contradicted_constraint_is_refused(monkeypatch, overrides):
@@ -272,6 +296,47 @@ async def test_single_use_is_only_asserted_when_we_asked_for_it(monkeypatch):
     _install(monkeypatch, body)
 
     issued = await _issuer().issue(_request(single_use=False))
+    assert issued.issuer_card_ref == "reap_card_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "echoed",
+    [
+        EXPIRES_AT.isoformat(),                                  # exactly what we sent
+        EXPIRES_AT.isoformat().replace("+00:00", "Z"),           # the Z spelling of the same UTC
+        EXPIRES_AT.astimezone(timezone(timedelta(hours=-7))).isoformat(),  # same instant, -07:00
+    ],
+)
+async def test_an_echoed_expiry_is_confirmed_across_iso_spellings(monkeypatch, echoed):
+    """The POSITIVE counterpart to the expiry refusals, and the reason the comparison is on
+    INSTANTS rather than strings: `Z` and `+00:00` and `-07:00` can all name the moment we sent,
+    and a string compare would refuse a correctly-honouring issuer for punctuation."""
+    _install(monkeypatch, _confirming_body(expires_at=echoed))
+
+    issued = await _issuer().issue(_request())
+    assert issued.issuer_card_ref == "reap_card_1"
+
+
+@pytest.mark.asyncio
+async def test_the_expiry_alias_spelling_is_accepted(monkeypatch):
+    """Same tight tolerance the other arms allow — `expiry` and nothing wider."""
+    body = _confirming_body()
+    body["card"].pop("expires_at")
+    body["card"]["expiry"] = EXPIRES_AT.isoformat()
+    _install(monkeypatch, body)
+
+    issued = await _issuer().issue(_request())
+    assert issued.issuer_card_ref == "reap_card_1"
+
+
+@pytest.mark.asyncio
+async def test_a_naive_expiry_echo_is_read_as_UTC(monkeypatch):
+    """UTC is the only zone this rail mints in (`card_expiry`), so a naive echo of the same
+    wall-clock is the same instant — not an unparseable value and not a mismatch."""
+    _install(monkeypatch, _confirming_body(expires_at=EXPIRES_AT.replace(tzinfo=None).isoformat()))
+
+    issued = await _issuer().issue(_request())
     assert issued.issuer_card_ref == "reap_card_1"
 
 
@@ -380,11 +445,22 @@ async def test_failures_with_NO_card_carry_no_ref(monkeypatch):
 # revoke(): confirmation required, and a wrong path must not read as success
 # --------------------------------------------------------------------------------------
 
-def _revoke_client(monkeypatch, status, body):
+def _revoke_client(monkeypatch, status, body, *, content=None):
+    """Doubles `AsyncClient.request`, which is what the adapter calls now that the verb is
+    configurable. `content` is httpx's raw body — the empty-204 confirmation reads it, so the
+    double carries the real attribute rather than inventing one."""
     seen = {}
+
+    import json as _json
+
+    if content is None:
+        content = b"" if body is None else _json.dumps(body).encode()
 
     class _R:
         status_code = status
+
+        def __init__(self):
+            self.content = content
 
         def json(self):
             if body is None:
@@ -401,7 +477,8 @@ def _revoke_client(monkeypatch, status, body):
         async def __aexit__(self, *a):
             return False
 
-        async def post(self, url, json=None, headers=None):
+        async def request(self, method, url, headers=None):
+            seen["method"] = method
             seen["url"] = url
             return _R()
 
@@ -469,3 +546,84 @@ async def test_revoke_refuses_an_empty_ref_before_calling_out(monkeypatch):
         await _issuer().revoke("")
 
     assert "url" not in seen, "an empty ref must not produce a request at all"
+
+
+@pytest.mark.asyncio
+async def test_the_default_verb_is_POST_and_it_is_what_goes_on_the_wire(monkeypatch):
+    """The verb is now configurable, so the DEFAULT has to be pinned too — an env-driven knob
+    whose unset behaviour nothing asserts is a knob that can be changed by accident."""
+    seen = _revoke_client(monkeypatch, 200, {"card": {"id": "reap_1", "status": "revoked"}})
+
+    await _issuer().revoke("reap_1")
+
+    assert seen["method"] == "POST"
+
+
+@pytest.mark.asyncio
+async def test_a_DELETE_revoke_confirms_on_an_empty_204(monkeypatch):
+    """Reap's real revoke is `DELETE /cards/{id}` -> 204 No Content. There is no body to name a
+    dead state in, so demanding one made the provider's own documented shape permanently
+    unconfirmable — the comment claimed the path was env-correctable while the code could not
+    express it. REAP_REVOKE_METHOD is what makes that claim true."""
+    seen = _revoke_client(monkeypatch, 204, None, content=b"")
+    issuer = _issuer(REAP_REVOKE_METHOD="delete", REAP_REVOKE_CARD_PATH="/v1/cards/{card_id}")
+
+    await issuer.revoke("reap_1")  # returns normally == confirmed
+
+    assert seen["method"] == "DELETE"
+    assert seen["url"] == "https://api.reap.test/v1/cards/reap_1"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_204_on_POST_is_still_UNCONFIRMED(monkeypatch):
+    """The narrowness IS the point. A `/cancel` POST that answers nothing has told us nothing,
+    and this file's rule is that silence never confirms. Only the DELETE verb — which has no
+    body by construction — may confirm on status alone."""
+    _revoke_client(monkeypatch, 204, None, content=b"")
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await _issuer().revoke("reap_1")
+
+    assert excinfo.value.code == "REAP_REVOKE_UNCONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_a_DELETE_404_is_still_refused(monkeypatch):
+    """A wrong path 404s on DELETE exactly as it does on POST, and calling that 'already gone'
+    would mark the whole orphan backlog revoked while killing nothing."""
+    _revoke_client(monkeypatch, 404, None, content=b"")
+    issuer = _issuer(REAP_REVOKE_METHOD="DELETE", REAP_REVOKE_CARD_PATH="/v1/cards/{card_id}")
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await issuer.revoke("reap_1")
+
+    assert excinfo.value.code == "REAP_REVOKE_REFUSED"
+
+
+@pytest.mark.asyncio
+async def test_a_DELETE_that_DOES_return_a_body_still_has_it_read(monkeypatch):
+    """The status-only path is for an EMPTY body. A DELETE that answers a card object is held
+    to the same confirmation as any other — otherwise `status: active` would pass."""
+    _revoke_client(monkeypatch, 200, {"card": {"id": "reap_1", "status": "active"}})
+    issuer = _issuer(REAP_REVOKE_METHOD="DELETE", REAP_REVOKE_CARD_PATH="/v1/cards/{card_id}")
+
+    with pytest.raises(CardIssuerError) as excinfo:
+        await issuer.revoke("reap_1")
+
+    assert excinfo.value.code == "REAP_REVOKE_UNCONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_blocked_is_an_affirmative_dead_state(monkeypatch):
+    """`POST /cards/{id}/block` -> a Card with status BLOCKED is the other shape the env knobs
+    exist to reach; the vocabulary has to admit it or the knob leads nowhere."""
+    _revoke_client(monkeypatch, 200, {"card": {"id": "reap_1", "status": "BLOCKED"}})
+    issuer = _issuer(REAP_REVOKE_CARD_PATH="/v1/cards/{card_id}/block")
+
+    await issuer.revoke("reap_1")
+
+
+def test_an_unusable_revoke_method_falls_back_to_the_strict_verb():
+    """A typo must not silently buy the looser confirmation rule. POST is the strict one."""
+    assert _issuer(REAP_REVOKE_METHOD="PUT").revoke_method == "POST"
+    assert _issuer(REAP_REVOKE_METHOD="  delete  ").revoke_method == "DELETE"

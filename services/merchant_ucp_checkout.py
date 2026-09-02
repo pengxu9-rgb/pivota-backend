@@ -20,7 +20,9 @@ now. Pin nothing to a version string; re-probe when a shape stops working.
 
 SCOPE — this module builds and prices a checkout. It never completes one: `complete_checkout` is
 the money hop and stays out until the credential question (can a Reap reveal handle produce the
-token `dev.shopify.card` wants?) is settled against a sandbox.
+token `dev.shopify.card` wants?) is settled against a sandbox. That scope is ENFORCED, not just
+described: `_ALLOWED_TOOLS` below is the list of tool names the transport will send, and anything
+else is refused before any I/O. A paragraph does not stop a call.
 """
 
 from __future__ import annotations
@@ -56,13 +58,34 @@ _DEFAULT_REFERRING_DOMAIN = "agent.pivota.cc"
 class MerchantUcpError(ValueError):
     """A merchant-side UCP call could not be completed.
 
-    `caller_fault` splits 4xx from 502 at the route, mirroring `MerchantQuoteError` so the two
-    clients present one failure vocabulary to their callers. Never string-match the message.
+    TWO FLAGS, TWO DIFFERENT PARTIES, because one flag was being asked to mean both and the
+    route read it the wrong way round:
+
+      caller_fault  THE API CALLER got it wrong — a line item with no variant_id, an update
+                    with no line_item_ids, a checkout the merchant rejected on its merits.
+                    The agent can fix its request and retry. The route answers 4xx.
+
+      our_fault     PIVOTA got it wrong — our agent profile is unreachable, our discovery
+                    handshake was refused, our code asked for a tool it may not send. The
+                    caller can do nothing about it and retrying changes nothing. The route
+                    answers 502 and logs the specific cause; telling the agent 422 sent it
+                    hunting a bug in its own request that was never there.
+
+    `our_fault` wins where both could be argued: a caller cannot fix our misconfiguration.
+    Never string-match the message.
     """
 
-    def __init__(self, message: str, *, caller_fault: bool = False, rpc_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        caller_fault: bool = False,
+        our_fault: bool = False,
+        rpc_code: Optional[int] = None,
+    ):
         super().__init__(message)
         self.caller_fault = caller_fault
+        self.our_fault = our_fault
         self.rpc_code = rpc_code
 
 
@@ -70,26 +93,34 @@ def write_ops_enabled() -> bool:
     return str(os.getenv(_WRITE_FLAG) or "").strip().lower() in ("1", "true", "on", "yes")
 
 
-def agent_profile_url() -> Optional[str]:
+# The profile we serve today, as a CODE DEFAULT rather than a required variable. This URL
+# answers 200 (verified 2026-09-02); the merchant fetches it during negotiation. It lives here
+# because an env var with no default made a deployment that simply forgot one variable fail
+# every mint — and fail it with the variable's NAME in the response body, handing an external
+# caller a piece of our configuration surface in exchange for nothing it could act on.
+# `UCP_AGENT_PROFILE_URL` still overrides, which is what a second serving host (mcp.pivota.cc)
+# or a staging profile needs.
+_DEFAULT_AGENT_PROFILE_URL = "https://ucp.pivota.cc/.well-known/ucp-agent"
+
+
+def agent_profile_url() -> str:
     """Our UCP agent profile URI, which the merchant will FETCH.
 
     A dead pointer is strictly worse than a missing one: absent → the merchant answers
     un-negotiated, dead → the whole call 422s with a discovery error that reads like an auth
-    problem. So an unset var refuses here rather than sending a call we know will fail.
-    Serving hosts today: ucp.pivota.cc, mcp.pivota.cc.
+    problem. So this never returns nothing: unset, empty, or whitespace all resolve to the
+    profile we actually serve. Serving hosts today: ucp.pivota.cc, mcp.pivota.cc.
     """
-    raw = str(os.getenv("UCP_AGENT_PROFILE_URL") or "").strip()
-    return raw or None
+    return str(os.getenv("UCP_AGENT_PROFILE_URL") or "").strip() or _DEFAULT_AGENT_PROFILE_URL
 
 
 def build_meta() -> Dict[str, Any]:
-    profile = agent_profile_url()
-    if not profile:
-        raise MerchantUcpError(
-            "UCP_AGENT_PROFILE_URL is not configured; the merchant cannot negotiate this call"
-        )
+    # No "is it configured" guard: `agent_profile_url()` cannot answer empty, and a branch that
+    # can never be taken reads as protection this module does not have. If the profile stops
+    # being served, the merchant says so — with a discovery refusal `_unwrap` already names as
+    # ours (our_fault) rather than the caller's.
     # The hyphen in `ucp-agent` is the merchant's spelling, not ours. Probed 2026-08-31.
-    return {"ucp-agent": {"profile": profile}}
+    return {"ucp-agent": {"profile": agent_profile_url()}}
 
 
 def build_attribution(
@@ -108,9 +139,21 @@ def build_attribution(
     Field names are the merchant's, probed 2026-08-31. `click_id_tag` is the PARAMETER NAME and
     `click_id_value` its value — the same pair we already put on referral URLs, so one click id
     reconciles across the referral lane and this one.
+
+    `referring_domain` IS VALIDATED AS A BARE HOSTNAME, through the card rail's own domain
+    guard. It is caller-influenced text that lands in the merchant's order record as a read-only
+    snapshot and is read back by humans and by reconciliation — so a full URL, a hostname with a
+    path or port, or something that is not a hostname at all would put a value in the merchant's
+    admin that no lane can match on. Anything that does not validate falls back to the default
+    rather than being sent: an unattributable order is recoverable, a mis-attributed one is not.
     """
+    referrer = validate_merchant_domain(referring_domain) if referring_domain else None
+    if referring_domain and not referrer:
+        logger.warning(
+            "merchant-ucp: referring_domain was not a bare hostname; stamping the default"
+        )
     attribution: Dict[str, Any] = {
-        "referring_domain": referring_domain or _DEFAULT_REFERRING_DOMAIN,
+        "referring_domain": referrer or _DEFAULT_REFERRING_DOMAIN,
         "utm_source": "pivota",
         "utm_medium": "agent",
     }
@@ -203,6 +246,20 @@ def build_destination(address: Dict[str, Any]) -> Dict[str, Any]:
     return dest
 
 
+def message_codes(payload: Dict[str, Any]) -> List[str]:
+    """The merchant's own reason codes out of a UCP `messages[]` array.
+
+    Codes only, never `content`: the code is the machine-readable half a caller can branch on,
+    and the free text is merchant-authored prose that has no business being pasted into our
+    error surface. Missing/oddly-shaped entries are skipped rather than guessed at.
+    """
+    out: List[str] = []
+    for entry in payload.get("messages") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("code"), str) and entry["code"].strip():
+            out.append(entry["code"].strip())
+    return out
+
+
 def _unwrap(rpc: Any) -> Dict[str, Any]:
     """Pull the checkout payload out of an MCP tools/call response.
 
@@ -219,11 +276,13 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
         code = err.get("code")
         data = err.get("data") if isinstance(err.get("data"), dict) else {}
         detail = str(data.get("code") or err.get("message") or "unknown error")
-        # A profile/discovery refusal is OUR misconfiguration, not the merchant being down —
-        # and it is the failure this module exists to stop shipping, so it gets named.
-        caller_fault = str(data.get("code") or "") in ("invalid_profile_url", "profile_unreachable")
+        # A profile/discovery refusal is OUR misconfiguration, not the merchant being down and
+        # not the agent's request — and it is the failure this module exists to stop shipping,
+        # so it gets named as ours. It used to be flagged `caller_fault`, which the route maps
+        # to 422: our own broken profile presented to the agent as ITS bad request.
+        our_fault = str(data.get("code") or "") in ("invalid_profile_url", "profile_unreachable")
         raise MerchantUcpError(
-            f"merchant refused the call: {detail}", caller_fault=caller_fault, rpc_code=code
+            f"merchant refused the call: {detail}", our_fault=our_fault, rpc_code=code
         )
 
     result = rpc.get("result")
@@ -249,13 +308,27 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
         # "success", with the refusal in `messages[]` — that is the same shape a sold-out item
         # comes back in WITHOUT isError, and callers already read `messages` off it. Return the
         # payload so the caller sees the merchant's own reason instead of a truncated dump.
+        #
+        # `ucp.status == "success"` IS THE WHOLE ADMISSION TEST, and it is not decoration. The
+        # first cut returned any dict carrying `messages` or `ucp` — which admits a payload whose
+        # own envelope says `ucp.status: "error"`. Such a payload can still carry `totals`, and
+        # `resolve_merchant_quote` reads totals: a merchant ERROR would have minted a real,
+        # spendable card capped against a checkout that does not exist. A payload that says it
+        # failed is a REFUSAL, and it is raised as one, carrying the merchant's own reason codes.
         for t in texts:
             try:
                 parsed = json.loads(t)
             except Exception:
                 continue
-            if isinstance(parsed, dict) and ("messages" in parsed or "ucp" in parsed):
+            if not isinstance(parsed, dict) or not ("messages" in parsed or "ucp" in parsed):
+                continue
+            ucp = parsed.get("ucp")
+            if isinstance(ucp, dict) and ucp.get("status") == "success":
                 return parsed
+            codes = ", ".join(message_codes(parsed)) or "unspecified"
+            raise MerchantUcpError(
+                f"merchant refused the checkout: {codes}", caller_fault=True
+            )
         detail = " | ".join(t for t in texts if t) or "unspecified"
         raise MerchantUcpError(
             f"merchant rejected the call: {detail[:500]}", caller_fault=True
@@ -276,10 +349,31 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
     raise MerchantUcpError("merchant response carried no checkout payload")
 
 
-async def call_tool(
+# THE TOOLS THIS MODULE MAY SEND, enumerated. The module docstring says it builds and prices a
+# checkout and never completes one — but a docstring does not stop a call, and `complete_checkout`
+# is one string away from every send site here. That hop is the MONEY hop and is deliberately
+# unbuilt (the credential question — can a Reap reveal handle produce the token `dev.shopify.card`
+# wants? — is unsettled), so the refusal is made structural: a tool not on this list never reaches
+# the wire, whatever a future caller passes. Widening this list is the decision, not a diff.
+_ALLOWED_TOOLS = frozenset(
+    {
+        "get_checkout",
+        "create_checkout",
+        "update_checkout",
+        "search_catalog",
+        "lookup_catalog",
+        "get_product",
+    }
+)
+
+
+async def _call_tool(
     merchant_domain: str, tool: str, arguments: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """ONE transport for every merchant-side UCP call.
+    """ONE transport for every merchant-side UCP call. PRIVATE — every caller is in this module.
+
+    Underscored so that adding a send site is an edit HERE, next to the allowlist and the two
+    SSRF guards, rather than an import somewhere else that inherits none of this file's rules.
 
     Host is caller input and we fetch it, so both guards run here and the scheme and path are
     pinned — the caller controls the host label and nothing else. Redirects are not followed:
@@ -292,6 +386,14 @@ async def call_tool(
     merchant-controlled input that we fetch, which reopens the SSRF surface the guards above
     close. Doing it properly means validating the discovered host with the same two guards.
     """
+    if tool not in _ALLOWED_TOOLS:
+        # BEFORE the guards and before any I/O: an unlisted tool is a bug in this module, not a
+        # request to validate. `complete_checkout` and `cancel_checkout` are the two names this
+        # is really about — see _ALLOWED_TOOLS.
+        raise MerchantUcpError(
+            f"{tool} is not a tool this client may send", our_fault=True
+        )
+
     domain = validate_merchant_domain(merchant_domain)
     if not domain:
         raise MerchantUcpError(
@@ -357,7 +459,7 @@ async def create_checkout(
     }
     if buyer:
         checkout["buyer"] = buyer
-    return await call_tool(
+    return await _call_tool(
         merchant_domain, "create_checkout", {"meta": build_meta(), "checkout": checkout}
     )
 
@@ -409,7 +511,7 @@ async def update_checkout(
         }
     if buyer:
         checkout["buyer"] = buyer
-    return await call_tool(
+    return await _call_tool(
         merchant_domain,
         "update_checkout",
         {"meta": build_meta(), "id": str(checkout_id), "checkout": checkout},
@@ -420,6 +522,6 @@ async def get_checkout(merchant_domain: str, checkout_id: str) -> Dict[str, Any]
     """Read a checkout back. `id`, not `checkout_id` — the merchant's spelling, probed."""
     if not str(checkout_id or "").strip():
         raise MerchantUcpError("checkout_id is required", caller_fault=True)
-    return await call_tool(
+    return await _call_tool(
         merchant_domain, "get_checkout", {"meta": build_meta(), "id": str(checkout_id)}
     )

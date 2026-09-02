@@ -118,9 +118,18 @@ _JOB_RUN_DEADLINES = {
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
     # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
-    # a serial issuer call bounded by the adapter's 15s timeout => 1500s worst case. 1800 covers
-    # that and still lands well inside the hourly cadence, so a wedged run cannot overlap the
-    # next one. Idle runs are a single indexed query.
+    # a serial issuer call.
+    #
+    # THE ADAPTER'S `timeout=15.0` IS NOT A 15s BUDGET PER CALL. httpx spreads a bare float
+    # across connect, read, write AND pool as 15s EACH, so one revoke can legitimately take
+    # ~60s before it gives up — 100 of them is up to ~6000s, well past this deadline, not the
+    # 1500s the arithmetic here used to claim. That is fine and is what the deadline is FOR:
+    # 1800s cuts a wedged run well inside the hourly cadence so it cannot overlap the next one,
+    # and rule 2 of the sweep makes the cut harmless — retry is unbounded by design, so the
+    # orphans a cut run did not reach are simply the head of the next run's oldest-first queue.
+    # What the deadline must not be read as is a guarantee that a full batch completes; only a
+    # smaller AGENT_CARD_REVOCATION_BATCH, or a real total-timeout on the adapter, would buy
+    # that. Idle runs are a single indexed query.
     "agent_card_revocation_sweep": 1800,
     # queue drainers: MAX_RUNS_PER_TICK runs each, serial. Audits routinely
     # run >15 min each (a cut run loses its LLM spend and re-runs after the

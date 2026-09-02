@@ -116,9 +116,19 @@ async def issue_card(
     try:
         quote = await resolve_merchant_quote(body.merchant_domain, body.checkout_id)
     except MerchantQuoteError as err:
-        # The distinction the caller needs: their input was bad (422->400 house mapping) vs the
-        # merchant was unreachable (502). The exception carries the verdict — no string
-        # matching on messages.
+        # THREE parties, not two. Their input was bad (422->400 house mapping); the merchant was
+        # unreachable or refused (502); or WE are misconfigured — our agent profile is dead, our
+        # discovery handshake was refused — which is also a 502 and used to be a 422. Telling an
+        # agent its request was invalid because of OUR configuration sends it debugging a request
+        # that was fine. The exception carries the verdict; no string matching on messages.
+        if err.our_fault:
+            # Generic detail on purpose: the specific cause names our env vars and internal
+            # config, which is our operational surface and nothing the caller can act on. The
+            # log is where the cause belongs.
+            logger.error("card issuance blocked by OUR merchant-negotiation config: %s", err)
+            raise HTTPException(
+                status_code=502, detail="merchant negotiation is not configured"
+            )
         raise HTTPException(status_code=422 if err.caller_fault else 502, detail=str(err))
 
     policy = issuance_policy()
