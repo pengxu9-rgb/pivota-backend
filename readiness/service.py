@@ -2197,6 +2197,64 @@ async def create_refund_for_checkout(
                 logger.warning("Refund transaction sync failed for checkout=%s", checkout_id, exc_info=True)
                 transaction_sync = {"ok": False, "skipped": False, "reason": "refund_transaction_sync_failed"}
 
+    if isinstance(transaction_sync, dict) and transaction_sync.get("retryable"):
+        # `ensure_external_refund_transaction_best_effort` refuses to write when
+        # it cannot read the existing transaction list, because an unreadable
+        # list is the one thing that could let it create a DUPLICATE refund row.
+        # That refusal is safe only where something retries — and this surface
+        # has no retrier: the endpoint answers 200 with the refusal embedded in
+        # the response. Hand it to the durable queue so a transient Shopify 429
+        # does not mean the refund is never mirrored to the merchant at all.
+        #
+        # `skip_cancel` because this path mirrors the refund transaction only;
+        # cancelling the merchant order is the refund_api flow's business.
+        try:
+            from db.merchant_order_sync_jobs import (
+                OP_REFUND_SYNC,
+                enqueue_merchant_order_sync_job,
+            )
+
+            deferred_job_id = await enqueue_merchant_order_sync_job(
+                order_id=str(order_id),
+                merchant_id=str(merchant_id),
+                op=OP_REFUND_SYNC,
+                dedupe_key=str(psp_refund_id or refund_id or "").strip()
+                or f"readiness-{checkout_id}",
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(merchant_id),
+                    "shopify_order_id": str(
+                        (refreshed_order or order_row).get("shopify_order_id") or ""
+                    ),
+                    "store_id": str(
+                        (refreshed_order or order_row).get("store_id") or ""
+                    ).strip()
+                    or None,
+                    "psp_used": str(
+                        (refreshed_order or order_row).get("psp_used") or ""
+                    ).strip()
+                    or None,
+                    "refund_id": psp_refund_id or refund_id,
+                    "amount": float(refund_amount),
+                    "currency": str(
+                        (refreshed_order or order_row).get("currency") or "USD"
+                    ),
+                    "is_partial": False,
+                    "skip_cancel": True,
+                },
+            )
+            transaction_sync = {
+                **transaction_sync,
+                "deferred_to_queue": True,
+                "deferred_job_id": deferred_job_id,
+            }
+        except Exception:
+            logger.warning(
+                "Could not defer refund transaction sync for checkout=%s",
+                checkout_id,
+                exc_info=True,
+            )
+
     await log_order_event(
         event_type="readiness_refund_transaction_sync",
         merchant_id=merchant_id,

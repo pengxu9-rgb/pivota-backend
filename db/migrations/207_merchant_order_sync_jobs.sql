@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS merchant_order_sync_jobs (
   payload           TEXT NOT NULL,
   status            TEXT NOT NULL DEFAULT 'pending',
   attempts          INTEGER NOT NULL DEFAULT 0,
-  max_attempts      INTEGER NOT NULL DEFAULT 8,
+  max_attempts      INTEGER NOT NULL DEFAULT 10,
   claimed_by_worker TEXT,
   claimed_until     TIMESTAMPTZ,
   next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

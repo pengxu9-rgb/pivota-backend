@@ -258,8 +258,14 @@ async def test_refund_txn_refuses_to_write_when_the_transaction_list_is_unreadab
             "must not create a refund transaction while the existing list is unknown"
         )
 
+    async def fake_annotate(**_kwargs):
+        # Stubbed so a mutant that removes the refusal fails on the assertion
+        # above rather than on a live outbound request to shop.myshopify.com.
+        return {"ok": True, "status": 200}
+
     monkeypatch.setattr(svc, "list_shopify_order_transactions", fake_list)
     monkeypatch.setattr(svc, "create_shopify_order_transaction", fake_create)
+    monkeypatch.setattr(svc, "annotate_shopify_order_best_effort", fake_annotate)
 
     result = await svc.ensure_external_refund_transaction_best_effort(
         shop_domain="shop.myshopify.com",
@@ -276,3 +282,41 @@ async def test_refund_txn_refuses_to_write_when_the_transaction_list_is_unreadab
     assert result["ok"] is False
     assert result["retryable"] is True
     assert result["reason"] == "transaction_list_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_refund_txn_does_not_mistake_a_non_refund_row_for_the_refund(monkeypatch):
+    """Dedupe keys on `authorization` alone now, so the `kind` guard is what
+    stops an unrelated transaction carrying the same string from reading as
+    "already refunded" — which would silently skip a refund the merchant needs."""
+    from services import shopify_transactions_service as svc
+
+    creates = []
+
+    async def fake_list(**_kwargs):
+        return [
+            {"id": 777, "gateway": "manual", "kind": "sale", "status": "success",
+             "authorization": "shared_ref"},
+        ]
+
+    async def fake_create(**kwargs):
+        creates.append(dict(kwargs["transaction"]))
+        return {"id": 9001}
+
+    monkeypatch.setattr(svc, "list_shopify_order_transactions", fake_list)
+    monkeypatch.setattr(svc, "create_shopify_order_transaction", fake_create)
+
+    result = await svc.ensure_external_refund_transaction_best_effort(
+        shop_domain="shop.myshopify.com",
+        access_token="token",
+        shopify_order_id="123",
+        psp_used="stripe",
+        external_refund_ref="shared_ref",
+        amount=12.0,
+        currency="USD",
+        parent_transaction_id=777,
+        pivota_order_id="ORD_KIND",
+    )
+
+    assert result["created"] is True
+    assert len(creates) == 1

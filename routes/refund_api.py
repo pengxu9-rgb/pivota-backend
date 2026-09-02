@@ -3,7 +3,11 @@ Refund Processing API
 Handles full and partial refunds for orders
 """
 
-from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from services.merchant_store_service import (
+    get_merchant_active_stores,
+    get_primary_store,
+    get_store_by_id,
+)
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -17,9 +21,6 @@ from db.products import log_order_event
 from utils.auth import require_admin, require_admin_or_key
 from adapters.psp_adapter import get_psp_adapter
 from utils.logger import logger
-from services.shopify_transactions_service import (
-    ensure_external_refund_transaction_best_effort,
-)
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
 from db.merchant_order_sync_jobs import (
@@ -467,10 +468,25 @@ async def process_refund(
         #
         # The guard mirrors the former task's early return, so a merchant with
         # no Shopify store still queues nothing.
+        # Gate on the store the WORKER will use, not the primary one. The worker
+        # resolves the order's bound store_id first (get_store_by_id's own
+        # guidance), so gating on the primary store both enqueues jobs the worker
+        # will refuse and skips jobs it could have completed.
+        enqueue_store = store_info
+        _bound_store_id = str(order.get("store_id") or "").strip()
+        if _bound_store_id:
+            try:
+                enqueue_store = await get_store_by_id(
+                    _bound_store_id,
+                    merchant_id=str(order.get("merchant_id") or ""),
+                )
+            except Exception:
+                enqueue_store = None
+
         if (
             order.get("shopify_order_id")
-            and store_info
-            and store_info.get("platform") == "shopify"
+            and enqueue_store
+            and enqueue_store.get("platform") == "shopify"
         ):
             enqueued_job_id = await enqueue_merchant_order_sync_job(
                 order_id=str(order_id),
@@ -484,7 +500,7 @@ async def process_refund(
                 # collide on the unique index, ON CONFLICT would return the FIRST
                 # job's id, and its sync would be silently dropped.
                 dedupe_key=(
-                    str(refund_id).strip()
+                    str(refund_id or "").strip()
                     or str(refund_request.idempotency_key or "").strip()
                     or f"noref-{uuid.uuid4()}"
                 ),

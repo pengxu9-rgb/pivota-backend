@@ -39,10 +39,27 @@ class _RetryableSyncError(Exception):
     """Raised when the job should be re-queued rather than treated as done."""
 
 
+class _TerminalSyncError(Exception):
+    """Raised when no number of retries can change the outcome.
+
+    Burning the whole attempt budget on these costs 2h of backoff and then
+    fires the `GAVE UP` money-path incident, which should mean "we tried and
+    Shopify would not take it", not "this job was never going to work".
+    """
+
+
 # Progress keys recorded on the job row, so a retry resumes rather than
 # re-running a side-effecting call that already landed.
 _STEP_TRANSACTION = "refund_transaction_synced"
 _STEP_CANCEL = "order_cancelled"
+
+# `ok: False` reasons that retrying genuinely cannot change. Everything else
+# that is not ok RETRIES — a Shopify 500 on POST /transactions.json comes back
+# as a bare {"ok": False, "error": ...} with no `retryable` flag, and treating
+# that as done would mark the job SUCCESS on a merchant order that was never
+# updated. That is the exact state this queue exists to eliminate, and it is
+# the same mistake the cancel-404 handling below was hardened against.
+_TERMINAL_SYNC_REASONS = {"missing_gateway_or_refund_ref"}
 
 
 def _is_already_cancelled(body: str) -> bool:
@@ -52,8 +69,12 @@ def _is_already_cancelled(body: str) -> bool:
     body before deciding a 422 is benign, because 422 on this endpoint also
     covers conditions a retry genuinely should not paper over.
     """
-    text = (body or "").lower()
-    return "cancel" in text and ("already" in text or "has been" in text)
+    # Match the one phrase Shopify actually uses, the way
+    # `_is_non_fatal_invalid_sale_error` does. A looser reader turns
+    # "cannot be cancelled because it has been fulfilled" into a completed
+    # step — a refunded-but-uncancelled order with a `done` row, which is the
+    # exact class the cancel-404 handling below exists to prevent.
+    return "already been cancel" in (body or "").lower()
 
 
 async def _resolve_store_for_refund(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,7 +101,7 @@ async def _resolve_store_for_refund(payload: Dict[str, Any]) -> Dict[str, Any]:
     if bound_store_id:
         store = await get_store_by_id(bound_store_id, merchant_id=merchant_id)
         if not store:
-            raise _RetryableSyncError(
+            raise _TerminalSyncError(
                 f"bound store {bound_store_id} is missing or inactive; refusing "
                 "to fall back to the primary store"
             )
@@ -153,19 +174,30 @@ async def _run_refund_sync_job(
             pivota_order_id=order_id,
         )
         result["transaction_sync"] = sync
-        if isinstance(sync, dict) and sync.get("retryable"):
-            # e.g. the existing-transaction list was unreadable, so the writer
-            # refused rather than risk a duplicate refund row.
-            raise _RetryableSyncError(
-                f"refund transaction sync deferred: {sync.get('reason')}"
-            )
+        if isinstance(sync, dict) and not sync.get("ok"):
+            reason = str(sync.get("reason") or "").strip()
+            if reason not in _TERMINAL_SYNC_REASONS:
+                # Covers the writer's explicit `retryable` refusal (the
+                # transaction list was unreadable) AND every bare failure it
+                # returns without one, e.g. a 5xx from the create call.
+                raise _RetryableSyncError(
+                    "refund transaction sync did not succeed: "
+                    f"reason={reason or None} error={sync.get('error')}"
+                )
+            # Nothing to write and no retry can change that; record it as its
+            # own outcome rather than letting it read as a clean success.
+            result["transaction_sync_skipped"] = reason
         progress[_STEP_TRANSACTION] = True
         if on_progress is not None:
             await on_progress(progress)
 
     # Full refund only: cancel the Shopify order for merchant ops visibility. Do
     # NOT ask Shopify to process refunds — the external PSP already moved funds.
-    if bool(payload.get("is_partial")) or progress.get(_STEP_CANCEL):
+    if (
+        bool(payload.get("is_partial"))
+        or bool(payload.get("skip_cancel"))
+        or progress.get(_STEP_CANCEL)
+    ):
         return result
 
     cancel_data = payload.get("cancel_payload")
@@ -272,7 +304,10 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                 max_attempts=max_attempts,
                 error=f"no handler for op {op} on this build",
             )
-            summary["failed" if status == "failed" else "requeued"] += 1
+            if status == "lease_lost":
+                summary["lease_lost"] += 1
+            else:
+                summary["failed" if status == "failed" else "requeued"] += 1
             continue
 
         async def _on_progress(progress, _job_id=job_id):
@@ -303,10 +338,13 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                 # itself was idempotent, so the sibling redoing it is safe.
                 summary["lease_lost"] += 1
         except Exception as exc:  # noqa: BLE001
+            # A terminal error spends the whole budget at once: retrying cannot
+            # change it, and the operator should see it now rather than in 2h.
+            spent = max_attempts if isinstance(exc, _TerminalSyncError) else attempts
             status = await fail_merchant_order_sync_job(
                 job_id=job_id,
                 worker_id=WORKER_ID,
-                attempts=attempts,
+                attempts=spent,
                 max_attempts=max_attempts,
                 error=f"{type(exc).__name__}: {exc}",
             )

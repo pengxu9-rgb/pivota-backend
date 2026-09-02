@@ -71,7 +71,7 @@ _DDL_STATEMENTS = [
       payload           TEXT NOT NULL,
       status            TEXT NOT NULL DEFAULT 'pending',
       attempts          INTEGER NOT NULL DEFAULT 0,
-      max_attempts      INTEGER NOT NULL DEFAULT 8,
+      max_attempts      INTEGER NOT NULL DEFAULT 10,
       claimed_by_worker TEXT,
       claimed_until     TIMESTAMPTZ,
       next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -399,6 +399,11 @@ async def fail_merchant_order_sync_job(
         logger.warning(
             "merchant_order_sync: fail-update failed for %s: %s", job_id, str(exc)[:200]
         )
+        # Do NOT report the status we computed: we did not write it. The row is
+        # still `running` and the lease reaper will hand it back, so claiming
+        # "failed" here would fire the GAVE UP money-path incident for a job
+        # that is about to be retried.
+        return "write_failed"
     return status
 
 

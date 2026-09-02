@@ -524,6 +524,12 @@ async def ensure_external_refund_transaction_best_effort(
     for t in txns:
         if not isinstance(t, dict):
             continue
+        # Only a refund row can be the refund we are about to write. The gateway
+        # conjunct removed above was incidentally providing this narrowing; keep
+        # it explicitly so an unrelated transaction that happens to carry the
+        # same authorization cannot read as "already refunded".
+        if str(t.get("kind") or "").strip().lower() != "refund":
+            continue
         if str(t.get("authorization") or "").strip() == refund_ref:
             return {
                 "ok": True,
