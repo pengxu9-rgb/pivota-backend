@@ -243,6 +243,19 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
             for chunk in (result.get("content") or [])
             if isinstance(chunk, dict) and chunk.get("type") == "text"
         ]
+        # TWO isError shapes, probed live 2026-09-02. cosrx.com: plain text ("Invalid
+        # arguments: ... missing required properties: line_item_ids") — a malformed request,
+        # raise it. judydoll.com: a full UCP checkout PAYLOAD as JSON text, `ucp.status`
+        # "success", with the refusal in `messages[]` — that is the same shape a sold-out item
+        # comes back in WITHOUT isError, and callers already read `messages` off it. Return the
+        # payload so the caller sees the merchant's own reason instead of a truncated dump.
+        for t in texts:
+            try:
+                parsed = json.loads(t)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and ("messages" in parsed or "ucp" in parsed):
+                return parsed
         detail = " | ".join(t for t in texts if t) or "unspecified"
         raise MerchantUcpError(
             f"merchant rejected the call: {detail[:500]}", caller_fault=True

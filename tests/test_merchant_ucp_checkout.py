@@ -397,3 +397,22 @@ async def test_a_tool_result_flagged_isError_is_surfaced_with_the_merchants_text
 
     assert "missing required properties: line_item_ids" in str(excinfo.value)
     assert excinfo.value.caller_fault is True
+
+
+@pytest.mark.asyncio
+async def test_an_isError_result_carrying_a_checkout_payload_is_returned_not_raised(monkeypatch):
+    """Probed live 2026-09-02 on judydoll.com: create_checkout answers isError=true whose text is
+    a full UCP payload (ucp.status "success") with the refusal in `messages[]` — the same shape
+    a sold-out line comes back in without isError. Callers read `messages`; do not throw it away."""
+    payload = {
+        "ucp": {"version": "2026-04-08", "status": "success"},
+        "messages": [{"type": "error", "code": "some_merchant_reason", "content": "explained here"}],
+    }
+    _Capture(
+        {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": True}}
+    ).install(monkeypatch)
+
+    out = await muc.create_checkout("judydoll.com", line_items=[{"variant_id": "1", "quantity": 1}])
+
+    assert out["messages"][0]["code"] == "some_merchant_reason"
+    assert out.get("id") is None
