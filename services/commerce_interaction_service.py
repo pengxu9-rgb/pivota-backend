@@ -7,9 +7,9 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import IS_POSTGRES, database
@@ -104,48 +104,122 @@ def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
     return f"int_{uuid.uuid4().hex[:24]}"
 
 
-async def _lookup_existing_interaction(refs: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
-    keys = (
-        "interaction_id",
-        "click_id",
-        "order_id",
-        "checkout_id",
-        "payment_id",
-        "cart_id",
-        "quote_id",
-        "refund_id",
-        "return_id",
-        "session_id",
-    )
+_INTERACTION_LOOKUP_KEYS = (
+    "interaction_id",
+    "click_id",
+    "order_id",
+    "checkout_id",
+    "payment_id",
+    "cart_id",
+    "quote_id",
+    "refund_id",
+    "return_id",
+    "session_id",
+)
+
+_STORE_SCOPED_LOOKUP_KEYS = {
+    "interaction_id",
+    "click_id",
+    "session_id",
+    "cart_id",
+    "payment_id",
+    "order_id",
+    "checkout_id",
+    "quote_id",
+    "refund_id",
+    "return_id",
+}
+
+_WEAK_INTERACTION_LOOKUP_KEYS = {"session_id", "cart_id", "payment_id"}
+_INTERACTION_SELECTION_KEYS = tuple(
+    key for key in _INTERACTION_LOOKUP_KEYS if key not in _WEAK_INTERACTION_LOOKUP_KEYS
+) + tuple(key for key in _INTERACTION_LOOKUP_KEYS if key in _WEAK_INTERACTION_LOOKUP_KEYS)
+
+
+def _interaction_lookup_conditions(
+    refs: Dict[str, Optional[str]], key: str
+) -> List[Any]:
     merchant_id = refs.get("merchant_id")
-    for key in keys:
+    conditions = [
+        commerce_interactions.c.merchant_id == merchant_id,
+        getattr(commerce_interactions.c, key) == refs.get(key),
+    ]
+    if key in _STORE_SCOPED_LOOKUP_KEYS:
+        store_id = refs.get("store_id")
+        conditions.append(
+            commerce_interactions.c.store_id == store_id
+            if store_id
+            else commerce_interactions.c.store_id.is_(None)
+        )
+    return conditions
+
+
+async def _lookup_matching_interactions(
+    refs: Dict[str, Optional[str]],
+) -> List[Dict[str, Any]]:
+    """Return every interaction reached by the incoming stitch keys.
+
+    Strong-key priority is deterministic. Weak keys are fallback-only and may
+    confirm a strong match, but never nominate a destructive merge loser.
+    """
+    match_conditions = []
+    # Strong keys are resolved first regardless of their legacy lookup order.
+    # Weak keys may select one row only when no strong key matched at all.
+    for key in _INTERACTION_SELECTION_KEYS:
+        if not refs.get(key):
+            continue
+        # Merchant scope is shared outside the OR; the remaining predicates
+        # retain per-key store scoping.
+        conditions = _interaction_lookup_conditions(refs, key)[1:]
+        match_conditions.append(and_(*conditions))
+    if not match_conditions:
+        return []
+
+    rows = await database.fetch_all(
+        select(commerce_interactions).where(
+            commerce_interactions.c.merchant_id == refs.get("merchant_id"),
+            or_(*match_conditions),
+        )
+    )
+
+    candidates = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: str(row.get("interaction_id") or ""),
+    )
+    matches: List[Dict[str, Any]] = []
+    matched_ids: set[str] = set()
+    for key in _INTERACTION_SELECTION_KEYS:
         value = refs.get(key)
         if not value:
             continue
-        conditions = [
-            commerce_interactions.c.merchant_id == merchant_id,
-            getattr(commerce_interactions.c, key) == value,
-        ]
-        if key in {
-            "session_id",
-            "cart_id",
-            "payment_id",
-            "order_id",
-            "checkout_id",
-            "quote_id",
-            "refund_id",
-            "return_id",
-        }:
-            store_id = refs.get("store_id")
-            conditions.append(
-                commerce_interactions.c.store_id == store_id
-                if store_id
-                else commerce_interactions.c.store_id.is_(None)
-            )
-        row = await database.fetch_one(select(commerce_interactions).where(*conditions))
-        if row:
-            return dict(row)
-    return None
+        key_candidates = [row for row in candidates if row.get(key) == value]
+        if not key_candidates:
+            continue
+        already_selected = next(
+            (
+                row
+                for row in key_candidates
+                if str(row.get("interaction_id") or "") in matched_ids
+            ),
+            None,
+        )
+        # A non-unique weak key (session/cart/payment) must not fan out and
+        # collapse every interaction that shares it. Prefer an interaction
+        # already selected by a stronger key. Once a strong match exists, a
+        # weak key can confirm it but can never nominate a loser for deletion.
+        if key in _WEAK_INTERACTION_LOOKUP_KEYS and matches and not already_selected:
+            continue
+        selected = already_selected or key_candidates[0]
+        interaction_id = str(selected.get("interaction_id") or "")
+        if interaction_id and interaction_id not in matched_ids:
+            matched_ids.add(interaction_id)
+            matches.append(selected)
+    return matches
+
+
+async def _lookup_existing_interaction(refs: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
+    matches = await _lookup_matching_interactions(refs)
+    return matches[0] if matches else None
 
 
 def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -250,6 +324,159 @@ async def _execute_insert(query: Any) -> Any:
     return await database.execute(query)
 
 
+async def _execute_update(query: Any) -> Any:
+    """Keep a PostgreSQL constraint failure inside a recoverable savepoint."""
+    if IS_POSTGRES:
+        async with database.transaction():
+            return await database.execute(query)
+    return await database.execute(query)
+
+
+_MERGEABLE_INTERACTION_FIELDS = (
+    "platform",
+    "store_id",
+    "surface",
+    "commerce_surface",
+    "prompt_id",
+    "result_id",
+    "click_id",
+    "cart_id",
+    "quote_id",
+    "checkout_id",
+    "payment_id",
+    "order_id",
+    "refund_id",
+    "return_id",
+    "canonical_product_id",
+    "canonical_variant_id",
+    "trace_id",
+    "brief_id",
+    "session_id",
+    "visitor_id",
+    "buyer_id",
+    "source_channel",
+    "source_family",
+    "query_source",
+    "agent_id",
+    "protocol_name",
+    "llm_provider",
+    "llm_model",
+    "caller_id",
+)
+
+
+def _merged_interaction_values(
+    matches: List[Dict[str, Any]], values: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Combine loser state into winner values without overriding fresh refs."""
+    merged = dict(values)
+    incoming_latest = (values.get("last_occurred_at"), values.get("latest_event_type"))
+    for field in _MERGEABLE_INTERACTION_FIELDS:
+        if merged.get(field) is None:
+            merged[field] = next(
+                (row.get(field) for row in matches if row.get(field) is not None),
+                None,
+            )
+
+    metadata: Dict[str, Any] = {}
+    # Lower-priority rows are folded first; winner and the incoming patch retain
+    # the same precedence as the legacy update path.
+    for row in reversed(matches):
+        if isinstance(row.get("metadata"), dict):
+            metadata.update(row["metadata"])
+    if isinstance(values.get("metadata"), dict):
+        metadata.update(values["metadata"])
+    merged["metadata"] = metadata or None
+
+    first_candidates = [
+        value
+        for value in [merged.get("first_occurred_at"), *(row.get("first_occurred_at") for row in matches)]
+        if value is not None
+    ]
+    last_candidates = [
+        value
+        for value in [merged.get("last_occurred_at"), *(row.get("last_occurred_at") for row in matches)]
+        if value is not None
+    ]
+    if first_candidates:
+        merged["first_occurred_at"] = min(first_candidates)
+    if last_candidates:
+        merged["last_occurred_at"] = max(last_candidates)
+
+    statuses = [merged.get("status"), *(row.get("status") for row in matches)]
+    merged["status"] = max(
+        (status for status in statuses if status is not None),
+        key=lambda status: _STATUS_RANK.get(status, 0),
+        default=None,
+    )
+
+    latest_candidates = [
+        incoming_latest,
+        *((row.get("last_occurred_at"), row.get("latest_event_type")) for row in matches),
+    ]
+    dated_latest = [candidate for candidate in latest_candidates if candidate[0] is not None and candidate[1]]
+    if dated_latest:
+        merged["latest_event_type"] = max(dated_latest, key=lambda candidate: candidate[0])[1]
+    return merged
+
+
+async def _merge_interactions(
+    matches: List[Dict[str, Any]], values: Dict[str, Any]
+) -> Dict[str, Any]:
+    if len(matches) < 2:
+        raise ValueError("interaction merge requires at least two matches")
+    winner = matches[0]
+    winner_id = str(winner["interaction_id"])
+    loser_ids = [str(row["interaction_id"]) for row in matches[1:]]
+    target_store_id = _normalize_text(values.get("store_id"))
+    if any(_normalize_text(row.get("store_id")) != target_store_id for row in matches):
+        raise ValueError("cannot merge commerce interactions across stores")
+    merged_values = _merged_interaction_values(matches, values)
+    merged_values["interaction_id"] = winner_id
+
+    async with database.transaction():
+        await database.execute(
+            commerce_interaction_events.update()
+            .where(commerce_interaction_events.c.interaction_id.in_(loser_ids))
+            .values(interaction_id=winner_id)
+        )
+        await database.execute(
+            commerce_interactions.delete().where(
+                commerce_interactions.c.merchant_id == winner["merchant_id"],
+                commerce_interactions.c.interaction_id.in_(loser_ids),
+            )
+        )
+        await database.execute(
+            commerce_interactions.update()
+            .where(
+                commerce_interactions.c.merchant_id == winner["merchant_id"],
+                commerce_interactions.c.interaction_id == winner_id,
+            )
+            .values(**merged_values)
+        )
+    logger.info(
+        "Merged commerce interactions merchant_id=%s winner_id=%s loser_ids=%s",
+        winner["merchant_id"],
+        winner_id,
+        loser_ids,
+    )
+    row = await database.fetch_one(
+        select(commerce_interactions).where(commerce_interactions.c.interaction_id == winner_id)
+    )
+    return dict(row) if row else {"interaction_id": winner_id, **merged_values}
+
+
+def _stitch_advisory_lock_keys(
+    merchant_id: str, refs: Dict[str, Optional[str]]
+) -> List[str]:
+    store_scope = refs.get("store_id") or ""
+    return sorted(
+        f"stitch|{merchant_id}|{store_scope}|{ref_name}|{refs[ref_name]}"
+        for ref_name in _INTERACTION_LOOKUP_KEYS
+        if refs.get(ref_name)
+    )
+
+
 @asynccontextmanager
 async def _event_write_lock(
     merchant_id: str,
@@ -260,23 +487,52 @@ async def _event_write_lock(
     if not IS_POSTGRES:
         yield
         return
-    async with database.transaction():
-        if key:
-            await database.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-                {"lock_key": f"event|{merchant_id}|{event_type}|{key}"},
-            )
-        existing = await _lookup_existing_interaction(refs)
-        interaction_id = (
-            (existing or {}).get("interaction_id")
-            or refs.get("interaction_id")
-            or _fallback_interaction_id(refs)
-        )
-        await database.execute(
-            "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-            {"lock_key": f"interaction|{merchant_id}|{interaction_id}"},
-        )
-        yield
+    stitch_lock_keys = _stitch_advisory_lock_keys(merchant_id, refs)
+    for _attempt in range(3):
+        retry = False
+        async with database.transaction():
+            if key:
+                await database.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                    {"lock_key": f"event|{merchant_id}|{event_type}|{key}"},
+                )
+            # These locks are independent of mutable database state, so a
+            # waiter cannot resolve a loser before a concurrent merge commits.
+            for stitch_lock_key in stitch_lock_keys:
+                await database.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                    {"lock_key": stitch_lock_key},
+                )
+
+            matches = await _lookup_matching_interactions(refs)
+            interaction_ids = {
+                str(match["interaction_id"])
+                for match in matches
+                if match.get("interaction_id")
+            }
+            if not interaction_ids:
+                interaction_ids.add(refs.get("interaction_id") or _fallback_interaction_id(refs))
+            # Globally stable lock order prevents bridge events from taking the
+            # same pair of interactions in opposite order.
+            for interaction_id in sorted(interaction_ids):
+                await database.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                    {"lock_key": f"interaction|{merchant_id}|{interaction_id}"},
+                )
+
+            refreshed_matches = await _lookup_matching_interactions(refs)
+            refreshed_ids = {
+                str(match["interaction_id"])
+                for match in refreshed_matches
+                if match.get("interaction_id")
+            }
+            if refreshed_ids.issubset(interaction_ids):
+                yield
+                return
+            retry = True
+        if retry:
+            continue
+    raise RuntimeError("commerce interaction locks did not stabilize")
 
 
 async def ensure_interaction(
@@ -305,7 +561,8 @@ async def ensure_interaction(
     if not merchant_id:
         raise ValueError("merchant_id is required for commerce interaction tracking")
 
-    existing = await _lookup_existing_interaction(refs)
+    matches = await _lookup_matching_interactions(refs)
+    existing = matches[0] if matches else None
     interaction_id = (
         (existing or {}).get("interaction_id")
         or refs.get("interaction_id")
@@ -363,12 +620,22 @@ async def ensure_interaction(
         "updated_at": now,
     }
 
+    if len(matches) > 1:
+        return await _merge_interactions(matches, values)
     if existing:
-        await database.execute(
-            commerce_interactions.update()
-            .where(commerce_interactions.c.interaction_id == interaction_id)
-            .values(**values)
-        )
+        try:
+            await _execute_update(
+                commerce_interactions.update()
+                .where(commerce_interactions.c.interaction_id == interaction_id)
+                .values(**values)
+            )
+        except Exception as exc:
+            if not _is_unique_violation(exc):
+                raise
+            raced_matches = await _lookup_matching_interactions(refs)
+            if len(raced_matches) < 2:
+                raise
+            return await _merge_interactions(raced_matches, values)
     else:
         try:
             await _execute_insert(

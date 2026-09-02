@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -253,9 +254,9 @@ async def test_session_stitch_lookup_is_scoped_to_merchant_and_store(monkeypatch
     queries = []
 
     class FakeDB:
-        async def fetch_one(self, query):
+        async def fetch_all(self, query):
             queries.append(query)
-            return {"interaction_id": "int_existing"}
+            return [{"interaction_id": "int_existing", "session_id": "session_shared"}]
 
     monkeypatch.setattr(service, "database", FakeDB())
     result = await service._lookup_existing_interaction(
@@ -266,7 +267,10 @@ async def test_session_stitch_lookup_is_scoped_to_merchant_and_store(monkeypatch
         }
     )
 
-    assert result == {"interaction_id": "int_existing"}
+    assert result == {
+        "interaction_id": "int_existing",
+        "session_id": "session_shared",
+    }
     compiled = queries[0].compile()
     sql = str(compiled)
     values = set(compiled.params.values())
@@ -277,16 +281,190 @@ async def test_session_stitch_lookup_is_scoped_to_merchant_and_store(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ref_name", ["order_id", "checkout_id", "quote_id", "refund_id", "return_id"])
+async def test_non_unique_session_lookup_selects_only_one_interaction(monkeypatch):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_b", "session_id": "session_shared"},
+                {"interaction_id": "int_a", "session_id": "session_shared"},
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            "session_id": "session_shared",
+        }
+    )
+
+    assert matches == [
+        {"interaction_id": "int_a", "session_id": "session_shared"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strong_order_match_prevents_session_fanout(monkeypatch):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_session", "session_id": "session_shared"},
+                {
+                    "interaction_id": "int_order",
+                    "order_id": "order_1",
+                    "session_id": "session_shared",
+                },
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            "order_id": "order_1",
+            "session_id": "session_shared",
+        }
+    )
+
+    assert matches == [
+        {
+            "interaction_id": "int_order",
+            "order_id": "order_1",
+            "session_id": "session_shared",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("weak_key", ["session_id", "cart_id", "payment_id"])
+async def test_weak_key_cannot_nominate_loser_after_strong_match(
+    monkeypatch, weak_key
+):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_weak", weak_key: "weak_shared"},
+                {"interaction_id": "int_order", "order_id": "order_1"},
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            "order_id": "order_1",
+            weak_key: "weak_shared",
+        }
+    )
+
+    assert matches == [{"interaction_id": "int_order", "order_id": "order_1"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("weak_key", ["session_id", "cart_id", "payment_id"])
+@pytest.mark.parametrize("strong_key", ["quote_id", "refund_id", "return_id"])
+async def test_late_strong_key_is_resolved_before_any_weak_key(
+    monkeypatch, weak_key, strong_key
+):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_weak", weak_key: "weak_shared"},
+                {"interaction_id": "int_strong", strong_key: "strong_1"},
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            weak_key: "weak_shared",
+            strong_key: "strong_1",
+        }
+    )
+
+    assert matches == [
+        {"interaction_id": "int_strong", strong_key: "strong_1"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_event_lock_restarts_when_loser_resolves_to_new_winner(monkeypatch):
+    from services import commerce_interaction_service as service
+
+    fetch_results = [
+        [{"interaction_id": "int_loser", "checkout_id": "checkout_1"}],
+        [{"interaction_id": "int_winner", "checkout_id": "checkout_1"}],
+        [{"interaction_id": "int_winner", "checkout_id": "checkout_1"}],
+        [{"interaction_id": "int_winner", "checkout_id": "checkout_1"}],
+    ]
+    lock_keys = []
+    transactions = 0
+
+    class FakeDB:
+        @asynccontextmanager
+        async def transaction(self):
+            nonlocal transactions
+            transactions += 1
+            yield
+
+        async def execute(self, _query, values):
+            lock_keys.append(values["lock_key"])
+
+        async def fetch_all(self, _query):
+            return fetch_results.pop(0)
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    monkeypatch.setattr(service, "IS_POSTGRES", True)
+
+    async with service._event_write_lock(
+        "merchant_a",
+        "checkout.started",
+        "delivery_1",
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            "checkout_id": "checkout_1",
+        },
+    ):
+        pass
+
+    assert transactions == 2
+    assert "interaction|merchant_a|int_loser" in lock_keys
+    assert "interaction|merchant_a|int_winner" in lock_keys
+    assert fetch_results == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ref_name",
+    [
+        "interaction_id",
+        "click_id",
+        "order_id",
+        "checkout_id",
+        "quote_id",
+        "refund_id",
+        "return_id",
+    ],
+)
 async def test_commerce_ref_lookup_is_scoped_to_merchant_and_store(monkeypatch, ref_name):
     from services import commerce_interaction_service as service
 
     queries = []
 
     class FakeDB:
-        async def fetch_one(self, query):
+        async def fetch_all(self, query):
             queries.append(query)
-            return {"interaction_id": "int_existing"}
+            return [{"interaction_id": "int_existing", ref_name: "ref_shared"}]
 
     monkeypatch.setattr(service, "database", FakeDB())
     result = await service._lookup_existing_interaction(
@@ -297,7 +475,7 @@ async def test_commerce_ref_lookup_is_scoped_to_merchant_and_store(monkeypatch, 
         }
     )
 
-    assert result == {"interaction_id": "int_existing"}
+    assert result == {"interaction_id": "int_existing", ref_name: "ref_shared"}
     compiled = queries[0].compile()
     sql = str(compiled)
     values = set(compiled.params.values())
@@ -402,6 +580,9 @@ async def test_out_of_order_event_preserves_terminal_status_and_latest_event(mon
     writes = []
 
     class FakeDB:
+        async def fetch_all(self, _query):
+            return [existing]
+
         async def fetch_one(self, _query):
             return existing
 
