@@ -600,20 +600,29 @@ async def test_the_staleness_window_is_measured_in_seconds_against_the_server_cl
 
 
 def _as_utc(value) -> datetime:
-    """`_normalize_row` hands back an ISO string with a `Z`; raw rows a datetime."""
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    """`_normalize_row` hands back an ISO string with a `Z`; raw rows a datetime.
+
+    Always returns an AWARE datetime: a parsed string with no offset would
+    otherwise be naive, and every caller subtracts an aware `now()` from it,
+    which raises TypeError instead of failing the assertion it was written for.
+    """
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+        str(value).replace("Z", "+00:00")
+    )
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 async def test_the_job_timestamps_are_written_and_are_close_to_now():
     """requested_at is no longer passed by the caller — the column default writes
-    it. That only works if every way this table can be built HAS a default
-    (migration 054: `NOW()`; this module's DDL: `CURRENT_TIMESTAMP`; the Column:
-    `server_default=func.now()`), so this is the case that fails loudly if one of
-    those three ever loses it. finished_at is the same story on the completion
-    path. This case is about the values being WRITTEN and current; the timezone
-    claim is the Postgres-only case below.
+    it. All three DDL paths define one — migration 054 `NOW()`, this module's DDL
+    `CURRENT_TIMESTAMP`, the Column `server_default=func.now()` — but be exact
+    about what this case can see: only ONE of them creates the table in any given
+    run, and which one depends on the job. `create_all` wins in the dialect gate;
+    in the SQLite sweep it is whichever caller reaches the freshly-deleted
+    database first. Migration 054 is never the creator in either. So this fails
+    loudly if the WINNING path loses its default, not if any of the three does.
+    finished_at is the same story on the completion path. The timezone claim is
+    the Postgres-only case below.
     """
     before = datetime.now(timezone.utc)
     job_id = await _new_job()
