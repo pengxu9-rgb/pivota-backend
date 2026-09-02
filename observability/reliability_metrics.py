@@ -247,6 +247,16 @@ try:
     except ValueError:
         commerce_attribution_inferred_recovered_total = _existing_collector("commerce_attribution_inferred_recovered_total")
 
+    try:
+        catalog_import_task_total = Counter(
+            "catalog_import_task_total",
+            "Platform catalog import ATTEMPT outcomes by connector, status and error category. "
+            "A retrying task emits one sample per attempt, not one per task.",
+            ["connector", "status", "error_category"],
+        )
+    except ValueError:
+        catalog_import_task_total = _existing_collector("catalog_import_task_total")
+
 except Exception:  # pragma: no cover
     Counter = Gauge = Histogram = None  # type: ignore
     payment_attempt_total = None
@@ -273,6 +283,7 @@ except Exception:  # pragma: no cover
     traffic_taxonomy_diagnostics_warning_total = None
     commerce_attribution_silent_reject_total = None
     commerce_attribution_inferred_recovered_total = None
+    catalog_import_task_total = None
 
 
 def record_payment_attempt(
@@ -484,4 +495,76 @@ def record_commerce_attribution_inferred_recovered(*, merchant_id: Optional[str]
         return
     commerce_attribution_inferred_recovered_total.labels(
         merchant_id=str(merchant_id or "unknown"),
+    ).inc()
+
+
+# Label allowlist for `connector`. NOT decoration: platform_import_tasks.connector
+# is a plain String(100) with no CHECK and no enum, `schedule_import_task` takes a
+# bare Optional[str], and services/platform_onboarding_service.py CATCHES
+# InvalidConnectorError and logs it without resetting the value — so a merchant
+# calling POST /platform/onboarding/register can put an arbitrary string in that
+# column and loop to seed unlimited distinct values.
+#
+# The drain lane is scoped to connector='shopify' today, so those rows are never
+# processed and never labelled. But db/platform_import_tasks.py explicitly invites
+# widening the lane, and the day it widens every string already sitting in that
+# column becomes a live label value. Clamping HERE survives that, because it does
+# not depend on the lane staying narrow.
+_KNOWN_IMPORT_CONNECTORS = frozenset(
+    {
+        "shopify",
+        "manual",
+        "amazon_sp_api",
+        "amazon_report",
+        "temu_report",
+        "amazon_orders",
+        "temu_orders",
+    }
+)
+
+
+def record_catalog_import_task(
+    *,
+    connector: Optional[str],
+    status: str,
+    error_category: Optional[str] = None,
+) -> None:
+    """Record the outcome of one platform catalog import ATTEMPT.
+
+    ATTEMPT, not task — the distinction matters for anyone writing an alert.
+
+    jobs/catalog_import_worker emitted NO metrics at all, which is why this
+    exists. `catalog_import_drain_tick` (#1964) is dormant behind
+    CATALOG_IMPORT_DRAIN_ENABLED, and the first thing it will do when armed is
+    walk a backlog nothing has ever drained. Without a counter, the two
+    outcomes that most need a human are indistinguishable from a quiet queue:
+
+      * a spike in error_category="credentials_unavailable" — either a
+        credential-resolution outage or a cohort whose stores no longer
+        resolve (#1989);
+      * a spike in status="failed" generally, which on this path means the
+        backlog is burning down into dead rows rather than importing.
+
+    A task that retries emits one sample per attempt. Specifically, a
+    ShopifyCredentialsUnavailableError is deliberately retryable, so ONE
+    merchant hitting ONE credential outage emits up to
+    SHOPIFY_MAX_RETRY_ATTEMPTS (5) samples of
+    status="retry_scheduled" plus one of status="failed" — six, not one. An
+    alert that treats each sample as a distinct affected merchant will
+    over-report by that multiplier. Filter on status="failed" to count tasks
+    that actually gave up, or leave status unfiltered to see retry storms; both
+    are legitimate, but they answer different questions.
+
+    `status` and `error_category` are bounded by enumeration — three terminal
+    states, and eight category literals the retry handlers assign.
+    `connector` is bounded by the allowlist above, NOT by construction, because
+    the column it comes from accepts arbitrary merchant-supplied strings.
+    """
+    if catalog_import_task_total is None:
+        return
+    raw_connector = str(connector or "unknown")
+    catalog_import_task_total.labels(
+        connector=raw_connector if raw_connector in _KNOWN_IMPORT_CONNECTORS else "other",
+        status=str(status or "unknown"),
+        error_category=str(error_category or "none"),
     ).inc()
