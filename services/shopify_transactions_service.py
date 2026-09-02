@@ -494,17 +494,42 @@ async def ensure_external_refund_transaction_best_effort(
             shopify_order_id,
             str(e),
         )
+        # The existing-transaction list is the ONLY thing preventing a duplicate
+        # refund row. Failing to read it is "cannot verify", not "nothing is
+        # there" — and with an explicit `parent_transaction_id` the code below
+        # would otherwise sail past the dedupe loop on an empty list and create
+        # a second refund. Refuse instead; the caller retries.
+        return {
+            "ok": False,
+            "skipped": True,
+            "retryable": True,
+            "reason": "transaction_list_unavailable",
+        }
 
+    # Dedupe on the refund reference ALONE — deliberately NOT on gateway.
+    #
+    # This loop used to skip any transaction whose gateway differed from
+    # `normalize_shopify_gateway(psp_used)`, while the create below writes
+    # `parent_gateway or gateway`. Whenever the parent sale's gateway differs
+    # from psp_used — a `manual` parent (which this module itself creates when
+    # Shopify 422s "sale is not a valid transaction"), `shopify_payments`, COD —
+    # the row this function created could never match its own dedupe filter, so
+    # every call created another refund transaction for the same refund.
+    # Measured: 3 calls, 3 identical refund rows.
+    #
+    # `authorization` holds the external PSP's refund id, which is unique per
+    # refund, so it is the correct identity here. Two distinct refunds never
+    # share one; the same refund must never be written twice whatever gateway
+    # label its row carries.
     for t in txns:
         if not isinstance(t, dict):
-            continue
-        if str(t.get("gateway") or "").lower() != gateway:
             continue
         if str(t.get("authorization") or "").strip() == refund_ref:
             return {
                 "ok": True,
                 "created": False,
                 "transaction_id": t.get("id"),
+                "transaction_gateway": t.get("gateway"),
                 "parent_transaction_id": parent_transaction_id,
             }
 

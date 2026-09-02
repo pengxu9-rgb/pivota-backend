@@ -178,3 +178,101 @@ async def test_refund_txn_soft_skips_when_parent_transaction_is_missing(monkeypa
     assert result["created"] is False
     assert result["soft_skipped"] is True
     assert result["reason"] == "missing_parent_transaction"
+
+
+@pytest.mark.asyncio
+async def test_refund_txn_is_idempotent_when_parent_gateway_differs_from_psp(monkeypatch):
+    """The retry-safety property the durable sync queue depends on.
+
+    The dedupe loop used to skip any transaction whose gateway differed from
+    `normalize_shopify_gateway(psp_used)`, while the create writes
+    `parent_gateway or gateway`. With a `manual` parent and psp_used="stripe"
+    the row this function created could never match its own dedupe filter, so
+    every call created another refund transaction for the same refund —
+    measured at 3 calls, 3 rows, all carrying the same authorization.
+    """
+    from services import shopify_transactions_service as svc
+
+    # A store whose transactions actually persist, so a second call can see
+    # what the first one wrote.
+    store = [
+        {"id": 777, "gateway": "manual", "kind": "sale", "status": "success",
+         "authorization": "pi_parent"},
+    ]
+    creates = []
+
+    async def fake_list(**_kwargs):
+        return list(store)
+
+    async def fake_create(**kwargs):
+        txn = dict(kwargs["transaction"])
+        creates.append(txn)
+        row = dict(txn)
+        row["id"] = 9000 + len(creates)
+        store.append(row)
+        return {"id": row["id"]}
+
+    monkeypatch.setattr(svc, "list_shopify_order_transactions", fake_list)
+    monkeypatch.setattr(svc, "create_shopify_order_transaction", fake_create)
+
+    async def call():
+        return await svc.ensure_external_refund_transaction_best_effort(
+            shop_domain="shop.myshopify.com",
+            access_token="token",
+            shopify_order_id="123",
+            psp_used="stripe",
+            external_refund_ref="re_IDEMPOTENT",
+            amount=12.0,
+            currency="USD",
+            parent_transaction_id=777,
+            pivota_order_id="ORD_RETRY",
+        )
+
+    first = await call()
+    second = await call()
+    third = await call()
+
+    assert first["created"] is True
+    # The row was written with the PARENT's gateway; dedupe must still find it.
+    assert creates[0]["gateway"] == "manual"
+    assert second["created"] is False
+    assert third["created"] is False
+    assert len(creates) == 1, f"refund written {len(creates)} times: {creates}"
+
+
+@pytest.mark.asyncio
+async def test_refund_txn_refuses_to_write_when_the_transaction_list_is_unreadable(monkeypatch):
+    """A failed read must not become a write.
+
+    The existing-transaction list is the only thing preventing a duplicate. With
+    an explicit parent_transaction_id, an empty list sails past the dedupe loop
+    and creates a second refund — so a list failure has to refuse, not proceed.
+    """
+    from services import shopify_transactions_service as svc
+
+    async def fake_list(**_kwargs):
+        raise RuntimeError("shopify 503")
+
+    async def fake_create(**_kwargs):
+        raise AssertionError(
+            "must not create a refund transaction while the existing list is unknown"
+        )
+
+    monkeypatch.setattr(svc, "list_shopify_order_transactions", fake_list)
+    monkeypatch.setattr(svc, "create_shopify_order_transaction", fake_create)
+
+    result = await svc.ensure_external_refund_transaction_best_effort(
+        shop_domain="shop.myshopify.com",
+        access_token="token",
+        shopify_order_id="123",
+        psp_used="stripe",
+        external_refund_ref="re_UNREADABLE",
+        amount=12.0,
+        currency="USD",
+        parent_transaction_id=777,
+        pivota_order_id="ORD_LIST_FAIL",
+    )
+
+    assert result["ok"] is False
+    assert result["retryable"] is True
+    assert result["reason"] == "transaction_list_unavailable"

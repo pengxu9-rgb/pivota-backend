@@ -48,9 +48,11 @@ DEFAULT_LEASE_SECONDS = 300
 # Keeps a flapping worker from stealing a lease its holder is about to renew.
 STALE_LEASE_GRACE_SECONDS = 30
 
-# 8 attempts on the backoff below spans roughly two hours, which covers a
-# Shopify incident without retrying a genuinely broken job forever.
-DEFAULT_MAX_ATTEMPTS = 8
+# 10 attempts on the backoff below spans ~2h
+# (30+60+120+240+480+960+1800*3 = 7290s), which covers a Shopify incident
+# without retrying a genuinely broken job forever. Counted, not estimated: 8
+# attempts is 3690s, barely an hour.
+DEFAULT_MAX_ATTEMPTS = 10
 
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_CAP_SECONDS = 1800
@@ -74,11 +76,17 @@ _DDL_STATEMENTS = [
       claimed_until     TIMESTAMPTZ,
       next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_error        TEXT,
+      progress          TEXT,
       created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at      TIMESTAMPTZ
     );
     """,
+    # CREATE TABLE IF NOT EXISTS cannot add a column to a table that already
+    # exists, so every column added after the first cut needs its own idempotent
+    # ALTER here — same pattern as db/merchant_audit_runs.py.
+    "ALTER TABLE merchant_order_sync_jobs "
+    "ADD COLUMN IF NOT EXISTS progress TEXT;",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_merchant_order_sync_jobs_dedupe "
     "ON merchant_order_sync_jobs (order_id, op, dedupe_key);",
     "CREATE INDEX IF NOT EXISTS idx_merchant_order_sync_jobs_claim "
@@ -137,11 +145,11 @@ async def enqueue_merchant_order_sync_job(
     so the loss is visible rather than silent, which is the property the
     `add_task` version never had.
     """
-    await ensure_merchant_order_sync_jobs_table()
     job_id = str(uuid.uuid4())
     now = _now_utc()
-    try:
-        row = await database.fetch_one(
+
+    async def _insert():
+        return await database.fetch_one(
             """
             INSERT INTO merchant_order_sync_jobs (
                 job_id, order_id, merchant_id, op, dedupe_key, payload,
@@ -166,6 +174,19 @@ async def enqueue_merchant_order_sync_job(
                 "now": now,
             },
         )
+
+    try:
+        # DDL is NOT run on this path by default. `ensure_*` takes a table lock
+        # before evaluating IF NOT EXISTS (db/_ddl_guard.py records a 665s lock
+        # wait from that pattern), and this call sits inside the refund request
+        # AFTER the PSP has moved funds. Postgres prod gets the table from
+        # migration 207; only a hermetic environment that has never seen it pays
+        # the ensure, and only once.
+        try:
+            row = await _insert()
+        except Exception:  # noqa: BLE001
+            await ensure_merchant_order_sync_jobs_table()
+            row = await _insert()
         if row is not None:
             return str(dict(row).get("job_id") or job_id)
         # ON CONFLICT DO NOTHING returned no row: the job is already queued.
@@ -224,7 +245,7 @@ async def claim_next_merchant_order_sync_job(
                   LIMIT 1
              )
             RETURNING job_id, order_id, merchant_id, op, dedupe_key, payload,
-                      attempts, max_attempts
+                      attempts, max_attempts, progress
             """,
             {"worker_id": str(worker_id), "lease_until": lease_until, "now": now},
         )
@@ -246,30 +267,91 @@ async def claim_next_merchant_order_sync_job(
             claimed.get("job_id"),
         )
         claimed["payload"] = {}
+    raw_progress = claimed.get("progress")
+    try:
+        claimed["progress"] = json.loads(raw_progress) if raw_progress else {}
+    except Exception:  # noqa: BLE001
+        claimed["progress"] = {}
+    claimed["worker_id"] = str(worker_id)
     return claimed
 
 
-async def complete_merchant_order_sync_job(*, job_id: str) -> None:
+async def record_merchant_order_sync_progress(
+    *, job_id: str, worker_id: str, progress: Dict[str, Any]
+) -> bool:
+    """Persist which steps of a multi-step job have already succeeded.
+
+    Lets a retry resume rather than re-running a side-effecting step that has
+    already landed. Fenced on the lease for the same reason complete/fail are.
+    """
+    try:
+        row = await database.fetch_one(
+            """
+            UPDATE merchant_order_sync_jobs
+               SET progress = :progress, updated_at = :now
+             WHERE job_id = :job_id AND claimed_by_worker = :worker_id
+            RETURNING job_id
+            """,
+            {
+                "job_id": str(job_id),
+                "worker_id": str(worker_id),
+                "progress": json.dumps(progress, default=str),
+                "now": _now_utc(),
+            },
+        )
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "merchant_order_sync: progress write failed for %s: %s",
+            job_id,
+            str(exc)[:200],
+        )
+        return False
+
+
+async def complete_merchant_order_sync_job(*, job_id: str, worker_id: str) -> bool:
+    """Mark done, but ONLY while this worker still holds the lease.
+
+    Without the `claimed_by_worker` fence a slow worker whose lease expired —
+    and whose job a sibling has legitimately re-claimed — would clear the new
+    holder's lease on its way out, letting a third claim run the job
+    concurrently. Reachable in one process: scheduler_job_runner abandons a
+    run that overshoots its deadline as a live zombie, so the zombie tick and
+    the next tick race on the same rows.
+
+    Returns True iff this call actually wrote.
+    """
     now = _now_utc()
     try:
-        await database.execute(
+        row = await database.fetch_one(
             """
             UPDATE merchant_order_sync_jobs
                SET status = 'done', completed_at = :now, updated_at = :now,
                    claimed_by_worker = NULL, claimed_until = NULL, last_error = NULL
-             WHERE job_id = :job_id
+             WHERE job_id = :job_id AND claimed_by_worker = :worker_id
+            RETURNING job_id
             """,
-            {"job_id": str(job_id), "now": now},
+            {"job_id": str(job_id), "worker_id": str(worker_id), "now": now},
         )
+        if row is None:
+            logger.warning(
+                "merchant_order_sync: lost the lease on %s before completing it; "
+                "another worker owns it now",
+                job_id,
+            )
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "merchant_order_sync: complete failed for %s: %s", job_id, str(exc)[:200]
         )
+        return False
 
 
 async def fail_merchant_order_sync_job(
     *,
     job_id: str,
+    worker_id: str,
     attempts: int,
     max_attempts: int,
     error: str,
@@ -286,22 +368,33 @@ async def fail_merchant_order_sync_job(
         seconds=_backoff_seconds(attempts)
     )
     try:
-        await database.execute(
+        # Lease-fenced for the same reason as complete(): a late write from a
+        # worker whose lease expired must not disturb the current holder.
+        row = await database.fetch_one(
             """
             UPDATE merchant_order_sync_jobs
                SET status = :status, last_error = :error, updated_at = :now,
                    next_attempt_at = :next_attempt_at,
                    claimed_by_worker = NULL, claimed_until = NULL
-             WHERE job_id = :job_id
+             WHERE job_id = :job_id AND claimed_by_worker = :worker_id
+            RETURNING job_id
             """,
             {
                 "job_id": str(job_id),
+                "worker_id": str(worker_id),
                 "status": status,
                 "error": str(error or "")[:1000],
                 "now": now,
                 "next_attempt_at": next_attempt_at,
             },
         )
+        if row is None:
+            logger.warning(
+                "merchant_order_sync: lost the lease on %s before recording a "
+                "failure; another worker owns it now",
+                job_id,
+            )
+            return "lease_lost"
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "merchant_order_sync: fail-update failed for %s: %s", job_id, str(exc)[:200]

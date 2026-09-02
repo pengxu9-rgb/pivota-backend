@@ -35,10 +35,19 @@ CREATE TABLE IF NOT EXISTS merchant_order_sync_jobs (
   claimed_until     TIMESTAMPTZ,
   next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_error        TEXT,
+  -- Which steps of a multi-step job already landed, so a retry resumes instead
+  -- of re-running a side-effecting call that has already succeeded.
+  progress          TEXT,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   completed_at      TIMESTAMPTZ
 );
+
+-- Idempotent for anyone who applied an earlier copy of this file: CREATE TABLE
+-- IF NOT EXISTS is a no-op on an existing table, so a later column needs its own
+-- ALTER.
+ALTER TABLE merchant_order_sync_jobs
+  ADD COLUMN IF NOT EXISTS progress TEXT;
 
 -- Enqueue is idempotent: a retried refund request must not queue the work twice.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_merchant_order_sync_jobs_dedupe

@@ -15,13 +15,14 @@ from __future__ import annotations
 import os
 import socket
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from db.merchant_order_sync_jobs import (
     OP_REFUND_SYNC,
     claim_next_merchant_order_sync_job,
     complete_merchant_order_sync_job,
     fail_merchant_order_sync_job,
+    record_merchant_order_sync_progress,
     release_stale_merchant_order_sync_leases,
 )
 from utils.logger import logger
@@ -38,40 +39,91 @@ class _RetryableSyncError(Exception):
     """Raised when the job should be re-queued rather than treated as done."""
 
 
-async def _run_refund_sync_job(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Mirror of the former `update_shopify_order_task` closure in refund_api.
+# Progress keys recorded on the job row, so a retry resumes rather than
+# re-running a side-effecting call that already landed.
+_STEP_TRANSACTION = "refund_transaction_synced"
+_STEP_CANCEL = "order_cancelled"
 
-    Behaviour is deliberately identical to the background-task version, including
-    resolving the store with `get_primary_store`. NOTE: `get_store_by_id`'s own
-    docstring says downstream jobs should prefer the order's bound `store_id` to
-    avoid cross-store token/domain mismatches on multi-store merchants; the
-    refund path has never done that. Left as-is here so this change delivers
-    exactly one behavioural difference — durability — and the store-resolution
-    question can be decided on its own.
+
+def _is_already_cancelled(body: str) -> bool:
+    """Shopify reports an already-cancelled order as a 422 with a message, not a
+    distinct status. Mirrors the house pattern in
+    `shopify_transactions_service._is_non_fatal_invalid_sale_error`: read the
+    body before deciding a 422 is benign, because 422 on this endpoint also
+    covers conditions a retry genuinely should not paper over.
+    """
+    text = (body or "").lower()
+    return "cancel" in text and ("already" in text or "has been" in text)
+
+
+async def _resolve_store_for_refund(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the store this order is actually bound to.
+
+    `get_store_by_id`'s own docstring: "Orders are bound to a store_id at
+    checkout time. Downstream jobs (Shopify sync, invites, etc.) should prefer
+    that store_id over 'primary store' to avoid cross-store token/domain
+    mismatches when a merchant connects multiple stores." The former background
+    task used `get_primary_store` unconditionally, so on a multi-store merchant
+    it cancelled against the wrong shop — which returns 404 and, before this,
+    was recorded as a successful job.
+
+    Never falls back to the primary store when a bound store_id exists and
+    cannot be resolved: cancelling on the wrong shop is worse than not
+    cancelling, and `routes/order_routes.sync_order_to_connected_store` takes
+    the same stance.
+    """
+    from services.merchant_store_service import get_primary_store, get_store_by_id
+
+    merchant_id = str(payload.get("merchant_id") or "")
+    bound_store_id = str(payload.get("store_id") or "").strip() or None
+
+    if bound_store_id:
+        store = await get_store_by_id(bound_store_id, merchant_id=merchant_id)
+        if not store:
+            raise _RetryableSyncError(
+                f"bound store {bound_store_id} is missing or inactive; refusing "
+                "to fall back to the primary store"
+            )
+        return store
+
+    store = await get_primary_store(merchant_id)
+    if not store:
+        raise _RetryableSyncError("no primary store is readable for this merchant")
+    return store
+
+
+async def _run_refund_sync_job(
+    payload: Dict[str, Any],
+    progress: Optional[Dict[str, Any]] = None,
+    on_progress=None,
+) -> Dict[str, Any]:
+    """Sync a completed refund to the merchant's store.
+
+    Replaces the former `update_shopify_order_task` closure in refund_api. Two
+    side-effecting steps, each recorded on the job so a retry of one does not
+    re-run the other.
     """
     import httpx
 
-    from services.merchant_store_service import get_primary_store
     from services.shopify_access_token_service import resolve_shopify_admin_access_token
     from services.shopify_transactions_service import (
         ensure_external_refund_transaction_best_effort,
     )
 
+    progress = dict(progress or {})
     order_id = str(payload.get("order_id") or "")
     shopify_order_id = str(payload.get("shopify_order_id") or "").strip()
     merchant_id = str(payload.get("merchant_id") or "")
 
     if not (shopify_order_id and merchant_id):
-        # The enqueue guard should prevent this; nothing to do and retrying
-        # cannot change it.
+        # The enqueue guard prevents this; retrying cannot change it.
         return {"skipped": "no_shopify_order_or_merchant"}
 
-    store_info = await get_primary_store(merchant_id)
-    if not (store_info and store_info.get("platform") == "shopify"):
-        # A store that is momentarily unreadable and a merchant who genuinely has
-        # no Shopify store are indistinguishable here. Retry: the backoff is
-        # bounded and a terminal failure is visible, which is the safer error.
-        raise _RetryableSyncError("primary store is not a readable shopify store")
+    store_info = await _resolve_store_for_refund(payload)
+    if str(store_info.get("platform") or "").lower() != "shopify":
+        raise _RetryableSyncError(
+            f"bound store is platform={store_info.get('platform')!r}, not shopify"
+        )
 
     shop_domain = store_info.get("domain")
     access_token, _ = await resolve_shopify_admin_access_token(
@@ -83,65 +135,109 @@ async def _run_refund_sync_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise _RetryableSyncError("could not resolve shopify admin credentials")
 
     result: Dict[str, Any] = {}
-    result["transaction_sync"] = await ensure_external_refund_transaction_best_effort(
-        shop_domain=shop_domain,
-        access_token=access_token,
-        shopify_order_id=shopify_order_id,
-        psp_used=payload.get("psp_used"),
-        external_refund_ref=payload.get("refund_id"),
-        amount=float(payload.get("amount") or 0),
-        currency=str(payload.get("currency") or "USD"),
-        pivota_order_id=order_id,
-    )
+
+    if progress.get(_STEP_TRANSACTION):
+        result["transaction_sync"] = {"skipped": "already_recorded_on_a_prior_attempt"}
+    else:
+        sync = await ensure_external_refund_transaction_best_effort(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            shopify_order_id=shopify_order_id,
+            psp_used=payload.get("psp_used"),
+            # NOT coerced with str(): a null PSP reference must stay None so the
+            # writer short-circuits to "missing_gateway_or_refund_ref" instead of
+            # recording a transaction whose authorization is the string "None".
+            external_refund_ref=payload.get("refund_id"),
+            amount=float(payload.get("amount") or 0),
+            currency=str(payload.get("currency") or "USD"),
+            pivota_order_id=order_id,
+        )
+        result["transaction_sync"] = sync
+        if isinstance(sync, dict) and sync.get("retryable"):
+            # e.g. the existing-transaction list was unreadable, so the writer
+            # refused rather than risk a duplicate refund row.
+            raise _RetryableSyncError(
+                f"refund transaction sync deferred: {sync.get('reason')}"
+            )
+        progress[_STEP_TRANSACTION] = True
+        if on_progress is not None:
+            await on_progress(progress)
 
     # Full refund only: cancel the Shopify order for merchant ops visibility. Do
     # NOT ask Shopify to process refunds — the external PSP already moved funds.
-    if not bool(payload.get("is_partial")):
-        url = (
-            f"https://{shop_domain}/admin/api/{_SHOPIFY_API_VERSION}"
-            f"/orders/{shopify_order_id}/cancel.json"
-        )
-        # Built by routes/refund_api.py via
-        # `_shopify_external_refund_cancel_payload`, so the Shopify cancel
-        # contract has exactly one owner and cannot drift between the enqueue
-        # site and this worker.
-        cancel_data = payload.get("cancel_payload")
-        if not isinstance(cancel_data, dict) or not cancel_data:
-            # A job with no cancel payload can never succeed; retrying it eight
-            # times would only delay the terminal failure.
-            return {"skipped": "missing_cancel_payload"}
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                json=cancel_data,
-                headers={
-                    "X-Shopify-Access-Token": access_token,
-                    "Content-Type": "application/json",
-                },
-                timeout=10.0,
-            )
-        if response.status_code == 200:
-            result["cancelled"] = True
-        elif response.status_code in (422, 404):
-            # Already cancelled, or the order is not cancellable. Retrying cannot
-            # change either, and both mean there is no outstanding merchant work.
-            result["cancelled"] = False
-            result["cancel_terminal"] = response.status_code
-        else:
-            raise _RetryableSyncError(
-                f"shopify cancel returned {response.status_code}: "
-                f"{(response.text or '')[:200]}"
-            )
+    if bool(payload.get("is_partial")) or progress.get(_STEP_CANCEL):
+        return result
 
-    return result
+    cancel_data = payload.get("cancel_payload")
+    if not isinstance(cancel_data, dict) or not cancel_data:
+        # Built by refund_api so the Shopify cancel contract has one owner. A job
+        # without it can never succeed; retrying only delays the terminal state.
+        return {**result, "skipped": "missing_cancel_payload"}
+
+    url = (
+        f"https://{shop_domain}/admin/api/{_SHOPIFY_API_VERSION}"
+        f"/orders/{shopify_order_id}/cancel.json"
+    )
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            url,
+            json=cancel_data,
+            headers={
+                "X-Shopify-Access-Token": access_token,
+                "Content-Type": "application/json",
+            },
+            timeout=10.0,
+        )
+
+    body = (response.text or "")[:500]
+    if response.status_code == 200:
+        result["cancelled"] = True
+        progress[_STEP_CANCEL] = True
+        if on_progress is not None:
+            await on_progress(progress)
+        return result
+
+    # The former closure logged a WARNING with the body for EVERY non-200.
+    # Keep that: this is the failure class the queue exists to surface.
+    logger.warning(
+        "merchant_order_sync: shopify cancel returned %s for order=%s shop=%s body=%s",
+        response.status_code,
+        order_id,
+        shop_domain,
+        body,
+    )
+
+    if response.status_code == 422 and _is_already_cancelled(body):
+        # Genuinely nothing left to do; the merchant already has the state.
+        result["cancelled"] = False
+        result["cancel_terminal"] = "already_cancelled"
+        progress[_STEP_CANCEL] = True
+        if on_progress is not None:
+            await on_progress(progress)
+        return result
+
+    # Everything else retries, INCLUDING 404. A 404 here means this order is not
+    # on the shop we just authenticated against — a credential or store-binding
+    # problem, not proof the work is done. Treating it as success is how a
+    # refunded-but-untouched merchant order acquires a positive success record.
+    raise _RetryableSyncError(
+        f"shopify cancel returned {response.status_code}: {body}"
+    )
 
 
 _HANDLERS = {OP_REFUND_SYNC: _run_refund_sync_job}
 
 
 async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
-    """Claim and process up to MAX_JOBS_PER_TICK jobs. Never raises."""
-    summary = {"claimed": 0, "done": 0, "requeued": 0, "failed": 0}
+    """Claim and process up to MAX_JOBS_PER_TICK jobs.
+
+    Swallows every `Exception`. Does NOT swallow `BaseException` — in 3.11 a
+    `CancelledError` from scheduler_job_runner's run deadline is a
+    BaseException, so a cut tick escapes here and leaves its job leased, to be
+    re-claimed once the lease expires. That is the behaviour we want; noting it
+    because "never raises" would be wrong.
+    """
+    summary = {"claimed": 0, "done": 0, "requeued": 0, "failed": 0, "lease_lost": 0}
     for _ in range(MAX_JOBS_PER_TICK):
         try:
             job = await claim_next_merchant_order_sync_job(worker_id=WORKER_ID)
@@ -154,39 +250,69 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
         summary["claimed"] += 1
         job_id = str(job.get("job_id"))
         op = str(job.get("op") or "")
+        attempts = int(job.get("attempts") or 0)
+        max_attempts = int(job.get("max_attempts") or 0)
         handler = _HANDLERS.get(op)
 
         if handler is None:
-            # An op this build does not know about. Do not burn attempts on it.
-            logger.error("merchant_order_sync: no handler for op=%s job=%s", op, job_id)
-            await fail_merchant_order_sync_job(
-                job_id=job_id,
-                attempts=int(job.get("max_attempts") or 0),
-                max_attempts=int(job.get("max_attempts") or 0),
-                error=f"no handler for op {op}",
-            )
-            summary["failed"] += 1
-            continue
-
-        try:
-            result = await handler(job.get("payload") or {})
-            await complete_merchant_order_sync_job(job_id=job_id)
-            summary["done"] += 1
-            logger.info(
-                "merchant_order_sync: %s done job=%s order=%s result=%s",
+            # An op this build does not know about. REQUEUE rather than give up:
+            # during a rolling deploy an old revision can claim a job enqueued by
+            # a new one, and failing it terminally would destroy work the next
+            # revision could have done. The attempt budget still bounds it.
+            logger.warning(
+                "merchant_order_sync: no handler for op=%s job=%s on this build; "
+                "requeuing for a revision that has one",
                 op,
                 job_id,
-                job.get("order_id"),
-                result,
             )
+            status = await fail_merchant_order_sync_job(
+                job_id=job_id,
+                worker_id=WORKER_ID,
+                attempts=attempts,
+                max_attempts=max_attempts,
+                error=f"no handler for op {op} on this build",
+            )
+            summary["failed" if status == "failed" else "requeued"] += 1
+            continue
+
+        async def _on_progress(progress, _job_id=job_id):
+            await record_merchant_order_sync_progress(
+                job_id=_job_id, worker_id=WORKER_ID, progress=progress
+            )
+
+        try:
+            result = await handler(
+                job.get("payload") or {},
+                job.get("progress") or {},
+                _on_progress,
+            )
+            wrote = await complete_merchant_order_sync_job(
+                job_id=job_id, worker_id=WORKER_ID
+            )
+            if wrote:
+                summary["done"] += 1
+                logger.info(
+                    "merchant_order_sync: %s done job=%s order=%s result=%s",
+                    op,
+                    job_id,
+                    job.get("order_id"),
+                    result,
+                )
+            else:
+                # Our lease expired and a sibling owns the job now. The work
+                # itself was idempotent, so the sibling redoing it is safe.
+                summary["lease_lost"] += 1
         except Exception as exc:  # noqa: BLE001
             status = await fail_merchant_order_sync_job(
                 job_id=job_id,
-                attempts=int(job.get("attempts") or 0),
-                max_attempts=int(job.get("max_attempts") or 0),
+                worker_id=WORKER_ID,
+                attempts=attempts,
+                max_attempts=max_attempts,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            if status == "failed":
+            if status == "lease_lost":
+                summary["lease_lost"] += 1
+            elif status == "failed":
                 summary["failed"] += 1
                 # Terminal on this queue means the buyer was refunded and the
                 # merchant's store was never told. That is an incident.
@@ -196,7 +322,7 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                     op,
                     job_id,
                     job.get("order_id"),
-                    job.get("attempts"),
+                    attempts,
                     str(exc)[:300],
                 )
             else:
@@ -205,7 +331,7 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                     "merchant_order_sync: %s job=%s attempt %s failed, requeued: %s",
                     op,
                     job_id,
-                    job.get("attempts"),
+                    attempts,
                     str(exc)[:300],
                 )
 

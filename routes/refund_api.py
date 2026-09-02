@@ -7,6 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import uuid
 from decimal import Decimal
 from datetime import datetime
 
@@ -477,13 +478,30 @@ async def process_refund(
                 op=OP_REFUND_SYNC,
                 # One job per PSP refund: a retried refund request that reuses
                 # the same refund_id must not queue the work twice.
-                dedupe_key=str(refund_id),
+                # `refund_id` can legitimately be empty when an adapter reports
+                # success without a reference. Coercing it with str() would key
+                # every such refund on the literal "None", so a second one would
+                # collide on the unique index, ON CONFLICT would return the FIRST
+                # job's id, and its sync would be silently dropped.
+                dedupe_key=(
+                    str(refund_id).strip()
+                    or str(refund_request.idempotency_key or "").strip()
+                    or f"noref-{uuid.uuid4()}"
+                ),
                 payload={
                     "order_id": str(order_id),
                     "merchant_id": str(order.get("merchant_id") or ""),
                     "shopify_order_id": str(order.get("shopify_order_id") or ""),
+                    # The store the order was BOUND to at checkout. The worker
+                    # prefers it over the primary store, per get_store_by_id's
+                    # own guidance, so a multi-store merchant is not cancelled
+                    # against the wrong shop.
+                    "store_id": str(order.get("store_id") or "").strip() or None,
                     "psp_used": order.get("psp_used") or psp_type,
-                    "refund_id": str(refund_id),
+                    # Raw, NOT str(): a null reference must stay null so the
+                    # transaction writer short-circuits instead of recording an
+                    # authorization of "None".
+                    "refund_id": refund_id,
                     "amount": float(refund_amount),
                     "currency": str(order.get("currency") or "USD"),
                     "is_partial": bool(is_partial),

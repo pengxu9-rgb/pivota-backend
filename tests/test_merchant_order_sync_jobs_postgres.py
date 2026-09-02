@@ -131,7 +131,8 @@ async def test_failed_job_is_requeued_with_backoff_then_given_up_on():
     job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
 
     status = await fail_merchant_order_sync_job(
-        job_id=job["job_id"], attempts=1, max_attempts=3, error="shopify 503"
+        job_id=job["job_id"], worker_id=job["worker_id"], attempts=1,
+        max_attempts=3, error="shopify 503",
     )
     assert status == "pending"
 
@@ -139,8 +140,19 @@ async def test_failed_job_is_requeued_with_backoff_then_given_up_on():
     # would spin the worker against a failing upstream.
     assert await claim_next_merchant_order_sync_job(worker_id="worker-a") is None
 
+    # Re-claim to hold the lease again: fail() is lease-fenced, and the call
+    # above released it. Clear the backoff first — the assertion above proved it
+    # is holding the job back.
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs SET next_attempt_at = NOW() "
+        "WHERE job_id = :j",
+        {"j": job["job_id"]},
+    )
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    assert job is not None
     status = await fail_merchant_order_sync_job(
-        job_id=job["job_id"], attempts=3, max_attempts=3, error="shopify 503"
+        job_id=job["job_id"], worker_id=job["worker_id"], attempts=3,
+        max_attempts=3, error="shopify 503",
     )
     assert status == "failed"
 
@@ -190,6 +202,101 @@ async def test_completed_job_is_not_reclaimed():
     order_id = _order_id()
     await _enqueue(order_id)
     job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
-    await complete_merchant_order_sync_job(job_id=job["job_id"])
+    await complete_merchant_order_sync_job(
+        job_id=job["job_id"], worker_id=job["worker_id"]
+    )
 
     assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None
+
+
+async def test_a_late_write_from_an_expired_lease_cannot_disturb_the_new_holder():
+    """Fencing. Worker A is slow, not dead; its lease expires, B legitimately
+    re-claims, then A finishes and reports. A's write must not land — otherwise
+    it clears B's lease and a third claim runs the job concurrently."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+        fail_merchant_order_sync_job,
+    )
+
+    order_id = _order_id()
+    await _enqueue(order_id)
+    a = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs "
+        "SET claimed_until = NOW() - INTERVAL '1 minute' WHERE job_id = :j",
+        {"j": a["job_id"]},
+    )
+    b = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert b is not None and b["job_id"] == a["job_id"]
+
+    # A's late completion, using A's now-stale worker id.
+    wrote = await complete_merchant_order_sync_job(
+        job_id=a["job_id"], worker_id="worker-a"
+    )
+    assert wrote is False
+
+    status = await fail_merchant_order_sync_job(
+        job_id=a["job_id"], worker_id="worker-a", attempts=1, max_attempts=5,
+        error="late failure from a lease A no longer holds",
+    )
+    assert status == "lease_lost"
+
+    row = dict(await database.fetch_one(
+        "SELECT status, claimed_by_worker FROM merchant_order_sync_jobs "
+        "WHERE job_id = :j",
+        {"j": a["job_id"]},
+    ))
+    assert row["status"] == "running"
+    assert row["claimed_by_worker"] == "worker-b"
+
+
+async def test_progress_survives_a_requeue_so_a_retry_can_resume():
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        fail_merchant_order_sync_job,
+        record_merchant_order_sync_progress,
+    )
+
+    order_id = _order_id()
+    await _enqueue(order_id)
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+
+    assert await record_merchant_order_sync_progress(
+        job_id=job["job_id"], worker_id="worker-a",
+        progress={"refund_transaction_synced": True},
+    ) is True
+
+    await fail_merchant_order_sync_job(
+        job_id=job["job_id"], worker_id="worker-a", attempts=1, max_attempts=5,
+        error="shopify 503 on cancel",
+    )
+
+    from db.database import database
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs SET next_attempt_at = NOW() "
+        "WHERE job_id = :j",
+        {"j": job["job_id"]},
+    )
+    again = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+
+    assert again is not None
+    # Without this the retry re-posts a refund transaction that already landed.
+    assert again["progress"] == {"refund_transaction_synced": True}
+
+
+async def test_progress_is_lease_fenced():
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        record_merchant_order_sync_progress,
+    )
+
+    order_id = _order_id()
+    await _enqueue(order_id)
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+
+    assert await record_merchant_order_sync_progress(
+        job_id=job["job_id"], worker_id="someone-else", progress={"x": True},
+    ) is False
