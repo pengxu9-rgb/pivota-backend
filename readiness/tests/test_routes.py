@@ -3137,3 +3137,245 @@ def test_order_sync_replay_reconciles_cancelled_order_state(monkeypatch):
     assert sync_2_json["replayed"] is True
     event_types = [event["event_type"] for event in sync_2_json["events"]]
     assert "merchant_cancellation_observed" in event_types
+
+
+def test_refund_defers_an_unwritable_transaction_mirror_to_the_durable_queue(monkeypatch):
+    """This surface answers 200 with the refusal embedded and has no retrier of
+    its own, so `ensure_external_refund_transaction_best_effort` refusing to
+    write (it cannot read the existing list, so it cannot rule out a duplicate)
+    would otherwise mean the refund is never mirrored to the merchant at all."""
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+    import db.merchant_order_sync_jobs as sync_jobs
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_DEFER",
+        "shopify_order_id": None,
+        "status": "paid",
+        "payment_status": "paid",
+        "payment_intent_id": "pi_alpha_refund_defer",
+        "client_secret": "cs_alpha_refund_defer",
+        "psp_used": "stripe",
+        "store_id": "st_alpha",
+        "metadata": {"shopify_parent_transaction_id": 1444},
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+    enqueued = []
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_DEFER"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777555",
+            "shopify_order_name": "#1775",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777555",
+        }
+
+    async def fake_create_refund(*, order_id: str, amount: float, reason: str,
+                                 source: str, created_by: str, idempotency_key=None):
+        order_state["status"] = "refunded"
+        order_state["payment_status"] = "refunded"
+        order_state["total_refunded"] = 29.0
+        return {
+            "status": "success",
+            "refund_id": "REF_ALPHA_DEFER",
+            "psp_refund_id": "re_alpha_defer",
+        }
+
+    async def refuses_to_write(**_kwargs):
+        # Shopify 429 on GET /transactions.json: the list is unreadable, so the
+        # writer cannot rule out a duplicate and declines.
+        return {"ok": False, "skipped": True, "retryable": True,
+                "reason": "transaction_list_unavailable"}
+
+    async def fake_enqueue(**kwargs):
+        enqueued.append(kwargs)
+        return "job-deferred-1"
+
+    async def fake_log_order_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service.refund_service, "create_refund", fake_create_refund)
+    monkeypatch.setattr(readiness_service, "ensure_external_refund_transaction_best_effort", refuses_to_write)
+    monkeypatch.setattr(sync_jobs, "enqueue_merchant_order_sync_job", fake_enqueue)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-defer",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={"reason": "operator_canary_refund"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # `.get()` deliberately: if the deferral stops happening these must fail on
+    # the assertion below, not on a KeyError before it is reached.
+    assert len(enqueued) == 1, "the unwritable mirror was not handed to the queue"
+    assert body["transaction_sync"].get("deferred_to_queue") is True
+    assert body["transaction_sync"].get("deferred_job_id") == "job-deferred-1"
+
+    job = enqueued[0]
+    assert job["op"] == sync_jobs.OP_REFUND_SYNC
+    # Namespaced so this producer can never collide with refund_api's key for
+    # the same refund — that surface does NOT set skip_cancel, and whichever
+    # lost ON CONFLICT would have its payload silently discarded.
+    assert job["dedupe_key"] == "txn:re_alpha_defer"
+    # Carried, or the writer's fallback rejects an authorization-kind parent and
+    # the job soft-skips to `done` having written nothing.
+    assert job["payload"]["parent_transaction_id"] == 1444
+    # This surface mirrors the transaction only; cancelling the merchant order
+    # is the refund_api flow's business.
+    assert job["payload"]["skip_cancel"] is True
+    assert job["payload"]["shopify_order_id"] == "9001777555"
+    assert job["payload"]["store_id"] == "st_alpha"
+
+
+def test_refund_reports_a_failed_deferral_instead_of_claiming_it_queued(monkeypatch):
+    """`enqueue_merchant_order_sync_job` returns None on a persistence failure
+    and never raises. Claiming `deferred_to_queue: True` there puts "deferred"
+    in a durable order event for work that was lost."""
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+    import db.merchant_order_sync_jobs as sync_jobs
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_LOST",
+        "shopify_order_id": None,
+        "status": "paid",
+        "payment_status": "paid",
+        "payment_intent_id": "pi_alpha_refund_lost",
+        "client_secret": "cs_alpha_refund_lost",
+        # Empty on purpose: the payload must fall back to payment_psp_used, or
+        # the writer short-circuits and the job completes having written nothing.
+        "psp_used": "",
+        "metadata": {"shopify_parent_transaction_id": 1444},
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+    enqueued = []
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_LOST"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777666",
+            "shopify_order_name": "#1776",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777666",
+        }
+
+    async def fake_create_refund(*, order_id: str, amount: float, reason: str,
+                                 source: str, created_by: str, idempotency_key=None):
+        order_state["status"] = "refunded"
+        order_state["payment_status"] = "refunded"
+        order_state["total_refunded"] = 29.0
+        return {"status": "success", "refund_id": "REF_LOST",
+                "psp_refund_id": "re_alpha_lost"}
+
+    async def refuses_to_write(**_kwargs):
+        return {"ok": False, "skipped": True, "retryable": True,
+                "reason": "transaction_list_unavailable"}
+
+    async def enqueue_fails(**kwargs):
+        enqueued.append(kwargs)
+        return None
+
+    async def fake_log_order_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service.refund_service, "create_refund", fake_create_refund)
+    monkeypatch.setattr(readiness_service, "ensure_external_refund_transaction_best_effort", refuses_to_write)
+    monkeypatch.setattr(sync_jobs, "enqueue_merchant_order_sync_job", enqueue_fails)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-lost",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+    client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={"reason": "operator_canary_refund"},
+    )
+
+    assert response.status_code == 200
+    sync = response.json()["transaction_sync"]
+    assert sync.get("deferred_to_queue") is False
+    assert sync.get("deferred_enqueue_failed") is True
+
+    assert len(enqueued) == 1
+    # NOTE: the `payment_psp_used` fallback on the same payload line is NOT
+    # covered here — this checkout path never populates that key, so the
+    # fallback cannot be reached from this harness. Named rather than asserted,
+    # because a test that pins the first disjunct would look like coverage of
+    # the second.
+    assert enqueued[0]["payload"]["psp_used"] is None

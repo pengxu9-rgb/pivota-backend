@@ -157,6 +157,11 @@ _JOB_RUN_DEADLINES = {
     # money path: 50 orders x (PSP verify + finalize + Shopify order); 2 ticks'
     # worth so a slow PSP is not cut off, but a wedge is bounded at 10 min.
     "payment_reconcile_tick": 600,
+    # money path: 20 jobs x (store read + token resolve + 2 Shopify calls at a
+    # 10s timeout). Comfortably over the worst realistic tick, under the 300s
+    # job lease so a cut run's lease expires and a sibling re-claims it.
+    "merchant_order_sync_worker_tick": 240,
+    "merchant_order_sync_lease_reaper": 120,
 }
 
 
@@ -1001,6 +1006,39 @@ async def start_scheduler() -> None:
             misfire_grace_time=120,
         )
 
+        # Durable merchant-order sync queue (migration 207). Replaces
+        # `background_tasks.add_task` on the refund path, where a dropped task
+        # left no state any reconciler could find. 30s keeps merchant-visible
+        # refund state close to real time; the claim is SKIP LOCKED so a second
+        # drainer would be safe, and `_add_job` already restricts this to the
+        # production worker. NOT flag-gated: unlike the reconcile sweep this
+        # only acts on rows a request explicitly enqueued, so a staging service
+        # sharing the prod DB cannot invent work — and gating it would recreate
+        # the silent-loss failure it exists to remove.
+        from services.merchant_order_sync_drain import (
+            run_merchant_order_sync_lease_reaper_tick,
+            run_merchant_order_sync_worker_tick,
+        )
+        _add_job(
+            run_merchant_order_sync_worker_tick,
+            "interval",
+            seconds=30,
+            id="merchant_order_sync_worker_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=60,
+        )
+        _add_job(
+            run_merchant_order_sync_lease_reaper_tick,
+            "interval",
+            seconds=60,
+            id="merchant_order_sync_lease_reaper",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
         # ADR-010 D-2 Phase B: weekly catalog identity-reconcile sweep —
         # classify -> propose -> auto-apply ONLY the mechanical allowlist
         # (same_url_dup, junk_url) -> review batches for the rest -> alert
@@ -1086,6 +1124,8 @@ async def start_scheduler() -> None:
             "+ agent_pdp_view_reconcile (cron */6h :43, ACTIVE) "
             "+ cafe24_reconciliation (15min, flag-gated CAFE24_RECONCILIATION_ENABLED) "
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
+            "+ merchant_order_sync_worker_tick (30s, ACTIVE) "
+            "+ merchant_order_sync_lease_reaper (60s, ACTIVE) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
         )
     except Exception as exc:  # noqa: BLE001

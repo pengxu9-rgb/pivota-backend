@@ -477,7 +477,30 @@ async def ensure_external_refund_transaction_best_effort(
     gateway = normalize_shopify_gateway(psp_used)
     refund_ref = str(external_refund_ref or "").strip() or None
     if not gateway or not refund_ref:
-        return {"ok": False, "skipped": True, "reason": "missing_gateway_or_refund_ref"}
+        # No reference to key a refund transaction on, and no retry can produce
+        # one. But returning here without touching Shopify is the one outcome
+        # that leaves NOTHING for the merchant to reconcile — every sibling
+        # non-write path at least annotates the order. Do the same, so the
+        # refund is visible even though it cannot be recorded as a transaction.
+        annotation = await annotate_shopify_order_best_effort(
+            shop_domain=shop_domain,
+            access_token=access_token,
+            shopify_order_id=shopify_order_id,
+            api_version=api_version,
+            note_attributes={
+                "pivota_order_id": str(pivota_order_id or ""),
+                "pivota_psp": str(gateway or psp_used or ""),
+                "pivota_refund_amount": str(amount),
+                "pivota_refund_currency": str(currency or ""),
+            },
+            tags=["pivota-external-psp-refund", "pivota-missing-refund-reference"],
+        )
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "missing_gateway_or_refund_ref",
+            "annotation": annotation,
+        }
 
     txns: List[Dict[str, Any]] = []
     try:
@@ -494,17 +517,54 @@ async def ensure_external_refund_transaction_best_effort(
             shopify_order_id,
             str(e),
         )
+        # The existing-transaction list is the ONLY thing preventing a duplicate
+        # refund row. Failing to read it is "cannot verify", not "nothing is
+        # there" — and with an explicit `parent_transaction_id` the code below
+        # would otherwise sail past the dedupe loop on an empty list and create
+        # a second refund. Refuse instead; the caller retries.
+        return {
+            "ok": False,
+            "skipped": True,
+            "retryable": True,
+            "reason": "transaction_list_unavailable",
+        }
 
+    # Dedupe on the refund reference ALONE — deliberately NOT on gateway.
+    #
+    # This loop used to skip any transaction whose gateway differed from
+    # `normalize_shopify_gateway(psp_used)`, while the create below writes
+    # `parent_gateway or gateway`. Whenever the parent sale's gateway differs
+    # from psp_used — a `manual` parent (which this module itself creates when
+    # Shopify 422s "sale is not a valid transaction"), `shopify_payments`, COD —
+    # the row this function created could never match its own dedupe filter, so
+    # every call created another refund transaction for the same refund.
+    # Measured: 3 calls, 3 identical refund rows.
+    #
+    # `authorization` holds the external PSP's refund id, which is unique per
+    # refund, so it is the correct identity here. Two distinct refunds never
+    # share one; the same refund must never be written twice whatever gateway
+    # label its row carries.
     for t in txns:
         if not isinstance(t, dict):
             continue
-        if str(t.get("gateway") or "").lower() != gateway:
+        # Only a refund row can be the refund we are about to write. The gateway
+        # conjunct removed above was incidentally providing this narrowing; keep
+        # it explicitly so an unrelated transaction that happens to carry the
+        # same authorization cannot read as "already refunded".
+        if str(t.get("kind") or "").strip().lower() != "refund":
+            continue
+        # A FAILED refund row carrying our reference is not a refund. Without
+        # this it read as "already refunded", nothing was written, and the job
+        # completed. The sibling payment path guards the same way.
+        t_status = str(t.get("status") or "").strip().lower()
+        if t_status and t_status != "success":
             continue
         if str(t.get("authorization") or "").strip() == refund_ref:
             return {
                 "ok": True,
                 "created": False,
                 "transaction_id": t.get("id"),
+                "transaction_gateway": t.get("gateway"),
                 "parent_transaction_id": parent_transaction_id,
             }
 
