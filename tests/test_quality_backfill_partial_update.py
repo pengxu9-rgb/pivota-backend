@@ -229,6 +229,27 @@ async def test_completing_a_job_keeps_counters_it_was_not_given():
     assert row["skipped"] == 2, "completion nulled a counter it was not given"
 
 
+async def test_a_second_claim_of_the_same_job_is_refused():
+    """The atomic-claim conjunct, pinned.
+
+    `claim_quality_backfill_job`'s `AND status = 'queued'` is what makes the
+    claim atomic — it is the difference between one worker taking a job and two
+    workers taking the same one and scoring the merchant's catalog twice. Every
+    other test here claims exactly once, so dropping that conjunct changed
+    nothing observable and the mutation survived.
+    """
+    job_id = await _new_job()
+
+    first = await claim_quality_backfill_job(job_id)
+    second = await claim_quality_backfill_job(job_id)
+
+    assert first is not None and first["status"] == "running"
+    assert second is None, (
+        "a job already running was claimed a second time — the `AND status = "
+        "'queued'` conjunct is what stops two workers taking the same job"
+    )
+
+
 async def test_requeue_stale_resets_a_running_job_and_stamps_the_reason():
     job_id = await _new_job()
     await claim_quality_backfill_job(job_id)
