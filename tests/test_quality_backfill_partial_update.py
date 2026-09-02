@@ -353,12 +353,17 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
     worker loop is dormant (nothing imports it), which is why this is an
     observability bug rather than an outage.
 
-    THE EXPECTED COUNT IS READ OUT OF THE TABLE, NOT ASSUMED TO BE 2. The
-    statement is table-wide — there is no merchant filter — and the shared
-    Postgres database this job runs against can carry stale `running` rows from
-    other files and from earlier runs. The eligibility query below is the
-    statement's own WHERE clause, evaluated with the same cutoff, so the two
-    agree by construction whatever else is in the table.
+    THE EXPECTED COUNT IS READ OUT OF THE TABLE, NOT ASSUMED TO BE 2, because
+    the statement is table-wide — there is no merchant filter, so it counts and
+    moves every eligible row, not just this file's. Today that is only this
+    file's rows: every other suite touching this table monkeypatches the
+    repository functions and writes none. The eligibility query below is the
+    statement's own WHERE clause with the same cutoff, so the two agree by
+    construction if that ever stops being true.
+
+    Note what is NOT asserted: that a second call returns 0. It would, but it
+    would also have returned 0 from the BROKEN helper on both engines, so it
+    discriminates nothing — the kind of assertion this file exists to avoid.
 
     NOTHING HERE ASSERTS THAT A FRESHLY CLAIMED JOB IS SPARED, which it should
     be and on a UTC server is: `:cutoff` is a NAIVE `datetime.utcnow()`, and
@@ -405,8 +410,3 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
         assert (await get_quality_backfill_job(job_id))["status"] == "queued", (
             "the count must be the count of rows this call actually moved"
         )
-
-    # Nothing is stale any more, so the answer must fall to 0 rather than stay
-    # at whatever the previous call returned. Pins the count to the ROWS, not to
-    # a constant that happens to match above.
-    assert await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5) == 0
