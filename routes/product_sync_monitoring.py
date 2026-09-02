@@ -53,7 +53,7 @@ async def get_sync_statistics(
                 platform,
                 COUNT(*) as connected_stores,
                 COUNT(CASE WHEN status = 'active' THEN 1 END) as active_stores,
-                AVG(EXTRACT(EPOCH FROM (NOW() - last_sync_at))) as avg_time_since_sync
+                AVG(EXTRACT(EPOCH FROM (NOW() - last_sync))) as avg_time_since_sync
             FROM merchant_stores
             GROUP BY platform
         """
@@ -111,7 +111,7 @@ async def get_merchant_sync_history(
         query = """
             SELECT 
                 platform,
-                last_sync_at,
+                last_sync,
                 status,
                 (
                     SELECT COUNT(*) 
@@ -122,8 +122,8 @@ async def get_merchant_sync_history(
                 ) as current_product_count
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
-                AND last_sync_at >= :since
-            ORDER BY last_sync_at DESC
+                AND last_sync >= :since
+            ORDER BY last_sync DESC
         """
         
         sync_events = await database.fetch_all(query, {
@@ -137,7 +137,7 @@ async def get_merchant_sync_history(
             "sync_events": [
                 {
                     "platform": e["platform"],
-                    "synced_at": e["last_sync_at"].isoformat() if e["last_sync_at"] else None,
+                    "synced_at": e["last_sync"].isoformat() if e["last_sync"] else None,
                     "status": e["status"],
                     "product_count": e["current_product_count"]
                 }
@@ -165,7 +165,7 @@ async def sync_health_check():
             SELECT COUNT(DISTINCT merchant_id) as stale_merchants
             FROM merchant_stores
             WHERE status = 'active' 
-                AND (last_sync_at IS NULL OR last_sync_at < NOW() - INTERVAL '24 hours')
+                AND (last_sync IS NULL OR last_sync < NOW() - INTERVAL '24 hours')
         """
         stale_result = await database.fetch_one(stale_check)
         
