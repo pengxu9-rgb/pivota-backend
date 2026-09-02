@@ -466,6 +466,17 @@ async def _merge_interactions(
     return dict(row) if row else {"interaction_id": winner_id, **merged_values}
 
 
+def _stitch_advisory_lock_keys(
+    merchant_id: str, refs: Dict[str, Optional[str]]
+) -> List[str]:
+    store_scope = refs.get("store_id") or ""
+    return sorted(
+        f"stitch|{merchant_id}|{store_scope}|{ref_name}|{refs[ref_name]}"
+        for ref_name in _INTERACTION_LOOKUP_KEYS
+        if refs.get(ref_name)
+    )
+
+
 @asynccontextmanager
 async def _event_write_lock(
     merchant_id: str,
@@ -476,12 +487,7 @@ async def _event_write_lock(
     if not IS_POSTGRES:
         yield
         return
-    store_scope = refs.get("store_id") or ""
-    stitch_lock_keys = sorted(
-        f"stitch|{merchant_id}|{store_scope}|{ref_name}|{refs[ref_name]}"
-        for ref_name in _INTERACTION_LOOKUP_KEYS
-        if refs.get(ref_name)
-    )
+    stitch_lock_keys = _stitch_advisory_lock_keys(merchant_id, refs)
     for _attempt in range(3):
         retry = False
         async with database.transaction():

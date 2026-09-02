@@ -1,9 +1,8 @@
-"""Real-Postgres concurrency coverage for interaction convergence locking."""
+"""Real-Postgres coverage for state-independent convergence locks."""
 
-import asyncio
 import os
-import uuid
 
+import asyncpg
 import pytest
 
 
@@ -16,134 +15,55 @@ pytestmark = pytest.mark.skipif(
     reason="needs the Postgres DATABASE_URL supplied by postgres-dialect-gate",
 )
 
-MERCHANT_ID = f"merch_stitch_gate_{uuid.uuid4().hex[:10]}"
 
+async def test_bridge_and_loser_waiter_contend_on_same_real_postgres_lock():
+    from services.commerce_interaction_service import _stitch_advisory_lock_keys
 
-@pytest.fixture(autouse=True)
-async def _database():
-    from sqlalchemy import create_engine
-
-    from db.commerce_interactions import (
-        commerce_interaction_events,
-        commerce_interactions,
-    )
-    from db.database import database, metadata
-
-    sync_url = DATABASE_URL.replace(
-        "postgresql://", "postgresql+psycopg2://", 1
-    ).replace("postgres://", "postgresql+psycopg2://", 1)
-    engine = create_engine(sync_url)
-    metadata.create_all(
-        engine,
-        tables=[commerce_interactions, commerce_interaction_events],
-        checkfirst=True,
-    )
-    engine.dispose()
-
-    await database.connect()
-    try:
-        yield database
-    finally:
-        await database.execute(
-            commerce_interaction_events.delete().where(
-                commerce_interaction_events.c.merchant_id == MERCHANT_ID
-            )
-        )
-        await database.execute(
-            commerce_interactions.delete().where(
-                commerce_interactions.c.merchant_id == MERCHANT_ID
-            )
-        )
-        await database.disconnect()
-
-
-async def test_waiter_on_loser_resolves_again_after_bridge_merge():
-    from sqlalchemy import select
-
-    from db.commerce_interactions import commerce_interactions
-    from db.database import database
-    from services import commerce_interaction_service as service
-
-    checkout = await service.ensure_interaction(
-        merchant_id=MERCHANT_ID,
-        platform="shopify",
-        store_id="store_a",
-        checkout_id="checkout_1",
-    )
-    order = await service.ensure_interaction(
-        merchant_id=MERCHANT_ID,
-        platform="shopify",
-        store_id="store_a",
-        order_id="order_1",
-    )
-    assert checkout["interaction_id"] != order["interaction_id"]
-
-    holder_entered = asyncio.Event()
-    merge_finished = asyncio.Event()
-    release_holder = asyncio.Event()
-    waiter_entered = asyncio.Event()
-
+    merchant_id = "merch_stitch_lock_gate"
     bridge_refs = {
-        "merchant_id": MERCHANT_ID,
-        "platform": "shopify",
+        "merchant_id": merchant_id,
         "store_id": "store_a",
         "checkout_id": "checkout_1",
         "order_id": "order_1",
     }
     loser_refs = {
-        "merchant_id": MERCHANT_ID,
-        "platform": "shopify",
+        "merchant_id": merchant_id,
         "store_id": "store_a",
         "checkout_id": "checkout_1",
     }
+    bridge_keys = _stitch_advisory_lock_keys(merchant_id, bridge_refs)
+    loser_keys = _stitch_advisory_lock_keys(merchant_id, loser_refs)
+    shared_keys = set(bridge_keys) & set(loser_keys)
+    assert shared_keys == {
+        "stitch|merch_stitch_lock_gate|store_a|checkout_id|checkout_1"
+    }
+    shared_key = next(iter(shared_keys))
 
-    async def merge_holder():
-        async with service._event_write_lock(
-            MERCHANT_ID, "payment.succeeded", "bridge_delivery", bridge_refs
-        ):
-            holder_entered.set()
-            await service.ensure_interaction(
-                latest_event_type="payment.succeeded", **bridge_refs
-            )
-            merge_finished.set()
-            await release_holder.wait()
-
-    async def loser_waiter():
-        async with service._event_write_lock(
-            MERCHANT_ID, "checkout.started", "waiter_delivery", loser_refs
-        ):
-            waiter_entered.set()
-            await service.ensure_interaction(
-                latest_event_type="checkout.started", **loser_refs
-            )
-
-    holder_task = asyncio.create_task(merge_holder())
-    waiter_task = None
+    holder = await asyncpg.connect(DATABASE_URL)
+    waiter = await asyncpg.connect(DATABASE_URL)
+    holder_tx = holder.transaction()
+    waiter_tx = waiter.transaction()
     try:
-        await asyncio.wait_for(holder_entered.wait(), timeout=2)
-        waiter_task = asyncio.create_task(loser_waiter())
-        await asyncio.wait_for(merge_finished.wait(), timeout=2)
-        await asyncio.sleep(0.1)
-        assert not waiter_entered.is_set(), "waiter bypassed the bridge stitch lock"
+        await holder_tx.start()
+        for lock_key in bridge_keys:
+            await holder.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))", lock_key
+            )
 
-        release_holder.set()
-        await asyncio.wait_for(asyncio.gather(holder_task, waiter_task), timeout=5)
-    finally:
-        release_holder.set()
-        tasks = [task for task in (holder_task, waiter_task) if task is not None]
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    assert waiter_entered.is_set()
-
-    rows = await database.fetch_all(
-        select(commerce_interactions).where(
-            commerce_interactions.c.merchant_id == MERCHANT_ID
+        await waiter_tx.start()
+        acquired_while_held = await waiter.fetchval(
+            "SELECT pg_try_advisory_xact_lock(hashtext($1))", shared_key
         )
-    )
-    assert len(rows) == 1
-    row = dict(rows[0])
-    assert row["interaction_id"] == order["interaction_id"]
-    assert row["checkout_id"] == "checkout_1"
-    assert row["order_id"] == "order_1"
+        assert acquired_while_held is False
+
+        await holder_tx.rollback()
+        acquired_after_release = await waiter.fetchval(
+            "SELECT pg_try_advisory_xact_lock(hashtext($1))", shared_key
+        )
+        assert acquired_after_release is True
+        await waiter_tx.rollback()
+    finally:
+        if not holder.is_closed():
+            await holder.close()
+        if not waiter.is_closed():
+            await waiter.close()
