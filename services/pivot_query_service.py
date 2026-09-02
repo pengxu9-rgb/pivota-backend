@@ -225,6 +225,14 @@ _CATEGORY_REFINEMENT_TERMS = frozenset(
 )
 
 
+# Bounds for a caller-supplied brand anchor. See _fetch_canonical_search_rows for why.
+_BRAND_ANCHOR_TERM_MAX_COUNT = 8
+_BRAND_ANCHOR_TERM_MAX_LEN = 64
+# Letters, digits, and the separators real brand tokens carry. Deliberately excludes the LIKE
+# wildcards '%' and '_'.
+_BRAND_ANCHOR_TERM_RE = re.compile(r"[a-z0-9&+.'\-]+", re.IGNORECASE)
+
+
 def _category_brand_anchor_terms(query: str) -> List[str]:
     """Return a conservative possible-brand anchor for category queries.
 
@@ -875,6 +883,7 @@ async def _fetch_canonical_search_rows(
     merchant_id: Optional[str],
     limit: int,
     require_signature: bool = False,
+    brand_anchor_terms: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     lowered = _normalize_query(query)
     if not lowered:
@@ -1062,17 +1071,68 @@ async def _fetch_canonical_search_rows(
     # it does not widen arbitrary queries, and category recall already admits
     # these rows.  It only ensures a real brand match is not truncated behind a
     # large set of same-category rows before the gateway can validate it.
+    # The caller's anchor wins when it supplied one. `_category_brand_anchor_terms`
+    # needs >= 2 residual tokens, so it can never boost a SINGLE-WORD brand — Murad,
+    # CeraVe, NARS. The gateway resolves those against the catalog brand dictionary
+    # and now threads the answer down, because a post-filter can only keep what recall
+    # already returned: with the boost missing, "show me Murad products" truncated
+    # every Murad row below the candidate limit and the gateway anchored on an empty
+    # set (`brand_category_anchor_matched: false`) while a LIZUSH bath bomb survived.
+    # None (no opinion from the caller) keeps the original behaviour for every other
+    # caller of this function.
     brand_anchor_score = ""
-    brand_anchor_terms = _category_brand_anchor_terms(query)
+    brand_anchor_terms = (
+        brand_anchor_terms
+        if brand_anchor_terms is not None
+        else _category_brand_anchor_terms(query)
+    )
+    # The field is client-supplied on POST /v1/pivot/query, and every term becomes three more LIKE
+    # predicates over the catalog join. Unbounded, 2000 terms produced a 719KB statement with 12k
+    # predicates — a statement-timeout shaped exactly like the pool incidents this service has had.
+    # A term carrying LIKE wildcards is worse than useless: '%' alone becomes LIKE '%%%', which is
+    # true for every row and hands the entire candidate set +180, flattening the ranking. Terms are
+    # always BOUND (only the integer index is interpolated), so this is not an injection surface —
+    # it is a denial-of-service and ranking-distortion surface, and the sibling fields on this model
+    # are all bounded already.
+    brand_anchor_terms = [
+        t
+        for t in (brand_anchor_terms or [])
+        if isinstance(t, str) and 0 < len(t) <= _BRAND_ANCHOR_TERM_MAX_LEN and _BRAND_ANCHOR_TERM_RE.fullmatch(t)
+    ][:_BRAND_ANCHOR_TERM_MAX_COUNT]
     if brand_anchor_terms:
+        # A SINGLE-token anchor matches identity fields ONLY, never the title.
+        #
+        # Every guard that lets a token become an anchor is an exact-span equality test — dictionary
+        # membership, the stopword list, `category_path_prefix_for_query(span)` — but the value they
+        # approve is consumed here as an UNANCHORED substring. For a 4-character brand those are not
+        # the same question. `lush` is a real catalog brand and `category_path_prefix_for_query`
+        # correctly refuses `blush`, and then `%lush%` matches "Soft Pinch Liquid B-LUSH", "Orgasm
+        # Powder B-LUSH", "Baked B-LUSH Luminoso" — six rows boosted, one of them actually LUSH.
+        # At +180 that outranks every legitimate text signal (exact title 100 + title LIKE 90), and
+        # under RECALL_RELEVANCE_V2 text_score IS the serving order, so "tula cleanser" would put a
+        # silicone spa-TULA at the top of a cleanser search: the same failure class this boost was
+        # extended to fix.
+        #
+        # Identity-only also makes recall agree with the gateway post-filter, which matches
+        # brand + merchant_name and nothing else. A title-only hit was being boosted into a 40-80 row
+        # candidate window and then discarded — spending the very slots real brand rows needed.
+        #
+        # MULTI-token anchors keep the title clause. They are ANDed, so "%knight% AND %unicorn%" is
+        # enormously more selective, and the title is where a two-word brand survives a missing
+        # `brand` column. That path is unchanged.
+        anchor_fields = ["p.brand", "m.merchant_name"]
+        if len(brand_anchor_terms) > 1:
+            anchor_fields.append("p.title")
         anchor_matches = []
         for anchor_index, anchor_term in enumerate(brand_anchor_terms):
             param_name = f"brand_anchor_{anchor_index}"
             params[param_name] = f"%{anchor_term}%"
             anchor_matches.append(
-                "(LOWER(COALESCE(p.brand, '')) LIKE :" + param_name
-                + " OR LOWER(COALESCE(m.merchant_name, '')) LIKE :" + param_name
-                + " OR LOWER(COALESCE(p.title, '')) LIKE :" + param_name + ")"
+                "("
+                + " OR ".join(
+                    f"LOWER(COALESCE({field}, '')) LIKE :{param_name}" for field in anchor_fields
+                )
+                + ")"
             )
         anchor_expression = " AND ".join(anchor_matches)
         brand_anchor_score = (
@@ -2338,6 +2398,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
         merchant_id=request.merchant_id,
         limit=request.limit,
         require_signature=request.canonical_entities_only,
+        brand_anchor_terms=request.brand_anchor_terms,
     )
     canonical_items = await _build_canonical_items(
         canonical_rows,

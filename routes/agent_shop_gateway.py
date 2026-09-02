@@ -7066,9 +7066,20 @@ async def _handle_find_products_multi_via_pivot(
         query_semantic_class=query_semantic_class,
     )
 
+    # Resolved BEFORE the search, not after, and threaded into it. Recall and the
+    # post-filter below now share one anchor: previously each called
+    # `_category_brand_anchor_terms` independently, so the gateway could resolve a
+    # single-word brand the recall SQL had no boost for, and then post-filter a
+    # candidate set that never contained a single row of that brand.
+    brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
+
     pivot_result = await search_pivot_catalog(
         PivotQueryRequest(
             query=query,
+            # The list is passed through AS RESOLVED. `or None` here would convert [] — a
+            # decision that this query has no brand — into "no opinion, derive it yourself",
+            # the exact opposite, and contradict the contract the field documents.
+            brand_anchor_terms=brand_anchor_terms,
             merchant_id=None,
             market=_pivot_market_from_payload(payload, request_metadata),
             limit=raw_limit,
@@ -7089,7 +7100,6 @@ async def _handle_find_products_multi_via_pivot(
     # match a real catalog brand/merchant, preserve the user's explicit brand
     # constraint instead of returning unrelated products from the same
     # category.  If no real identity matches, keep broad category behaviour.
-    brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
     brand_anchor_matched = False
     if products and brand_anchor_terms:
         anchored_products = []
