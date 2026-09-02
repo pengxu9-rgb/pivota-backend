@@ -62,6 +62,7 @@ async def _db():
     if not was_connected:
         await database.connect()
     await ensure_product_quality_backfill_jobs_table()
+    await _align_timestamp_columns_to_production()
     await _reset()
     try:
         yield
@@ -69,6 +70,48 @@ async def _db():
         await _reset()
         if not was_connected:
             await database.disconnect()
+
+
+async def _align_timestamp_columns_to_production() -> None:
+    """Declare the three timestamp columns the way PRODUCTION declares them.
+
+    THE DIALECT GATE'S COPY OF THIS TABLE IS MODEL-FIRST, and that quietly
+    disarms every timezone case in this file. An earlier gate file runs
+    `metadata.create_all`, which builds requested_at/started_at/finished_at from
+    the bare `DateTime` Column as naive `timestamp`; migration 054 and this
+    module's own DDL — and therefore production — say TIMESTAMPTZ. Measured on
+    CI: `{'requested_at': 'timestamp without time zone', ...}`.
+
+    That difference is not cosmetic, it decides whether these cases can fail at
+    all. asyncpg converts a naive datetime to the client process's local wall
+    time ONLY for a `timestamptz` parameter; against a naive `timestamp` it
+    passes the value through untouched. So on the gate's schema the naive binds
+    this file exists to catch round-trip perfectly, and the tests below PASS
+    against the unfixed code — demonstrated, by running them that way.
+
+    Aligning the columns here is therefore the difference between a real guard
+    and decoration. The gate's database is a throwaway (`pivota_dialect_check`),
+    this file owns every row in this table, and it is the LAST entry in that
+    job's file list, so nothing else observes the change. On SQLite there is no
+    such distinction and this is a no-op.
+    """
+    if not IS_POSTGRES:
+        return
+    await database.execute(
+        "ALTER TABLE product_quality_backfill_jobs "
+        "ALTER COLUMN requested_at TYPE TIMESTAMPTZ, "
+        "ALTER COLUMN started_at TYPE TIMESTAMPTZ, "
+        "ALTER COLUMN finished_at TYPE TIMESTAMPTZ"
+    )
+    declared = {
+        dict(row)["column_name"]: dict(row)["data_type"]
+        for row in await database.fetch_all(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 'product_quality_backfill_jobs' "
+            "AND column_name IN ('requested_at', 'started_at', 'finished_at')"
+        )
+    }
+    assert set(declared.values()) == {"timestamp with time zone"}, declared
 
 
 async def _reset() -> None:
@@ -455,6 +498,19 @@ async def test_a_non_utc_process_timezone_does_not_make_every_running_job_stale(
         os.environ["TZ"] = "America/Los_Angeles"
         time.tzset()
         assert time.tzname[0] != "UTC", "the process timezone did not change"
+
+        # The precondition this case rests on, stated where it is used: a naive
+        # bind is only converted for a TIMESTAMPTZ parameter. See
+        # _align_timestamp_columns_to_production above.
+        started_at_type = await database.fetch_val(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'product_quality_backfill_jobs' "
+            "AND column_name = 'started_at'"
+        )
+        assert started_at_type == "timestamp with time zone", (
+            f"started_at is {started_at_type} — against a naive column this case "
+            "passes on the unfixed code and proves nothing"
+        )
 
         job_id = await _new_job()
         # started_at = CURRENT_TIMESTAMP, i.e. one second old, in server time.
