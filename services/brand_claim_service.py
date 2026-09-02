@@ -309,6 +309,12 @@ async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[st
 
     def _detail(host: str, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {
+            # True when inference independently produces this host, whatever the
+            # stored row says. The binding view needs it: a stored `asserted`
+            # row must not SHADOW a genuine inferred membership for the same
+            # host, or a merchant who claimed a domain before declaring it is
+            # locked out of ever verifying it.
+            "also_inferred": host in inferred,
             "source": str((row or {}).get("source") or mod.SOURCE_INFERRED),
             "liveness_status": str(
                 (row or {}).get("liveness_status") or mod.LIVENESS_UNCHECKED
@@ -365,7 +371,9 @@ async def record_official_domain(
     eventual-consistency net, and inference still covers the domain in the
     meantime if it was derivable at all.
 
-    Liveness is deliberately left `unchecked` rather than assumed live: we just
+    Liveness is left `unchecked` on a FRESH row (a claim proves control, not
+    that the storefront answers HTTP); on an existing row the sweep's recorded
+    verdict is preserved rather than blanked rather than assumed live: we just
     proved DNS TXT control or mailbox control, neither of which is evidence that
     the storefront answers HTTP.
     """
@@ -412,6 +420,19 @@ async def merchant_bound_domains(merchant_id: str) -> set:
     so if the binding check read it back, a second identical /claim/verify call
     would find the row its own first call had just written and grant brand_direct
     — turning "needs review" into a one-call delay instead of a gate.
+
+    A host that is asserted AND independently inferred is admitted: inference is
+    evidence the merchant supplied elsewhere, and shadowing it would lock out a
+    merchant who happened to claim the domain before declaring it.
+
+    Two limits worth knowing, both PRE-EXISTING and neither closed here:
+      * The exclusion is HOST-EXACT, while host_matches_known is suffix-aware.
+        An excluded `x.example` is still reachable through an inferred relative
+        like `us.x.example`.
+      * The inferred tier is merchant-SELF-DECLARED — PUT /merchant/profile
+        writes `website` with no proof — so this gate ultimately reduces to
+        "prove DNS control of a domain you also typed into your profile".
+        Hardening that is a separate change to the profile write path.
     """
     from db import merchant_official_domains as mod
 
@@ -420,6 +441,7 @@ async def merchant_bound_domains(merchant_id: str) -> set:
         host
         for host, detail in detailed.items()
         if str(detail.get("source") or "") != mod.SOURCE_ASSERTED
+        or bool(detail.get("also_inferred"))
     }
 
 

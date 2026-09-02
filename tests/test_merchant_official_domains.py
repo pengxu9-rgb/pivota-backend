@@ -908,3 +908,89 @@ async def test_a_fresh_row_with_no_verdict_defaults_to_unchecked():
     [row] = await mod.list_official_domains(m)
     assert row["liveness_status"] == mod.LIVENESS_UNCHECKED
     assert row["last_checked_at"] is None
+
+
+# --- an asserted row must not SHADOW a later legitimate inference ----------
+# Found in review of the fix above: merchant_owned_domains_detailed resolves a
+# host to ONE source and the stored row wins, so an asserted row hid a genuine
+# inferred membership for the same host. The result was an order-dependent,
+# permanent, silent lockout — identical end states, opposite outcomes:
+#   claim then declare  -> domain_verified_unbound forever
+#   declare then claim  -> verified
+async def _claim_for(monkeypatch, merchant, domain, inferred_hosts):
+    claim = {
+        "claim_id": f"shadow-{merchant}",
+        "merchant_id": merchant,
+        "claim_method": "dns",
+        "brand_domain": domain,
+        "challenge_token": "pivota-verify=tok",
+        "verification_status": "pending",
+    }
+    granted = []
+
+    async def _get(cid):
+        return claim
+
+    async def _inferred(mid):
+        return set(inferred_hosts)
+
+    async def _grant(mid):
+        granted.append(mid)
+        return True
+
+    async def _mark(cid, **kw):
+        return True
+
+    monkeypatch.setattr(svc.bc, "get_brand_claim", _get)
+    monkeypatch.setattr(svc.bc, "mark_claim_verified", _mark)
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
+    monkeypatch.setattr(svc, "set_merchant_brand_direct", _grant)
+    return claim, granted
+
+
+async def test_an_asserted_row_does_not_shadow_a_later_inference(monkeypatch):
+    """Claim the domain BEFORE declaring it, then declare it. The merchant must
+    still be able to verify — the asserted row must not outrank inference."""
+    m, d = "shadow_a", "mybrand.example"
+    hosts = set()
+    claim, granted = await _claim_for(monkeypatch, m, d, hosts)
+
+    first = await svc.verify_brand_claim(
+        claim["claim_id"], txt_resolver=lambda x: ["pivota-verify=tok"]
+    )
+    assert first["status"] == "domain_verified_unbound"
+
+    hosts.add(d)  # the merchant now legitimately declares it
+    second = await svc.verify_brand_claim(
+        claim["claim_id"], txt_resolver=lambda x: ["pivota-verify=tok"]
+    )
+    assert second["status"] == "verified", "an asserted row must not lock the merchant out"
+    assert granted == [m]
+    assert d in await svc.merchant_bound_domains(m)
+
+
+async def test_the_other_order_still_verifies(monkeypatch):
+    """Order independence: the same two states, declared first, already worked
+    and must keep working."""
+    m, d = "shadow_b", "mybrand.example"
+    claim, granted = await _claim_for(monkeypatch, m, d, {d})
+    result = await svc.verify_brand_claim(
+        claim["claim_id"], txt_resolver=lambda x: ["pivota-verify=tok"]
+    )
+    assert result["status"] == "verified"
+    assert granted == [m]
+
+
+async def test_asserted_alone_is_still_excluded_from_binding(monkeypatch):
+    """The bypass fix must survive: asserted WITHOUT inference stays unbound
+    however many times /claim/verify is called."""
+    m, d = "shadow_c", "totally-unrelated.example"
+    claim, granted = await _claim_for(monkeypatch, m, d, {"anua.com"})
+    for _ in range(3):
+        result = await svc.verify_brand_claim(
+            claim["claim_id"], txt_resolver=lambda x: ["pivota-verify=tok"]
+        )
+        assert result["status"] == "domain_verified_unbound"
+    assert granted == []
+    assert d in await svc.merchant_owned_domains(m)      # reporting: yes
+    assert d not in await svc.merchant_bound_domains(m)  # binding: no
