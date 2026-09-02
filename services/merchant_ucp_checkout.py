@@ -122,6 +122,28 @@ def build_attribution(
     return attribution
 
 
+_VARIANT_GID_PREFIX = "gid://shopify/ProductVariant/"
+
+
+def _variant_gid(variant_id: str) -> str:
+    """The merchant's `item.id` is a Shopify ProductVariant GID, not the bare number.
+
+    Probed live 2026-09-02 against cosrx.com: `{"item": {"id": "51086327775448"}}` is refused
+    with `invalid_input` "is not a valid ProductVariant GID"; the same id as
+    `gid://shopify/ProductVariant/51086327775448` opens the checkout. Every variant id we hold
+    (the offers-lane token ctx, `attached_variant_id`, the storefront .js stamp) is the bare
+    number, so the wrap happens HERE, once, rather than at every call site. A value that is
+    already a GID passes through; anything else is left as given — this module pins Shopify's
+    `/api/ucp/mcp` path, so a non-numeric, non-GID id is an upstream data problem the merchant
+    will name, not something to guess at.
+    """
+    if not variant_id:
+        return variant_id
+    if variant_id.isdigit():
+        return f"{_VARIANT_GID_PREFIX}{variant_id}"
+    return variant_id
+
+
 def build_line_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize to the merchant's shape: `{"item": {"id": <variant id>}, "quantity": n}`.
 
@@ -132,7 +154,7 @@ def build_line_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     for raw in items or []:
-        variant_id = str((raw or {}).get("variant_id") or "").strip()
+        variant_id = _variant_gid(str((raw or {}).get("variant_id") or "").strip())
         if not variant_id:
             raise MerchantUcpError(
                 "each line item needs a storefront variant_id", caller_fault=True
@@ -207,6 +229,24 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
     result = rpc.get("result")
     if not isinstance(result, dict):
         raise MerchantUcpError("merchant response carried no result")
+
+    # VALIDATION ERRORS COME BACK AS A SUCCESSFUL TOOL CALL. Shopify's UCP door answers a schema
+    # violation with `result.isError: true` and a plain-text chunk ("Invalid arguments: object
+    # at `/checkout/fulfillment/methods/0` is missing required properties: line_item_ids"), not
+    # a JSON-RPC `error`. Read as a payload that text is not JSON, so the old path fell through
+    # to "carried no checkout payload" — the merchant told us exactly what was wrong and we
+    # threw the message away. Probed live 2026-09-02. These are OUR malformed requests, hence
+    # caller_fault.
+    if result.get("isError"):
+        texts = [
+            str(chunk.get("text") or "").strip()
+            for chunk in (result.get("content") or [])
+            if isinstance(chunk, dict) and chunk.get("type") == "text"
+        ]
+        detail = " | ".join(t for t in texts if t) or "unspecified"
+        raise MerchantUcpError(
+            f"merchant rejected the call: {detail[:500]}", caller_fault=True
+        )
 
     if isinstance(result.get("structuredContent"), dict):
         return result["structuredContent"]
@@ -317,6 +357,7 @@ async def update_checkout(
     address: Optional[Dict[str, Any]] = None,
     fulfillment_type: str = "shipping",
     buyer: Optional[Dict[str, Any]] = None,
+    line_item_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Set the destination so the merchant can price shipping and tax.
 
@@ -331,9 +372,26 @@ async def update_checkout(
 
     checkout: Dict[str, Any] = {"line_items": build_line_items(line_items)}
     if address:
+        # The merchant's schema REQUIRES `line_item_ids` on a fulfillment method — which lines
+        # this shipping method covers. Those ids are the merchant's own (`line_items[].id` on the
+        # CREATE response, `gid://shopify/CartLine/<uuid>?cart=<cart>`), not our variant ids,
+        # so the caller has to carry them over from the checkout it created. Probed live
+        # 2026-09-02: a method without them is rejected ("missing required properties:
+        # line_item_ids"), and before the isError fix above that read as "no checkout payload".
+        ids = [str(i).strip() for i in (line_item_ids or []) if str(i or "").strip()]
+        if not ids:
+            raise MerchantUcpError(
+                "pricing a destination needs the checkout's line_item_ids "
+                "(from create_checkout's line_items[].id)",
+                caller_fault=True,
+            )
         checkout["fulfillment"] = {
             "methods": [
-                {"type": fulfillment_type, "destinations": [build_destination(address)]}
+                {
+                    "type": fulfillment_type,
+                    "line_item_ids": ids,
+                    "destinations": [build_destination(address)],
+                }
             ]
         }
     if buyer:

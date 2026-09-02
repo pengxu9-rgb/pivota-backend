@@ -127,6 +127,7 @@ async def test_update_checkout_carries_id_at_top_level_and_items_in_checkout(mon
         "chk_1",
         line_items=[{"variant_id": "4242", "quantity": 1}],
         address={"address_country": "US", "postal_code": "94111"},
+        line_item_ids=["gid://shopify/CartLine/l1?cart=c1"],
     )
 
     args = _args(cap)
@@ -143,9 +144,29 @@ async def test_line_item_nests_the_variant_under_item_id(monkeypatch):
     await muc.create_checkout("cosrx.com", line_items=[{"variant_id": "4242", "quantity": 3}])
 
     items = _args(cap)["checkout"]["line_items"]
-    # Live: line item required == ["item", "quantity"], item required == ["id"]
-    assert items == [{"item": {"id": "4242"}, "quantity": 3}]
+    # Live: line item required == ["item", "quantity"], item required == ["id"] — and the id is
+    # the ProductVariant GID (probed 2026-09-02: the bare number is refused as "not a valid
+    # ProductVariant GID"). Every id we hold is the bare number, so the caller wraps it.
+    assert items == [{"item": {"id": "gid://shopify/ProductVariant/4242"}, "quantity": 3}]
     assert "variant_id" not in items[0], "our field name must not reach the wire"
+
+
+@pytest.mark.asyncio
+async def test_a_variant_id_that_is_already_a_gid_is_sent_as_given(monkeypatch):
+    cap = _Capture(_ok({"id": "chk_1"})).install(monkeypatch)
+    gid = "gid://shopify/ProductVariant/51086327742680"
+
+    await muc.create_checkout("cosrx.com", line_items=[{"variant_id": gid, "quantity": 1}])
+
+    assert _args(cap)["checkout"]["line_items"][0]["item"]["id"] == gid
+
+
+def test_variant_gid_wraps_only_bare_numbers():
+    assert muc._variant_gid("51086327742680") == "gid://shopify/ProductVariant/51086327742680"
+    assert muc._variant_gid("gid://shopify/ProductVariant/1") == "gid://shopify/ProductVariant/1"
+    assert muc._variant_gid("") == ""
+    # Not numeric, not a GID: left alone for the merchant to name, never double-wrapped or guessed.
+    assert muc._variant_gid("SKU-RED-30ML") == "SKU-RED-30ML"
 
 
 @pytest.mark.asyncio
@@ -163,10 +184,14 @@ async def test_address_maps_onto_fulfillment_methods_destinations(monkeypatch):
             "postal_code": "94111",
             "address_country": "US",
         },
+        line_item_ids=["gid://shopify/CartLine/l1?cart=c1"],
     )
 
     methods = _args(cap)["checkout"]["fulfillment"]["methods"]
     assert methods[0]["type"] == "shipping"
+    # Live (2026-09-02): the method schema REQUIRES line_item_ids — the merchant's own CartLine
+    # ids from the create response, not our variant ids.
+    assert methods[0]["line_item_ids"] == ["gid://shopify/CartLine/l1?cart=c1"]
     dest = methods[0]["destinations"][0]
     assert dest["address_country"] == "US"
     assert dest["street_address"] == "123 Main St"
@@ -323,3 +348,52 @@ async def test_ssrf_guards_run_before_any_request(monkeypatch):
     with pytest.raises(MerchantUcpError):
         await muc.get_checkout("cosrx.com", "chk_1")
     assert cap.body is None
+
+
+
+@pytest.mark.asyncio
+async def test_pricing_a_destination_without_line_item_ids_is_refused_before_the_wire(monkeypatch):
+    """The merchant rejects a fulfillment method without line_item_ids; refusing here names the
+    fix (carry create_checkout's line_items[].id) instead of shipping a request we know fails."""
+    cap = _Capture(_ok({"id": "chk_1"})).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.update_checkout(
+            "cosrx.com",
+            "chk_1",
+            line_items=[{"variant_id": "4242", "quantity": 1}],
+            address={"address_country": "US", "postal_code": "94111"},
+        )
+
+    assert excinfo.value.caller_fault is True
+    assert "line_item_ids" in str(excinfo.value)
+    assert cap.body is None, "nothing must reach the merchant"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_flagged_isError_is_surfaced_with_the_merchants_text(monkeypatch):
+    """Reproduced live 2026-09-02: a schema violation comes back as a SUCCESSFUL tool call with
+    result.isError=true and a plain-text chunk. Before this, that read as "carried no checkout
+    payload" and the merchant's exact diagnosis was thrown away."""
+    _Capture(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Invalid arguments: object at `/checkout/fulfillment/methods/0` "
+                        "is missing required properties: line_item_ids",
+                    }
+                ],
+                "isError": True,
+            },
+        }
+    ).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("cosrx.com", "chk_1")
+
+    assert "missing required properties: line_item_ids" in str(excinfo.value)
+    assert excinfo.value.caller_fault is True
