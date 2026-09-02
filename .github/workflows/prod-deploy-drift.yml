@@ -37,6 +37,10 @@ on:
 
 permissions:
   contents: read
+  # Reading the worker's deployed image needs GCP. `web` is answerable over a public
+  # health endpoint; `worker` is not invocable by allUsers and its run.app URL answers a
+  # GFE 404, so the only way to ask what it runs is Cloud Run itself.
+  id-token: write
 
 env:
   # How long production may lag main before this job goes red. Long enough that a normal
@@ -61,6 +65,14 @@ env:
   # nominal minute (p90 51m), so the real ceiling is ~9h, not 8.
   GRACE_MINUTES: '240'
 
+  # The worker gets its own, much longer window, because it is manual BY DESIGN:
+  # deploy-prod.yml deploys `web` only, and says so — "rolling it has queue semantics this
+  # does not model". A 4h window on a service nobody promises to deploy in 4h would make
+  # this job permanently red, which is the crying-wolf this file exists to avoid and would
+  # take the working `web` alarm down with it. A day is long enough that an ordinary manual
+  # cadence never trips it, and short enough that a forgotten roll is still caught.
+  WORKER_GRACE_MINUTES: '1440'
+
 jobs:
   drift:
     runs-on: ubuntu-latest
@@ -77,6 +89,15 @@ jobs:
           # file contents.
           fetch-depth: 0
           filter: blob:none
+
+      - uses: google-github-actions/auth@v2
+        with:
+          # Same identifiers deploy-prod.yml uses: neither grants anything without a
+          # GitHub-signed OIDC token asserting this repository.
+          workload_identity_provider: projects/371394967380/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: sa-github-deploy@pivota-shared.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
 
       - name: Compare live production against this commit
         run: |
@@ -185,6 +206,102 @@ jobs:
             SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
               RUN_COMMAND=python RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
               infra/gcp/deploy_backend.sh prod <sha>
+            WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <sha> <gateway-sha>
+          EOF
+          exit 1
+
+      # THE BLIND SPOT THIS JOB HAD.
+      #
+      # Everything above asks api.pivota.cc/health, which is the load balancer, which is
+      # `web`. So the service this job proved was current is the ONE service deploy-prod.yml
+      # already deploys automatically — and `worker`, which runs the APScheduler and every
+      # cron, queue drain and reaper in this repo, was checked by nothing at all. It sat two
+      # commits behind main with a merged queue drain, lease reaper, gap alert and repair
+      # lane in those commits, none of them executing, and no signal said so. That is the
+      # same shape as the #1812 gap this file was written for, one service over.
+      #
+      # `if: always()` deliberately: a `web` drift must not hide a `worker` drift. They are
+      # independent facts and each is worth its own line.
+      #
+      # The classification below duplicates the step above rather than refactoring it. That
+      # is the cheaper mistake here: the `web` check is the alarm that currently works, and
+      # rewriting it to share a helper risks breaking a thing that is load-bearing in order
+      # to tidy a thing that is new.
+      - name: Compare the worker against this commit
+        if: always()
+        run: |
+          set -uo pipefail
+          MAIN_SHA="$(git rev-parse HEAD)"
+
+          IMAGE="$(gcloud run services describe worker --region=us-west1 --project=pivota-prod \
+                     --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)"
+          if [ -z "$IMAGE" ]; then
+            # Degrade, never cry wolf: an auth hiccup or an API blip is not drift, and a job
+            # that reddens on its own plumbing gets muted exactly like one that cries wolf.
+            echo "::warning::could not read the worker's deployed image - worker drift is UNKNOWN this run"
+            exit 0
+          fi
+          LIVE_SHA="${IMAGE##*:}"
+          echo "main:        $MAIN_SHA"
+          echo "live worker: $LIVE_SHA"
+
+          if [ "$LIVE_SHA" = "$MAIN_SHA" ]; then
+            echo "the worker is running main"
+            exit 0
+          fi
+
+          if ! git cat-file -e "$LIVE_SHA" 2>/dev/null; then
+            echo "::warning::the worker runs $LIVE_SHA, which is not in this repository."
+            exit 0
+          fi
+
+          # Same exemption list as the web check: anything NOT here is treated as
+          # runtime-affecting, so a new top-level directory is a deploy until someone says
+          # otherwise. `routes/` counts: the worker imports main.py, so a route module that
+          # fails to import takes the scheduler down with it.
+          RUNTIME_CHANGED="$(git diff --name-only "$LIVE_SHA..HEAD" \
+            | grep -vE '^(docs/|infra/|\.github/|scripts/|tests/|README|CHANGELOG)' \
+            | grep -vE '\.md$' || true)"
+          if [ -z "$RUNTIME_CHANGED" ]; then
+            echo "the worker is $(git rev-list --count "$LIVE_SHA..HEAD") commit(s) behind main,"
+            echo "but none of them touch code the container runs. No roll needed."
+            exit 0
+          fi
+          echo "runtime-affecting files not on the worker:"
+          printf '%s\n' "$RUNTIME_CHANGED" | sed 's/^/  /'
+
+          if ! git merge-base --is-ancestor "$LIVE_SHA" HEAD 2>/dev/null; then
+            echo "::error::the worker runs $LIVE_SHA, which is NOT an ancestor of main - they have diverged."
+            exit 1
+          fi
+
+          # Age measured from when the change LANDED ON MAIN, for the reason the web check
+          # spells out: commit timestamps make a branch look stale the instant it merges.
+          RT_LIST="$(mktemp)"; printf '%s\n' "$RUNTIME_CHANGED" > "$RT_LIST"
+          LANDED=""
+          for c in $(git rev-list --reverse --first-parent "$LIVE_SHA..HEAD"); do
+            if git diff --name-only "$c^" "$c" 2>/dev/null | grep -qFxf "$RT_LIST"; then
+              LANDED="$(git show -s --format=%ct "$c")"; break
+            fi
+          done
+          rm -f "$RT_LIST"
+          if [ -n "$LANDED" ]; then
+            AGE_MIN=$(( ( $(date -u +%s) - LANDED ) / 60 ))
+            if [ "$AGE_MIN" -lt "$WORKER_GRACE_MINUTES" ]; then
+              echo "::notice::undeployed worker code landed on main ${AGE_MIN}m ago, inside the ${WORKER_GRACE_MINUTES}m manual-roll window - not alarming yet."
+              exit 0
+            fi
+            echo "this gap has been on main for ${AGE_MIN} minutes (window is ${WORKER_GRACE_MINUTES})."
+          fi
+
+          echo "::error::the worker is $(git rev-list --count "$LIVE_SHA..HEAD") commit(s) BEHIND main."
+          echo "Nothing it runs - the scheduler, every cron, the queue drains and reapers - is on main's code."
+          echo "commits not on the worker:"
+          git log --oneline "$LIVE_SHA..HEAD" | sed 's/^/  /'
+          cat <<'EOF'
+          To roll the worker (deploy-prod.yml deliberately does not):
+            gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
+              --substitutions=COMMIT_SHA=<sha> .
             WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <sha> <gateway-sha>
           EOF
           exit 1
