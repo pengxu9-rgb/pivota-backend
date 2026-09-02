@@ -635,10 +635,13 @@ async def test_a_non_utc_process_timezone_does_not_shift_the_stored_timestamps()
         assert time.tzname[0] != "UTC", "the process timezone did not change"
 
         # THE PRECONDITION, ASSERTED. `CURRENT_TIMESTAMP` is only timezone-proof
-        # for a TIMESTAMPTZ column; on a database built by `metadata.create_all`
-        # these are naive `timestamp` columns and no expression satisfies both.
-        # Production and migration 054 say TIMESTAMPTZ, so pin that rather than
-        # let this case quietly measure something else.
+        # for a TIMESTAMPTZ column, and a naive bind is only CONVERTED for one —
+        # against a naive `timestamp` column the old code round-trips correctly
+        # and this case cannot fail. The fixture aligns the declaration to
+        # production's (see _align_timestamp_columns_to_production); this is the
+        # check that the alignment happened. It is not hypothetical: this
+        # assertion is what caught the gate running these cases against a
+        # model-first schema, where they passed against the unfixed code.
         kinds = await database.fetch_all(
             "SELECT column_name, data_type FROM information_schema.columns "
             "WHERE table_name = 'product_quality_backfill_jobs' "
