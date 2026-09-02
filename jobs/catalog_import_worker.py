@@ -78,6 +78,24 @@ class ShopifyConfigError(ShopifyAPIError):
     """Raised when Shopify configuration is missing or invalid."""
 
 
+class ShopifyCredentialsUnavailableError(ShopifyAPIError):
+    """No usable per-merchant Shopify credentials could be resolved right now.
+
+    Deliberately NOT a ShopifyConfigError, because that class is terminal and
+    this condition is not reliably distinguishable from a transient one.
+    `get_merchant_active_stores` catches its own DB errors and returns `[]`, so
+    a statement timeout — which this repo has a documented history of — looks
+    exactly like "this merchant has no store". Treating that as terminal would
+    permanently fail a fully connected merchant's import on attempt 1 over a
+    momentary blip.
+
+    Retrying is close to free here: a merchant with no store costs ZERO Shopify
+    calls per attempt (the resolver returns before any fetch), so the bounded
+    retry buys transient recovery for the price of a few DB reads, and a
+    genuinely storeless merchant still terminates at SHOPIFY_MAX_RETRY_ATTEMPTS.
+    """
+
+
 class ShopifyAuthError(ShopifyAPIError):
     """Raised when Shopify rejects our credentials (401/403)."""
 
@@ -512,14 +530,36 @@ def _get_shopify_config() -> Dict[str, Any]:
     return {"shop_domain": shop_domain, "access_token": access_token}
 
 
-async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
+async def _get_shopify_config_for_merchant(
+    merchant_id: str,
+    *,
+    allow_global_fallback: bool = True,
+) -> Dict[str, Any]:
     """
     Resolve Shopify configuration for a specific merchant.
 
     Order of precedence:
     1) Per-merchant encrypted connector_credentials (if available and decryptable).
     2) Per-merchant merchant_stores primary store (domain/api_key), when available.
-    3) Global settings/env fallback via _get_shopify_config().
+    3) Global settings/env fallback via _get_shopify_config() — ONLY when
+       `allow_global_fallback` is true.
+
+    THE FALLBACK ANSWERS A DIFFERENT QUESTION THAN THE ONE ASKED. Tiers 1 and 2
+    resolve "what are THIS merchant's credentials"; tier 3 returns the
+    platform's own env-configured store, for any merchant, and those env vars
+    are set in production. So a merchant who never connected a store — or who
+    detached one — still gets a usable shop_domain + access_token back.
+
+    That has already cost the repo once: the store-detach gate in
+    readiness/sources/shopify_live.py had to switch from `shopify_connected` to
+    `get_primary_store` precisely because this fallback made every merchant look
+    connected (readiness/tests/test_store_detach_catalog_gate.py pins it). The
+    hazard was routed around there rather than closed here, because read paths
+    can tolerate a wrong-but-harmless config while write paths cannot.
+
+    Pass `allow_global_fallback=False` from any caller that WRITES merchant-owned
+    data. Read-only callers keep the historical default so their behaviour is
+    unchanged.
     """
     # Try per-merchant encrypted credentials first.
     try:
@@ -592,7 +632,14 @@ async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
             extra={"merchant_id": merchant_id, "error": str(e)},
         )
 
-    # Fallback to global configuration.
+    # Fallback to global configuration — the platform's own store, not this
+    # merchant's. Callers that write merchant-owned data opt out.
+    if not allow_global_fallback:
+        logger.warning(
+            "No per-merchant Shopify credentials; refusing the global env fallback",
+            extra={"merchant_id": merchant_id},
+        )
+        return {"shop_domain": "", "access_token": ""}
     return _get_shopify_config()
 
 
@@ -721,11 +768,32 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
     try:
         # Shopify connector import branch.
         if source_type == "connector" and connector == "shopify":
-            cfg = await _get_shopify_config_for_merchant(merchant_id)
+            # allow_global_fallback=False: this branch WRITES the merchant's
+            # catalog. Falling back to the platform's env store would import the
+            # platform's own products into this merchant's products_cache and
+            # then expire their real rows in the full-sync sweep below — a
+            # silent cross-merchant catalog overwrite, not a degraded import.
+            # Failing here is the correct outcome: ShopifyConfigError is
+            # terminal (see the retry handler), so a merchant with no
+            # credentials fails fast instead of retrying five times.
+            cfg = await _get_shopify_config_for_merchant(
+                merchant_id, allow_global_fallback=False
+            )
             shop_domain = cfg["shop_domain"]
             access_token = cfg["access_token"]
             if not shop_domain or not access_token:
-                raise ShopifyConfigError("Shopify configuration missing (SHOPIFY_STORE_URL/SHOPIFY_ACCESS_TOKEN)")
+                # The dominant reader of this string is a MERCHANT: the sync
+                # status endpoint returns the task row verbatim, with no message
+                # mapping. And the likeliest reader is someone whose Integrations
+                # page shows their store as connected — the endpoint gates on a
+                # merchant_stores row and never resolves a token, so a store with
+                # an unusable api_key passes the gate and lands here. "You have no
+                # store" would tell them to redo what they already did, and naming
+                # connector_credentials points them at an internal table.
+                raise ShopifyCredentialsUnavailableError(
+                    "Could not resolve a Shopify access token for this merchant. "
+                    "If your store shows as connected, please reconnect it in Integrations."
+                )
 
             shop_currency: Optional[str] = None
             try:
@@ -1433,6 +1501,12 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             counts["error_category"] = "auth"
         elif isinstance(exc, ShopifyConfigError):
             counts["error_category"] = "config"
+        elif isinstance(exc, ShopifyCredentialsUnavailableError):
+            # Distinct from "config" on purpose: a spike in THIS category means
+            # either a credential-resolution outage or a cohort of merchants
+            # whose stores no longer resolve, and both want a human. It is the
+            # signal to watch when CATALOG_IMPORT_DRAIN_ENABLED is first armed.
+            counts["error_category"] = "credentials_unavailable"
         else:
             counts["error_category"] = "upstream"
 
