@@ -53,6 +53,7 @@ def _args(tmp_path: Path, *, write: bool) -> argparse.Namespace:
         merchant_jwt="jwt-secret-value",
         merchant_api_key="merchant-hmac-secret" if write else None,
         write_canary=write,
+        confirm_dedicated_canary_store="store_canary" if write else None,
         run_id="run_20260831",
         amount_minor=100,
         refund_minor=25,
@@ -182,6 +183,13 @@ def test_write_canary_proves_ingest_replay_trace_and_stages(tmp_path: Path) -> N
     )
 
     assert report["overall_ok"] is True
+    funnel_calls = [
+        call
+        for call in session.calls
+        if call[0] == "GET" and call[1].endswith("/merchant/analytics/commerce-funnel")
+    ]
+    assert funnel_calls
+    assert all(call[2]["params"]["surface"] == "ops_canary" for call in funnel_calls)
     post_calls = [call for call in session.calls if call[0] == "POST"]
     assert len(post_calls) == 2
     assert all("Authorization" not in call[2]["headers"] for call in post_calls)
@@ -193,6 +201,20 @@ def test_write_canary_proves_ingest_replay_trace_and_stages(tmp_path: Path) -> N
     assert "merchant-hmac-secret" not in (tmp_path / "report.json").read_text(
         encoding="utf-8"
     )
+
+
+def test_write_canary_rejects_missing_or_mismatched_dedicated_store_confirmation(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path, write=True)
+    args.confirm_dedicated_canary_store = "another-store"
+
+    try:
+        module.run(args, session=_Session([]))
+    except ValueError as exc:
+        assert "dedicated canary store" in str(exc)
+    else:
+        raise AssertionError("write canary accepted an unconfirmed store")
 
 
 def test_missing_trace_event_fails_closed(tmp_path: Path) -> None:

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+import databases
 import pytest
+from sqlalchemy import create_engine
+
+from db.commerce_interactions import commerce_interaction_events
+from db.database import metadata
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +47,68 @@ def test_funnel_indexes_roll_out_concurrently_outside_startup_guard() -> None:
     ):
         assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}" in migration
         assert index_name not in schema_guard
+
+
+@pytest.mark.asyncio
+async def test_default_funnel_excludes_ops_canary_but_explicit_surface_can_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import services.merchant_commerce_event_funnel_service as module
+
+    db_path = tmp_path / "funnel-canary-exclusion.sqlite3"
+    sync_engine = create_engine(f"sqlite:///{db_path}")
+    metadata.create_all(sync_engine, tables=[commerce_interaction_events], checkfirst=True)
+    with sync_engine.begin() as connection:
+        connection.execute(
+            commerce_interaction_events.insert(),
+            [
+                {
+                    "event_id": "evt_real",
+                    "interaction_id": "int_real",
+                    "merchant_id": "merch_1",
+                    "platform": "shopify",
+                    "store_id": "store_1",
+                    "surface": "merchant_storefront",
+                    "event_type": "payment.succeeded",
+                    "occurred_at": datetime(2026, 9, 2, 12, 0),
+                    "payload": {"amount_cents": 5000, "currency": "USD"},
+                },
+                {
+                    "event_id": "evt_canary",
+                    "interaction_id": "int_canary",
+                    "merchant_id": "merch_1",
+                    "platform": "shopify",
+                    "store_id": "store_1",
+                    "surface": "ops_canary",
+                    "event_type": "payment.succeeded",
+                    "occurred_at": datetime(2026, 9, 2, 12, 1),
+                    "payload": {"amount_cents": 100, "currency": "USD"},
+                },
+            ],
+        )
+    sync_engine.dispose()
+
+    test_database = databases.Database(f"sqlite+aiosqlite:///{db_path}")
+    await test_database.connect()
+    monkeypatch.setattr(module, "database", test_database)
+    try:
+        default_result = await module.get_merchant_commerce_event_funnel(
+            merchant_id="merch_1", group_by="store"
+        )
+        canary_result = await module.get_merchant_commerce_event_funnel(
+            merchant_id="merch_1", group_by="store", surface="ops_canary"
+        )
+
+        assert default_result.payload["summary"]["events_total"] == 1
+        assert default_result.payload["summary"]["paid_amount_cents_by_currency"] == {
+            "USD": 5000
+        }
+        assert canary_result.payload["summary"]["events_total"] == 1
+        assert canary_result.payload["summary"]["paid_amount_cents_by_currency"] == {
+            "USD": 100
+        }
+    finally:
+        await test_database.disconnect()
 
 
 @pytest.fixture

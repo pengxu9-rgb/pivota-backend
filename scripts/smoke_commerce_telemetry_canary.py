@@ -96,6 +96,15 @@ def _parse_args() -> argparse.Namespace:
         help="Explicitly allow an eight-event synthetic write and idempotency replay.",
     )
     parser.add_argument(
+        "--confirm-dedicated-canary-store",
+        default=None,
+        metavar="STORE_ID",
+        help=(
+            "Required with --write-canary. Must exactly match --store-id to confirm "
+            "the target is dedicated to synthetic telemetry probes."
+        ),
+    )
+    parser.add_argument(
         "--run-id",
         default=None,
         help="Stable run identifier. Reusing it verifies idempotent replay without adding events.",
@@ -123,6 +132,13 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--merchant-jwt is required or set MERCHANT_JWT")
     if args.write_canary and not args.merchant_api_key:
         parser.error("--merchant-api-key is required with --write-canary")
+    if args.write_canary and _text(args.confirm_dedicated_canary_store) != _text(
+        args.store_id
+    ):
+        parser.error(
+            "--confirm-dedicated-canary-store must exactly match --store-id "
+            "when --write-canary is enabled"
+        )
     if args.amount_minor < 0 or args.refund_minor < 0:
         parser.error("canary amounts must be non-negative")
     if args.refund_minor > args.amount_minor:
@@ -331,7 +347,14 @@ def _record(
 
 
 def _analytics_params(args: argparse.Namespace) -> Dict[str, str]:
-    return {"group_by": "store", "platform": args.platform, "store_id": args.store_id}
+    params = {
+        "group_by": "store",
+        "platform": args.platform,
+        "store_id": args.store_id,
+    }
+    if args.write_canary:
+        params["surface"] = "ops_canary"
+    return params
 
 
 def _merchant_read_headers(args: argparse.Namespace) -> Dict[str, str]:
@@ -381,6 +404,13 @@ def run(
     sleep=time.sleep,
     monotonic=time.monotonic,
 ) -> Dict[str, Any]:
+    if args.write_canary and _text(
+        getattr(args, "confirm_dedicated_canary_store", None)
+    ) != _text(args.store_id):
+        raise ValueError(
+            "write canary requires confirmation that --store-id is a dedicated "
+            "canary store"
+        )
     base = _base_url(args.base_url)
     client = session or requests.Session()
     client.headers.update({"User-Agent": "pivota-commerce-telemetry-canary/1.0"})
