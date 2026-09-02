@@ -320,3 +320,80 @@ async def test_refund_txn_does_not_mistake_a_non_refund_row_for_the_refund(monke
 
     assert result["created"] is True
     assert len(creates) == 1
+
+
+@pytest.mark.asyncio
+async def test_refund_txn_annotates_when_there_is_no_refund_reference(monkeypatch):
+    """This path used to return before making ANY Shopify call, so unlike every
+    sibling non-write path it left nothing for the merchant to reconcile. On a
+    partial refund (no cancel step) the whole job then completed having touched
+    Shopify zero times."""
+    from services import shopify_transactions_service as svc
+
+    annotated = []
+
+    async def fake_annotate(**kwargs):
+        annotated.append(kwargs)
+        return {"ok": True, "status": 200}
+
+    async def fake_list(**_kwargs):
+        raise AssertionError("must not list transactions without a refund ref")
+
+    monkeypatch.setattr(svc, "annotate_shopify_order_best_effort", fake_annotate)
+    monkeypatch.setattr(svc, "list_shopify_order_transactions", fake_list)
+
+    result = await svc.ensure_external_refund_transaction_best_effort(
+        shop_domain="shop.myshopify.com",
+        access_token="token",
+        shopify_order_id="123",
+        psp_used="checkout",
+        external_refund_ref=None,
+        amount=12.0,
+        currency="USD",
+        pivota_order_id="ORD_NO_REF",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "missing_gateway_or_refund_ref"
+    assert result["annotation"]["ok"] is True
+    assert len(annotated) == 1
+    assert "pivota-missing-refund-reference" in annotated[0]["tags"]
+
+
+@pytest.mark.asyncio
+async def test_refund_txn_ignores_a_failed_refund_row_carrying_our_reference(monkeypatch):
+    """A FAILED refund transaction is not a refund. Without the status guard it
+    read as "already refunded", nothing was written, and the job completed."""
+    from services import shopify_transactions_service as svc
+
+    creates = []
+
+    async def fake_list(**_kwargs):
+        return [
+            {"id": 777, "gateway": "manual", "kind": "sale", "status": "success",
+             "authorization": "pi_parent"},
+            {"id": 888, "gateway": "stripe", "kind": "refund", "status": "failure",
+             "authorization": "re_FAILED"},
+        ]
+
+    async def fake_create(**kwargs):
+        creates.append(dict(kwargs["transaction"]))
+        return {"id": 9002}
+
+    monkeypatch.setattr(svc, "list_shopify_order_transactions", fake_list)
+    monkeypatch.setattr(svc, "create_shopify_order_transaction", fake_create)
+
+    result = await svc.ensure_external_refund_transaction_best_effort(
+        shop_domain="shop.myshopify.com",
+        access_token="token",
+        shopify_order_id="123",
+        psp_used="stripe",
+        external_refund_ref="re_FAILED",
+        amount=12.0,
+        currency="USD",
+        parent_transaction_id=777,
+        pivota_order_id="ORD_FAILED_ROW",
+    )
+
+    assert result["created"] is True
+    assert len(creates) == 1

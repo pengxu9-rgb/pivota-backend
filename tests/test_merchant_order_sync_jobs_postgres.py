@@ -236,7 +236,7 @@ async def test_a_late_write_from_an_expired_lease_cannot_disturb_the_new_holder(
     wrote = await complete_merchant_order_sync_job(
         job_id=a["job_id"], worker_id="worker-a"
     )
-    assert wrote is False
+    assert wrote == "lease_lost"
 
     status = await fail_merchant_order_sync_job(
         job_id=a["job_id"], worker_id="worker-a", attempts=1, max_attempts=5,
@@ -300,3 +300,39 @@ async def test_progress_is_lease_fenced():
     assert await record_merchant_order_sync_progress(
         job_id=job["job_id"], worker_id="someone-else", progress={"x": True},
     ) is False
+
+
+async def test_complete_is_lease_fenced_and_reports_why():
+    """`fail` and `progress` fences were covered; `complete`'s was not, despite
+    being the one that decides whether a job is recorded as done."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+    )
+    from db.database import database
+
+    order_id = _order_id()
+    await _enqueue(order_id)
+    a = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs "
+        "SET claimed_until = NOW() - INTERVAL '1 minute' WHERE job_id = :j",
+        {"j": a["job_id"]},
+    )
+    b = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert b is not None
+
+    assert await complete_merchant_order_sync_job(
+        job_id=a["job_id"], worker_id="worker-a"
+    ) == "lease_lost"
+
+    assert await complete_merchant_order_sync_job(
+        job_id=a["job_id"], worker_id="worker-b"
+    ) == "written"
+
+    row = dict(await database.fetch_one(
+        "SELECT status FROM merchant_order_sync_jobs WHERE job_id = :j",
+        {"j": a["job_id"]},
+    ))
+    assert row["status"] == "done"

@@ -309,7 +309,7 @@ async def record_merchant_order_sync_progress(
         return False
 
 
-async def complete_merchant_order_sync_job(*, job_id: str, worker_id: str) -> bool:
+async def complete_merchant_order_sync_job(*, job_id: str, worker_id: str) -> str:
     """Mark done, but ONLY while this worker still holds the lease.
 
     Without the `claimed_by_worker` fence a slow worker whose lease expired —
@@ -319,7 +319,9 @@ async def complete_merchant_order_sync_job(*, job_id: str, worker_id: str) -> bo
     run that overshoots its deadline as a live zombie, so the zombie tick and
     the next tick race on the same rows.
 
-    Returns True iff this call actually wrote.
+    Returns "written", "lease_lost" (a sibling owns the job now), or
+    "write_failed" (the UPDATE itself raised — the work DID reach Shopify, the
+    row just does not say so yet, and the lease reaper will hand it back).
     """
     now = _now_utc()
     try:
@@ -339,13 +341,13 @@ async def complete_merchant_order_sync_job(*, job_id: str, worker_id: str) -> bo
                 "another worker owns it now",
                 job_id,
             )
-            return False
-        return True
+            return "lease_lost"
+        return "written"
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "merchant_order_sync: complete failed for %s: %s", job_id, str(exc)[:200]
         )
-        return False
+        return "write_failed"
 
 
 async def fail_merchant_order_sync_job(

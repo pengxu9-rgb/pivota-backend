@@ -36,15 +36,14 @@ _SHOPIFY_API_VERSION = "2025-10"
 
 
 class _RetryableSyncError(Exception):
-    """Raised when the job should be re-queued rather than treated as done."""
+    """Raised when the job should be re-queued rather than treated as done.
 
-
-class _TerminalSyncError(Exception):
-    """Raised when no number of retries can change the outcome.
-
-    Burning the whole attempt budget on these costs 2h of backoff and then
-    fires the `GAVE UP` money-path incident, which should mean "we tried and
-    Shopify would not take it", not "this job was never going to work".
+    There is deliberately no terminal counterpart. The conditions that looked
+    terminal — no bound store, no primary store — are both resolved through
+    `status IN ('active','connected')`, so a merchant re-authing their Shopify
+    app flips them within minutes. Failing fast on those fires the money-path
+    incident for something the attempt budget absorbs, and a job that genuinely
+    cannot succeed still ends `failed` after the budget, which is visible.
     """
 
 
@@ -93,34 +92,52 @@ async def _resolve_store_for_refund(payload: Dict[str, Any]) -> Dict[str, Any]:
     cancelling, and `routes/order_routes.sync_order_to_connected_store` takes
     the same stance.
     """
-    from services.merchant_store_service import get_primary_store, get_store_by_id
+    from services.merchant_store_service import get_merchant_active_stores
 
     merchant_id = str(payload.get("merchant_id") or "")
     bound_store_id = str(payload.get("store_id") or "").strip() or None
 
-    if bound_store_id:
-        store = await get_store_by_id(bound_store_id, merchant_id=merchant_id)
-        if not store:
-            # RETRYABLE, not terminal: `get_store_by_id` filters on
-            # status IN ('active','connected'), so a merchant re-authing their
-            # Shopify app flips disconnected -> active within minutes. The
-            # attempt budget absorbs that; giving up on the first attempt would
-            # fire the money-path incident for a condition that fixes itself.
-            raise _RetryableSyncError(
-                f"bound store {bound_store_id} is missing or inactive; refusing "
-                "to fall back to the primary store"
-            )
-        return store
+    # Resolve through `get_merchant_active_stores`, NOT `get_store_by_id`.
+    #
+    # `get_store_by_id` queries `merchant_stores` alone, but the id bound onto
+    # an order can come from elsewhere: `get_merchant_active_stores` SYNTHESISES
+    # `legacy_<merchant_id>` for a merchant with no store row but an
+    # `merchant_onboarding.mcp_platform`, and order creation binds that id
+    # verbatim. Resolving such an order through `get_store_by_id` returns None
+    # forever — so every refund for that merchant burned the whole attempt
+    # budget and fired the money-path incident, on a merchant whose store and
+    # token both work.
+    stores = await get_merchant_active_stores(merchant_id) or []
+    shopify_stores = [
+        s for s in stores
+        if str((s or {}).get("platform") or "").strip().lower() == "shopify"
+    ]
 
-    store = await get_primary_store(merchant_id)
-    if not store:
-        # TERMINAL: no bound store and no primary store is a structural gap, not
-        # a blip. Retrying for two hours and then paging says "Shopify would not
-        # take it" when the truth is there was never a store to write to.
-        raise _TerminalSyncError(
-            "no store is connected for this merchant; nothing to sync to"
+    if bound_store_id:
+        for store in shopify_stores:
+            if str(store.get("store_id") or "") == bound_store_id:
+                return store
+
+    if len(shopify_stores) == 1:
+        # The bound id names no Shopify store this merchant has — it is a legacy
+        # id, a detached row, or (routinely) a non-Shopify primary, because
+        # order creation binds the platform-agnostic primary while the Shopify
+        # order write falls back to any active Shopify store. With exactly one
+        # Shopify store there is nothing to guess: that is where the order is.
+        return shopify_stores[0]
+
+    if not shopify_stores:
+        raise _RetryableSyncError(
+            "no active Shopify store for this merchant; nothing to sync to"
         )
-    return store
+
+    # Several Shopify stores and a bound id matching none of them. Guessing here
+    # is how a refund gets cancelled on the wrong shop, which is worse than not
+    # cancelling — refuse and let the attempt budget expose it.
+    raise _RetryableSyncError(
+        f"bound store {bound_store_id} matches none of this merchant's "
+        f"{len(shopify_stores)} Shopify stores; refusing to guess"
+    )
 
 
 async def _run_refund_sync_job(
@@ -151,10 +168,6 @@ async def _run_refund_sync_job(
         return {"skipped": "no_shopify_order_or_merchant"}
 
     store_info = await _resolve_store_for_refund(payload)
-    if str(store_info.get("platform") or "").lower() != "shopify":
-        raise _RetryableSyncError(
-            f"bound store is platform={store_info.get('platform')!r}, not shopify"
-        )
 
     shop_domain = store_info.get("domain")
     access_token, _ = await resolve_shopify_admin_access_token(
@@ -191,35 +204,40 @@ async def _run_refund_sync_job(
             pivota_order_id=order_id,
         )
         result["transaction_sync"] = sync
-        if isinstance(sync, dict) and not sync.get("ok"):
+        if isinstance(sync, dict):
             reason = str(sync.get("reason") or "").strip()
-            if reason not in _TERMINAL_SYNC_REASONS:
-                # Covers the writer's explicit `retryable` refusal (the
-                # transaction list was unreadable) AND every bare failure it
-                # returns without one, e.g. a 5xx from the create call.
+
+            if not sync.get("ok") and reason not in _TERMINAL_SYNC_REASONS:
+                # The writer's explicit `retryable` refusal (the transaction
+                # list was unreadable) AND every bare failure it returns without
+                # one, e.g. a 5xx from the create call.
                 raise _RetryableSyncError(
                     "refund transaction sync did not succeed: "
                     f"reason={reason or None} error={sync.get('error')}"
                 )
-            # Nothing to write and no retry can change that; record it as its
-            # own outcome rather than letting it read as a clean success.
-            result["transaction_sync_skipped"] = reason
-        elif sync.get("soft_skipped"):
-            # `ok: True` here means the writer could NOT write the refund
-            # transaction (no parent to attach it to) and fell back to
-            # annotating the order for a human. That annotation is itself
-            # best-effort: `annotate_shopify_order_best_effort` returns
-            # ok:False on any non-2xx. If neither landed, nothing at all
-            # reached Shopify, and completing would leave exactly the
-            # unreconcilable state this queue exists to prevent.
-            annotation = sync.get("annotation")
-            if not (isinstance(annotation, dict) and annotation.get("ok")):
-                raise _RetryableSyncError(
-                    "refund transaction was not written "
-                    f"(reason={sync.get('reason')}) and the fallback annotation "
-                    "did not land either"
-                )
-            result["transaction_sync_soft_skipped"] = str(sync.get("reason") or "")
+
+            # THE RULE, stated once instead of per-path: a job may only complete
+            # when something actually reached the merchant's order. `created`
+            # means the refund transaction was written; a dedupe hit means it was
+            # already there. Every other outcome wrote nothing, and is allowed to
+            # complete ONLY if the fallback annotation landed — which is itself
+            # best-effort and returns ok:False on any non-2xx.
+            #
+            # Three review rounds each found a different path that completed
+            # having written nothing and annotated nothing: a bare `ok: False`,
+            # a `soft_skipped` whose annotation failed, and a
+            # `missing_gateway_or_refund_ref` that returned before any HTTP at
+            # all. This predicate covers them together.
+            wrote_something = bool(sync.get("ok")) and not sync.get("soft_skipped")
+            if not wrote_something:
+                annotation = sync.get("annotation")
+                if not (isinstance(annotation, dict) and annotation.get("ok")):
+                    raise _RetryableSyncError(
+                        "nothing reached the merchant's order: the refund "
+                        f"transaction was not written (reason={reason or None}) "
+                        "and the fallback annotation did not land either"
+                    )
+                result["transaction_sync_soft_skipped"] = reason
         progress[_STEP_TRANSACTION] = True
         if on_progress is not None:
             await on_progress(progress)
@@ -366,7 +384,7 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
             wrote = await complete_merchant_order_sync_job(
                 job_id=job_id, worker_id=WORKER_ID
             )
-            if wrote:
+            if wrote == "written":
                 summary["done"] += 1
                 logger.info(
                     "merchant_order_sync: %s done job=%s order=%s result=%s",
@@ -375,18 +393,27 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                     job.get("order_id"),
                     result,
                 )
+            elif wrote == "write_failed":
+                # The work reached Shopify; only the row does not say so. Do NOT
+                # report this as a lost lease — nobody else owns the job, it is
+                # simply unrecorded until the reaper hands it back.
+                summary["write_failed"] += 1
+                logger.error(
+                    "merchant_order_sync: job=%s order=%s SUCCEEDED but the "
+                    "completion could not be recorded; it stays leased until "
+                    "expiry and will be redone (idempotently)",
+                    job_id,
+                    job.get("order_id"),
+                )
             else:
                 # Our lease expired and a sibling owns the job now. The work
                 # itself was idempotent, so the sibling redoing it is safe.
                 summary["lease_lost"] += 1
         except Exception as exc:  # noqa: BLE001
-            # A terminal error spends the whole budget at once: retrying cannot
-            # change it, and the operator should see it now rather than in 2h.
-            spent = max_attempts if isinstance(exc, _TerminalSyncError) else attempts
             status = await fail_merchant_order_sync_job(
                 job_id=job_id,
                 worker_id=WORKER_ID,
-                attempts=spent,
+                attempts=attempts,
                 max_attempts=max_attempts,
                 error=f"{type(exc).__name__}: {exc}",
             )

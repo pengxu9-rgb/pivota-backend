@@ -166,7 +166,7 @@ def _wire_drain(monkeypatch, job, handler=None):
     async def fake_complete(*, job_id, worker_id):
         seen["completed"].append(job_id)
         seen["complete_worker"] = worker_id
-        return True
+        return "written"
 
     async def fake_fail(*, job_id, worker_id, attempts, max_attempts, error):
         status = "failed" if int(attempts) >= int(max_attempts) else "pending"
@@ -258,7 +258,7 @@ async def test_a_lost_lease_is_not_counted_as_done(monkeypatch):
     seen = _wire_drain(monkeypatch, _job(), handler=handler)
 
     async def lease_lost(*, job_id, worker_id):
-        return False
+        return "lease_lost"
 
     monkeypatch.setattr(drain, "complete_merchant_order_sync_job", lease_lost)
 
@@ -300,8 +300,13 @@ class _FakeAsyncClient:
 
 
 def _wire_handler(monkeypatch, *, cancel_response=None, store=None,
-                  bound_store=None, sync_result=None):
-    """Patch the modules the handler imports at call time."""
+                  bound_store=None, sync_result=None, stores=None):
+    """Patch the modules the handler imports at call time.
+
+    `stores` gives the raw list when a test needs several; otherwise it is built
+    from `bound_store` (the order's bound store) and `store` (the merchant's
+    other/primary store), which is how most of these read.
+    """
     import httpx
 
     import services.merchant_store_service as store_svc
@@ -310,11 +315,15 @@ def _wire_handler(monkeypatch, *, cancel_response=None, store=None,
 
     calls = {"cancel": [], "sync": [], "progress": []}
 
-    async def fake_primary(merchant_id):
-        return store
-
-    async def fake_by_id(store_id, *, merchant_id=None):
-        return bound_store
+    async def fake_active_stores(merchant_id):
+        if stores is not None:
+            return list(stores)
+        out = []
+        if bound_store:
+            out.append(bound_store)
+        if store:
+            out.append(store)
+        return out
 
     async def fake_token(**kwargs):
         return "shpat_token", None
@@ -323,8 +332,7 @@ def _wire_handler(monkeypatch, *, cancel_response=None, store=None,
         calls["sync"].append(kwargs)
         return sync_result if sync_result is not None else {"ok": True, "created": True}
 
-    monkeypatch.setattr(store_svc, "get_primary_store", fake_primary)
-    monkeypatch.setattr(store_svc, "get_store_by_id", fake_by_id)
+    monkeypatch.setattr(store_svc, "get_merchant_active_stores", fake_active_stores)
     monkeypatch.setattr(token_svc, "resolve_shopify_admin_access_token", fake_token)
     monkeypatch.setattr(
         txn_svc, "ensure_external_refund_transaction_best_effort", fake_sync
@@ -359,6 +367,9 @@ def _payload(**over):
 
 
 _SHOPIFY_STORE = {"platform": "shopify", "domain": "x.myshopify.com", "store_id": "st_1"}
+_OTHER_SHOPIFY_STORE = {
+    "platform": "shopify", "domain": "other.myshopify.com", "store_id": "st_other",
+}
 
 
 @pytest.mark.asyncio
@@ -480,30 +491,71 @@ async def test_handler_prefers_the_bound_store_over_the_primary(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handler_refuses_to_fall_back_when_the_bound_store_is_gone(monkeypatch):
-    """Cancelling on the wrong shop is worse than not cancelling.
-
-    RETRYABLE, not terminal: `get_store_by_id` filters on
-    status IN ('active','connected'), so a merchant re-authing their Shopify app
-    flips disconnected -> active well inside the attempt budget.
-    """
-    _wire_handler(monkeypatch, store=_SHOPIFY_STORE, bound_store=None)
+async def test_handler_refuses_to_guess_between_several_shopify_stores(monkeypatch):
+    """Cancelling on the wrong shop is worse than not cancelling. With more than
+    one Shopify store and a bound id matching none of them, guessing is exactly
+    how a refund lands on the wrong merchant shop."""
+    _wire_handler(
+        monkeypatch, stores=[_SHOPIFY_STORE, _OTHER_SHOPIFY_STORE]
+    )
 
     with pytest.raises(drain._RetryableSyncError):
         await drain._run_refund_sync_job(_payload(store_id="st_missing"), {}, None)
 
 
 @pytest.mark.asyncio
-async def test_a_terminal_error_spends_the_whole_budget_at_once(monkeypatch):
-    async def handler(payload, progress=None, on_progress=None):
-        raise drain._TerminalSyncError("no store is connected for this merchant")
+async def test_a_legacy_bound_store_id_still_resolves(monkeypatch):
+    """`get_merchant_active_stores` SYNTHESISES `legacy_<merchant_id>` for a
+    merchant with no store row but an mcp_platform, and order creation binds
+    that id verbatim. Resolving it through `get_store_by_id` — which queries
+    merchant_stores alone — returned None forever, so every refund for that
+    merchant burned the budget and paged, on a store whose token works."""
+    legacy = {
+        "platform": "shopify",
+        "domain": "legacy.myshopify.com",
+        "store_id": "legacy_merch_1",
+        "source": "legacy_mcp",
+    }
+    calls = _wire_handler(monkeypatch, stores=[legacy])
 
-    seen = _wire_drain(monkeypatch, _job(attempts=1, max_attempts=10), handler=handler)
+    await drain._run_refund_sync_job(_payload(store_id="legacy_merch_1"), {}, None)
+
+    assert "legacy.myshopify.com" in calls["cancel"][0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_shopify_bound_store_falls_back_to_the_only_shopify_one(monkeypatch):
+    """Order creation binds the platform-agnostic PRIMARY store while the
+    Shopify order write falls back to any active Shopify store — so an order can
+    carry a shopify_order_id and a store_id pointing at the Woo row."""
+    woo = {"platform": "woocommerce", "domain": "shop.example", "store_id": "st_woo"}
+    calls = _wire_handler(monkeypatch, stores=[woo, _SHOPIFY_STORE])
+
+    await drain._run_refund_sync_job(_payload(store_id="st_woo"), {}, None)
+
+    assert "x.myshopify.com" in calls["cancel"][0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_completion_is_not_reported_as_a_lost_lease(monkeypatch):
+    """The work DID reach Shopify; only the row does not say so. Reporting a
+    lost lease says another worker owns it, which is false."""
+
+    async def handler(payload, progress=None, on_progress=None):
+        return {"cancelled": True}
+
+    _wire_drain(monkeypatch, _job(), handler=handler)
+
+    async def complete_write_fails(*, job_id, worker_id):
+        return "write_failed"
+
+    monkeypatch.setattr(drain, "complete_merchant_order_sync_job", complete_write_fails)
+
     summary = await drain.run_merchant_order_sync_worker_tick()
 
-    assert summary["failed"] == 1
-    assert summary["requeued"] == 0
-    assert seen["failed"][0]["status"] == "failed"
+    assert summary["write_failed"] == 1
+    assert summary["lease_lost"] == 0
+    assert summary["done"] == 0
 
 
 @pytest.mark.asyncio
@@ -565,21 +617,68 @@ async def test_handler_retries_a_bare_transaction_write_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handler_treats_a_missing_refund_reference_as_terminal(monkeypatch):
-    """Genuinely un-retryable — but recorded as its own outcome rather than
-    reading as a clean success."""
+async def test_a_missing_refund_reference_completes_only_once_annotated(monkeypatch):
+    """No retry can produce a reference, so the transaction can never be
+    written — but the order must still carry the annotation, or nothing at all
+    reached the merchant."""
     calls = _wire_handler(
         monkeypatch,
         store=_SHOPIFY_STORE,
         sync_result={"ok": False, "skipped": True,
-                     "reason": "missing_gateway_or_refund_ref"},
+                     "reason": "missing_gateway_or_refund_ref",
+                     "annotation": {"ok": True, "status": 200}},
     )
 
     result = await drain._run_refund_sync_job(_payload(refund_id=None), {}, None)
 
-    assert result["transaction_sync_skipped"] == "missing_gateway_or_refund_ref"
+    assert result["transaction_sync_soft_skipped"] == "missing_gateway_or_refund_ref"
     # The cancel still runs: a full refund must still cancel the merchant order.
     assert len(calls["cancel"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_partial_refund_with_no_reference_cannot_complete_silently(monkeypatch):
+    """THE BLOCKER round four found, and the fourth instance of one class.
+
+    `missing_gateway_or_refund_ref` returned before any HTTP, so unlike every
+    sibling non-write path it annotated nothing. On a PARTIAL refund the cancel
+    step is skipped too, so the job completed having made ZERO Shopify calls:
+    buyer refunded, merchant's order carrying no transaction, no note attribute
+    and no tag, and the queue recording `done`.
+
+    Reachable today: adapters/checkout_adapter returns `action_id or id`, which
+    is None when the 202 body carries neither.
+    """
+    calls = _wire_handler(
+        monkeypatch,
+        store=_SHOPIFY_STORE,
+        sync_result={"ok": False, "skipped": True,
+                     "reason": "missing_gateway_or_refund_ref",
+                     "annotation": {"ok": False, "status": 500}},
+    )
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_refund_sync_job(
+            _payload(refund_id=None, is_partial=True), {}, None
+        )
+
+    assert calls["cancel"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_transaction_only_job_cannot_complete_without_reaching_shopify(monkeypatch):
+    """The readiness surface sets skip_cancel, so the transaction IS the whole
+    job — there is no second step to make the outcome visible."""
+    _wire_handler(
+        monkeypatch,
+        store=_SHOPIFY_STORE,
+        sync_result={"ok": True, "created": False, "soft_skipped": True,
+                     "reason": "missing_parent_transaction",
+                     "annotation": {"ok": False, "status": 502}},
+    )
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_refund_sync_job(_payload(skip_cancel=True), {}, None)
 
 
 @pytest.mark.asyncio
@@ -770,12 +869,13 @@ async def test_an_unknown_op_that_loses_its_lease_is_not_counted_as_requeued(mon
 
 
 @pytest.mark.asyncio
-async def test_no_connected_store_at_all_is_terminal(monkeypatch):
-    """Structural, not a blip: retrying for two hours and then paging says
-    "Shopify would not take it" when there was never a store to write to."""
+async def test_no_shopify_store_is_retryable_not_terminal(monkeypatch):
+    """`get_merchant_active_stores` filters status IN ('active','connected'), so
+    "no store" and "store mid-reconnect" are indistinguishable here — failing
+    fast fires the money-path incident for something that self-heals."""
     _wire_handler(monkeypatch, store=None)
 
-    with pytest.raises(drain._TerminalSyncError):
+    with pytest.raises(drain._RetryableSyncError):
         await drain._run_refund_sync_job(_payload(), {}, None)
 
 
