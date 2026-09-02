@@ -220,10 +220,37 @@ def main() -> int:
             if active and args.deactivate:
                 print("\n--deactivate: taking these rows out of runtime selection")
                 for row in active:
-                    cursor.execute(
-                        "UPDATE merchant_psps SET status = 'inactive' WHERE psp_id = %s",
-                        (row["psp_id"],),
-                    )
+                    # ORDERING TRAP, verified on Postgres 15 against a real prod
+                    # row. Migration 207 puts CHECK check_merchant_psps_psp_id_format
+                    # on this table. NOT VALID spares EXISTING rows at ADD time but
+                    # enforces every subsequent UPDATE -- including one that does
+                    # not touch psp_id at all. So a row whose psp_id is ALSO
+                    # malformed cannot be deactivated: the UPDATE below is refused
+                    # by a constraint about a column it is not changing.
+                    #
+                    # That is not hypothetical. In production on 2026-09-02 every
+                    # single unaccepted-provider row ALSO carried a malformed
+                    # psp_id -- both are the signature of the same pre-fix
+                    # setup-psp mint -- so without this, --deactivate would fail on
+                    # every row it was pointed at.
+                    #
+                    # Repair first (scripts/audit_malformed_psp_ids.py --repair):
+                    # that UPDATE rewrites psp_id to a CONFORMING value, so the
+                    # resulting row satisfies the constraint and is allowed.
+                    try:
+                        cursor.execute(
+                            "UPDATE merchant_psps SET status = 'inactive' WHERE psp_id = %s",
+                            (row["psp_id"],),
+                        )
+                    except Exception as exc:
+                        conn.rollback()
+                        raise SystemExit(
+                            f"REFUSING to continue: could not deactivate {row['psp_id']!r}: {exc}\n"
+                            "If this is check_merchant_psps_psp_id_format, the row's psp_id is "
+                            "malformed too and NO update to it is possible until that is fixed.\n"
+                            "Run this first, then re-run --deactivate:\n"
+                            "    python scripts/audit_malformed_psp_ids.py --repair"
+                        )
                     row["deactivated"] = True
                     print(f"  {row['psp_id']} -> status=inactive")
                 conn.commit()

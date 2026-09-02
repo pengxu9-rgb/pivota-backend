@@ -51,9 +51,43 @@ def _extract_public_key(config: Optional[Dict[str, Any]]) -> Optional[str]:
 
 
 def _generate_psp_id(provider: str) -> str:
+    """Mint a psp_id that `orders` and `merchant_psps` will both accept.
+
+    The rule, from db/migrations/006_psp_fields_constraints.sql and mirrored by
+    migration 207:
+
+        ^psp_[a-z0-9]+_[a-z0-9]{12}$
+
+    Note the PROVIDER segment: `[a-z0-9]+`. No underscores, no uppercase, no
+    punctuation. This function used to interpolate the provider raw, so it
+    produced an id its own constraint refuses for any provider that is not pure
+    lowercase alphanumeric:
+
+        _generate_psp_id("other_manual_test")
+            -> 'psp_other_manual_test_eh8btx4ukza2'   REJECTED
+
+    That is not theoretical. Production carries an ACTIVE merchant_psps row with
+    provider 'other_manual_test' (merch_9b3c4e68b9f76d79, observed 2026-09-02),
+    and scripts/audit_malformed_psp_ids.py --repair — the tool whose whole job is
+    to rewrite a malformed psp_id into a canonical one — CRASHED on it, because
+    the canonical id it generated was itself malformed. The repair for a bad id
+    could not be applied to the row that needed it most.
+
+    Sanitising here rather than at the call sites is deliberate: this function is
+    the single definition of "canonical", and every caller
+    (persist_canonical_merchant_psp, the audit script, the tests) is entitled to
+    assume its output satisfies the constraint. Callers already lowercase the
+    provider, so for every supported provider — stripe, adyen, checkout, paypal,
+    antom — the output is byte-identical to before.
+    """
     alphabet = string.ascii_lowercase + string.digits
     suffix = "".join(secrets.choice(alphabet) for _ in range(12))
-    return f"psp_{provider}_{suffix}"
+    # `[a-z0-9]+` — one or more, so an all-punctuation provider still needs a
+    # segment. "psp" is a recognisable stand-in, and the row's `provider` column
+    # remains the authority on what the PSP actually is; psp_id is an identifier,
+    # not a label.
+    segment = "".join(ch for ch in str(provider or "").strip().lower() if ch in alphabet) or "psp"
+    return f"psp_{segment}_{suffix}"
 
 
 def default_capabilities_for_provider(provider: str) -> List[str]:

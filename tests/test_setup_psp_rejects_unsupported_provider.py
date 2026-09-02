@@ -286,6 +286,57 @@ def test_the_canonical_generator_satisfies_the_orders_format_rule() -> None:
         assert psp_id.startswith(f"psp_{provider}_")
 
 
+@pytest.mark.parametrize(
+    "provider",
+    [
+        "other_manual_test",  # a REAL active production row, observed 2026-09-02
+        "Square",
+        "Checkout.com",
+        "protocol_deferred",
+        "",
+        "___",
+        "  MoLLie  ",
+    ],
+)
+def test_the_generator_conforms_for_a_provider_it_was_never_designed_for(provider) -> None:
+    """The provider SEGMENT is `[a-z0-9]+` — no underscores, no uppercase, no dots.
+
+    _generate_psp_id interpolated the provider raw, so it minted an id its OWN
+    constraint refuses for anything that is not pure lowercase alphanumeric:
+
+        _generate_psp_id("other_manual_test") -> 'psp_other_manual_test_...'  REJECTED
+
+    Found the hard way. Production carries an ACTIVE merchant_psps row with
+    provider 'other_manual_test' (merch_9b3c4e68b9f76d79), and
+    scripts/audit_malformed_psp_ids.py --repair — the tool whose entire job is to
+    turn a malformed psp_id into a canonical one — CRASHED on it, because the
+    "canonical" id it produced was itself malformed. The repair could not be
+    applied to the row that needed it most.
+
+    This is the same writer/reader disagreement as everything else in this change,
+    but one level down: in the function every other fix delegates to as the
+    authority on what "canonical" means.
+    """
+    from services.merchant_psp_config_service import _generate_psp_id
+
+    psp_id = _generate_psp_id(provider)
+    assert re.fullmatch(r"psp_[a-z0-9]+_[a-z0-9]{12}", psp_id), (provider, psp_id)
+
+
+def test_sanitising_did_not_change_the_id_shape_for_supported_providers() -> None:
+    """The fix must be invisible where nothing was wrong.
+
+    Every provider the endpoint accepts is pure lowercase alphanumeric, so the
+    sanitiser is a no-op on all of them — the segment must still be the provider
+    name itself, not a mangled version of it.
+    """
+    from routes.employee_store_psp_fixes import SETUP_PSP_ALLOWED_PROVIDERS
+    from services.merchant_psp_config_service import _generate_psp_id
+
+    for provider in sorted(SETUP_PSP_ALLOWED_PROVIDERS):
+        assert _generate_psp_id(provider).startswith(f"psp_{provider}_"), provider
+
+
 @pytest.mark.parametrize("provider", ["STRIPE", " Stripe ", "AnToM"])
 async def test_case_and_whitespace_are_normalised_the_way_the_row_will_be(
     provider: str, _merchant_lookup_table
