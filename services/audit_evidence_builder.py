@@ -946,8 +946,13 @@ async def record_audit_basis(
     audit_run_id: str,
     brand_report: Mapping[str, Any],
     merchant_id: Optional[str],
+    persist: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """A3: record, immutably, what this run was measured WITH.
+
+    With ``persist=False`` this builds and returns the basis PAYLOAD without
+    writing it — what services/audit_delta needs for the CURRENT run, whose row
+    does not exist yet when the delta is attached.
 
     Called at audit completion, from `persist_canonical_evidence` — the one
     place that already receives the assembled report, the run id and the
@@ -958,9 +963,12 @@ async def record_audit_basis(
     (db/audit_basis.record_basis), so a worker reclaim after a crash re-enters
     this path safely.
     """
-    if not audit_run_id or not merchant_id:
+    # audit_run_id is only needed to WRITE. The comparability path builds the
+    # current run's basis before that run has an id to write under, and passes
+    # "" deliberately — gating on it there made this whole feature inert.
+    if not merchant_id or (persist and not audit_run_id):
         return None
-    from db.audit_basis import record_basis
+    from db.audit_basis import METHODOLOGY_VERSION, record_basis
     from db.merchant_official_domains import is_excluded, list_official_domains
     from services.primary_destination import PRIMARY_DESTINATION_VERSION
 
@@ -1002,18 +1010,37 @@ async def record_audit_basis(
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning("record_audit_basis: locale read failed: %s", str(exc)[:200])
 
+    # Normalise EXACTLY as db.audit_basis.record_basis does before storing.
+    # It writes sorted({lower(strip(d))}); this path returned the raw
+    # list_official_domains order, which has no ORDER BY. Comparing the two
+    # shapes made a run non-comparable with ITSELF, so every multi-domain
+    # merchant would have been told their basis changed on every re-audit —
+    # the same defect as the one being fixed, pointing the other way.
+    domains = sorted({str(d).strip().lower() for d in domains if str(d).strip()})
+
+    payload = {
+        "providers_and_models": build_providers_and_models(brand_report),
+        "prompt_set_id": set_ids["prompt_set_id"],
+        "selected_set_id": set_ids["selected_set_id"],
+        "tier_mix": build_tier_mix(brand_report),
+        "official_domains": domains,
+        "primary_destination_version": PRIMARY_DESTINATION_VERSION,
+        "market": market,
+        "language": language,
+        "currency": None,
+    }
+    if not persist:
+        # The comparability path wants the SHAPE, not a row: at delta-attach
+        # time this run's basis has not been written yet (persist_canonical_
+        # evidence runs later, from the worker), so reading it back would always
+        # return None and the check would be permanently inert.
+        payload["methodology_version"] = METHODOLOGY_VERSION
+        return payload
+
     return await record_basis(
         audit_run_id=str(audit_run_id),
         merchant_id=str(merchant_id),
-        providers_and_models=build_providers_and_models(brand_report),
-        prompt_set_id=set_ids["prompt_set_id"],
-        selected_set_id=set_ids["selected_set_id"],
-        tier_mix=build_tier_mix(brand_report),
-        official_domains=domains,
-        primary_destination_version=PRIMARY_DESTINATION_VERSION,
-        market=market,
-        language=language,
-        currency=None,
+        **payload,
     )
 
 

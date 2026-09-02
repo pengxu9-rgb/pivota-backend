@@ -16577,6 +16577,41 @@ def _build_history_trend(
     }
 
 
+
+async def _basis_pair_for_delta(
+    report: Mapping[str, Any],
+    merchant_id: Optional[str],
+    prior_run_id: Optional[str],
+) -> tuple:
+    """(current_basis, prior_basis) for audit_delta's comparability check.
+
+    The CURRENT run's basis is built in memory, not read: persist_canonical_
+    evidence writes it later (from the worker), so at attach time the row does
+    not exist and a read would make the check permanently inert. The PRIOR run's
+    basis is a real stored row.
+
+    Best-effort and returns (None, None) on any failure, which falls audit_delta
+    back to its prompt-set-only verdict — the behaviour before this wiring.
+    """
+    if not merchant_id or not prior_run_id:
+        return (None, None)
+    try:
+        from db.audit_basis import get_basis_for_run
+        from services.audit_evidence_builder import record_audit_basis
+
+        prior = await get_basis_for_run(str(prior_run_id))
+        if not prior:
+            return (None, None)
+        current = await record_audit_basis(
+            audit_run_id="", brand_report=report,
+            merchant_id=merchant_id, persist=False,
+        )
+        return (current, prior)
+    except Exception as exc:  # noqa: BLE001 - comparability must not sink the audit
+        logger.warning("basis pair for delta failed: %s", str(exc)[:200])
+        return (None, None)
+
+
 async def _attach_reaudit_delta(
     report: Dict[str, Any],
     *,
@@ -16632,11 +16667,16 @@ async def _attach_reaudit_delta(
         )
         if not isinstance(prior_report, dict):
             return report
+        # A3: the two runs' measurement bases, so a model / official-domain /
+        # tier-mix change is not narrated to the merchant as their own movement.
+        _legacy_bases = await _basis_pair_for_delta(report, merchant_id, prior_run_id)
         merchant_view["reaudit_delta"] = build_reaudit_delta(
             current_report=report,
             prior_report=prior_report,
             prior_row=prior_row,
             days_since=_days_between(prior_row.get("requested_at")),
+            current_basis=_legacy_bases[0],
+            prior_basis=_legacy_bases[1],
         )
         # Audit→action→outcome loop: what changed at the hosts the PRIOR
         # report told the merchant to target. Reuses the measurement basis
@@ -16756,12 +16796,17 @@ async def _attach_outreach_outcomes_per_sku(
         )
         if not isinstance(prior_report, dict):
             return report
+        # A3: the two runs' measurement bases, so a model / official-domain /
+        # tier-mix change is not narrated to the merchant as their own movement.
+        _delta_bases = await _basis_pair_for_delta(report, merchant_id, prior_run_id)
         report["outreach_outcomes"] = build_outreach_outcomes(
             current_report=report,
             prior_report=prior_report,
             # Same W2 basis verdict build_reaudit_delta computes — via
             # audit_delta's single source of truth, never re-derived here.
-            measurement_basis=measurement_basis_between(report, prior_report),
+            measurement_basis=measurement_basis_between(
+                report, prior_report, *_delta_bases
+            ),
             completed_actions=await _completed_outreach_actions(merchant_id),
         )
         # Wave-1 A1: per-SKU sibling of the legacy merchant_view attach —
@@ -16773,6 +16818,8 @@ async def _attach_outreach_outcomes_per_sku(
             days_since=_days_between(
                 str(prior_row.get("requested_at") or "") or None
             ),
+            current_basis=_delta_bases[0],
+            prior_basis=_delta_bases[1],
         )
     except Exception as exc:  # noqa: BLE001 - audit must not fail on history
         logger.warning(
