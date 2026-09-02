@@ -88,6 +88,44 @@ class WalletStatusUpdate(BaseModel):
     reason: Optional[str] = Field(None, description="Reason for status change")
 
 
+# WHY THE SIX WRITE ENDPOINTS BELOW ALL USE `RETURNING wallet_id`.
+#
+# `verify_*`, `update_*_status` and `delete_*` each targets exactly one row by
+# primary key, and each used to run a bare `database.execute` of its UPDATE or
+# DELETE and then return its success shape unconditionally. Called with a
+# wallet_id that exists nowhere, all six answered 200: "verified", "updated",
+# "deleted" — describing work that never happened. `verify_*` was the worst of
+# them, because "verified" is a claim about a wallet's provenance rather than a
+# state change, so a caller acting on it believes an address was checked.
+#
+# THERE IS NO ROWCOUNT TO CHECK INSTEAD, which is the whole reason for the
+# RETURNING clause rather than a two-line guard. `databases` 0.7.0 on asyncpg
+# implements `execute` as `fetchval`, so an UPDATE or DELETE with no RETURNING
+# yields None whether it moved one row or none — measured on PG 15:
+#
+#     UPDATE ... WHERE <matches a row>    -> None
+#     UPDATE ... WHERE <matches nothing>  -> None   (identical, hence the defect)
+#
+# Reading `RETURNING wallet_id` back through `fetch_one` gives a Record on a hit
+# and None on a miss. That is this repo's existing answer to the same question:
+# db/product_quality_backfill_jobs.py uses `fetch_one` with `RETURNING` precisely
+# to learn whether a row was touched, and documents the same asyncpg behaviour.
+#
+# NO STATIC GATE CAN SEE THIS DEFECT. tests/test_repo_sql_prepare_postgres.py
+# PREPAREs every statement in this file — all 18 of them, these six included —
+# but PREPARE is Parse+Describe: it validates TYPES, never execution, and "how
+# many rows did that move" is not a question a plan can answer. So the coverage
+# is behavioural, in tests/test_wallet_admin_missing_row_postgres.py, which
+# executes all six handlers against a real Postgres. Its sibling
+# tests/test_wallet_status_vocabulary_postgres.py exists for the same reason.
+#
+# Keep each statement inline. Passing the SQL into a shared helper would remove
+# all six from the PREPARE sweep, which resolves a `database.*` first argument
+# only as a literal, a module-level name, or a literal bound once to a
+# function-local — and a function PARAMETER counts as a binding, so a helper
+# resolves nothing.
+
+
 # ========================
 # Merchant Wallet Management
 # ========================
@@ -274,9 +312,16 @@ async def verify_merchant_wallet(wallet_id: str):
             verified_at = NOW(),
             updated_at = NOW()
         WHERE wallet_id = :wallet_id
+        RETURNING wallet_id
     """
     
-    await database.execute(update_query, {"wallet_id": wallet_id})
+    verified = await database.fetch_one(update_query, {"wallet_id": wallet_id})
+    
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Merchant wallet not found"
+        )
     
     logger.info(f"Merchant wallet verified: {wallet_id}")
     
@@ -308,15 +353,22 @@ async def update_merchant_wallet_status(
         SET status = :status,
             updated_at = NOW()
         WHERE wallet_id = :wallet_id
+        RETURNING wallet_id
     """
     
-    result = await database.execute(
+    updated = await database.fetch_one(
         update_query,
         {
             "wallet_id": wallet_id,
             "status": status_update.status
         }
     )
+    
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Merchant wallet not found"
+        )
     
     logger.info(
         f"Merchant wallet status updated: {wallet_id} = {status_update.status} "
@@ -341,9 +393,16 @@ async def delete_merchant_wallet(wallet_id: str):
     delete_query = """
         DELETE FROM merchant_wallets
         WHERE wallet_id = :wallet_id
+        RETURNING wallet_id
     """
     
-    await database.execute(delete_query, {"wallet_id": wallet_id})
+    deleted = await database.fetch_one(delete_query, {"wallet_id": wallet_id})
+    
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Merchant wallet not found"
+        )
     
     logger.info(f"Merchant wallet deleted: {wallet_id}")
     
@@ -547,9 +606,16 @@ async def verify_agent_wallet(wallet_id: str):
             verified_at = NOW(),
             updated_at = NOW()
         WHERE wallet_id = :wallet_id
+        RETURNING wallet_id
     """
     
-    await database.execute(update_query, {"wallet_id": wallet_id})
+    verified = await database.fetch_one(update_query, {"wallet_id": wallet_id})
+    
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent wallet not found"
+        )
     
     logger.info(f"Agent wallet verified: {wallet_id}")
     
@@ -581,15 +647,22 @@ async def update_agent_wallet_status(
         SET status = :status,
             updated_at = NOW()
         WHERE wallet_id = :wallet_id
+        RETURNING wallet_id
     """
     
-    result = await database.execute(
+    updated = await database.fetch_one(
         update_query,
         {
             "wallet_id": wallet_id,
             "status": status_update.status
         }
     )
+    
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent wallet not found"
+        )
     
     logger.info(
         f"Agent wallet status updated: {wallet_id} = {status_update.status} "
@@ -614,9 +687,16 @@ async def delete_agent_wallet(wallet_id: str):
     delete_query = """
         DELETE FROM agent_wallets
         WHERE wallet_id = :wallet_id
+        RETURNING wallet_id
     """
     
-    await database.execute(delete_query, {"wallet_id": wallet_id})
+    deleted = await database.fetch_one(delete_query, {"wallet_id": wallet_id})
+    
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent wallet not found"
+        )
     
     logger.info(f"Agent wallet deleted: {wallet_id}")
     
