@@ -3714,7 +3714,7 @@ async def _build_external_seed_product(
         new_click_id,
         normalize_surface,
     )
-    from services.outbound_links_service import append_referral_click_param
+    from services.outbound_links_service import REFERRAL_CLICK_PARAM, append_referral_click_param
     from services.seller_identity import anchor_merchant_from_product_key
 
     stable_click_id = new_click_id()
@@ -3847,8 +3847,19 @@ async def _build_external_seed_product(
         "source": "external_seed",
         **({"external_domain": str(seed_row.get("domain") or "").strip()} if str(seed_row.get("domain") or "").strip() else {}),
         **({"canonical_url": canonical_url} if canonical_url else {}),
-        "destination_url": destination_url,
-        "external_url": destination_url,
+        # ATTRIBUTED, not raw. `dest_with_utm` is exactly what the `/r` token above signs —
+        # UTM plus the referral click param — so an agent that drives checkout from this URL
+        # instead of following the redirect carries the SAME click id the redirect would have
+        # stamped. Until now the click id lived only inside the token and the card published
+        # the bare seed URL, so that lane generated revenue we could not see. `canonical_url`
+        # above stays raw for anyone who needs the plain product page.
+        "destination_url": dest_with_utm,
+        "external_url": dest_with_utm,
+        "tracking": {
+            "click_id": stable_click_id,
+            "param": REFERRAL_CLICK_PARAM,
+            "join_mode": "referral_only",
+        },
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
