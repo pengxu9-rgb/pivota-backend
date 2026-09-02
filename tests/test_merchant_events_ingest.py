@@ -253,9 +253,9 @@ async def test_session_stitch_lookup_is_scoped_to_merchant_and_store(monkeypatch
     queries = []
 
     class FakeDB:
-        async def fetch_one(self, query):
+        async def fetch_all(self, query):
             queries.append(query)
-            return {"interaction_id": "int_existing"}
+            return [{"interaction_id": "int_existing", "session_id": "session_shared"}]
 
     monkeypatch.setattr(service, "database", FakeDB())
     result = await service._lookup_existing_interaction(
@@ -266,7 +266,10 @@ async def test_session_stitch_lookup_is_scoped_to_merchant_and_store(monkeypatch
         }
     )
 
-    assert result == {"interaction_id": "int_existing"}
+    assert result == {
+        "interaction_id": "int_existing",
+        "session_id": "session_shared",
+    }
     compiled = queries[0].compile()
     sql = str(compiled)
     values = set(compiled.params.values())
@@ -277,16 +280,78 @@ async def test_session_stitch_lookup_is_scoped_to_merchant_and_store(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ref_name", ["order_id", "checkout_id", "quote_id", "refund_id", "return_id"])
+async def test_non_unique_session_lookup_selects_only_one_interaction(monkeypatch):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_b", "session_id": "session_shared"},
+                {"interaction_id": "int_a", "session_id": "session_shared"},
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            "session_id": "session_shared",
+        }
+    )
+
+    assert matches == [
+        {"interaction_id": "int_a", "session_id": "session_shared"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strong_order_match_prevents_session_fanout(monkeypatch):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_session", "session_id": "session_shared"},
+                {
+                    "interaction_id": "int_order",
+                    "order_id": "order_1",
+                    "session_id": "session_shared",
+                },
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            "order_id": "order_1",
+            "session_id": "session_shared",
+        }
+    )
+
+    assert matches == [
+        {
+            "interaction_id": "int_order",
+            "order_id": "order_1",
+            "session_id": "session_shared",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ref_name",
+    ["click_id", "order_id", "checkout_id", "quote_id", "refund_id", "return_id"],
+)
 async def test_commerce_ref_lookup_is_scoped_to_merchant_and_store(monkeypatch, ref_name):
     from services import commerce_interaction_service as service
 
     queries = []
 
     class FakeDB:
-        async def fetch_one(self, query):
+        async def fetch_all(self, query):
             queries.append(query)
-            return {"interaction_id": "int_existing"}
+            return [{"interaction_id": "int_existing", ref_name: "ref_shared"}]
 
     monkeypatch.setattr(service, "database", FakeDB())
     result = await service._lookup_existing_interaction(
@@ -297,7 +362,7 @@ async def test_commerce_ref_lookup_is_scoped_to_merchant_and_store(monkeypatch, 
         }
     )
 
-    assert result == {"interaction_id": "int_existing"}
+    assert result == {"interaction_id": "int_existing", ref_name: "ref_shared"}
     compiled = queries[0].compile()
     sql = str(compiled)
     values = set(compiled.params.values())
@@ -402,6 +467,9 @@ async def test_out_of_order_event_preserves_terminal_status_and_latest_event(mon
     writes = []
 
     class FakeDB:
+        async def fetch_all(self, _query):
+            return [existing]
+
         async def fetch_one(self, _query):
             return existing
 
