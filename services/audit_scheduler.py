@@ -39,10 +39,11 @@ Job registration happens at start-up time. Currently registers:
   upstream (Shopify shop.json / Wix products query) and disconnects the ones
   the platform no longer recognises, then re-derives
   catalog_merchants.status from merchant_stores (issue #1648).
-- `catalog_import_drain_tick` — fires every 30 seconds, claims and runs one
-  ready row from platform_import_tasks (merchant "Sync products"). Paired with
+- `catalog_import_drain_tick` — every 30 seconds, claims and runs one ready
+  Shopify row from platform_import_tasks (merchant "Sync products"). Paired with
   `catalog_import_stale_reaper` every 5 minutes, which returns `running` rows
-  abandoned by a revision swap to the queue.
+  abandoned by a revision swap to the queue. Both are DORMANT unless
+  CATALOG_IMPORT_DRAIN_ENABLED is explicitly enabled.
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
@@ -137,6 +138,13 @@ _JOB_RUN_DEADLINES = {
     # SHOPIFY_MAX_PRODUCTS_PER_RUN rows. 30 min is well above that; a cut run
     # shields a `retry_scheduled` write on CancelledError, so it resumes on a
     # later tick rather than stranding the merchant.
+    #
+    # This deadline is deliberately LONGER than STALE_RUNNING_AFTER_SECONDS
+    # (900), which looks inverted — the reaper would appear able to requeue a run
+    # the scheduler still permits. It cannot: the import heartbeats
+    # `updated_at` after every page, so the reaper's window is measured from the
+    # last page and never elapses while a run is making progress. The heartbeat
+    # is what reconciles the two numbers; see db/platform_import_tasks.py.
     "catalog_import_drain_tick": 1800,
     # DB-only reapers (60s / 5min cadence)
     "audit_run_lease_reaper": 120,
@@ -932,7 +940,14 @@ async def start_scheduler() -> None:
         # two firing at once cannot import the same catalog twice.
         # 30s matches quality_backfill_drain_tick; one task per fire, and
         # max_instances=1 keeps a slow import from stacking ticks.
-        # Disable via CATALOG_IMPORT_DRAIN_ENABLED=false without a deploy.
+        #
+        # DORMANT unless CATALOG_IMPORT_DRAIN_ENABLED is set — same posture as
+        # catalog_onboard_queue_drain and payment_reconcile_tick above, for the
+        # same reasons plus one more: nothing has EVER drained this queue, so the
+        # backlog is unmeasured and the first armed tick starts calling merchant
+        # Shopify credentials on rows that may be months old. Measure, then arm.
+        # Scoped to source_type='connector'/connector='shopify'; the table's
+        # amazon_orders / orders_report / report rows are out of the lane.
         from jobs.catalog_import_worker import (
             run_catalog_import_drain_tick,
             run_catalog_import_stale_reaper_tick,

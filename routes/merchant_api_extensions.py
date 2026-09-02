@@ -1537,14 +1537,23 @@ async def sync_shopify_products(
             # retry_scheduled so the background worker can pick it up again.
             #
             # The window is STALE_RUNNING_AFTER_SECONDS, shared with the
-            # catalog_import_stale_reaper tick, and must not be shortened. It
-            # used to be 5 minutes, which is BELOW SHOPIFY_MAX_RUNTIME_SECONDS
-            # (default 600) — an import that was still healthily paginating got
-            # flipped back to retry_scheduled. That was merely wasteful while
-            # this endpoint was the only runner; now that
-            # catalog_import_drain_tick is claiming the queue every 30s, it
-            # would hand the still-live import's row to a second runner, which
-            # is exactly the double-run the atomic claim exists to prevent.
+            # catalog_import_stale_reaper tick. It was 5 minutes, and widening it
+            # is a deliberate trade, not a cleanup.
+            #
+            # What makes any window safe here is the per-page heartbeat below
+            # (_process_import_task_record writes status="running" after every
+            # page, refreshing updated_at), so this measures time since the last
+            # page, not since the claim. 5 minutes was survivable while this
+            # endpoint was the ONLY runner: a premature flip just re-ran the
+            # import. It is not survivable now that catalog_import_drain_tick can
+            # claim the row 30s later — that hands a still-live import to a
+            # second runner, the exact double-run the atomic claim prevents. One
+            # slow page (30s HTTP timeout, retries, 250 upserts) is well within
+            # 5 minutes of wall clock but not within 15.
+            #
+            # The cost is real and accepted: a merchant whose import genuinely
+            # died now waits 15 minutes for this button to recover it rather than
+            # 5, and the reaper is no faster (same cutoff, 300s tick).
             if existing_status == "running":
                 updated_at = existing_task.get("updated_at")
                 try:
@@ -1563,6 +1572,7 @@ async def sync_shopify_products(
                                 error = 'stale_running_recovered',
                                 updated_at = NOW()
                             WHERE id = :task_id
+                              AND status = 'running'
                             """,
                             {"task_id": existing_task_id},
                         )

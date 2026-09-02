@@ -1584,12 +1584,31 @@ async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
 
 
 def _catalog_import_drain_enabled() -> bool:
-    """Kill switch for the scheduler drain tick (no deploy needed to flip)."""
-    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "true") or "").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
+    """Whether the scheduler drain tick and its reaper may do anything.
+
+    DORMANT BY DEFAULT, matching the two closest precedents in
+    services/audit_scheduler.py — `catalog_onboard_queue_drain` ("OFF BY DEFAULT
+    ... so deploying never starts autonomous catalog writes") and
+    `payment_reconcile_tick` ("DORMANT unless ... enable deliberately"). Every
+    reason those give applies here and then some: this drains a queue nothing has
+    ever drained, so the backlog is unmeasured and may be months old; each task
+    calls a merchant's Shopify Admin API with stored credentials and rewrites
+    their products_cache; and prod and staging share one Postgres.
+
+    So arming it is a separate, deliberate act from deploying it. Measure the
+    backlog first:
+
+        SELECT status, source_type, connector, count(*), min(created_at)
+        FROM platform_import_tasks GROUP BY 1, 2, 3;
+
+    then set CATALOG_IMPORT_DRAIN_ENABLED=true. Read per-run, so flipping it
+    takes effect on the next tick.
+    """
+    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "false") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -1624,6 +1643,11 @@ async def run_catalog_import_stale_reaper_tick() -> Dict[str, Any]:
     requeued = await requeue_stale_running_tasks(
         stale_after_seconds=_env_int("CATALOG_IMPORT_STALE_AFTER_SECONDS", None),
         limit=_env_int("CATALOG_IMPORT_STALE_REQUEUE_LIMIT", 5) or 5,
+        # Poison-pill bound. A task that kills its process never reaches the
+        # worker's attempt cutoffs (they all sit in `except` handlers), so the
+        # reaper has to apply one itself or an OOM-inducing row is requeued
+        # forever. Same ceiling the retry handlers use.
+        max_attempt=SHOPIFY_MAX_RETRY_ATTEMPTS,
     )
     if requeued:
         logger.warning("Requeued %s stale catalog import task(s)", requeued)

@@ -78,9 +78,10 @@ async def requeue_stale_running_tasks(
     *,
     stale_after_seconds: Optional[int] = None,
     limit: int = 5,
+    max_attempt: Optional[int] = None,
 ) -> int:
     """Return abandoned `running` ImportTasks to the queue; return how many."""
-    kwargs: Dict[str, Any] = {"limit": limit}
+    kwargs: Dict[str, Any] = {"limit": limit, "max_attempt": max_attempt}
     if stale_after_seconds is not None:
         kwargs["stale_after_seconds"] = stale_after_seconds
     return await requeue_stale_import_tasks(**kwargs)
