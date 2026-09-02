@@ -50,15 +50,20 @@ REDIRECTOR_RETAILER = {
     "title": "oliveyoung.com",
 }
 
+# The branded runs carry their real stamped axis ("intent" / "review"). They
+# used to carry NO axis and leaned on the classifier's fail-BRANDED default,
+# which made the branded assertions below vacuous — every unstamped run was
+# branded. That default is now fail-UNBRANDED, so the fixture states the axis
+# the probe pipeline actually stamps for these query shapes.
 RUNS = [
     # branded query, gemini: own page cited (T1) + retailer listing
-    _run("where to buy glow brand serum", [OWN_SOURCE, RETAILER_SOURCE], "gemini"),
+    _run("where to buy glow brand serum", [OWN_SOURCE, RETAILER_SOURCE], "gemini", axis="intent"),
     # category query, gemini: editorial host NAMES the brand (T2+T3), no own page
     _run("best vitamin c serum", [EDITORIAL_NAMING_SOURCE], "gemini", axis="category"),
     # category query, openai: only a redirector-resolved retailer, brand absent
     _run("best vitamin c serum", [REDIRECTOR_RETAILER], "openai", axis="category"),
     # branded query, openai: no citations at all
-    _run("glow brand serum reviews", [], "openai"),
+    _run("glow brand serum reviews", [], "openai", axis="review"),
 ]
 
 IDENTITY = dict(
