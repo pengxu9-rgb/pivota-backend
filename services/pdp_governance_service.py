@@ -499,10 +499,6 @@ def _named_in(prefix: str, values: List[str]) -> Tuple[str, Dict[str, str]]:
     return ", ".join(f":{name}" for name in params), params
 
 
-def _sql_now_expr() -> str:
-    return "NOW()" if IS_POSTGRES else "CURRENT_TIMESTAMP"
-
-
 async def ensure_pdp_governance_tables() -> None:
     global _TABLES_READY
     if _TABLES_READY:
@@ -2188,7 +2184,6 @@ async def _apply_external_candidate_attach(subject: Dict[str, Any], candidate: D
     if not seed:
         raise LookupError("EXTERNAL_SEED_NOT_FOUND")
 
-    now_expr = _sql_now_expr()
     attached_product_key = (target_product_key or "").strip()
     if not attached_product_key and subject.get("product_group_id"):
         attached_product_key = (
@@ -2200,11 +2195,11 @@ async def _apply_external_candidate_attach(subject: Dict[str, Any], candidate: D
 
     if attached_product_key:
         await database.execute(
-            f"""
+            """
             UPDATE external_product_seeds
             SET attached_product_key = :attached_product_key,
                 attached_variant_id = :attached_variant_id,
-                updated_at = {now_expr}
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = :seed_id
             """,
             {
@@ -2219,10 +2214,10 @@ async def _apply_external_candidate_attach(subject: Dict[str, Any], candidate: D
     if not external_product_id:
         raise ValueError("PDP_IDENTITY_ATTACH_REQUIRES_PRODUCT_KEY")
     await database.execute(
-        f"""
+        """
         UPDATE external_product_seeds
         SET external_product_id = :external_product_id,
-            updated_at = {now_expr}
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = :seed_id
         """,
         {"seed_id": seed_id, "external_product_id": external_product_id},
@@ -2231,19 +2226,18 @@ async def _apply_external_candidate_attach(subject: Dict[str, Any], candidate: D
 
 
 async def _upsert_product_group_member(product_group_id: str, merchant_id: str, platform: str, platform_product_id: str) -> None:
-    now_expr = _sql_now_expr()
     try:
         await database.execute(
-            f"""
+            """
             INSERT INTO product_group_members (
               product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at
             ) VALUES (
-              :product_group_id, :merchant_id, :platform, :platform_product_id, FALSE, {now_expr}
+              :product_group_id, :merchant_id, :platform, :platform_product_id, FALSE, CURRENT_TIMESTAMP
             )
             ON CONFLICT (merchant_id, platform, platform_product_id)
             DO UPDATE SET
               product_group_id = EXCLUDED.product_group_id,
-              updated_at = {now_expr}
+              updated_at = CURRENT_TIMESTAMP
             """,
             {
                 "product_group_id": product_group_id,
@@ -2270,10 +2264,10 @@ async def _upsert_product_group_member(product_group_id: str, merchant_id: str, 
         )
         if existing:
             await database.execute(
-                f"""
+                """
                 UPDATE product_group_members
                 SET product_group_id = :product_group_id,
-                    updated_at = {now_expr}
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE merchant_id = :merchant_id
                   AND platform = :platform
                   AND platform_product_id = :platform_product_id
@@ -2287,11 +2281,11 @@ async def _upsert_product_group_member(product_group_id: str, merchant_id: str, 
             )
         else:
             await database.execute(
-                f"""
+                """
                 INSERT INTO product_group_members (
                   product_group_id, merchant_id, platform, platform_product_id, is_primary, updated_at
                 ) VALUES (
-                  :product_group_id, :merchant_id, :platform, :platform_product_id, FALSE, {now_expr}
+                  :product_group_id, :merchant_id, :platform, :platform_product_id, FALSE, CURRENT_TIMESTAMP
                 )
                 """,
                 {
@@ -2367,21 +2361,20 @@ async def _set_product_group_primary(product_group_id: str, product_key: str) ->
     if not await _product_group_member_exists(product_group_id, product_key):
         raise LookupError("PDP_PRODUCT_GROUP_MEMBER_NOT_FOUND")
     merchant_id, platform, platform_product_id = parse_product_key(product_key)
-    now_expr = _sql_now_expr()
     await database.execute(
-        f"""
+        """
         UPDATE product_group_members
         SET is_primary = FALSE,
-            updated_at = {now_expr}
+            updated_at = CURRENT_TIMESTAMP
         WHERE product_group_id = :product_group_id
         """,
         {"product_group_id": product_group_id},
     )
     await database.execute(
-        f"""
+        """
         UPDATE product_group_members
         SET is_primary = TRUE,
-            updated_at = {now_expr}
+            updated_at = CURRENT_TIMESTAMP
         WHERE product_group_id = :product_group_id
           AND merchant_id = :merchant_id
           AND platform = :platform
@@ -2623,13 +2616,12 @@ async def _apply_merchant_candidate_merge(subject: Dict[str, Any], candidate: Di
     await _upsert_product_group_member(product_group_id, merchant_id, platform, platform_product_id)
 
     if subject.get("external_product_id"):
-        now_expr = _sql_now_expr()
         await database.execute(
-            f"""
+            """
             UPDATE external_product_seeds
             SET attached_product_key = :product_key,
                 attached_variant_id = COALESCE(attached_variant_id, '∅'),
-                updated_at = {now_expr}
+                updated_at = CURRENT_TIMESTAMP
             WHERE external_product_id = :external_product_id
               AND status = 'active'
             """,
