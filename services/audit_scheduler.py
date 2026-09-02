@@ -124,6 +124,20 @@ _JOB_RUN_DEADLINES = {
     "catalog_onboard_queue_drain": 1500,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
+    # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
+    # a serial issuer call.
+    #
+    # THE ADAPTER'S `timeout=15.0` IS NOT A 15s BUDGET PER CALL. httpx spreads a bare float
+    # across connect, read, write AND pool as 15s EACH, so one revoke can legitimately take
+    # ~60s before it gives up — 100 of them is up to ~6000s, well past this deadline, not the
+    # 1500s the arithmetic here used to claim. That is fine and is what the deadline is FOR:
+    # 1800s cuts a wedged run well inside the hourly cadence so it cannot overlap the next one,
+    # and rule 2 of the sweep makes the cut harmless — retry is unbounded by design, so the
+    # orphans a cut run did not reach are simply the head of the next run's oldest-first queue.
+    # What the deadline must not be read as is a guarantee that a full batch completes; only a
+    # smaller AGENT_CARD_REVOCATION_BATCH, or a real total-timeout on the adapter, would buy
+    # that. Idle runs are a single indexed query.
+    "agent_card_revocation_sweep": 1800,
     # queue drainers: MAX_RUNS_PER_TICK runs each, serial. Audits routinely
     # run >15 min each (a cut run loses its LLM spend and re-runs after the
     # 15-min lease expires) so 3 get 2h; executor agents (sitemap fetch, GSC
@@ -344,6 +358,24 @@ async def start_scheduler() -> None:
             id="nightly_index_health",
             replace_existing=True,
             misfire_grace_time=3600,
+            coalesce=True,
+        )
+
+        # Orphan card revocation: kill cards that exist at the issuer but that we refused to
+        # accept because the constraints came back unconfirmed or contradicted. Runs HOURLY, not
+        # daily, and that is the point — an orphan may be an uncapped, unlocked card, so the
+        # window in which it is spendable is the thing being minimised. Cheap when idle: one
+        # indexed query that returns nothing unless a mint actually failed that way.
+        # Its own kill switch (AGENT_CARD_REVOCATION_SWEEP_ENABLED, default off) gates the
+        # provider calls, so registering it here is inert until that is set.
+        from jobs.agent_card_revocation_sweep import run_agent_card_revocation_sweep
+        _add_job(
+            run_agent_card_revocation_sweep,
+            "cron",
+            minute=17,          # off the hour, away from the :00 cron pile-up
+            id="agent_card_revocation_sweep",
+            replace_existing=True,
+            misfire_grace_time=1800,
             coalesce=True,
         )
 

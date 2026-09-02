@@ -240,3 +240,84 @@ async def apply_settlement(card_id: str, settled_amount_minor: int) -> bool:
         {"card_id": card_id, "amount": settled_amount_minor},
     )
     return row is not None
+
+
+# ---------------------------------------------------------------------------------------------
+# Orphan revocation
+# ---------------------------------------------------------------------------------------------
+#
+# AN ORPHAN IS A ROW THAT SAYS `failed` WHILE HOLDING AN `issuer_card_ref`. That combination
+# cannot arise on the success path — a ref means `issued` there — so it is precisely the set of
+# cards that exist at the issuer but that we refused to accept. Today only the constraint
+# verdicts (REAP_CONSTRAINTS_MISMATCH / REAP_CONSTRAINTS_UNCONFIRMED) produce it, because those
+# are the only failures raised AFTER a card id came back.
+#
+# The predicate is STRUCTURAL rather than a list of failure_reason codes on purpose: a future
+# failure path that also gets past a 2xx would be an orphan too, and a hardcoded code list would
+# silently stop sweeping it. `failure_reason` is still recorded, and read for the alarm.
+
+
+async def mark_failed_with_orphan(card_id: str, reason: str, issuer_card_ref: str) -> None:
+    """Fail the row but KEEP the issuer's card id, because that card is real.
+
+    Separate from `mark_failed` rather than an optional argument: these are different events.
+    `mark_failed` means nothing was minted; this means something was minted and we would not
+    accept it. Making the caller choose keeps a plain failure from ever landing a stray ref that
+    the sweep would then try to revoke.
+    """
+    await database.execute(
+        """
+        UPDATE agent_issued_cards
+           SET status = 'failed', failure_reason = :reason, issuer_card_ref = :ref,
+               updated_at = now()
+         WHERE card_id = :card_id AND status = 'requested'
+        """,
+        {"card_id": card_id, "reason": (reason or "")[:500], "ref": issuer_card_ref},
+    )
+
+
+async def list_orphaned_cards(limit: int = 100) -> list:
+    """Cards that may be live at the issuer while our row says failed.
+
+    Ordered oldest-first so a persistent failure at the head of the queue cannot starve newer
+    orphans forever — each run still reaches them once the bounded head is retried.
+    """
+    rows = await database.fetch_all(
+        """
+        SELECT card_id, agent_id, issuer, issuer_card_ref, merchant_domain,
+               amount_cap_minor, currency, failure_reason, created_at
+          FROM agent_issued_cards
+         WHERE status = 'failed'
+           AND issuer_card_ref IS NOT NULL
+         ORDER BY created_at ASC
+         LIMIT :limit
+        """,
+        {"limit": int(limit)},
+    )
+    return [dict(r) for r in rows]
+
+
+async def mark_revoked(card_id: str) -> bool:
+    """Record a CONFIRMED revocation. Returns False if the row moved underneath us.
+
+    Guarded on `status = 'failed'` so this can only ever advance an orphan. It must not be able
+    to revoke a live `issued` card as a side effect of a sweep bug — that path needs its own
+    deliberate design, not this one widened.
+
+    FETCH_ONE + RETURNING, not `execute`. On databases==0.7.0/asyncpg a non-RETURNING UPDATE
+    answers None ALWAYS — success and no-match alike — so `execute(...) is not None` was a
+    constant False. Every successful revoke reported "the row did not advance", the sweep logged
+    it as unconfirmed at ERROR and left it to be retried forever, and the one signal that says a
+    live card was killed never fired. THE ROW COMING BACK IS THE CLAIM, which is the idiom every
+    other transition in this file already uses (record_event_once, apply_auth_*, apply_settlement).
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE agent_issued_cards
+           SET status = 'revoked', updated_at = now()
+         WHERE card_id = :card_id AND status = 'failed' AND issuer_card_ref IS NOT NULL
+        RETURNING card_id
+        """,
+        {"card_id": card_id},
+    )
+    return row is not None

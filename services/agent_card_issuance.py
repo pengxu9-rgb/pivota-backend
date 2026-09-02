@@ -6,36 +6,42 @@ forbids amount fields outright), and not from Pivota's index (31.1% of index rec
 wrong-spec per the 2026-08-21 audit — the merchant's quote is the only number the merchant is
 guaranteed to honour, and the card is capped by it).
 
-The merchant quote call mirrors the LIVE-verified wire shape from the gateway's
-ucpBuyerAgentClient (cosrx, 2026-07-13): POST https://{shop}/api/ucp/mcp, JSON-RPC tools/call,
-`totals` is an ARRAY of {type, amount, ...} with amounts in MINOR units, `currency` top-level,
-with total_amount/grand_total as scalar fallbacks.
+TRANSPORT MOVED (2026-08-31) to services/merchant_ucp_checkout.py, which is now the one place
+that speaks to a merchant's UCP door. The shape this module used to build was wrong on two
+counts — no `meta`, and `checkout_id` where the merchant's argument is `id` — so every mint
+would have failed at the quote step. A live `tools/list` probe caught it; the route tests could
+not, because they stub `resolve_merchant_quote` wholesale. What stays here is the READING of a
+quote: `totals` is an ARRAY of {type, amount, ...} with amounts in MINOR units, `currency`
+top-level, with total_amount/grand_total as scalar fallbacks.
 """
 
 from __future__ import annotations
 
 import ipaddress
-import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
-import httpx
 
 from utils.logger import logger
 
 
 class MerchantQuoteError(ValueError):
-    """A quote could not be resolved. `caller_fault` decides the route's 4xx-vs-502 split —
-    typed here so the route never string-matches an error message (that mapping broke the
-    moment anyone reworded an error)."""
+    """A quote could not be resolved. The FLAGS decide the route's 4xx-vs-502 split — typed here
+    so the route never string-matches an error message (that mapping broke the moment anyone
+    reworded an error).
 
-    def __init__(self, message: str, *, caller_fault: bool = False):
+    `caller_fault` = the API caller's request was bad (4xx). `our_fault` = Pivota's own
+    configuration or code was, which is a 502 with a generic detail: an agent told 422 because
+    OUR agent profile is unreachable goes looking for a bug in a request that was fine. The two
+    mirror `MerchantUcpError`, whose values are carried across the translation below unchanged.
+    """
+
+    def __init__(self, message: str, *, caller_fault: bool = False, our_fault: bool = False):
         super().__init__(message)
         self.caller_fault = caller_fault
-
-_QUOTE_TIMEOUT_SECONDS = 12.0
+        self.our_fault = our_fault
 
 # Hostname allowed to receive our server-side quote request. merchant_domain is CALLER INPUT and
 # we fetch it — this is an SSRF surface. Dots-and-dashes hostnames only, no ports, no IP
@@ -246,54 +252,47 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
     price the cart the agent actually built, not a fresh one-item cart that would quietly drop
     quantities and multi-line carts from the cap.
     """
-    domain = validate_merchant_domain(merchant_domain)
-    if not domain:
-        raise MerchantQuoteError(
-            "merchant_domain is not a fetchable public hostname", caller_fault=True
-        )
-    if not resolves_only_public(domain):
-        raise MerchantQuoteError(
-            "merchant_domain does not resolve to a public address", caller_fault=True
-        )
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": "get_checkout", "arguments": {"checkout_id": checkout_id}},
-    }
-    url = f"https://{domain}/api/ucp/mcp"
-    try:
-        async with httpx.AsyncClient(timeout=_QUOTE_TIMEOUT_SECONDS, follow_redirects=False) as client:
-            resp = await client.post(url, json=body)
-    except httpx.HTTPError as err:
-        logger.warning(f"card-rail quote fetch failed domain={domain}: {type(err).__name__}")
-        raise MerchantQuoteError("merchant quote endpoint unreachable") from err
-    if resp.status_code >= 300:
-        raise MerchantQuoteError(f"merchant quote endpoint returned HTTP {resp.status_code}")
-    try:
-        rpc = resp.json()
-    except Exception as err:
-        raise MerchantQuoteError("merchant quote response was not JSON") from err
+    # TRANSPORT LIVES IN ONE PLACE (services/merchant_ucp_checkout.py). The body this function
+    # used to build was wrong in two ways that a live probe caught on 2026-08-31, and BOTH made
+    # every mint fail at the quote step while the route tests — which stub this function out
+    # entirely — stayed green:
+    #   * no `meta`, so the merchant refused with `-32001 invalid_profile_url`. The refusal
+    #     arrives as HTTP 200 with an `error` member, and the old code read only `result`, so it
+    #     reported "carried no checkout payload" — a wrong diagnosis of a wrong request.
+    #   * `checkout_id` instead of `id`, which is the merchant's actual argument name.
+    # Deferred import: merchant_ucp_checkout imports this module's SSRF guards, so a top-level
+    # import here would be a cycle.
+    from services.merchant_ucp_checkout import MerchantUcpError, get_checkout
 
-    result = rpc.get("result") if isinstance(rpc, dict) else None
-    payload: Optional[Dict[str, Any]] = None
-    if isinstance(result, dict):
-        if isinstance(result.get("structuredContent"), dict):
-            payload = result["structuredContent"]
-        else:
-            content = result.get("content")
-            if isinstance(content, list):
-                for chunk in content:
-                    if isinstance(chunk, dict) and chunk.get("type") == "text":
-                        try:
-                            parsed = json.loads(chunk.get("text") or "")
-                        except Exception:
-                            continue
-                        if isinstance(parsed, dict):
-                            payload = parsed
-                            break
-    if payload is None:
-        raise MerchantQuoteError("merchant quote response carried no checkout payload")
+    try:
+        payload = await get_checkout(merchant_domain, checkout_id)
+    except MerchantUcpError as err:
+        # Translated, not re-raised: this function's callers switch on MerchantQuoteError and its
+        # fault flags, and that contract predates the shared client. BOTH flags cross over —
+        # dropping `our_fault` here would put our own misconfiguration back in front of the agent
+        # as a 422, which is the whole reason the second flag exists.
+        raise MerchantQuoteError(
+            str(err), caller_fault=err.caller_fault, our_fault=err.our_fault
+        ) from err
+
+    # A PAYLOAD THAT SAYS IT FAILED IS NOT A QUOTE, AND IT IS CHECKED BEFORE THE TOTALS ARE READ.
+    # UCP answers a refusal with a full checkout envelope: `ucp.status` "error", the reasons in
+    # `messages[]` — and, because it is the same document shape, frequently a `totals` array
+    # too. Read totals-first, that mints a REAL, SPENDABLE card capped against a checkout the
+    # merchant has already declined; the card is the thing that cannot be un-issued, so the
+    # envelope's own verdict is consulted before anything is derived from its numbers. The
+    # transport (`_unwrap`) refuses the same shape on the isError path; this closes the door on
+    # the path where the merchant does NOT set isError, which is how it arrives without one.
+    #
+    # NOT caller_fault: the agent's request may have been perfectly well formed and the merchant
+    # still declined (sold out, unshippable). 502 tells it to look at the merchant, not itself.
+    ucp = payload.get("ucp")
+    if isinstance(ucp, dict) and "status" in ucp:
+        status = str(ucp.get("status") or "").strip().lower()
+        if status != "success":
+            raise MerchantQuoteError(
+                "merchant checkout is not in a success state; no cap may be derived from it"
+            )
 
     raw_total, currency = _pick_total(payload)
     if raw_total is None or not currency:
