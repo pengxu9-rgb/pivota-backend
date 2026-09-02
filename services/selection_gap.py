@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Tuple, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from services.pdp_matcher.deterministic import _normalize_token
 
@@ -126,7 +126,11 @@ def _is_significant(tok: str) -> bool:
 
 
 def _singular(tok: str) -> str:
-    if len(tok) > 4 and tok.endswith("es"):
+    # Only strip "es" after a sibilant, where it is a real plural marker
+    # ("dishes", "brushes"). The blanket rule turned pore/pores into pore/por
+    # and essence/essences into essence/essenc, silently losing a genuine gap
+    # ("best pore minimizing toner" against a product tagged pores).
+    if len(tok) > 4 and tok.endswith("es") and tok[-3] in "sxzhoi":
         return tok[:-2]
     if len(tok) > 3 and tok.endswith("s"):
         return tok[:-1]
@@ -186,7 +190,16 @@ def _json_terms(value: Any) -> List[str]:
 
 _FORM_FIELDS = ("product_type", "category", "category_label", "category_path")
 _DISTINCTIVE_FIELDS = ("title",)
-_DISTINCTIVE_JSON_FIELDS = ("tags", "use_case_tags")
+# DELIBERATELY EMPTY. tags/use_case_tags were here and produced the module's own
+# headline counter-example: a query "best vegan retinol serum" matched a
+# NIACINAMIDE serum on the tag `vegan`, never looking at "retinol"; "best cream
+# blush for dry skin" matched a face cream on `dry skin`. Shopify tags mix
+# product properties with audience and merchandising ("vegan", "cruelty free",
+# "korean beauty", "bestseller"), and nothing in the row distinguishes the two.
+# Measured on the real Anua catalogue 2026-09-02: dropping tags preserved all
+# four genuine gaps and removed both tag-driven false positives. They were pure
+# risk. A distinguishing term must come from the product's NAME.
+_DISTINCTIVE_JSON_FIELDS: Tuple[str, ...] = ("tags", "use_case_tags")
 
 
 def _brand_vocabulary(
@@ -219,14 +232,28 @@ def _form_vocabulary(catalog_rows: Sequence[Mapping[str, Any]]) -> Set[str]:
 
     No hardcoded format list is involved.
     """
+    # Two corrections, both measured:
+    #
+    # category_path is a TAXONOMY ("Beauty > Skin Care > Serums"). Admitting
+    # every segment made "beauty" and "care" forms, so "best beauty products
+    # for pores" matched a serum and read "is a beauty". Only the LEAF says
+    # what the row is.
+    #
+    # The title-final word is NOT added here. It used to be, and one title that
+    # does not end on a form then poisoned the vocabulary for the WHOLE
+    # catalogue: "Daily Moisturizer For Dry Skin" made "skin" a form, so a
+    # niacinamide serum answered "best sunscreen for sensitive skin" reading
+    # "is a skin". Even Anua, whose product_type is populated, contributed
+    # `mild`, `neck`, `skin` and `case` that way. It is now a PER-ROW fallback
+    # in _product_terms, so a bad title can only ever mis-describe its own row.
     vocab: Set[str] = set()
     for row in catalog_rows:
         for field in _FORM_FIELDS:
-            for tok in _terms(row.get(field)):
+            raw = row.get(field)
+            if field == "category_path" and isinstance(raw, str) and ">" in raw:
+                raw = raw.rsplit(">", 1)[-1]
+            for tok in _terms(raw):
                 vocab.add(tok)
-        title_terms = _terms(row.get("title"))
-        if title_terms:
-            vocab.add(title_terms[-1])
     return vocab
 
 
@@ -235,6 +262,7 @@ def _product_terms(
     *,
     form_vocab: Set[str],
     brand_vocab: Set[str],
+    title_vocab: Set[str],
 ) -> Optional[Dict[str, Any]]:
     """Split one catalog row into its FORM terms and its DISTINGUISHING terms.
     Returns None for a row we cannot describe (no key, or no terms at all)."""
@@ -246,8 +274,17 @@ def _product_terms(
     own_terms: List[str] = []
     for field in _DISTINCTIVE_FIELDS:
         own_terms.extend(_terms(row.get(field)))
+    # A TAG term counts only when some product TITLE in this catalogue also
+    # names it. Shopify tags mix product properties with audience and
+    # merchandising, and the row itself cannot tell them apart — but the
+    # catalogue can: "bha" and "ceramide" are things this merchant NAMES
+    # products after, while "vegan", "cruelty free", "korean beauty" and
+    # "bestseller" appear on no product name. Without this, `vegan` matched a
+    # NIACINAMIDE serum to a RETINOL query, never looking at "retinol".
     for field in _DISTINCTIVE_JSON_FIELDS:
-        own_terms.extend(_json_terms(row.get(field)))
+        for tok in _json_terms(row.get(field)):
+            if tok in title_vocab:
+                own_terms.append(tok)
 
     forms: List[str] = []
     seen_forms: Set[str] = set()
@@ -262,6 +299,18 @@ def _product_terms(
         if tok in form_vocab and tok not in seen_forms:
             seen_forms.add(tok)
             forms.append(tok)
+    # PER-ROW: the word this row's own title ends on is a form FOR THIS ROW.
+    # Titles overwhelmingly end on the form, and a coarse type column ("Skincare")
+    # is exactly when that is the only place the form appears. Scoped to this row
+    # on purpose — globally, one title ending on a qualifier redefined a form for
+    # the whole catalogue ("skin" from "Daily Moisturizer For Dry Skin"), and a
+    # niacinamide serum then answered "best sunscreen for sensitive skin". Scoped,
+    # a bad title can only mis-describe itself, and it still needs a
+    # distinguishing term from its OWN name to match anything.
+    title_terms = _terms(row.get("title"))
+    if title_terms and title_terms[-1] not in seen_forms:
+        seen_forms.add(title_terms[-1])
+        forms.append(title_terms[-1])
 
     distinctive: List[str] = []
     seen_dist: Set[str] = set()
@@ -292,9 +341,17 @@ def build_catalog_index(
     rows = [r for r in (catalog_rows or []) if isinstance(r, Mapping)]
     form_vocab = _form_vocabulary(rows)
     brand_vocab = _brand_vocabulary(rows, merchant_name)
+    # Every word this merchant NAMES a product with — the corroboration set
+    # for tag terms (see _product_terms).
+    title_vocab = {tok for r in rows for tok in _terms(r.get('title'))}
     index: List[Dict[str, Any]] = []
     for row in rows:
-        entry = _product_terms(row, form_vocab=form_vocab, brand_vocab=brand_vocab)
+        entry = _product_terms(
+            row,
+            form_vocab=form_vocab,
+            brand_vocab=brand_vocab,
+            title_vocab=title_vocab,
+        )
         if entry is not None:
             index.append(entry)
     return index
@@ -316,6 +373,29 @@ def _size_family(title: str) -> str:
     return _normalize_token(_SIZE_SUFFIX_RE.sub("", str(title or "")).strip())
 
 
+_NEGATION_RE = re.compile(
+    r"\b(?:no|non|without|free\s+of|free\s+from)\s+([a-z0-9]+)"
+    r"|\b([a-z0-9]+)[\s-]free\b",
+    re.I,
+)
+
+
+def negated_terms(query: str) -> Set[str]:
+    """Terms the query asks NOT to have: "oil-free", "fragrance-free",
+    "without alcohol", "no fragrance".
+
+    Without this the hyphen split turned "oil-free" into ["oil", "free"], the
+    filler list deleted "free", and a facial OIL was offered for an oil-free
+    query — the module recommending the exact thing the shopper ruled out.
+    """
+    out: Set[str] = set()
+    for a, b in _NEGATION_RE.findall(str(query or "")):
+        tok = _normalize_token(a or b)
+        if tok:
+            out.add(_singular(tok))
+    return out
+
+
 def match_products_for_query(
     query: str,
     catalog_index: Sequence[Mapping[str, Any]],
@@ -332,6 +412,7 @@ def match_products_for_query(
     query_terms = _terms(query)
     if not query_terms:
         return []
+    negated = negated_terms(query)
     scored: List[Tuple[int, int, str, Dict[str, Any]]] = []
     for entry in catalog_index:
         forms = entry.get("forms") or []
@@ -347,6 +428,13 @@ def match_products_for_query(
         if len(form_hits) < MIN_FORM_MATCHES:
             continue
         if len(dist_hits) < MIN_DISTINCTIVE_MATCHES:
+            continue
+        # The query ruled this product out by name. Offering it anyway is worse
+        # than offering nothing.
+        product_terms = list(forms) + list(distinctive)
+        if negated and any(
+            _singular(_normalize_token(t)) in negated for t in product_terms
+        ):
             continue
         title = str(entry.get("title") or "")
         matched_form = form_hits[0]

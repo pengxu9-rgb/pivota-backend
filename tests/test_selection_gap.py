@@ -389,10 +389,15 @@ def test_output_is_a_list_of_named_queries_not_a_rate():
         query_evidence=per_prompt_evidence(reports),
         merchant_name="Anua",
     )
-    # The queries are named, verbatim.
+    # The queries are named, verbatim. "best bha exfoliating toner" is NOT here:
+    # its only link to the Heartleaf toner is that product's `bha` tag, and a tag
+    # term counts as distinguishing only when some product TITLE in the catalogue
+    # also names it. No product here is named for BHA, so the tag is
+    # uncorroborated and correctly ignored — the same rule that stops `vegan`
+    # selling a niacinamide serum against a retinol query. Conservative by
+    # design: a miss, not a fabrication.
     assert [g["query"] for g in out["gaps"]] == [
         "best affordable niacinamide serum",
-        "best bha exfoliating toner",
     ]
     assert [w["query"] for w in out["won_queries"]] == ["best ceramide cream"]
 
@@ -632,3 +637,97 @@ def test_a_bracketed_product_distinction_is_not_collapsed():
 
     assert _size_family("X Serum (30ml)") == _size_family("X Serum")
     assert _size_family("X Serum (Multichrome)") != _size_family("X Serum")
+
+
+# ===========================================================================
+# The three false-positive classes review found, each reproduced then fixed.
+# All six inputs below produced a wrong, merchant-facing claim before the fix.
+# ===========================================================================
+def _idx(rows, merchant="Anua"):
+    from services.selection_gap import build_catalog_index
+    return build_catalog_index(rows, merchant_name=merchant)
+
+
+def _match(rows, query, merchant="Anua"):
+    from services.selection_gap import match_products_for_query
+    return match_products_for_query(query, _idx(rows, merchant))
+
+
+def test_a_merchandising_tag_cannot_carry_a_match():
+    """`vegan` matched a NIACINAMIDE serum to a RETINOL query — "retinol" was
+    never looked at. Shopify tags mix product properties with audience and
+    marketing, and nothing in the row separates them, so a distinguishing term
+    must come from the product's NAME."""
+    rows = [{"product_key": "s1", "title": "Niacinamide 10 Serum", "brand": "Anua",
+             "product_type": "Serum", "tags": ["vegan", "cruelty free", "korean beauty"]}]
+    assert _match(rows, "best vegan retinol serum") == []
+
+
+def test_an_audience_tag_cannot_carry_a_match():
+    """`dry skin` sold a FACE CREAM against a CREAM BLUSH query."""
+    rows = [{"product_key": "c1", "title": "Hydrating Ceramide Cream", "brand": "Anua",
+             "product_type": "Moisturizer", "tags": ["dry skin"]}]
+    assert _match(rows, "best cream blush for dry skin") == []
+
+
+def test_a_negated_term_the_product_carries_refuses_the_match():
+    """"oil-free" split to ["oil","free"], the filler list deleted "free", and a
+    facial OIL was offered for an oil-free query — recommending the exact thing
+    the shopper ruled out."""
+    rows = [{"product_key": "p1", "title": "Squalane Facial Oil", "brand": "Anua",
+             "product_type": "Face Oil", "tags": []}]
+    assert _match(rows, "best oil-free moisturiser for oily skin") == []
+    rows2 = [{"product_key": "v1", "title": "Vitamin C Fragrance Serum", "brand": "Anua",
+              "product_type": "Serum", "tags": []}]
+    assert _match(rows2, "best fragrance-free serum for sensitive skin") == []
+
+
+def test_a_non_negated_query_still_matches():
+    """Positive counterpart: negation handling must not blunt ordinary matching."""
+    rows = [{"product_key": "n1", "title": "Niacinamide 10 Serum", "brand": "Anua",
+             "product_type": "Serum", "tags": []}]
+    assert _match(rows, "best affordable niacinamide serum")
+
+
+def test_an_uncorroborated_title_final_word_is_not_a_form():
+    """One title not ending on a form poisoned the GLOBAL form vocabulary:
+    "Daily Moisturizer For Dry Skin" made "skin" a form, and a niacinamide serum
+    then answered "best sunscreen for sensitive skin" reading "is a skin"."""
+    rows = [
+        {"product_key": "a1", "title": "Daily Moisturizer For Dry Skin",
+         "brand": "Anua", "product_type": None, "tags": None},
+        {"product_key": "a2", "title": "Niacinamide 10 Serum",
+         "brand": "Anua", "product_type": None, "tags": ["sensitive skin"]},
+    ]
+    assert _match(rows, "best sunscreen for sensitive skin") == []
+
+
+def test_a_corroborated_title_final_word_is_still_a_form():
+    """Positive counterpart: the heuristic exists to recover the form when the
+    type column is coarse, and must keep doing that when a type column agrees."""
+    rows = [
+        {"product_key": "b1", "title": "Heartleaf Soothing Toner",
+         "brand": "Anua", "product_type": "Skincare", "tags": []},
+        {"product_key": "b2", "title": "BHA Exfoliating Toner",
+         "brand": "Anua", "product_type": "Toner", "tags": []},
+    ]
+    assert _match(rows, "best exfoliating toner")
+
+
+def test_only_the_leaf_of_a_category_path_is_a_form():
+    """"Beauty > Skin Care > Serums" made "beauty" and "care" forms, so "best
+    beauty products for pores" matched a serum and read "is a beauty"."""
+    rows = [{"product_key": "x", "title": "Peach 70% Niacinamide Serum", "brand": "Anua",
+             "product_type": "Skincare", "category_path": "Beauty > Skin Care > Serums",
+             "tags": []}]
+    assert _match(rows, "best beauty products for pores") == []
+    assert _match(rows, "best niacinamide serum"), "the leaf must still work"
+
+
+def test_singular_does_not_over_strip_es():
+    """pore/pores became pore/por, silently losing a real gap."""
+    from services.selection_gap import _singular
+    assert _singular("pores") == _singular("pore")
+    assert _singular("essences") == _singular("essence")
+    assert _singular("serums") == _singular("serum")
+    assert _singular("brushes") == "brush", "a real -es plural must still strip"
