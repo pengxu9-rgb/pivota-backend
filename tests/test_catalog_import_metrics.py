@@ -132,3 +132,75 @@ async def test_a_metrics_failure_never_breaks_the_import(monkeypatch, claimed):
     result = await worker.process_import_task_by_id(7)
 
     assert result["status"] == "succeeded"
+
+
+async def test_an_arbitrary_connector_cannot_become_a_label_value(monkeypatch):
+    """Cardinality clamp. `platform_import_tasks.connector` is a plain
+    String(100) with no CHECK and no enum; `schedule_import_task` takes a bare
+    Optional[str]; and services/platform_onboarding_service.py CATCHES
+    InvalidConnectorError and logs it WITHOUT resetting the value. So a merchant
+    calling POST /platform/onboarding/register can put an arbitrary string in
+    that column and loop to seed unlimited distinct values.
+
+    The drain lane is scoped to connector='shopify' today, so those rows are
+    never processed. But db/platform_import_tasks.py explicitly invites widening
+    the lane, and the clamp is what makes this safe when it widens — it does not
+    depend on the lane staying narrow.
+    """
+    task = {
+        "id": 9,
+        "merchant_id": "m_evil",
+        "source_type": "connector",
+        "connector": "attacker-supplied-" + "x" * 40,
+        "attempt": 1,
+        "counts": {},
+    }
+
+    async def _claim_by_id(task_id):
+        return dict(task)
+
+    async def _record(t):
+        return {"processed": True, "task_id": 9, "status": "failed", "counts": {}}
+
+    monkeypatch.setattr(worker, "claim_ready_task_by_id", _claim_by_id)
+    monkeypatch.setattr(worker, "_process_import_task_record", _record)
+
+    before_other = _counter_value("other", "failed", "none")
+    before_raw = _counter_value(task["connector"], "failed", "none")
+
+    await worker.process_import_task_by_id(9)
+
+    assert _counter_value("other", "failed", "none") == before_other + 1
+    assert _counter_value(task["connector"], "failed", "none") == before_raw, (
+        "an arbitrary merchant-supplied string became a live label value"
+    )
+
+
+async def test_a_retrying_task_counts_once_per_attempt_not_once_per_task(monkeypatch, claimed):
+    """The multiplier an alert has to account for, pinned so the docs stay true.
+
+    ShopifyCredentialsUnavailableError is deliberately retryable, so one
+    merchant hitting one credential outage emits a sample per attempt. An
+    earlier version of this counter's docstring called these outcomes
+    "terminal", which would have led whoever wrote the runbook to read six
+    samples as six affected merchants.
+    """
+    async def _record(task):
+        return {
+            "processed": True,
+            "task_id": 7,
+            "status": "retry_scheduled",
+            "counts": {"error_category": "credentials_unavailable"},
+        }
+
+    monkeypatch.setattr(worker, "_process_import_task_record", _record)
+    before = _counter_value("shopify", "retry_scheduled", "credentials_unavailable")
+
+    for _ in range(3):
+        await worker.process_next_import_task()
+
+    after = _counter_value("shopify", "retry_scheduled", "credentials_unavailable")
+    assert after == before + 3, (
+        "retries are counted per attempt; if this ever becomes +1 the docs and "
+        "any alert built on them are wrong"
+    )

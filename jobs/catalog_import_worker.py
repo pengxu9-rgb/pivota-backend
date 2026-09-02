@@ -1612,7 +1612,12 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _record_import_outcome(task: Dict[str, Any], result: Dict[str, Any]) -> None:
-    """Emit the terminal outcome of one import task to the metrics counter.
+    """Emit the outcome of one import ATTEMPT to the metrics counter.
+
+    Attempt, not task: `retry_scheduled` is a processed outcome and is counted,
+    so a task that retries emits a sample per attempt. See
+    observability.reliability_metrics.record_catalog_import_task for the
+    multiplier an alert has to account for.
 
     Called at the two ENTRY POINTS rather than inside
     _process_import_task_record, which has a dozen return statements across five
@@ -1641,7 +1646,12 @@ def _record_import_outcome(task: Dict[str, Any], result: Dict[str, Any]) -> None
             error_category=(counts or {}).get("error_category") if isinstance(counts, dict) else None,
         )
     except Exception:  # noqa: BLE001 — observability must not break the import
-        logger.debug("Failed to record catalog import metrics", exc_info=True)
+        # WARNING, not DEBUG. If the collector is broken for every call — a
+        # label mismatch, a duplicate registration returning None, a client
+        # upgrade — the counter reads zero forever. For an alert keyed on the
+        # PRESENCE of credentials_unavailable, a silently dead counter and a
+        # healthy queue are the same observation, and prod does not emit DEBUG.
+        logger.warning("Failed to record catalog import metrics", exc_info=True)
 
 
 async def process_next_import_task() -> Dict[str, Any]:
