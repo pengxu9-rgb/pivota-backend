@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from db.commerce_interactions import commerce_interaction_events
 from db.database import database
@@ -14,6 +14,7 @@ from services.traffic_taxonomy_service import taxonomy_from_row
 
 
 logger = logging.getLogger("merchant_commerce_event_funnel_service")
+OPS_CANARY_SURFACE = "ops_canary"
 
 
 def _event_limit() -> int:
@@ -367,6 +368,16 @@ async def _fetch_event_rows(
     )
     if surface:
         query = query.where(commerce_interaction_events.c.surface == surface)
+    else:
+        # Synthetic production probes remain queryable through an explicit
+        # surface=ops_canary request, but must never contribute to a merchant's
+        # default funnel stages, order counts, paid GMV, or refund totals.
+        query = query.where(
+            or_(
+                commerce_interaction_events.c.surface.is_(None),
+                commerce_interaction_events.c.surface != OPS_CANARY_SURFACE,
+            )
+        )
     if platform:
         query = query.where(commerce_interaction_events.c.platform == platform)
     if store_id:
