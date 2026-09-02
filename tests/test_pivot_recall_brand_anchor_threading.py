@@ -167,3 +167,67 @@ def test_the_gateway_resolves_the_anchor_BEFORE_the_search() -> None:
     assert resolve_at < search_at, "the anchor must be resolved before the search that needs it"
     assert "brand_anchor_terms=brand_anchor_terms," in source, ( "the resolved anchor must be threaded into the recall request AS RESOLVED — `or None` turns [] (no brand) into None (derive it yourself), the opposite of the documented contract"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# ADMIT, don't merely re-rank. `brand_anchor_score` is a SCORE term — it never appears in the
+# WHERE — so it reorders the candidate set but cannot admit a row the WHERE excluded. Measured in
+# prod with the boost live (web-00278-tor): "I am looking for a Murad cleanser" returned 5 Murad
+# products (because `cleanser` yields a category prefix and category recall admits them), while
+# "show me Murad products" still returned one LIZUSH bath bomb — the phrase predicate looks for
+# "%show me murad products%" and no Murad row was ever a candidate.
+
+
+@pytest.mark.asyncio
+async def test_a_brand_anchor_ADMITS_rows_not_just_boosts_them(captured_sql):
+    await svc._fetch_canonical_search_rows(
+        query="show me Murad products",
+        merchant_id=None,
+        limit=20,
+        brand_anchor_terms=["murad"],
+    )
+    sql = captured_sql["sql"]
+    # The admit predicate is bound and lives in the candidate WHERE, not only in the scoring.
+    assert captured_sql["params"].get("brand_admit_0") == "% murad %"
+    where = sql[sql.index("WHERE (") : sql.index("ORDER BY rank_score")]
+    assert "brand_admit_0" in where, "the anchor must widen the candidate set, not only re-rank it"
+
+
+@pytest.mark.asyncio
+async def test_the_admit_branch_is_whole_word_and_identity_only(captured_sql):
+    """It ADMITS rows, so a substring hit costs far more here than in the scoring: `%lush%` inside
+    "Blush" would pull every blush in the catalog into the candidate window. Comparing against a
+    space-padded field makes the match word-delimited with plain LIKE and a bound parameter."""
+    await svc._fetch_canonical_search_rows(
+        query="lush blush", merchant_id=None, limit=20, brand_anchor_terms=["lush"]
+    )
+    sql = captured_sql["sql"]
+    assert captured_sql["params"]["brand_admit_0"] == "% lush %"
+    admit = sql[sql.index("brand_admit_0") - 300 : sql.index("brand_admit_0") + 200]
+    assert "p.brand" in admit and "m.merchant_name" in admit
+    assert "p.title" not in admit, "admitting on title would flood the candidate window"
+
+
+@pytest.mark.parametrize(
+    "brand,term,admitted",
+    [
+        ("Murad", "murad", True),
+        ("Murad Skin Care", "murad", True),   # the brand is one word among several
+        ("LUSH", "lush", True),
+        ("Blush", "lush", False),             # the substring hazard, refused
+        ("Plush Beauty", "lush", False),
+        ("Four Sigmatic", "sigma", False),
+        ("Sigma Beauty", "sigma", True),
+    ],
+)
+def test_the_word_boundary_property_the_admit_branch_relies_on(brand, term, admitted):
+    """`(' ' || brand || ' ') LIKE '% term %'` in SQL, expressed here as the string property it is."""
+    assert (f" {term} " in f" {brand.lower()} ") is admitted
+
+
+@pytest.mark.asyncio
+async def test_no_anchor_means_no_admit_branch(captured_sql):
+    await svc._fetch_canonical_search_rows(
+        query="hydrating cleanser", merchant_id=None, limit=20, brand_anchor_terms=[]
+    )
+    assert not [k for k in captured_sql["params"] if k.startswith("brand_admit_")]

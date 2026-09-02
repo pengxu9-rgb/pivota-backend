@@ -1081,6 +1081,7 @@ async def _fetch_canonical_search_rows(
     # None (no opinion from the caller) keeps the original behaviour for every other
     # caller of this function.
     brand_anchor_score = ""
+    brand_anchor_where = ""
     brand_anchor_terms = (
         brand_anchor_terms
         if brand_anchor_terms is not None
@@ -1139,6 +1140,40 @@ async def _fetch_canonical_search_rows(
             "\n                    + CASE WHEN ("
             + anchor_expression
             + ") THEN 180 ELSE 0 END\n"
+        )
+
+        # ADMIT the brand's rows, do not merely re-rank them.
+        #
+        # `brand_anchor_score` is a SCORE term — it appears in rank_score/text_score and never in
+        # the WHERE. A score reorders the candidate set; it cannot admit a row the WHERE excluded.
+        # That is why boosting alone did not fix a brand-only query. Measured in prod on 2026-09-02
+        # with the boost live (web-00278-tor): "I am looking for a Murad cleanser" returned 5 Murad
+        # products, because `cleanser` yields a category prefix and category recall admits Murad's
+        # cleansers for the anchor to find — while "show me Murad products", which has no category
+        # term, still returned one LIZUSH bath bomb with `brand_category_anchor_matched: false`.
+        # The phrase predicate looks for the literal "%show me murad products%" and matches nothing,
+        # so no Murad row was ever a candidate.
+        #
+        # WHOLE-WORD, and IDENTITY FIELDS ONLY. This branch ADMITS rows, so a substring hit here is
+        # far more expensive than one that merely re-ranks: `%lush%` inside "Blush" would pull every
+        # blush in the catalog into the candidate window. Comparing against a space-padded field
+        # makes the match word-delimited using plain LIKE with a bound parameter — " murad " matches
+        # "Murad" and "Murad Skin Care", and " lush " does not match " blush ". No regex, so a term
+        # carrying regex metacharacters cannot change the shape of the predicate.
+        padded_matches = []
+        for anchor_index, anchor_term in enumerate(brand_anchor_terms):
+            param_name = f"brand_admit_{anchor_index}"
+            params[param_name] = f"% {anchor_term} %"
+            padded_matches.append(
+                "("
+                + " OR ".join(
+                    f"(' ' || LOWER(COALESCE({field}, '')) || ' ') LIKE :{param_name}"
+                    for field in ("p.brand", "m.merchant_name")
+                )
+                + ")"
+            )
+        brand_anchor_where = (
+            "\n                OR (" + " AND ".join(padded_matches) + ")\n"
         )
 
     # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
@@ -1287,6 +1322,7 @@ async def _fetch_canonical_search_rows(
                 {category_where}
                 {vertical_where}
                 {token_where}
+                {brand_anchor_where}
             )
             {merchant_clause}
             {lifecycle_clause}
