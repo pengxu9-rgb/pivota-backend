@@ -97,6 +97,13 @@ async def reconcile_paid_orders_missing_merchant_order(
 
     cutoff = datetime.utcnow() - timedelta(seconds=int(min_age_seconds))
     merchant_clause = "AND merchant_id = :merchant_id" if merchant_id else ""
+    # Bind ONLY what `merchant_clause` actually interpolates. `databases` hands
+    # this dict straight to text().bindparams(), which raises ArgumentError for
+    # a parameter the query never declared — and the scheduled caller always
+    # passes merchant_id=None, so an unconditional bind fails every real run.
+    values: Dict[str, Any] = {"cutoff": cutoff, "limit": int(limit)}
+    if merchant_id:
+        values["merchant_id"] = merchant_id
     rows = await database.fetch_all(
         f"""
         SELECT order_id
@@ -112,11 +119,7 @@ async def reconcile_paid_orders_missing_merchant_order(
         ORDER BY created_at ASC
         LIMIT :limit
         """,
-        {
-            "merchant_id": merchant_id,
-            "cutoff": cutoff,
-            "limit": int(limit),
-        },
+        values,
     )
     order_ids = [str(dict(row).get("order_id") or "") for row in rows or []]
     order_ids = [order_id for order_id in order_ids if order_id]

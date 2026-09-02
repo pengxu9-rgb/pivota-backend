@@ -181,7 +181,8 @@ Production alerts/metrics to add:
 
 Recommended alert thresholds:
 
-- Page immediately when `paid_merchant_order_failed_count > 0` for live merchants.
+- Page immediately when `paid_missing_merchant_order_count > 0` for live merchants. This is the complete count of paid orders with no merchant-platform order, and it carries a 300s age floor so a sync still in flight does not page.
+- Do NOT page on `paid_merchant_order_failed_count`. It is a strict SUBSET: it requires a `paid_merchant_order_failed` marker, which is only written when a sync attempt ran and failed, so it is blind to a dispatch that died with the process. Measured 2026-09-01 it read 4 while the real figure was 33.
 - Treat `paid_merchant_order_failed_active_count` as the current unresolved paid-without-merchant-order signal. Treat `merchant_order_retry_failed_count` / `merchant_order_retry_failed_event_count` as historical event counters; they should trigger investigation only when they increase, not by their absolute value after the active count has returned to zero.
 - Alert when order-impacting webhook failure count or reconciliation drift count is non-zero for more than one scheduled interval. Raw `webhook_failed_count` should be investigated by event type because PSP report or dispute notifications can be non-order-impacting.
 - Alert when merchant order retry failures increase after deployment.
