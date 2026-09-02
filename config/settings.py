@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     )
     # App Store (public) distribution scope set: read-only sync + optimization +
     # AI-readiness. MUST exactly match the scopes declared in shopify.app.toml
-    # ([access_scopes] read_discounts,read_fulfillments,read_orders,read_products).
+    # Includes Web Pixel activation (`write_pixels`, `read_customer_events`).
     # Requesting any scope NOT declared in the app config (e.g. write_webhooks)
     # makes Shopify reject the OAuth authorize request with a 400, which fails the
     # "authenticates after install" automated review check. Compliance/GDPR
@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     # (with write_orders + write_webhooks) stays for custom/headless installs.
     shopify_appstore_scopes: str = os.getenv(
         "SHOPIFY_APPSTORE_SCOPES",
-        "read_products,read_orders,read_fulfillments,read_discounts",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_pixels,read_customer_events",
     )
 
     # --- Dual Shopify app credentials -------------------------------------
@@ -142,7 +142,7 @@ class Settings(BaseSettings):
     )
     shopify_headless_scopes: str = os.getenv(
         "SHOPIFY_HEADLESS_SCOPES",
-        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders",
+        "read_products,read_orders,read_fulfillments,read_discounts,write_webhooks,write_orders,write_pixels,read_customer_events",
     )
 
     # Wix
@@ -910,4 +910,3 @@ def _enforce_jwt_secret_strength(current: "Settings") -> None:
         "JWT secret is weak (%s). Permitted only because this host is not "
         "deployed and not production.", problem,
     )
-

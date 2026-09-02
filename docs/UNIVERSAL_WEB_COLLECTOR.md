@@ -199,8 +199,10 @@ through the merchant CMP rather than using the declarative `granted` mode.
 - WooCommerce, Adobe Commerce, SHOPLINE, Shoplazza, and SFCC use it for product,
   search, session, cart, and storefront-specific checkout observations while
   retaining native signed webhooks for transaction closure.
-- Shopify Web Pixel should map its standard events to this API in the Shopify
-  bridge increment; do not embed the generic script directly in a restricted
-  pixel sandbox without validating Shopify's sandbox transport rules.
+- Shopify uses the dedicated strict-sandbox bridge under
+  `integrations/shopify-web-pixel/` and
+  `POST /merchant-events/v1/shopify-pixel/batch`. Its store-bound public token
+  has a separate audience because a strict pixel sandbox cannot reliably supply
+  the merchant storefront Origin required by the generic collector.
 - Custom/headless stores use `POST /integrations/custom/connect` to create their
   active store scope and receive the consent-pending installation snippet.

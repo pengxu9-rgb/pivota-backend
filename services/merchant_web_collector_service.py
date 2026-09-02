@@ -14,11 +14,12 @@ from pydantic import ValidationError
 from config.settings import settings
 from services.merchant_event_ingest_service import MerchantEventBatch
 
-
 WEB_COLLECTOR_ISSUER = "pivota-merchant-events"
 WEB_COLLECTOR_AUDIENCE = "pivota-web-collector"
 WEB_COLLECTOR_TOKEN_TYPE = "merchant_web_collector"
 WEB_COLLECTOR_TOKEN_VERSION = 1
+SHOPIFY_PIXEL_AUDIENCE = "pivota-shopify-web-pixel"
+SHOPIFY_PIXEL_TOKEN_TYPE = "shopify_web_pixel"
 
 # A public browser write token may observe a funnel, but it must never be able
 # to manufacture authoritative money movement. Payment settlement, orders,
@@ -107,7 +108,9 @@ def collector_request_origin(*, origin: Optional[str], referer: Optional[str]) -
         if parsed.scheme and parsed.netloc:
             candidate = f"{parsed.scheme}://{parsed.netloc}"
     if not candidate:
-        raise WebCollectorError(403, "Web collector requests require an allowed Origin or Referer")
+        raise WebCollectorError(
+            403, "Web collector requests require an allowed Origin or Referer"
+        )
     try:
         return normalize_collector_origin(candidate)
     except ValueError as exc:
@@ -212,7 +215,9 @@ def verify_web_collector_token(
     except ValueError as exc:
         raise WebCollectorError(401, "Invalid web collector token") from exc
     if normalized_request_origin not in allowed:
-        raise WebCollectorError(403, "Origin is not allowed for this web collector token")
+        raise WebCollectorError(
+            403, "Origin is not allowed for this web collector token"
+        )
     return {
         **claims,
         "merchant_id": merchant_id,
@@ -223,17 +228,83 @@ def verify_web_collector_token(
     }
 
 
+def issue_shopify_pixel_token(
+    *,
+    merchant_id: str,
+    store_id: str,
+    ttl_days: int = 90,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    issued_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expires_at = issued_at + timedelta(
+        days=max(1, min(int(ttl_days), MAX_TOKEN_TTL_DAYS))
+    )
+    claims = {
+        "iss": WEB_COLLECTOR_ISSUER,
+        "aud": SHOPIFY_PIXEL_AUDIENCE,
+        "typ": SHOPIFY_PIXEL_TOKEN_TYPE,
+        "v": WEB_COLLECTOR_TOKEN_VERSION,
+        "merchant_id": str(merchant_id).strip(),
+        "store_id": str(store_id).strip(),
+        "platform": "shopify",
+        "iat": int(issued_at.timestamp()),
+        "exp": int(expires_at.timestamp()),
+    }
+    if not claims["merchant_id"] or not claims["store_id"]:
+        raise ValueError("merchant_id and store_id are required")
+    return {
+        "token": jwt.encode(claims, _collector_signing_key(), algorithm="HS256"),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+def verify_shopify_pixel_token(token: Any) -> Dict[str, Any]:
+    raw = str(token or "").strip()
+    if not raw:
+        raise WebCollectorError(401, "Missing Shopify pixel token")
+    try:
+        claims = jwt.decode(
+            raw,
+            _collector_signing_key(),
+            algorithms=["HS256"],
+            audience=SHOPIFY_PIXEL_AUDIENCE,
+            issuer=WEB_COLLECTOR_ISSUER,
+            options={"require": ["exp", "iat", "aud", "iss"]},
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise WebCollectorError(401, "Shopify pixel token has expired") from exc
+    except jwt.InvalidTokenError as exc:
+        raise WebCollectorError(401, "Invalid Shopify pixel token") from exc
+    if (
+        claims.get("typ") != SHOPIFY_PIXEL_TOKEN_TYPE
+        or claims.get("v") != WEB_COLLECTOR_TOKEN_VERSION
+    ):
+        raise WebCollectorError(401, "Invalid Shopify pixel token")
+    merchant_id = str(claims.get("merchant_id") or "").strip()
+    store_id = str(claims.get("store_id") or "").strip()
+    if not merchant_id or not store_id or claims.get("platform") != "shopify":
+        raise WebCollectorError(401, "Invalid Shopify pixel token")
+    return {
+        **claims,
+        "merchant_id": merchant_id,
+        "store_id": store_id,
+        "platform": "shopify",
+    }
+
+
 def build_web_collector_batch(
     payload: Dict[str, Any],
     *,
     claims: Dict[str, Any],
     now: Optional[datetime] = None,
+    source: str = "universal_web_collector",
 ) -> MerchantEventBatch:
     unknown_batch_keys = sorted(set(payload) - {"collector_token", "events"})
     if unknown_batch_keys:
         raise WebCollectorError(
             422,
-            "Web collector body contains unsupported keys: " + ", ".join(unknown_batch_keys[:10]),
+            "Web collector body contains unsupported keys: "
+            + ", ".join(unknown_batch_keys[:10]),
         )
     raw_events = payload.get("events")
     if not isinstance(raw_events, list) or not raw_events or len(raw_events) > 100:
@@ -253,9 +324,13 @@ def build_web_collector_batch(
                 f"event_type is not allowed from a public web collector: {event_type or 'missing'}",
             )
         if event.get("platform") not in (None, "", platform):
-            raise WebCollectorError(422, "Web collector event platform does not match its token")
+            raise WebCollectorError(
+                422, "Web collector event platform does not match its token"
+            )
         if event.get("store_id") not in (None, "", store_id):
-            raise WebCollectorError(422, "Web collector event store_id does not match its token")
+            raise WebCollectorError(
+                422, "Web collector event store_id does not match its token"
+            )
         forbidden_fields = sorted(
             field
             for field in FORBIDDEN_WEB_EVENT_FIELDS
@@ -264,14 +339,20 @@ def build_web_collector_batch(
         if forbidden_fields:
             raise WebCollectorError(
                 422,
-                "Public web collector events cannot report: " + ", ".join(forbidden_fields),
+                "Public web collector events cannot report: "
+                + ", ".join(forbidden_fields),
             )
-        if event.get("amount_cents") is not None or event.get("currency") not in (None, ""):
-            raise WebCollectorError(422, "Public web collector events cannot report money amounts")
+        if event.get("amount_cents") is not None or event.get("currency") not in (
+            None,
+            "",
+        ):
+            raise WebCollectorError(
+                422, "Public web collector events cannot report money amounts"
+            )
         event["event_type"] = event_type
         event["platform"] = platform
         event["store_id"] = store_id
-        event["source"] = "universal_web_collector"
+        event["source"] = source
         event["amount_cents"] = None
         event["currency"] = None
         normalized_events.append(event)
@@ -286,5 +367,7 @@ def build_web_collector_batch(
         if event.occurred_at < current - MAX_WEB_EVENT_AGE:
             raise WebCollectorError(422, "Web collector event is older than seven days")
         if event.occurred_at > current + MAX_WEB_EVENT_FUTURE_SKEW:
-            raise WebCollectorError(422, "Web collector event occurred_at is in the future")
+            raise WebCollectorError(
+                422, "Web collector event occurred_at is in the future"
+            )
     return batch
