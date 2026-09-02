@@ -57,6 +57,7 @@ from services.external_seed_search import (
 )
 from services.pivot_query_service import (
     _category_brand_anchor_terms,
+    category_path_prefix_for_query,
     search_pivot_catalog,
 )
 from services.query_semantic_class import classify_query_semantic_class
@@ -6769,36 +6770,53 @@ async def _resolve_brand_anchor_terms(query: str) -> tuple[list, str | None]:
     """Brand-anchor terms for the pivot lane, and where they came from.
 
     `_category_brand_anchor_terms` requires a category prefix AND at least two
-    residual tokens.  That second rule exists for a good reason — it stops a lone
-    descriptor like "brightening" in "brightening blush" becoming an accidental
-    brand gate — but a token COUNT cannot tell a descriptor from a brand, and the
-    cost is that no SINGLE-WORD brand can ever anchor.  Measured against the
-    shipped helper:
+    residual tokens.  The second rule stops a lone descriptor like "brightening"
+    in "brightening blush" becoming an accidental brand gate, but a token COUNT
+    cannot tell a descriptor from a brand, so no SINGLE-WORD brand can ever
+    anchor.  Measured against the shipped helper:
 
-        "knight unicorn blush"   -> ['knight', 'unicorn']   (two-word brand, works)
+        "knight unicorn blush"   -> ['knight', 'unicorn']   two-word brand, works
         "murad cleanser"         -> []   category found, ONE residual token
         "show me Murad products" -> []   no category at all
         "brightening blush"      -> []   correctly refused
 
-    So Murad, CeraVe, NARS, Tatcha — the entire single-word brand class — went
-    unanchored, and the broad category lane filled the page with whatever else
-    matched.  Live on 2026-09-02 "show me Murad products" answered with a LIZUSH
-    bath bomb whose title ends "bath & body products", and "I am looking for a
-    Murad cleanser" answered with twelve cleansers from other brands.
+    Murad, CeraVe, NARS, Tatcha — the whole single-word class — went unanchored,
+    and the broad category lane filled the page with whatever else matched.
 
-    The signal that actually separates "murad" from "brightening" is whether the
-    token IS a brand in our own catalog, and this service already maintains that:
-    `_detect_brand_query` matches against `_DYNAMIC_BRAND_SET`, grouped from
-    catalog_products.brand and warmed by `_ensure_brand_dictionary_loaded`.  Only
-    'catalog' and 'static' modes are accepted — 'heuristic' is a guess about an
-    unknown string and would re-admit exactly the false positives the residual
-    rule was written to keep out.  Same accepted-mode set the sibling call site in
-    this file already uses.
+    This anchor is a HARD FILTER on the page, so every guard below exists to make
+    a false positive impossible rather than merely unlikely.  Each was written
+    against a reproduced failure, so do not relax one without re-running them:
 
-    Fail-safe in both directions: a cold or empty dictionary yields no anchor and
-    the caller keeps today's behaviour, and the caller only narrows the page when
-    the anchor actually matches something (`if anchored_products:`), so a wrong
-    anchor cannot empty a result set.
+    ONLY mode 'catalog'.  'static' is not gated by GATEWAY_DYNAMIC_BRAND_DETECT
+    and matches by COMPACT SUBSTRING over the whole query, so it fires even where
+    the dynamic dictionary is off and on strings that merely contain a brand:
+    "four sigmatic mushroom coffee" resolved ['sigma','beauty'] and collapsed a
+    ten-product page to Sigma Beauty, dropping the Four Sigmatic row the user
+    asked for.  'heuristic' is a guess about an unknown string and would re-admit
+    exactly the false positives the residual rule was written to exclude.
+    'catalog' is the only mode that means "this whole token span IS a brand in our
+    catalog" — an exact span lookup, no substring.
+
+    EXACTLY ONE BRAND, or refuse.  "tom ford vs jo malone" resolved two brands and
+    the old `next(...)` silently kept the alphabetically-first one, answering a
+    comparison with a Jo Malone-only page.  A tie is not ours to break.
+
+    TOKENS LONGER THAN TWO CHARACTERS.  `_normalize_brand_query_text` deletes
+    apostrophes and accents into spaces rather than folding them, so "L'Oréal"
+    becomes the span "l or al", which split into ['l','or','al'] and matched
+    "Floral Street" while reporting a brand hit.  `_tokenize_relevance` already
+    drops <=2-char tokens on the legacy path; this mirrors it.
+
+    A SPAN THAT IS ITSELF A CATEGORY IS NOT AN ANCHOR.  `essence`, `ampoule`,
+    `lipstick`, `mascara` and `blush` are all real catalog brands AND product
+    types; anchoring "essence toner" on the `essence` brand narrows a page of
+    K-beauty essences to one drugstore label.  `category_path_prefix_for_query`
+    already knows the difference — it resolves those to a category path and
+    resolves `murad`/`cerave`/`nars` to None — so it decides, rather than a
+    hand-maintained stopword list that has to be remembered.
+
+    Fail-safe: a cold, empty or erroring dictionary yields no anchor and the
+    caller keeps today's behaviour.
     """
     terms = _category_brand_anchor_terms(query)
     if terms:
@@ -6812,22 +6830,26 @@ async def _resolve_brand_anchor_terms(query: str) -> tuple[list, str | None]:
 
         await _agent_ensure_brand_dictionary_loaded()
         detected = _agent_detect_brand_query(query) or {}
-        if detected.get("brand_like") and str(detected.get("mode") or "") in {
-            "catalog",
-            "static",
-        }:
-            span = next(
-                (str(t) for t in (detected.get("brand_terms") or []) if str(t or "").strip()),
-                "",
-            )
-            tokens = [t for t in _strip_accents(span.lower()).split() if t]
-            if tokens:
-                return tokens, str(detected.get("mode"))
+        if not detected.get("brand_like"):
+            return [], None
+        if str(detected.get("mode") or "") != "catalog":
+            return [], None
+
+        spans = [str(t).strip() for t in (detected.get("brand_terms") or []) if str(t or "").strip()]
+        if len(spans) != 1:
+            return [], None
+
+        span = spans[0]
+        if category_path_prefix_for_query(span):
+            return [], None
+
+        tokens = [t for t in _strip_accents(span.lower()).split() if len(t) > 2]
+        if not tokens:
+            return [], None
+        return tokens, "catalog"
     except Exception:
         # Never let brand detection break recall — fall back to the prior gate.
-        pass
-
-    return [], None
+        return [], None
 
 
 async def _handle_find_products_multi_via_pivot(

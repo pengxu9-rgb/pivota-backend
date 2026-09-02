@@ -131,3 +131,77 @@ def test_the_pivot_handler_consumes_the_resolver() -> None:
     assert (
         "brand_anchor_terms = _category_brand_anchor_terms(query)" not in source
     ), "a direct call re-introduces the single-word-brand blind spot"
+
+
+# ---------------------------------------------------------------------------------------------
+# The guards below each exist because a review REPRODUCED the failure. They run the REAL
+# `_detect_brand_query` with the real flag, because every test above monkeypatches it — and with
+# the flag unset the headline fix is a no-op while the static path still fires, which no
+# monkeypatched test could ever have caught.
+
+
+@pytest.fixture
+def real_detector(monkeypatch: pytest.MonkeyPatch):
+    """Real detector, flag ON, with a seeded catalog dictionary."""
+    monkeypatch.setenv("GATEWAY_DYNAMIC_BRAND_DETECT", "1")
+    monkeypatch.setattr(
+        agent_api,
+        "_DYNAMIC_BRAND_SET",
+        frozenset({"murad", "cerave", "the ordinary", "essence", "sigma beauty"}),
+    )
+    monkeypatch.setattr(agent_api, "_DYNAMIC_BRAND_LOADED_AT", float("inf"))
+
+
+@pytest.mark.asyncio
+async def test_the_real_detector_anchors_a_real_brand(real_detector):
+    """The integration, not a stub: mode really is 'catalog' for a catalogued brand."""
+    assert agent_api._detect_brand_query("murad cleanser").get("mode") == "catalog"
+    terms, source = await gw._resolve_brand_anchor_terms("murad cleanser")
+    assert (terms, source) == (["murad"], "catalog")
+
+
+@pytest.mark.asyncio
+async def test_the_static_path_can_never_anchor(real_detector):
+    """`static` is NOT gated by the flag and matches by COMPACT SUBSTRING over the whole
+    query, so it fired on strings that merely contain a brand. Reproduced with the flag OFF:
+    "four sigmatic mushroom coffee" resolved ['sigma','beauty'] and collapsed a ten-product
+    page to Sigma Beauty — dropping the Four Sigmatic row the user asked for."""
+    for query in ("four sigmatic mushroom coffee", "sigma brushes"):
+        assert agent_api._detect_brand_query(query).get("mode") == "static"  # still detected...
+        assert await gw._resolve_brand_anchor_terms(query) == ([], None)     # ...never anchors
+
+
+@pytest.mark.asyncio
+async def test_two_brands_refuse_rather_than_picking_one(real_detector):
+    """"tom ford vs jo malone" kept the alphabetically-first brand and answered a comparison
+    with a Jo Malone-only page. A tie is not ours to break."""
+    assert await gw._resolve_brand_anchor_terms("tom ford vs jo malone") == ([], None)
+    # NOTE: what actually refuses this today is the mode guard — the two-brand list came from
+    # `static`. The `len(spans) != 1` check in the resolver is defensive: `_detect_brand_query`'s
+    # catalog branch returns exactly one span by construction, so no test can kill that line, and
+    # a surviving mutant there is correct rather than missing coverage.
+
+
+@pytest.mark.asyncio
+async def test_degenerate_short_tokens_never_anchor(monkeypatch: pytest.MonkeyPatch, real_detector):
+    """`_normalize_brand_query_text` deletes apostrophes/accents into spaces rather than folding
+    them, so "L'Oreal" becomes the span "l or al" -> ['l','or','al'], which matched "Floral
+    Street" while reporting a brand hit."""
+    monkeypatch.setattr(agent_api, "_DYNAMIC_BRAND_SET", frozenset({"l or al"}))
+    # The ACCENTED spelling is the one that degenerates: "L'Oreal serum" normalizes to
+    # "l oreal serum" and never matches the span, so an unaccented test would pass for the
+    # wrong reason — it did, and this mutant survived until the accent was put back.
+    assert agent_api._normalize_brand_query_text("L'Or\u00e9al serum") == "l or al serum"
+    assert agent_api._detect_brand_query("L'Or\u00e9al serum").get("mode") == "catalog"
+    assert await gw._resolve_brand_anchor_terms("L'Or\u00e9al serum") == ([], None)
+
+
+@pytest.mark.asyncio
+async def test_a_span_that_is_itself_a_category_never_anchors(real_detector):
+    """`essence` is both a real drugstore brand and a product type. Anchoring "essence toner"
+    on the brand narrows a page of K-beauty essences to one label. category_path_prefix_for_query
+    resolves 'essence' to a category and 'murad' to None, so it decides — not a stopword list."""
+    assert "essence" in agent_api._DYNAMIC_BRAND_SET
+    assert await gw._resolve_brand_anchor_terms("essence toner") == ([], None)
+    # ...while a real brand with a category term still anchors.
+    assert await gw._resolve_brand_anchor_terms("murad cleanser") == (["murad"], "catalog")
