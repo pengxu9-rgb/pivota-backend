@@ -8,13 +8,47 @@ PREPARE each one. The two are complementary and neither subsumes the other —
     driven   sees `.format()`/f-string SQL, but only where a test drives it;
     static   sees every literal call site it can FOLLOW.
 
-Be precise about that second one, because "static sweep" oversells it. Of ~3,300
-`database.*` call sites in the swept directories this collector resolves ~1,960:
-literals, module-level constants, loop-over-literals, and lambda bodies. It does
-NOT follow a literal assigned to a function-local first (~300 sites) or passed by
-keyword (~5), and it cannot see f-strings or `.format()` at all (~825). Those are
-not "dynamic SQL" — most are perfectly static strings this collector simply
-cannot trace. Stated here rather than left to be inferred from a green run.
+Be precise about that second one, because "static sweep" oversells it. MIND THE
+UNIT: a CALL SITE is one `database.*(...)` expression, a STATEMENT is one SQL
+string handed to PREPARE, and they are not the same number — the loop-over-
+literals idiom turns 18 call sites into 181 statements. Both appear below, each
+labelled, because an earlier revision of this docstring compared one against the
+other and so reported a blind spot 3.6x smaller than it is.
+
+Of 3,681 call sites in the swept directories this collector resolves 2,527, which
+expand to 2,690 statements: literals, module-level constants, loop-over-literals,
+lambda bodies, a literal assigned to a FUNCTION-LOCAL name, one passed by
+KEYWORD, and one wrapped in `text(...)`. Those last three were the biggest blind
+spot this file had, and closing them took the sweep from 2,232 collected / 2,090
+planned to 2,690 / 2,503.
+
+WHAT IT STILL CANNOT SEE, in CALL SITES, measured, so nobody has to infer it from
+a green run:
+
+    475  SQLAlchemy Core constructs (`table.select()`, `.insert().values()`).
+         NOT raw SQL and out of scope by construction — they are compiled for the
+         dialect and cannot carry this defect class at all.
+    424  a NAME this collector will not follow. Broken down, because most are not
+         recoverable and it matters which: 210 bound once to a non-literal (an
+         f-string one hop away), 99 bound repeatedly with differing values, 48
+         bound opaquely (a parameter, a loop or `with` target, an except name),
+         41 not bound in this scope at all. Only 26 are declined purely by the
+         one-binding rule's conservatism — see `_local_literal_sql` for why that
+         rule is worth those 26.
+    239  f-strings, `.format()` and concatenation. Most are genuinely dynamic: a
+         WHERE clause joined from a list of conditions, an interpolated
+         identifier. A minority are dialect splits or optional-field SETs, and
+         those CAN be made static — `if IS_POSTGRES:` over module-level
+         constants, or `COALESCE(:param, column)`. See
+         db/product_quality_backfill_jobs.py for both patterns done, and
+         services/pdp_governance_service.py for the case where NO split is needed
+         because `CURRENT_TIMESTAMP` is portable.
+     16  a helper call returning SQL, or a shape none of the above describes.
+
+The function-local rule is deliberately strict — exactly one binding, and a
+function parameter counts as a binding. Resolving the WRONG SQL for a call site
+is worse than resolving none, because it PASSES a statement nobody looked at.
+See `_local_literal_sql`.
 
 WHY IT PAYS. The first sweep found NINE statements that cannot be planned, all
 in code shipped since May 2026 and all fixed in the commit that adds this file:
@@ -43,9 +77,16 @@ real coverage, of 1,954 collected statements:
     + isolated from `public` ................. 1,826 planned
     + private database, UTF8 client ......... 1,835 planned,  122 unchecked
 
-Note what "planned" does and does not prove: ~380 of these are utility statements
+(Those are the numbers from when the fixture was built, against the 1,954
+statements the collector could then resolve. It plans 2,500 of 2,690 today; the
+fixture did not change, the collector did.)
+
+Note what "planned" does and does not prove: ~500 of these are utility statements
 (CREATE/ALTER/DROP), for which Postgres does no name or type analysis at Parse.
-They always plan. The number that carries weight is the ~1,450 DML statements.
+They always plan — with one exception worth knowing, since it also bounds the
+multi-command exemption below: a CREATE that CARRIES a query (`CREATE TABLE ... AS
+SELECT`, `CREATE MATERIALIZED VIEW`) does get that query analysed. The number
+that carries weight is the ~2,000 DML statements.
 
 The 3 `stale_catalog_*` stubs matter for the same reason — they are TEMP tables
 the sync prune creates at runtime, and without them three genuinely-broken
@@ -69,9 +110,10 @@ import asyncio
 import hashlib
 import os
 import re
+import textwrap
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -118,6 +160,10 @@ _SWEPT_FILES = ("main.py",)
 
 _DB_METHODS = {"execute", "execute_many", "fetch_all", "fetch_one", "fetch_val", "iterate"}
 
+# `databases` names the first parameter `query`; `sql` and `stmt` appear at a
+# handful of call sites written against the same shape.
+_SQL_KEYWORDS = {"query", "sql", "stmt"}
+
 # TEMP tables the code creates at runtime (`CREATE TEMP TABLE ... ON COMMIT DROP`).
 # Declared as plain tables so statements that reference them can be planned. Without
 # these, services/catalog_sync_service.py's three prune statements fail with
@@ -159,6 +205,62 @@ _FIXTURE_GAP = {
     "InvalidSchemaNameError",
 }
 
+# PREPARE takes exactly ONE command. A statement that is a multi-command script —
+# `CREATE TABLE ...; CREATE INDEX ...;` — is refused by Postgres before it looks
+# at anything, with this message, no matter how correct the SQL is.
+#
+# These are NOT defects and they are not fixture gaps either, so neither existing
+# bucket describes them. They also work perfectly at runtime: `databases` hands a
+# parameterless query to asyncpg's `execute`, which uses the simple query
+# protocol, and that protocol does allow multiple commands. It is only the
+# PREPARE path — this gate — that cannot take them.
+#
+# Pinning them one by one in _KNOWN_UNPLANNABLE would be the wrong mechanism:
+# this is a permanent property of a whole SHAPE, not a list of statements someone
+# means to fix, and every new self-heal DDL script would need another pin.
+_MULTI_COMMAND = "cannot insert multiple commands into a prepared statement"
+
+# Commands Postgres does no name or type analysis on at Parse. A multi-command
+# script made only of these is provably costing this gate nothing, because each
+# command would have planned vacuously anyway.
+_UTILITY_COMMAND_RE = re.compile(
+    r"^\s*(CREATE|ALTER|DROP|COMMENT|GRANT|REVOKE|REINDEX|TRUNCATE|SET|BEGIN|COMMIT)\b",
+    re.IGNORECASE,
+)
+
+# ...with one exception that breaks the "analyses nothing" premise: a CREATE that
+# CARRIES A QUERY does get its SELECT analysed at Parse. Measured on the server:
+#
+#     CREATE INDEX i ON t (missing_column)        -> PARSE OK   (vacuous, as claimed)
+#     CREATE TABLE t AS SELECT * FROM nope        -> UndefinedTableError
+#     CREATE MATERIALIZED VIEW v AS SELECT ...    -> UndefinedTableError
+#
+# So a script whose first command is a CTAS with a broken SELECT would be excused
+# un-planned and un-reported — a real statement leaving coverage. Excluded here
+# rather than trusted to the keyword list.
+_QUERY_CARRYING_DDL_RE = re.compile(
+    r"^\s*CREATE\b(?=.*\bAS\b\s*(\(\s*)?(SELECT|WITH|VALUES|TABLE)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_all_utility_ddl(sql: str) -> bool:
+    """Every command in this script is utility DDL.
+
+    Deliberately conservative, and the direction of error is the point: string
+    literals and comments are blanked first, but dollar-quoted bodies are not
+    understood, so a `$$ ... ; ... $$` function body splits into fragments that do
+    not start with a DDL keyword — and this returns False, which reports the
+    statement as a DEFECT rather than excusing it. Failing towards "report" is the
+    only safe direction for a check whose job is to decide what may be ignored.
+    """
+    commands = [c for c in _strip_sql_noise(sql).split(";") if c.strip()]
+    return bool(commands) and all(
+        _UTILITY_COMMAND_RE.match(c) and not _QUERY_CARRYING_DDL_RE.match(c)
+        for c in commands
+    )
+
+
 # Measured on this fixture at the commit that added this file: 1954 collected,
 # 1826 planned, 128 unchecked. Three separate things are pinned because they
 # fail in three different ways.
@@ -176,13 +278,30 @@ _FIXTURE_GAP = {
 # Small slack on each so unrelated PRs that add or remove a query do not have to
 # touch this file; a real regression moves these by far more.
 #
-# _MIN_COLLECTED last raised 2050 -> 2150 when the sweep was collecting 2227: the
-# floor had drifted 177 below actual, wider than the ~100 of headroom the prior
-# bump left, and a slack floor that keeps widening stops being a tripwire. Raise
-# it in coarse steps like this one, never by the delta of a single PR.
-_MIN_COLLECTED = 2150
-_MIN_PLANNED = 1950
-_MAX_UNCHECKED = 140
+# _MIN_COLLECTED last raised 2150 -> 2610 when the collector learned to follow a
+# literal assigned to a function-local, a literal passed by keyword, and one
+# wrapped in `text(...)`. That moved the sweep 2232 -> 2690 collected and
+# 2090 -> 2500 planned in a single change, which is the kind of step this floor
+# exists to be re-cut against. Raise it in coarse steps like this one, never by
+# the delta of a single PR.
+_MIN_COLLECTED = 2610
+_MIN_PLANNED = 2400
+
+# _MAX_UNCHECKED 140 -> 185, against 171 actual. It grew because the 458 newly
+# visible statements carry their own share of names this fixture does not build —
+# the ratio barely moved (134/2232 = 6.0% before, 171/2690 = 6.4% after), so this
+# is the same fixture reaching further rather than the fixture getting worse.
+# Still the number to watch: a hole here MASKS defects rather than merely losing
+# coverage. It may shrink freely.
+_MAX_UNCHECKED = 185
+
+# Multi-command DDL scripts, which PREPARE cannot take at all — see
+# _MULTI_COMMAND above. Four today: three self-heal table builds in
+# services/ugc_capabilities_service.py and one paired ALTER in db/schema_guard.py.
+# Held at 5, not the 8 an earlier revision chose. This bucket is the one place a
+# statement can leave this gate's coverage without anybody deciding to let it, so
+# it gets the tightest ceiling in the file, not the loosest.
+_MAX_MULTI_COMMAND = 5
 
 # Statements that cannot be planned today and are NOT fixed here, because each
 # belongs to an unrelated subsystem and this commit is the agent_pdp_view
@@ -234,6 +353,70 @@ _KNOWN_UNPLANNABLE = {
     #      earlier silent-miss bug.
     ("services/attached_seed_runtime_evidence.py", 'column "category" does not exist', "7a110251d5f0"),
     ("services/catalog_enrichment_agent/apply.py", 'column "status" does not exist', "a34e0f691cd4"),
+    #
+    # ---- added when the collector learned to follow function-local literals ----
+    # Seven statements that were always there and are only now visible. None is
+    # fixed in that change, and each is here for a DIFFERENT reason — read them
+    # rather than treating the block as one deferral.
+    #
+    # 9.    NOT A DEFECT. db/merchant_onboarding.py::update_platform_profile runs
+    #       `ALTER TABLE merchant_onboarding ADD COLUMN IF NOT EXISTS
+    #       platform_profile JSONB` on the line above, every call, as a runtime
+    #       self-heal. The column therefore exists whenever the UPDATE runs; it is
+    #       declared by no migration, so this fixture never builds it. The gate
+    #       cannot see a self-heal any more than it can see the runtime guard in
+    #       entry 3. Fixing this properly means teaching the fixture to apply the
+    #       `ADD COLUMN IF NOT EXISTS` literals in swept files the way it already
+    #       lifts main.py's CREATE TABLEs — worth doing, and its own change, since
+    #       it widens what this fixture will execute.
+    ("db/merchant_onboarding.py", 'column "platform_profile" of relation "merchant_onboarding"', "4bb4378cc3b9"),
+    #
+    # 10-11. GENUINELY BROKEN, and unreachable. routes/admin_protocol_sync.py
+    #       writes x402_exchange_rates two different ways. Its snapshot INSERT and
+    #       SELECT match the real table (`base_currency` + a `rates` jsonb blob,
+    #       migration 023). Its bulk upsert and its DELETE assume a per-pair table
+    #       with `from_currency, to_currency, rate` columns that has never existed
+    #       anywhere in this repo. Those two cannot ever have run.
+    #
+    #       Not fixed here because the fix is a product decision, not a rename:
+    #       there is no per-pair table to point them at, and the router is
+    #       imported by NOTHING — `admin_protocol_sync` appears in main.py zero
+    #       times — so both endpoints are unreachable and no behaviour depends on
+    #       the answer. Deleting them or building the table they want is a call
+    #       for whoever owns x402, not for the change that made them visible.
+    #
+    #       The upsert is also the statement that proved the `DO UPDATE SET` hole:
+    #       while `set` was captured as a table name it was demoted to a fixture
+    #       gap, so it stayed invisible even once the collector could resolve it.
+    ("routes/admin_protocol_sync.py", 'column "from_currency" of relation "x402_exchange_rates"', "b4a37486d835"),
+    ("routes/admin_protocol_sync.py", 'column "from_currency" does not exist', "d5e9e2250428"),
+    #
+    # 12-13. NOT DEFECTS, and the scope of that claim is exactly TWO statements.
+    #       `routes/init_orders_table.py::init_orders_table` DROPs `orders` and
+    #       recreates it with its own, much smaller schema — which DOES declare
+    #       `amount` — and only then runs these two. They are self-consistent
+    #       with the table that exists at the moment they run, and "correcting"
+    #       them to `total` would break them.
+    #
+    #       Unplannable here for the same reason the stale_catalog_* stubs exist
+    #       at the top of this file, in reverse: those are tables the code creates
+    #       at runtime and the fixture must fake, while this is a table the code
+    #       REPLACES at runtime and the fixture is right about. Both are the gate
+    #       seeing a schema the statement does not run against.
+    #
+    #       🚨 AN EARLIER REVISION PINNED FOUR STATEMENTS UNDER THIS HEADING, and
+    #       the other two were in `get_orders_stats` — a SEPARATE endpoint that
+    #       recreates nothing, only asking information_schema whether `orders`
+    #       exists before summing a column it does not have. They were live,
+    #       permanently-dead statements of exactly the class the commit two below
+    #       this one fixes, excused by a reason that was never true for them.
+    #       Both are now fixed to `total` rather than pinned. That is the failure
+    #       this list's own header warns about — "do not add to it to turn a red
+    #       gate green" — reached not by ignoring the rule but by writing one
+    #       justification for a group whose members did not all share it. When
+    #       pinning more than one statement, verify the reason against EACH.
+    ("routes/init_orders_table.py", 'column "amount" of relation "orders" does not exist', "582a253bd91a"),
+    ("routes/init_orders_table.py", 'column "amount" does not exist', "e2f56ac1a67e"),
 }
 
 
@@ -842,6 +1025,128 @@ def _loop_bound_sql(scope: ast.AST) -> Dict[str, List[str]]:
     return bound
 
 
+def _local_literal_sql(scope: ast.AST) -> Dict[str, str]:
+    """name -> literal, for names bound EXACTLY ONCE in this scope to a string.
+
+    THE BIGGEST BLIND SPOT THIS FILE HAD. `query = "SELECT ..."` on one line and
+    `await database.fetch_one(query, ...)` on the next is the single most common
+    way this repo writes SQL, and the collector could not follow it: 335 call
+    sites, spread across ~150 files at one to sixteen each. They are not dynamic
+    SQL. They are ordinary literals one name-binding away from the call.
+
+    #1966 closed this shape in ONE file by inlining the literals at the call
+    site. That works, but it does not scale to 150 files and it does not stop the
+    blind spot reopening the next time somebody writes the obvious thing. This
+    resolves the shape instead, so the coverage is permanent and costs no
+    production churn.
+
+    THE ONE-BINDING RULE IS THE WHOLE SAFETY ARGUMENT, and it is deliberately
+    stricter than it needs to be. A name is resolved only when this scope binds
+    it exactly once, to a string constant. Anything that could make the value at
+    the call site differ from the literal counts as a binding and disqualifies
+    the name:
+
+        query = "SELECT ..."          # once   -> resolved
+        query = "A"; query = "B"      # twice  -> skipped, not "last wins"
+        query += " WHERE x = :x"      # AugAssign is a binding -> skipped
+        for query in (...)            # loop target -> skipped (and already
+                                      #   handled properly by _loop_bound_sql)
+        with x() as query:            # `with` target -> skipped
+        def f(query): ...             # a PARAMETER is a binding -> skipped
+
+    That last one matters most and is the easiest to forget: without counting
+    parameters, a helper `async def run(sql)` that happens to contain
+    `sql = "..."` in a branch would attribute that literal to every caller's
+    statement. Resolving the wrong SQL is worse than resolving none — it reports
+    defects against innocent lines and, worse, PASSES statements that were never
+    examined.
+
+    Scope discipline comes free from `_own_nodes`, which stops at nested
+    functions: a `sql` in an inner function cannot leak out to an outer call
+    site, or vice versa.
+    """
+    bindings: Dict[str, List[Optional[ast.AST]]] = defaultdict(list)
+
+    def bind(target: ast.AST, value: Optional[ast.AST]) -> None:
+        if isinstance(target, ast.Name):
+            bindings[target.id].append(value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            # `a, b = ...` — a binding whose value this cannot follow, which is
+            # exactly why it is recorded as an opaque one rather than ignored.
+            for element in target.elts:
+                bind(element, None)
+
+    for node in _own_nodes(scope):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind(target, node.value if len(node.targets) == 1 else None)
+        elif isinstance(node, ast.AnnAssign):
+            bind(node.target, node.value)
+        elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+            bind(node.target, None)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            bind(node.target, None)
+        elif isinstance(node, ast.withitem):
+            if node.optional_vars is not None:
+                bind(node.optional_vars, None)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                bindings[node.name].append(None)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bindings[(alias.asname or alias.name).split(".")[0]].append(None)
+        elif isinstance(node, ast.Global) or isinstance(node, ast.Nonlocal):
+            # The value can be rebound from anywhere; never resolve these.
+            for name in node.names:
+                bindings[name].append(None)
+                bindings[name].append(None)
+
+    # Parameters of the scope itself. A parameter is a binding whose value is the
+    # caller's, so a literal assigned to the same name elsewhere must not be
+    # attributed to it.
+    args = getattr(scope, "args", None)
+    if args is not None:
+        for argument in (
+            list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+            + [a for a in (args.vararg, args.kwarg) if a is not None]
+        ):
+            bindings[argument.arg].append(None)
+
+    resolved: Dict[str, str] = {}
+    for name, values in bindings.items():
+        if len(values) != 1 or values[0] is None:
+            continue
+        text = _literal_str(values[0])
+        if text:
+            resolved[name] = text
+    return resolved
+
+
+def _unwrap_sql_wrapper(node: ast.AST) -> ast.AST:
+    """`text("SELECT ...")` -> the literal inside it.
+
+    180 call sites hand their SQL through `text(...)`. Most are SQLAlchemy's
+    `text()`; db/schema_guard.py defines its own one-line shim of the same name
+    that returns the string unchanged. Either way the argument IS the raw SQL
+    this gate wants to plan, and wrapping it made the whole statement an
+    `ast.Call` the collector dropped on the floor.
+
+    Only the wrapper is unwrapped, not the general call — the result is fed back
+    through the same literal/constant/local resolution as any other first
+    argument, so `text(SOME_CONSTANT)` resolves and `text(f"...")` still does not.
+    """
+    if isinstance(node, ast.Call) and node.args:
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute)
+            else func.id if isinstance(func, ast.Name)
+            else ""
+        )
+        if name in ("text", "sa_text"):
+            return node.args[0]
+    return node
+
+
 def collect_statements() -> List[Tuple[str, str]]:
     """Every `database.<method>(<str literal>, ...)` reachable statically.
 
@@ -874,15 +1179,26 @@ def collect_statements() -> List[Tuple[str, str]]:
 
         for scope in _scopes(tree):
             loop_bound = _loop_bound_sql(scope)
+            local_literal = _local_literal_sql(scope)
             for node in _own_nodes(scope):
                 if not isinstance(node, ast.Call) or id(node) in sqlite_only:
                     continue
                 func = node.func
                 if not isinstance(func, ast.Attribute) or func.attr not in _DB_METHODS:
                     continue
-                if _receiver_name(func) not in _DB_RECEIVERS or not node.args:
+                if _receiver_name(func) not in _DB_RECEIVERS:
                     continue
-                first = node.args[0]
+                if node.args:
+                    first = node.args[0]
+                else:
+                    # `database.fetch_one(query=SQL, values=...)`. Rare (5 sites)
+                    # but free, and a shape nothing else in this file would ever
+                    # have caught.
+                    keyword = [k for k in node.keywords if k.arg in _SQL_KEYWORDS]
+                    if not keyword:
+                        continue
+                    first = keyword[0].value
+                first = _unwrap_sql_wrapper(first)
                 resolved: List[str] = []
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
                     resolved = [first.value]
@@ -891,6 +1207,8 @@ def collect_statements() -> List[Tuple[str, str]]:
                         resolved = loop_bound[first.id]
                     elif first.id in constants:
                         resolved = [constants[first.id]]
+                    elif first.id in local_literal:
+                        resolved = [local_literal[first.id]]
                 for index, sql in enumerate(resolved):
                     if not sql.strip():
                         continue
@@ -946,6 +1264,12 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
                 # whose column is `source_product_id` — sit in production inside
                 # a best-effort `except`, dead on every call.
                 name = "UndefinedColumnError:real"
+            if _MULTI_COMMAND in str(exc) and _is_all_utility_ddl(sql):
+                # See _MULTI_COMMAND above: unplannable by construction, works at
+                # runtime, and made only of commands Parse would not have
+                # analysed anyway. Counted and ceilinged, never silently dropped.
+                classes["multi_command_ddl"] += 1
+                continue
             classes[name] += 1
             if name not in _FIXTURE_GAP:
                 if _is_known_unplannable(label, str(exc), sql):
@@ -966,6 +1290,7 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
     with capsys.disabled():
         print(f"\n[sql-prepare-gate] {len(statements)} collected | {planned} planned | "
               f"{unchecked} unchecked (fixture gaps) | "
+              f"{classes['multi_command_ddl']} multi-command DDL | "
               f"{classes['known_unplannable']} known-unplannable (pinned)")
 
     # A pin that no longer matches anything is debt that was paid without the
@@ -1020,6 +1345,13 @@ def test_every_sql_literal_in_the_repo_can_be_planned(prepare, capsys) -> None:
     assert planned >= _MIN_PLANNED, (
         f"only {planned} statements were planned, floor is {_MIN_PLANNED}. The "
         "fixture stopped resolving names it used to resolve; coverage regressed."
+    )
+    assert classes["multi_command_ddl"] <= _MAX_MULTI_COMMAND, (
+        f"{classes['multi_command_ddl']} multi-command DDL scripts (ceiling "
+        f"{_MAX_MULTI_COMMAND}). Each is excused from PREPARE by construction, so "
+        "this bucket is the one place a statement can leave this gate's coverage "
+        "without anybody deciding to let it. It may shrink freely; growing it "
+        "needs a reason."
     )
     assert unchecked <= _MAX_UNCHECKED, (
         f"{unchecked} statements went UNCHECKED (ceiling {_MAX_UNCHECKED}) because "
@@ -1240,3 +1572,118 @@ def test_a_pin_excuses_only_its_own_statement() -> None:
     assert not _is_known_unplannable("routes/other.py", message, "x")
     # And every pin still carries a fingerprint.
     assert all(len(fp) == 12 for _p, _f, fp in _KNOWN_UNPLANNABLE)
+
+
+# ---------------------------------------------------------------------------
+# self-tests for the local-literal resolver
+# ---------------------------------------------------------------------------
+# `_local_literal_sql` is the most dangerous helper in this file, because it is
+# the only one that can attribute a statement to a call site that does not
+# actually run it. Resolving the WRONG SQL is worse than resolving none: it
+# reports defects against innocent lines, and — the bad direction — it PASSES a
+# call site whose real statement was never examined. So the one-binding rule gets
+# a case per shape that must not resolve, not just the happy path.
+
+def _resolve_in_function(source: str, name: str = "f") -> Dict[str, str]:
+    """Run the resolver over the named function in `source`."""
+    tree = ast.parse(textwrap.dedent(source))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return _local_literal_sql(node)
+    raise AssertionError(f"no function {name!r} in the snippet")
+
+
+@pytest.mark.parametrize("source,expected", [
+    # the shape this exists for: bound once, to a literal
+    ("def f():\n    query = 'SELECT 1'\n    database.execute(query)", {"query": "SELECT 1"}),
+    # an annotated assignment is still one binding
+    ("def f():\n    query: str = 'SELECT 1'\n", {"query": "SELECT 1"}),
+    # ...and a non-string literal is not SQL
+    ("def f():\n    query = 42\n", {}),
+    # -- everything below must NOT resolve --
+    # bound twice: not "last wins", not "first wins" — unknowable at the call site
+    ("def f():\n    query = 'A'\n    query = 'B'\n", {}),
+    # appended to after binding, which is how dynamic SQL is usually built here
+    ("def f():\n    query = 'SELECT 1'\n    query += ' WHERE x = :x'\n", {}),
+    # a loop target (and _loop_bound_sql already handles the real idiom properly)
+    ("def f():\n    query = 'SELECT 1'\n    for query in ('a', 'b'):\n        pass\n", {}),
+    # a `with` target
+    ("def f():\n    query = 'SELECT 1'\n    with open('x') as query:\n        pass\n", {}),
+    # a walrus rebinding
+    ("def f():\n    query = 'SELECT 1'\n    if (query := g()):\n        pass\n", {}),
+    # an except-handler name
+    ("def f():\n    query = 'SELECT 1'\n    try:\n        pass\n    except Exception as query:\n        pass\n", {}),
+    # tuple unpacking is a binding whose value cannot be followed
+    ("def f():\n    query = 'SELECT 1'\n    query, other = g()\n", {}),
+    # THE IMPORTANT ONE: a parameter is a binding. Without this, a helper whose
+    # parameter shares a name with a literal elsewhere in its body would hand
+    # every caller's statement the wrong SQL.
+    ("def f(query):\n    if not query:\n        query = 'SELECT 1'\n", {}),
+    ("def f(*, query='x'):\n    pass\n", {}),
+    ("def f(**query):\n    pass\n", {}),
+    # `global` means the value can come from anywhere
+    ("def f():\n    global query\n    query = 'SELECT 1'\n", {}),
+])
+def test_only_a_name_bound_exactly_once_to_a_literal_resolves(source, expected) -> None:
+    assert _resolve_in_function(source) == expected
+
+
+def test_a_nested_function_does_not_leak_its_literal_to_the_outer_scope() -> None:
+    """Scope discipline, which `_own_nodes` provides and this pins.
+
+    Without it, an inner helper's `query` would be attributed to an outer call
+    site that binds nothing of the sort — a statement reported at, and credited
+    to, a line that never runs it.
+    """
+    source = """
+        def f(query):
+            def inner():
+                query = 'SELECT inner'
+                database.execute(query)
+            database.execute(query)
+    """
+    assert _resolve_in_function(source, "f") == {}
+    assert _resolve_in_function(source, "inner") == {"query": "SELECT inner"}
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("text('SELECT 1')", "SELECT 1"),
+    ("sa_text('SELECT 1')", "SELECT 1"),
+    ("sqlalchemy.text('SELECT 1')", "SELECT 1"),
+    # not a wrapper: the argument is not the statement
+    ("json.dumps('SELECT 1')", None),
+    # unwrapping is one layer and feeds back into the normal resolution, so a
+    # wrapped f-string is still correctly unresolvable
+    ("text(f'SELECT {x}')", None),
+])
+def test_the_sql_wrapper_is_unwrapped_but_nothing_else_is(source, expected) -> None:
+    node = _unwrap_sql_wrapper(ast.parse(source, mode="eval").body)
+    assert _literal_str(node) == expected
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ("CREATE TABLE a (x int); CREATE INDEX i ON a (x);", True),
+    ("ALTER TABLE a ADD COLUMN x int; ALTER TABLE b ADD COLUMN y int;", True),
+    ("CREATE TABLE a (x int);", True),
+    # a DML command in the script means this gate would really be skipping
+    # something, so it must be reported rather than excused
+    ("CREATE TABLE a (x int); INSERT INTO a VALUES (1);", False),
+    ("SELECT 1; SELECT 2;", False),
+    # a semicolon inside a string literal must not manufacture a command
+    ("CREATE TABLE a (x text DEFAULT 'p;q');", True),
+    # dollar-quoted bodies are NOT understood, and the conservative answer is
+    # False — report it, do not excuse it
+    ("CREATE FUNCTION f() RETURNS void AS $$ BEGIN; END $$ LANGUAGE plpgsql;", False),
+    ("", False),
+    # a CREATE that CARRIES a query does get its SELECT analysed at Parse, so it
+    # is not vacuous and must not be excused
+    ("CREATE TABLE t AS SELECT * FROM nope; CREATE INDEX i ON t (a);", False),
+    ("CREATE MATERIALIZED VIEW v AS SELECT x FROM nope; ALTER TABLE a ADD COLUMN b int;", False),
+    ("CREATE TABLE t AS WITH c AS (SELECT 1) SELECT * FROM c;", False),
+    ("CREATE TABLE t AS TABLE other;", False),
+    # ...while an ordinary CREATE TABLE that merely contains the word `as` in an
+    # identifier is still excused
+    ("CREATE TABLE t (as_of date); CREATE INDEX i ON t (as_of);", True),
+])
+def test_only_an_all_utility_script_may_be_excused_as_multi_command(sql, expected) -> None:
+    assert _is_all_utility_ddl(sql) is expected
