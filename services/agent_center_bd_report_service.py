@@ -108,6 +108,7 @@ from services.cited_host_classifier import (
     ROLE_RELATIVE_UNCLASSIFIED,
 )
 from services.merchant_narrative_builder import build_merchant_narrative
+from services.primary_destination import select_primary_destination
 from services.win_plan_builder import build_win_plan, is_broad_head_query
 from services.coverage_profiles import (
     resolve_coverage_profile,
@@ -8936,7 +8937,17 @@ def build_authority_map(
             _axis_meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
             axis_explicit = bool(str(_axis_meta.get("axis") or "").strip())
             excerpt = run.get("evidence_excerpt") or parsed.get("evidence_excerpt") or parsed.get("evidence_text")
-            for source in run.get("grounding_sources") or []:
+            # B3: `ordinal` is the zero-based position of this grounding source
+            # WITHIN THIS RESPONSE — the order the model attached its citations
+            # in. This loop is the only place that order still exists: every
+            # downstream structure (`sku["authority_hosts"]`, and therefore
+            # services/audit_evidence_builder.extract_citation_observations) is
+            # a HOST-keyed aggregate, so position is gone by the time anything
+            # else could read it. Enumerating BEFORE the two `continue`s below
+            # is deliberate: the ordinal must be the position in the answer's
+            # citation list, not the position among the citations we managed to
+            # resolve — a dropped redirector must not renumber the ones after it.
+            for ordinal, source in enumerate(run.get("grounding_sources") or []):
                 if not isinstance(source, dict):
                     continue
                 uri = source.get("uri") or ""
@@ -8990,7 +9001,20 @@ def build_authority_map(
                     "evidence_excerpt": None,
                     "competitors_named": [],
                     "_queries": set(),
-                    "_observations": set(),
+                    # B3: was a SET of (query, query_class, provider). It is now
+                    # a DICT keyed by that same tuple, valued by the BEST (lowest)
+                    # ordinal this host reached in that response. The dedupe
+                    # semantics of the set are preserved exactly — still one
+                    # entry per (query, query_class, provider) — because turning
+                    # the ordinal into part of the key would emit two
+                    # `query_observations` for one response/host pair, and
+                    # citation_observations has no ordinal in its identity
+                    # ((audit_run_id, content_key, provider, query, cited_host)),
+                    # so the second row would collide on idempotency_key and be
+                    # silently dropped. Keeping the LOWEST is the honest fold: a
+                    # host the answer cited at both position 0 and position 5 was
+                    # reached at position 0.
+                    "_observations": {},
                 })
                 if query_class == QUERY_CLASS_CATEGORY:
                     row["cited_on_category_query"] = True
@@ -9005,8 +9029,12 @@ def build_authority_map(
                     row["prompts_cited_count"] += 1
                 # P0.2: retain per-(query, provider) linkage for
                 # citation_observations (otherwise lost at the pop below).
+                # B3: and the position the host reached in that response.
                 if query and provider:
-                    row["_observations"].add((query, query_class, provider))
+                    _obs_key = (query, query_class, provider)
+                    _prior = row["_observations"].get(_obs_key)
+                    if _prior is None or ordinal < _prior:
+                        row["_observations"][_obs_key] = ordinal
                 if provider not in row["providers"]:
                     row["providers"].append(provider)
                 row["provider_counts"][provider] = (
@@ -9073,6 +9101,32 @@ def build_authority_map(
                         "about_merchant": covers_merchant,
                     })
 
+        # B3: resolve the PRIMARY COMMERCE DESTINATION of each response before
+        # the host rows are flattened. A response is identified by
+        # (query, query_class, provider) — the same identity
+        # citation_observations keys on, minus the run/content_key that are
+        # constant here — and the candidates for it are every host that reached
+        # it, with the best ordinal each reached. Selection is
+        # services/primary_destination.select_primary_destination: at most one
+        # winner, and legitimately none when the answer cited no place to buy.
+        _response_candidates: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+        for row in host_rows.values():
+            for _obs_key, _ordinal in (row.get("_observations") or {}).items():
+                _response_candidates[_obs_key].append({
+                    "host": row.get("host"),
+                    "ordinal": _ordinal,
+                    "host_type": row.get("host_type"),
+                    "first_party": row.get("first_party"),
+                })
+        _primary_by_response: Dict[Tuple[str, str, str], str] = {}
+        for _key, _cands in _response_candidates.items():
+            _winner = select_primary_destination(_cands)
+            # A response with no commerce host is left OUT of the map, not
+            # stored as None: "no actionable destination" is the absence of a
+            # primary, and no host row may then match it.
+            if _winner is not None:
+                _primary_by_response[_key] = _winner.host
+
         authority_hosts = []
         for row in host_rows.values():
             row.pop("_queries", None)
@@ -9080,10 +9134,23 @@ def build_authority_map(
             # into a clean, JSON-safe field the deposit builder reads into
             # citation_observations. Replaces the discard that killed the
             # per-query citation matrix.
-            _obs = row.pop("_observations", set())
+            # B3: each observation now also carries the host's position in that
+            # response (`destination_rank`) and whether it WON that response
+            # (`is_primary_destination`). At most one host per response key can
+            # answer True, by construction — the winner is looked up from a
+            # single map, not recomputed per row.
+            _obs = row.pop("_observations", {})
             row["query_observations"] = [
-                {"query": q, "query_class": qc, "provider": p}
-                for (q, qc, p) in sorted(_obs)
+                {
+                    "query": q,
+                    "query_class": qc,
+                    "provider": p,
+                    "destination_rank": rank,
+                    "is_primary_destination": (
+                        _primary_by_response.get((q, qc, p)) == row.get("host")
+                    ),
+                }
+                for (q, qc, p), rank in sorted(_obs.items())
             ]
             row["providers"] = sorted(row.get("providers") or [])
             row["provider_counts"] = dict(sorted((row.get("provider_counts") or {}).items()))

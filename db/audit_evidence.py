@@ -40,6 +40,7 @@ from sqlalchemy import (
     select as sa_select,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.sql import expression
 
 from db._ddl_guard import apply_ddl_statements
 from db.database import database, metadata
@@ -453,6 +454,25 @@ citation_observations = Table(
     Column("is_competitor", Boolean, nullable=True),
     Column("evidence_url", Text, nullable=True),
     Column("content_key_basis", Text, nullable=False),
+    # B3 (migration 209) — where the answer sent the buyer.
+    # destination_rank: the host's zero-based position in THIS response's
+    # citation list. NULLABLE on purpose: a row deposited from a report written
+    # before B3 has no position, and NULL says that, where 0 would falsely claim
+    # "the answer's first citation".
+    Column("destination_rank", Integer, nullable=True),
+    # is_primary_destination: this host was selected as the ONE commerce
+    # destination of this response (services/primary_destination.py). At most one
+    # row per (audit_run_id, content_key, provider, query) may be true; a
+    # response that cited no place to buy has NO true row, which is the real
+    # "no actionable destination" outcome rather than a gap.
+    # NOT NULL + server_default false, and expression.false() rather than the
+    # string "false": SQLAlchemy renders a string Boolean default QUOTED, so
+    # SQLite would store the five-character word and every IS TRUE/IS FALSE
+    # downstream would read it wrong (see tests/model_schema.py).
+    Column(
+        "is_primary_destination", Boolean, nullable=False,
+        server_default=expression.false(),
+    ),
     Column("observed_at", DateTime(timezone=True), nullable=False),
     Column("idempotency_key", Text, nullable=False),
     extend_existing=True,
@@ -532,6 +552,8 @@ _DDL_STATEMENTS = [
         is_competitor     BOOLEAN NULL,
         evidence_url      TEXT NULL,
         content_key_basis TEXT NOT NULL,
+        destination_rank  INTEGER NULL,
+        is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE,
         observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         idempotency_key   TEXT NOT NULL
     );
@@ -542,6 +564,20 @@ _DDL_STATEMENTS = [
     "ON citation_observations (content_key, provider, observed_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_citation_observations_run "
     "ON citation_observations (audit_run_id);",
+    # B3 (migration 209): the CREATE TABLE above only carries these on a FRESH
+    # database. An existing citation_observations needs the ALTERs, and both
+    # halves must be present or the migration path and this backstop would build
+    # different schemas.
+    "ALTER TABLE citation_observations "
+    "ADD COLUMN IF NOT EXISTS destination_rank INTEGER NULL;",
+    "ALTER TABLE citation_observations "
+    "ADD COLUMN IF NOT EXISTS is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE;",
+    # Reading the primary destinations of a run is the whole point of B3, and
+    # they are a small minority of rows — a partial index keeps that read off a
+    # full scan without paying for the false rows.
+    "CREATE INDEX IF NOT EXISTS idx_citation_observations_primary_destination "
+    "ON citation_observations (audit_run_id, cited_host) "
+    "WHERE is_primary_destination;",
 
     # readiness_findings
     """
@@ -1387,12 +1423,20 @@ async def insert_citation_observation(
     first_party: Optional[bool] = None,
     is_competitor: Optional[bool] = None,
     evidence_url: Optional[str] = None,
+    destination_rank: Optional[int] = None,
+    is_primary_destination: Optional[bool] = None,
     idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
     """P0.2 best-effort write of one citation observation. Idempotent via the
     unique index on idempotency_key (a re-run of the same audit collapses to
     the same row). Returns observation_id, or None on failure / idempotent
-    skip — never raises, so it can't take down the audit lifecycle."""
+    skip — never raises, so it can't take down the audit lifecycle.
+
+    B3: `destination_rank` is the host's zero-based position in that response's
+    citation list (None when the source report predates B3);
+    `is_primary_destination` says this host was the ONE commerce destination of
+    the response. The column is NOT NULL, so a caller passing None means "not
+    primary" — an unknown here is a negative, never a null."""
     await ensure_audit_evidence_tables()
     observation_id = str(uuid.uuid4())
     try:
@@ -1414,6 +1458,10 @@ async def insert_citation_observation(
                 is_competitor=is_competitor,
                 evidence_url=evidence_url,
                 content_key_basis=content_key_basis,
+                destination_rank=(
+                    None if destination_rank is None else int(destination_rank)
+                ),
+                is_primary_destination=bool(is_primary_destination),
                 observed_at=_now_utc(),
                 idempotency_key=idempotency_key,
             )
