@@ -314,7 +314,19 @@ async def setup_merchant_psp(
             capabilities=capabilities,
             status="pending" if setup_later else "active",
             connected_at=datetime.now(),
-            psp_id=(dict(existing)["psp_id"] if existing else f"psp_{request.psp_type}_{uuid.uuid4().hex[:8]}"),
+            # A NEW psp_id must come from the canonical generator, never from an
+            # inline uuid slice. `orders` carries CHECK check_psp_id_format
+            # (db/migrations/006_psp_fields_constraints.sql) --
+            # `^psp_[a-z0-9]+_[a-z0-9]{12}$`, exactly TWELVE trailing chars -- and
+            # order creation copies merchant_psps.psp_id straight into orders.psp_id
+            # (routes/order_routes.py `_resolve_active_order_psp` -> create_order).
+            # This line used to mint `uuid.uuid4().hex[:8]`, an EIGHT-char suffix.
+            # merchant_psps accepted it, the merchant's PSP validated, and then every
+            # order creation 500'd on the orders CHECK -- a silent time bomb between
+            # onboarding and first sale (prod, merch_c5e24a8d3738d73b, 2026-08-29).
+            # Passing None delegates to _generate_psp_id(provider) inside
+            # persist_canonical_merchant_psp, which also lowercases the provider.
+            psp_id=(dict(existing)["psp_id"] if existing else None),
             existing_row=dict(existing) if existing else None,
             stripe_mode="payment_intent",
         )

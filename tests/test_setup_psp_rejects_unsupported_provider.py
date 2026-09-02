@@ -34,16 +34,45 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_208 = REPO_ROOT / "db" / "migrations" / "208_orders_psp_used_valid_provider.sql"
 
 
+def _startup_merchant_psps_ddl() -> str:
+    """main.py's own `CREATE TABLE IF NOT EXISTS merchant_psps` literal.
+
+    Lifted from main.py's AST, never hand-copied: `merchant_psps` is built by
+    application bootstrap rather than by a migration or by `metadata`, and a stub
+    written here would drift from the real column set silently. SQLite accepts
+    this statement verbatim (its type affinity tolerates JSONB and
+    TIMESTAMP WITH TIME ZONE), so no invented DDL is needed to run it.
+    """
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "main.py").read_text(encoding="utf-8"), filename="main.py")
+    found = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "CREATE TABLE IF NOT EXISTS merchant_psps" in node.value
+    ]
+    assert len(found) == 1, (
+        "expected exactly one merchant_psps CREATE TABLE literal in main.py, found "
+        f"{len(found)} — the fixture can no longer build the real table"
+    )
+    return found[0]
+
+
 @pytest.fixture
 async def _merchant_lookup_table():
-    """Just `merchant_onboarding`, so the route's own lookup can return a real 404.
+    """The two tables this route reads before it writes.
 
-    The positive tests below need to prove they got PAST the allowlist. Without
-    this the route dies on "no such table" and wraps it in a 500, which is a much
-    weaker signal — it would also be produced by a guard that rejected everything
-    and then blew up for an unrelated reason. A genuine 404 from the route's own
-    merchant lookup says exactly one thing: the allowlist let the provider
-    through.
+    `merchant_onboarding` so the route's own lookup can return a real 404: the
+    positive tests below need to prove they got PAST the allowlist, and without
+    the table the route dies on "no such table" and wraps it in a 500 — a much
+    weaker signal, since a guard that rejected everything and then blew up for an
+    unrelated reason produces the same thing. A genuine 404 from the route's own
+    merchant lookup says exactly one thing: the allowlist let the provider through.
+
+    `merchant_psps` because the route queries it for an existing row before
+    persisting, and that query is on the path to the psp_id assertion below.
     """
     from sqlalchemy import create_engine
 
@@ -57,6 +86,7 @@ async def _merchant_lookup_table():
     was_connected = database.is_connected
     if not was_connected:
         await database.connect()
+    await database.execute(_startup_merchant_psps_ddl())
     try:
         yield
     finally:
@@ -186,6 +216,74 @@ async def test_a_supported_provider_passes_the_allowlist(provider: str, _merchan
         )
     assert excinfo.value.status_code == 404, excinfo.value.detail
     assert "Merchant not found" in str(excinfo.value.detail), excinfo.value.detail
+
+
+async def test_a_new_psp_id_comes_from_the_canonical_generator(
+    _merchant_lookup_table, monkeypatch
+) -> None:
+    """The route must not mint its own psp_id.
+
+    `orders.check_psp_id_format` is `^psp_[a-z0-9]+_[a-z0-9]{12}$` — exactly TWELVE
+    trailing characters. This route minted `f"psp_{psp_type}_{uuid4().hex[:8]}"`,
+    EIGHT, so the row saved, the PSP validated, the portal said "connected", and
+    every order creation 500'd at the merchant's first sale. Passing None delegates
+    to `_generate_psp_id`, which honours the rule.
+
+    Asserted on the ARGUMENT handed to persist_canonical_merchant_psp rather than
+    on the returned id: `None` is what makes the canonical generator run, and a
+    route that re-introduced a conforming-but-hand-rolled id would still be the
+    same class of defect — two generators to keep in sync. The constraint itself
+    is executed in tests/test_psp_used_valid_provider_postgres.py.
+    """
+    import routes.employee_store_psp_fixes as module
+
+    captured = {}
+
+    async def fake_persist(**kwargs):
+        captured.update(kwargs)
+        # The real helper's contract: it returns the row it wrote, psp_id filled in.
+        return {"psp_id": kwargs.get("psp_id") or "psp_stripe_abcdef123456"}
+
+    monkeypatch.setattr(module, "persist_canonical_merchant_psp", fake_persist)
+
+    from db.database import database
+
+    await database.execute(
+        "INSERT INTO merchant_onboarding (merchant_id, business_name, contact_email)"
+        " VALUES (:m, 'psp id gate', 'pspid-gate@example.invalid')",
+        {"m": "merch_pspid_gate"},
+    )
+    try:
+        await module.setup_merchant_psp(
+            module.ConnectPSPRequest(
+                merchant_id="merch_pspid_gate",
+                psp_type="stripe",
+                api_key="sk_test_" + "a" * 24,
+                test_mode=True,
+            ),
+            current_user={"role": "merchant", "merchant_id": "merch_pspid_gate"},
+        )
+    finally:
+        await database.execute(
+            "DELETE FROM merchant_onboarding WHERE merchant_id = :m",
+            {"m": "merch_pspid_gate"},
+        )
+
+    assert captured, "the route never reached persist_canonical_merchant_psp"
+    assert captured["psp_id"] is None, (
+        f"the route minted its own psp_id ({captured['psp_id']!r}) instead of "
+        "delegating to _generate_psp_id"
+    )
+
+
+def test_the_canonical_generator_satisfies_the_orders_format_rule() -> None:
+    """The positive counterpart: delegation is only a fix if the delegate is right."""
+    from services.merchant_psp_config_service import _generate_psp_id
+
+    for provider in ("stripe", "adyen", "checkout", "paypal", "antom"):
+        psp_id = _generate_psp_id(provider)
+        assert re.fullmatch(r"psp_[a-z0-9]+_[a-z0-9]{12}", psp_id), psp_id
+        assert psp_id.startswith(f"psp_{provider}_")
 
 
 @pytest.mark.parametrize("provider", ["STRIPE", " Stripe ", "AnToM"])
