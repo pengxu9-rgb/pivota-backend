@@ -134,6 +134,29 @@ BEGIN
         )
         NOT VALID;
 
+    -- ...then earn the validated status back where it is earnable.
+    --
+    -- Measured in production 2026-09-02: this constraint is INSTALLED and
+    -- convalidated=TRUE, on an `orders` of 593 rows with zero violations. A bare
+    -- DROP + ADD NOT VALID would therefore DOWNGRADE a proven invariant to a
+    -- merely-enforced one and hand the operator a manual step to get it back --
+    -- a regression this file would have shipped silently. The new list is a
+    -- strict SUPERSET of the old, so on any database whose old constraint was
+    -- validated, no existing row can fail the new one.
+    --
+    -- VALIDATE takes only SHARE UPDATE EXCLUSIVE: it does not block reads or
+    -- writes. Bounded by a local timeout and swallowed, so the two cases this
+    -- file was originally written for still behave exactly as before -- a table
+    -- too large to scan in time, or one holding genuinely bad rows because 006
+    -- never ran, simply keeps the constraint NOT VALID, which still enforces
+    -- every new INSERT and UPDATE. The boot is never blocked and never aborted.
+    BEGIN
+        SET LOCAL statement_timeout = '15s';
+        ALTER TABLE orders VALIDATE CONSTRAINT check_psp_used_valid_provider;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'check_psp_used_valid_provider left NOT VALID: %', SQLERRM;
+    END;
+
     -- Inside the guard, and via EXECUTE, so the WHOLE file is one statement that
     -- is a no-op on a database with no `orders` table. A bare COMMENT ON would
     -- abort the file there.
