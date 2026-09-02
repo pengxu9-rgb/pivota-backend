@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -84,10 +85,20 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    # Defaults to $DATABASE_URL, matching every other ops script in this repo
+    # (scripts/catalog_migration_058.py, backfill_pg_singleton.py, ...). Not
+    # cosmetic: scripts/ops/run_oneoff_job.sh is how anything runs against
+    # production, and it MOUNTS DATABASE_URL as an env var while passing --args
+    # literally, with no shell to expand `$DATABASE_URL`. `required=True` made this
+    # script impossible to invoke through the only mechanism that reaches the
+    # database it audits.
     parser.add_argument(
         "--database-url",
-        required=True,
-        help="Postgres URL. Never point --deactivate at a DB you cannot restore.",
+        default=os.getenv("DATABASE_URL") or "",
+        help=(
+            "Postgres URL; defaults to $DATABASE_URL. "
+            "Never point --deactivate at a DB you cannot restore."
+        ),
     )
     parser.add_argument(
         "--deactivate",
@@ -120,6 +131,12 @@ def _rows(cursor) -> List[Dict[str, Any]]:
 
 def main() -> int:
     args = _parse_args()
+    if not str(args.database_url or "").strip():
+        raise SystemExit(
+            "no database URL: pass --database-url or set DATABASE_URL. (Under "
+            "scripts/ops/run_oneoff_job.sh, mount it with "
+            "SECRETS=DATABASE_URL=DATABASE_URL:latest -- a Cloud Run job inherits nothing.)"
+        )
     providers = accepted_providers()
     print(f"orders.psp_used accepts: {', '.join(providers)}\n")
 
