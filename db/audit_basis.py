@@ -72,6 +72,17 @@ COMPARABILITY_FIELDS: Sequence[str] = (
     "primary_destination_version",
     "prompt_set_id",
     "selected_set_id",
+    # Review: these four were RECORDED and then never consulted, which left the
+    # check blind to the two config edits most likely to move the headline.
+    # official_domains decides first_party on every cited host, so adding one
+    # moves "AI sends buyers to your own store" with no merchant behaviour
+    # change at all; migration 208's own comment says two runs with the same
+    # prompt_set_id but a different tier mix are not measuring the same thing;
+    # and market/language change which SERP was probed.
+    "official_domains",
+    "tier_mix",
+    "market",
+    "language",
 )
 
 
@@ -386,6 +397,14 @@ def _normalized_component(field: str, basis: Mapping[str, Any]) -> Any:
     return out
 
 
+# Components whose ABSENCE cannot support a comparability claim. market/
+# language/currency are excluded: a legitimately unset locale is a real,
+# equal state on both sides, not missing evidence.
+_EVIDENCE_REQUIRED_FIELDS = frozenset({
+    "methodology_version", "providers_and_models", "primary_destination_version",
+})
+
+
 def bases_are_comparable(
     a: Optional[Mapping[str, Any]],
     b: Optional[Mapping[str, Any]],
@@ -393,9 +412,11 @@ def bases_are_comparable(
     """Can a before/after diff claim MOVEMENT between these two runs?
 
     True only when every field in :data:`COMPARABILITY_FIELDS` matches:
-    `methodology_version`, `providers_and_models`, `primary_destination_version`
-    and the pinned prompt/selected set ids. Anything else — a missing basis, a
-    None on one side only, an undecodable component — answers False.
+    `methodology_version`, `providers_and_models`, `primary_destination_version`,
+    the pinned prompt/selected set ids, `official_domains`, `tier_mix`, and
+    `market`/`language`. Anything else — a missing basis, a None on one side
+    only, an undecodable component, or a missing component on BOTH sides for a
+    field in :data:`_EVIDENCE_REQUIRED_FIELDS` — answers False.
 
     Conservative by design. A wrong True tells a merchant that a model swap or a
     selection-rule change was their own movement; a wrong False only says "we
@@ -415,7 +436,16 @@ def bases_are_comparable(
     if not isinstance(a, Mapping) or not isinstance(b, Mapping):
         return False
     for field in COMPARABILITY_FIELDS:
-        if _normalized_component(field, a) != _normalized_component(field, b):
+        left = _normalized_component(field, a)
+        right = _normalized_component(field, b)
+        if left != right:
+            return False
+        # Review: two bases that are BOTH missing a component used to compare
+        # equal and answer True, so a report that lost its provider block got a
+        # green comparability light on zero evidence — the docstring already
+        # promised False. An empty/undecodable component is not evidence that
+        # two runs were measured the same way; it is the absence of evidence.
+        if field in _EVIDENCE_REQUIRED_FIELDS and not left:
             return False
     return True
 

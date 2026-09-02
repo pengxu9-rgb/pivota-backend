@@ -1017,6 +1017,70 @@ async def record_audit_basis(
     )
 
 
+
+async def _deposit_citation_observations(
+    *,
+    brand_report: Any,
+    content_key_map: Optional[Dict[str, Any]],
+    audit_run_id: str,
+    merchant_id: Optional[str],
+    summary: Dict[str, Any],
+) -> None:
+    """Deposit the cross-channel citation matrix, content_key-keyed.
+
+    Extracted from persist_canonical_evidence so the hand-off into
+    insert_citation_observation is reachable by a test. It was not: mutants
+    forcing `destination_rank=None` or `is_primary_destination=False` at this
+    boundary survived the whole suite, which meant the two columns B3 exists to
+    produce could be zeroed here and ship green.
+
+    Best-effort and idempotent; only depositable products emit (gated inside
+    extract_citation_observations via content_key_map).
+    """
+    # Imported here, not at module scope: this module is imported during report
+    # assembly and db.audit_evidence pulls in the DB layer.
+    from db.audit_evidence import (
+        compute_canonical_idempotency_key,
+        insert_citation_observation,
+    )
+
+    summary["citation_observations_inserted"] = 0
+    summary["citation_observations_skipped"] = 0
+    for obs in extract_citation_observations(brand_report, content_key_map):
+        idem_key = compute_canonical_idempotency_key(
+            audit_run_id=audit_run_id,
+            item_type="citation_observation",
+            item_signature="{}|{}|{}|{}".format(
+                obs.get("content_key"), obs.get("provider"),
+                obs.get("query"), obs.get("cited_host"),
+            ),
+        )
+        new_obs_id = await insert_citation_observation(
+            audit_run_id=audit_run_id,
+            merchant_id=merchant_id,
+            content_key=obs["content_key"],
+            product_key=obs.get("product_key"),
+            provider=obs["provider"],
+            query=obs["query"],
+            axis=obs.get("axis"),
+            query_class=obs.get("query_class"),
+            cited_host=obs.get("cited_host"),
+            host_type=obs.get("host_type"),
+            citation_role=obs.get("citation_role"),
+            first_party=obs.get("first_party"),
+            is_competitor=obs.get("is_competitor"),
+            evidence_url=obs.get("evidence_url"),
+            content_key_basis=obs.get("content_key_basis") or "unknown",
+            destination_rank=obs.get("destination_rank"),
+            is_primary_destination=obs.get("is_primary_destination"),
+            idempotency_key=idem_key,
+        )
+        if new_obs_id is None:
+            summary["citation_observations_skipped"] += 1
+        else:
+            summary["citation_observations_inserted"] += 1
+
+
 async def persist_canonical_evidence(
     *,
     audit_run_id: str,
@@ -1216,41 +1280,13 @@ async def persist_canonical_evidence(
     # P0.2: citation_observations — the cross-channel matrix, content_key-keyed.
     # Best-effort, idempotent; only depositable products emit (gated inside
     # extract_citation_observations via content_key_map).
-    summary["citation_observations_inserted"] = 0
-    summary["citation_observations_skipped"] = 0
-    for obs in extract_citation_observations(brand_report, content_key_map):
-        idem_key = compute_canonical_idempotency_key(
-            audit_run_id=audit_run_id,
-            item_type="citation_observation",
-            item_signature="{}|{}|{}|{}".format(
-                obs.get("content_key"), obs.get("provider"),
-                obs.get("query"), obs.get("cited_host"),
-            ),
-        )
-        new_obs_id = await insert_citation_observation(
-            audit_run_id=audit_run_id,
-            merchant_id=merchant_id,
-            content_key=obs["content_key"],
-            product_key=obs.get("product_key"),
-            provider=obs["provider"],
-            query=obs["query"],
-            axis=obs.get("axis"),
-            query_class=obs.get("query_class"),
-            cited_host=obs.get("cited_host"),
-            host_type=obs.get("host_type"),
-            citation_role=obs.get("citation_role"),
-            first_party=obs.get("first_party"),
-            is_competitor=obs.get("is_competitor"),
-            evidence_url=obs.get("evidence_url"),
-            content_key_basis=obs.get("content_key_basis") or "unknown",
-            destination_rank=obs.get("destination_rank"),
-            is_primary_destination=obs.get("is_primary_destination"),
-            idempotency_key=idem_key,
-        )
-        if new_obs_id is None:
-            summary["citation_observations_skipped"] += 1
-        else:
-            summary["citation_observations_inserted"] += 1
+    await _deposit_citation_observations(
+        brand_report=brand_report,
+        content_key_map=content_key_map,
+        audit_run_id=audit_run_id,
+        merchant_id=merchant_id,
+        summary=summary,
+    )
 
     # A3: record what this run was measured WITH, once and immutably. Placed
     # AFTER the citation deposit so the basis describes a run whose evidence has

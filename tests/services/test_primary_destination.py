@@ -408,3 +408,139 @@ def test_a_non_integer_rank_is_stored_as_null(bad):
                                "destination_rank": bad}]),
     ]))
     assert rows[0]["destination_rank"] is None
+
+
+# ---------------------------------------------------------------------------
+# The DELIVERY PATH. Review found three mutants alive here: forcing
+# is_primary_destination=False or destination_rank=None at the persist boundary
+# (services/audit_evidence_builder.py:1246-1247), or forcing False inside the DB
+# writer, all shipped with every test green. The whole point of B3 is those two
+# values reaching the row, and nothing asserted that they do.
+# ---------------------------------------------------------------------------
+import db.audit_evidence as ae  # noqa: E402
+
+
+async def _one_observation(monkeypatch, rank, primary):
+    """Capture the bound parameters of the real insert.
+
+    The writer builds a SQLAlchemy Insert (`citation_observations.insert()
+    .values(...)`), so the values ride on the STATEMENT, not on a second
+    argument to `database.execute` — reading them off the statement is what
+    makes this test exercise the delivering line rather than a stub's shape.
+    """
+    captured = {}
+
+    async def _fake_execute(stmt, values=None):
+        try:
+            captured.update(stmt.compile().params)
+        except Exception:  # pragma: no cover - a shape change should fail loud
+            captured["__unparsed__"] = repr(stmt)
+        return None
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(ae.database, "execute", _fake_execute)
+    monkeypatch.setattr(ae, "ensure_audit_evidence_tables", _noop)
+    await ae.insert_citation_observation(
+        audit_run_id="run-1", merchant_id="m1", content_key="ck1",
+        product_key="pk1", provider="gemini", query="best cream blush",
+        axis="category", query_class="category_discovery",
+        cited_host="ulta.com", host_type="retailer", citation_role=None,
+        first_party=False, is_competitor=False,
+        evidence_url="https://ulta.com/p", content_key_basis="resolved",
+        idempotency_key="idem-1",
+        destination_rank=rank, is_primary_destination=primary,
+    )
+    assert "__unparsed__" not in captured, captured.get("__unparsed__")
+    return captured
+
+
+async def test_the_rank_and_primary_flag_reach_the_insert(monkeypatch):
+    """M3/M4/M5: assert the values actually arrive as bound parameters."""
+    values = await _one_observation(monkeypatch, rank=0, primary=True)
+    assert values.get("destination_rank") == 0
+    assert values.get("is_primary_destination") is True
+
+
+async def test_a_non_primary_observation_persists_its_rank_and_false(monkeypatch):
+    """Positive counterpart: the writer is not hardcoded the other way either."""
+    values = await _one_observation(monkeypatch, rank=3, primary=False)
+    assert values.get("destination_rank") == 3
+    assert values.get("is_primary_destination") is False
+
+
+async def test_an_absent_rank_persists_as_null_not_zero(monkeypatch):
+    """Rank 0 is the BEST position; None means 'no ordinal known'. Collapsing
+    the two would make an unranked row look like the top destination."""
+    values = await _one_observation(monkeypatch, rank=None, primary=False)
+    assert values.get("destination_rank") is None
+
+
+# --- the extract -> insert BOUNDARY (audit_evidence_builder.py:1246-1247) ---
+# The two tests above pin the DB writer. They do NOT pin the hand-off into it:
+# mutants forcing `is_primary_destination=False` / `destination_rank=None` at
+# the call site survived both. This drives the real deposit loop and asserts the
+# kwargs it actually passes.
+async def test_the_deposit_loop_forwards_rank_and_primary(monkeypatch):
+    import services.audit_evidence_builder as eb
+
+    seen = []
+
+    async def _capture(**kwargs):
+        seen.append(kwargs)
+        return "obs-id"
+
+    def _one_obs(brand_report, content_key_map=None):
+        return [{
+            "content_key": "ck1", "product_key": "pk1", "provider": "gemini",
+            "query": "best cream blush", "axis": "category",
+            "query_class": "category_discovery", "cited_host": "ulta.com",
+            "host_type": "retailer", "citation_role": None,
+            "first_party": False, "is_competitor": False,
+            "evidence_url": "https://ulta.com/p", "content_key_basis": "resolved",
+            "destination_rank": 0, "is_primary_destination": True,
+        }]
+
+    # The helper imports it locally from db.audit_evidence, so patch it there.
+    monkeypatch.setattr(ae, "insert_citation_observation", _capture)
+    monkeypatch.setattr(eb, "extract_citation_observations", _one_obs)
+    await eb._deposit_citation_observations(
+        brand_report={}, content_key_map=None,
+        audit_run_id="run-1", merchant_id="m1",
+        summary={"citation_observations_inserted": 0,
+                 "citation_observations_skipped": 0},
+    )
+    assert len(seen) == 1, seen
+    assert seen[0]["destination_rank"] == 0
+    assert seen[0]["is_primary_destination"] is True
+
+
+async def test_the_deposit_loop_forwards_a_non_primary_unchanged(monkeypatch):
+    """Positive counterpart: the hand-off is not hardcoded the other way."""
+    import services.audit_evidence_builder as eb
+
+    seen = []
+
+    async def _capture(**kwargs):
+        seen.append(kwargs)
+        return "obs-id"
+
+    def _one_obs(brand_report, content_key_map=None):
+        return [{
+            "content_key": "ck1", "provider": "gemini", "query": "q",
+            "cited_host": "editorial.example", "content_key_basis": "resolved",
+            "destination_rank": 4, "is_primary_destination": False,
+        }]
+
+    # The helper imports it locally from db.audit_evidence, so patch it there.
+    monkeypatch.setattr(ae, "insert_citation_observation", _capture)
+    monkeypatch.setattr(eb, "extract_citation_observations", _one_obs)
+    await eb._deposit_citation_observations(
+        brand_report={}, content_key_map=None,
+        audit_run_id="run-1", merchant_id="m1",
+        summary={"citation_observations_inserted": 0,
+                 "citation_observations_skipped": 0},
+    )
+    assert seen[0]["destination_rank"] == 4
+    assert seen[0]["is_primary_destination"] is False

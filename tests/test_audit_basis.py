@@ -227,6 +227,13 @@ def test_every_comparability_field_is_actually_checked():
         "primary_destination_version": 2,
         "prompt_set_id": "ps_zzzz",
         "selected_set_id": "sel_zzzz",
+        # Review: recorded but never consulted until now. official_domains
+        # decides first_party on every cited host; tier_mix changes what was
+        # asked; market/language change which SERP answered.
+        "official_domains": ["brand.com", "brand.co.uk"],
+        "tier_mix": {"trust": 10},
+        "market": "GB",
+        "language": "fr",
     }
     assert set(perturbations) == set(mod.COMPARABILITY_FIELDS)
     for field, value in perturbations.items():
