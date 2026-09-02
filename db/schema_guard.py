@@ -265,6 +265,110 @@ async def ensure_required_schema_light() -> None:
     await _ensure_database_connected()
     try:
         if IS_POSTGRES:
+            # mig 207: the Reap EXTERNAL AUTHORIZATION ledger + merchant descriptor
+            # registry. Both tables are read on the FIRST authorization Reap sends,
+            # inside a 1.6-second budget, and a missing relation there is not a 500
+            # on a background job — it is a DECLINED CARD at a live checkout. Prod
+            # deploys skip db/migrations/, so the tables are born here too.
+            #
+            # The schema-guard-coverage gate only inspects ADD COLUMN, so nothing
+            # would have flagged these CREATE TABLEs; they are here because the
+            # runtime read exists, not because a test demanded them. Keep this DDL
+            # byte-identical to db/migrations/207_agent_card_auth_decisions.sql —
+            # a self-heal that disagrees with the migration makes prod behave
+            # unlike every environment where the migration ran.
+            #
+            # FIRST IN THE BRANCH, AND IN ITS OWN try/except. Both are deliberate,
+            # and both were measured rather than guessed.
+            #
+            # This whole IS_POSTGRES branch is ONE try-block: the first statement
+            # that raises abandons every statement after it. The mig-190 block
+            # names that hazard and answers it by moving LATER in the chain, which
+            # is the right trade for columns that only make /health fail closed.
+            # It is the WRONG trade here — a missing relation on this path is a
+            # declined card at a live checkout, inside Reap's 1.6s budget, not a
+            # background 500. Reproduced on an empty database 2026-09-02: the
+            # `CREATE INDEX ... ON commerce_interactions` further down carries no
+            # IF EXISTS guard on its table, raises, and starved these two tables
+            # completely when they sat at the end of the chain.
+            #
+            # So: first, so nothing upstream can starve them; and wrapped, so a
+            # failure HERE cannot starve the self-heals that follow. Isolated in
+            # both directions, which position alone cannot buy.
+            try:
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS agent_card_auth_decisions (
+                        event_id VARCHAR(128) PRIMARY KEY,
+                        card_id VARCHAR(64),
+                        issuer_card_ref VARCHAR(128) NOT NULL,
+                        decision VARCHAR(8) NOT NULL
+                            CHECK (decision IN ('APPROVE', 'DECLINE')),
+                        reason VARCHAR(32),
+                        reason_code VARCHAR(48) NOT NULL,
+                        amount_minor BIGINT,
+                        currency VARCHAR(8),
+                        channel VARCHAR(16),
+                        merchant_name TEXT,
+                        merchant_city TEXT,
+                        merchant_country VARCHAR(2),
+                        mcc VARCHAR(4),
+                        merchant_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                        latency_ms INTEGER NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_card_auth_decisions_card_decision "
+                        "ON agent_card_auth_decisions (card_id, decision);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS agent_card_merchant_descriptors (
+                        id BIGSERIAL PRIMARY KEY,
+                        merchant_domain VARCHAR(255) NOT NULL,
+                        name_norm TEXT NOT NULL,
+                        country VARCHAR(2),
+                        city_norm TEXT,
+                        source VARCHAR(16) NOT NULL,
+                        seen_count INTEGER NOT NULL DEFAULT 1,
+                        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (merchant_domain, name_norm, country)
+                    );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_card_merchant_descriptors_domain "
+                        "ON agent_card_merchant_descriptors (merchant_domain);"
+                    )
+                )
+                # mig 207 (F5): the composite the LIVE decision reads under its advisory lock.
+                # ALTER-free and on a table born in mig 201, so it heals independently of
+                # whether that migration ever ran here.
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_issued_cards_issuer_ref_status "
+                        "ON agent_issued_cards (issuer_card_ref, status);"
+                    )
+                )
+            except Exception:
+                # Same best-effort contract as the enclosing block. The card-rail
+                # decision path is the loud one if this ever silently fails: the
+                # first authorization 500s inside Reap's 1.6s budget, which Reap
+                # renders as a declined card — not a silent wrong answer.
+                pass
             # Universal commerce collector references (migration 204). Railway
             # fast-mode skips migrations, while SQLAlchemy SELECTs materialize
             # every modeled column; self-heal before the first event arrives.

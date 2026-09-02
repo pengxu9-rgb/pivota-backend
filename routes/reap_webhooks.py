@@ -1,4 +1,14 @@
-"""POST /webhooks/reap — the issuer's report of what happened to a minted card.
+"""The two Reap receivers: the record, and the live decision.
+
+  POST /webhooks/reap            NOTIFICATION mode — the issuer's report of what happened to a
+                                 minted card. Async, retried, at-least-once. Documented below.
+  POST /webhooks/reap/authorize  REQUEST mode — Reap holding a card authorization open for
+                                 1.6s waiting for APPROVE/DECLINE. Synchronous, never retried,
+                                 fail-closed. Documented on receive_reap_authorization, whose
+                                 response-code posture is the exact INVERSE of this one's.
+
+They share the signature verifier and nothing else — separate endpoints, separate registrations
+at Reap, separate signing secrets, separate env dials.
 
 AUTH IS THE SIGNATURE: `X-Reap-Webhook-Signature: t=<unix seconds>,v1=<hex hmac>`, HMAC-SHA256
 over `"{t}.{raw bytes}"` within a 300 s window (services/reap_webhooks.verify_signature, and
@@ -24,7 +34,9 @@ receiver exists for.
 
 from __future__ import annotations
 
+import decimal
 import json
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -39,6 +51,14 @@ from db.agent_issued_cards import (
 )
 from db.card_rail_outcomes import record_outcome
 from db.database import database
+from services.reap_external_auth import (
+    REQUEST_TYPE,
+    auth_signature_header_name,
+    auth_webhook_secret,
+    decide,
+    external_auth_enabled,
+    parse_authorization_request,
+)
 from services.reap_webhooks import (
     ReapEvent,
     alarm,
@@ -52,6 +72,12 @@ from services.reap_webhooks import (
 from utils.logger import logger
 
 router = APIRouter(prefix="/webhooks", tags=["reap-webhooks"])
+
+# A CARD_AUTHORIZATION_REQUEST is a few hundred bytes. 64 KiB is ~100x headroom and still small
+# enough that hashing it cannot eat a meaningful share of Reap's 1.6-second budget. Scoped to
+# the authorization route deliberately: the notification receiver is async and retried, so a
+# large body there costs latency nobody is waiting on.
+MAX_AUTHORIZATION_BODY_BYTES = 64 * 1024
 
 
 def _outcome_values(
@@ -171,3 +197,106 @@ async def receive_reap_webhook(request: Request) -> Dict[str, Any]:
             return {"status": "ok", "handled": "ignored_event_type"}
 
     return {"status": "ok", "handled": event.event_type, "applied": applied}
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """Read the request body, aborting the moment it crosses MAX_AUTHORIZATION_BODY_BYTES.
+
+    `await request.body()` buffers the WHOLE body first and only then lets the caller measure
+    it, so a lying-small content-length with a 200 KB body was fully read into memory before
+    anything refused it — the ceiling was a report, not a limit. Streaming with a running total
+    stops at the first chunk that crosses the line: at most the ceiling plus one chunk is ever
+    held.
+
+    Two gates, because neither covers the other. The declared content-length (checked by the
+    caller) refuses before a single byte is read, but it is attacker-supplied and a chunked
+    request has none. This one measures what actually arrived and cannot be lied to.
+
+    DELIBERATELY FAIL-CLOSED ON THE HEADER: a content-length declaring MORE than the ceiling is
+    refused even if the body turns out to be small. Reap's real requests are a few hundred bytes
+    and declare it honestly, so the only traffic this rejects is malformed or hostile — and on
+    a decision endpoint a wrong refusal costs one declined authorization, while a wrong
+    acceptance spends the budget of the next one.
+    """
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_AUTHORIZATION_BODY_BYTES:
+            raise HTTPException(
+                status_code=413, detail="authorization request body too large"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@router.post("/reap/authorize")
+async def receive_reap_authorization(request: Request) -> Dict[str, str]:
+    """POST /webhooks/reap/authorize — Reap's EXTERNAL AUTHORIZATION request (mode: REQUEST).
+
+    The sibling of the receiver above, and its opposite in every posture that matters. That one
+    records what already happened and answers 200 for anything it cannot act on, because a 4xx
+    invites infinite redelivery. This one is the LIVE DECISION on a card authorization: Reap is
+    holding the transaction open for 1.6 seconds waiting for our answer, and treats a timeout, a
+    non-2xx, an unreachable host or an unparseable body as a DECLINE.
+
+    That inverts the response-code posture completely — every error code here is a decline, so
+    every ambiguity resolves toward one:
+
+      503  the feature switch is off, or the endpoint's secret is unset. Both are fail-closed
+           dials: an unconfigured decision endpoint must decline, never approve.
+      413  body over MAX_AUTHORIZATION_BODY_BYTES, refused BEFORE the HMAC.
+      401  bad or missing signature.
+      400  signed body that is not JSON, is not a CARD_AUTHORIZATION_REQUEST, or carries no
+           eventId/cardId — we cannot record a decision without an event id, and an unrecorded
+           approval is the one outcome worse than a decline.
+      200  a real decision: {"decision":"APPROVE"} or {"decision":"DECLINE","reason":...},
+           and NOTHING else in the body.
+
+    A 500 (database down mid-decision) also declines, and that is the correct failure: the
+    alternative — approving, or declining without a ledger row — would spend or refuse money
+    with no record of why. This handler therefore does not catch.
+
+    REAP_EXTERNAL_AUTH_ENABLED is checked BEFORE the secret so the switch alone can take the
+    endpoint out of service without touching secret storage.
+    """
+    started_at = time.monotonic()
+
+    if not external_auth_enabled():
+        raise HTTPException(status_code=503, detail="reap external authorization is disabled")
+    secret = auth_webhook_secret()
+    if not secret:
+        # NOT falling back to REAP_WEBHOOK_SECRET: the REQUEST-mode endpoint is registered
+        # separately and gets its own signingSecret. A fallback would authenticate live
+        # spending decisions with the notification receiver's key.
+        raise HTTPException(status_code=503, detail="reap authorization receiver is not configured")
+
+    # SIZE CEILING BEFORE THE HMAC, and before the body is even buffered. See
+    # _read_bounded_body: the declared content-length is the cheap first gate, and the streaming
+    # read is the one that holds when that header lies or is absent.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_AUTHORIZATION_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="authorization request body too large")
+    raw = await _read_bounded_body(request)
+
+    if not verify_signature(raw, request.headers.get(auth_signature_header_name()), secret):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    try:
+        # parse_float=Decimal, NOT the default float: Reap sends decimal MAJOR-unit amounts and
+        # 42.50 as a binary float is 42.4999999999999964..., which would be compared against a
+        # spending cap. Money never becomes a binary float on this path.
+        body = json.loads(raw.decode("utf-8"), parse_float=decimal.Decimal)
+    except Exception:
+        raise HTTPException(status_code=400, detail="signed body was not valid JSON")
+
+    if not isinstance(body, dict) or body.get("type") != REQUEST_TYPE:
+        raise HTTPException(status_code=400, detail="unsupported authorization request type")
+
+    authorization = parse_authorization_request(body)
+    if authorization is None:
+        # No detail from the body — the 400 says the shape was unusable, never what was in it.
+        raise HTTPException(status_code=400, detail="authorization request had no usable identity")
+
+    outcome = await decide(authorization, started_at)
+    return outcome.body()
