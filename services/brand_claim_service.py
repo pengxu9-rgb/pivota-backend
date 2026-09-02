@@ -346,11 +346,19 @@ async def merchant_owned_domains(merchant_id: str) -> set:
     return set(await merchant_owned_domains_detailed(merchant_id))
 
 
-async def record_verified_official_domain(
-    merchant_id: str, domain: Optional[str]
+async def record_official_domain(
+    merchant_id: str,
+    domain: Optional[str],
+    *,
+    source: str = "verified",
 ) -> bool:
     """Backfill hook: a claim just PROVED control of `domain`, so promote it to
-    the official set as source='verified'.
+    the official set.
+
+    `source='verified'` means control proven AND bound to this merchant's brand
+    identity. `source='asserted'` means control proven, binding not established
+    — still far stronger evidence than inference, which counts with no proof at
+    all, but it does not grant brand_direct.
 
     Best-effort, like every other write in this file — a claim must never fail
     because the official-domain table was unavailable. The liveness sweep is the
@@ -370,15 +378,27 @@ async def record_verified_official_domain(
         return await mod.upsert_official_domain(
             merchant_id=merchant_id,
             domain=host,
-            source=mod.SOURCE_VERIFIED,
+            source=source,
             verification_status=mod.VERIFICATION_VERIFIED,
         )
     except Exception as exc:  # noqa: BLE001 — never break claim verification
         logger.warning(
-            "record_verified_official_domain failed for %s/%s: %s",
+            "record_official_domain failed for %s/%s: %s",
             merchant_id, host, str(exc)[:200],
         )
         return False
+
+
+async def record_verified_official_domain(
+    merchant_id: str, domain: Optional[str]
+) -> bool:
+    """Brand-bound verification: control proven AND the domain belongs to this
+    merchant's known identity. Thin wrapper kept for the existing call sites."""
+    from db import merchant_official_domains as mod
+
+    return await record_official_domain(
+        merchant_id, domain, source=mod.SOURCE_VERIFIED
+    )
 
 
 async def merchant_owns_domain(merchant_id: str, domain: str) -> bool:
@@ -655,7 +675,19 @@ async def verify_brand_claim(
         )
         bound = False
     if not bound:
-        # Record the proof, but DO NOT grant brand_direct on an unbound domain.
+        # Domain CONTROL is proven (TXT token / emailed code matched); only
+        # brand-identity BINDING is missing. That is exactly source='asserted':
+        # the domain joins the merchant's official set — it is strictly stronger
+        # evidence than the inference that already counts unconditionally — but
+        # brand_direct stays closed pending review. Without this the proof was
+        # discarded, which is why a second storefront on a different registrable
+        # domain (anua.us alongside anua.com; measured 2026-09-01) could never
+        # be recorded and read as third-party in the audit.
+        from db import merchant_official_domains as mod
+
+        await record_official_domain(
+            claim["merchant_id"], domain, source=mod.SOURCE_ASSERTED
+        )
         return {
             "status": "domain_verified_unbound",
             "brand_direct_set": False,

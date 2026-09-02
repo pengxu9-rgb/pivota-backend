@@ -707,15 +707,34 @@ async def test_a_verified_dns_claim_upserts_a_verified_official_domain(monkeypat
     assert rows[0]["liveness_status"] == mod.LIVENESS_UNCHECKED
 
 
-async def test_an_unbound_domain_writes_no_official_row(monkeypatch):
-    """The positive counterpart's negative: a claim that proved domain control
-    but is NOT bound to this merchant is not granted brand_direct, so it must
-    not be granted an official-domain row either."""
+async def test_control_proven_but_unbound_domain_is_recorded_as_asserted(monkeypatch):
+    """A claim that PROVED domain control but is not bound to this merchant's
+    brand identity records the domain as source='asserted' — and still does NOT
+    grant brand_direct.
+
+    This reverses the first cut of this test, which asserted no row was written.
+    Three reasons:
+
+    1. Control is the proof. A matched DNS TXT token / emailed code proves the
+       claimant controls the domain. `merchant_owned_domains` answers "is this
+       cited host a destination the merchant owns?", and proven control answers
+       exactly that. It is strictly stronger evidence than inference, which
+       already counts with no proof at all.
+    2. SOURCE_ASSERTED was otherwise unreachable. The vocabulary defined it and
+       `merchant_owned_domains` counted it, but nothing could ever create one.
+    3. It is the measured case. Anua runs anua.com AND anua.us; `anua.us` does
+       not bind to `anua.com` (different registrable domains), so the proof was
+       discarded and the second storefront read as third-party — 21 points of
+       error on branded official share (2026-09-01).
+
+    The money gate is untouched: brand_direct still requires binding. This is
+    the measurement gate, and the two have different risk profiles.
+    """
     claim = {
         "claim_id": "c2",
         "merchant_id": MERCHANT,
         "claim_method": "dns",
-        "brand_domain": "someoneelse.com",
+        "brand_domain": "anua.us",
         "challenge_token": "pivota-verify=tok",
         "verification_status": "pending",
     }
@@ -733,6 +752,35 @@ async def test_an_unbound_domain_writes_no_official_row(monkeypatch):
         owned_domain_check=_unbound,
     )
     assert result["status"] == "domain_verified_unbound"
+    assert result["brand_direct_set"] is False, "the money gate must stay closed"
+
+    rows = await mod.list_official_domains(MERCHANT)
+    assert [(r["domain"], r["source"]) for r in rows] == [("anua.us", mod.SOURCE_ASSERTED)]
+    assert "anua.us" in await svc.merchant_owned_domains(MERCHANT)
+
+
+async def test_a_failed_proof_writes_no_official_row(monkeypatch):
+    """The real negative: control was NOT proven, so nothing is recorded. This
+    is what stops an unproven domain entering the set."""
+    claim = {
+        "claim_id": "c3",
+        "merchant_id": MERCHANT,
+        "claim_method": "dns",
+        "brand_domain": "someoneelse.com",
+        "challenge_token": "pivota-verify=tok",
+        "verification_status": "pending",
+    }
+
+    async def _get(cid):
+        return claim
+
+    monkeypatch.setattr(svc.bc, "get_brand_claim", _get)
+    result = await svc.verify_brand_claim(
+        "c3",
+        txt_resolver=lambda d: ["some-other-token"],
+        owned_domain_check=lambda mid, dom: False,
+    )
+    assert result["status"] == "pending"
     assert await mod.list_official_domains(MERCHANT) == []
 
 
