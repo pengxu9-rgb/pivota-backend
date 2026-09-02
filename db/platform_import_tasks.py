@@ -158,16 +158,24 @@ async def claim_import_task(task_id: int) -> Optional[Dict[str, Any]]:
     The winner's row comes back with `attempt` already incremented, so callers
     must NOT increment it again.
     """
-    query = """
-    UPDATE platform_import_tasks
-    SET status = 'running',
-        attempt = attempt + 1,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = :task_id
-      AND status IN ('pending', 'retry_scheduled')
-    RETURNING *
-    """
-    row = await database.fetch_one(query, {"task_id": task_id})
+    # The SQL is passed INLINE, not via a local `query = """..."""`. The
+    # Postgres dialect gate (tests/test_repo_sql_prepare_postgres.py) collects
+    # string literals at `database.*` call sites and resolves a bare Name only
+    # against MODULE-level constants — a function-local assignment is invisible
+    # to it, so that shape ships raw SQL that nothing ever plans against a real
+    # schema. Verified by running collect_statements() over this file.
+    row = await database.fetch_one(
+        """
+        UPDATE platform_import_tasks
+        SET status = 'running',
+            attempt = attempt + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = :task_id
+          AND status IN ('pending', 'retry_scheduled')
+        RETURNING *
+        """,
+        {"task_id": task_id},
+    )
     return dict(row) if row else None
 
 
