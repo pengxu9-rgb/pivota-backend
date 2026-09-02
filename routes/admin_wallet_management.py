@@ -269,7 +269,7 @@ async def update_merchant_wallet_status(
     update_query = """
         UPDATE merchant_wallets
         SET status = :status,
-            last_updated = NOW()
+            updated_at = NOW()
         WHERE wallet_id = :wallet_id
     """
     
@@ -542,7 +542,7 @@ async def update_agent_wallet_status(
     update_query = """
         UPDATE agent_wallets
         SET status = :status,
-            last_updated = NOW()
+            updated_at = NOW()
         WHERE wallet_id = :wallet_id
     """
     
