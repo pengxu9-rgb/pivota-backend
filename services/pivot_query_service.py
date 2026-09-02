@@ -875,6 +875,7 @@ async def _fetch_canonical_search_rows(
     merchant_id: Optional[str],
     limit: int,
     require_signature: bool = False,
+    brand_anchor_terms: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     lowered = _normalize_query(query)
     if not lowered:
@@ -1062,8 +1063,21 @@ async def _fetch_canonical_search_rows(
     # it does not widen arbitrary queries, and category recall already admits
     # these rows.  It only ensures a real brand match is not truncated behind a
     # large set of same-category rows before the gateway can validate it.
+    # The caller's anchor wins when it supplied one. `_category_brand_anchor_terms`
+    # needs >= 2 residual tokens, so it can never boost a SINGLE-WORD brand — Murad,
+    # CeraVe, NARS. The gateway resolves those against the catalog brand dictionary
+    # and now threads the answer down, because a post-filter can only keep what recall
+    # already returned: with the boost missing, "show me Murad products" truncated
+    # every Murad row below the candidate limit and the gateway anchored on an empty
+    # set (`brand_category_anchor_matched: false`) while a LIZUSH bath bomb survived.
+    # None (no opinion from the caller) keeps the original behaviour for every other
+    # caller of this function.
     brand_anchor_score = ""
-    brand_anchor_terms = _category_brand_anchor_terms(query)
+    brand_anchor_terms = (
+        brand_anchor_terms
+        if brand_anchor_terms is not None
+        else _category_brand_anchor_terms(query)
+    )
     if brand_anchor_terms:
         anchor_matches = []
         for anchor_index, anchor_term in enumerate(brand_anchor_terms):
@@ -2338,6 +2352,7 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
         merchant_id=request.merchant_id,
         limit=request.limit,
         require_signature=request.canonical_entities_only,
+        brand_anchor_terms=request.brand_anchor_terms,
     )
     canonical_items = await _build_canonical_items(
         canonical_rows,

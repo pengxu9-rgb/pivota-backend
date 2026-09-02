@@ -112,6 +112,12 @@ class PivotQueryRequest(BaseModel):
     # lane MAY contribute when INDEX_ELIGIBLE_RECALL is on. The flag still gates
     # whether the lane runs at all; this only narrows WHEN it may contribute.
     strict_serving_mode: bool = False
+    # The brand anchor the CALLER already resolved, threaded down so recall and the
+    # gateway's post-filter agree. Before this existed both sides independently called
+    # `_category_brand_anchor_terms`, so a caller that resolved a brand the recall SQL
+    # could not was left post-filtering a candidate set that never contained the brand.
+    # None means "decide it yourself" and preserves every other caller's behaviour.
+    brand_anchor_terms: Optional[List[str]] = None
 
 
 class PivotPricing(BaseModel):
