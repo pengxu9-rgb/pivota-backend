@@ -98,6 +98,131 @@ async def test_ensure_updates_existing_pixel(monkeypatch):
     )
     assert result["status"] == "updated"
     assert calls[1]["variables"]["id"] == "gid://shopify/WebPixel/1"
+    assert calls[1]["redact_errors"] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_taken_requeries_and_updates(monkeypatch):
+    import services.shopify_web_pixel_provisioning as service
+
+    responses = [
+        {"webPixel": None},
+        {
+            "webPixelCreate": {
+                "webPixel": None,
+                "userErrors": [{"code": "TAKEN", "message": "already exists"}],
+            }
+        },
+        {"webPixel": {"id": "gid://shopify/WebPixel/race", "settings": {}}},
+        {
+            "webPixelUpdate": {
+                "webPixel": {
+                    "id": "gid://shopify/WebPixel/race",
+                    "settings": {"collectorToken": "secret", "endpoint": "https://api"},
+                },
+                "userErrors": [],
+            }
+        },
+    ]
+    calls = []
+
+    async def fake_graphql(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(service, "shopify_admin_graphql", fake_graphql)
+    result = await service.ensure_shopify_web_pixel(
+        shop_domain="shop.example",
+        access_token="admin-secret",
+        settings={"collectorToken": "secret", "endpoint": "https://api"},
+    )
+
+    assert result["status"] == "updated"
+    assert result["web_pixel_id"] == "gid://shopify/WebPixel/race"
+    assert calls[-1]["variables"]["id"] == "gid://shopify/WebPixel/race"
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_graphql_redacted_errors_never_log_or_raise_echoed_token(
+    monkeypatch, caplog
+):
+    import services.shopify_graphql_client as client
+
+    secret = "collector-token-that-must-not-escape"
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+        headers = {"x-request-id": "request-1"}
+
+        def json(self):
+            return {"errors": [{"message": f"invalid settings {secret}"}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(client.httpx, "AsyncClient", FakeClient)
+    with pytest.raises(client.ShopifyGraphQLError) as caught:
+        await client.shopify_admin_graphql(
+            shop_domain="shop.example",
+            access_token="admin-secret",
+            query="mutation Pixel($settings: JSON!) { pixel(settings: $settings) }",
+            variables={"settings": {"collectorToken": secret}},
+            redact_errors=True,
+        )
+
+    assert secret not in str(caught.value)
+    assert secret not in caplog.text
+    assert caught.value.errors == [{"message": "redacted"}]
+
+
+@pytest.mark.asyncio
+async def test_graphql_redacted_http_body_never_reaches_logs(monkeypatch, caplog):
+    import services.shopify_graphql_client as client
+
+    secret = "collector-token-echoed-in-http-body"
+
+    class FakeResponse:
+        status_code = 422
+        text = f'invalid settings: {{"collectorToken":"{secret}"}}'
+        headers = {}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(client.httpx, "AsyncClient", FakeClient)
+    with pytest.raises(RuntimeError) as caught:
+        await client.shopify_admin_graphql(
+            shop_domain="shop.example",
+            access_token="admin-secret",
+            query="mutation Pixel { pixel }",
+            variables={"settings": {"collectorToken": secret}},
+            redact_errors=True,
+        )
+
+    assert str(caught.value) == "Shopify GraphQL HTTP 422"
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio

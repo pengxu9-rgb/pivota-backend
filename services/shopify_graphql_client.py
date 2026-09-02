@@ -41,6 +41,7 @@ async def shopify_admin_graphql(
     variables: Optional[Dict[str, Any]] = None,
     api_version: str = "2025-10",
     timeout_s: float = 15.0,
+    redact_errors: bool = False,
 ) -> Dict[str, Any]:
     """
     Minimal Shopify Admin GraphQL client.
@@ -61,14 +62,34 @@ async def shopify_admin_graphql(
         resp = await client.post(url, headers=headers, json=payload)
         text = resp.text
         if resp.status_code >= 400:
-            logger.warning("Shopify GraphQL error: %s %s", resp.status_code, text[:800])
+            if redact_errors:
+                logger.warning("Shopify GraphQL error: %s [redacted]", resp.status_code)
+            else:
+                logger.warning(
+                    "Shopify GraphQL error: %s %s", resp.status_code, text[:800]
+                )
             raise RuntimeError(f"Shopify GraphQL HTTP {resp.status_code}")
 
         data = resp.json()
         if "errors" in data and data["errors"]:
             errors = data.get("errors") or []
-            request_id = resp.headers.get("x-request-id") or resp.headers.get("x-shopify-request-id")
-            logger.warning("Shopify GraphQL top-level errors request_id=%s: %s", request_id, str(errors)[:800])
-            raise ShopifyGraphQLError(message="Shopify GraphQL errors", errors=errors, request_id=request_id)
+            request_id = resp.headers.get("x-request-id") or resp.headers.get(
+                "x-shopify-request-id"
+            )
+            if redact_errors:
+                logger.warning(
+                    "Shopify GraphQL top-level errors request_id=%s: [redacted]",
+                    request_id,
+                )
+                errors = [{"message": "redacted"}]
+            else:
+                logger.warning(
+                    "Shopify GraphQL top-level errors request_id=%s: %s",
+                    request_id,
+                    str(errors)[:800],
+                )
+            raise ShopifyGraphQLError(
+                message="Shopify GraphQL errors", errors=errors, request_id=request_id
+            )
 
         return data.get("data") or {}

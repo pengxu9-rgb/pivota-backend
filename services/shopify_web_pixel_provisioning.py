@@ -79,20 +79,26 @@ def _public_pixel(pixel: Any) -> Dict[str, Any]:
     }
 
 
-def _raise_for_user_errors(payload: Any) -> None:
+def _user_error_codes(payload: Any) -> List[str]:
     payload = payload if isinstance(payload, dict) else {}
     errors = payload.get("userErrors") or []
     if not isinstance(errors, list) or not errors:
-        return
+        return []
     # Do not include Shopify messages here: a provider may echo invalid settings,
     # and the settings contain the collector token.
-    codes = sorted(
+    return sorted(
         {
             str(error.get("code") or "SHOPIFY_USER_ERROR").strip()
             for error in errors
             if isinstance(error, dict)
         }
     )
+
+
+def _raise_for_user_errors(payload: Any) -> None:
+    codes = _user_error_codes(payload)
+    if not codes:
+        return
     suffix = ",".join(code for code in codes if code) or "SHOPIFY_USER_ERROR"
     raise ShopifyWebPixelProvisioningError(f"web_pixel_rejected:{suffix}")
 
@@ -105,6 +111,7 @@ async def get_shopify_web_pixel_status(
         access_token=access_token,
         query=WEB_PIXEL_QUERY,
         api_version=api_version,
+        redact_errors=True,
     )
     return _public_pixel(data.get("webPixel"))
 
@@ -121,28 +128,46 @@ async def ensure_shopify_web_pixel(
         access_token=access_token,
         api_version=api_version,
     )
-    variables: Dict[str, Any] = {"webPixel": {"settings": settings}}
-    if current["web_pixel_id"]:
-        operation = "updated"
-        variables["id"] = current["web_pixel_id"]
+
+    async def update_pixel(web_pixel_id: str) -> Dict[str, Any]:
         data = await shopify_admin_graphql(
             shop_domain=shop_domain,
             access_token=access_token,
             query=WEB_PIXEL_UPDATE_MUTATION,
-            variables=variables,
+            variables={
+                "id": web_pixel_id,
+                "webPixel": {"settings": settings},
+            },
             api_version=api_version,
+            redact_errors=True,
         )
-        payload = data.get("webPixelUpdate")
+        return data.get("webPixelUpdate")
+
+    if current["web_pixel_id"]:
+        operation = "updated"
+        payload = await update_pixel(current["web_pixel_id"])
     else:
         operation = "created"
         data = await shopify_admin_graphql(
             shop_domain=shop_domain,
             access_token=access_token,
             query=WEB_PIXEL_CREATE_MUTATION,
-            variables=variables,
+            variables={"webPixel": {"settings": settings}},
             api_version=api_version,
+            redact_errors=True,
         )
         payload = data.get("webPixelCreate")
+        if "TAKEN" in _user_error_codes(payload):
+            # Another ensure may have created the app-owned singleton between
+            # our read and create. Confirm it, then rotate to these settings.
+            concurrent = await get_shopify_web_pixel_status(
+                shop_domain=shop_domain,
+                access_token=access_token,
+                api_version=api_version,
+            )
+            if concurrent["web_pixel_id"]:
+                operation = "updated"
+                payload = await update_pixel(concurrent["web_pixel_id"])
 
     if not isinstance(payload, dict):
         raise ShopifyWebPixelProvisioningError("web_pixel_response_invalid")
