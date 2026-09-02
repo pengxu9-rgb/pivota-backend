@@ -1,4 +1,14 @@
-"""POST /webhooks/reap — the issuer's report of what happened to a minted card.
+"""The two Reap receivers: the record, and the live decision.
+
+  POST /webhooks/reap            NOTIFICATION mode — the issuer's report of what happened to a
+                                 minted card. Async, retried, at-least-once. Documented below.
+  POST /webhooks/reap/authorize  REQUEST mode — Reap holding a card authorization open for
+                                 1.6s waiting for APPROVE/DECLINE. Synchronous, never retried,
+                                 fail-closed. Documented on receive_reap_authorization, whose
+                                 response-code posture is the exact INVERSE of this one's.
+
+They share the signature verifier and nothing else — separate endpoints, separate registrations
+at Reap, separate signing secrets, separate env dials.
 
 AUTH IS THE SIGNATURE: `X-Reap-Webhook-Signature: t=<unix seconds>,v1=<hex hmac>`, HMAC-SHA256
 over `"{t}.{raw bytes}"` within a 300 s window (services/reap_webhooks.verify_signature, and
@@ -24,7 +34,9 @@ receiver exists for.
 
 from __future__ import annotations
 
+import decimal
 import json
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -39,6 +51,14 @@ from db.agent_issued_cards import (
 )
 from db.card_rail_outcomes import record_outcome
 from db.database import database
+from services.reap_external_auth import (
+    REQUEST_TYPE,
+    auth_signature_header_name,
+    auth_webhook_secret,
+    decide,
+    external_auth_enabled,
+    parse_authorization_request,
+)
 from services.reap_webhooks import (
     ReapEvent,
     alarm,
@@ -171,3 +191,67 @@ async def receive_reap_webhook(request: Request) -> Dict[str, Any]:
             return {"status": "ok", "handled": "ignored_event_type"}
 
     return {"status": "ok", "handled": event.event_type, "applied": applied}
+
+
+@router.post("/reap/authorize")
+async def receive_reap_authorization(request: Request) -> Dict[str, str]:
+    """POST /webhooks/reap/authorize — Reap's EXTERNAL AUTHORIZATION request (mode: REQUEST).
+
+    The sibling of the receiver above, and its opposite in every posture that matters. That one
+    records what already happened and answers 200 for anything it cannot act on, because a 4xx
+    invites infinite redelivery. This one is the LIVE DECISION on a card authorization: Reap is
+    holding the transaction open for 1.6 seconds waiting for our answer, and treats a timeout, a
+    non-2xx, an unreachable host or an unparseable body as a DECLINE.
+
+    That inverts the response-code posture completely — every error code here is a decline, so
+    every ambiguity resolves toward one:
+
+      503  the feature switch is off, or the endpoint's secret is unset. Both are fail-closed
+           dials: an unconfigured decision endpoint must decline, never approve.
+      401  bad or missing signature.
+      400  signed body that is not JSON, is not a CARD_AUTHORIZATION_REQUEST, or carries no
+           eventId/cardId — we cannot record a decision without an event id, and an unrecorded
+           approval is the one outcome worse than a decline.
+      200  a real decision: {"decision":"APPROVE"} or {"decision":"DECLINE","reason":...},
+           and NOTHING else in the body.
+
+    A 500 (database down mid-decision) also declines, and that is the correct failure: the
+    alternative — approving, or declining without a ledger row — would spend or refuse money
+    with no record of why. This handler therefore does not catch.
+
+    REAP_EXTERNAL_AUTH_ENABLED is checked BEFORE the secret so the switch alone can take the
+    endpoint out of service without touching secret storage.
+    """
+    started_at = time.monotonic()
+
+    if not external_auth_enabled():
+        raise HTTPException(status_code=503, detail="reap external authorization is disabled")
+    secret = auth_webhook_secret()
+    if not secret:
+        # NOT falling back to REAP_WEBHOOK_SECRET: the REQUEST-mode endpoint is registered
+        # separately and gets its own signingSecret. A fallback would authenticate live
+        # spending decisions with the notification receiver's key.
+        raise HTTPException(status_code=503, detail="reap authorization receiver is not configured")
+
+    raw = await request.body()
+    if not verify_signature(raw, request.headers.get(auth_signature_header_name()), secret):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    try:
+        # parse_float=Decimal, NOT the default float: Reap sends decimal MAJOR-unit amounts and
+        # 42.50 as a binary float is 42.4999999999999964..., which would be compared against a
+        # spending cap. Money never becomes a binary float on this path.
+        body = json.loads(raw.decode("utf-8"), parse_float=decimal.Decimal)
+    except Exception:
+        raise HTTPException(status_code=400, detail="signed body was not valid JSON")
+
+    if not isinstance(body, dict) or body.get("type") != REQUEST_TYPE:
+        raise HTTPException(status_code=400, detail="unsupported authorization request type")
+
+    authorization = parse_authorization_request(body)
+    if authorization is None:
+        # No detail from the body — the 400 says the shape was unusable, never what was in it.
+        raise HTTPException(status_code=400, detail="authorization request had no usable identity")
+
+    outcome = await decide(authorization, started_at)
+    return outcome.body()

@@ -1341,7 +1341,7 @@ app.include_router(agent_recommendations_router)  # Agent recommendations (proxy
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
 app.include_router(card_rail_outcomes_router)  # POST /agent/v1/outcomes — handoff results
 app.include_router(agent_cards_router)  # POST /agent/v1/cards — Reap rail card minting (503 unless AGENT_CARD_ISSUANCE_ENABLED)
-app.include_router(reap_webhooks_router)  # POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET)
+app.include_router(reap_webhooks_router)  # POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET); POST /webhooks/reap/authorize — live external authorization (503 unless REAP_EXTERNAL_AUTH_ENABLED + REAP_AUTH_WEBHOOK_SECRET)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)

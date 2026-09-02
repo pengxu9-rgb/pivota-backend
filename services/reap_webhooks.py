@@ -34,8 +34,8 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from decimal import Decimal
-from typing import Any, Dict, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Optional, Tuple
 
 from utils.logger import logger
 
@@ -201,6 +201,40 @@ def parse_event(body: Dict[str, Any]) -> Optional[ReapEvent]:
 def minor_to_major(amount_minor: int, currency: str) -> Decimal:
     exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
     return Decimal(amount_minor) / (Decimal(10) ** exponent)
+
+
+def major_to_minor(value: Any, currency: str) -> Optional[int]:
+    """The inverse, for the external-authorization path — where Reap sends DECIMAL MAJOR-UNIT
+    amounts ("amount": 42.50) and our cap is in minor units.
+
+    REFUSES rather than rounds, returning None, when:
+      * the value is not an exact decimal (a binary float is refused outright — the route
+        parses with parse_float=Decimal precisely so one never reaches here),
+      * it is zero or negative,
+      * or it carries more decimal places than the currency has (1.005 USD, 500.5 JPY).
+
+    The refusal is the point. This number is compared against a SPENDING CAP, and every
+    rounding rule picks a direction: round down and an authorization for 100.005 passes a cap
+    of 100.00; round up and an honest 100.004 is declined. A refusal is a visible decline with
+    reason_code 'amount_unparseable' — one authorization lost, nothing over-spent.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float):
+        # Never a legitimate input: 42.50 as a binary float is 42.49999999999999644729...,
+        # and a cap comparison that inherits that error is wrong in a direction nobody chose.
+        return None
+    try:
+        amount = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount <= 0:
+        return None
+    exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
+    scaled = amount * (Decimal(10) ** exponent)
+    if scaled != scaled.to_integral_value():
+        return None
+    return int(scaled)
 
 
 def check_card_consistency(event: ReapEvent, card: Dict[str, Any]) -> Optional[str]:
