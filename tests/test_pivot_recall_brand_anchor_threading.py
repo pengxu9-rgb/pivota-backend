@@ -27,6 +27,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import services.pivot_query_service as svc  # noqa: E402
 
 
+
+def _candidate_or_group(sql: str) -> str:
+    """The text INSIDE the candidate WHERE's top-level OR parens.
+
+    Slicing from "WHERE (" to "ORDER BY" also spans the trailing AND filters, so it cannot tell an
+    OR arm from an AND filter — a mutant that emitted `AND (...)` outside the OR group, inverting
+    "admit the brand's rows" into "require every row to be the brand", passed 425 assertions.
+    Matching the paren is what makes the distinction real.
+    """
+    start = sql.index("WHERE (") + len("WHERE ")
+    depth = 0
+    for i in range(start, len(sql)):
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[start : i + 1]
+    raise AssertionError("unbalanced candidate WHERE")
+
+
 @pytest.fixture
 def captured_sql(monkeypatch: pytest.MonkeyPatch):
     """Capture the recall SQL + params instead of hitting Postgres."""
@@ -53,7 +74,7 @@ async def test_a_caller_supplied_anchor_is_what_recall_boosts(captured_sql):
         brand_anchor_terms=["murad"],
     )
     # ...but the caller's anchor reaches the scoring SQL as a bound parameter.
-    assert captured_sql["params"].get("brand_anchor_0") == "%murad%"
+    assert captured_sql["params"].get("brand_anchor_0") == "% murad %"
     assert "brand_anchor_0" in captured_sql["sql"]
     # The boost must actually be worth something, and must reach the field that orders the page.
     assert "THEN 180" in captured_sql["sql"]
@@ -65,8 +86,8 @@ async def test_no_opinion_from_the_caller_preserves_the_old_behaviour(captured_s
     await svc._fetch_canonical_search_rows(
         query="knight unicorn blush", merchant_id=None, limit=20
     )
-    assert captured_sql["params"].get("brand_anchor_0") == "%knight%"
-    assert captured_sql["params"].get("brand_anchor_1") == "%unicorn%"
+    assert captured_sql["params"].get("brand_anchor_0") == "% knight %"
+    assert captured_sql["params"].get("brand_anchor_1") == "% unicorn %"
 
 
 @pytest.mark.asyncio
@@ -109,13 +130,13 @@ async def test_a_multi_token_anchor_KEEPS_the_title_clause(captured_sql):
     await svc._fetch_canonical_search_rows(
         query="knight unicorn blush", merchant_id=None, limit=20
     )
-    assert captured_sql["params"].get("brand_anchor_1") == "%unicorn%"
-    # Scoped to the ANCHOR clause: `p.title` appears elsewhere in the scoring SQL, so an
-    # unscoped `"p.title" in sql` passes even when the anchor drops it — it did, and the
+    assert captured_sql["params"].get("brand_anchor_1") == "% unicorn %"
+    # Scoped to the SCORE clause between the two anchor params: `p.title` appears elsewhere in the
+    # scoring SQL, so an unscoped `"p.title" in sql` passes even when the anchor drops it — the
     # over-correction mutant survived until this was narrowed.
     sql = captured_sql["sql"]
-    anchor_clause = sql[sql.index("brand_anchor_0") - 400 : sql.index("brand_anchor_1") + 200]
-    assert "p.title" in anchor_clause
+    between = sql[sql.index("brand_anchor_0") : sql.index("brand_anchor_1")]
+    assert "p.title" in between, "a multi-token anchor keeps the title clause"
 
 
 @pytest.mark.asyncio
@@ -167,3 +188,139 @@ def test_the_gateway_resolves_the_anchor_BEFORE_the_search() -> None:
     assert resolve_at < search_at, "the anchor must be resolved before the search that needs it"
     assert "brand_anchor_terms=brand_anchor_terms," in source, ( "the resolved anchor must be threaded into the recall request AS RESOLVED — `or None` turns [] (no brand) into None (derive it yourself), the opposite of the documented contract"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# ADMIT, don't merely re-rank. `brand_anchor_score` is a SCORE term — it never appears in the
+# WHERE — so it reorders the candidate set but cannot admit a row the WHERE excluded. Measured in
+# prod with the boost live (web-00278-tor): "I am looking for a Murad cleanser" returned 5 Murad
+# products (because `cleanser` yields a category prefix and category recall admits them), while
+# "show me Murad products" still returned one LIZUSH bath bomb — the phrase predicate looks for
+# "%show me murad products%" and no Murad row was ever a candidate.
+
+
+@pytest.mark.asyncio
+async def test_a_brand_anchor_ADMITS_rows_not_just_boosts_them(captured_sql):
+    await svc._fetch_canonical_search_rows(
+        query="show me Murad products",
+        merchant_id=None,
+        limit=20,
+        brand_anchor_terms=["murad"],
+    )
+    sql = captured_sql["sql"]
+    assert captured_sql["params"].get("brand_admit_0") == "% murad %"
+    # It must be an OR arm INSIDE the candidate WHERE's disjunction — not an AND filter.
+    # A window that merely spans "WHERE (" to "ORDER BY" also covers the trailing AND filters, so
+    # it cannot tell a widening from a narrowing: a mutant that emitted `AND (...)` and moved the
+    # placeholder outside the OR parens — inverting this change into "every row must be the brand"
+    # — passed 425 assertions until this was tightened.
+    # Inside the OR group = widening. Outside it = an AND filter, i.e. a narrowing.
+    assert "brand_admit_0" in _candidate_or_group(sql), (
+        "the admit predicate must be an OR arm inside the candidate WHERE; ANDing it would "
+        "REQUIRE every row to be the brand"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_admit_branch_is_whole_word_and_identity_only(captured_sql):
+    """It ADMITS rows, so a substring hit costs far more here than in the scoring: `%lush%` inside
+    "Blush" would pull every blush in the catalog into the candidate window. Comparing against a
+    space-padded field makes the match word-delimited with plain LIKE and a bound parameter."""
+    await svc._fetch_canonical_search_rows(
+        query="lush blush", merchant_id=None, limit=20, brand_anchor_terms=["lush"]
+    )
+    sql = captured_sql["sql"]
+    assert captured_sql["params"]["brand_admit_0"] == "% lush %"
+    group = _candidate_or_group(sql)
+    admit = group[group.index("OR (") + 4 :] if "OR (" in group else group
+    admit = admit[: admit.index("brand_admit_0") + 200]
+    assert "p.brand" in admit and "m.merchant_name" in admit
+    assert "p.title" not in admit.split("brand_admit_0")[0][-400:], (
+        "admitting on title would flood the candidate window"
+    )
+
+
+@pytest.mark.parametrize(
+    "brand,term,admitted",
+    [
+        ("Murad", "murad", True),
+        ("Murad Skin Care", "murad", True),   # the brand is one word among several
+        ("LUSH", "lush", True),
+        ("Blush", "lush", False),             # the substring hazard, refused
+        ("Plush Beauty", "lush", False),
+        ("Four Sigmatic", "sigma", False),
+        ("Sigma Beauty", "sigma", True),
+    ],
+)
+def test_the_word_boundary_property_the_admit_branch_relies_on(brand, term, admitted):
+    """`(' ' || brand || ' ') LIKE '% term %'` in SQL, expressed here as the string property it is."""
+    assert (f" {term} " in f" {brand.lower()} ") is admitted
+
+
+@pytest.mark.asyncio
+async def test_no_anchor_means_no_admit_branch(captured_sql):
+    await svc._fetch_canonical_search_rows(
+        query="hydrating cleanser", merchant_id=None, limit=20, brand_anchor_terms=[]
+    )
+    assert not [k for k in captured_sql["params"] if k.startswith("brand_admit_")]
+
+
+
+@pytest.mark.asyncio
+async def test_the_admit_branch_stays_RELEVANT_when_the_query_names_a_category(captured_sql):
+    """Unconditional admission spends the candidate window on the brand's off-category rows.
+
+    The +180 anchor score beats the +90 category-path score, so the brand's serums outrank other
+    brands' cleansers by 90 points — always. Measured on a Postgres fixture for "murad cleanser"
+    (500 Murad products, 15 cleansers, vs 3000 other cleansers): 65 of 80 candidate slots flipped
+    from cleansers to Murad NON-cleansers, and with realistic offer sparsity the served page
+    collapsed from 65 relevant rows to 3 irrelevant ones — the offer join runs OUTSIDE this CTE's
+    LIMIT, so the slots were already spent.
+    """
+    await svc._fetch_canonical_search_rows(
+        query="murad cleanser", merchant_id=None, limit=20, brand_anchor_terms=["murad"]
+    )
+    sql = captured_sql["sql"]
+    admit_at = sql.index("brand_admit_0")
+    arm = sql[admit_at : admit_at + 400]
+    assert "category_path_prefix" in arm, (
+        "when the query names a category, admitted brand rows must satisfy it too"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_brand_only_query_still_admits_the_whole_brand(captured_sql):
+    """The counterpart: no category term means no conjunct to add, and "show me Murad products"
+    is precisely a request for the whole brand."""
+    await svc._fetch_canonical_search_rows(
+        query="show me Murad products", merchant_id=None, limit=20, brand_anchor_terms=["murad"]
+    )
+    sql = captured_sql["sql"]
+    admit_at = sql.index("brand_admit_0")
+    assert "category_path_prefix" not in sql[admit_at : admit_at + 400]
+
+
+@pytest.mark.parametrize(
+    "brand,term,matches",
+    [
+        ("Murad, Inc.", "murad", True),
+        ("La Roche-Posay", "roche", True),
+        ("Kiehl's Since 1851", "kiehl", True),
+        ("Dr. Jart+", "jart", True),
+        ("Blush Cosmetics", "lush", False),
+        ("Four Sigmatic", "sigma", False),
+    ],
+)
+def test_punctuation_is_folded_before_the_word_boundary_is_applied(brand, term, matches):
+    """Padding finds boundaries made of SPACES, but brands separate tokens with punctuation.
+    Measured in Postgres against the raw padded expression, every punctuated brand above failed
+    to match its own token while still collecting +180 — a fix that read as if it covered them."""
+    import sqlite3
+
+    # The REAL expression, executed by a real SQL engine — a Python simulation of it would pass
+    # even with the folding deleted, and that mutant survived until this was changed.
+    conn = sqlite3.connect(":memory:")
+    got = conn.execute(
+        "SELECT " + svc._brand_identity_expr("?") + " LIKE ?", (brand, f"% {term} %")
+    ).fetchone()[0]
+    assert bool(got) is matches
