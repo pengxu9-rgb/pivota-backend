@@ -18,22 +18,61 @@ dropping the error_category label, turns a test below red.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import jobs.catalog_import_worker as worker
 from observability.reliability_metrics import catalog_import_task_total
 
 
+def _metrics_explicitly_disabled() -> bool:
+    return (os.getenv("PROMETHEUS_METRICS_ENABLED") or "true").strip().lower() != "true"
+
+
+# A MISSING COLLECTOR IS A FAILURE, NOT A SKIP.
+#
+# The first version of this file called pytest.skip() whenever the collector was
+# None. With PROMETHEUS_METRICS_ENABLED=false that skipped five of six tests —
+# the entire alertable-series claim — and still exited 0. Nothing would have
+# caught it: backend-test-sweep cannot fail on skips (it has 33 legitimate
+# env-gated ones) and guards with a 12,000-test floor instead, so losing five is
+# invisible.
+#
+# So the skip now honours ONLY an explicit opt-out. If metrics are supposed to be
+# on and the collector is absent — prometheus_client failed to import, or
+# _existing_collector returned None on the duplicate-registration branch — that
+# is a real defect in the thing under test and this file says so out loud.
+if catalog_import_task_total is None and not _metrics_explicitly_disabled():
+    raise AssertionError(
+        "catalog_import_task_total was not registered even though "
+        "PROMETHEUS_METRICS_ENABLED is not false — the counter this file exists "
+        "to cover does not exist"
+    )
+
+pytestmark = pytest.mark.skipif(
+    _metrics_explicitly_disabled(),
+    reason="PROMETHEUS_METRICS_ENABLED is explicitly false",
+)
+
+
 def _counter_value(connector: str, status: str, error_category: str) -> float:
-    """Read the live child series, or 0.0 when it has never been incremented."""
-    if catalog_import_task_total is None:  # pragma: no cover - metrics disabled
-        pytest.skip("prometheus metrics disabled in this environment")
-    try:
-        return catalog_import_task_total.labels(
-            connector=connector, status=status, error_category=error_category
-        )._value.get()
-    except Exception:  # pragma: no cover
-        return 0.0
+    """Read the live child series through the PUBLIC registry API.
+
+    `REGISTRY.get_sample_value` rather than the child's private `._value.get()`:
+    prometheus_client is unpinned in requirements.txt, and a rename of client
+    internals would surface as a confusing 0.0 rather than an error. It also
+    returns None (not an exception) for a series that has never been
+    incremented, so no bare `except` is needed — and a bare except here would
+    turn a wrong LABEL NAME into a silent 0.0 on both sides of the assertion.
+    """
+    from prometheus_client import REGISTRY
+
+    value = REGISTRY.get_sample_value(
+        "catalog_import_task_total",
+        {"connector": connector, "status": status, "error_category": error_category},
+    )
+    return 0.0 if value is None else float(value)
 
 
 @pytest.fixture
@@ -121,7 +160,10 @@ async def test_a_metrics_failure_never_breaks_the_import(monkeypatch, claimed):
     async def _record(task):
         return {"processed": True, "task_id": 7, "status": "succeeded", "counts": {}}
 
+    calls = []
+
     def _boom(**kwargs):
+        calls.append(kwargs)
         raise RuntimeError("collector exploded")
 
     monkeypatch.setattr(worker, "_process_import_task_record", _record)
@@ -131,6 +173,12 @@ async def test_a_metrics_failure_never_breaks_the_import(monkeypatch, claimed):
 
     result = await worker.process_import_task_by_id(7)
 
+    # Positive counterpart. Without it this test passes even if
+    # _record_import_outcome stops being called at all — the swallow would look
+    # load-bearing while covering nothing. It also pins that the function-body
+    # `from observability.reliability_metrics import ...` re-reads the module
+    # attribute, so this patch target is the one that actually resolves.
+    assert calls, "the recorder was never invoked; the swallow proves nothing"
     assert result["status"] == "succeeded"
 
 
