@@ -6783,6 +6783,32 @@ def _build_pivot_multi_shadow_diff_summary(
     }
 
 
+def _product_matches_brand_anchor(product: Dict[str, Any], anchor_terms: List[str]) -> bool:
+    """Does this row's IDENTITY carry every anchor term as a whole word?
+
+    Mirrors `_brand_identity_expr` in the recall SQL, and must keep mirroring it: three paths decide
+    the page — the recall admit branch, the +180 recall score, and this filter — and a guarantee
+    enforced in only some of them is not a guarantee. A raw substring test here kept exactly the
+    rows the SQL refuses: measured, `lush` kept "Blush Cosmetics" and "Plush Beauty" and `sigma`
+    kept "Four Sigmatic", each reported back as brand_anchor_matched: true.
+
+    Non-alphanumerics fold to spaces so a punctuated brand still matches its own token
+    ("La Roche-Posay", "Kiehl's Since 1851", "Murad, Inc.").
+    """
+    blob = " {} ".format(
+        re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            _strip_accents(
+                " ".join(
+                    str(product.get(key) or "").lower() for key in ("brand", "merchant_name")
+                )
+            ),
+        ).strip()
+    )
+    return all(f" {term} " in blob for term in anchor_terms)
+
+
 async def _resolve_brand_anchor_terms(query: str) -> tuple[list, str | None]:
     """Brand-anchor terms for the pivot lane, and where they came from.
 
@@ -7104,13 +7130,13 @@ async def _handle_find_products_multi_via_pivot(
     if products and brand_anchor_terms:
         anchored_products = []
         for product in products:
-            identity_blob = _strip_accents(
-                " ".join(
-                    str(product.get(key) or "").lower()
-                    for key in ("brand", "merchant_name")
-                )
-            )
-            if all(term in identity_blob for term in brand_anchor_terms):
+            # Word-boundary, matching the recall SQL. A raw substring test here kept the rows
+            # the SQL refuses: measured, `lush` KEPT "Blush Cosmetics" and "Plush Beauty" and
+            # `sigma` KEPT "Four Sigmatic", each reported as brand_anchor_matched: true. Three
+            # paths decide this page — the admit branch, the +180 score, and this filter — and a
+            # guarantee enforced in one of them is not a guarantee. Punctuation is folded to
+            # spaces so "La Roche-Posay" and "Kiehl's" still match their own token.
+            if _product_matches_brand_anchor(product, brand_anchor_terms):
                 anchored_products.append(product)
         if anchored_products:
             products = anchored_products

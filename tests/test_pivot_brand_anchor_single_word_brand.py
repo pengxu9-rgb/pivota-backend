@@ -205,3 +205,28 @@ async def test_a_span_that_is_itself_a_category_never_anchors(real_detector):
     assert await gw._resolve_brand_anchor_terms("essence toner") == ([], None)
     # ...while a real brand with a category term still anchors.
     assert await gw._resolve_brand_anchor_terms("murad cleanser") == (["murad"], "catalog")
+
+
+# The gateway post-filter is the THIRD path that decides the page, alongside the recall admit
+# branch and the +180 score. A review measured all three and only one was word-delimited: a raw
+# substring test here KEPT the rows the SQL refuses — `lush` kept "Blush Cosmetics" and "Plush
+# Beauty", `sigma` kept "Four Sigmatic" — each reported as brand_anchor_matched: true.
+
+
+@pytest.mark.parametrize(
+    "brand,term,kept",
+    [
+        ("LUSH", "lush", True),
+        ("Blush Cosmetics", "lush", False),
+        ("Plush Beauty", "lush", False),
+        ("Four Sigmatic", "sigma", False),
+        ("Sigma Beauty", "sigma", True),
+        ("La Roche-Posay", "roche", True),   # separators fold, so a punctuated brand still matches
+        ("Kiehl's Since 1851", "kiehl", True),
+        ("Murad, Inc.", "murad", True),
+    ],
+)
+def test_the_post_filter_matches_on_WORD_boundaries(brand, term, kept):
+    """Mirrors `_brand_identity_expr` in the recall SQL. The two must agree or the page is decided
+    by whichever ran last."""
+    assert gw._product_matches_brand_anchor({"brand": brand}, [term]) is kept

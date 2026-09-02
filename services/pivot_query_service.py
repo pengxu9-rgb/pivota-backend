@@ -225,6 +225,39 @@ _CATEGORY_REFINEMENT_TERMS = frozenset(
 )
 
 
+# Word-boundary identity matching for brand anchors.
+#
+# Padding a field with spaces turns a plain LIKE into a word-delimited match: " murad " matches
+# "Murad" and "Murad Skin Care" but " lush " does not match " blush ". That is what makes an anchor
+# safe to ADMIT rows on rather than merely re-rank them.
+#
+# But padding alone only finds boundaries made of SPACES, and real brand strings separate tokens
+# with punctuation: "Murad, Inc.", "La Roche-Posay", "Kiehl's Since 1851". Measured against the raw
+# padded expression, each failed to match its own brand token. So separators are folded to spaces.
+#
+# Nested replace(), not translate(): translate() is Postgres-only and this suite runs the same SQL
+# against SQLite, where it is a syntax error. Not hypothetical — the first cut used translate() and
+# took an existing recall test down with `sqlite3.OperationalError: near "/"`, because the
+# punctuation set also contained an apostrophe that closed the SQL string literal. Keep this list
+# short: each entry is one more replace() per column per term, in a statement already spanning a
+# three-table join.
+#
+# Accents are deliberately NOT folded here. Anchor terms arrive accent-stripped so an accented brand
+# column cannot match — a real gap, but a PRE-EXISTING one (before this branch nothing was admitted
+# by brand at all), and closing it in SQL costs ~25 more replaces per column. It belongs in a
+# normalized column, not in the hot query.
+_BRAND_IDENTITY_SEPARATORS = (".", ",", "-", "'", "+", "/", "&", "(", ")")
+
+
+def _brand_identity_expr(column: str) -> str:
+    """`column`, lowered, separator-folded and space-padded for word-delimited LIKE matching."""
+    expr = "LOWER(COALESCE(" + column + ", ''))"
+    for sep in _BRAND_IDENTITY_SEPARATORS:
+        literal = "''''" if sep == "'" else "'" + sep + "'"
+        expr = "replace(" + expr + ", " + literal + ", ' ')"
+    return "(' ' || " + expr + " || ' ')"
+
+
 # Bounds for a caller-supplied brand anchor. See _fetch_canonical_search_rows for why.
 _BRAND_ANCHOR_TERM_MAX_COUNT = 8
 _BRAND_ANCHOR_TERM_MAX_LEN = 64
@@ -1121,20 +1154,23 @@ async def _fetch_canonical_search_rows(
         # MULTI-token anchors keep the title clause. They are ANDed, so "%knight% AND %unicorn%" is
         # enormously more selective, and the title is where a two-word brand survives a missing
         # `brand` column. That path is unchanged.
-        anchor_fields = ["p.brand", "m.merchant_name"]
-        if len(brand_anchor_terms) > 1:
-            anchor_fields.append("p.title")
+        # Word-boundary on the identity fields here too. A review measured all three deciding
+        # paths and only the admit branch was padded: `%lush%` still scored "Blush Cosmetics" and
+        # "Plush Beauty" at +180, tying real LUSH rows so `updated_at` broke the tie arbitrarily.
+        # A guarantee enforced in one of three places is not a guarantee.
         anchor_matches = []
         for anchor_index, anchor_term in enumerate(brand_anchor_terms):
             param_name = f"brand_anchor_{anchor_index}"
-            params[param_name] = f"%{anchor_term}%"
-            anchor_matches.append(
-                "("
-                + " OR ".join(
-                    f"LOWER(COALESCE({field}, '')) LIKE :{param_name}" for field in anchor_fields
-                )
-                + ")"
-            )
+            params[param_name] = f"% {anchor_term} %"
+            field_matches = [
+                f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                for field in ("p.brand", "m.merchant_name")
+            ]
+            if len(brand_anchor_terms) > 1:
+                # Multi-token anchors keep the title: ANDed terms are far more selective, and the
+                # title is where a two-word brand survives a missing `brand` column.
+                field_matches.append(f"{_brand_identity_expr('p.title')} LIKE :{param_name}")
+            anchor_matches.append("(" + " OR ".join(field_matches) + ")")
         anchor_expression = " AND ".join(anchor_matches)
         brand_anchor_score = (
             "\n                    + CASE WHEN ("
@@ -1167,13 +1203,32 @@ async def _fetch_canonical_search_rows(
             padded_matches.append(
                 "("
                 + " OR ".join(
-                    f"(' ' || LOWER(COALESCE({field}, '')) || ' ') LIKE :{param_name}"
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
                     for field in ("p.brand", "m.merchant_name")
                 )
                 + ")"
             )
+        admit_predicate = " AND ".join(padded_matches)
+        # THE ADMIT BRANCH MUST STAY RELEVANT TO THE QUERY.
+        #
+        # Unconditional, it admits EVERY row of the anchored brand, and the +180 anchor score beats
+        # the +90 category-path score — so the brand's off-category rows outrank other brands'
+        # on-category rows by 90 points, always. A review measured it on a Postgres fixture for
+        # "murad cleanser" (500 Murad products, 15 of them cleansers, against 3000 other cleansers):
+        # 65 of the 80 candidate slots flipped from cleansers to Murad NON-cleansers. With realistic
+        # offer sparsity the served page collapsed from 65 relevant rows to 3 irrelevant ones,
+        # because the offer join runs OUTSIDE this CTE's LIMIT — the slots were already spent.
+        #
+        # So when the query names a category, the brand's rows must satisfy it too. A brand-only
+        # query ("show me Murad products") has no category prefix and still admits the whole brand,
+        # which is exactly what that query asked for.
+        if category_where:
+            admit_predicate = (
+                "(" + admit_predicate + ")"
+                + " AND (p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix)"
+            )
         brand_anchor_where = (
-            "\n                OR (" + " AND ".join(padded_matches) + ")\n"
+            "\n                OR (" + admit_predicate + ")\n"
         )
 
     # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
