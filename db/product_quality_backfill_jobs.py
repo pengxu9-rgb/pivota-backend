@@ -273,10 +273,14 @@ async def claim_next_quality_backfill_job() -> Optional[Dict[str, Any]]:
 # there; it is only reachable on a model-first database, and it is another reason
 # to close the drift above rather than live with it.
 
-# `RETURNING job_id` on both requeue variants is NOT decoration: it is the only
-# way this statement can report how many rows it moved. See
-# `requeue_stale_quality_backfill_jobs` below — dropping it makes the helper
-# return 0 on Postgres while still doing the work.
+# `RETURNING job_id` on both requeue variants is NOT decoration: it is what lets
+# the helper below count the rows it moved, uniformly on both engines. Dropping
+# it makes the helper return 0 on Postgres while still doing the work — the
+# asyncpg backend's `execute` is `fetchval`, which yields None for an UPDATE
+# with nothing to return. (The SQLite backend answers correctly either way: it
+# reads `cursor.lastrowid`, which is 0 on the fresh connection `databases`
+# acquires per statement, and falls back to `rowcount`. Verified, because a
+# review claimed the opposite.)
 _REQUEUE_STALE_SQL = """
     UPDATE product_quality_backfill_jobs
     SET status = 'queued',
@@ -405,6 +409,7 @@ async def requeue_stale_quality_backfill_jobs(
     SQLite and 0 on Postgres however many rows it moved: the asyncpg backend
     yields no rowcount for an UPDATE without a RETURNING clause. The requeue
     itself was always correct — only the number was wrong, and the number is
+<<<<<<< HEAD
     the only thing anyone reads. `jobs/product_quality_backfill_worker.py`
     gates its "Requeued %s stale quality backfill job(s)" warning on it, so a
     stale-job requeue was silent in production and loud in the SQLite suite.
@@ -441,6 +446,17 @@ async def requeue_stale_quality_backfill_jobs(
     `started_at` against the same clock that WROTE it (`claim_quality_backfill
     _job` sets `started_at = COALESCE(started_at, CURRENT_TIMESTAMP)`), which
     the old form did not: it measured a server timestamp against a client one.
+=======
+    the only thing anyone reads: `jobs/product_quality_backfill_worker.py` gates
+    its "Requeued %s stale quality backfill job(s)" warning on it, so a falsy
+    count does not misreport the requeue, it deletes the log line.
+
+    BE PRECISE ABOUT THE BLAST RADIUS. That warning does not fire in production
+    today for a simpler reason — `start_product_quality_backfill_loop` has no
+    callers anywhere, so this function only runs from tests and from a manual
+    invocation of that job module. The count being wrong is what would greet
+    whoever revives the loop, not something production is losing now.
+>>>>>>> claude/requeue-rowcount-postgres
     """
     await ensure_product_quality_backfill_jobs_table()
     seconds = max(30, stale_after_seconds)

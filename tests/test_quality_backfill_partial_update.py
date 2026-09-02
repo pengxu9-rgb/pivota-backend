@@ -37,6 +37,7 @@ sweep `--ignore-glob`s that pattern, which trades the gap for the opposite gap.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -75,11 +76,12 @@ async def _db():
 @asynccontextmanager
 async def _columns_declared_timestamptz():
     """Run the body with the three `*_at` columns declared TIMESTAMPTZ, then put
-    the declaration back exactly as it was found.
+    the declaration back exactly as it was found. POSTGRES ONLY — every caller is
+    `skipif(not IS_POSTGRES)`, and SQLite has no such distinction to make.
 
     WHY THIS IS NEEDED AT ALL, AND WHY IT IS SCOPED. The deployed table does NOT
-    have these columns as TIMESTAMPTZ. `main.py` runs `metadata.create_all`
-    (line 1857) BEFORE `run_sql_migrations` (line 1880), and this module is in
+    have these columns as TIMESTAMPTZ. `main.py` runs its final
+    `metadata.create_all` BEFORE `run_sql_migrations`, and this module is in
     metadata by then — routes/merchant_products.py imports it at module scope —
     so create_all builds the table from the bare `DateTime` Column as naive
     `timestamp`, and migration 054's `CREATE TABLE IF NOT EXISTS` is a dead
@@ -106,10 +108,6 @@ async def _columns_declared_timestamptz():
     out so no other case, in this file or a later one, is measured against a
     schema production does not have.
     """
-    if not IS_POSTGRES:
-        yield
-        return
-
     def _types():
         return database.fetch_all(
             "SELECT column_name, data_type FROM information_schema.columns "
@@ -118,6 +116,13 @@ async def _columns_declared_timestamptz():
         )
 
     before = {dict(r)["column_name"]: dict(r)["data_type"] for r in await _types()}
+    # An empty read means the table is not there — `ensure_...` swallows every
+    # exception — and an empty restore clause would be a syntax error masking
+    # that. Fail on the real cause instead.
+    assert set(before) == {"requested_at", "started_at", "finished_at"}, (
+        f"expected three timestamp columns to switch, found {before}"
+    )
+
     await database.execute(
         "ALTER TABLE product_quality_backfill_jobs "
         "ALTER COLUMN requested_at TYPE TIMESTAMPTZ, "
@@ -129,10 +134,19 @@ async def _columns_declared_timestamptz():
         assert set(now.values()) == {"timestamp with time zone"}, now
         yield
     finally:
+        # A failure to restore must not REPLACE the body's failure: an exception
+        # raised in the finally of a generator context manager supersedes the one
+        # in flight, so a real assertion error would surface as an ALTER error.
+        # Re-raise only when nothing is already propagating.
+        failing = sys.exc_info()[0] is not None
         restore = ", ".join(
             f"ALTER COLUMN {column} TYPE {kind.upper()}" for column, kind in sorted(before.items())
         )
-        await database.execute(f"ALTER TABLE product_quality_backfill_jobs {restore}")
+        try:
+            await database.execute(f"ALTER TABLE product_quality_backfill_jobs {restore}")
+        except Exception:
+            if not failing:
+                raise
 
 
 async def _reset() -> None:
@@ -418,15 +432,20 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
     worker loop is dormant (nothing imports it), which is why this is an
     observability bug rather than an outage.
 
-    THE EXPECTED COUNT IS READ OUT OF THE TABLE, NOT ASSUMED TO BE 2. The
-    statement is table-wide — there is no merchant filter — and the shared
-    Postgres database this job runs against can carry stale `running` rows from
-    other files and from earlier runs. The eligibility query below is the
-    statement's own WHERE clause, evaluated with the same cutoff, so the two
-    agree by construction whatever else is in the table.
+    THE EXPECTED COUNT IS READ OUT OF THE TABLE, NOT ASSUMED TO BE 2, because
+    the statement is table-wide — there is no merchant filter, so it counts and
+    moves every eligible row, not just this file's. Today that is only this
+    file's rows: every other suite touching this table monkeypatches the
+    repository functions and writes none. The eligibility query below is the
+    statement's own WHERE clause with the same cutoff, so the two agree by
+    construction if that ever stops being true.
+
+    Note what is NOT asserted: that a second call returns 0. It would, but it
+    would also have returned 0 from the BROKEN helper on both engines, so it
+    discriminates nothing — the kind of assertion this file exists to avoid.
 
     A FRESHLY CLAIMED JOB BEING SPARED is a different claim, pinned by
-    test_a_non_utc_session_timezone_does_not_make_every_running_job_stale below
+    test_a_non_utc_process_timezone_does_not_make_every_running_job_stale below
     — it used to be false on any non-UTC server and could not be asserted here.
     """
     stale_ids = [await _new_job(), await _new_job()]
@@ -474,11 +493,6 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
         assert (await get_quality_backfill_job(job_id))["status"] == "queued", (
             "the count must be the count of rows this call actually moved"
         )
-
-    # Nothing is stale any more, so the answer must fall to 0 rather than stay
-    # at whatever the previous call returned. Pins the count to the ROWS, not to
-    # a constant that happens to match above.
-    assert await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5) == 0
 
 
 @pytest.mark.skipif(
@@ -553,9 +567,9 @@ async def test_the_staleness_window_is_measured_in_seconds_against_the_server_cl
     straddles the boundary, in both dialects, with both rows backdated by the
     SERVER so no client clock enters the comparison.
     """
-    stale_id = await _new_job()      # 120s old, asked for 60s  -> must move
-    recent_id = await _new_job()     #  45s old, asked for 600s -> must NOT move
-    for job_id, age in ((stale_id, 120), (recent_id, 45)):
+    stale_id = await _new_job()      # 1h old,  asked for 300s -> must move
+    recent_id = await _new_job()     # 45s old, asked for 300s -> must NOT move
+    for job_id, age in ((stale_id, 3600), (recent_id, 45)):
         await claim_quality_backfill_job(job_id)
         if IS_POSTGRES:
             await database.execute(
@@ -570,19 +584,17 @@ async def test_the_staleness_window_is_measured_in_seconds_against_the_server_cl
                 {"age": f"-{age} seconds", "j": job_id},
             )
 
-    # A limit big enough that neither row can be spared by the LIMIT instead of
-    # by the predicate — that would pass for the wrong reason.
-    await requeue_stale_quality_backfill_jobs(stale_after_seconds=60, limit=1000)
+    # Both margins are minutes wide, so a slow run cannot flip either verdict:
+    # 3600s against a 300s window, and 45s against the same 300s window. `limit`
+    # only has to exceed the eligible rows so that nothing is spared by the
+    # LIMIT instead of by the predicate — which would pass for the wrong reason.
+    await requeue_stale_quality_backfill_jobs(stale_after_seconds=300, limit=5)
     assert (await get_quality_backfill_job(stale_id))["status"] == "queued", (
-        "a job running for 120s was not stale at a 60s window — the interval is "
-        "not being measured in seconds"
+        "a job running for an hour was not stale at a 300s window — the interval "
+        "is not being measured in seconds"
     )
-    assert (await get_quality_backfill_job(recent_id))["status"] == "running"
-
-    # The floor is max(30, stale_after_seconds), so 600 is honoured as given.
-    await requeue_stale_quality_backfill_jobs(stale_after_seconds=600, limit=1000)
     assert (await get_quality_backfill_job(recent_id))["status"] == "running", (
-        "a job running for 45s was stale at a 600s window — the window is too "
+        "a job running for 45s was stale at a 300s window — the window is too "
         "short, or the comparison runs the wrong way"
     )
 

@@ -254,7 +254,13 @@ jobs:
           # fix: backend-test-sweep --ignore-glob's that pattern, so it would swap
           # the Postgres gap for a SQLite one, and the split needs BOTH sides.
           # Checked SQLite-safe under this job's Postgres URL, against a jsonb
-          # column and a model-first json one, and it declares no skips.
+          # column and a model-first json one. It DOES declare two skips
+          # (`skipif(not IS_POSTGRES)`, for cases about asyncpg's datetime
+          # encoding), but they are inert here because IS_POSTGRES is true — the
+          # preflight asserts that — so the zero-skip check below still holds.
+          # KEEP THIS ENTRY LAST: one of those cases ALTERs the timestamp
+          # columns of product_quality_backfill_jobs and restores them, and a
+          # ride-along added after it would run while that is in flight.
           for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_partial_update.py; do
             [ -e "$f" ] && files="$files $f"
           done
