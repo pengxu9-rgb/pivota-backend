@@ -1987,7 +1987,10 @@ async def claim_next_pending_verification(
              SELECT verify_id
                FROM verification_runs
               WHERE status IN ('pending', 'claimed')
-                AND (:verifier_id IS NULL OR verifier_id = :verifier_id)
+                AND (
+                    CAST(:verifier_id AS text) IS NULL
+                 OR verifier_id = CAST(:verifier_id AS text)
+                )
                 AND (
                     :exclude_remote_verifiers IS FALSE
                     OR verifier_id NOT IN ('ucp_probe', 'commerce_checkout_probe')
