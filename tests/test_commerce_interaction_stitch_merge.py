@@ -24,7 +24,7 @@ async def test_merge_rejects_cross_store_candidates_before_mutation():
                 {
                     "interaction_id": "int_b",
                     "merchant_id": "merchant_a",
-                    "store_id": "store_b",
+                    "store_id": None,
                 },
             ],
             {
@@ -143,5 +143,25 @@ async def test_bridge_event_atomically_merges_interactions_and_preserves_events(
         }
         assert len(await test_database.fetch_all(select(commerce_interactions))) == 1
         assert len(await test_database.fetch_all(select(commerce_interaction_events))) == 3
+
+        with pytest.raises(Exception) as cross_store_error:
+            await service.ensure_interaction(
+                interaction_id=bridge_result["interaction_id"],
+                merchant_id="merchant_a",
+                platform="shopify",
+                store_id="store_b",
+                latest_event_type="order.paid",
+            )
+        assert service._is_unique_violation(cross_store_error.value)
+        unchanged = dict(
+            await test_database.fetch_one(
+                select(commerce_interactions).where(
+                    commerce_interactions.c.interaction_id
+                    == bridge_result["interaction_id"]
+                )
+            )
+        )
+        assert unchanged["store_id"] == "store_a"
+        assert len(await test_database.fetch_all(select(commerce_interactions))) == 1
     finally:
         await test_database.disconnect()

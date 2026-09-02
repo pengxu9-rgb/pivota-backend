@@ -118,6 +118,7 @@ _INTERACTION_LOOKUP_KEYS = (
 )
 
 _STORE_SCOPED_LOOKUP_KEYS = {
+    "interaction_id",
     "click_id",
     "session_id",
     "cart_id",
@@ -128,6 +129,8 @@ _STORE_SCOPED_LOOKUP_KEYS = {
     "refund_id",
     "return_id",
 }
+
+_WEAK_INTERACTION_LOOKUP_KEYS = {"session_id", "cart_id", "payment_id"}
 
 
 def _interaction_lookup_conditions(
@@ -187,17 +190,21 @@ async def _lookup_matching_interactions(
         key_candidates = [row for row in candidates if row.get(key) == value]
         if not key_candidates:
             continue
-        # A non-unique weak key (session/cart/payment) must not fan out and
-        # collapse every interaction that shares it. Prefer an interaction
-        # already selected by a stronger key, otherwise choose one stable row.
-        selected = next(
+        already_selected = next(
             (
                 row
                 for row in key_candidates
                 if str(row.get("interaction_id") or "") in matched_ids
             ),
-            key_candidates[0],
+            None,
         )
+        # A non-unique weak key (session/cart/payment) must not fan out and
+        # collapse every interaction that shares it. Prefer an interaction
+        # already selected by a stronger key. Once a strong match exists, a
+        # weak key can confirm it but can never nominate a loser for deletion.
+        if key in _WEAK_INTERACTION_LOOKUP_KEYS and matches and not already_selected:
+            continue
+        selected = already_selected or key_candidates[0]
         interaction_id = str(selected.get("interaction_id") or "")
         if interaction_id and interaction_id not in matched_ids:
             matched_ids.add(interaction_id)
@@ -417,14 +424,7 @@ async def _merge_interactions(
     winner_id = str(winner["interaction_id"])
     loser_ids = [str(row["interaction_id"]) for row in matches[1:]]
     target_store_id = _normalize_text(values.get("store_id"))
-    conflicting_store_ids = {
-        _normalize_text(row.get("store_id"))
-        for row in matches
-        if _normalize_text(row.get("store_id"))
-        and target_store_id
-        and _normalize_text(row.get("store_id")) != target_store_id
-    }
-    if conflicting_store_ids:
+    if any(_normalize_text(row.get("store_id")) != target_store_id for row in matches):
         raise ValueError("cannot merge commerce interactions across stores")
     merged_values = _merged_interaction_values(matches, values)
     merged_values["interaction_id"] = winner_id
@@ -471,28 +471,57 @@ async def _event_write_lock(
     if not IS_POSTGRES:
         yield
         return
-    async with database.transaction():
-        if key:
-            await database.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-                {"lock_key": f"event|{merchant_id}|{event_type}|{key}"},
-            )
-        matches = await _lookup_matching_interactions(refs)
-        interaction_ids = {
-            str(match["interaction_id"])
-            for match in matches
-            if match.get("interaction_id")
-        }
-        if not interaction_ids:
-            interaction_ids.add(refs.get("interaction_id") or _fallback_interaction_id(refs))
-        # Globally stable lock order prevents two bridge events from taking the
-        # same pair of interactions in opposite order.
-        for interaction_id in sorted(interaction_ids):
-            await database.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-                {"lock_key": f"interaction|{merchant_id}|{interaction_id}"},
-            )
-        yield
+    store_scope = refs.get("store_id") or ""
+    stitch_lock_keys = sorted(
+        f"stitch|{merchant_id}|{store_scope}|{ref_name}|{refs[ref_name]}"
+        for ref_name in _INTERACTION_LOOKUP_KEYS
+        if refs.get(ref_name)
+    )
+    for _attempt in range(3):
+        retry = False
+        async with database.transaction():
+            if key:
+                await database.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                    {"lock_key": f"event|{merchant_id}|{event_type}|{key}"},
+                )
+            # These locks are independent of mutable database state, so a
+            # waiter cannot resolve a loser before a concurrent merge commits.
+            for stitch_lock_key in stitch_lock_keys:
+                await database.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                    {"lock_key": stitch_lock_key},
+                )
+
+            matches = await _lookup_matching_interactions(refs)
+            interaction_ids = {
+                str(match["interaction_id"])
+                for match in matches
+                if match.get("interaction_id")
+            }
+            if not interaction_ids:
+                interaction_ids.add(refs.get("interaction_id") or _fallback_interaction_id(refs))
+            # Globally stable lock order prevents bridge events from taking the
+            # same pair of interactions in opposite order.
+            for interaction_id in sorted(interaction_ids):
+                await database.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+                    {"lock_key": f"interaction|{merchant_id}|{interaction_id}"},
+                )
+
+            refreshed_matches = await _lookup_matching_interactions(refs)
+            refreshed_ids = {
+                str(match["interaction_id"])
+                for match in refreshed_matches
+                if match.get("interaction_id")
+            }
+            if refreshed_ids.issubset(interaction_ids):
+                yield
+                return
+            retry = True
+        if retry:
+            continue
+    raise RuntimeError("commerce interaction locks did not stabilize")
 
 
 async def ensure_interaction(
