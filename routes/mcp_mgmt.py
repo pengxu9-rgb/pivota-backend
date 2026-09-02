@@ -213,7 +213,7 @@ async def get_mcp_merchants(
             FROM merchant_onboarding m
             LEFT JOIN merchant_stores s ON m.merchant_id = s.merchant_id
             WHERE m.status = 'active'
-            GROUP BY m.merchant_id, m.business_name, m.email, m.status
+            GROUP BY m.merchant_id, m.business_name, m.contact_email, m.status
             ORDER BY m.business_name
         """
 

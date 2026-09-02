@@ -53,7 +53,7 @@ async def get_sync_statistics(
                 platform,
                 COUNT(*) as connected_stores,
                 COUNT(CASE WHEN status = 'active' THEN 1 END) as active_stores,
-                AVG(EXTRACT(EPOCH FROM (NOW() - last_sync_at))) as avg_time_since_sync
+                AVG(EXTRACT(EPOCH FROM (NOW() - last_sync))) as avg_time_since_sync
             FROM merchant_stores
             GROUP BY platform
         """
@@ -165,7 +165,7 @@ async def sync_health_check():
             SELECT COUNT(DISTINCT merchant_id) as stale_merchants
             FROM merchant_stores
             WHERE status = 'active' 
-                AND (last_sync_at IS NULL OR last_sync_at < NOW() - INTERVAL '24 hours')
+                AND (last_sync IS NULL OR last_sync < NOW() - INTERVAL '24 hours')
         """
         stale_result = await database.fetch_one(stale_check)
         
