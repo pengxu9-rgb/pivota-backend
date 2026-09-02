@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, get_args
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -68,6 +68,7 @@ from services.similarity_service import (
     similarity_service,
 )
 from services.similarity_config import get_similarity_scoring_weights
+from routes.agent_auth import AgentContext, get_agent_context
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -8320,6 +8321,150 @@ def _external_seed_to_shop_product(
     if ingredient_ids:
         product["ingredient_ids"] = list(ingredient_ids)
     return product
+
+
+class ExternalSeedLinkCandidate(BaseModel):
+    """One card the gateway built itself and wants attributed. Field names are the seed row's."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    external_seed_id: str = Field(min_length=1, max_length=128)
+    destination_url: str = Field(min_length=1, max_length=2048)
+    external_product_id: Optional[str] = Field(default=None, max_length=256)
+    canonical_url: Optional[str] = Field(default=None, max_length=2048)
+    market: Optional[str] = Field(default=None, max_length=16)
+    tool: Optional[str] = Field(default=None, max_length=64)
+    utm_template: Optional[str] = Field(default=None, max_length=512)
+    domain: Optional[str] = Field(default=None, max_length=256)
+    attached_product_key: Optional[str] = Field(default=None, max_length=512)
+    attached_variant_id: Optional[str] = Field(default=None, max_length=128)
+    seller_ref: Optional[str] = Field(default=None, max_length=256)
+    seed_kind: Optional[str] = Field(default=None, max_length=64)
+    variant_id: Optional[str] = Field(default=None, max_length=128)
+
+
+EXTERNAL_SEED_LINKS_MAX_CANDIDATES = 50
+
+
+class ExternalSeedLinksRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    market: Optional[str] = Field(default=None, max_length=16)
+    tool: Optional[str] = Field(default=None, max_length=64)
+    candidates: List[ExternalSeedLinkCandidate] = Field(
+        min_length=1, max_length=EXTERNAL_SEED_LINKS_MAX_CANDIDATES
+    )
+
+
+async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, Any]:
+    """Mint the attributed links for seed cards the GATEWAY built itself.
+
+    WHY THIS EXISTS. The gateway's search stack builds external-seed cards in JS straight from
+    Postgres, and those cards reach agents (find_products_multi, MCP search_catalog) with a raw
+    merchant URL and no `/r` link at all — the one lane the readiness audit flagged that the card
+    builders here could not reach, because those cards never pass through this backend. The
+    gateway holds no redirect signing secret, on purpose (the safety kernel's result sanitizer
+    documents that this backend stamps those links), so it asks here.
+
+    SAME MINT, SAME STAMP. This is `_build_prefetched_external_seed_wrappers`' mint block behind a
+    route: `_external_seed_redirect_identity` → `_make_external_redirect_url` (market allowlist,
+    Shopify cart join when the identity justifies one) → `_seed_attribution_from_redirect`, so a
+    gateway-built card ends up byte-for-byte as attributed as one we built. Nothing in it is
+    caller-specific — the gateway caches search results across callers, and a per-buyer link
+    would leak one buyer's id into another buyer's result.
+
+    A candidate we cannot mint (domain not allowlisted, unusable URL) is simply absent from
+    `links`: the gateway keeps that card's raw URL, which is exactly what it had before.
+    """
+    default_market = str(body.market or "US").strip().upper() or "US"
+    default_tool = str(body.tool or "*").strip() or "*"
+    links: List[Dict[str, Any]] = []
+    redirect_cache: Dict[str, Optional[str]] = {}
+    for candidate in body.candidates:
+        # No scheme check here on purpose: `_make_external_redirect_url` refuses anything that is
+        # not http(s) and answers None, which is the one path an unusable URL takes below. A
+        # second check here could not be told apart from it by any test — mutated out, it
+        # survived — so it would be a guard that reads as protection while proving nothing.
+        destination_url = str(candidate.destination_url or "").strip()
+        market = str(candidate.market or default_market).strip().upper() or default_market
+        tool = str(candidate.tool or default_tool).strip() or default_tool
+        row = candidate.model_dump()
+        redirect_identity = _external_seed_redirect_identity(
+            row=row, seed_data={}, offer_variant_id=candidate.variant_id
+        )
+        cache_key = "||".join([
+            market, tool, destination_url, str(candidate.utm_template or ""),
+            str(redirect_identity.get("seller_ref") or ""),
+            str(redirect_identity.get("seed_kind") or ""),
+            str(redirect_identity.get("cart_variant_id") or ""),
+        ])
+        if cache_key in redirect_cache:
+            redirect_url = redirect_cache[cache_key]
+        else:
+            redirect_url = await _make_external_redirect_url(
+                market=market,
+                tool=tool,
+                destination_url=destination_url,
+                utm_template=candidate.utm_template,
+                ctx={"seedId": candidate.external_seed_id, "source": "external_seed_links"},
+                allowed_domains=None,
+                merchant_id=redirect_identity["merchant_id"],
+                product_id=redirect_identity["product_id"],
+                variant_id=redirect_identity["variant_id"],
+                cart_variant_id=redirect_identity.get("cart_variant_id"),
+                shop_domain=redirect_identity["shop_domain"],
+                platform=redirect_identity["platform"],
+                seller_ref=redirect_identity["seller_ref"],
+                seed_kind=redirect_identity["seed_kind"],
+            )
+            redirect_cache[cache_key] = redirect_url
+        if not redirect_url:
+            continue
+        attribution = _seed_attribution_from_redirect(
+            redirect_url,
+            destination_url=destination_url,
+            utm_template=candidate.utm_template,
+            market=market,
+            tool=tool,
+            shop_domain=redirect_identity.get("shop_domain"),
+            platform=redirect_identity.get("platform"),
+            cart_variant_id=redirect_identity.get("cart_variant_id"),
+        )
+        if not attribution:
+            # We minted a link but could not confirm the URL we would publish is the one it
+            # signs — the same refusal the card builders make. The link alone is still honest.
+            links.append(
+                {
+                    "external_seed_id": candidate.external_seed_id,
+                    "external_product_id": candidate.external_product_id,
+                    "external_redirect_url": redirect_url,
+                    "destination_url": None,
+                    "cart_url": None,
+                    "tracking": None,
+                }
+            )
+            continue
+        links.append(
+            {
+                "external_seed_id": candidate.external_seed_id,
+                "external_product_id": candidate.external_product_id,
+                "external_redirect_url": redirect_url,
+                "destination_url": attribution.get("destination_url"),
+                "cart_url": attribution.get("cart_url"),
+                "tracking": attribution["tracking"],
+            }
+        )
+    return {"links": links}
+
+
+@router.post("/attribution/external-seed-links")
+async def external_seed_links_endpoint(
+    body: ExternalSeedLinksRequest,
+    _context: AgentContext = Depends(get_agent_context),
+) -> Dict[str, Any]:
+    """Credentialed only: the gateway calls this with its internal key. Anonymous callers get
+    the same 401 every other agent route gives them — a mint is not a public read."""
+    return await mint_external_seed_links(body)
 
 
 def _normalize_prefetched_external_seed_candidates(
