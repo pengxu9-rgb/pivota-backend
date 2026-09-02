@@ -42,8 +42,10 @@ Job registration happens at start-up time. Currently registers:
 - `catalog_import_drain_tick` — every 30 seconds, claims and runs one ready
   Shopify row from platform_import_tasks (merchant "Sync products"). Paired with
   `catalog_import_stale_reaper` every 5 minutes, which returns `running` rows
-  abandoned by a revision swap to the queue. Both are ON by default;
-  CATALOG_IMPORT_DRAIN_ENABLED=false is the kill switch.
+  abandoned by a revision swap to the queue. The drain is ON by default;
+  CATALOG_IMPORT_DRAIN_ENABLED=false stops it (scheduler lane only — the Sync
+  endpoint's BackgroundTask does not consult it). The reaper is NOT gated on
+  that flag, so pulling the switch mid-run does not strand the in-flight row.
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
@@ -957,6 +959,7 @@ async def start_scheduler() -> None:
         # Scoped to source_type='connector'/connector='shopify'; the table's
         # amazon_orders / orders_report / report rows are out of the lane.
         from jobs.catalog_import_worker import (
+            _catalog_import_drain_enabled,
             run_catalog_import_drain_tick,
             run_catalog_import_stale_reaper_tick,
         )
@@ -1129,7 +1132,15 @@ async def start_scheduler() -> None:
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
             "+ merchant_order_sync_worker_tick (30s, ACTIVE) "
             "+ merchant_order_sync_lease_reaper (60s, ACTIVE) "
-            "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP)"
+            "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP) "
+            # Both listed so a mistyped kill switch is not indistinguishable from
+            # a working one: the drain resolves its flag per-run and returns
+            # {"reason": "disabled"} silently, so this line is the one place an
+            # operator can see what posture the process booted with.
+            "+ catalog_import_drain_tick (30s, ON by default; kill switch "
+            "CATALOG_IMPORT_DRAIN_ENABLED=false — resolved now as %s) "
+            "+ catalog_import_stale_reaper (5min, ACTIVE, not flag-gated)",
+            "ON" if _catalog_import_drain_enabled() else "OFF",
         )
     except Exception as exc:  # noqa: BLE001
         _BOOT_ERROR = repr(exc)

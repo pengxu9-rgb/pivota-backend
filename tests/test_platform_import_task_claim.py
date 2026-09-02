@@ -256,9 +256,14 @@ async def test_the_drain_is_on_by_default(monkeypatch):
 
 
 @pytest.mark.parametrize("value", ["0", "false", "no", "off", "False", " off "])
-async def test_the_kill_switch_stops_both_ticks(monkeypatch, value):
-    """The env var is a kill switch, so every disabling spelling must work —
-    an operator reaching for it mid-incident should not have to guess."""
+async def test_the_kill_switch_stops_the_drain_but_not_the_reaper(monkeypatch, value):
+    """Every disabling spelling must stop the DRAIN — an operator reaching for
+    it mid-incident should not have to guess. And the REAPER must keep running
+    regardless: on Cloud Run, pulling the switch is a restart that abandons the
+    in-flight import into `running`, and the reaper is the only thing that
+    recovers it. An earlier version gated both on the same flag, which meant
+    the act of stopping the drain stranded the row it was in the middle of.
+    """
     import jobs.catalog_import_worker as worker
 
     async def _record(task):  # pragma: no cover - must not run
@@ -268,16 +273,17 @@ async def test_the_kill_switch_stops_both_ticks(monkeypatch, value):
     monkeypatch.setenv("CATALOG_IMPORT_DRAIN_ENABLED", value)
 
     await _insert()
-    await _insert(status="running", updated_at=datetime.utcnow() - timedelta(hours=1))
+    stranded = await _insert(
+        status="running", updated_at=datetime.utcnow() - timedelta(hours=1)
+    )
 
     assert await worker.run_catalog_import_drain_tick() == {
         "processed": False,
         "reason": "disabled",
     }
-    assert await worker.run_catalog_import_stale_reaper_tick() == {
-        "requeued": 0,
-        "reason": "disabled",
-    }
+    # The switch is OFF and the reaper still does its job.
+    assert await worker.run_catalog_import_stale_reaper_tick() == {"requeued": 1}
+    assert (await get_import_task(stranded))["status"] == "retry_scheduled"
 
 
 @pytest.mark.parametrize(
