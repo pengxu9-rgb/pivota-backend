@@ -406,28 +406,30 @@ async def test_a_terminal_create_job_does_not_tombstone_the_order():
     revived = await claim_next_merchant_order_sync_job(worker_id="worker-b")
     assert revived is not None, "the re-enqueue was a silent no-op"
     assert str(revived["job_id"]) == first
-    assert revived["attempts"] == 1, "attempts reset, so it gets a full budget"
+    assert revived["attempts"] == 1, "attempts reset, so it gets its one attempt"
     assert revived["progress"] == {}
 
 
-async def test_a_repeat_enqueue_adopts_the_newer_payload():
-    """First-writer-wins was a real failure: a PSP webhook enqueuing with
-    require_shopify_primary=True tombstoned the admin confirm-payment site,
-    which has no store guard at all — so a WooCommerce merchant's order was
-    never created."""
+async def test_repeat_enqueues_share_one_identical_payload():
+    """The payload no longer carries a caller-specific flag, so a repeat enqueue
+    cannot change the stored job's meaning. An earlier cut adopted the newer
+    payload on every conflict — including onto a RUNNING row, where the worker
+    had already read the old one, finished the old work, and the newer caller's
+    request vanished with a success return."""
     from db.merchant_order_sync_jobs import (
         claim_next_merchant_order_sync_job,
         enqueue_merchant_order_create,
     )
 
     order_id = _order_id()
-    await enqueue_merchant_order_create(
-        order_id=order_id, merchant_id="m1", require_shopify_primary=True)
-    await enqueue_merchant_order_create(
-        order_id=order_id, merchant_id="m1", require_shopify_primary=False)
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
 
     job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
-    assert job["payload"]["require_shopify_primary"] is False
+    # Every caller's payload is identical now — the store guard is applied at
+    # the call site, so nothing about the stored job depends on which caller
+    # won the race to enqueue.
+    assert job["payload"] == {"order_id": order_id, "merchant_id": "m1"}
 
 
 async def test_a_repeat_refund_enqueue_still_does_not_revive():
@@ -446,3 +448,45 @@ async def test_a_repeat_refund_enqueue_still_does_not_revive():
     again = await _enqueue(order_id, dedupe="re_once")
     assert again == first
     assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None
+
+
+async def test_a_create_job_is_stored_with_a_single_attempt():
+    """At-most-once is enforced by the ROW, not by the handler remembering to
+    ask. A second attempt on Woo/Wix/BigCommerce is a second merchant order."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    job_id = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+
+    row = dict(await database.fetch_one(
+        "SELECT max_attempts FROM merchant_order_sync_jobs WHERE job_id=:j",
+        {"j": job_id}))
+    assert row["max_attempts"] == 1
+
+
+async def test_a_revive_does_not_disturb_a_running_job():
+    """The revive is NOT lease-fenced, so it must not touch an in-flight row.
+    An earlier cut swapped the payload under a worker that had already read it:
+    the worker finished the old work, completed the job, and the newer caller's
+    request disappeared having returned a job id."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    first = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    claimed = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    assert claimed is not None
+
+    again = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    assert again == first
+
+    row = dict(await database.fetch_one(
+        "SELECT status, attempts, claimed_by_worker FROM merchant_order_sync_jobs "
+        "WHERE job_id=:j", {"j": first}))
+    assert row["status"] == "running", "a running job must not be revived"
+    assert row["attempts"] == 1
+    assert row["claimed_by_worker"] == "worker-a", "the lease must survive"

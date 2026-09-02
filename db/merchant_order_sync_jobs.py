@@ -136,14 +136,16 @@ def _backoff_seconds(attempts: int) -> int:
 
 _IGNORE_ON_CONFLICT = "ON CONFLICT (order_id, op, dedupe_key) DO NOTHING"
 
-# Revives a terminal row and always adopts the newest payload. Written with
-# explicit CASE arms rather than a `WHERE` on the DO UPDATE so the statement
-# always RETURNS a row — the caller must be able to tell "queued" from
-# "persistence failed", and a filtered DO UPDATE returns nothing for an
-# in-flight job, which reads identically to a failure.
+# Revives a TERMINAL row. Written with explicit CASE arms rather than a `WHERE`
+# on the DO UPDATE so the statement always RETURNS a row — the caller must be
+# able to tell "queued" from "persistence failed", and a filtered DO UPDATE
+# returns nothing for an in-flight job, which reads identically to a failure.
+#
+# Deliberately does NOT touch a `pending` or `running` row, payload included. A
+# worker reads its payload in the claim's RETURNING, so swapping it mid-flight
+# meant the old work completed and the new request disappeared.
 _REVIVE_ON_CONFLICT = """
             ON CONFLICT (order_id, op, dedupe_key) DO UPDATE SET
-                payload = EXCLUDED.payload,
                 updated_at = EXCLUDED.updated_at,
                 status = CASE
                     WHEN merchant_order_sync_jobs.status IN ('done', 'failed')
@@ -262,11 +264,24 @@ async def enqueue_merchant_order_sync_job(
         return None
 
 
+# ONE attempt per enqueue. The merchant-order create is not idempotent on
+# WooCommerce, Wix or BigCommerce — none of them looks for an existing order
+# before POSTing — and the paths that fail WITHOUT reporting (an exception
+# escaping the sync, a contended advisory lock) are exactly the ones a
+# retry-classifier cannot see. Measured while this was 10: ten Wix orders and
+# ten shipments for one buyer, from a single link-write timeout.
+#
+# So this queue gives DURABILITY OF INTENT, not retries: the work survives the
+# revision swap that used to drop it, and is attempted exactly once. That is
+# the failure the six call sites actually had. Automatic retry is a separate
+# feature that needs per-platform idempotency to be safe, and does not exist yet.
+MERCHANT_ORDER_CREATE_MAX_ATTEMPTS = 1
+
+
 async def enqueue_merchant_order_create(
     *,
     order_id: str,
     merchant_id: str,
-    require_shopify_primary: bool = False,
 ) -> Optional[str]:
     """Queue the post-payment merchant-order create for one order.
 
@@ -279,16 +294,20 @@ async def enqueue_merchant_order_create(
         order_id=str(order_id),
         merchant_id=str(merchant_id),
         op=OP_MERCHANT_ORDER_CREATE,
+        max_attempts=MERCHANT_ORDER_CREATE_MAX_ATTEMPTS,
         dedupe_key=MERCHANT_ORDER_CREATE_DEDUPE_KEY,
         # Keyed per ORDER, and two of the call sites exist ONLY to be retries
         # (the agent and Checkout.com already-paid branches). Without this a
         # terminal job tombstones the order and those sites become silent
         # no-ops that still answer "Shopify sync initiated".
         revive_terminal=True,
+        # Identical for every caller: the store guard the PSP webhooks apply is
+        # evaluated at the CALL SITE, where it was before this queue existed.
+        # Carrying it as a payload flag made the stored job depend on which
+        # caller won the race to enqueue.
         payload={
             "order_id": str(order_id),
             "merchant_id": str(merchant_id),
-            "require_shopify_primary": bool(require_shopify_primary),
         },
     )
 

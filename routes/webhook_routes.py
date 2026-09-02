@@ -3,7 +3,7 @@ Webhook 处理路由
 处理来自 PSP（Stripe/Adyen）和 MCP（Shopify）的事件通知
 """
 
-from services.merchant_store_service import get_merchant_active_stores
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
@@ -1699,14 +1699,14 @@ async def handle_stripe_webhook(
                     # `add_task` sites, reached by a different mechanism — which is
                     # why it did not show up in an add_task sweep.
                     #
-                    # `require_shopify_primary` preserves the guard this path had:
-                    # the worker makes the same primary-store check rather than
-                    # widening it to the other platforms the sync can dispatch.
-                    await enqueue_merchant_order_create(
-                        order_id=order_id,
-                        merchant_id=merchant_id,
-                        require_shopify_primary=True,
-                    )
+                    # The store guard stays HERE, where this path has always
+                    # applied it, rather than travelling as a payload flag.
+                    store_info = await get_primary_store(merchant_id)
+                    if store_info and store_info.get("platform") == "shopify":
+                        await enqueue_merchant_order_create(
+                            order_id=order_id,
+                            merchant_id=merchant_id,
+                        )
             else:
                 logger.info(
                     "Stripe payment success replay skipped for order %s due to settled or terminal state",

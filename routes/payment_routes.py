@@ -217,6 +217,7 @@ async def checkout_webhook(
         # Lazy imports to avoid circular dependencies
         from db.orders import get_order, mark_order_paid, update_payment_info
         from routes.order_routes import log_order_event
+        from services.merchant_store_service import get_primary_store
         
         order = await get_order(order_id)
         if not order:
@@ -228,15 +229,17 @@ async def checkout_webhook(
             shopify_sync = "already_linked" if order.get("shopify_order_id") else "initiated"
             if not order.get("shopify_order_id"):
 
-                # Durable enqueue — replaces `background_tasks.add_task`, which ran
-                # in this process with no retry and died with a revision swap.
-                # `require_shopify_primary` preserves this webhook's own narrower
-                # guard; the worker checks it rather than widening the path.
-                await enqueue_merchant_order_create(
-                    order_id=order_id,
-                    merchant_id=str(order.get("merchant_id") or ""),
-                    require_shopify_primary=True,
-                )
+                # Durable enqueue — replaces `background_tasks.add_task`, which
+                # ran in this process with no retry and died with a revision
+                # swap. The store guard stays HERE, where this webhook has
+                # always applied it: carrying it as a payload flag made the
+                # stored job depend on which caller won the race to enqueue.
+                _store = await get_primary_store(order["merchant_id"])
+                if _store and _store.get("platform") == "shopify":
+                    await enqueue_merchant_order_create(
+                        order_id=order_id,
+                        merchant_id=str(order.get("merchant_id") or ""),
+                    )
 
             logger.info(
                 f"Order {order_id} already paid, marking webhook as processed (shopify_sync={shopify_sync})"
@@ -272,11 +275,12 @@ async def checkout_webhook(
         )
         
         # Durable enqueue — see the already-paid branch above.
-        await enqueue_merchant_order_create(
-            order_id=order_id,
-            merchant_id=str(order.get("merchant_id") or ""),
-            require_shopify_primary=True,
-        )
+        store_info = await get_primary_store(order["merchant_id"])
+        if store_info and store_info.get("platform") == "shopify":
+            await enqueue_merchant_order_create(
+                order_id=order_id,
+                merchant_id=str(order.get("merchant_id") or ""),
+            )
         
         # Mark webhook as processed
         await WebhookService.update_event_status(event_id, "processed")

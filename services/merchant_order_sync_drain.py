@@ -310,28 +310,6 @@ async def _run_refund_sync_job(
     )
 
 
-# `_mark_merchant_order_sync_failed_best_effort` swallows its own write
-# failure, and the marker lives in ORDER metadata rather than job state — so it
-# survives from any earlier attempt. A stale `retryable: False` would otherwise
-# complete a transient failure. Only trust the flag while it plausibly describes
-# THIS attempt.
-_MARKER_FRESHNESS_SECONDS = 300
-
-
-def _marker_is_fresh(merchant_order: Dict[str, Any]) -> bool:
-    raw = str(merchant_order.get("last_attempt_at") or "").strip()
-    if not raw:
-        return False
-    try:
-        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except Exception:  # noqa: BLE001
-        return False
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - stamp).total_seconds()
-    return 0 <= age <= _MARKER_FRESHNESS_SECONDS
-
-
 async def _run_merchant_order_create_job(
     payload: Dict[str, Any],
     progress: Optional[Dict[str, Any]] = None,
@@ -339,10 +317,27 @@ async def _run_merchant_order_create_job(
 ) -> Dict[str, Any]:
     """Create the merchant-side order for an order the buyer has already paid.
 
-    Replaces the `background_tasks.add_task(create_shopify_order, ...)` at five
-    call sites. Safe to retry: `sync_order_to_connected_store` returns early
-    when the order already carries a linked platform order, and takes an
-    advisory lock around the create itself.
+    AT-MOST-ONCE BY CONSTRUCTION. Enqueued with `max_attempts=1`, so any
+    outcome — returned or raised — is terminal.
+
+    That is deliberate, and it is the third design here. Two earlier ones tried
+    to decide retryability after the fact: from the boolean
+    `sync_order_to_connected_store` returns, then from the failure marker it
+    writes. Both leaked, because the paths that are dangerous to retry are
+    exactly the ones that report nothing. An exception escaping the sync writes
+    no marker and requeued; a contended advisory lock returns True having done
+    nothing. Measured on the marker design: ten Wix orders and ten shipments for
+    one buyer, from a single link-write timeout after a successful POST.
+
+    Only Shopify looks for an existing order before creating
+    (`_find_existing_order_id_best_effort` plus tag reuse). Woo, Wix and
+    BigCommerce POST unconditionally, so a second attempt is a second order.
+
+    What this queue therefore delivers is the failure the six call sites
+    actually had: the work no longer dies with the API process between the
+    response and the sync. It is durable intent, attempted once — not retries.
+    A repeat enqueue from a call site revives the job for one more attempt,
+    which is exactly what those sites did before this queue existed.
     """
     from db.orders import get_order
     from routes.order_routes import (
@@ -351,97 +346,37 @@ async def _run_merchant_order_create_job(
     )
 
     order_id = str(payload.get("order_id") or "")
-    merchant_id = str(payload.get("merchant_id") or "")
     if not order_id:
         return {"skipped": "no_order_id"}
 
-    if payload.get("require_shopify_primary"):
-        # Preserves the Checkout.com webhook's own narrower guard. That path
-        # only ever created merchant orders for a Shopify PRIMARY store, even
-        # though `sync_order_to_connected_store` also dispatches WooCommerce,
-        # BigCommerce and Wix. Widening it here would silently start creating
-        # orders on platforms that webhook has never served.
-        from services.merchant_store_service import get_primary_store
+    created = await sync_order_to_connected_store(order_id)
 
-        store = await get_primary_store(merchant_id)
-        if not (store and str(store.get("platform") or "").lower() == "shopify"):
-            return {"skipped": "primary_store_not_shopify"}
-
-    if await sync_order_to_connected_store(order_id):
-        # `True` is not proof of delivery. Every platform creator returns True
-        # when the per-order advisory lock is already held by someone else
-        # (the ops retry endpoint, a sibling worker, the reconcile lane) —
-        # "someone else is doing it", not "it is done". Completing on that
-        # records success for a merchant order that may never arrive, and the
-        # constant dedupe key means nothing would re-queue it.
-        order = await get_order(order_id) or {}
-        if _linked_platform_order(order):
-            return {"created": True}
-        raise _RetryableSyncError(
-            f"{order_id}: create reported success but the order carries no "
-            "linked platform order — most likely another holder has the create "
-            "lock; re-check on the next attempt"
-        )
-
-    # It returned False, and on the way it wrote a `merchant_order` marker.
+    # `True` is not proof of delivery: every platform creator returns True when
+    # another holder has the per-order advisory lock — "someone else is doing
+    # it", not "it is done". Verify against the order rather than the return.
     order = await get_order(order_id) or {}
-    metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
-    merchant_order = metadata.get("merchant_order") or {}
-    reason = str(merchant_order.get("last_failure_reason") or "unknown")
-    platform = str(merchant_order.get("platform") or "").strip().lower()
+    if created and _linked_platform_order(order):
+        return {"created": True}
 
-    # RETRY ONLY WHERE THE REMOTE CREATE IS IDEMPOTENT.
-    #
-    # `sync_order_to_connected_store` collapses the adapter's own `retryable`
-    # flag to a bare bool and then hardcodes retryable=True, so a failure that
-    # happened AFTER the platform order was created reads as retryable here.
-    # `adapters/wix_adapter` returns retryable=False in six places; the worst is
-    # `wix_physical_order_auto_fulfilled`, raised after a real Wix order AND a
-    # payment record were written, with order_id=None so nothing links. Retrying
-    # that POSTs a brand-new order — up to 10 merchant orders and 10 shipments
-    # for one buyer.
-    #
-    # Only the Shopify path looks for an existing order before creating
-    # (`_find_existing_order_id_best_effort` plus tag reuse). Woo, Wix and
-    # BigCommerce have no remote-side idempotency, so a retry there cannot be
-    # distinguished from a fresh create.
-    #
-    # For those platforms this queue therefore gives DURABILITY OF INTENT, not
-    # retries: the job is recorded, attempted once, and left visible. That is
-    # parity with the `background_tasks` behaviour it replaced, and strictly
-    # better than duplicating a merchant order.
-    if platform and platform != "shopify":
-        logger.error(
-            "merchant_order_sync: %s failed for order %s on platform=%s "
-            "(reason=%s). NOT retrying — this platform's create is not remotely "
-            "idempotent, so a retry could duplicate the merchant order. The "
-            "order stays paid with no merchant order and is reported by "
-            "paid_missing_merchant_order_count.",
-            OP_MERCHANT_ORDER_CREATE, order_id, platform, reason,
+    if created:
+        # Contended lock. The other holder owns this create; a second attempt
+        # from here would be a second POST on a platform that cannot dedupe it.
+        logger.warning(
+            "merchant_order_sync: %s for order %s reported success with no "
+            "linked platform order — another holder has the create lock and "
+            "owns the outcome",
+            OP_MERCHANT_ORDER_CREATE, order_id,
         )
-        return {"created": False, "skipped": reason, "platform": platform}
+        return {"created": False, "skipped": "create_in_progress_elsewhere"}
 
-    if merchant_order.get("retryable") is False and _marker_is_fresh(merchant_order):
-        # No retry can change this. The order stays paid with no merchant
-        # order, so it is REPORTABLE — `paid_missing_merchant_order_count` on
-        # /orders/ops/transaction-safety/metrics counts it, and the ops retry
-        # endpoint can act on it.
-        #
-        # Be precise about what that is worth: nothing scrapes that endpoint
-        # today, and `reconcile_paid_orders_missing_merchant_order` has no
-        # scheduler registration, so the trace is queryable by a human who goes
-        # looking and by nothing else. It is a weaker guarantee than the refund
-        # op's rule, which does not depend on anyone looking.
-        logger.error(
-            "merchant_order_sync: %s cannot be created for order %s (reason=%s, "
-            "not retryable); it remains reported by "
-            "paid_missing_merchant_order_count",
-            OP_MERCHANT_ORDER_CREATE, order_id, reason,
-        )
-        return {"created": False, "skipped": reason}
-
+    # Terminal by construction. Raise so the job lands `failed` and appears in
+    # `list_failed_merchant_order_sync_jobs`, and so the tick emits its
+    # money-path ERROR. The order also stays paid with no merchant order, which
+    # `paid_missing_merchant_order_count` reports — though note nothing scrapes
+    # that endpoint today and the reconcile lane has no scheduler registration,
+    # so both traces need a human to go looking.
     raise _RetryableSyncError(
-        f"merchant order creation returned false for {order_id} (reason={reason})"
+        f"merchant order creation did not succeed for {order_id}"
     )
 
 
@@ -536,7 +471,9 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
             elif wrote == "write_failed":
                 # The work reached Shopify; only the row does not say so. Do NOT
                 # report this as a lost lease — nobody else owns the job, it is
-                # simply unrecorded until the reaper hands it back.
+                # simply unrecorded until the reaper hands it back. A redo is
+                # safe here because the refund write dedupes and a create that
+                # linked short-circuits on the linked-order check.
                 summary["write_failed"] += 1
                 logger.error(
                     "merchant_order_sync: job=%s order=%s SUCCEEDED but the "
@@ -546,8 +483,9 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
                     job.get("order_id"),
                 )
             else:
-                # Our lease expired and a sibling owns the job now. The work
-                # itself was idempotent, so the sibling redoing it is safe.
+                # Our lease expired and a sibling owns the job now. A redo is
+                # safe for the same reason as above: the refund write dedupes,
+                # and a create that already linked short-circuits.
                 summary["lease_lost"] += 1
         except Exception as exc:  # noqa: BLE001
             status = await fail_merchant_order_sync_job(

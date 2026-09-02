@@ -1102,7 +1102,7 @@ async def test_payment_aftercare_canary_stripe_payment_failed_then_succeeded_rec
         assert merchant_id == "m_stripe"
         return {"merchant_id": merchant_id, "status": "active"}
 
-    async def fake_enqueue(*, order_id, merchant_id, require_shopify_primary=False):
+    async def fake_enqueue(*, order_id, merchant_id):
         # Records the same way the inline create used to, so the assertion below
         # still pins "the merchant order was requested exactly once".
         shopify_calls.append(order_id)
@@ -1130,7 +1130,9 @@ async def test_payment_aftercare_canary_stripe_payment_failed_then_succeeded_rec
         "create_order_snapshot_evidence_pack",
         fake_create_order_snapshot_evidence_pack,
     )
-    # The create is enqueued now, not resolved-and-called inline here.
+    # The create is enqueued now, but the store guard still runs at this call
+    # site — so both have to be patched.
+    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fake_get_primary_store)
     monkeypatch.setattr(
         webhook_routes_module, "enqueue_merchant_order_create", fake_enqueue
     )
