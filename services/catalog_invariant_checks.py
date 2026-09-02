@@ -167,7 +167,10 @@ _SERVING_NOT_RENDERABLE_COUNT_SQL = compile_pg(
     .where(_SERVING_NOT_RENDERABLE_WHERE)
 )
 _SERVING_NOT_RENDERABLE_SAMPLE_SQL = compile_pg(
-    select(_cp.c.product_key)
+    # `.label("subject_key")` is the runner's sample contract, not decoration:
+    # see _sample_keys. Unlabelled, a `databases` Record on Postgres raised
+    # KeyError('subject_key') in the daily sweep (worker, 2026-09-02).
+    select(_cp.c.product_key.label("subject_key"))
     .select_from(_SERVING_NOT_RENDERABLE_FROM)
     .where(_SERVING_NOT_RENDERABLE_WHERE)
     .limit(_SAMPLE_LIMIT)
@@ -1235,7 +1238,7 @@ _CHECKS: List[Dict[str, Any]] = [
                          (details::jsonb) -> 'components'
                      ) AS c
             )
-            SELECT name
+            SELECT name AS subject_key
             FROM comps
             GROUP BY name
             HAVING count(*) >= 200 AND max(score) = 0
@@ -1363,6 +1366,47 @@ def _threshold(check: Dict[str, Any]) -> int:
         return int(check["default_threshold"])
 
 
+SAMPLE_KEY_COLUMN = "subject_key"
+
+
+def _sample_keys(check: Dict[str, Any], rows: Any) -> List[Any]:
+    """Read the sample keys out of a check's `sample_sql` rows.
+
+    THE CONTRACT: every `sample_sql` projects exactly one column, aliased
+    `... AS subject_key`. The runner reads it by name so a check's sample is
+    meaningful whatever its natural key is called (product_key, offer_id,
+    content_key, a component name).
+
+    THE TOLERANCE: on the production dialect a `databases` Record raises
+    KeyError for a column the row does not carry, and that KeyError lands in
+    the runner's per-check handler. Two checks shipped without the alias
+    (`dead_quality_component` projected `name`, `serving_eligible_not_renderable`
+    projected `product_key`), so on 2026-09-02 the worker turned two REAL
+    violations into two "check failed" tracebacks with no samples and no tally.
+    Both are aliased now; this fallback exists so the next check that forgets
+    degrades to a positional read plus a loud WARNING, not a lost verdict.
+    Column 0 is right by construction — one projected column — and the warning
+    names the check so the alias gets added rather than the tolerance relied on.
+    """
+    keys: List[Any] = []
+    warned_once = False
+    for row in rows:
+        try:
+            keys.append(row[SAMPLE_KEY_COLUMN])
+            continue
+        except (KeyError, IndexError, TypeError):
+            pass
+        if not warned_once:
+            logger.warning(
+                "catalog_invariants: check %s sample_sql does not project "
+                "%s; reading column 0 instead — alias it AS %s",
+                check["name"], SAMPLE_KEY_COLUMN, SAMPLE_KEY_COLUMN,
+            )
+            warned_once = True
+        keys.append(row[0])
+    return keys
+
+
 async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
     """Run every invariant; return counts, thresholds, and sample keys for
     checks that are over threshold. Never raises for a single failing check — a
@@ -1407,14 +1451,20 @@ async def run_catalog_invariant_checks(db: Any) -> Dict[str, Any]:
             entry["over_threshold"] = over_threshold
             entry["violated"] = over_threshold and not warn_only
             if over_threshold:
-                if samples is None:
-                    rows = await db.fetch_all(check["sample_sql"])
-                    samples = [r["subject_key"] for r in rows]
-                entry["sample_keys"] = samples
+                # Tally BEFORE sampling. The verdict is the count; a sample
+                # fetch that raises must not also erase the check from the
+                # totals. It did: the 2026-09-02 worker run reported two
+                # entries with `violated: true` and a violated_count that
+                # excluded both, because the KeyError below fired between the
+                # entry being marked and the counter being bumped.
                 if warn_only:
                     warned += 1
                 else:
                     violated += 1
+                if samples is None:
+                    rows = await db.fetch_all(check["sample_sql"])
+                    samples = _sample_keys(check, rows)
+                entry["sample_keys"] = samples
         except Exception as exc:  # noqa: BLE001 — one bad check must not sink the sweep
             logger.exception("catalog_invariants: check %s failed", check["name"])
             entry["error"] = str(exc)
