@@ -5271,7 +5271,7 @@ def _axis_coverage(probe_runs: Any) -> Dict[str, int]:
 
 
 # Internal-first gate for deep-tier comparison probes — shared with
-# sku_opportunity via services.deep_tier_prompts (single definition, no cycle).
+# sku_opportunity. The single definition now lives in services.audit_facts;
 _run_is_internal_comparison = run_is_internal_comparison
 
 
