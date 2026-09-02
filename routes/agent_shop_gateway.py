@@ -6765,6 +6765,71 @@ def _build_pivot_multi_shadow_diff_summary(
     }
 
 
+async def _resolve_brand_anchor_terms(query: str) -> tuple[list, str | None]:
+    """Brand-anchor terms for the pivot lane, and where they came from.
+
+    `_category_brand_anchor_terms` requires a category prefix AND at least two
+    residual tokens.  That second rule exists for a good reason — it stops a lone
+    descriptor like "brightening" in "brightening blush" becoming an accidental
+    brand gate — but a token COUNT cannot tell a descriptor from a brand, and the
+    cost is that no SINGLE-WORD brand can ever anchor.  Measured against the
+    shipped helper:
+
+        "knight unicorn blush"   -> ['knight', 'unicorn']   (two-word brand, works)
+        "murad cleanser"         -> []   category found, ONE residual token
+        "show me Murad products" -> []   no category at all
+        "brightening blush"      -> []   correctly refused
+
+    So Murad, CeraVe, NARS, Tatcha — the entire single-word brand class — went
+    unanchored, and the broad category lane filled the page with whatever else
+    matched.  Live on 2026-09-02 "show me Murad products" answered with a LIZUSH
+    bath bomb whose title ends "bath & body products", and "I am looking for a
+    Murad cleanser" answered with twelve cleansers from other brands.
+
+    The signal that actually separates "murad" from "brightening" is whether the
+    token IS a brand in our own catalog, and this service already maintains that:
+    `_detect_brand_query` matches against `_DYNAMIC_BRAND_SET`, grouped from
+    catalog_products.brand and warmed by `_ensure_brand_dictionary_loaded`.  Only
+    'catalog' and 'static' modes are accepted — 'heuristic' is a guess about an
+    unknown string and would re-admit exactly the false positives the residual
+    rule was written to keep out.  Same accepted-mode set the sibling call site in
+    this file already uses.
+
+    Fail-safe in both directions: a cold or empty dictionary yields no anchor and
+    the caller keeps today's behaviour, and the caller only narrows the page when
+    the anchor actually matches something (`if anchored_products:`), so a wrong
+    anchor cannot empty a result set.
+    """
+    terms = _category_brand_anchor_terms(query)
+    if terms:
+        return terms, "category_residual"
+
+    try:
+        from routes.agent_api import (
+            _detect_brand_query as _agent_detect_brand_query,
+            _ensure_brand_dictionary_loaded as _agent_ensure_brand_dictionary_loaded,
+        )
+
+        await _agent_ensure_brand_dictionary_loaded()
+        detected = _agent_detect_brand_query(query) or {}
+        if detected.get("brand_like") and str(detected.get("mode") or "") in {
+            "catalog",
+            "static",
+        }:
+            span = next(
+                (str(t) for t in (detected.get("brand_terms") or []) if str(t or "").strip()),
+                "",
+            )
+            tokens = [t for t in _strip_accents(span.lower()).split() if t]
+            if tokens:
+                return tokens, str(detected.get("mode"))
+    except Exception:
+        # Never let brand detection break recall — fall back to the prior gate.
+        pass
+
+    return [], None
+
+
 async def _handle_find_products_multi_via_pivot(
     payload: FindProductsMultiPayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -6985,7 +7050,7 @@ async def _handle_find_products_multi_via_pivot(
     # match a real catalog brand/merchant, preserve the user's explicit brand
     # constraint instead of returning unrelated products from the same
     # category.  If no real identity matches, keep broad category behaviour.
-    brand_anchor_terms = _category_brand_anchor_terms(query)
+    brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
     brand_anchor_matched = False
     if products and brand_anchor_terms:
         anchored_products = []
@@ -7171,6 +7236,7 @@ async def _handle_find_products_multi_via_pivot(
             "query_semantic_class": query_semantic_class,
             "brand_category_anchor_terms": brand_anchor_terms,
             "brand_category_anchor_matched": brand_anchor_matched,
+            "brand_category_anchor_source": brand_anchor_source,
             "fetched_at": datetime.utcnow().isoformat(),
             "pivot_rollout_mode": "serve",
             "pivot_rollout_guard_passed": True,
