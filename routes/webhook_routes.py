@@ -4,6 +4,7 @@ Webhook 处理路由
 """
 
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -1690,20 +1691,22 @@ async def handle_stripe_webhook(
                 )
 
                 if not skip_platform_order_creation:
-                    # 触发 Shopify 订单创建
-                    from routes.order_routes import create_shopify_order
-
+                    # Durable enqueue — this was a single INLINE attempt whose
+                    # failure was swallowed, after which the handler fell through
+                    # to its normal 200. Stripe therefore acked and never retried,
+                    # so one transient Shopify error lost the merchant order while
+                    # the buyer was already charged. Same failure mode as the five
+                    # `add_task` sites, reached by a different mechanism — which is
+                    # why it did not show up in an add_task sweep.
+                    #
+                    # The store guard stays HERE, where this path has always
+                    # applied it, rather than travelling as a payload flag.
                     store_info = await get_primary_store(merchant_id)
                     if store_info and store_info.get("platform") == "shopify":
-                        logger.info(f"🔄 Creating Shopify order for {order_id} after webhook payment confirmation")
-                        try:
-                            success = await create_shopify_order(order_id)
-                            if success:
-                                logger.info(f"✅ Shopify order created via webhook for {order_id}")
-                            else:
-                                logger.error(f"❌ Shopify order creation failed for {order_id}")
-                        except Exception as shop_err:
-                            logger.error(f"❌ Shopify order creation error: {shop_err}")
+                        await enqueue_merchant_order_create(
+                            order_id=order_id,
+                            merchant_id=merchant_id,
+                        )
             else:
                 logger.info(
                     "Stripe payment success replay skipped for order %s due to settled or terminal state",

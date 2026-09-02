@@ -68,6 +68,20 @@ def _order(order_id: str, **overrides: Any) -> Dict[str, Any]:
     return base
 
 
+def _recording_enqueue(sink):
+    """Stand-in for db.merchant_order_sync_jobs.enqueue_merchant_order_create."""
+
+    async def _enqueue(*, order_id, merchant_id, require_shopify_primary=False):
+        sink.append({
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "require_shopify_primary": require_shopify_primary,
+        })
+        return "job-1"
+
+    return _enqueue
+
+
 @pytest.mark.asyncio
 async def test_agent_confirm_payment_client_owned_psp_waits_for_webhook(
     monkeypatch: pytest.MonkeyPatch,
@@ -212,6 +226,7 @@ async def test_agent_confirm_payment_backend_owned_still_marks_paid(
     mark_paid_calls: list[str] = []
     order_events: list[str] = []
     shopify_calls: list[str] = []
+    enqueued: list[Dict[str, Any]] = []
     queued_background_tasks: list[tuple[str, tuple[Any, ...], Dict[str, Any]]] = []
 
     async def fake_validate_request(*args: Any, **kwargs: Any) -> None:
@@ -251,6 +266,12 @@ async def test_agent_confirm_payment_backend_owned_still_marks_paid(
         "create_order_snapshot_evidence_pack",
         fake_create_order_snapshot_evidence_pack,
     )
+    # Patch where the name is USED: routes/agent_api.py binds it with a
+    # module-level `from ... import`, so patching the source module would not
+    # reach the already-bound reference.
+    monkeypatch.setattr(
+        agent_api, "enqueue_merchant_order_create", _recording_enqueue(enqueued)
+    )
 
     background_tasks = BackgroundTasks()
 
@@ -274,7 +295,15 @@ async def test_agent_confirm_payment_backend_owned_still_marks_paid(
     assert mark_paid_calls == ["ORD_BACKEND_PENDING"]
     assert order_events == ["payment_succeeded"]
     queued_task_names = [name for name, _, _ in queued_background_tasks]
-    assert "fake_create_shopify_order" in queued_task_names
+    # The merchant-order create no longer rides on BackgroundTasks: it is
+    # enqueued durably, so a revision swap between the response and the sync
+    # cannot lose it while the buyer is already charged.
+    assert "fake_create_shopify_order" not in queued_task_names
+    assert enqueued == [{
+        "order_id": "ORD_BACKEND_PENDING",
+        "merchant_id": "m_confirm",
+        "require_shopify_primary": False,
+    }]
     assert "log_agent_request" in queued_task_names
     assert "emit_agent_webhook_event" in queued_task_names
     assert "_send_order_confirmation_email_background" not in queued_task_names
@@ -357,3 +386,67 @@ async def test_agent_confirm_payment_paypal_auth_first_authorizes_before_finaliz
         "agent_confirm_payment:ORD_PAYPAL_AUTH_FIRST",
     )
     assert calls[1] == ("finalize", "ORD_PAYPAL_AUTH_FIRST", "agent_confirm_payment")
+
+
+@pytest.mark.asyncio
+async def test_agent_confirm_payment_already_paid_branch_enqueues_a_retry(monkeypatch):
+    """The already-paid branch exists ONLY to be a retry: it logs
+    `shopify_sync_retry_requested` and answers "Order already paid; Shopify sync
+    initiated". Deleting its enqueue left every suite green — and it is the site
+    where a tombstoned job would do the most damage, since the caller is
+    explicitly asking again.
+    """
+    import routes.agent_api as agent_api
+    import routes.order_routes as order_routes_module
+
+    enqueued: list[Dict[str, Any]] = []
+    order_events: list[str] = []
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_confirm",
+            "payment_status": "paid",
+            "status": "paid",
+            # already paid, and NO merchant order yet — the retry condition
+            "shopify_order_id": None,
+            "payment_intent_id": "pi_retry",
+            "total": "31.00",
+            "currency": "USD",
+            "metadata": {},
+        }
+
+    async def fake_log_order_event(*, event_type: str, **kwargs: Any) -> None:
+        order_events.append(event_type)
+
+    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        return {"platform": "shopify", "api_key": "shp_key"}
+
+    async def fake_validate_request(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(agent_api, "validate_request_compat", fake_validate_request)
+    monkeypatch.setattr(order_routes_module, "get_order", fake_get_order)
+    monkeypatch.setattr(order_routes_module, "log_order_event", fake_log_order_event)
+    monkeypatch.setattr(
+        __import__("services.merchant_store_service", fromlist=["x"]),
+        "get_primary_store",
+        fake_get_primary_store,
+    )
+    monkeypatch.setattr(
+        agent_api, "enqueue_merchant_order_create", _recording_enqueue(enqueued)
+    )
+
+    body = await agent_api.agent_confirm_payment(
+        order_id="ORD_ALREADY_PAID_RETRY",
+        background_tasks=BackgroundTasks(),
+        context=_TestAgentContext(),
+    )
+
+    assert body["shopify_sync"] == "initiated"
+    assert "shopify_sync_retry_requested" in order_events
+    assert enqueued == [{
+        "order_id": "ORD_ALREADY_PAID_RETRY",
+        "merchant_id": "m_confirm",
+        "require_shopify_primary": False,
+    }]

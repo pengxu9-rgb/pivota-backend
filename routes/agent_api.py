@@ -102,6 +102,7 @@ from observability.reliability_metrics import (
 )
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 import uuid
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
@@ -9347,7 +9348,6 @@ async def agent_confirm_payment(
         from services.agent_governance import agent_governance
         from routes.order_routes import (
             _resolve_order_psp_adapter,
-            create_shopify_order,
             finalize_authorized_payment_order,
             get_order,
             log_order_event,
@@ -9503,7 +9503,10 @@ async def agent_confirm_payment(
                 except Exception:
                     pass
 
-                background_tasks.add_task(create_shopify_order, order_id)
+                await enqueue_merchant_order_create(
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                )
 
                 background_tasks.add_task(
                     log_agent_request,
@@ -9643,7 +9646,10 @@ async def agent_confirm_payment(
             logger.debug("decision funnel link scheduling failed", exc_info=True)
 
         if can_shopify_sync:
-            background_tasks.add_task(create_shopify_order, order_id)
+            await enqueue_merchant_order_create(
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+            )
 
         try:
             from services.agent_webhook_service import emit_agent_webhook_event

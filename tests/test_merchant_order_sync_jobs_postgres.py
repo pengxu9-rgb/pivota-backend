@@ -336,3 +336,157 @@ async def test_complete_is_lease_fenced_and_reports_why():
         {"j": a["job_id"]},
     ))
     assert row["status"] == "done"
+
+
+async def test_five_call_sites_racing_on_one_order_enqueue_once():
+    """The create op keys on a constant, so an agent confirm and a PSP webhook
+    both landing for the same order produce ONE job, not five."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    ids = []
+    for _ in range(5):
+        ids.append(await enqueue_merchant_order_create(
+            order_id=order_id, merchant_id="merch_test",
+        ))
+
+    assert all(i is not None for i in ids)
+    assert len(set(ids)) == 1, f"five enqueues produced {len(set(ids))} distinct jobs"
+
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS c FROM merchant_order_sync_jobs WHERE order_id = :o",
+        {"o": order_id},
+    )
+    assert dict(row)["c"] == 1
+
+
+async def test_a_create_and_a_refund_job_coexist_for_one_order():
+    """Different ops, so the create must not dedupe against a refund_sync job."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="merch_test")
+    await _enqueue(order_id, dedupe="re_1")
+
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS c FROM merchant_order_sync_jobs WHERE order_id = :o",
+        {"o": order_id},
+    )
+    assert dict(row)["c"] == 2
+
+
+async def test_a_terminal_create_job_does_not_tombstone_the_order():
+    """Two call sites exist ONLY to be retries — the agent and Checkout.com
+    already-paid branches, which answer "Shopify sync initiated". Without
+    revival a `done`/`failed` job is permanent: the unique index has no status
+    column, the claim reads only pending/running, and nothing resets a terminal
+    row. Those sites would return the tombstone's id and never run again."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    first = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    await complete_merchant_order_sync_job(job_id=job["job_id"], worker_id="worker-a")
+
+    row = dict(await database.fetch_one(
+        "SELECT status FROM merchant_order_sync_jobs WHERE job_id=:j", {"j": first}))
+    assert row["status"] == "done"
+
+    # The retry site enqueues again.
+    again = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    assert again == first, "still one row per order"
+
+    revived = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert revived is not None, "the re-enqueue was a silent no-op"
+    assert str(revived["job_id"]) == first
+    assert revived["attempts"] == 1, "attempts reset, so it gets its one attempt"
+    assert revived["progress"] == {}
+
+
+async def test_repeat_enqueues_share_one_identical_payload():
+    """The payload no longer carries a caller-specific flag, so a repeat enqueue
+    cannot change the stored job's meaning. An earlier cut adopted the newer
+    payload on every conflict — including onto a RUNNING row, where the worker
+    had already read the old one, finished the old work, and the newer caller's
+    request vanished with a success return."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    # Every caller's payload is identical now — the store guard is applied at
+    # the call site, so nothing about the stored job depends on which caller
+    # won the race to enqueue.
+    assert job["payload"] == {"order_id": order_id, "merchant_id": "m1"}
+
+
+async def test_a_repeat_refund_enqueue_still_does_not_revive():
+    """The refund op keys on the PSP refund id — one unrepeatable event — so a
+    repeat enqueue must NOT re-run a completed sync."""
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        complete_merchant_order_sync_job,
+    )
+
+    order_id = _order_id()
+    first = await _enqueue(order_id, dedupe="re_once")
+    job = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    await complete_merchant_order_sync_job(job_id=job["job_id"], worker_id="worker-a")
+
+    again = await _enqueue(order_id, dedupe="re_once")
+    assert again == first
+    assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None
+
+
+async def test_a_create_job_is_stored_with_a_single_attempt():
+    """At-most-once is enforced by the ROW, not by the handler remembering to
+    ask. A second attempt on Woo/Wix/BigCommerce is a second merchant order."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    job_id = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+
+    row = dict(await database.fetch_one(
+        "SELECT max_attempts FROM merchant_order_sync_jobs WHERE job_id=:j",
+        {"j": job_id}))
+    assert row["max_attempts"] == 1
+
+
+async def test_a_revive_does_not_disturb_a_running_job():
+    """The revive is NOT lease-fenced, so it must not touch an in-flight row.
+    An earlier cut swapped the payload under a worker that had already read it:
+    the worker finished the old work, completed the job, and the newer caller's
+    request disappeared having returned a job id."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+    )
+
+    order_id = _order_id()
+    first = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    claimed = await claim_next_merchant_order_sync_job(worker_id="worker-a")
+    assert claimed is not None
+
+    again = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    assert again == first
+
+    row = dict(await database.fetch_one(
+        "SELECT status, attempts, claimed_by_worker FROM merchant_order_sync_jobs "
+        "WHERE job_id=:j", {"j": first}))
+    assert row["status"] == "running", "a running job must not be revived"
+    assert row["attempts"] == 1
+    assert row["claimed_by_worker"] == "worker-a", "the lease must survive"
