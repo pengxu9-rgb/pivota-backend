@@ -250,6 +250,54 @@ async def test_a_second_claim_of_the_same_job_is_refused():
     )
 
 
+async def test_requeue_stale_leaves_a_finished_job_alone():
+    """The `WHERE status = 'running'` conjunct, pinned by a row it must NOT touch.
+
+    The positive test below is not enough on its own and this is the reason: it
+    seeds a `running` job and asserts it comes back `queued`, which is true with
+    or without the conjunct — a `WHERE 1=1` sweep requeues that row too. Killing
+    the mutant needs a row the sweep is required to skip. Verified: replacing
+    `WHERE status = 'running'` with `WHERE 1=1` in BOTH dialect constants leaves
+    the rest of this file green and fails only here.
+
+    The conjunct is what stops a FINISHED backfill being silently re-run with its
+    diagnostics destroyed — counters zeroed and the real errors_sample
+    overwritten with `stale_backfill_job_requeued` — for the sole crime of having
+    started before the cutoff.
+    """
+    done_id = await _new_job()
+    await update_quality_backfill_job_progress(done_id, total_candidates=12, processed=12)
+    # The sample goes in via completion, not via a progress tick: completing a
+    # job ALWAYS rewrites errors_sample (pinned above), so a sample set earlier
+    # would be cleared to [] here and this test would be asserting on nothing.
+    await complete_quality_backfill_job(
+        done_id,
+        status="completed",
+        errors_sample=[{"error": "real_failure", "message": "keep me"}],
+    )
+    # Same side of the cutoff as the stale running job in the test below, so the
+    # ONLY thing keeping this row out of the sweep is its status.
+    await database.execute(
+        "UPDATE product_quality_backfill_jobs "
+        "SET started_at = :old WHERE job_id = :j",
+        {"old": datetime(2020, 1, 1), "j": done_id},
+    )
+
+    await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5)
+
+    row = await get_quality_backfill_job(done_id)
+    assert row["status"] == "completed", (
+        "a finished job was requeued — the sweep's `WHERE status = 'running'` "
+        "conjunct is gone, so any job started before the cutoff gets re-run"
+    )
+    assert (row["total_candidates"], row["processed"]) == (12, 12), (
+        "a finished job's counters were zeroed by the stale sweep"
+    )
+    assert row["errors_sample"] and row["errors_sample"][0]["error"] == "real_failure", (
+        "a finished job's diagnostics were overwritten with the requeue reason"
+    )
+
+
 async def test_requeue_stale_resets_a_running_job_and_stamps_the_reason():
     job_id = await _new_job()
     await claim_quality_backfill_job(job_id)
