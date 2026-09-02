@@ -1,12 +1,16 @@
 """POST /webhooks/reap — the issuer's report of what happened to a minted card.
 
-AUTH IS THE SIGNATURE, verified over the exact raw bytes (services/reap_webhooks.py rule 1).
-No REAP_WEBHOOK_SECRET configured means 503 for everything — an unset secret is a receiver
-that does not exist yet, never one that accepts unsigned reports.
+AUTH IS THE SIGNATURE: `X-Reap-Webhook-Signature: t=<unix seconds>,v1=<hex hmac>`, HMAC-SHA256
+over `"{t}.{raw bytes}"` within a 300 s window (services/reap_webhooks.verify_signature, and
+rule 1 there — the exact raw bytes, never a re-serialized body). No REAP_WEBHOOK_SECRET
+configured means 503 for everything — an unset secret is a receiver that does not exist yet,
+never one that accepts unsigned reports.
 
 RESPONSE-CODE POSTURE, because webhook providers retry on non-2xx:
   503  secret unconfigured (we are not ready; retrying is correct)
-  401  bad/missing signature (retrying the same forgery is useless but harmless)
+  401  bad/missing signature, INCLUDING a valid MAC outside the replay window (retrying the
+       same forgery is useless but harmless; a genuine delivery delayed past 300 s comes back
+       re-signed on the next retry)
   400  VALID signature, unparseable JSON (the holder of the secret sent garbage — surface it)
   200  everything else, including events we ignore (unknown card, duplicate, unusable shape):
        a 4xx would invite infinite redelivery of something that will never become processable.

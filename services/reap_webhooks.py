@@ -1,9 +1,15 @@
 """Reap webhook processing — the reconcile half of the card rail.
 
-⚠️ WIRE FORMAT NOT YET VERIFIED AGAINST REAP, same status as reap_issuer.py: the event field
-names in `parse_event` are the adapter's best-understood shape, confined to that one function.
-The signature scheme (HMAC-SHA256 of the raw body, hex, optional "sha256=" prefix, header name
-configurable) is the industry-common default and equally awaits verification.
+SIGNATURE SCHEME: VERIFIED against Reap's docs (docs.reap.global/webhooks/signature-verification,
+/webhooks/overview, read 2026-09-01). Header `X-Reap-Webhook-Signature`, value shaped
+`t=<unix seconds>,v1=<hex hmac>`; the signed payload is the string `"{t}.{raw_body}"`; the MAC is
+HMAC-SHA256 over that, hex, compared constant-time; deliveries outside a 300 s tolerance window
+are rejected as replays. Reap also sends `X-Reap-Webhook-Id` (mirrors body `id`) and
+`X-Reap-Webhook-Timestamp`, but the value we sign over is the `t=` INSIDE the signature header —
+that is the one Reap actually MAC'd, so the separate header cannot be trusted for the computation.
+
+⚠️ EVENT FIELD NAMES still not verified against Reap, same status as reap_issuer.py: the shape
+`parse_event` reads is the adapter's best-understood guess, confined to that one function.
 
 Three rules that hold regardless of how the wire format moves:
 
@@ -25,6 +31,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, Optional
@@ -33,31 +41,87 @@ from utils.logger import logger
 
 _ZERO_DECIMAL_CURRENCIES = frozenset({"JPY", "KRW", "VND", "CLP", "ISK", "KMF", "XOF", "XAF"})
 
+# Module-level reference so tests patch services.reap_webhooks._now and never the stdlib module
+# object (patching time.time globally breaks every other clock in the process).
+_now = time.time
+
+# Reap's documented replay window. Applied SYMMETRICALLY: the docs say to reject when the
+# timestamp "differs from the current time by more than 300 seconds", which reads on both sides,
+# and a future-dated t is either a clock we cannot trust or a signature farmed to outlive the
+# window. Rejecting it costs a redelivery; accepting it extends every stolen signature's life.
+SIGNATURE_TOLERANCE_SECONDS = 300
+
+# ASCII digits only. `int()` happily parses unicode digits ("١٢٣" -> 123), which would then fail
+# to .encode("ascii") when we rebuild the signed payload; refuse the shape up front instead.
+_TIMESTAMP_RE = re.compile(r"[0-9]{1,20}")
+
 
 def webhook_secret() -> str:
     return str(os.getenv("REAP_WEBHOOK_SECRET") or "").strip()
 
 
 def signature_header_name() -> str:
-    return str(os.getenv("REAP_WEBHOOK_SIG_HEADER") or "x-reap-signature").strip().lower()
+    return str(
+        os.getenv("REAP_WEBHOOK_SIG_HEADER") or "x-reap-webhook-signature"
+    ).strip().lower()
 
 
 def verify_signature(raw_body: bytes, provided: Optional[str], secret: str) -> bool:
-    """Constant-time HMAC check over the exact received bytes. No secret => never valid — the
-    caller turns that into a 503, not an open door."""
+    """Reap's scheme: header `t=<unix seconds>,v1=<hex hmac>`, MAC = HMAC-SHA256 over the string
+    `"{t}.{raw_body}"`, compared constant-time, within a 300 s tolerance window.
+
+    The timestamp is part of the SIGNED input, so it cannot be edited to slide a captured
+    delivery forward — changing `t` invalidates `v1`. That is why the window is enforced against
+    the `t` inside this header and not against `X-Reap-Webhook-Timestamp`, which Reap sends
+    separately and never MAC'd.
+
+    No secret => never valid — the caller turns that into a 503, not an open door.
+    """
     if not secret or not provided:
         return False
-    candidate = provided.strip()
-    if candidate.lower().startswith("sha256="):
-        candidate = candidate[7:]
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    # Compare as BYTES: hmac.compare_digest raises TypeError on non-ASCII str, and Starlette
-    # decodes headers latin-1, so any byte >= 0x80 in the header was an unauthenticated 500.
-    try:
-        provided_bytes = candidate.lower().encode("utf-8")
-    except Exception:
+
+    timestamp: Optional[str] = None
+    candidates: list[str] = []
+    for part in provided.strip().split(","):
+        key, sep, value = part.partition("=")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "t":
+            if timestamp is None:
+                timestamp = value
+        elif key == "v1":
+            # Accept-if-ANY-matches. The docs describe one v1 and say rotation invalidates the
+            # old secret immediately, so this is normally a one-element list; each entry still
+            # has to be a real HMAC under our secret, so tolerating several costs nothing.
+            candidates.append(value)
+    # A header missing either half is not "partially signed", it is unsigned.
+    if not timestamp or not candidates:
         return False
-    return hmac.compare_digest(provided_bytes, expected.lower().encode("ascii"))
+    if not _TIMESTAMP_RE.fullmatch(timestamp):
+        return False
+
+    # Replay window, symmetric. Enforced BEFORE the MAC so a stale delivery is refused even when
+    # its signature is perfectly valid — which is the entire point of the timestamp.
+    if abs(_now() - int(timestamp)) > SIGNATURE_TOLERANCE_SECONDS:
+        return False
+
+    # `{t}.{raw_body}` — built from the EXACT received bytes, never a re-serialized body.
+    signed_payload = timestamp.encode("ascii") + b"." + raw_body
+    expected = (
+        hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest().encode("ascii")
+    )
+    for candidate in candidates:
+        # Compare as BYTES: hmac.compare_digest raises TypeError on non-ASCII str, and Starlette
+        # decodes headers latin-1, so any byte >= 0x80 in the header was an unauthenticated 500.
+        try:
+            candidate_bytes = candidate.lower().encode("utf-8")
+        except Exception:
+            continue
+        if hmac.compare_digest(candidate_bytes, expected):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
