@@ -71,6 +71,7 @@ tests/test_reap_external_auth.py pins that against caplog.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -182,6 +183,12 @@ class AuthorizationRequest:
     merchant_city: Optional[str]
     merchant_country: Optional[str]
     mcc: Optional[str]
+    # An amount field was PRESENT on the wire and could not be parsed (a non-finite Decimal, a
+    # binary float, a non-numeric string). Distinct from absent, and it must stay distinct: with
+    # both legs in the card's currency, _select_leg takes max() over whatever parsed, so a
+    # poisoned leg would silently defer to its sibling and the cap would be enforced against a
+    # number the request did not actually ask for. Any malformed leg declines.
+    amount_malformed: bool = False
 
 
 def _currency(value: Any) -> Optional[str]:
@@ -192,15 +199,25 @@ def _currency(value: Any) -> Optional[str]:
 def _amount(value: Any) -> Optional[Decimal]:
     """Reap sends decimal MAJOR-unit numbers. The route parses with parse_float=Decimal, so a
     JSON number arrives as Decimal or int; a float here would mean that guard was removed, and
-    it is refused rather than silently absorbed."""
+    it is refused rather than silently absorbed.
+
+    NON-FINITE IS REFUSED HERE, NOT DOWNSTREAM, and that placement is the whole fix.
+    `Decimal("NaN")`, `Decimal("sNaN")` and `Decimal("Infinity")` all parse happily from a JSON
+    STRING, and major_to_minor would have rejected them — but the value never got that far. A
+    NaN reaches `max(legs)` in _select_leg and a signalling NaN reaches `raw_amount == 0` in
+    _evaluate, and BOTH raise decimal.InvalidOperation: a 500 with no decision row, on the one
+    path whose premise is that every decision is recorded. Bounding at the parse door means
+    every later stage can assume a finite number.
+    """
     if isinstance(value, bool) or value is None or isinstance(value, float):
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value).strip())
+        parsed = Decimal(str(value).strip())
     except (InvalidOperation, TypeError, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def parse_authorization_request(body: Any) -> Optional[AuthorizationRequest]:
@@ -217,14 +234,20 @@ def parse_authorization_request(body: Any) -> Optional[AuthorizationRequest]:
     if not event_id or not card_ref:
         return None
     merchant = data.get("merchant") if isinstance(data.get("merchant"), dict) else {}
+    raw_billing, raw_presentment = data.get("amount"), data.get("originalAmount")
+    billing_amount, presentment_amount = _amount(raw_billing), _amount(raw_presentment)
     return AuthorizationRequest(
         event_id=event_id[:128],
         card_ref=card_ref[:128],
         channel=str(data.get("channel") or "").strip().upper()[:16],
         currency=_currency(data.get("currency")),
-        amount=_amount(data.get("amount")),
+        amount=billing_amount,
         original_currency=_currency(data.get("originalCurrency")),
-        original_amount=_amount(data.get("originalAmount")),
+        original_amount=presentment_amount,
+        amount_malformed=(
+            (raw_billing is not None and billing_amount is None)
+            or (raw_presentment is not None and presentment_amount is None)
+        ),
         merchant_name=(str(merchant.get("name") or "").strip()[:255] or None),
         merchant_city=(str(merchant.get("city") or "").strip()[:255] or None),
         merchant_country=(str(merchant.get("country") or "").strip().upper()[:2] or None),
@@ -277,6 +300,13 @@ def alarm(code: str, *, event_id: str, reason_code: str, card_id: Optional[str] 
 # to a token that matches unrelated merchants.
 MIN_PINNABLE_ALNUM = 3
 
+# ...and at least this many LETTERS. An id has alphanumerics without being a name: "2a3b4", the
+# tail of "AMZN MKTP US*2A3B4", clears the alnum floor while identifying an ORDER rather than a
+# merchant. Pinning it would decline that merchant's every later order, so the domain is better
+# left unlearned — approving merchant_verified=false under the cap, the single use and the
+# expiry. The same count decides whether a side of the star looks like a name at all.
+MIN_PINNABLE_LETTERS = 3
+
 
 def _scrub(text: str) -> str:
     """Non-alphanumerics to spaces, whitespace collapsed. Punctuation becomes a SPACE rather
@@ -287,33 +317,127 @@ def _scrub(text: str) -> str:
     )
 
 
+# Acquirer / aggregator tags that appear beside the '*' in a card descriptor. A tag identifies
+# WHO PROCESSED the payment, never WHO WAS PAID, so it must never become a merchant pin: pinning
+# "paypal" for a domain approves every other PayPal merchant against it, verified.
+#
+# Lowercase, already scrubbed to the form _scrub produces, and compared for EQUALITY (a merchant
+# genuinely called "Square Enix" scrubs to "square enix" and is not "square").
+_ACQUIRER_TAGS = frozenset({
+    "paypal", "pp", "stripe", "sq", "square", "sumup", "shopify", "shp", "toast", "tst",
+    "sp", "ic", "amzn mktp", "amazon mktplace", "ebay", "klarna", "affirm", "adyen",
+    "checkout com", "mollie",
+})
+
+# An acquirer tag sitting to the LEFT of the star, by shape: a short run of tag-ish characters
+# (no comma — "ACME Store, Inc.*1234" is a merchant with a suffix, not a tag) then the star.
+# 12 characters is long enough for "AMZN MKTP US" and short enough to exclude most real names.
+_ACQUIRER_PREFIX_RE = re.compile(r"^[a-z0-9 .&-]{1,12}\s*\*")
+
+
+def _letter_count(text: str) -> int:
+    return sum(1 for ch in text if ch.isalpha())
+
+
+def _is_acquirer_tag(candidate: str) -> bool:
+    """Equality, plus a MULTI-WORD tag carrying a short locale suffix.
+
+    The second form exists for "amzn mktp us": Amazon's descriptor appends a country code to the
+    tag, so exact equality against "amzn mktp" misses it and the aggregator becomes the pin —
+    every marketplace seller then matching it verified, the F2 hole in a different costume.
+
+    Both extra conditions are load-bearing, and the first cut of this function had neither:
+
+      MULTI-WORD tag — a bare `startswith(tag + " ")` over single-word tags swallows real
+        merchants. "square enix" starts with "square ", and an earlier version of this function
+        classified Square Enix as an acquirer while its own docstring claimed it did not.
+      SHORT suffix — a locale code, not a word. "amzn mktp us" yes; a hypothetical
+        "amzn mktp superstore" is not something we should silently treat as the aggregator.
+
+    A single-word tag therefore matches only on equality. That leaves variants like
+    "paypal express" pinnable — more specific than "paypal", so it cannot verify an arbitrary
+    PayPal merchant, which is the property F2 is about.
+    """
+    if candidate in _ACQUIRER_TAGS:
+        return True
+    for tag in _ACQUIRER_TAGS:
+        if " " not in tag or not candidate.startswith(tag + " "):
+            continue
+        suffix = candidate[len(tag) + 1:].strip()
+        if suffix and len(suffix) <= 3 and suffix.isalpha():
+            return True
+    return False
+
+
 def normalize_descriptor(value: Optional[str]) -> str:
     """The ONE descriptor normalizer. A second implementation would silently un-pin every
     merchant, because the registry stores what this function produced.
 
-    casefold -> split on the first '*' and keep the LONGER side -> non-alphanumerics to
-    spaces -> collapse whitespace.
+    casefold -> pick a side of the first '*' -> non-alphanumerics to spaces -> collapse.
 
-      "ACME Store, Inc.*1234"  ->  "acme store inc"     (suffix tag dropped)
-      "SQ *HONEST SHOP"        ->  "honest shop"        (acquirer PREFIX dropped)
-      "acme-store inc"         ->  "acme store inc"
+      "ACME Store, Inc.*1234"  ->  "acme store inc"   (suffix tag dropped)
+      "PAYPAL *ACME"           ->  "acme"             (acquirer PREFIX dropped)
+      "PAYPAL *EVIL"           ->  "evil"             (...and so these two do NOT collide)
+      "SQ *HONEST SHOP"        ->  "honest shop"
+      "ACME STORE*SQ"          ->  "acme store"       (denylist rejects the longer side)
+      "*ACME"                  ->  "acme"
+      "ACME*"                  ->  "acme"
 
-    WHY THE LONGER SIDE, AND WHAT THAT HEURISTIC IS WORTH. Acquirers put their tag on either
-    side of the '*': "ACME STORE*1234" (suffix) and "SQ *ACME STORE", "PAYPAL *ACME",
-    "TST* ACME" (prefix) are all in the wild. An earlier cut of this function always kept the
-    PREFIX, which mapped every Square merchant to "sq" — and because the first authorization for
-    a domain PINS what it saw, that pinned "sq" and then approved any other Square merchant
-    against it with merchant_verified=true. The tag is short and the merchant name is not, so
-    the longer side is the better guess; it is a heuristic and not a rule, which is exactly why
-    MIN_PINNABLE_ALNUM exists as the second line of defence: a side that wins and still carries
-    no identity is refused as a pin rather than trusted as one.
+    HOW THE SIDE IS CHOSEN, and why "longer wins" was not enough. The previous rule kept the
+    longer side, which silently keeps the ACQUIRER whenever its tag is at least as long as the
+    merchant name: "PAYPAL *ACME" pinned "paypal", and the next authorization for that domain —
+    "PAYPAL *EVIL", a completely different merchant — matched that pin and was approved
+    merchant_verified=TRUE. Same for STRIPE, SQUARE, SUMUP, SHOPIFY and TOAST against any short
+    merchant name. Length is not evidence of identity.
+
+    So there are now three filters, in order:
+      1. SHAPE. A short, tag-shaped run immediately left of the star is an acquirer prefix, and
+         the RIGHT side wins regardless of length.
+      2. DENYLIST. Whichever side would win, a side that IS a known acquirer tag is skipped in
+         favour of the other. This catches suffix placement ("ACME STORE*SQ") and any prefix the
+         shape rule misses.
+      3. LENGTH, only as the tiebreak once neither of the above applies.
+    And `is_pinnable` remains the backstop: a winner that carries no identity is never learned.
+
+    Worked example of all three, "AMZN MKTP US*2A3B4": the shape rule declines to fire because
+    "2a3b4" has fewer than MIN_PINNABLE_LETTERS letters, so length picks "amzn mktp us" — which
+    _is_acquirer_tag catches on the "amzn mktp" boundary — leaving "2a3b4", which is_pinnable
+    then refuses. The domain stays UNLEARNED and keeps approving merchant_verified=false. That
+    is the intended outcome: pinning the aggregator would verify every marketplace seller, and
+    pinning the order id would decline that merchant's every later order.
+
+    KNOWN LIMITS, because this is a heuristic and pretending otherwise is how the last version
+    shipped a hole. A short real merchant name in front of a star, followed by something that
+    reads as a name, is taken as a tag ("SQUARE ENIX*GIFT CARD" -> "gift card"). An aggregator
+    absent from the denylist whose trailing token IS a plausible name pins that token. Both fail
+    CLOSED — a wrong descriptor still has to match a pin before anything is approved — and both
+    are recoverable with the runbook's unpin / manual-pin recipe. Neither can approve an
+    unrelated merchant against a pin learned from a different one, which is the property that
+    matters and the one the longer-side rule did not have.
     """
     raw = (value or "").casefold().strip()
-    if "*" in raw:
-        left, _, right = raw.partition("*")
-        left_norm, right_norm = _scrub(left), _scrub(right)
-        return left_norm if len(left_norm) >= len(right_norm) else right_norm
-    return _scrub(raw)
+    if "*" not in raw:
+        return _scrub(raw)
+
+    left, _, right = raw.partition("*")
+    left_norm, right_norm = _scrub(left), _scrub(right)
+
+    # The shape rule only fires when the OTHER side actually looks like a name. Without that
+    # condition "ACME Store*4471" — a merchant with an order-number suffix, one of the most
+    # common descriptor shapes there is — reads as an acquirer prefix and pins "4471".
+    if _ACQUIRER_PREFIX_RE.match(raw) and _letter_count(right_norm) >= MIN_PINNABLE_LETTERS:
+        ordered = (right_norm, left_norm)
+    elif len(left_norm) >= len(right_norm):
+        ordered = (left_norm, right_norm)
+    else:
+        ordered = (right_norm, left_norm)
+
+    for candidate in ordered:
+        if candidate and not _is_acquirer_tag(candidate):
+            return candidate
+    # Both sides are empty or both are acquirer tags — nothing here identifies a merchant.
+    # Returned as-is so is_pinnable refuses it rather than the registry learning a tag.
+    return ordered[0]
 
 
 def is_pinnable(name_norm: str) -> bool:
@@ -326,7 +450,15 @@ def is_pinnable(name_norm: str) -> bool:
     safer, because the cap, the single use and the expiry still bound it, and every one of its
     authorizations is queryable as merchant_verified=false.
     """
-    return sum(1 for ch in name_norm if ch.isalnum()) >= MIN_PINNABLE_ALNUM
+    return (
+        sum(1 for ch in name_norm if ch.isalnum()) >= MIN_PINNABLE_ALNUM
+        and _letter_count(name_norm) >= MIN_PINNABLE_LETTERS
+        # A descriptor that is NOTHING BUT an acquirer tag reaches here whenever the other side
+        # of the star is empty ("PAYPAL *"), and "paypal" clears both length floors. Refusing it
+        # here is the backstop for the one case normalize_descriptor cannot resolve: there is no
+        # merchant name in the string to prefer.
+        and not _is_acquirer_tag(name_norm)
+    )
 
 
 def _is_expired(expires_at: Any, now: datetime) -> bool:
@@ -342,33 +474,81 @@ def _is_expired(expires_at: Any, now: datetime) -> bool:
     return expires_at <= now
 
 
-async def _match_or_pin(request: AuthorizationRequest, merchant_domain: str) -> Optional[bool]:
-    """Rule (g). Returns True (matched a pin), False (not verified — the domain had no pins), or
-    None (the domain has pins and this descriptor is not one of them => decline).
+def _names_match(pinned: str, incoming: str) -> bool:
+    """Whether two normalized descriptors name the same merchant.
 
-    False covers TWO cases that must not be conflated in code even though they answer alike:
-    the domain had no pins and we LEARNED this descriptor, and the domain had no pins and the
-    descriptor was too weak to learn, so the domain stays unlearned. Both approve
-    merchant_verified=false; only the first writes.
+    Exact equality, plus one deliberate relaxation: a STORE/LOCATION NUMBER suffix.
+    "acme store" and "acme store 0412" are the same merchant at two branches, and the acquirer
+    is free to send either — but as separate pins they split the domain, and the first buyer to
+    hit the other branch is declined merchant_mismatch on a perfectly good card.
+
+    The relaxation is deliberately narrow: one name must be a prefix of the other AND the entire
+    remainder must be digits and whitespace. "acme store" therefore matches "acme store 0412"
+    but NOT "acme storefront", which is a different merchant whose name merely starts the same
+    way. Anything alphabetic in the remainder means no match.
+    """
+    if pinned == incoming:
+        return True
+    longer, shorter = (pinned, incoming) if len(pinned) >= len(incoming) else (incoming, pinned)
+    if not shorter or not longer.startswith(shorter):
+        return False
+    remainder = longer[len(shorter):]
+    if not remainder.strip():
+        return False
+    return all(ch.isdigit() or ch.isspace() for ch in remainder)
+
+
+# A registry write the decision EARNED but has not committed: ("pin", kwargs) or ("touch", id).
+# Deferred rather than performed inline — see _evaluate's return and decide()'s ordering.
+_PendingRegistryWrite = Optional[Tuple[str, Any]]
+
+
+async def _match_registry(
+    request: AuthorizationRequest, merchant_domain: str
+) -> Tuple[Optional[bool], _PendingRegistryWrite]:
+    """Rule (g), as a PURE decision plus the registry write it implies.
+
+    Returns (verified, pending):
+      (True,  ("touch", id))   matched a pin — bump its counters
+      (False, ("pin", {...}))  domain had no pins and this descriptor is worth learning
+      (False, None)            domain had no pins and the descriptor carries no identity
+      (None,  None)            domain has pins, none matches => decline
+
+    NOTHING IS WRITTEN HERE, and that is the fix rather than a style choice. This used to write
+    inline, which meant a decision later downgraded to `deadline_exceeded` had ALREADY taught the
+    registry — a decline that pins a descriptor, and bumps seen_count as if it were evidence.
+    The write is now handed back and committed by decide() only if the outcome survives the
+    deadline. See F8.
     """
     name_norm = normalize_descriptor(request.merchant_name)
     country = (request.merchant_country or "").strip().upper()
     pins: List[Dict[str, Any]] = await list_descriptors(merchant_domain)
     if not pins:
-        if is_pinnable(name_norm):
-            await pin_descriptor(
-                merchant_domain=merchant_domain,
-                name_norm=name_norm,
-                country=country,
-                city_norm=normalize_descriptor(request.merchant_city) or None,
-                source="authorization",
-            )
-        return False
+        if not is_pinnable(name_norm):
+            return False, None
+        return False, ("pin", {
+            "merchant_domain": merchant_domain,
+            "name_norm": name_norm,
+            "country": country,
+            "city_norm": normalize_descriptor(request.merchant_city) or None,
+            "source": "authorization",
+        })
     for pin in pins:
-        if pin["name_norm"] == name_norm and (pin["country"] or "") == country:
-            await touch_descriptor(int(pin["id"]))
-            return True
-    return None
+        if _names_match(str(pin["name_norm"]), name_norm) and (pin["country"] or "") == country:
+            # A store-number variant is recorded against the pin it matched — deliberately NOT
+            # as a second pin, or the registry would fan out one entry per branch.
+            return True, ("touch", int(pin["id"]))
+    return None, None
+
+
+async def _commit_registry(pending: _PendingRegistryWrite) -> None:
+    if pending is None:
+        return
+    kind, payload = pending
+    if kind == "pin":
+        await pin_descriptor(**payload)
+    elif kind == "touch":
+        await touch_descriptor(payload)
 
 
 def _select_leg(request: AuthorizationRequest,
@@ -411,7 +591,7 @@ def _select_leg(request: AuthorizationRequest,
 
 
 async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]],
-                    now: datetime) -> Decision:
+                    now: datetime) -> Tuple[Decision, _PendingRegistryWrite]:
     """First failing rule wins. Order is deliberate: identity, then liveness, then the
     single-use reservation, then the channel, then the money, then the merchant — the merchant
     check writes to the registry, so it must not run for a decision already lost."""
@@ -421,7 +601,7 @@ async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]
             "CARD_AUTH_UNKNOWN_CARD", event_id=request.event_id,
             issuer_card_ref=request.card_ref, reason_code="unknown_card",
         )
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "unknown_card")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "unknown_card"), None
 
     card_id = card["card_id"]
 
@@ -435,24 +615,24 @@ async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]
             "CARD_AUTH_AMBIGUOUS_CARD", event_id=request.event_id, card_id=card_id,
             issuer_card_ref=request.card_ref, reason_code="ambiguous_card",
         )
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "ambiguous_card")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "ambiguous_card"), None
 
     # (c) liveness
     if card["status"] != "issued":
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "card_not_live")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "card_not_live"), None
     if _is_expired(card["expires_at"], now):
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "card_expired")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "card_expired"), None
 
     # (d) the single-use reservation. Before the amount work on purpose: a card already spent
     # must decline identically whatever this authorization is for. has_approval counts only
     # approvals that MOVED MONEY (amount_minor > 0), so a $0.00 verification does not burn the
     # card it was checking.
     if card["single_use"] and await has_approval(card_id):
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "already_authorized")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "already_authorized"), None
 
     # (e) channel
     if request.channel not in ALLOWED_CHANNELS:
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "channel_not_allowed")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "channel_not_allowed"), None
 
     # (f) the amount, IN THE CARD'S CURRENCY. See _select_leg for which leg and why.
     card_currency = str(card["currency"] or "").strip().upper()
@@ -464,7 +644,7 @@ async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]
             "CARD_AUTH_CURRENCY_MISMATCH", event_id=request.event_id, card_id=card_id,
             issuer_card_ref=request.card_ref, reason_code="currency_mismatch",
         )
-        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "currency_mismatch")
+        return _decline(REASON_TRANSACTION_NOT_ALLOWED, "currency_mismatch"), None
 
     # (f2) A ZERO-AMOUNT VERIFICATION AUTHORIZATION. Merchants routinely run a $0.00 auth to
     # check a card is live before charging it; declining those declines the purchase that
@@ -472,16 +652,23 @@ async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]
     # reservation and out of nothing else — and it does NOT pin a descriptor: a verification
     # tells us the card works, not that this merchant is the one the card was minted for, and
     # learning from it would let a zero-cost probe teach the registry.
+    if request.amount_malformed:
+        # Before the zero check and before major_to_minor: a malformed leg is refused on its own
+        # evidence, not on whatever its sibling happened to contain.
+        return _decline(
+            REASON_TRANSACTION_NOT_ALLOWED, "amount_unparseable", currency=card_currency
+        ), None
+
     if raw_amount is not None and raw_amount == 0:
         return _approve(
             reason_code="zero_amount_verification", amount_minor=0, currency=card_currency
-        )
+        ), None
 
     amount_minor = major_to_minor(raw_amount, card_currency) if raw_amount is not None else None
     if amount_minor is None:
         return _decline(
             REASON_TRANSACTION_NOT_ALLOWED, "amount_unparseable", currency=card_currency
-        )
+        ), None
 
     # (f3) the cap, CUMULATIVELY. For a single-use card the sum is provably 0 (rule (d) above
     # declined anything with a prior spend approval), so this is the same comparison it always
@@ -497,10 +684,12 @@ async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]
         return _decline(
             REASON_INSUFFICIENT_BALANCE, "over_cap",
             amount_minor=amount_minor, currency=card_currency,
-        )
+        ), None
 
-    # (g) merchant
-    verified = await _match_or_pin(request, card["merchant_domain"])
+    # (g) merchant. The registry WRITE this implies is returned, not performed — decide()
+    # commits it only after the deadline check, so a downgraded decline never teaches the
+    # registry (F8).
+    verified, pending_write = await _match_registry(request, card["merchant_domain"])
     if verified is None:
         alarm(
             "CARD_AUTH_MERCHANT_MISMATCH", event_id=request.event_id, card_id=card_id,
@@ -509,12 +698,12 @@ async def _evaluate(request: AuthorizationRequest, card: Optional[Dict[str, Any]
         return _decline(
             REASON_TRANSACTION_NOT_ALLOWED, "merchant_mismatch",
             amount_minor=amount_minor, currency=card_currency,
-        )
+        ), None
 
     # (h)
     return _approve(
         amount_minor=amount_minor, currency=card_currency, merchant_verified=verified
-    )
+    ), pending_write
 
 
 def _decision_values(request: AuthorizationRequest, card: Optional[Dict[str, Any]],
@@ -617,7 +806,7 @@ async def decide(request: AuthorizationRequest, started_at: float) -> Decision:
             return _stored_decision(stored)
 
         card = await find_by_issuer_ref(request.card_ref)
-        outcome = await _evaluate(request, card, datetime.now(timezone.utc))
+        outcome, pending_write = await _evaluate(request, card, datetime.now(timezone.utc))
 
         latency_ms = max(0, int((_now_monotonic() - started_at) * 1000))
 
@@ -637,6 +826,14 @@ async def decide(request: AuthorizationRequest, started_at: float) -> Decision:
                 amount_minor=outcome.amount_minor, currency=outcome.currency,
                 merchant_verified=outcome.merchant_verified,
             )
+            # ...and the registry write this decision had earned is DISCARDED with it. A
+            # deadline_exceeded row is a decline; letting it pin a descriptor, or bump a pin's
+            # seen_count, would record the authorization as evidence about the merchant when
+            # nobody acted on it. seen_count is an operator's confidence signal and must count
+            # only decisions that stood.
+            pending_write = None
+
+        await _commit_registry(pending_write)
 
         claimed = await record_decision(
             _decision_values(request, card, outcome, latency_ms)

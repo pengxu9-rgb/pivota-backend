@@ -79,8 +79,16 @@ The 200 response carries `id`, `name`, `url`, `status`, `mode`, `lastUsedAt`, `c
 `updatedAt` — and **`signingSecret`**.
 
 > `signingSecret` is **returned exactly once** and cannot be retrieved again. Put it into
-> `REAP_AUTH_WEBHOOK_SECRET` from the API response, before you close the terminal. Losing it
-> means deleting the endpoint and registering a new one.
+> `REAP_AUTH_WEBHOOK_SECRET` from the API response, before you close the terminal.
+>
+> **If it is lost, ROTATE — do not delete and re-register.** `POST /webhooks/{id}/rotate-secret`
+> returns a fresh secret (again, exactly once). Deleting the REQUEST endpoint to recreate it
+> leaves the project with no authorization receiver in the gap, and every authorization in that
+> window is declined. Rotation is not free either: per Reap's docs the previous secret is
+> **invalidated immediately**, so any in-flight request signed with the old one fails
+> verification at our 401 — deploy the new value promptly, and expect a brief burst of declines.
+> (Reap retries *notification* deliveries automatically; an authorization REQUEST is synchronous
+> and simply declines.)
 
 Prod host is `api.pivota.cc` — the ops API answers only there.
 
@@ -99,9 +107,12 @@ v1 = HMAC-SHA256(signingSecret, "{t}.{raw_body}")     # hex
   unreplayable; without it, one observed approval could be re-spent until the card expires.
 
 One implementation, shared with the notification receiver:
-`services/reap_webhooks.verify_signature`. It also still accepts the older bare-hex /
-`sha256=<hex>` form that endpoint was registered with — not a downgrade path, since that form
-signs a different message (`{body}` rather than `{t}.{body}`) and still requires the secret.
+`services/reap_webhooks.verify_signature`, shared with the notification receiver.
+
+**The `t=`/`v1=` form is the only accepted form.** A bare hex digest, or the `sha256=<hex>`
+shape some providers use, is **rejected** — a signature with no timestamp has no replay window,
+and on a decision endpoint a replayable approval re-spends a card. A header missing either half
+is not "partially signed", it is unsigned.
 
 ## The decision rules
 
@@ -161,12 +172,30 @@ authorizations for one card both see no prior APPROVE and both approve — a cap
 `tests/test_reap_external_auth_postgres.py` reproduces exactly that (2 APPROVE rows) and then
 shows the same interleaving yielding 1 with the lock taken. Different cards stay concurrent.
 
-**(f) Which amount.** Reap sends a billing pair (`currency`/`amount`) and the merchant's
-presentment pair (`originalCurrency`/`originalAmount`), both as decimal **major-unit** numbers.
-The cap is in the card's currency, so we compare whichever pair is denominated in it —
-presentment first, because that is the number the merchant actually charged. Neither being in
-the card's currency means an FX conversion we did not authorize stands between the charge and
-the cap, so the cap is not enforceable and we decline.
+**(f) Which amount.** Reap sends a billing pair (`currency`/`amount` — what actually debits the
+account) and the merchant's presentment pair (`originalCurrency`/`originalAmount` — the currency
+the merchant charged in), both as decimal **major-unit** numbers. The cap is in the card's
+currency, so the rule is:
+
+| Which legs are in the card's currency | Amount enforced against the cap |
+|---|---|
+| **both** (a domestic transaction) | **`max(billing, presentment)`** |
+| presentment only (billing is foreign) | presentment |
+| billing only | billing |
+| neither | DECLINE `currency_mismatch` |
+
+Reap's docs state that for a domestic transaction "both currency pairs are identical and the
+conversion rate is 1.0", so when both legs are the card's currency they are *supposed* to agree
+and `max` costs nothing. A request where they disagree is anomalous, and taking the larger is
+what stops `originalAmount: 0.01` alongside `amount: 999999.00` from passing a cap check for one
+minor unit while the account is debited a million. Presentment-first survives only where it is
+actually informative — a **foreign** billing leg, where the merchant's own number is the one our
+cap was quoted in. Neither leg in the card's currency means an FX conversion we did not
+authorize stands between the charge and the cap, so the cap is not enforceable and we decline.
+
+If **either** amount field is present but unparseable (a non-finite `NaN`/`Infinity`, a
+non-numeric string), the decision is `amount_unparseable` regardless of what the other leg says
+— a poisoned leg must not silently defer to its sibling.
 
 Amounts are **refused, never rounded**: `1.005 USD` and `500.5 JPY` decline with
 `amount_unparseable`. Every rounding rule picks a direction, and on a spending cap both
@@ -181,16 +210,33 @@ strength of the other constraints and pins what it saw (`source='authorization'`
 `(name_norm, country)`. The exposure that buys is bounded by exactly one authorization, at or
 below a cap we set, on a single-use card that expires.
 
-Descriptors normalize by: casefold → split on the first `*` and keep the **longer** side →
-punctuation to spaces → collapse whitespace.
+Descriptors normalize by: casefold → pick a side of the first `*` → punctuation to spaces →
+collapse whitespace. The side is picked by three filters in order — **shape** (a short tag-like
+run immediately left of the star loses, provided the right side actually reads like a name),
+**denylist** (a side that IS a known acquirer/aggregator tag loses), then **length** as the
+tiebreak. `is_pinnable` is the backstop: at least 3 alphanumerics, at least 3 **letters**, and
+never a known tag.
 
-| Raw descriptor | `name_norm` |
-|---|---|
-| `ACME Store, Inc.*1234` | `acme store inc` |
-| `SQ *HONEST SHOP` | `honest shop` |
-| `PAYPAL *ACME STORE` | `acme store` |
-| `SQ *` | `sq` — **not pinnable** |
-| `***` | `` — **not pinnable** |
+| Raw descriptor | `name_norm` | Learned? |
+|---|---|---|
+| `ACME Store, Inc.*1234` | `acme store inc` | yes |
+| `ACME Store*4471` | `acme store` | yes — an order-number suffix, not an acquirer prefix |
+| `PAYPAL *ACME` | `acme` | yes |
+| `PAYPAL *EVIL` | `evil` | yes — and **not** the same pin as the line above |
+| `SQ *HONEST SHOP` | `honest shop` | yes |
+| `ACME STORE*SQ` | `acme store` | yes — the denylist rejects the longer side |
+| `ACME*` | `acme` | yes |
+| `*ACME` | `acme` | yes |
+| `AMZN MKTP US*2A3B4` | `2a3b4` | **no** — too few letters |
+| `SQ *` | `sq` | **no** — a bare acquirer tag |
+| `***` | `` | **no** |
+
+`AMZN MKTP US*2A3B4` is the case worth understanding, because all three filters have to
+cooperate: the shape rule declines to fire (too few letters right of the star), length picks
+`amzn mktp us`, the denylist catches that on the `amzn mktp` boundary, and `is_pinnable` refuses
+what remains. The domain stays **unlearned** and keeps approving `merchant_verified=false`.
+That is intended — pinning the aggregator would verify every marketplace seller, and pinning the
+order id would decline that merchant's every later order.
 
 > **A WRONG PIN IS NOT HARMLESS.** An earlier version of this runbook said the `*` handling
 > "mis-approves nothing, because a wrong descriptor still has to match a pin". **That was
@@ -201,11 +247,26 @@ punctuation to spaces → collapse whitespace.
 > wrong pin does not merely fail to protect; it manufactures positive evidence for an unrelated
 > merchant.
 >
-> Two guards now. The longer-side split is a **heuristic** (acquirer tags are short, merchant
-> names are not) and can still be wrong — so `is_pinnable` refuses to *learn* any descriptor
-> carrying fewer than 3 alphanumerics. Such an authorization still approves, at
-> `merchant_verified=false`, and the domain simply stays unlearned. That is strictly safer: the
-> cap, the single use and the expiry still bound it, and every weak decision is queryable.
+> **The longer-side rule that replaced it was also wrong**, in the same shape: length is not
+> evidence of identity, so it kept the ACQUIRER whenever its tag was at least as long as the
+> merchant name. `PAYPAL *ACME` pinned `paypal`, and `PAYPAL *EVIL` — a different merchant —
+> then matched that pin and was approved `merchant_verified=true`. Same for STRIPE, SQUARE,
+> SUMUP, SHOPIFY and TOAST against any short merchant name.
+>
+> Hence the current three filters (shape, denylist, length) plus `is_pinnable`. The shape rule
+> is still a **heuristic** and can still be wrong — a short real merchant name in front of a
+> star followed by something that reads like a name is taken as a tag. What the heuristic no
+> longer does is let one merchant's authorization verify a *different* merchant behind the same
+> acquirer, which is the property that matters. An authorization whose descriptor cannot be
+> trusted still approves, at `merchant_verified=false`, and the domain stays unlearned —
+> strictly safer: the cap, the single use and the expiry still bound it, and every weak decision
+> is queryable.
+
+**Branch numbers do not split a pin.** A pinned `acme store` also matches `acme store 0412`:
+one name being a prefix of the other with a purely **digits-and-whitespace** remainder is the
+same merchant at another location, recorded against the existing pin rather than creating a
+second one. Anything alphabetic in the remainder is a different merchant — `acme storefront`
+does **not** match `acme store` — because otherwise the relaxation would be a wildcard.
 
 **Nothing here touches `agent_issued_cards`.** `apply_auth_approved` is guarded on
 `status='issued'` and alarms `AUTH_ON_NON_ISSUED_CARD` otherwise — so a decision that exhausted

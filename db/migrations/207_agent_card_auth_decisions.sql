@@ -45,9 +45,12 @@ CREATE TABLE IF NOT EXISTS agent_card_auth_decisions (
     -- APPROVE (an approval carries no reason on the wire).
     reason VARCHAR(32),
 
-    -- Ours. The rule that fired: approved | unknown_card | card_not_live | card_expired |
-    -- already_authorized | channel_not_allowed | currency_mismatch | amount_unparseable |
-    -- over_cap | merchant_mismatch. NOT NULL — every path names its rule.
+    -- Ours. The rule that fired, and the column ops actually queries:
+    --   approved | zero_amount_verification            (the two APPROVE codes)
+    --   unknown_card | ambiguous_card | card_not_live | card_expired | already_authorized |
+    --   channel_not_allowed | currency_mismatch | amount_unparseable | over_cap |
+    --   merchant_mismatch | deadline_exceeded          (the DECLINE codes)
+    -- NOT NULL — every path names its rule.
     reason_code VARCHAR(48) NOT NULL,
 
     -- The amount IN THE CARD'S CURRENCY, minor units, as the cap comparison saw it. NULL when
@@ -128,3 +131,24 @@ CREATE TABLE IF NOT EXISTS agent_card_merchant_descriptors (
 -- The lookup every decision runs: all pins for this card's merchant_domain.
 CREATE INDEX IF NOT EXISTS idx_agent_card_merchant_descriptors_domain
     ON agent_card_merchant_descriptors (merchant_domain);
+
+
+-- THE ISSUER-REF INDEX THE AUTHORIZATION PATH NEEDS.
+--
+-- Migration 202 already indexes agent_issued_cards (issuer_card_ref) for the webhook receiver,
+-- but production deploys skip db/migrations/ and the composite below serves BOTH reads the live
+-- decision makes, INSIDE the per-card advisory lock and inside Reap's 1.6-second budget:
+--
+--   find_by_issuer_ref         WHERE issuer_card_ref = ? ORDER BY (status='issued') DESC, ...
+--   count_issued_by_issuer_ref WHERE issuer_card_ref = ? AND status = 'issued'
+--
+-- Without it the first is a Seq Scan over every card ever minted and the second reaches for
+-- (agent_id, status), which is the wrong leading column and scans every issued card. Both
+-- degrade with table size while holding a lock that serializes an entire card's authorizations
+-- — the shape where a slow query stops being slow and starts being a DECLINED CARD.
+--
+-- Composite on (issuer_card_ref, status) rather than the bare column: status is the count's
+-- filter and the lookup's sort key, so it belongs in the index rather than costing a heap
+-- fetch per candidate row.
+CREATE INDEX IF NOT EXISTS idx_agent_issued_cards_issuer_ref_status
+    ON agent_issued_cards (issuer_card_ref, status);

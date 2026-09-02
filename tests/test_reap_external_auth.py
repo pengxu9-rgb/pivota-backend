@@ -874,13 +874,22 @@ def test_parse_authorization_request_allowlists_the_body():
     digitalWallet, postCode, mccCategory and occurredAt are dropped at the door."""
     from services.reap_external_auth import parse_authorization_request
 
-    parsed = parse_authorization_request(_request())
+    # Round-tripped through the wire encoding the route uses. Parsing the dict directly would
+    # feed _amount raw Python floats, which it refuses by design — so the fixture would look
+    # malformed and the assertion below would be testing the fixture, not the allowlist.
+    parsed = parse_authorization_request(
+        json.loads(json.dumps(_request()), parse_float=Decimal)
+    )
     assert parsed is not None
     fields = set(vars(parsed))
     assert fields == {
         "event_id", "card_ref", "channel", "currency", "amount", "original_currency",
         "original_amount", "merchant_name", "merchant_city", "merchant_country", "mcc",
+        # Derived at parse time, not copied from the body: whether an amount field was PRESENT
+        # and unparseable, which must not be confused with absent.
+        "amount_malformed",
     }
+    assert parsed.amount_malformed is False
     assert parse_authorization_request({"type": "CARD_AUTHORIZATION_REQUEST"}) is None
     assert parse_authorization_request({"data": {"eventId": "e"}}) is None   # no cardId
     assert parse_authorization_request("not a dict") is None
@@ -1336,3 +1345,338 @@ def test_a_chunked_oversized_body_is_refused_with_no_content_length(rig):
     )
     assert response.status_code == 413
     assert state["recorded"] == []
+
+
+# ============================================================================================
+# Second review round
+# ============================================================================================
+
+# --- F1: non-finite Decimals never reach arithmetic ------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["NaN", "sNaN", "Infinity", "-Infinity", "nan", "inf"])
+@pytest.mark.parametrize("leg", ["billing", "presentment", "both"])
+def test_a_non_finite_amount_declines_with_a_row(rig, text, leg):
+    """`Decimal("NaN")` parses happily from a JSON STRING, and then poisons arithmetic two
+    different ways: NaN in `max(legs)` when both legs are the card's currency, and a SIGNALLING
+    NaN in `raw_amount == 0`. Both raise decimal.InvalidOperation — a 500 with no decision row,
+    on the one path whose premise is that every decision is recorded."""
+    client, state = rig
+    billing = text if leg in ("billing", "both") else 42.50
+    presentment = text if leg in ("presentment", "both") else 42.50
+    r = _post(client, _request(currency="USD", amount=billing,
+                               originalCurrency="USD", originalAmount=presentment))
+    _assert_declined(r, state, "TRANSACTION_NOT_ALLOWED", "amount_unparseable")
+    assert _row(state)["amount_minor"] is None
+
+
+def test_a_non_finite_amount_leaves_no_traceback(rig, caplog):
+    """The exception path is the one place authorization content reaches a log line."""
+    client, state = rig
+    with _capture(caplog, logging.DEBUG):
+        r = _post(client, _request(currency="USD", amount="sNaN",
+                                   originalCurrency="USD", originalAmount="sNaN"))
+    assert r.status_code == 200
+    assert "Traceback" not in caplog.text
+    assert "InvalidOperation" not in caplog.text
+    for fragment in ("NaN", "sNaN", "ACME", "Berlin"):
+        assert fragment not in caplog.text, f"{fragment!r} reached a log line"
+
+
+@pytest.mark.parametrize("raw", ["NaN", "sNaN", "Infinity", "-Infinity"])
+def test_amount_parser_refuses_non_finite(raw):
+    """Pinned at the unit seam too: the guard belongs at the PARSE door, so every later stage
+    can assume a finite number rather than each re-deriving that obligation."""
+    from decimal import Decimal
+
+    from services.reap_external_auth import _amount
+
+    assert _amount(raw) is None
+    assert _amount(Decimal(raw)) is None
+    assert _amount("42.50") == Decimal("42.50")
+
+
+# --- F2: an acquirer tag must never become a merchant pin -------------------------------------
+
+
+@pytest.mark.parametrize("tag", ["PAYPAL", "STRIPE", "SQUARE", "SUMUP", "SHOPIFY", "TOAST", "SQ"])
+def test_two_merchants_behind_one_acquirer_do_not_share_a_pin(tag):
+    """The F2 hole. "longer side wins" keeps the ACQUIRER whenever its tag is at least as long
+    as the merchant name, so `PAYPAL *ACME` pinned "paypal" — and `PAYPAL *EVIL`, a completely
+    different merchant, then matched that pin and was approved merchant_verified=TRUE."""
+    honest = normalize_descriptor(f"{tag} *ACME")
+    evil = normalize_descriptor(f"{tag} *EVIL")
+    assert honest == "acme", (tag, honest)
+    assert evil == "evil", (tag, evil)
+    assert honest != evil
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("PAYPAL *ACME", "acme"),
+    ("PAYPAL *EVIL", "evil"),
+    ("SQ *HONEST SHOP", "honest shop"),
+    ("ACME Store*4471", "acme store"),      # order-number SUFFIX, not an acquirer prefix
+    ("ACME Store, Inc.*1234", "acme store inc"),
+    ("ACME STORE*SQ", "acme store"),        # denylist rejects the longer side
+    ("ACME*", "acme"),
+    ("*ACME", "acme"),
+    ("TST* ACME STORE", "acme store"),
+    ("AMZN MKTP US*2A3B4", "2a3b4"),        # ...and is_pinnable then refuses it
+])
+def test_descriptor_normalization_table(raw, expected):
+    """The exact table the runbook documents. If these drift apart the runbook is lying."""
+    assert normalize_descriptor(raw) == expected
+
+
+def test_an_acquirer_tag_is_never_pinnable():
+    from services.reap_external_auth import _ACQUIRER_TAGS, is_pinnable
+
+    for tag in _ACQUIRER_TAGS:
+        # Either it normalizes away from the tag, or it is refused as a pin. Never learned.
+        assert not is_pinnable(normalize_descriptor(f"{tag} *")) or \
+            normalize_descriptor(f"{tag} *") != tag, tag
+
+
+def test_the_amazon_aggregator_is_not_learned():
+    """Worked end to end because all three filters have to cooperate: the shape rule declines
+    (too few letters right of the star), length picks the aggregator, the denylist catches it on
+    a word boundary, and is_pinnable refuses what is left. The domain stays UNLEARNED — safer
+    than pinning the aggregator (every marketplace seller verified) or the order id (that
+    merchant's every later order declined)."""
+    from services.reap_external_auth import is_pinnable
+
+    assert normalize_descriptor("AMZN MKTP US*2A3B4") == "2a3b4"
+    assert is_pinnable("2a3b4") is False
+
+
+def test_a_real_merchant_name_resembling_a_tag_still_works():
+    """The denylist compares whole tokens, so a merchant genuinely called "Square Enix" is not
+    mistaken for "square"."""
+    from services.reap_external_auth import is_pinnable
+
+    assert normalize_descriptor("SQUARE ENIX") == "square enix"
+    assert is_pinnable("square enix") is True
+
+
+def test_an_acquirer_domain_declines_the_second_merchant(rig):
+    """End to end: pin from `PAYPAL *ACME`, then `PAYPAL *EVIL` on the same domain must be a
+    merchant_mismatch DECLINE, not a verified approval."""
+    client, state = rig
+    body = _request()
+    body["data"]["merchant"]["name"] = "PAYPAL *ACME"
+    assert _post(client, body).json() == {"decision": "APPROVE"}
+    assert state["pins"][0]["name_norm"] == "acme"
+
+    state["recorded"].clear()
+    evil = _request(eventId="evt_evil")
+    evil["data"]["merchant"]["name"] = "PAYPAL *EVIL"
+    r = _post(client, evil)
+    assert r.json() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert _row(state, "evt_evil")["reason_code"] == "merchant_mismatch"
+
+
+# --- F9: store-number suffixes are the same merchant ------------------------------------------
+
+
+@pytest.mark.parametrize("pinned,incoming", [
+    ("acme store", "acme store 0412"),
+    ("acme store 0412", "acme store"),
+    ("acme store", "acme store 7"),
+    ("acme store", "acme store  12 34"),
+])
+def test_a_store_number_suffix_matches_its_pin(pinned, incoming):
+    from services.reap_external_auth import _names_match
+
+    assert _names_match(pinned, incoming) is True
+
+
+@pytest.mark.parametrize("pinned,incoming", [
+    ("acme store", "acme storefront"),     # a different merchant that merely starts the same
+    ("acme store", "acme store west"),
+    ("acme store", "acme store 12a"),      # 'a' is not a location number
+    ("acme store", "beta store"),
+    ("acme store", ""),
+])
+def test_a_non_numeric_suffix_does_not_match(pinned, incoming):
+    from services.reap_external_auth import _names_match
+
+    assert _names_match(pinned, incoming) is False
+
+
+def test_a_branch_number_approves_without_creating_a_second_pin(rig):
+    """Legitimate suffix variants used to split a domain's pins, so the first buyer routed to
+    another branch was declined on a perfectly good card."""
+    client, state = rig
+    state["descriptors"].append({
+        "id": 7, "merchant_domain": "shop.example.com", "name_norm": "acme store",
+        "country": "DE", "city_norm": None, "source": "authorization", "seen_count": 1,
+    })
+    body = _request()
+    body["data"]["merchant"]["name"] = "ACME STORE 0412"
+    r = _post(client, body)
+    assert r.json() == {"decision": "APPROVE"}
+    assert _row(state)["merchant_verified"] is True
+    assert state["touches"] == [7]
+    assert state["pins"] == [], "a branch variant created a second pin"
+
+
+# --- F8: a downgraded decline must not teach the registry -------------------------------------
+
+
+def test_a_deadline_downgrade_writes_no_pin(rig, monkeypatch):
+    """The registry write used to happen inside _evaluate, before the downgrade — so a
+    deadline_exceeded DECLINE still pinned a descriptor. seen_count is an operator's confidence
+    signal and must count only decisions that stood."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    monkeypatch.setenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", "1")
+    monkeypatch.setattr(svc, "_now_monotonic", lambda: time.monotonic() + 10.0)
+    r = _post(client)
+    _assert_declined(r, state, "TRANSACTION_NOT_ALLOWED", "deadline_exceeded")
+    assert state["pins"] == [], "a downgraded decline pinned a descriptor"
+    assert state["touches"] == []
+
+
+def test_a_deadline_downgrade_does_not_bump_an_existing_pin(rig, monkeypatch):
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    state["descriptors"].append({
+        "id": 7, "merchant_domain": "shop.example.com", "name_norm": "acme store",
+        "country": "DE", "city_norm": None, "source": "authorization", "seen_count": 1,
+    })
+    monkeypatch.setenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", "1")
+    monkeypatch.setattr(svc, "_now_monotonic", lambda: time.monotonic() + 10.0)
+    _post(client)
+    assert state["touches"] == [], "a downgraded decline bumped seen_count"
+
+
+def test_an_in_time_approval_still_writes_the_pin(rig):
+    """The positive counterpart: deferring the write must not lose it."""
+    client, state = rig
+    assert _post(client).json() == {"decision": "APPROVE"}
+    assert len(state["pins"]) == 1 and state["pins"][0]["name_norm"] == "acme store"
+
+
+# --- F4: the body is bounded as it is READ, not after -----------------------------------------
+
+
+async def _drive_authorize(body: bytes, *, chunk_size: int, content_length: str | None):
+    """Call the handler with a real starlette Request over a counting receive channel.
+
+    Driven at this seam rather than through TestClient because the claim is about HOW MUCH IS
+    READ, and httpx buffers the request body before the ASGI app ever sees it — a client-level
+    test cannot tell "streamed and aborted early" from "buffered then rejected".
+    """
+    from starlette.requests import Request
+
+    from routes.reap_webhooks import receive_reap_authorization
+
+    sent = {"bytes": 0}
+    headers = [(b"content-type", b"application/json"),
+               (b"x-reap-webhook-signature", _sign(body).encode())]
+    if content_length is not None:
+        headers.append((b"content-length", content_length.encode()))
+
+    offsets = list(range(0, len(body), chunk_size)) or [0]
+
+    async def receive():
+        if not offsets:
+            return {"type": "http.disconnect"}
+        start = offsets.pop(0)
+        piece = body[start:start + chunk_size]
+        sent["bytes"] += len(piece)
+        return {"type": "http.request", "body": piece, "more_body": bool(offsets)}
+
+    scope = {"type": "http", "method": "POST", "path": "/webhooks/reap/authorize",
+             "headers": headers, "query_string": b"", "scheme": "http",
+             "server": ("test", 80), "client": ("test", 1), "http_version": "1.1"}
+    return receive_reap_authorization(Request(scope, receive)), sent
+
+
+async def test_a_lying_small_content_length_does_not_buy_an_unbounded_read(rig):
+    """`await request.body()` buffered the WHOLE body and only then measured it, so a
+    content-length of 10 with 200 KB behind it was fully read into memory before anything
+    refused it. The ceiling was a report, not a limit."""
+    from fastapi import HTTPException
+    from routes.reap_webhooks import MAX_AUTHORIZATION_BODY_BYTES
+
+    client, state = rig
+    chunk = 8192
+    body = b"x" * (200 * 1024)
+    coro, sent = await _drive_authorize(body, chunk_size=chunk, content_length="10")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await coro
+    assert excinfo.value.status_code == 413
+    assert sent["bytes"] <= MAX_AUTHORIZATION_BODY_BYTES + chunk, (
+        f"read {sent['bytes']} bytes of a 200 KB body — the ceiling did not stop the read"
+    )
+    assert sent["bytes"] < len(body), "the whole body was read"
+    assert state["recorded"] == []
+
+
+async def test_a_content_length_over_the_ceiling_is_refused_before_any_read(rig):
+    """Fail-closed on the declared size, deliberately: refused even though the body is small.
+    Reap declares it honestly, so the only traffic this rejects is malformed or hostile."""
+    from fastapi import HTTPException
+    from routes.reap_webhooks import MAX_AUTHORIZATION_BODY_BYTES
+
+    client, state = rig
+    coro, sent = await _drive_authorize(
+        b'{"tiny":1}', chunk_size=8192,
+        content_length=str(MAX_AUTHORIZATION_BODY_BYTES + 1),
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        await coro
+    assert excinfo.value.status_code == 413
+    assert sent["bytes"] == 0, "the body was read despite an over-ceiling content-length"
+
+
+async def test_a_normal_body_is_read_whole_and_decided(rig):
+    """The positive counterpart: a bounded read that refused everything would pass both tests
+    above while breaking the endpoint."""
+    client, state = rig
+    body = json.dumps(_request()).encode()
+    coro, sent = await _drive_authorize(body, chunk_size=64, content_length=str(len(body)))
+    result = await coro
+    assert result == {"decision": "APPROVE"}
+    assert sent["bytes"] == len(body)
+
+
+@pytest.mark.parametrize("tag", ["WORLDPAY", "NEXI", "ELAVON", "GLOBALPAY"])
+def test_an_acquirer_absent_from_the_denylist_is_still_dropped(tag):
+    """The SHAPE rule, isolated.
+
+    Every tag in the F2 table above is on the denylist, so those tests pass with the shape rule
+    deleted — the denylist alone produces the right answer, and a mutant reverting to plain
+    longer-side-wins SURVIVED the whole suite on exactly that. The denylist can only ever list
+    acquirers we already know; the shape rule is what covers the rest, and it needs a tag that
+    is NOT listed and is LONGER than the merchant name to be the deciding filter.
+    """
+    from services.reap_external_auth import _ACQUIRER_TAGS
+
+    assert tag.casefold() not in _ACQUIRER_TAGS, f"{tag} is denylisted — this test proves nothing"
+    honest = normalize_descriptor(f"{tag} *ACME")
+    evil = normalize_descriptor(f"{tag} *EVIL")
+    assert honest == "acme", (tag, honest)
+    assert evil == "evil", (tag, evil)
+    assert honest != evil, f"{tag} collapsed two merchants onto one pin"
+
+
+def test_an_unlisted_acquirer_domain_declines_the_second_merchant(rig):
+    """Same, end to end through the decision: pin from an unlisted acquirer's first merchant,
+    then a different merchant behind that acquirer must be a merchant_mismatch DECLINE."""
+    client, state = rig
+    body = _request()
+    body["data"]["merchant"]["name"] = "WORLDPAY *ACME"
+    assert _post(client, body).json() == {"decision": "APPROVE"}
+    assert state["pins"][0]["name_norm"] == "acme"
+
+    state["recorded"].clear()
+    evil = _request(eventId="evt_wp_evil")
+    evil["data"]["merchant"]["name"] = "WORLDPAY *EVIL"
+    assert _post(client, evil).json() == {"decision": "DECLINE",
+                                          "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert _row(state, "evt_wp_evil")["reason_code"] == "merchant_mismatch"

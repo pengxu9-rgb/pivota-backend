@@ -118,10 +118,15 @@ async def find_by_issuer_ref(issuer_card_ref: str) -> Optional[Dict[str, Any]]:
     row that came back was whatever the plan happened to emit first, which on the external
     authorization path means the CAP and the CURRENCY of an arbitrary one of them.
 
-    ORDER BY created_at DESC LIMIT 1 makes the choice the newest row, deterministically. That is
-    the right default for the webhook path (the latest instrument is the one in play) but it is
-    NOT a safety property on its own: a caller that must not act on an ambiguous card has to
-    detect the ambiguity itself. services.reap_external_auth does, via
+    LIVE ROWS FIRST, then newest. `ORDER BY created_at DESC` alone disagreed with the ambiguity
+    check that guards this function: count_issued_by_issuer_ref counts only 'issued' rows, so one
+    live older row plus one revoked NEWER row counts 1 — not ambiguous — while this lookup
+    returned the revoked one and the decision declined `card_not_live` on a perfectly good card.
+    A re-issue that revokes the old instrument is the ordinary way to reach that state, so the
+    two orderings have to agree on which row is "the" card: the live one.
+
+    Deterministic, but still NOT a safety property on its own — a caller that must not act on an
+    ambiguous card has to detect the ambiguity itself. services.reap_external_auth does, via
     count_issued_by_issuer_ref, and declines `ambiguous_card` rather than picking a cap.
     """
     row = await database.fetch_one(
@@ -131,7 +136,7 @@ async def find_by_issuer_ref(issuer_card_ref: str) -> Optional[Dict[str, Any]]:
                status, single_use, expires_at, auth_count
           FROM agent_issued_cards
          WHERE issuer_card_ref = :ref
-         ORDER BY created_at DESC
+         ORDER BY (status = 'issued') DESC, created_at DESC
          LIMIT 1
         """,
         {"ref": issuer_card_ref},

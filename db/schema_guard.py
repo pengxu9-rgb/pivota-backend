@@ -353,6 +353,16 @@ async def ensure_required_schema_light() -> None:
                         "ON agent_card_merchant_descriptors (merchant_domain);"
                     )
                 )
+                # mig 207 (F5): the composite the LIVE decision reads under its advisory lock.
+                # ALTER-free and on a table born in mig 201, so it heals independently of
+                # whether that migration ever ran here.
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_agent_issued_cards_issuer_ref_status "
+                        "ON agent_issued_cards (issuer_card_ref, status);"
+                    )
+                )
             except Exception:
                 # Same best-effort contract as the enclosing block. The card-rail
                 # decision path is the loud one if this ever silently fails: the

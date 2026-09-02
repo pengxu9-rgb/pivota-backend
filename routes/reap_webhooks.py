@@ -199,6 +199,37 @@ async def receive_reap_webhook(request: Request) -> Dict[str, Any]:
     return {"status": "ok", "handled": event.event_type, "applied": applied}
 
 
+async def _read_bounded_body(request: Request) -> bytes:
+    """Read the request body, aborting the moment it crosses MAX_AUTHORIZATION_BODY_BYTES.
+
+    `await request.body()` buffers the WHOLE body first and only then lets the caller measure
+    it, so a lying-small content-length with a 200 KB body was fully read into memory before
+    anything refused it — the ceiling was a report, not a limit. Streaming with a running total
+    stops at the first chunk that crosses the line: at most the ceiling plus one chunk is ever
+    held.
+
+    Two gates, because neither covers the other. The declared content-length (checked by the
+    caller) refuses before a single byte is read, but it is attacker-supplied and a chunked
+    request has none. This one measures what actually arrived and cannot be lied to.
+
+    DELIBERATELY FAIL-CLOSED ON THE HEADER: a content-length declaring MORE than the ceiling is
+    refused even if the body turns out to be small. Reap's real requests are a few hundred bytes
+    and declare it honestly, so the only traffic this rejects is malformed or hostile — and on
+    a decision endpoint a wrong refusal costs one declined authorization, while a wrong
+    acceptance spends the budget of the next one.
+    """
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_AUTHORIZATION_BODY_BYTES:
+            raise HTTPException(
+                status_code=413, detail="authorization request body too large"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/reap/authorize")
 async def receive_reap_authorization(request: Request) -> Dict[str, str]:
     """POST /webhooks/reap/authorize — Reap's EXTERNAL AUTHORIZATION request (mode: REQUEST).
@@ -240,18 +271,13 @@ async def receive_reap_authorization(request: Request) -> Dict[str, str]:
         # spending decisions with the notification receiver's key.
         raise HTTPException(status_code=503, detail="reap authorization receiver is not configured")
 
-    # SIZE CEILING BEFORE THE HMAC. verify_signature reads every byte it is given, so an
-    # unauthenticated caller can otherwise choose how much work we do — and this endpoint is the
-    # one place where spending that work late is itself the damage: hashing a large body eats
-    # the 1.6s budget for the REAL authorization queued behind it. Checked against the declared
-    # content-length first (cheap, refuses before the read) and then against what was actually
-    # read, because content-length is attacker-supplied and a chunked body has none.
+    # SIZE CEILING BEFORE THE HMAC, and before the body is even buffered. See
+    # _read_bounded_body: the declared content-length is the cheap first gate, and the streaming
+    # read is the one that holds when that header lies or is absent.
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > MAX_AUTHORIZATION_BODY_BYTES:
         raise HTTPException(status_code=413, detail="authorization request body too large")
-    raw = await request.body()
-    if len(raw) > MAX_AUTHORIZATION_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="authorization request body too large")
+    raw = await _read_bounded_body(request)
 
     if not verify_signature(raw, request.headers.get(auth_signature_header_name()), secret):
         raise HTTPException(status_code=401, detail="invalid signature")

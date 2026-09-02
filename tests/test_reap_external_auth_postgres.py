@@ -136,10 +136,28 @@ async def _insert_card(**over) -> Dict[str, Any]:
     return row
 
 
+# Wire field name for each AuthorizationRequest field, so tests can keep naming the dataclass
+# fields while the body is assembled and PARSED the way the route does.
+_WIRE_NAMES = {
+    "event_id": "eventId", "card_ref": "cardId", "channel": "channel", "currency": "currency",
+    "amount": "amount", "original_currency": "originalCurrency",
+    "original_amount": "originalAmount",
+}
+_WIRE_MERCHANT = {"merchant_name": "name", "merchant_city": "city",
+                  "merchant_country": "country", "mcc": "mccCode"}
+
+
 def _request(card_ref: str, **over) -> Any:
+    """Build the wire body and run it through parse_authorization_request.
+
+    Constructing AuthorizationRequest DIRECTLY — which this used to do — skips the parser, and
+    the parser is where several rules live: the non-finite refusal, the float refusal, the
+    present-but-unparseable flag. A malformed-amount test against a hand-built dataclass proves
+    nothing about what a real request does, which is how F1 reached this file's blind spot.
+    """
     from decimal import Decimal
 
-    from services.reap_external_auth import AuthorizationRequest
+    from services.reap_external_auth import parse_authorization_request
 
     fields: Dict[str, Any] = {
         "event_id": f"evt_pg_{uuid.uuid4().hex[:12]}",
@@ -155,7 +173,14 @@ def _request(card_ref: str, **over) -> Any:
         "mcc": "5732",
     }
     fields.update(over)
-    return AuthorizationRequest(**fields)
+
+    data: Dict[str, Any] = {_WIRE_NAMES[k]: fields[k] for k in _WIRE_NAMES}
+    data["merchant"] = {_WIRE_MERCHANT[k]: fields[k] for k in _WIRE_MERCHANT}
+    parsed = parse_authorization_request(
+        {"id": "req", "type": "CARD_AUTHORIZATION_REQUEST", "data": data}
+    )
+    assert parsed is not None, "the test fixture did not survive the parser"
+    return parsed
 
 
 async def _stored(event_id: str) -> Optional[Dict[str, Any]]:
@@ -879,3 +904,284 @@ async def test_has_approval_reserves_only_on_an_approved_spend():
                                amount_minor=4250, currency="USD", reason=None,
                                reason_code="approved"))
     assert await has_approval(card["card_id"]) is True
+
+
+# ============================================================================================
+# Second review round, on real rows
+# ============================================================================================
+
+
+@pytest.mark.parametrize("text", ["NaN", "sNaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("leg", ["billing", "presentment"])
+async def test_a_non_finite_amount_records_a_decline(text, leg):
+    """F1. These parse as Decimals from a JSON string and then raise InvalidOperation inside
+    max() or `== 0` — a 500 with no row, on the path whose premise is that every decision is
+    recorded. Here the row exists."""
+    from decimal import Decimal
+
+    card = await _insert_card()
+    over = {"amount": text, "original_amount": Decimal("42.50")} if leg == "billing" else {
+        "amount": Decimal("42.50"), "original_amount": text}
+    outcome, row = await _decide(card["issuer_card_ref"], **over)
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["reason_code"] == "amount_unparseable"
+    assert row["amount_minor"] is None
+
+
+@pytest.mark.parametrize("tag", ["PAYPAL", "STRIPE", "SQUARE", "SUMUP", "SHOPIFY", "TOAST"])
+async def test_two_merchants_behind_one_acquirer_do_not_share_a_pin(tag):
+    """F2 end to end. The longer-side rule pinned the ACQUIRER whenever its tag was at least as
+    long as the merchant name, so the second merchant behind that acquirer was approved
+    merchant_verified=TRUE against the first one's pin."""
+    from db.database import database
+
+    domain = f"{tag.lower()}shop.example"
+    first = await _insert_card(merchant_domain=domain)
+    outcome, row = await _decide(first["issuer_card_ref"], merchant_name=f"{tag} *ACME")
+    assert outcome.decision == "APPROVE"
+
+    pins = await database.fetch_all(
+        "SELECT name_norm FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": domain},
+    )
+    assert [p["name_norm"] for p in pins] == ["acme"], f"{tag} pinned its own tag"
+
+    second = await _insert_card(merchant_domain=domain)
+    outcome, row = await _decide(second["issuer_card_ref"], merchant_name=f"{tag} *EVIL")
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["reason_code"] == "merchant_mismatch"
+    assert row["merchant_verified"] is False
+
+
+async def test_the_amazon_aggregator_never_becomes_a_pin():
+    """F2's hardest case: neither side identifies a merchant, so the domain must stay unlearned
+    rather than pin the aggregator (verifying every marketplace seller) or the order id
+    (declining that merchant's every later order)."""
+    from db.database import database
+
+    card = await _insert_card(merchant_domain="amzn.example")
+    outcome, row = await _decide(card["issuer_card_ref"], merchant_name="AMZN MKTP US*2A3B4")
+    assert outcome.decision == "APPROVE"
+    assert row["merchant_verified"] is False
+    pins = await database.fetch_all(
+        "SELECT id FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "amzn.example"},
+    )
+    assert pins == []
+
+
+# --- F3: the lookup and the ambiguity check must agree on which row is "the" card -------------
+
+
+@pytest.mark.parametrize("revoke_first", [True, False])
+async def test_a_revoked_newer_sibling_does_not_hide_the_live_card(revoke_first):
+    """`ORDER BY created_at DESC` alone disagreed with count_issued_by_issuer_ref, which counts
+    only 'issued': one live older row plus one revoked NEWER row counts 1 — not ambiguous —
+    while the lookup returned the revoked row and the card declined `card_not_live`. A re-issue
+    that revokes the old instrument is the ordinary way to reach that state.
+
+    Both insertion orders, because an ordering bug that happens to agree with physical row order
+    passes a one-directional test by accident."""
+    from db.database import database
+
+    shared = f"ref_liveorder_{uuid.uuid4().hex[:8]}"
+    if revoke_first:
+        live = await _insert_card(issuer_card_ref=shared, status="issued")
+        dead = await _insert_card(issuer_card_ref=shared, status="revoked")
+    else:
+        dead = await _insert_card(issuer_card_ref=shared, status="revoked")
+        live = await _insert_card(issuer_card_ref=shared, status="issued")
+        await database.execute(
+            "UPDATE agent_issued_cards SET created_at = now() + interval '1 hour' "
+            "WHERE card_id = :c",
+            {"c": dead["card_id"]},
+        )
+
+    from db.agent_issued_cards import find_by_issuer_ref
+
+    found = await find_by_issuer_ref(shared)
+    assert found["card_id"] == live["card_id"], "the lookup returned the revoked sibling"
+
+    outcome, row = await _decide(shared)
+    assert outcome.decision == "APPROVE", row["reason_code"]
+
+
+async def test_among_several_live_rows_the_newest_still_wins():
+    """The tiebreak survives: status first, then recency. (Two live rows also trip
+    ambiguous_card — this asserts the ORDERING, which is what find_by_issuer_ref promises.)"""
+    from db.agent_issued_cards import find_by_issuer_ref
+    from db.database import database
+
+    shared = f"ref_twolive_{uuid.uuid4().hex[:8]}"
+    older = await _insert_card(issuer_card_ref=shared, status="issued", amount_cap_minor=111)
+    newer = await _insert_card(issuer_card_ref=shared, status="issued", amount_cap_minor=222)
+    await database.execute(
+        "UPDATE agent_issued_cards SET created_at = now() - interval '1 day' WHERE card_id = :c",
+        {"c": older["card_id"]},
+    )
+    found = await find_by_issuer_ref(shared)
+    assert found["card_id"] == newer["card_id"]
+
+
+# --- F5: the index the decision reads under its lock ------------------------------------------
+
+
+async def test_both_hot_reads_use_the_issuer_ref_index():
+    """F5. Both of these run INSIDE the per-card advisory lock and inside Reap's 1.6s budget.
+    Production skips db/migrations/, and schema_guard never created migration 202's
+    issuer_card_ref index either — so before this migration prod had NO index on that column and
+    both queries were Seq Scans that degrade with every card ever minted, while holding a lock
+    that serializes an entire card's authorizations.
+
+    Asserting on the PLAN rather than on a duration: a timing assertion on a small test table
+    would pass with the index dropped."""
+    from db.database import database
+
+    # Enough rows that a Seq Scan is genuinely the worse plan. On a ten-row table Postgres
+    # prefers a Seq Scan whatever indexes exist, so the assertion below would fail with the
+    # index present and "pass" nothing useful without it — the table has to be big enough for
+    # the choice to mean something.
+    await database.execute(
+        """
+        INSERT INTO agent_issued_cards (card_id, agent_id, merchant_domain, checkout_id,
+            quote_total_minor, amount_cap_minor, currency, issuer, issuer_card_ref, status,
+            single_use, expires_at)
+        SELECT 'crd_bulk_'||g, 'agent_bulk', 'bulk.example', 'chk', 1000, 1000, 'USD', 'mock',
+               'ref_bulk_'||g, 'issued', TRUE, now() + interval '1 day'
+          FROM generate_series(1, 5000) g
+        """
+    )
+    await database.execute("ANALYZE agent_issued_cards")
+
+    lookup = "\n".join(
+        str(r["QUERY PLAN"]) for r in await database.fetch_all(
+            "EXPLAIN SELECT card_id FROM agent_issued_cards WHERE issuer_card_ref = 'ref_x' "
+            "ORDER BY (status = 'issued') DESC, created_at DESC LIMIT 1"
+        )
+    )
+    assert "idx_agent_issued_cards_issuer_ref_status" in lookup, lookup
+    assert "Seq Scan" not in lookup, lookup
+
+    counted = "\n".join(
+        str(r["QUERY PLAN"]) for r in await database.fetch_all(
+            "EXPLAIN SELECT COUNT(*) FROM agent_issued_cards "
+            "WHERE issuer_card_ref = 'ref_x' AND status = 'issued'"
+        )
+    )
+    assert "idx_agent_issued_cards_issuer_ref_status" in counted, counted
+    assert "Seq Scan" not in counted, counted
+    # The composite carries status, so the count never touches the heap.
+    assert "Index Only Scan" in counted, counted
+
+
+# --- F8: a downgraded decline must not teach the registry --------------------------------------
+
+
+async def test_a_deadline_downgrade_writes_no_pin_on_real_rows():
+    """The registry write used to happen inside _evaluate, before the downgrade — so a
+    deadline_exceeded DECLINE pinned a descriptor and bumped seen_count as if it were
+    evidence."""
+    import services.reap_external_auth as svc
+    from db.database import database
+
+    card = await _insert_card(merchant_domain="deadline.example")
+    original = svc._now_monotonic
+    svc._now_monotonic = lambda: original() + 10.0
+    try:
+        outcome, row = await _decide(card["issuer_card_ref"])
+    finally:
+        svc._now_monotonic = original
+
+    assert row["reason_code"] == "deadline_exceeded"
+    pins = await database.fetch_all(
+        "SELECT id FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "deadline.example"},
+    )
+    assert pins == [], "a downgraded decline taught the registry"
+
+
+async def test_a_deadline_downgrade_does_not_bump_an_existing_pin():
+    import services.reap_external_auth as svc
+    from db.agent_card_auth_decisions import pin_descriptor_manual
+    from db.database import database
+
+    await pin_descriptor_manual("bumpme.example", "ACME Store", "DE")
+    before = await database.fetch_val(
+        "SELECT seen_count FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "bumpme.example"},
+    )
+    card = await _insert_card(merchant_domain="bumpme.example")
+    original = svc._now_monotonic
+    svc._now_monotonic = lambda: original() + 10.0
+    try:
+        _, row = await _decide(card["issuer_card_ref"])
+    finally:
+        svc._now_monotonic = original
+    assert row["reason_code"] == "deadline_exceeded"
+    after = await database.fetch_val(
+        "SELECT seen_count FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "bumpme.example"},
+    )
+    assert after == before
+
+
+# --- F9: store-number suffixes ------------------------------------------------------------------
+
+
+async def test_a_branch_number_matches_the_pin_without_splitting_it():
+    """F9 on real rows: legitimate suffix variants used to split a domain's pins, so the first
+    buyer routed to another branch was declined merchant_mismatch on a good card."""
+    from db.database import database
+
+    first = await _insert_card(merchant_domain="branches.example")
+    await _decide(first["issuer_card_ref"], merchant_name="ACME STORE")
+
+    second = await _insert_card(merchant_domain="branches.example")
+    outcome, row = await _decide(second["issuer_card_ref"], merchant_name="ACME STORE 0412")
+    assert outcome.decision == "APPROVE"
+    assert row["merchant_verified"] is True
+
+    pins = await database.fetch_all(
+        "SELECT name_norm, seen_count FROM agent_card_merchant_descriptors "
+        "WHERE merchant_domain = :d",
+        {"d": "branches.example"},
+    )
+    assert [p["name_norm"] for p in pins] == ["acme store"], "the branch created a second pin"
+    assert pins[0]["seen_count"] == 2
+
+
+async def test_a_lookalike_name_still_declines():
+    """The negative counterpart: 'ACME STOREFRONT' is a different merchant that merely starts
+    the same way, and the relaxation must not reach it."""
+    first = await _insert_card(merchant_domain="lookalike.example")
+    await _decide(first["issuer_card_ref"], merchant_name="ACME STORE")
+
+    second = await _insert_card(merchant_domain="lookalike.example")
+    outcome, row = await _decide(second["issuer_card_ref"], merchant_name="ACME STOREFRONT")
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["reason_code"] == "merchant_mismatch"
+
+
+@pytest.mark.parametrize("tag", ["WORLDPAY", "ELAVON"])
+async def test_an_unlisted_acquirer_does_not_collapse_two_merchants(tag):
+    """The shape rule on real rows. The denylist covers acquirers we already know; this covers
+    the ones we do not, and it is the only thing standing between an unlisted aggregator and the
+    F2 hole. Isolated deliberately — every denylisted tag passes with the shape rule deleted."""
+    from db.database import database
+    from services.reap_external_auth import _ACQUIRER_TAGS
+
+    assert tag.casefold() not in _ACQUIRER_TAGS
+    domain = f"{tag.lower()}.example"
+    first = await _insert_card(merchant_domain=domain)
+    outcome, _ = await _decide(first["issuer_card_ref"], merchant_name=f"{tag} *ACME")
+    assert outcome.decision == "APPROVE"
+    pins = await database.fetch_all(
+        "SELECT name_norm FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": domain},
+    )
+    assert [p["name_norm"] for p in pins] == ["acme"], f"{tag} pinned its own tag"
+
+    second = await _insert_card(merchant_domain=domain)
+    outcome, row = await _decide(second["issuer_card_ref"], merchant_name=f"{tag} *EVIL")
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["reason_code"] == "merchant_mismatch"
