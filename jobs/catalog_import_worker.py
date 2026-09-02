@@ -78,6 +78,24 @@ class ShopifyConfigError(ShopifyAPIError):
     """Raised when Shopify configuration is missing or invalid."""
 
 
+class ShopifyCredentialsUnavailableError(ShopifyAPIError):
+    """No usable per-merchant Shopify credentials could be resolved right now.
+
+    Deliberately NOT a ShopifyConfigError, because that class is terminal and
+    this condition is not reliably distinguishable from a transient one.
+    `get_merchant_active_stores` catches its own DB errors and returns `[]`, so
+    a statement timeout — which this repo has a documented history of — looks
+    exactly like "this merchant has no store". Treating that as terminal would
+    permanently fail a fully connected merchant's import on attempt 1 over a
+    momentary blip.
+
+    Retrying is close to free here: a merchant with no store costs ZERO Shopify
+    calls per attempt (the resolver returns before any fetch), so the bounded
+    retry buys transient recovery for the price of a few DB reads, and a
+    genuinely storeless merchant still terminates at SHOPIFY_MAX_RETRY_ATTEMPTS.
+    """
+
+
 class ShopifyAuthError(ShopifyAPIError):
     """Raised when Shopify rejects our credentials (401/403)."""
 
@@ -764,9 +782,17 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             shop_domain = cfg["shop_domain"]
             access_token = cfg["access_token"]
             if not shop_domain or not access_token:
-                raise ShopifyConfigError(
-                    "No Shopify credentials for this merchant "
-                    "(connector_credentials or a connected merchant store are required)"
+                # The dominant reader of this string is a MERCHANT: the sync
+                # status endpoint returns the task row verbatim, with no message
+                # mapping. And the likeliest reader is someone whose Integrations
+                # page shows their store as connected — the endpoint gates on a
+                # merchant_stores row and never resolves a token, so a store with
+                # an unusable api_key passes the gate and lands here. "You have no
+                # store" would tell them to redo what they already did, and naming
+                # connector_credentials points them at an internal table.
+                raise ShopifyCredentialsUnavailableError(
+                    "Could not resolve a Shopify access token for this merchant. "
+                    "If your store shows as connected, please reconnect it in Integrations."
                 )
 
             shop_currency: Optional[str] = None
@@ -1475,6 +1501,12 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             counts["error_category"] = "auth"
         elif isinstance(exc, ShopifyConfigError):
             counts["error_category"] = "config"
+        elif isinstance(exc, ShopifyCredentialsUnavailableError):
+            # Distinct from "config" on purpose: a spike in THIS category means
+            # either a credential-resolution outage or a cohort of merchants
+            # whose stores no longer resolve, and both want a human. It is the
+            # signal to watch when CATALOG_IMPORT_DRAIN_ENABLED is first armed.
+            counts["error_category"] = "credentials_unavailable"
         else:
             counts["error_category"] = "upstream"
 

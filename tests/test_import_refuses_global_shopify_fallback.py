@@ -20,7 +20,8 @@ what makes this reachable at scale.
 
 Mutation-checked: reverting the call site to `_get_shopify_config_for_merchant(
 merchant_id)` (i.e. letting the fallback back in) turns
-test_import_refuses_to_run_on_the_platform_store red.
+test_import_refuses_to_run_on_the_platform_store red; making the refusal a
+terminal ShopifyConfigError again turns the transient-retry test red.
 """
 
 from __future__ import annotations
@@ -84,24 +85,32 @@ async def test_import_refuses_to_run_on_the_platform_store(monkeypatch):
     """
     fetched = []
 
-    async def _explode(*args, **kwargs):
-        fetched.append(args)
-        raise AssertionError("the import fetched from Shopify with no merchant credentials")
+    async def _record_and_explode(*args, **kwargs):
+        fetched.append(kwargs or args)
+        raise AssertionError("the import reached Shopify with no merchant credentials")
 
-    monkeypatch.setattr(worker.ShopifyProductAdapter, "fetch_shop_currency", _explode)
+    # BOTH outbound entry points are doubled, and `fetched` is what the test
+    # asserts on — not the exception.
+    #
+    # fetch_shop_currency alone is NOT a trip-wire: the worker wraps it in a bare
+    # `except Exception: shop_currency = None`, which swallows an AssertionError
+    # raised from a double. An earlier version of this test patched only that,
+    # so under a mutant the flow sailed past it and made a REAL HTTPS request to
+    # the env-configured domain; the test still went red, but via the retry
+    # trip-wire below rather than the assertion that claims to prove it, and it
+    # was not network-isolated. Recording into a list survives the swallow.
+    monkeypatch.setattr(worker.ShopifyProductAdapter, "fetch_shop_currency", _record_and_explode)
+    monkeypatch.setattr(worker, "_fetch_shopify_products_page", _record_and_explode)
+    monkeypatch.setattr(worker, "_fetch_shopify_products", _record_and_explode)
 
     recorded = {}
 
-    async def _fake_failed(task_id, error, counts=None):
+    async def _fake_retry(task_id, error, counts=None, next_run_at=None):
         recorded["error"] = error
         recorded["counts"] = counts
         return True
 
-    async def _unexpected_retry(*args, **kwargs):
-        raise AssertionError("a missing-credentials import must be terminal, not retried")
-
-    monkeypatch.setattr(worker, "mark_import_task_failed", _fake_failed)
-    monkeypatch.setattr(worker, "mark_import_task_retry_scheduled", _unexpected_retry)
+    monkeypatch.setattr(worker, "mark_import_task_retry_scheduled", _fake_retry)
 
     result = await worker._process_import_task_record(
         {
@@ -114,9 +123,88 @@ async def test_import_refuses_to_run_on_the_platform_store(monkeypatch):
         }
     )
 
-    assert fetched == [], "no Shopify call may be made without merchant credentials"
+    assert fetched == [], (
+        "no Shopify call may be made without merchant credentials; "
+        f"reached: {fetched}"
+    )
+    assert result["status"] == "retry_scheduled"
+    assert "reconnect it in Integrations" in recorded["error"]
+    assert recorded["counts"]["error_category"] == "credentials_unavailable"
+
+
+async def test_a_transient_resolution_failure_is_retried_not_failed_permanently(monkeypatch):
+    """The regression the first draft of this change introduced.
+
+    `get_merchant_active_stores` catches its own DB errors and returns `[]`, so
+    a statement-timeout blip is indistinguishable from "this merchant has no
+    store". Making the refusal terminal would permanently fail a FULLY CONNECTED
+    merchant's import on attempt 1 over a momentary wobble — and nothing
+    re-enqueues a `failed` row. Retrying costs zero Shopify calls, because the
+    resolver returns before any fetch.
+    """
+    import services.merchant_store_service as store_service
+
+    async def _db_blip(merchant_id):
+        return []  # what the service returns when it swallows a statement timeout
+
+    monkeypatch.setattr(store_service, "get_merchant_active_stores", _db_blip)
+
+    outcome = {}
+
+    async def _fake_retry(task_id, error, counts=None, next_run_at=None):
+        outcome["retried"] = True
+        outcome["counts"] = counts
+        return True
+
+    async def _fail_is_wrong(*args, **kwargs):
+        raise AssertionError(
+            "a transient resolution failure must be retried, not failed terminally"
+        )
+
+    monkeypatch.setattr(worker, "mark_import_task_retry_scheduled", _fake_retry)
+    monkeypatch.setattr(worker, "mark_import_task_failed", _fail_is_wrong)
+
+    result = await worker._process_import_task_record(
+        {
+            "id": 2,
+            "merchant_id": "merch_connected_but_db_blipped",
+            "source_type": "connector",
+            "connector": "shopify",
+            "attempt": 1,
+            "counts": {},
+        }
+    )
+
+    assert outcome.get("retried") is True
+    assert result["status"] == "retry_scheduled"
+
+
+async def test_a_genuinely_storeless_merchant_still_terminates(monkeypatch):
+    """Positive counterpart: retrying must not mean retrying forever. At the
+    attempt ceiling the task fails, so a merchant who will never have a store
+    does not occupy the drain's FIFO head indefinitely."""
+    outcome = {}
+
+    async def _fake_failed(task_id, error, counts=None):
+        outcome["failed"] = True
+        return True
+
+    async def _retry_is_wrong(*args, **kwargs):
+        raise AssertionError("past the attempt ceiling this must be terminal")
+
+    monkeypatch.setattr(worker, "mark_import_task_failed", _fake_failed)
+    monkeypatch.setattr(worker, "mark_import_task_retry_scheduled", _retry_is_wrong)
+
+    result = await worker._process_import_task_record(
+        {
+            "id": 3,
+            "merchant_id": "merch_no_store",
+            "source_type": "connector",
+            "connector": "shopify",
+            "attempt": worker.SHOPIFY_MAX_RETRY_ATTEMPTS,
+            "counts": {},
+        }
+    )
+
+    assert outcome.get("failed") is True
     assert result["status"] == "failed"
-    assert "No Shopify credentials for this merchant" in recorded["error"]
-    # terminal, not retried: a merchant with no store will never acquire one by
-    # waiting, so five backoff rounds against the platform store is pure risk
-    assert recorded["counts"]["error_category"] == "config"
