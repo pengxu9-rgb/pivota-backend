@@ -118,14 +118,23 @@ async def test_waiter_on_loser_resolves_again_after_bridge_merge():
             )
 
     holder_task = asyncio.create_task(merge_holder())
-    await asyncio.wait_for(holder_entered.wait(), timeout=2)
-    waiter_task = asyncio.create_task(loser_waiter())
-    await asyncio.wait_for(merge_finished.wait(), timeout=2)
-    await asyncio.sleep(0.1)
-    assert not waiter_entered.is_set(), "waiter bypassed the bridge stitch lock"
+    waiter_task = None
+    try:
+        await asyncio.wait_for(holder_entered.wait(), timeout=2)
+        waiter_task = asyncio.create_task(loser_waiter())
+        await asyncio.wait_for(merge_finished.wait(), timeout=2)
+        await asyncio.sleep(0.1)
+        assert not waiter_entered.is_set(), "waiter bypassed the bridge stitch lock"
 
-    release_holder.set()
-    await asyncio.wait_for(asyncio.gather(holder_task, waiter_task), timeout=5)
+        release_holder.set()
+        await asyncio.wait_for(asyncio.gather(holder_task, waiter_task), timeout=5)
+    finally:
+        release_holder.set()
+        tasks = [task for task in (holder_task, waiter_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     assert waiter_entered.is_set()
 
     rows = await database.fetch_all(
