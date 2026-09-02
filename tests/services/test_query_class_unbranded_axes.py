@@ -174,3 +174,47 @@ def test_the_internal_rollup_can_opt_back_in():
         [_comparison_run()], merchant_host="brand.com", include_internal_comparison=True
     )
     assert facts.run_count == 1
+
+
+# --- the OTHER two stamp sites --------------------------------------------
+# The three tests above only reach prompt_basis.py's default: reverting the two
+# agent_center defaults alone leaves 1749 tests green. These pin the remaining
+# two directly. :10762 is the load-bearing one — it writes the axis into the
+# PERSISTED payload's axis_metadata, which is the exact field run_query_class /
+# _query_class_coverage / intent_axis_for read back at report time.
+def test_persisted_payload_stamps_unclassified_for_an_unspecified_axis():
+    from services.agent_center_bd_report_service import (
+        _normalize_per_sku_probe_payload,
+    )
+    from services.audit_facts import AXIS_UNCLASSIFIED
+
+    payload = _normalize_per_sku_probe_payload(
+        result={"provider": "gemini", "raw_runs": [{"query": "best cream blush"}]},
+        requested_provider="gemini",
+        sku_key="sku-1",
+        sku_ctx={},
+        query_specs=[],  # nothing to look the query up by -> the default fires
+        probe_run_id="p1",
+        model_info={},
+    )
+    runs = payload.get("raw_runs") or []
+    assert runs, "expected the run to survive normalisation"
+    assert runs[0]["axis_metadata"]["axis"] == AXIS_UNCLASSIFIED
+
+
+def test_persisted_payload_keeps_a_stamped_axis():
+    """Positive counterpart: the default only fills a gap, never overwrites."""
+    from services.agent_center_bd_report_service import (
+        _normalize_per_sku_probe_payload,
+    )
+
+    payload = _normalize_per_sku_probe_payload(
+        result={"provider": "gemini", "raw_runs": [{"query": "where to buy X"}]},
+        requested_provider="gemini",
+        sku_key="sku-1",
+        sku_ctx={},
+        query_specs=[("where to buy X", "intent")],
+        probe_run_id="p1",
+        model_info={},
+    )
+    assert payload["raw_runs"][0]["axis_metadata"]["axis"] == "intent"

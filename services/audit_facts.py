@@ -356,7 +356,8 @@ BRANDED_INTENTS = frozenset({"navigational", "trust"})
 # online" are branded lookups, the same set `sku_opportunity._query_class` and
 # `report_summary_builder._SOV_BRANDED_AXES` already treat as branded.
 _NAVIGATIONAL_AXES = frozenset({"intent", "identity", "price", "brand"})
-# Values that mean "no axis was stamped" — fail UNBRANDED (discovery).
+
+
 def intent_axis_for(query: Optional[str], axis: Optional[str]) -> str:
     a = str(axis or "").strip().lower()
     q = str(query or "").strip().lower()

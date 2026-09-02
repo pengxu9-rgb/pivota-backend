@@ -35,7 +35,12 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from services.audit_facts import (
+# COMPARISON_AXIS / DEEP_TIER_PROMPT_SOURCE / run_is_internal_comparison now
+# live in audit_facts (the fact layer must exclude internal-comparison runs
+# without importing this module, which already imports run_errored from it).
+# Re-exported here: agent_center:81 and sku_opportunity:113 import them from
+# this module. DEEP_TIER_PROMPT_SOURCE is unused locally — keep the re-export.
+from services.audit_facts import (  # noqa: F401
     COMPARISON_AXIS,
     DEEP_TIER_PROMPT_SOURCE,
     run_errored,
