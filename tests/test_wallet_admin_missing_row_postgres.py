@@ -238,8 +238,18 @@ async def _count(table: str, owner_column: str, owner: str) -> int:
     return int(row["n"])
 
 
+# Each handler's 404 detail, carried here so the tests can assert the MESSAGE and
+# not just the status code. Worth the extra column: a review mutant that pointed
+# all four agent-side 404s at the merchant wording left this file entirely green
+# (10 passed), which means an admin chasing a missing agent wallet could have been
+# sent to the wrong table with nothing to catch it. Asserting the code alone is
+# what allowed that.
+_MERCHANT_404 = "Merchant wallet not found"
+_AGENT_404 = "Agent wallet not found"
+
+
 def _handlers():
-    """Every handler under test, as (label, callable taking one wallet_id).
+    """Every handler under test, as (label, callable taking one wallet_id, detail).
 
     The status pair takes a body as well, so it is bound here rather than at each
     call site — `inactive` is deliberately NOT the seeded value, so a status
@@ -256,18 +266,20 @@ def _handlers():
     )
 
     return [
-        ("verify_merchant_wallet", verify_merchant_wallet),
-        ("verify_agent_wallet", verify_agent_wallet),
+        ("verify_merchant_wallet", verify_merchant_wallet, _MERCHANT_404),
+        ("verify_agent_wallet", verify_agent_wallet, _AGENT_404),
         (
             "update_merchant_wallet_status",
             lambda w: update_merchant_wallet_status(w, WalletStatusUpdate(status="inactive")),
+            _MERCHANT_404,
         ),
         (
             "update_agent_wallet_status",
             lambda w: update_agent_wallet_status(w, WalletStatusUpdate(status="inactive")),
+            _AGENT_404,
         ),
-        ("delete_merchant_wallet", delete_merchant_wallet),
-        ("delete_agent_wallet", delete_agent_wallet),
+        ("delete_merchant_wallet", delete_merchant_wallet, _MERCHANT_404),
+        ("delete_agent_wallet", delete_agent_wallet, _AGENT_404),
     ]
 
 
@@ -284,11 +296,14 @@ async def test_a_missing_wallet_is_a_404_not_a_success(label):
     from fastapi import HTTPException
 
     await _seed()
-    handler = dict(_handlers())[label]
+    handler, expected_detail = {h[0]: (h[1], h[2]) for h in _handlers()}[label]
 
     with pytest.raises(HTTPException) as caught:
         await handler(MISSING)
     assert caught.value.status_code == 404, caught.value.detail
+    # The MESSAGE too, not just the code — a handler naming the wrong table sends
+    # an admin to the wrong place, and nothing else here would notice.
+    assert caught.value.detail == expected_detail
 
     # A 404 that also destroyed something would satisfy the line above. Nothing
     # in either table may have moved: same row count, same statuses, still
@@ -373,7 +388,7 @@ async def test_delete_still_deletes_a_wallet_that_exists_and_only_that_one():
 
     await _seed()
 
-    for handler, table, owner_column, owner, wallet_id, bystander in (
+    for handler, table, owner_column, owner, wallet_id, bystander, expected_detail in (
         (
             delete_merchant_wallet,
             "merchant_wallets",
@@ -381,8 +396,17 @@ async def test_delete_still_deletes_a_wallet_that_exists_and_only_that_one():
             MERCHANT,
             MERCHANT_WALLET,
             MERCHANT_BYSTANDER,
+            _MERCHANT_404,
         ),
-        (delete_agent_wallet, "agent_wallets", "agent_id", AGENT, AGENT_WALLET, AGENT_BYSTANDER),
+        (
+            delete_agent_wallet,
+            "agent_wallets",
+            "agent_id",
+            AGENT,
+            AGENT_WALLET,
+            AGENT_BYSTANDER,
+            _AGENT_404,
+        ),
     ):
         body = await handler(wallet_id)
         assert body["status"] == "deleted"
@@ -397,6 +421,7 @@ async def test_delete_still_deletes_a_wallet_that_exists_and_only_that_one():
         with pytest.raises(HTTPException) as caught:
             await handler(wallet_id)
         assert caught.value.status_code == 404, caught.value.detail
+        assert caught.value.detail == expected_detail
         # Still exactly one row: the failed second delete took nothing with it.
         assert await _count(table, owner_column, owner) == 1
 
