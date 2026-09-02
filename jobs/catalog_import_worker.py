@@ -512,14 +512,36 @@ def _get_shopify_config() -> Dict[str, Any]:
     return {"shop_domain": shop_domain, "access_token": access_token}
 
 
-async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
+async def _get_shopify_config_for_merchant(
+    merchant_id: str,
+    *,
+    allow_global_fallback: bool = True,
+) -> Dict[str, Any]:
     """
     Resolve Shopify configuration for a specific merchant.
 
     Order of precedence:
     1) Per-merchant encrypted connector_credentials (if available and decryptable).
     2) Per-merchant merchant_stores primary store (domain/api_key), when available.
-    3) Global settings/env fallback via _get_shopify_config().
+    3) Global settings/env fallback via _get_shopify_config() — ONLY when
+       `allow_global_fallback` is true.
+
+    THE FALLBACK ANSWERS A DIFFERENT QUESTION THAN THE ONE ASKED. Tiers 1 and 2
+    resolve "what are THIS merchant's credentials"; tier 3 returns the
+    platform's own env-configured store, for any merchant, and those env vars
+    are set in production. So a merchant who never connected a store — or who
+    detached one — still gets a usable shop_domain + access_token back.
+
+    That has already cost the repo once: the store-detach gate in
+    readiness/sources/shopify_live.py had to switch from `shopify_connected` to
+    `get_primary_store` precisely because this fallback made every merchant look
+    connected (readiness/tests/test_store_detach_catalog_gate.py pins it). The
+    hazard was routed around there rather than closed here, because read paths
+    can tolerate a wrong-but-harmless config while write paths cannot.
+
+    Pass `allow_global_fallback=False` from any caller that WRITES merchant-owned
+    data. Read-only callers keep the historical default so their behaviour is
+    unchanged.
     """
     # Try per-merchant encrypted credentials first.
     try:
@@ -592,7 +614,14 @@ async def _get_shopify_config_for_merchant(merchant_id: str) -> Dict[str, Any]:
             extra={"merchant_id": merchant_id, "error": str(e)},
         )
 
-    # Fallback to global configuration.
+    # Fallback to global configuration — the platform's own store, not this
+    # merchant's. Callers that write merchant-owned data opt out.
+    if not allow_global_fallback:
+        logger.warning(
+            "No per-merchant Shopify credentials; refusing the global env fallback",
+            extra={"merchant_id": merchant_id},
+        )
+        return {"shop_domain": "", "access_token": ""}
     return _get_shopify_config()
 
 
@@ -721,11 +750,24 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
     try:
         # Shopify connector import branch.
         if source_type == "connector" and connector == "shopify":
-            cfg = await _get_shopify_config_for_merchant(merchant_id)
+            # allow_global_fallback=False: this branch WRITES the merchant's
+            # catalog. Falling back to the platform's env store would import the
+            # platform's own products into this merchant's products_cache and
+            # then expire their real rows in the full-sync sweep below — a
+            # silent cross-merchant catalog overwrite, not a degraded import.
+            # Failing here is the correct outcome: ShopifyConfigError is
+            # terminal (see the retry handler), so a merchant with no
+            # credentials fails fast instead of retrying five times.
+            cfg = await _get_shopify_config_for_merchant(
+                merchant_id, allow_global_fallback=False
+            )
             shop_domain = cfg["shop_domain"]
             access_token = cfg["access_token"]
             if not shop_domain or not access_token:
-                raise ShopifyConfigError("Shopify configuration missing (SHOPIFY_STORE_URL/SHOPIFY_ACCESS_TOKEN)")
+                raise ShopifyConfigError(
+                    "No Shopify credentials for this merchant "
+                    "(connector_credentials or a connected merchant store are required)"
+                )
 
             shop_currency: Optional[str] = None
             try:
