@@ -26,8 +26,9 @@ async def get_payment_analytics(
             SELECT 
                 status,
                 COUNT(*) as count,
-                COALESCE(SUM(amount), 0) as total_amount
+                COALESCE(SUM(total), 0) as total_amount
             FROM orders
+            WHERE (is_deleted IS NULL OR is_deleted = FALSE)
             GROUP BY status
         """
         

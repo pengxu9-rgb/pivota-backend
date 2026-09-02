@@ -1058,9 +1058,10 @@ async def get_onboarding_details(
     stats = {"total_transactions": 0, "total_revenue": 0, "unique_customers": 0}
     try:
         stats_query = """SELECT COUNT(*) as total_transactions, 
-                         COALESCE(SUM(amount), 0) as total_revenue,
+                         COALESCE(SUM(total), 0) as total_revenue,
                          COUNT(DISTINCT customer_email) as unique_customers
-                         FROM orders WHERE merchant_id = :merchant_id"""
+                         FROM orders WHERE merchant_id = :merchant_id
+                           AND (is_deleted IS NULL OR is_deleted = FALSE)"""
         stats_row = await database.fetch_one(stats_query, {"merchant_id": merchant_id})
         if stats_row:
             stats = dict(stats_row)
