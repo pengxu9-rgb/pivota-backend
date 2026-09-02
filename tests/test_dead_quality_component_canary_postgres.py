@@ -162,3 +162,34 @@ def test_threshold_is_zero_and_named():
     chk = _check("dead_quality_component")
     assert chk["default_threshold"] == 0
     assert chk["env"] == "CATALOG_INVARIANT_DEAD_COMPONENT_THRESHOLD"
+
+
+@pytest.mark.asyncio
+async def test_sample_rows_carry_subject_key_through_the_production_reader():
+    """The tests above read samples by POSITION (`r[0]`), which is not how the
+    runner reads them: run_catalog_invariant_checks reads `r["subject_key"]`,
+    and on asyncpg a `databases` Record raises KeyError for a column the row
+    does not carry. This sample_sql projected `name` until 2026-09-02, so the
+    daily sweep on worker logged a KeyError traceback for this check instead
+    of its samples — with the positional tests green. Read it the way the
+    runner does, through the production client."""
+    from databases import Database
+
+    from services.catalog_invariant_checks import SAMPLE_KEY_COLUMN
+
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=250, summary_score=0.0)
+    eng.dispose()
+
+    db = Database(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+    await db.connect()
+    try:
+        rows = await db.fetch_all(chk["sample_sql"])
+        names = [r[SAMPLE_KEY_COLUMN] for r in rows]
+    finally:
+        await db.disconnect()
+    assert names == ["summary"]

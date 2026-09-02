@@ -252,3 +252,30 @@ def test_it_asks_a_different_question_from_public_not_renderable():
     assert "catalog_row_trust" in a["count_sql"]
     assert "index_pipeline_state" in b["count_sql"]
     assert "catalog_row_trust" not in b["count_sql"]
+
+
+@pytest.mark.asyncio
+async def test_sample_rows_carry_subject_key_through_the_production_reader(pg_engine):
+    """test_sample_sql_returns_the_offending_keys reads `r[0]`; the runner reads
+    `r["subject_key"]`, and on asyncpg a `databases` Record raises KeyError for
+    a column the row does not carry. This sample_sql was compiled from
+    `select(_cp.c.product_key)` with no label until 2026-09-02, so the daily
+    sweep on worker logged a KeyError traceback for this check instead of its
+    samples — with the positional test green. Read it the way the runner does,
+    through the production client."""
+    from databases import Database
+
+    from services.catalog_invariant_checks import SAMPLE_KEY_COLUMN
+
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _row(conn, pk="pk_sample", ck="ck_sample", serving=True, with_seed=False)
+
+    db = Database(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+    await db.connect()
+    try:
+        rows = await db.fetch_all(_check()["sample_sql"])
+        keys = [r[SAMPLE_KEY_COLUMN] for r in rows]
+    finally:
+        await db.disconnect()
+    assert keys == ["pk_sample"]
