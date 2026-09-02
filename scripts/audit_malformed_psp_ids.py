@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -70,7 +71,12 @@ REWRITE_SQL = "UPDATE merchant_psps SET psp_id = %s WHERE psp_id = %s"
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--database-url", required=True, help="Postgres URL. Never point --repair at a DB you cannot restore.")
+    # Defaults to $DATABASE_URL. DIVERGES from 20f4542c, deliberately:
+    # scripts/ops/run_oneoff_job.sh is the only way anything reaches production,
+    # and it MOUNTS DATABASE_URL as an env var while passing --args literally,
+    # with no shell to expand `$DATABASE_URL`. With required=True this script
+    # could never be run against the database it exists to audit.
+    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL") or "", help="Postgres URL; defaults to $DATABASE_URL. Never point --repair at a DB you cannot restore.")
     parser.add_argument("--repair", action="store_true", help="Rewrite each malformed psp_id to a canonical one.")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args()
@@ -94,6 +100,12 @@ def _rows(cursor) -> List[Dict[str, Any]]:
 
 def main() -> int:
     args = _parse_args()
+    if not str(args.database_url or "").strip():
+        raise SystemExit(
+            "no database URL: pass --database-url or set DATABASE_URL. (Under "
+            "scripts/ops/run_oneoff_job.sh, mount it with "
+            "SECRETS=DATABASE_URL=DATABASE_URL:latest -- a Cloud Run job inherits nothing.)"
+        )
     conn = _connect_postgres(args.database_url)
     findings: List[Dict[str, Any]] = []
     try:
