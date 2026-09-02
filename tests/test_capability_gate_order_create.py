@@ -9,6 +9,8 @@ Behavior tests for:
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fastapi import HTTPException
 
@@ -122,7 +124,18 @@ async def test_order_create_accepted_for_capable_merchant_when_gate_on(monkeypat
         "merch_cap", None, defer_payment=True
     )
     assert provider == module.CAPABILITY_DEFERRED_PSP_PROVIDER == "protocol_deferred"
-    assert psp_id == "merch_cap:protocol_deferred"
+    # Both values land in `orders`, which enforces CHECK check_psp_id_format
+    # (`^psp_[a-z0-9]+_[a-z0-9]{12}$`) and CHECK check_psp_used_valid_provider.
+    # This assertion used to pin `"merch_cap:protocol_deferred"`, an id the CHECK
+    # refuses outright — so the lane this gate exists to enable could not have
+    # created a single order. Pinned to the RULE now, not to a literal, and
+    # executed against a real Postgres in
+    # tests/test_psp_used_valid_provider_postgres.py.
+    assert re.fullmatch(r"psp_[a-z0-9]+_[a-z0-9]{12}", psp_id), psp_id
+    assert psp_id.startswith("psp_deferred_")
+    # Deterministic per merchant: a retry must not mint a second identity.
+    assert psp_id == module._capability_deferred_psp_id("merch_cap")
+    assert psp_id != module._capability_deferred_psp_id("merch_other")
 
 
 @pytest.mark.asyncio

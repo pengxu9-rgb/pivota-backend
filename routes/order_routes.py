@@ -689,11 +689,36 @@ def _resolve_order_live_readiness_requirement(
 # see docs/protocol_checkout_capability_canary_runbook.md). Kept as a recognizable,
 # non-empty value so the downstream psp_type/psp_id validation passes without ever
 # resolving a real PSP adapter.
+# Both values below are written to `orders` (psp_used and psp_id), which enforces
+# CHECK check_psp_used_valid_provider and CHECK check_psp_id_format
+# (db/migrations/006_psp_fields_constraints.sql). Neither used to satisfy its
+# constraint, so this whole lane could not create a single order: turning
+# AGENT_CHECKOUT_CAPABILITY_GATE on would have 500'd every order it was meant to
+# enable, for exactly the merchants it targets. The flag is default-off, so it was
+# latent rather than live — the same silent writer/reader disagreement as the
+# psp_id-format defect fixed in 20f4542c, one env var away.
+#
+# 'protocol_deferred' is admitted by the widened list in migration 208.
 CAPABILITY_DEFERRED_PSP_PROVIDER = "protocol_deferred"
 
 
 def _capability_deferred_psp_id(merchant_id: str) -> str:
-    return f"{str(merchant_id or '').strip()}:protocol_deferred"
+    """A deferred-lane psp_id `orders` will accept.
+
+    check_psp_id_format is `^psp_[a-z0-9]+_[a-z0-9]{12}$`. This used to return
+    `f"{merchant_id}:protocol_deferred"` — a colon, no `psp_` prefix, no 12-char
+    suffix — which the CHECK refuses outright.
+
+    Still deterministic per merchant (the old value was, and a stable id keeps a
+    retry from minting a second identity for the same deferred order), still
+    recognisable as deferred, and still resolves to NO merchant_psps row, which is
+    the point: `_resolve_order_psp_adapter` finds nothing and refuses, so this id
+    can never select a real PSP adapter. The digest is hex, so it satisfies the
+    `[a-z0-9]{12}` class by construction; a collision between merchants is
+    harmless because nothing looks the value up.
+    """
+    digest = hashlib.sha256(str(merchant_id or "").strip().encode("utf-8")).hexdigest()
+    return f"psp_deferred_{digest[:12]}"
 
 
 async def _resolve_active_order_psp(

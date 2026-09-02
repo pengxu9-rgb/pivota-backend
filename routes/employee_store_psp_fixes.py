@@ -9,12 +9,45 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from utils.auth import get_current_user
 from db.database import database
-from services.merchant_psp_config_service import persist_canonical_merchant_psp
+from services.merchant_psp_config_service import (
+    SUPPORTED_CANONICAL_PSPS,
+    persist_canonical_merchant_psp,
+)
 from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
 import uuid
 import json
 
 router = APIRouter()
+
+# Providers `POST /merchant/onboarding/setup-psp` may write to
+# merchant_psps.provider.
+#
+# WHY THIS EXISTS. This route took `psp_type: str` with no allowlist at all and
+# persisted it verbatim with status='active'. Every other door into that column
+# has always had one — /admin/psp/connect allows stripe/adyen/checkout/paypal,
+# /merchant/integrations/psp/connect allows SUPPORTED_CANONICAL_PSPS — and this
+# one, which allows role `merchant` for self-service onboarding, had none. The
+# value comes straight back out at order creation
+# (services.merchant_psp_config_service.fetch_active_runtime_merchant_psp filters
+# on status='active' only, then routes/order_routes._resolve_active_order_psp
+# returns it) and is written to orders.psp_used, where a CHECK constraint refuses
+# anything it has not been taught. Reproduced on Postgres 15, 2026-09-01: 'square'
+# and 'antom' both saved, both validated, both showed "connected", and then every
+# order creation 500'd on check_psp_used_valid_provider. Same failure mode as the
+# psp_id-format defect fixed in 20f4542c — a value the writer accepts and the
+# reader refuses, silent between onboarding and the merchant's first sale.
+#
+# THE SET. SUPPORTED_CANONICAL_PSPS (stripe/adyen/checkout/antom) plus paypal,
+# which /admin/psp/connect accepts and migration 006 has always allowed. Note
+# what is NOT here: `square`, which this route's own capabilities map and the
+# ConnectPSPRequest comment both advertised. Square has no PSP adapter anywhere in
+# this repo — only catalog/storefront sync (services/commerce_source_registry.py,
+# routes/universal_product_sync.py) — so a merchant who "connected" it had a row
+# that could never charge and an account that could never take an order.
+#
+# Keep this in sync with migration 208's CHECK list on orders.psp_used: a provider
+# accepted here that the constraint refuses is exactly the bug above.
+SETUP_PSP_ALLOWED_PROVIDERS = frozenset(SUPPORTED_CANONICAL_PSPS | {"paypal"})
 
 # ============== Models ==============
 
@@ -34,7 +67,10 @@ class ConnectWixRequest(BaseModel):
 
 class ConnectPSPRequest(BaseModel):
     merchant_id: str
-    psp_type: str  # stripe, adyen, paypal, square
+    # See SETUP_PSP_ALLOWED_PROVIDERS below for the values this actually accepts.
+    # This comment used to read "stripe, adyen, paypal, square"; `square` has no
+    # PSP adapter in this repo and is refused.
+    psp_type: str
     api_key: Optional[str] = None
     test_mode: bool = True
     account_id: Optional[str] = None
@@ -191,7 +227,21 @@ async def setup_merchant_psp(
     """
     if current_user.get("role") not in ["employee", "admin", "merchant"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # An unsupported provider must be refused HERE, not discovered at the
+    # merchant's first sale. `persist_canonical_merchant_psp` lowercases the
+    # provider before writing it, so the allowlist is checked on the same
+    # normalised form the row will carry. See SETUP_PSP_ALLOWED_PROVIDERS.
+    psp_type_norm = str(request.psp_type or "").strip().lower()
+    if psp_type_norm not in SETUP_PSP_ALLOWED_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported PSP provider: {request.psp_type or 'unknown'}. "
+                f"Supported: {', '.join(sorted(SETUP_PSP_ALLOWED_PROVIDERS))}"
+            ),
+        )
+
     try:
         api_key = (request.api_key or "").strip()
         setup_later = bool(request.setup_later) or not api_key
@@ -264,7 +314,19 @@ async def setup_merchant_psp(
             capabilities=capabilities,
             status="pending" if setup_later else "active",
             connected_at=datetime.now(),
-            psp_id=(dict(existing)["psp_id"] if existing else f"psp_{request.psp_type}_{uuid.uuid4().hex[:8]}"),
+            # A NEW psp_id must come from the canonical generator, never from an
+            # inline uuid slice. `orders` carries CHECK check_psp_id_format
+            # (db/migrations/006_psp_fields_constraints.sql) --
+            # `^psp_[a-z0-9]+_[a-z0-9]{12}$`, exactly TWELVE trailing chars -- and
+            # order creation copies merchant_psps.psp_id straight into orders.psp_id
+            # (routes/order_routes.py `_resolve_active_order_psp` -> create_order).
+            # This line used to mint `uuid.uuid4().hex[:8]`, an EIGHT-char suffix.
+            # merchant_psps accepted it, the merchant's PSP validated, and then every
+            # order creation 500'd on the orders CHECK -- a silent time bomb between
+            # onboarding and first sale (prod, merch_c5e24a8d3738d73b, 2026-08-29).
+            # Passing None delegates to _generate_psp_id(provider) inside
+            # persist_canonical_merchant_psp, which also lowercases the provider.
+            psp_id=(dict(existing)["psp_id"] if existing else None),
             existing_row=dict(existing) if existing else None,
             stripe_mode="payment_intent",
         )
