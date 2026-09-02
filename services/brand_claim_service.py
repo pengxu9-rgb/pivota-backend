@@ -220,10 +220,18 @@ def host_matches_known(domain: Optional[str], known_hosts: Iterable[str]) -> boo
     return False
 
 
-async def merchant_owned_domains(merchant_id: str) -> set:
-    """Best-effort set of hosts Pivota already associates with this merchant:
-    onboarding store_url/website + catalog product source/canonical hosts. Does
-    NOT include pivota_canonical_url (that's Pivota's host, not the brand's)."""
+async def _inferred_merchant_hosts(merchant_id: str) -> set:
+    """The INFERRED tier, unchanged: hosts Pivota derives from what it already
+    holds — onboarding store_url/website + catalog product source/canonical
+    hosts. Does NOT include pivota_canonical_url (that's Pivota's host, not the
+    brand's).
+
+    Kept as a separate function because it is now one of two tiers, and because
+    the liveness sweep needs it to seed rows it can check
+    (services/official_domain_liveness.seed_inferred_domains). It is NOT
+    weakened and NOT removed: merchants who have never asserted a domain still
+    get exactly the set they got before, minus anything measured dead.
+    """
     hosts: set = set()
     if not merchant_id:
         return hosts
@@ -236,7 +244,7 @@ async def merchant_owned_domains(merchant_id: str) -> set:
             if h:
                 hosts.add(h)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("merchant_owned_domains: onboarding load failed: %s", str(exc)[:200])
+        logger.warning("_inferred_merchant_hosts: onboarding load failed: %s", str(exc)[:200])
     try:
         rows = await database.fetch_all(
             """
@@ -253,8 +261,124 @@ async def merchant_owned_domains(merchant_id: str) -> set:
                 if h:
                     hosts.add(h)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("merchant_owned_domains: catalog load failed: %s", str(exc)[:200])
+        logger.warning("_inferred_merchant_hosts: catalog load failed: %s", str(exc)[:200])
     return hosts
+
+
+async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[str, Any]]:
+    """B1 — the official-domain set WITH its provenance, host -> details.
+
+    Two tiers, and the difference between them is the whole point of B1:
+
+      ASSERTED / VERIFIED — rows in `merchant_official_domains` the merchant
+      supplied or a brand claim proved. Included unconditionally, whether or not
+      inference ever found them. This is the anua.us half of the defect: anua.com
+      and anua.us are byte-identical storefronts, only anua.com was ever
+      inferred, and 7 citations of anua.us were scored as retailer traffic —
+      reading the branded official share as 46% instead of 67%.
+
+      INFERRED — the legacy derivation, still the fallback for every merchant
+      who has asserted nothing. Unchanged, except that a host whose STORED
+      liveness verdict is `dead` drops out. This is the us.judydoll.com half:
+      inferred, counted official, and carrying no DNS record at all.
+
+    Only `dead` excludes. `unverifiable` and `unchecked` stay in the set — see
+    db/merchant_official_domains.is_excluded and the measurement behind it.
+
+    A stored row whose source is `inferred` is honoured only while inference
+    still produces that host: inference is the live truth for its own tier, so a
+    row left behind by a catalog that has moved on must not outlive it.
+
+    Each value carries {source, liveness_status, verification_status,
+    is_primary, last_checked_at} so a caller can tell "verified live" from
+    "inferred, never checked". NOT wired into agent_center yet — the report
+    will want it, and `merchant_owned_domains` stays the set-shaped contract
+    every existing caller uses.
+    """
+    from db import merchant_official_domains as mod
+
+    detailed: Dict[str, Dict[str, Any]] = {}
+    if not merchant_id:
+        return detailed
+
+    inferred = await _inferred_merchant_hosts(merchant_id)
+    # Best-effort by construction: on any DB error this returns [], and the
+    # result degrades to exactly today's inferred set rather than to nothing.
+    stored = await mod.list_official_domains(merchant_id)
+    by_domain = {str(r.get("domain") or ""): r for r in stored if r.get("domain")}
+
+    def _detail(host: str, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "source": str((row or {}).get("source") or mod.SOURCE_INFERRED),
+            "liveness_status": str(
+                (row or {}).get("liveness_status") or mod.LIVENESS_UNCHECKED
+            ),
+            "verification_status": (row or {}).get("verification_status"),
+            "is_primary": bool((row or {}).get("is_primary") or False),
+            "last_checked_at": (row or {}).get("last_checked_at"),
+        }
+
+    for host, row in by_domain.items():
+        if str(row.get("source") or "") not in mod.OFFICIAL_SOURCES:
+            continue
+        if mod.is_excluded(row.get("liveness_status")):
+            continue
+        detailed[host] = _detail(host, row)
+
+    for host in inferred:
+        if host in detailed:
+            continue
+        row = by_domain.get(host)
+        if row is not None and mod.is_excluded(row.get("liveness_status")):
+            continue
+        detailed[host] = _detail(host, row)
+
+    return detailed
+
+
+async def merchant_owned_domains(merchant_id: str) -> set:
+    """The official-domain set as a plain set of hosts — the shape every caller
+    already depends on (notably `build_authority_map(merchant_extra_hosts=...)`
+    in services/agent_center_bd_report_service.py, which decides `first_party`
+    on every cited host). See `merchant_owned_domains_detailed` for what changed
+    behind it: the set is now asserted/verified plus inferred, minus anything
+    measured DEAD."""
+    return set(await merchant_owned_domains_detailed(merchant_id))
+
+
+async def record_verified_official_domain(
+    merchant_id: str, domain: Optional[str]
+) -> bool:
+    """Backfill hook: a claim just PROVED control of `domain`, so promote it to
+    the official set as source='verified'.
+
+    Best-effort, like every other write in this file — a claim must never fail
+    because the official-domain table was unavailable. The liveness sweep is the
+    eventual-consistency net, and inference still covers the domain in the
+    meantime if it was derivable at all.
+
+    Liveness is deliberately left `unchecked` rather than assumed live: we just
+    proved DNS TXT control or mailbox control, neither of which is evidence that
+    the storefront answers HTTP.
+    """
+    from db import merchant_official_domains as mod
+
+    host = normalize_host(domain)
+    if not merchant_id or not host:
+        return False
+    try:
+        return await mod.upsert_official_domain(
+            merchant_id=merchant_id,
+            domain=host,
+            source=mod.SOURCE_VERIFIED,
+            verification_status=mod.VERIFICATION_VERIFIED,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break claim verification
+        logger.warning(
+            "record_verified_official_domain failed for %s/%s: %s",
+            merchant_id, host, str(exc)[:200],
+        )
+        return False
 
 
 async def merchant_owns_domain(merchant_id: str, domain: str) -> bool:
@@ -431,6 +555,10 @@ async def approve_manual_claim(
     if evidence_ref:
         proof = f"{proof}:{evidence_ref}"
     await bc.mark_claim_verified(claim_id, proof_ref=proof)
+    # B1: a verified claim's domain joins the official set as source='verified'.
+    await record_verified_official_domain(
+        claim["merchant_id"], claim.get("brand_domain")
+    )
     # Same lifecycle promotion as DNS/email: unclaimed -> claimed. Best-effort.
     from services.claim_state import promote_merchant_skus_to_claimed
 
@@ -536,6 +664,9 @@ async def verify_brand_claim(
 
     ok = await set_merchant_brand_direct(claim["merchant_id"])
     await bc.mark_claim_verified(claim_id, proof_ref=proof_ref)
+    # B1: the domain we just proved control of joins the official set as
+    # source='verified' — it is no longer only as good as what inference found.
+    await record_verified_official_domain(claim["merchant_id"], domain)
     # P1: promote the verified brand's audit-seeded SKUs unclaimed -> claimed
     # (the lifecycle backbone for the syndicate-after-claim gate). Best-effort.
     from services.claim_state import promote_merchant_skus_to_claimed
