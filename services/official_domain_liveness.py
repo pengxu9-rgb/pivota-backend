@@ -31,10 +31,20 @@ So only a CONFIRMED NEGATIVE excludes:
 or timeout — all `unverifiable`. The domain keeps its place and we try again
 after the TTL.
 
-WHAT THIS FETCHES: exactly `https://<host>/`, once, and nothing else. The host
-must pass `brand_claim_service.is_valid_public_hostname` first, which rejects
-IPs, single-label/internal names and anything malformed, so this cannot be
-pointed at a private address by a bad row.
+WHAT THIS FETCHES: `https://<host>/`, plus whatever `crawl_politeness` fetches
+to honour robots (it loads `robots.txt` for the host first, and CRAWL_ROBOTS_
+ENABLED defaults on). The host must pass `brand_claim_service.
+is_valid_public_hostname` first, which rejects bare IP literals, `localhost`
+and single-label names.
+
+KNOWN GAP (not yet closed; the sweep has no caller, so nothing reaches this):
+that validator does NOT reject a name that RESOLVES to a private address —
+`127.0.0.1.nip.io`, `169.254.169.254.nip.io` and `metadata.google.internal`
+all pass it — and `follow_redirects=True` does not validate the redirect
+target, so a public host can 302 to a link-local address. Rows reach here from
+`merchant_onboarding.store_url`, which merchants control. Address-family
+validation after resolution, plus a redirect-target check, are owed before
+this sweep is registered anywhere.
 """
 
 from __future__ import annotations

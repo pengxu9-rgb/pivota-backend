@@ -233,24 +233,29 @@ def _now_utc() -> datetime:
 # `excluded.`-qualified upsert syntax. tests/test_repo_sql_prepare_postgres.py
 # collects module-level constants, so this statement is PREPARE-checked there.
 #
-# COALESCE on the three verdict columns is what makes the upsert composable: a
-# writer that only knows the SOURCE (the brand-claim backfill) must not blank
-# the liveness the sweep recorded, and a writer that only knows the LIVENESS
-# (the sweep) must not blank the verification status.
+# COALESCE on the verdict columns is what makes the upsert composable: a writer
+# that only knows the SOURCE (the brand-claim backfill) passes
+# liveness_status=None and must not blank the liveness the sweep recorded, and a
+# writer that only knows the LIVENESS must not blank the verification status. A
+# fresh INSERT falls back to 'unchecked'. Without this a later claim silently
+# resurrected a domain the sweep had measured DEAD, for a whole TTL.
 UPSERT_OFFICIAL_DOMAIN_SQL = """
 INSERT INTO merchant_official_domains (
     merchant_id, domain, source, verification_status,
     liveness_status, last_checked_at, is_primary, created_at, updated_at
 ) VALUES (
     :merchant_id, :domain, :source, :verification_status,
-    :liveness_status, :last_checked_at, :is_primary, :now, :now
+    COALESCE(:liveness_status, 'unchecked'), :last_checked_at,
+    :is_primary, :now, :now
 )
 ON CONFLICT (merchant_id, domain) DO UPDATE SET
     source              = excluded.source,
     verification_status = COALESCE(excluded.verification_status,
                                    merchant_official_domains.verification_status),
-    liveness_status     = excluded.liveness_status,
-    last_checked_at     = excluded.last_checked_at,
+    liveness_status     = COALESCE(:liveness_status,
+                                   merchant_official_domains.liveness_status),
+    last_checked_at     = COALESCE(:last_checked_at,
+                                   merchant_official_domains.last_checked_at),
     is_primary          = excluded.is_primary,
     updated_at          = excluded.updated_at
 """
@@ -303,7 +308,7 @@ async def upsert_official_domain(
     domain: str,
     source: str,
     verification_status: Optional[str] = None,
-    liveness_status: str = LIVENESS_UNCHECKED,
+    liveness_status: Optional[str] = None,
     last_checked_at: Optional[datetime] = None,
     is_primary: bool = False,
     now: Optional[datetime] = None,
@@ -320,12 +325,19 @@ async def upsert_official_domain(
     if source not in VALID_SOURCES:
         logger.warning("upsert_official_domain: bad source %r", source)
         return False
-    if liveness_status not in VALID_LIVENESS:
+    # None is meaningful here: "I only know the SOURCE, leave the sweep's
+    # verdict alone". The SQL COALESCEs it against the stored value (and against
+    # 'unchecked' on a fresh INSERT), so it is not a missing value to reject.
+    if liveness_status is not None and liveness_status not in VALID_LIVENESS:
         logger.warning("upsert_official_domain: bad liveness %r", liveness_status)
         return False
     await ensure_merchant_official_domains_table()
     stamp = now or _now_utc()
-    if liveness_status != LIVENESS_UNCHECKED and last_checked_at is None:
+    if (
+        liveness_status is not None
+        and liveness_status != LIVENESS_UNCHECKED
+        and last_checked_at is None
+    ):
         # Keep ck_..._checked_at satisfiable for a caller that supplies a
         # verdict without a clock: the verdict IS the observation, so its time
         # is this write.

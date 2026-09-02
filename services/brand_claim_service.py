@@ -401,9 +401,34 @@ async def record_verified_official_domain(
     )
 
 
+async def merchant_bound_domains(merchant_id: str) -> set:
+    """The BINDING view: hosts that establish this merchant's brand identity.
+
+    Deliberately NOT the same set as `merchant_owned_domains`. That one answers
+    "is this cited host a destination the merchant owns?" and counts `asserted`
+    rows — control proven, binding not established. This one answers "is this
+    domain evidence of who the merchant IS?", which `asserted` cannot be without
+    circularity: verify_brand_claim WRITES an asserted row on the unbound branch,
+    so if the binding check read it back, a second identical /claim/verify call
+    would find the row its own first call had just written and grant brand_direct
+    — turning "needs review" into a one-call delay instead of a gate.
+    """
+    from db import merchant_official_domains as mod
+
+    detailed = await merchant_owned_domains_detailed(merchant_id)
+    return {
+        host
+        for host, detail in detailed.items()
+        if str(detail.get("source") or "") != mod.SOURCE_ASSERTED
+    }
+
+
 async def merchant_owns_domain(merchant_id: str, domain: str) -> bool:
-    """True iff `domain` is bound to the merchant's known brand identity."""
-    return host_matches_known(domain, await merchant_owned_domains(merchant_id))
+    """True iff `domain` is bound to the merchant's known brand identity.
+
+    Reads the BINDING view, which excludes `asserted` — see
+    merchant_bound_domains for why reading the reporting set here is circular."""
+    return host_matches_known(domain, await merchant_bound_domains(merchant_id))
 
 
 # ---------------------------------------------------------------------------

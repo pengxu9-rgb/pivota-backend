@@ -791,3 +791,120 @@ async def test_backfill_normalizes_before_writing():
     assert [r["domain"] for r in await mod.list_official_domains(MERCHANT)] == ["anua.us"]
     assert await svc.record_verified_official_domain(MERCHANT, None) is False
     assert await svc.record_verified_official_domain("", "anua.us") is False
+
+
+# ---------------------------------------------------------------------------
+# The bypass the first cut of the assert path shipped, and the injected-stub
+# test that hid it. These drive the REAL merchant_owns_domain — no
+# owned_domain_check override — because the defect lives in the loop between
+# what verify_brand_claim WRITES and what its own binding check READS BACK.
+# ---------------------------------------------------------------------------
+async def _unbound_claim(monkeypatch, domain="totally-unrelated.example"):
+    claim = {
+        "claim_id": "loop",
+        "merchant_id": MERCHANT,
+        "claim_method": "dns",
+        "brand_domain": domain,
+        "challenge_token": "pivota-verify=tok",
+        "verification_status": "pending",
+    }
+
+    async def _get(cid):
+        return claim
+
+    async def _inferred(mid):
+        return {"anua.com"}
+
+    granted = []
+
+    async def _grant(mid):
+        granted.append(mid)
+        return True
+
+    async def _mark(cid, **kw):
+        return True
+
+    monkeypatch.setattr(svc.bc, "get_brand_claim", _get)
+    monkeypatch.setattr(svc.bc, "mark_claim_verified", _mark)
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
+    monkeypatch.setattr(svc, "set_merchant_brand_direct", _grant)
+    return granted
+
+
+async def test_repeating_verify_never_promotes_an_unbound_domain(monkeypatch):
+    """Calling /claim/verify twice must not grant brand_direct.
+
+    The asserted row written by call 1 must not be visible to call 2's binding
+    check, or the review gate becomes a one-call delay: the claim stays pending
+    (no mark_claim_verified on this branch) and the route is freely repeatable.
+    """
+    granted = await _unbound_claim(monkeypatch)
+    for _ in range(3):
+        result = await svc.verify_brand_claim(
+            "loop", txt_resolver=lambda d: ["pivota-verify=tok"]
+        )
+        assert result["status"] == "domain_verified_unbound"
+        assert result["brand_direct_set"] is False
+    assert granted == [], "brand_direct must never be granted on an unbound domain"
+
+
+async def test_the_asserted_row_is_still_written_on_every_attempt(monkeypatch):
+    """Positive counterpart: the gate holds because the BINDING view excludes
+    asserted — not because the write silently failed."""
+    await _unbound_claim(monkeypatch)
+    await svc.verify_brand_claim("loop", txt_resolver=lambda d: ["pivota-verify=tok"])
+    rows = await mod.list_official_domains(MERCHANT)
+    assert [(r["domain"], r["source"]) for r in rows] == [
+        ("totally-unrelated.example", mod.SOURCE_ASSERTED)
+    ]
+    assert "totally-unrelated.example" in await svc.merchant_owned_domains(MERCHANT)
+    assert "totally-unrelated.example" not in await svc.merchant_bound_domains(MERCHANT)
+
+
+async def test_a_genuinely_bound_domain_still_verifies(monkeypatch):
+    """The gate must not have been closed by breaking the real path."""
+    granted = await _unbound_claim(monkeypatch, domain="anua.com")
+    result = await svc.verify_brand_claim(
+        "loop", txt_resolver=lambda d: ["pivota-verify=tok"]
+    )
+    assert result["status"] == "verified"
+    assert result["brand_direct_set"] is True
+    assert granted == [MERCHANT]
+
+
+# --- a source-only write must not blank the sweep's verdict -----------------
+async def test_a_source_only_upsert_preserves_a_recorded_liveness_verdict():
+    """The brand-claim backfill knows the SOURCE, not the liveness. If it blanks
+    the sweep's verdict, a domain measured DEAD silently rejoins the official set
+    for a whole TTL — undoing the exclusion this table exists to provide."""
+    m, d = "clobber_merchant", "us.judydoll.com"
+    await mod.upsert_official_domain(merchant_id=m, domain=d, source=mod.SOURCE_INFERRED)
+    await mod.record_liveness(merchant_id=m, domain=d, liveness_status=mod.LIVENESS_DEAD)
+
+    await mod.upsert_official_domain(merchant_id=m, domain=d, source=mod.SOURCE_ASSERTED)
+
+    [row] = await mod.list_official_domains(m)
+    assert row["liveness_status"] == mod.LIVENESS_DEAD
+    assert row["source"] == mod.SOURCE_ASSERTED
+
+
+async def test_an_explicit_liveness_verdict_still_wins():
+    """Positive counterpart: COALESCE must not make the columns unwritable."""
+    m, d = "explicit_merchant", "example.com"
+    await mod.upsert_official_domain(merchant_id=m, domain=d, source=mod.SOURCE_INFERRED)
+    await mod.record_liveness(merchant_id=m, domain=d, liveness_status=mod.LIVENESS_DEAD)
+    await mod.upsert_official_domain(
+        merchant_id=m, domain=d, source=mod.SOURCE_ASSERTED,
+        liveness_status=mod.LIVENESS_LIVE,
+    )
+    [row] = await mod.list_official_domains(m)
+    assert row["liveness_status"] == mod.LIVENESS_LIVE
+    assert row["last_checked_at"] is not None
+
+
+async def test_a_fresh_row_with_no_verdict_defaults_to_unchecked():
+    m, d = "fresh_merchant", "brandnew.com"
+    await mod.upsert_official_domain(merchant_id=m, domain=d, source=mod.SOURCE_ASSERTED)
+    [row] = await mod.list_official_domains(m)
+    assert row["liveness_status"] == mod.LIVENESS_UNCHECKED
+    assert row["last_checked_at"] is None
