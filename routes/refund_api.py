@@ -21,6 +21,10 @@ from services.shopify_transactions_service import (
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.merchant_webhook_service import emit_merchant_webhook_event
+from db.merchant_order_sync_jobs import (
+    OP_REFUND_SYNC,
+    enqueue_merchant_order_sync_job,
+)
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -450,69 +454,63 @@ async def process_refund(
         except Exception:
             pass
         
-        # Background task: Cancel/update Shopify order
-        async def update_shopify_order_task():
-            """Update or cancel Shopify order after refund"""
-            try:
-                if not (order.get("shopify_order_id") and store_info and store_info.get("platform") == "shopify"):
-                    return
-
-                shop_domain = store_info.get("domain")
-                access_token, _ = await resolve_shopify_admin_access_token(
-                    shop_domain=shop_domain,
-                    api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
-                    store_id=str(store_info.get("store_id") or "").strip() or None,
-                )
-                if not (shop_domain and access_token):
-                    return
-
-                await ensure_external_refund_transaction_best_effort(
-                    shop_domain=shop_domain,
-                    access_token=access_token,
-                    shopify_order_id=str(order["shopify_order_id"]),
-                    psp_used=order.get("psp_used") or psp_type,
-                    external_refund_ref=refund_id,
-                    amount=float(refund_amount),
-                    currency=str(order.get("currency") or "USD"),
-                    pivota_order_id=order_id,
-                )
-
-                # Full refund: optionally cancel the Shopify order for merchant ops visibility,
-                # but do NOT ask Shopify to process refunds (external PSP already handled it).
-                if not is_partial:
-                    import httpx
-
-                    url = f"https://{shop_domain}/admin/api/2025-10/orders/{order['shopify_order_id']}/cancel.json"
-                    headers_shopify = {
-                        "X-Shopify-Access-Token": access_token,
-                        "Content-Type": "application/json",
-                    }
-                    cancel_data = _shopify_external_refund_cancel_payload(
+        # Durable enqueue — replaces `background_tasks.add_task`.
+        #
+        # A refund whose Shopify cancel never fired leaves NO state a reconciler
+        # could find: the order is refunded and still carries its
+        # shopify_order_id, exactly like one whose cancel succeeded. Unlike the
+        # paid-order-missing-a-merchant-order case, there is nothing to select
+        # for after the fact, so the intent has to be recorded durably here, at
+        # the moment it is formed. Drained by
+        # services/merchant_order_sync_drain.py under a lease, with backoff.
+        #
+        # The guard mirrors the former task's early return, so a merchant with
+        # no Shopify store still queues nothing.
+        if (
+            order.get("shopify_order_id")
+            and store_info
+            and store_info.get("platform") == "shopify"
+        ):
+            enqueued_job_id = await enqueue_merchant_order_sync_job(
+                order_id=str(order_id),
+                merchant_id=str(order.get("merchant_id") or ""),
+                op=OP_REFUND_SYNC,
+                # One job per PSP refund: a retried refund request that reuses
+                # the same refund_id must not queue the work twice.
+                dedupe_key=str(refund_id),
+                payload={
+                    "order_id": str(order_id),
+                    "merchant_id": str(order.get("merchant_id") or ""),
+                    "shopify_order_id": str(order.get("shopify_order_id") or ""),
+                    "psp_used": order.get("psp_used") or psp_type,
+                    "refund_id": str(refund_id),
+                    "amount": float(refund_amount),
+                    "currency": str(order.get("currency") or "USD"),
+                    "is_partial": bool(is_partial),
+                    # Built here so the Shopify cancel contract stays owned by
+                    # this module rather than being restated in the worker.
+                    "cancel_payload": _shopify_external_refund_cancel_payload(
                         reason=refund_request.reason,
                         restore_inventory=refund_request.restore_inventory,
+                    ),
+                },
+            )
+            # enqueue returns None only on a persistence failure, which it logs
+            # at ERROR. It does not raise: the PSP has already moved funds, so
+            # failing the request here would turn lost follow-up work into a 5xx
+            # on a refund that actually succeeded.
+            if enqueued_job_id is None:
+                try:
+                    await log_order_event(
+                        event_type="merchant_order_sync_enqueue_failed",
+                        order_id=str(order_id),
+                        merchant_id=str(order.get("merchant_id") or ""),
+                        total_amount=float(refund_amount),
+                        currency=str(order.get("currency") or "USD"),
+                        metadata={"op": OP_REFUND_SYNC, "refund_id": str(refund_id)},
                     )
-
-                    async with httpx.AsyncClient() as client:
-                        response = await client.post(
-                            url,
-                            json=cancel_data,
-                            headers=headers_shopify,
-                            timeout=10.0,
-                        )
-                        if response.status_code == 200:
-                            logger.info(f"Shopify order {order['shopify_order_id']} cancelled")
-                        else:
-                            logger.warning(
-                                "Failed to cancel Shopify order after external refund: "
-                                "%s body=%s",
-                                response.status_code,
-                                (response.text or "")[:500],
-                            )
-                                
-            except Exception as e:
-                logger.error(f"Error updating Shopify order after refund: {e}")
-        
-        background_tasks.add_task(update_shopify_order_task)
+                except Exception:
+                    pass
 
         try:
             await emit_merchant_webhook_event(
