@@ -1508,6 +1508,7 @@ async def sync_shopify_products(
         #    This prevents browser net::ERR_CONNECTION_CLOSED due to proxy/request timeouts.
         from services.platform_import_service import schedule_import_task
         from jobs.catalog_import_worker import process_import_task_by_id
+        from db.platform_import_tasks import STALE_RUNNING_AFTER_SECONDS
 
         # De-dupe: if there's already an active Shopify import task, return it instead of
         # creating another. This prevents "Sync" button spam from spawning concurrent jobs.
@@ -1534,6 +1535,16 @@ async def sync_shopify_products(
             # If a task is stuck in `running` (e.g., process restarted mid-sync),
             # allow it to be recovered automatically by flipping it back to
             # retry_scheduled so the background worker can pick it up again.
+            #
+            # The window is STALE_RUNNING_AFTER_SECONDS, shared with the
+            # catalog_import_stale_reaper tick, and must not be shortened. It
+            # used to be 5 minutes, which is BELOW SHOPIFY_MAX_RUNTIME_SECONDS
+            # (default 600) — an import that was still healthily paginating got
+            # flipped back to retry_scheduled. That was merely wasteful while
+            # this endpoint was the only runner; now that
+            # catalog_import_drain_tick is claiming the queue every 30s, it
+            # would hand the still-live import's row to a second runner, which
+            # is exactly the double-run the atomic claim exists to prevent.
             if existing_status == "running":
                 updated_at = existing_task.get("updated_at")
                 try:
@@ -1541,7 +1552,9 @@ async def sync_shopify_products(
                     # updated_at from DB might be naive; treat as UTC.
                     if isinstance(updated_at, datetime) and updated_at.tzinfo is None:
                         updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(minutes=5):
+                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(
+                        seconds=STALE_RUNNING_AFTER_SECONDS
+                    ):
                         await database.execute(
                             """
                             UPDATE platform_import_tasks
@@ -1586,8 +1599,14 @@ async def sync_shopify_products(
             connector="shopify",
         )
 
-        # Kick off processing in the background (best effort). If a dedicated worker is running,
-        # it can also pick up the pending task later.
+        # Kick off processing in the background (best effort) — KEPT deliberately
+        # now that catalog_import_drain_tick exists, because it is what makes the
+        # Sync button feel immediate instead of up to 30s late. It is no longer
+        # the only runner, and it is no longer load-bearing: it is not retried
+        # and dies with the process on a revision swap, and the drain tick picks
+        # up whatever it drops. Both paths go through the same atomic claim, so
+        # the two firing together cannot import the same catalog twice — the
+        # loser gets `task_not_ready`.
         background_tasks.add_task(process_import_task_by_id, task_id)
 
         logger.info(

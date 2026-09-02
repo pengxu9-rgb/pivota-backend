@@ -14,6 +14,9 @@ from db.platform_import_tasks import (
     list_import_tasks_for_merchant,
     update_import_task_status,
     get_next_scheduled_task,
+    claim_import_task,
+    claim_next_import_task,
+    requeue_stale_import_tasks,
 )
 
 
@@ -56,8 +59,43 @@ async def get_next_ready_task() -> Optional[Dict[str, Any]]:
     return await get_next_scheduled_task()
 
 
+async def claim_next_ready_task() -> Optional[Dict[str, Any]]:
+    """Atomically claim the next ready ImportTask, or None.
+
+    Preferred over `get_next_ready_task` + `mark_import_task_running`: that pair
+    is a read-then-write with no guard, so two runners can claim the same row.
+    The returned row already has `attempt` incremented and `status = running`.
+    """
+    return await claim_next_import_task()
+
+
+async def claim_ready_task_by_id(task_id: int) -> Optional[Dict[str, Any]]:
+    """Atomically claim ONE ImportTask by id, or None if it was not claimable."""
+    return await claim_import_task(task_id)
+
+
+async def requeue_stale_running_tasks(
+    *,
+    stale_after_seconds: Optional[int] = None,
+    limit: int = 5,
+) -> int:
+    """Return abandoned `running` ImportTasks to the queue; return how many."""
+    kwargs: Dict[str, Any] = {"limit": limit}
+    if stale_after_seconds is not None:
+        kwargs["stale_after_seconds"] = stale_after_seconds
+    return await requeue_stale_import_tasks(**kwargs)
+
+
 async def mark_import_task_running(task_id: int, attempt: int) -> bool:
-    """Mark task as running."""
+    """Mark task as running.
+
+    NOT a claim: it overwrites the row unconditionally, and pairing it with
+    `get_next_ready_task` is the read-then-write that let two runners import the
+    same catalog. No callers remain — both entry points in
+    jobs/catalog_import_worker.py now go through `claim_next_ready_task` /
+    `claim_ready_task_by_id`. Kept only so an out-of-band script that still
+    imports it does not break; do not reach for it in new code.
+    """
     return await update_import_task_status(
         task_id=task_id,
         status="running",

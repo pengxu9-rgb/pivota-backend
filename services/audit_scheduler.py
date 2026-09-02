@@ -39,6 +39,10 @@ Job registration happens at start-up time. Currently registers:
   upstream (Shopify shop.json / Wix products query) and disconnects the ones
   the platform no longer recognises, then re-derives
   catalog_merchants.status from merchant_stores (issue #1648).
+- `catalog_import_drain_tick` — fires every 30 seconds, claims and runs one
+  ready row from platform_import_tasks (merchant "Sync products"). Paired with
+  `catalog_import_stale_reaper` every 5 minutes, which returns `running` rows
+  abandoned by a revision swap to the queue.
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
@@ -128,6 +132,12 @@ _JOB_RUN_DEADLINES = {
     "executor_run_worker_tick": 1800,
     "verification_run_worker_tick": 300,
     "quality_backfill_drain_tick": 3600,
+    # Platform catalog import (Shopify Admin pagination): bounded per run by
+    # SHOPIFY_MAX_RUNTIME_SECONDS (default 600) plus upsert time for up to
+    # SHOPIFY_MAX_PRODUCTS_PER_RUN rows. 30 min is well above that; a cut run
+    # shields a `retry_scheduled` write on CancelledError, so it resumes on a
+    # later tick rather than stranding the merchant.
+    "catalog_import_drain_tick": 1800,
     # DB-only reapers (60s / 5min cadence)
     "audit_run_lease_reaper": 120,
     "audit_run_abandoned_reaper": 120,
@@ -135,6 +145,7 @@ _JOB_RUN_DEADLINES = {
     "verification_run_lease_reaper": 120,
     "metering_expire_reservations": 120,
     "stamp_attribution_reaper": 120,
+    "catalog_import_stale_reaper": 120,
     # money path: 50 orders x (PSP verify + finalize + Shopify order); 2 ticks'
     # worth so a slow PSP is not cut off, but a wedge is bounded at 10 min.
     "payment_reconcile_tick": 600,
@@ -908,6 +919,52 @@ async def start_scheduler() -> None:
             replace_existing=True,
             coalesce=True,
             max_instances=1,
+        )
+
+        # Merchant catalog import (Shopify "Sync products"): drain the
+        # platform_import_tasks queue. jobs/catalog_import_worker defined the
+        # drainer but NOTHING called it — the only runner was the request-scoped
+        # BackgroundTask in routes/merchant_api_extensions.py, which is not
+        # retried and dies with the process on a Cloud Run revision swap or
+        # scale-down, stranding the row `pending` forever. The endpoint still
+        # kicks its task off for interactive latency; both paths now go through
+        # an atomic claim (db.platform_import_tasks.claim_import_task) so the
+        # two firing at once cannot import the same catalog twice.
+        # 30s matches quality_backfill_drain_tick; one task per fire, and
+        # max_instances=1 keeps a slow import from stacking ticks.
+        # Disable via CATALOG_IMPORT_DRAIN_ENABLED=false without a deploy.
+        from jobs.catalog_import_worker import (
+            run_catalog_import_drain_tick,
+            run_catalog_import_stale_reaper_tick,
+        )
+        _add_job(
+            run_catalog_import_drain_tick,
+            "interval",
+            seconds=30,
+            id="catalog_import_drain_tick",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # Backstop for the above. A run cut by its DEADLINE recovers itself —
+        # _process_import_task_record shields a `retry_scheduled` write on
+        # CancelledError — but a process that simply dies (revision swap,
+        # scale-down, OOM) never reaches that handler and leaves the row
+        # `running`, which get_next_scheduled_task never reconsiders and the
+        # endpoint's de-dupe branch reports as "already in progress". Own job
+        # rather than a step inside the drain tick, because that tick can
+        # legitimately be busy for ten minutes and recovery must not wait behind
+        # it.
+        _add_job(
+            run_catalog_import_stale_reaper_tick,
+            "interval",
+            seconds=300,
+            id="catalog_import_stale_reaper",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
         )
 
         # Pending-payment reconcile sweep: safety net behind the Stripe webhook.
