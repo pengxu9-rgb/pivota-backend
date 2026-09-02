@@ -341,6 +341,14 @@ async def claim_next_merchant_order_sync_job(
                    FROM merchant_order_sync_jobs
                   WHERE status IN ('pending', 'running')
                     AND next_attempt_at <= :now
+                    -- A job whose budget is spent must never be handed out
+                    -- again. `max_attempts` used to be consulted only by
+                    -- `fail_...`, i.e. only when a worker survived long enough
+                    -- to REPORT — so a worker that died mid-attempt had its
+                    -- work re-claimed once the lease expired. For the
+                    -- at-most-once create op that is a second POST to a
+                    -- platform that cannot dedupe it.
+                    AND attempts < max_attempts
                     AND (claimed_until IS NULL OR claimed_until < :now)
                   ORDER BY created_at ASC
                   FOR UPDATE SKIP LOCKED
@@ -533,7 +541,19 @@ async def release_stale_merchant_order_sync_leases(
         rows = await database.fetch_all(
             """
             UPDATE merchant_order_sync_jobs
-               SET status = 'pending', claimed_by_worker = NULL, claimed_until = NULL
+               SET claimed_by_worker = NULL,
+                   claimed_until = NULL,
+                   -- A row whose worker died with its budget spent can never be
+                   -- claimed again (the claim now requires attempts <
+                   -- max_attempts), so parking it `pending` would strand it
+                   -- silently. Retire it instead: `failed` is visible in
+                   -- list_failed_merchant_order_sync_jobs.
+                   status = CASE WHEN attempts >= max_attempts
+                                 THEN 'failed' ELSE 'pending' END,
+                   last_error = CASE WHEN attempts >= max_attempts
+                                     THEN 'worker died mid-attempt with no '
+                                          'attempts left; not retried'
+                                     ELSE last_error END
              WHERE status = 'running'
                AND claimed_until IS NOT NULL
                AND claimed_until < :cutoff

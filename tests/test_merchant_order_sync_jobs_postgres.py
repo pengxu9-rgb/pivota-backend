@@ -546,3 +546,160 @@ async def test_the_reconciler_only_repairs_orders_the_queue_never_heard_of():
     finally:
         await database.execute(
             "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+
+async def test_a_dead_worker_does_not_get_an_at_most_once_create_reattempted():
+    """The premise the reconciler's whole safety argument rests on.
+
+    `max_attempts` used to be consulted only by `fail_...`, i.e. only when a
+    worker survived long enough to REPORT. A worker that died mid-POST — the
+    Cloud Run revision swap this queue exists to survive — had its work
+    re-claimed once the lease expired, handing the same non-idempotent
+    Woo/Wix/BigCommerce create to a second worker.
+    """
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        enqueue_merchant_order_create,
+        release_stale_merchant_order_sync_leases,
+    )
+
+    order_id = _order_id()
+    job_id = await enqueue_merchant_order_create(order_id=order_id, merchant_id="m1")
+    claimed = await claim_next_merchant_order_sync_job(worker_id="worker-dies")
+    assert claimed is not None and claimed["attempts"] == 1
+
+    # The worker dies mid-attempt: the lease is held by nobody.
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs SET claimed_until = NOW() - INTERVAL "
+        "'10 minutes' WHERE job_id = :j", {"j": job_id})
+
+    assert await claim_next_merchant_order_sync_job(worker_id="worker-b") is None, \
+        "an at-most-once create was handed out a second time"
+
+    # And the reaper retires it rather than parking it `pending` where nothing
+    # would ever claim it again.
+    await release_stale_merchant_order_sync_leases(grace_seconds=0)
+    row = dict(await database.fetch_one(
+        "SELECT status, last_error FROM merchant_order_sync_jobs WHERE job_id=:j",
+        {"j": job_id}))
+    assert row["status"] == "failed"
+    assert "no attempts left" in (row["last_error"] or "")
+
+
+async def test_a_refund_job_with_budget_left_is_still_recovered():
+    """Positive counterpart: the budget guard must not strand a job that has
+    attempts remaining — that is the dead-worker recovery the queue is for."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import (
+        claim_next_merchant_order_sync_job,
+        release_stale_merchant_order_sync_leases,
+    )
+
+    order_id = _order_id()
+    await _enqueue(order_id, dedupe="re_budget")   # refund op: max_attempts=10
+    first = await claim_next_merchant_order_sync_job(worker_id="worker-dies")
+    assert first["attempts"] == 1
+
+    await database.execute(
+        "UPDATE merchant_order_sync_jobs SET claimed_until = NOW() - INTERVAL "
+        "'10 minutes' WHERE job_id = :j", {"j": first["job_id"]})
+    released = await release_stale_merchant_order_sync_leases(grace_seconds=0)
+    assert released >= 1
+
+    again = await claim_next_merchant_order_sync_job(worker_id="worker-b")
+    assert again is not None and again["attempts"] == 2
+
+
+async def test_the_reconciler_is_inert_on_the_scheduled_unfiltered_path():
+    """The tick always passes merchant_id=None, and the NOT EXISTS guard FAILS
+    OPEN: an unbound named parameter renders as NULL under databases/asyncpg
+    with no error, so `j.op = NULL` is never true and every candidate is
+    re-enqueued. The filtered path alone could not catch that."""
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+    from datetime import datetime, timedelta, timezone
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_unfiltered_{uuid.uuid4().hex[:6]}"
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+    order_id = f"ORD_UNFILTERED_{uuid.uuid4().hex[:8]}"
+    await database.execute(orders_table.insert().values(
+        order_id=order_id, merchant_id=merchant, customer_email="u@x.test",
+        shipping_address={}, items=[], subtotal=10, total=10, currency="USD",
+        payment_status="paid", status="paid", shopify_order_id=None,
+        metadata={}, is_deleted=False, created_at=old, paid_at=old))
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id=merchant)
+
+    try:
+        # merchant_id=None — exactly what run_merchant_order_create_reconcile_tick does.
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=None, limit=200, min_age_seconds=60, dry_run=True)
+        assert order_id not in result["candidates"], \
+            "the queue already owns this order; re-enqueuing would revive it every tick"
+    finally:
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
+
+
+async def test_the_reconciler_repairs_an_order_with_a_null_is_deleted():
+    """`orders.is_deleted` is nullable with only a CLIENT-side default, and two
+    raw-SQL insert paths omit it entirely (scripts/shakeout/c_full_order_pipeline
+    and routes/init_orders_table). A bare `is_deleted = false` is NULL for those
+    rows, so the counter (which COALESCEs) paged on them forever while this
+    repair lane could never touch them."""
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+    from datetime import datetime, timedelta, timezone
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_nulldel_{uuid.uuid4().hex[:6]}"
+    order_id = f"ORD_NULLDEL_{uuid.uuid4().hex[:8]}"
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+
+    # Raw insert that OMITS is_deleted, as those two production paths do.
+    await database.execute(
+        """
+        INSERT INTO orders (order_id, merchant_id, customer_email, shipping_address,
+                            items, subtotal, total, currency, payment_status, status,
+                            created_at, paid_at)
+        VALUES (:oid, :mid, 'n@x.test', '{}', '[]', 10, 10, 'USD', 'paid', 'paid',
+                :old, :old)
+        """,
+        {"oid": order_id, "mid": merchant, "old": old},
+    )
+    row = dict(await database.fetch_one(
+        "SELECT is_deleted FROM orders WHERE order_id = :o", {"o": order_id}))
+    assert row["is_deleted"] is None, "fixture must reproduce the NULL, not a false"
+
+    try:
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=True)
+        assert result["candidates"] == [order_id], \
+            "an order the alert pages on must be repairable by this lane"
+    finally:
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})

@@ -106,9 +106,17 @@ async def reconcile_paid_orders_missing_merchant_order(
     So it now ENQUEUES onto the durable queue instead of creating, and only for
     orders that have no create job at all. That confines it to exactly the gap
     it exists for — an enqueue that was lost — and inherits the queue's
-    at-most-once guarantee. An order whose job already ran and FAILED is not
-    re-attempted here; that needs the ops retry endpoint, or a deliberate
-    per-platform retry lane that does not exist yet.
+    at-most-once guarantee.
+
+    An order whose job already ran is not re-attempted here, whatever the
+    outcome — and note that includes a job marked `done` on the contended-lock
+    path, where the handler returns `create_in_progress_elsewhere` having
+    created nothing. If that lock holder then died, the order sits outside this
+    lane permanently. It stays visible through
+    `paid_missing_merchant_order_count`, and the ops retry endpoint repairs it
+    by calling `sync_order_to_connected_store` directly. A `failed` job is the
+    same story. Neither is re-attempted automatically, because retrying a
+    create on a platform that cannot dedupe it is the duplicate-order problem.
     """
     from db.merchant_order_sync_jobs import (
         OP_MERCHANT_ORDER_CREATE,
@@ -137,7 +145,7 @@ async def reconcile_paid_orders_missing_merchant_order(
         f"""
         SELECT order_id, merchant_id
         FROM orders
-        WHERE is_deleted = false
+        WHERE COALESCE(is_deleted, false) = false
           AND payment_status = 'paid'
           AND (shopify_order_id IS NULL OR shopify_order_id = '')
           -- A WooCommerce/Wix/BigCommerce order records its id in metadata and
