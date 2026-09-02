@@ -1508,6 +1508,7 @@ async def sync_shopify_products(
         #    This prevents browser net::ERR_CONNECTION_CLOSED due to proxy/request timeouts.
         from services.platform_import_service import schedule_import_task
         from jobs.catalog_import_worker import process_import_task_by_id
+        from db.platform_import_tasks import STALE_RUNNING_AFTER_SECONDS
 
         # De-dupe: if there's already an active Shopify import task, return it instead of
         # creating another. This prevents "Sync" button spam from spawning concurrent jobs.
@@ -1534,6 +1535,25 @@ async def sync_shopify_products(
             # If a task is stuck in `running` (e.g., process restarted mid-sync),
             # allow it to be recovered automatically by flipping it back to
             # retry_scheduled so the background worker can pick it up again.
+            #
+            # The window is STALE_RUNNING_AFTER_SECONDS, shared with the
+            # catalog_import_stale_reaper tick. It was 5 minutes, and widening it
+            # is a deliberate trade, not a cleanup.
+            #
+            # What makes any window safe here is the per-page heartbeat below
+            # (_process_import_task_record writes status="running" after every
+            # page, refreshing updated_at), so this measures time since the last
+            # page, not since the claim. 5 minutes was survivable while this
+            # endpoint was the ONLY runner: a premature flip just re-ran the
+            # import. It is not survivable now that catalog_import_drain_tick can
+            # claim the row 30s later — that hands a still-live import to a
+            # second runner, the exact double-run the atomic claim prevents. One
+            # slow page (30s HTTP timeout, retries, 250 upserts) is well within
+            # 5 minutes of wall clock but not within 15.
+            #
+            # The cost is real and accepted: a merchant whose import genuinely
+            # died now waits 15 minutes for this button to recover it rather than
+            # 5, and the reaper is no faster (same cutoff, 300s tick).
             if existing_status == "running":
                 updated_at = existing_task.get("updated_at")
                 try:
@@ -1541,7 +1561,9 @@ async def sync_shopify_products(
                     # updated_at from DB might be naive; treat as UTC.
                     if isinstance(updated_at, datetime) and updated_at.tzinfo is None:
                         updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(minutes=5):
+                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(
+                        seconds=STALE_RUNNING_AFTER_SECONDS
+                    ):
                         await database.execute(
                             """
                             UPDATE platform_import_tasks
@@ -1550,6 +1572,7 @@ async def sync_shopify_products(
                                 error = 'stale_running_recovered',
                                 updated_at = NOW()
                             WHERE id = :task_id
+                              AND status = 'running'
                             """,
                             {"task_id": existing_task_id},
                         )
@@ -1586,8 +1609,14 @@ async def sync_shopify_products(
             connector="shopify",
         )
 
-        # Kick off processing in the background (best effort). If a dedicated worker is running,
-        # it can also pick up the pending task later.
+        # Kick off processing in the background (best effort) — KEPT deliberately
+        # now that catalog_import_drain_tick exists, because it is what makes the
+        # Sync button feel immediate instead of up to 30s late. It is no longer
+        # the only runner, and it is no longer load-bearing: it is not retried
+        # and dies with the process on a revision swap, and the drain tick picks
+        # up whatever it drops. Both paths go through the same atomic claim, so
+        # the two firing together cannot import the same catalog twice — the
+        # loser gets `task_not_ready`.
         background_tasks.add_task(process_import_task_by_id, task_id)
 
         logger.info(

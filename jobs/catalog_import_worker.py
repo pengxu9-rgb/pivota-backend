@@ -26,8 +26,9 @@ import io
 
 from config.settings import settings
 from services.platform_import_service import (
-    get_next_ready_task,
-    mark_import_task_running,
+    claim_next_ready_task,
+    claim_ready_task_by_id,
+    requeue_stale_running_tasks,
     mark_import_task_succeeded,
     mark_import_task_failed,
     mark_import_task_retry_scheduled,
@@ -687,8 +688,14 @@ async def _ingest_orders_report_csv(
 
 
 async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Run one ImportTask that the caller has ALREADY claimed.
+
+    `task` must be the row returned by `claim_next_ready_task` /
+    `claim_ready_task_by_id` — status is already `running` and `attempt` is
+    already incremented, so this function must not do either again.
+    """
     task_id = task["id"]
-    attempt = int(task.get("attempt", 0)) + 1
+    attempt = int(task.get("attempt") or 1)
     merchant_id = task.get("merchant_id")
     source_type = task.get("source_type")
     connector = task.get("connector")
@@ -703,7 +710,8 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
         },
     )
 
-    await mark_import_task_running(task_id, attempt)
+    # NOT marked running here: the atomic claim already did it. Re-marking would
+    # re-open the double-run window the claim exists to close.
 
     # Counts are stored as JSON; if the task is retry_scheduled we may resume from prior progress.
     existing_counts = task.get("counts") if isinstance(task.get("counts"), dict) else {}
@@ -1531,13 +1539,17 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
 
 async def process_next_import_task() -> Dict[str, Any]:
     """
-    Process the next ready ImportTask, if any.
+    Claim and process the next ready ImportTask, if any.
 
-    - Picks the oldest `pending`/`retry_scheduled` task
+    - Atomically claims the oldest `pending`/`retry_scheduled` task
     - For Shopify connector tasks, fetches a small batch of products and records counts
     - For other tasks, performs the corresponding import and marks status
+
+    Returns `reason="no_pending_tasks"` both when the queue is empty and when a
+    racing runner claimed the candidate first — from this runner's point of view
+    those are the same outcome: there is nothing for it to do.
     """
-    task = await get_next_ready_task()
+    task = await claim_next_ready_task()
     if not task:
         return {"processed": False, "reason": "no_pending_tasks"}
     return await _process_import_task_record(task)
@@ -1545,22 +1557,109 @@ async def process_next_import_task() -> Dict[str, Any]:
 
 async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
     """
-    Process a specific ImportTask by ID (best-effort).
+    Claim and process a specific ImportTask by ID (best-effort).
 
     Intended for APIs that want to schedule a task and immediately kick off processing
-    without relying on an external worker.
+    without waiting for the drain tick in services/audit_scheduler.py.
+
+    The claim is what makes it safe for BOTH to fire at once: whichever gets the
+    conditional UPDATE first runs the import, and the loser reports
+    `task_not_ready` instead of importing the same catalog a second time.
     """
-    task = await get_import_task(task_id)
-    if not task:
+    task = await claim_ready_task_by_id(task_id)
+    if task:
+        return await _process_import_task_record(task)
+
+    # Claim failed: either the row is gone or it was not in a claimable state
+    # (already running/succeeded/failed, or another runner just took it).
+    existing = await get_import_task(task_id)
+    if not existing:
         return {"processed": False, "reason": "task_not_found", "task_id": task_id}
+    return {
+        "processed": False,
+        "reason": "task_not_ready",
+        "task_id": task_id,
+        "status": existing.get("status"),
+    }
 
-    status = (task.get("status") or "").lower()
-    if status not in ("pending", "retry_scheduled"):
-        return {
-            "processed": False,
-            "reason": "task_not_ready",
-            "task_id": task_id,
-            "status": task.get("status"),
-        }
 
-    return await _process_import_task_record(task)
+def _catalog_import_drain_enabled() -> bool:
+    """Whether the scheduler drain tick and its reaper may do anything.
+
+    DORMANT BY DEFAULT, matching the two closest precedents in
+    services/audit_scheduler.py — `catalog_onboard_queue_drain` ("OFF BY DEFAULT
+    ... so deploying never starts autonomous catalog writes") and
+    `payment_reconcile_tick` ("DORMANT unless ... enable deliberately"). Every
+    reason those give applies here and then some: this drains a queue nothing has
+    ever drained, so the backlog is unmeasured and may be months old; each task
+    calls a merchant's Shopify Admin API with stored credentials and rewrites
+    their products_cache; and prod and staging share one Postgres.
+
+    So arming it is a separate, deliberate act from deploying it. Measure the
+    backlog first:
+
+        SELECT status, source_type, connector, count(*), min(created_at)
+        FROM platform_import_tasks GROUP BY 1, 2, 3;
+
+    then set CATALOG_IMPORT_DRAIN_ENABLED=true. Read per-run, so flipping it
+    takes effect on the next tick.
+    """
+    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "false") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+async def run_catalog_import_drain_tick() -> Dict[str, Any]:
+    """Scheduler tick: drain ONE ready ImportTask per fire.
+
+    Registered as `catalog_import_drain_tick` in services/audit_scheduler.py.
+    Before this existed the ONLY runner was the request-scoped BackgroundTask in
+    routes/merchant_api_extensions.py, which dies with the process on a Cloud Run
+    revision swap or scale-down — leaving the row `pending` with nobody looking
+    at it, because `process_next_import_task` had zero callers anywhere.
+
+    One task per tick (not a drain loop) so a slow Shopify import cannot hold the
+    run past its deadline; `max_instances=1` + a 30s interval means the queue
+    still empties steadily.
+    """
+    if not _catalog_import_drain_enabled():
+        return {"processed": False, "reason": "disabled"}
+    return await process_next_import_task()
+
+
+async def run_catalog_import_stale_reaper_tick() -> Dict[str, Any]:
+    """Scheduler tick: return abandoned `running` ImportTasks to the queue.
+
+    Registered as `catalog_import_stale_reaper` in services/audit_scheduler.py.
+    Separate from the drain tick on purpose: the drain tick holds
+    `max_instances=1` for the length of a real import (up to
+    SHOPIFY_MAX_RUNTIME_SECONDS), and recovery must not queue behind that.
+    """
+    if not _catalog_import_drain_enabled():
+        return {"requeued": 0, "reason": "disabled"}
+    requeued = await requeue_stale_running_tasks(
+        stale_after_seconds=_env_int("CATALOG_IMPORT_STALE_AFTER_SECONDS", None),
+        limit=_env_int("CATALOG_IMPORT_STALE_REQUEUE_LIMIT", 5) or 5,
+        # Poison-pill bound. A task that kills its process never reaches the
+        # worker's attempt cutoffs (they all sit in `except` handlers), so the
+        # reaper has to apply one itself or an OOM-inducing row is requeued
+        # forever. Same ceiling the retry handlers use.
+        max_attempt=SHOPIFY_MAX_RETRY_ATTEMPTS,
+    )
+    if requeued:
+        logger.warning("Requeued %s stale catalog import task(s)", requeued)
+    return {"requeued": requeued}
+
+
+def _env_int(name: str, default: Optional[int]) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default

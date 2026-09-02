@@ -33,6 +33,12 @@ _MANAGEABLE_JOB_IDS = frozenset(
         "partner_settlement_monthly",   # T8
         "settlement_file_generate",     # PR #8 day-5
         "settlement_file_transfer",     # PR #8 day-10 (Stripe Connect transfers)
+        # The catalog-import drain writes merchant catalogs from an unmeasured
+        # backlog and calls merchant Shopify credentials. Its only other stop
+        # lever is an env var, i.e. a deploy — and a deploy abandons whatever
+        # import is in flight. Pausing must not require one.
+        "catalog_import_drain_tick",
+        "catalog_import_stale_reaper",
     }
 )
 
@@ -52,6 +58,10 @@ _RUNNABLE_JOB_IDS = frozenset(
         "verification_run_lease_reaper",
         "external_conversion_poll",
         "cafe24_reconciliation",
+        # Idempotent, DB-only, bounded by `limit` — same shape as the lease
+        # reapers above. Force-runnable so an operator can recover rows stranded
+        # in `running` without waiting out the 300s tick.
+        "catalog_import_stale_reaper",
     }
 )
 
