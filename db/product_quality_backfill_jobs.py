@@ -55,10 +55,6 @@ def _ddl_lock() -> asyncio.Lock:
     return _DDL_LOCK
 
 
-def _utcnow() -> datetime:
-    return datetime.utcnow().replace(microsecond=0)
-
-
 def _json_type_sql() -> str:
     return "JSONB" if IS_POSTGRES else "JSON"
 
@@ -141,8 +137,15 @@ async def create_quality_backfill_job(
 ) -> Dict[str, Any]:
     await ensure_product_quality_backfill_jobs_table()
     job_id = f"qbf_{uuid.uuid4().hex[:20]}"
-    requested_at = _utcnow()
 
+    # requested_at is DELIBERATELY ABSENT: the column's own default supplies it
+    # (`NOW()` in migration 054, `CURRENT_TIMESTAMP` in this module's DDL,
+    # `server_default=func.now()` on the Column above — every way this table can
+    # be built has one). Passing `_utcnow()` bound a NAIVE datetime, which
+    # asyncpg encodes for a TIMESTAMPTZ column as the CLIENT PROCESS's local
+    # wall time, so the row recorded an instant hours off whenever the app ran
+    # off UTC. See `complete_quality_backfill_job` for the same fix on
+    # finished_at, and `requeue_stale_quality_backfill_jobs` for the read side.
     await database.execute(
         product_quality_backfill_jobs.insert().values(
             job_id=job_id,
@@ -150,7 +153,6 @@ async def create_quality_backfill_job(
             platform=platform,
             status="queued",
             requested_by=requested_by,
-            requested_at=requested_at,
             force_refresh=force_refresh,
             missing_only=missing_only,
             total_candidates=0,
@@ -343,10 +345,24 @@ _UPDATE_PROGRESS_SQL_SQLITE = """
 
 # errors_sample is NOT COALESCEd here: completing a job always rewrites it, and
 # `_json_param(None)` deliberately yields `[]` so a clean run clears the sample.
+#
+# finished_at IS WRITTEN BY THE SERVER, for the reason the requeue cutoff is:
+# a naive `_utcnow()` bound to a TIMESTAMPTZ column is encoded by asyncpg as the
+# CLIENT PROCESS's local wall time, so it landed hours off whenever the app ran
+# off UTC. BE EXACT ABOUT WHAT THIS FIXES. `CURRENT_TIMESTAMP` is right for a
+# TIMESTAMPTZ column whatever the client's timezone — that is production,
+# migration 054, and this module's own DDL. For a naive `timestamp` column (what
+# `metadata.create_all` builds, since the Column above is a bare `DateTime`) it
+# is right only while the SESSION is UTC, because the server converts to
+# session-local on the way in and this module reads naive values back AS UTC. No
+# single expression satisfies both declarations — `now() AT TIME ZONE 'UTC'`
+# fixes the naive case and breaks the aware one — so this picks the declaration
+# production actually has. The model/migration drift is the real defect and is
+# not fixed here; it is the same drift the errors_sample comment above describes.
 _COMPLETE_SQL = """
     UPDATE product_quality_backfill_jobs
     SET status = :status,
-        finished_at = :finished_at,
+        finished_at = CURRENT_TIMESTAMP,
         errors_sample = CAST(:errors_sample AS JSONB),
         total_candidates = COALESCE(:total_candidates, total_candidates),
         processed = COALESCE(:processed, processed),
@@ -359,7 +375,7 @@ _COMPLETE_SQL = """
 _COMPLETE_SQL_SQLITE = """
     UPDATE product_quality_backfill_jobs
     SET status = :status,
-        finished_at = :finished_at,
+        finished_at = CURRENT_TIMESTAMP,
         errors_sample = :errors_sample,
         total_candidates = COALESCE(:total_candidates, total_candidates),
         processed = COALESCE(:processed, processed),
@@ -509,7 +525,6 @@ async def complete_quality_backfill_job(
     values: Dict[str, Any] = {
         "job_id": job_id,
         "status": status,
-        "finished_at": _utcnow(),
         "errors_sample": _json_param(errors_sample),
         "total_candidates": total_candidates,
         "processed": processed,

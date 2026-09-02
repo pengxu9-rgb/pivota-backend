@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -516,3 +516,100 @@ async def test_the_staleness_window_is_measured_in_seconds_against_the_server_cl
         "a job running for 45s was stale at a 600s window — the window is too "
         "short, or the comparison runs the wrong way"
     )
+
+
+def _as_utc(value) -> datetime:
+    """`_normalize_row` hands back an ISO string with a `Z`; raw rows a datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+async def test_the_job_timestamps_are_written_and_are_close_to_now():
+    """requested_at is no longer passed by the caller — the column default writes
+    it. That only works if every way this table can be built HAS a default
+    (migration 054: `NOW()`; this module's DDL: `CURRENT_TIMESTAMP`; the Column:
+    `server_default=func.now()`), so this is the case that fails loudly if one of
+    those three ever loses it. finished_at is the same story on the completion
+    path. This case is about the values being WRITTEN and current; the timezone
+    claim is the Postgres-only case below.
+    """
+    before = datetime.now(timezone.utc)
+    job_id = await _new_job()
+
+    row = await get_quality_backfill_job(job_id)
+    requested = _as_utc(row["requested_at"])
+    assert abs((requested - before).total_seconds()) < 120, (
+        f"requested_at is {requested}, now is {before} — the column default did "
+        "not write the instant this job was created"
+    )
+    assert row["finished_at"] is None
+
+    await complete_quality_backfill_job(job_id, status="completed")
+    finished = _as_utc((await get_quality_backfill_job(job_id))["finished_at"])
+    assert abs((finished - datetime.now(timezone.utc)).total_seconds()) < 120, (
+        f"finished_at is {finished} — completion did not stamp the current instant"
+    )
+
+
+@pytest.mark.skipif(
+    not IS_POSTGRES,
+    reason="asyncpg encodes a naive datetime for timestamptz using the CLIENT timezone; SQLite binds no datetime here",
+)
+async def test_a_non_utc_process_timezone_does_not_shift_the_stored_timestamps():
+    """The write-path twin of the cutoff case.
+
+    `requested_at` was `_utcnow()` through the SQLAlchemy insert and
+    `finished_at` was `_utcnow()` bound into the completion UPDATE — both NAIVE
+    datetimes into TIMESTAMPTZ columns, which asyncpg encodes as the CLIENT
+    PROCESS's local wall time. From a process on Pacific time every job was
+    recorded as requested SEVEN HOURS in the future, and `_normalize_row` then
+    reported that shifted instant as UTC. Ordering stayed self-consistent (every
+    row shifted equally) and nothing compares these to a cutoff, which is why
+    the damage was confined to what the API reports.
+
+    `TZ` + `time.tzset()` is the lever, NOT `SET TIME ZONE` on the connection —
+    the session setting does not change how a bound parameter is encoded, and a
+    test that used it passed against this very bug on a UTC runner.
+    """
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        assert time.tzname[0] != "UTC", "the process timezone did not change"
+
+        # THE PRECONDITION, ASSERTED. `CURRENT_TIMESTAMP` is only timezone-proof
+        # for a TIMESTAMPTZ column; on a database built by `metadata.create_all`
+        # these are naive `timestamp` columns and no expression satisfies both.
+        # Production and migration 054 say TIMESTAMPTZ, so pin that rather than
+        # let this case quietly measure something else.
+        kinds = await database.fetch_all(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 'product_quality_backfill_jobs' "
+            "AND column_name IN ('requested_at', 'finished_at')"
+        )
+        declared = {dict(r)["column_name"]: dict(r)["data_type"] for r in kinds}
+        assert set(declared.values()) == {"timestamp with time zone"}, (
+            f"these columns are {declared} — this case only means something "
+            "against the TIMESTAMPTZ declaration production has"
+        )
+
+        now = datetime.now(timezone.utc)
+        job_id = await _new_job()
+        requested = _as_utc((await get_quality_backfill_job(job_id))["requested_at"])
+        assert abs((requested - now).total_seconds()) < 120, (
+            f"requested_at came back {requested} against a real now of {now} — a "
+            "naive datetime was encoded as this process's local wall time"
+        )
+
+        await complete_quality_backfill_job(job_id, status="completed")
+        finished = _as_utc((await get_quality_backfill_job(job_id))["finished_at"])
+        assert abs((finished - datetime.now(timezone.utc)).total_seconds()) < 120, (
+            f"finished_at came back {finished} — same defect on the completion path"
+        )
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
