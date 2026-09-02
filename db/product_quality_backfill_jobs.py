@@ -244,6 +244,20 @@ async def claim_next_quality_backfill_job() -> Optional[Dict[str, Any]]:
 # affinity, so `CAST('[{"error": ...}]' AS JSONB)` silently stores 0 — the JSON
 # payload is destroyed, without an error. The split is load-bearing.
 #
+# WHY errors_sample IS CAST ON BOTH SIDES OF ITS COALESCE. This column is
+# declared THREE times and they do not agree: migration 054 and this module's own
+# runtime DDL say JSONB, the SQLAlchemy Column above says JSON. Postgres has no
+# implicit json<->jsonb coercion, so `COALESCE(CAST(:x AS JSONB), errors_sample)`
+# is unplannable wherever the column landed as json — which is any database built
+# model-first, including the dialect gate's own fixture (create_all runs before
+# the migrations, whose CREATE TABLE IF NOT EXISTS is then a no-op). Casting both
+# arms makes the statement correct under either declaration. A plain assignment
+# does not need this and does not have it: `errors_sample = CAST(:x AS JSONB)`
+# reaches the column through an assignment cast, which json accepts.
+#
+# The drift itself is NOT fixed here — changing the model's column type rebuilds
+# every create_all-backed test database in the repo, which is its own change.
+#
 # WHY COALESCE. `update_*` and `complete_*` used to join a list of `assignments`
 # built from whichever keyword arguments were not None, which is what made their
 # SQL dynamic. `COALESCE(:param, column)` expresses the same rule — NULL means
@@ -299,7 +313,7 @@ _UPDATE_PROGRESS_SQL = """
         processed = COALESCE(:processed, processed),
         skipped = COALESCE(:skipped, skipped),
         failed = COALESCE(:failed, failed),
-        errors_sample = COALESCE(CAST(:errors_sample AS JSONB), errors_sample)
+        errors_sample = COALESCE(CAST(:errors_sample AS JSONB), CAST(errors_sample AS JSONB))
     WHERE job_id = :job_id
     RETURNING *
     """

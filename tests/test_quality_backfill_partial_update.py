@@ -27,6 +27,8 @@ the `else` branch of each dialect split, on the Postgres dialect job the
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from db.database import database
@@ -180,16 +182,25 @@ async def test_requeue_stale_resets_a_running_job_and_stamps_the_reason():
 
     # started_at is set to now by the claim, so a zero-second staleness window
     # is what makes the row eligible; the helper floors it at 30s internally.
+    # A real datetime, not a string: asyncpg rejects a str bound to a timestamp
+    # column outright, while SQLite accepts it — so a string here would pass
+    # locally and fail the moment this ran against Postgres.
     await database.execute(
         "UPDATE product_quality_backfill_jobs "
         "SET started_at = :old WHERE job_id = :j",
-        {"old": "2020-01-01 00:00:00", "j": job_id},
+        {"old": datetime(2020, 1, 1), "j": job_id},
     )
 
-    requeued = await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5)
+    await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5)
 
+    # Asserted on the ROW, not on the return value. `database.execute` yields no
+    # rowcount for an UPDATE without RETURNING on the asyncpg backend, so this
+    # helper returns 0 on Postgres however many rows it moved — pre-existing, and
+    # only ever read for a log line in jobs/product_quality_backfill_worker.py
+    # ("Requeued %s stale ... job(s)" therefore never fires in production). An
+    # `assert requeued >= 1` here would pass on SQLite and fail on Postgres while
+    # the requeue itself worked perfectly.
     row = await get_quality_backfill_job(job_id)
-    assert requeued >= 1
     assert row["status"] == "queued"
     assert row["started_at"] is None and row["finished_at"] is None
     assert row["processed"] == 0 and row["total_candidates"] == 0
