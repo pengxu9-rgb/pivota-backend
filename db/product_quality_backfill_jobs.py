@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Index, Integer, JSON, String, Table
@@ -284,7 +284,7 @@ _REQUEUE_STALE_SQL = """
         FROM product_quality_backfill_jobs
         WHERE status = 'running'
           AND started_at IS NOT NULL
-          AND started_at < :cutoff
+          AND started_at < CURRENT_TIMESTAMP - (:stale_seconds * INTERVAL '1 second')
         ORDER BY started_at ASC
         LIMIT :limit
     )
@@ -306,7 +306,7 @@ _REQUEUE_STALE_SQL_SQLITE = """
         FROM product_quality_backfill_jobs
         WHERE status = 'running'
           AND started_at IS NOT NULL
-          AND started_at < :cutoff
+          AND started_at < datetime('now', :stale_window)
         ORDER BY started_at ASC
         LIMIT :limit
     )
@@ -379,11 +379,27 @@ async def requeue_stale_quality_backfill_jobs(
     the only thing anyone reads. `jobs/product_quality_backfill_worker.py`
     gates its "Requeued %s stale quality backfill job(s)" warning on it, so a
     stale-job requeue was silent in production and loud in the SQLite suite.
+
+    THE CUTOFF IS COMPUTED BY THE SERVER, NOT BOUND FROM PYTHON. It used to be
+    `_utcnow() - timedelta(...)`, a NAIVE datetime, and asyncpg hands a naive
+    datetime to a `timestamptz` column to be read in the SESSION timezone —
+    measured on PG 15 with `TimeZone=America/Los_Angeles`, `$1::timestamptz` of
+    a `utcnow()` lands SEVEN HOURS in the future. Every `running` row was
+    therefore stale on any non-UTC server, whatever `stale_after_seconds` said.
+    Binding a tz-AWARE datetime instead fixes that arithmetic and introduces a
+    worse failure: asyncpg refuses an aware datetime against a plain `timestamp`
+    column (`DataError: can't subtract offset-naive and offset-aware`), which is
+    what these columns are in any database built from `metadata.create_all` —
+    the SQLAlchemy Column above is `DateTime`, naive, while this module's DDL
+    and migration 054 say TIMESTAMPTZ. `CURRENT_TIMESTAMP - interval` binds no
+    datetime at all, so it is correct under either declaration, and it compares
+    `started_at` against the same clock that WROTE it (`claim_quality_backfill
+    _job` sets `started_at = COALESCE(started_at, CURRENT_TIMESTAMP)`), which
+    the old form did not: it measured a server timestamp against a client one.
     """
     await ensure_product_quality_backfill_jobs_table()
-    cutoff = _utcnow() - timedelta(seconds=max(30, stale_after_seconds))
+    seconds = max(30, stale_after_seconds)
     values: Dict[str, Any] = {
-        "cutoff": cutoff,
         "limit": max(1, limit),
         "errors_sample": _json_param(
             [
@@ -395,9 +411,13 @@ async def requeue_stale_quality_backfill_jobs(
         ),
     }
     if IS_POSTGRES:
-        rows = await database.fetch_all(_REQUEUE_STALE_SQL, values)
+        rows = await database.fetch_all(
+            _REQUEUE_STALE_SQL, {**values, "stale_seconds": seconds}
+        )
     else:
-        rows = await database.fetch_all(_REQUEUE_STALE_SQL_SQLITE, values)
+        rows = await database.fetch_all(
+            _REQUEUE_STALE_SQL_SQLITE, {**values, "stale_window": f"-{seconds} seconds"}
+        )
     return len(rows)
 
 
