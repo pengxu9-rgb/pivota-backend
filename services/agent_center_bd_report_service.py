@@ -40,6 +40,10 @@ from services.audit_delta import build_reaudit_delta, measurement_basis_between
 from services.outreach_outcomes import build_outreach_outcomes
 from services.prompt_basis import basis_meta_from_probe_runs, PROMPT_BASIS_VERSION
 from services.audit_facts import (
+    AXIS_UNCLASSIFIED,
+    BRANDED_INTENTS as _BRANDED_INTENTS,
+    DISCOVERY_INTENTS as _DISCOVERY_INTENTS,
+    INTENT_AXES as _INTENT_AXES,
     QUERY_CLASS_BRANDED,
     QUERY_CLASS_CATEGORY,
     _VERTEX_REDIRECTOR_HOSTS,
@@ -55,6 +59,7 @@ from services.audit_facts import (
     parity_check,
     parity_measure,
     run_errored as _run_is_error,
+    intent_axis_for as _intent_axis_for,
     query_class_for_axis as _query_class_for_axis,
     run_query_class as _run_query_class,
 )
@@ -5288,33 +5293,12 @@ def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
     return counts
 
 
-# Fine intent-axis taxonomy (Step 2) — a per-query INTENT classification layered on
-# top of the coarse `axis`, so the report shows citation performance by the WAY
-# shoppers ask (head term vs problem/need vs constraint vs trust vs navigational),
-# not just branded-vs-category. Classified from (query, axis) at report-build time
-# — additive, no probe-pipeline change. Snapshot-only (no per-intent trend yet; see
+# _INTENT_AXES / _intent_axis_for MOVED to services/audit_facts.py (alongside
+# QUERY_CLASS_BRANDED / QUERY_CLASS_CATEGORY / _query_class_for_axis /
+# _run_query_class) and re-imported at the top of this module, so the coarse
+# query class and the fine intent axis can no longer disagree. Snapshot-only
+# (no per-intent trend yet; see
 # PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md).
-_INTENT_AXES = ("category_head", "problem_jtbd", "constraint", "trust", "navigational", "custom")
-
-
-def _intent_axis_for(query: Optional[str], axis: Optional[str]) -> str:
-    a = str(axis or "").strip().lower()
-    q = str(query or "").strip().lower()
-    if a in ("intent", "identity"):
-        return "navigational"
-    if a == "review":
-        return "trust"
-    if a in ("attribute", "sidewalk"):
-        return "constraint"
-    if a == "custom":
-        return "custom"
-    if a == "category":
-        # need/problem-framed ("best X for sleep", "what helps with X", "X for women")
-        # vs a bare head term ("best X", "top X", "X reviews").
-        if q.startswith("what helps") or " for " in q:
-            return "problem_jtbd"
-        return "category_head"
-    return "category_head"
 
 
 def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:
@@ -5517,12 +5501,10 @@ def build_channel_appearance(
     }
 
 
-# Non-branded DISCOVERY intents — where a brand wins NEW demand inside frontier
-# models ("best hair oil", "best hair oil for damaged hair"). vs BRANDED intents
-# (by name / "is X legit") which are low-value: a shopper who types a product
-# name already found it elsewhere, so being cited there isn't the prize.
-_DISCOVERY_INTENTS = frozenset({"category_head", "problem_jtbd", "constraint"})
-_BRANDED_INTENTS = frozenset({"navigational", "trust"})
+# _DISCOVERY_INTENTS / _BRANDED_INTENTS MOVED to services/audit_facts.py (they
+# now sit next to `intent_axis_for`, which is the only thing that produces the
+# values they partition) and are re-imported under these names at the top of
+# this module.
 
 
 # Unambiguous product-form / ingredient nouns that are never a brand's second
@@ -10775,7 +10757,9 @@ def _normalize_per_sku_probe_payload(
         meta.update({
             "sku_key": sku_key,
             "product_key": sku_ctx.get("product_key") or product.get("product_key"),
-            "axis": axis_by_query.get(query.lower(), meta.get("axis") or "intent"),
+            # Fail UNBRANDED on a missing axis: "intent" here silently stamped a
+            # degraded run as navigational, i.e. branded, on every surface.
+            "axis": axis_by_query.get(query.lower(), meta.get("axis") or AXIS_UNCLASSIFIED),
             "source": "v3_per_sku_audit",
             "upstream_scan_mode": payload.get("scan_mode"),
         })
@@ -10947,7 +10931,7 @@ async def _probe_per_sku_ctx(
             })
             existing.add(text.lower())
     query_specs = [
-        (str(record.get("query") or ""), str(record.get("axis") or "intent"))
+        (str(record.get("query") or ""), str(record.get("axis") or AXIS_UNCLASSIFIED))
         for record in query_records
     ]
     query_metadata = _query_metadata_from_records(query_records)

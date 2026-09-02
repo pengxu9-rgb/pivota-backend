@@ -36,6 +36,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
+from services.audit_facts import AXIS_UNCLASSIFIED
+
 logger = logging.getLogger(__name__)
 
 # Bump when the prompt GENERATORS change materially (new shapes, new mining
@@ -142,7 +144,9 @@ def clean_selected_specs(records: Any) -> List[Dict[str, Any]]:
         seen.add(key)
         spec: Dict[str, Any] = {"query": query}
         axis = record.get("axis")
-        spec["axis"] = str(axis).strip() if axis else "intent"
+        # Fail UNBRANDED on a missing axis: the old "intent" default made an
+        # unstamped spec navigational (branded) on every downstream surface.
+        spec["axis"] = str(axis).strip() if axis else AXIS_UNCLASSIFIED
         source = record.get("source")
         if source:
             spec["source"] = str(source).strip()

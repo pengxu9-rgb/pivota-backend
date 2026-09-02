@@ -318,25 +318,94 @@ def _own_url_cited_runs(
 # ---------------------------------------------------------------------------
 
 # Fix 2 — query-class tagging. Every probe query carries an `axis` (set in
-# `_build_per_sku_base_query_specs`). Only the `category` axis is a non-branded
-# discovery query ("best <product_type> ...", "top <product_type> for <topic>");
-# every other axis (intent / price / review / comparison / brand / identity /
-# content / custom) names the SKU or brand, i.e. branded/navigational. The two
-# classes must be reported separately: being found on a branded query ("where to
-# buy <my product>") proves nothing about category discovery.
+# `_build_per_sku_base_query_specs`). The coarse branded-vs-category split must
+# describe the partition the PROBE ACTUALLY RAN UNDER: the fanout picks its scan
+# mode with `_scan_mode_for_query_spec`, which asks
+# `intent_axis_for(query, axis) in BRANDED_INTENTS`. So the report's split is
+# derived from the same predicate, by construction — see the intent taxonomy
+# below. The old implementation was a one-value whitelist (only the literal
+# "category" was non-branded), which filed every unbranded discovery shape the
+# generator emits (sidewalk / attribute / head / problem / dupe) — and every
+# missing axis — as branded, inflating "found when shoppers name you" with
+# probes that ran under organic category visibility.
 QUERY_CLASS_BRANDED = "branded_navigational"
 QUERY_CLASS_CATEGORY = "category_discovery"
-_CATEGORY_DISCOVERY_AXES = frozenset({"category"})
+
+# The axis value stamped when a record carries no axis of its own. It must NOT
+# be a real branded axis: an unknown axis is classified as discovery so a
+# degraded/unstamped record can never inflate a brand's own numbers.
+AXIS_UNCLASSIFIED = "unclassified"
+
+# Fine intent-axis taxonomy (Step 2) — a per-query INTENT classification layered
+# on top of the coarse `axis`, so the report shows citation performance by the
+# WAY shoppers ask (head term vs problem/need vs constraint vs trust vs
+# navigational), not just branded-vs-category. Classified from (query, axis) at
+# report-build time — additive, no probe-pipeline change. MOVED here from the
+# god module so the coarse class and the scan-mode partition cannot drift.
+INTENT_AXES = ("category_head", "problem_jtbd", "constraint", "trust", "navigational", "custom")
+
+# Non-branded DISCOVERY intents — where a brand wins NEW demand inside frontier
+# models ("best hair oil", "best hair oil for damaged hair"). vs BRANDED intents
+# (by name / "is X legit") which are low-value: a shopper who types a product
+# name already found it elsewhere, so being cited there isn't the prize.
+DISCOVERY_INTENTS = frozenset({"category_head", "problem_jtbd", "constraint"})
+BRANDED_INTENTS = frozenset({"navigational", "trust"})
+
+# Axes whose query NAMES the product or brand -> navigational. `price` and
+# `brand` join intent/identity here: "<brand> collagen price", "buy <brand>
+# online" are branded lookups, the same set `sku_opportunity._query_class` and
+# `report_summary_builder._SOV_BRANDED_AXES` already treat as branded.
+_NAVIGATIONAL_AXES = frozenset({"intent", "identity", "price", "brand"})
+# Values that mean "no axis was stamped" — fail UNBRANDED (discovery).
+_UNCLASSIFIED_AXES = frozenset({"", "unknown", AXIS_UNCLASSIFIED, "none", "null"})
 
 
-def query_class_for_axis(axis: Optional[str]) -> str:
+def intent_axis_for(query: Optional[str], axis: Optional[str]) -> str:
     a = str(axis or "").strip().lower()
-    return QUERY_CLASS_CATEGORY if a in _CATEGORY_DISCOVERY_AXES else QUERY_CLASS_BRANDED
+    q = str(query or "").strip().lower()
+    if a in INTENT_AXES:
+        # Idempotent over its own output: some producers/stored reports stamp
+        # the already-normalized fine name rather than the coarse axis (see
+        # report_summary_builder._SOV_BRANDED_AXES, which carries both
+        # vocabularies). Classifying "trust"/"navigational" as discovery would
+        # silently demote a genuinely branded prompt.
+        return a
+    if a in _NAVIGATIONAL_AXES:
+        return "navigational"
+    if a == "review":
+        return "trust"
+    if a in ("attribute", "sidewalk"):
+        return "constraint"
+    if a == "custom":
+        return "custom"
+    if a in _UNCLASSIFIED_AXES:
+        # Fail UNBRANDED: a missing axis must never be counted as a query that
+        # named the brand.
+        return "category_head"
+    if a == "category":
+        # need/problem-framed ("best X for sleep", "what helps with X", "X for women")
+        # vs a bare head term ("best X", "top X", "X reviews").
+        if q.startswith("what helps") or " for " in q:
+            return "problem_jtbd"
+        return "category_head"
+    return "category_head"
+
+
+def query_class_for_axis(axis: Optional[str], query: Optional[str] = None) -> str:
+    """Coarse branded/category class for a (query, axis) spec. Branded IFF the
+    fine intent axis is one the probe would have run under the BRANDED scan
+    mode — same predicate as `_scan_mode_for_query_spec`."""
+    return (
+        QUERY_CLASS_BRANDED
+        if intent_axis_for(query, axis) in BRANDED_INTENTS
+        else QUERY_CLASS_CATEGORY
+    )
 
 
 def run_query_class(run: Dict[str, Any]) -> str:
     meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
-    return query_class_for_axis(meta.get("axis"))
+    query = run.get("normalized_query") or run.get("query")
+    return query_class_for_axis(meta.get("axis"), query)
 
 
 # ---------------------------------------------------------------------------
