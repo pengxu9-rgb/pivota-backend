@@ -43,7 +43,6 @@ from services.audit_facts import (
     AXIS_UNCLASSIFIED,
     BRANDED_INTENTS as _BRANDED_INTENTS,
     DISCOVERY_INTENTS as _DISCOVERY_INTENTS,
-    INTENT_AXES as _INTENT_AXES,
     QUERY_CLASS_BRANDED,
     QUERY_CLASS_CATEGORY,
     _VERTEX_REDIRECTOR_HOSTS,
@@ -5279,8 +5278,9 @@ _run_is_internal_comparison = run_is_internal_comparison
 def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
     """Probe counts split into branded/navigational vs category/discovery, so
     the report never conflates "found when shoppers name you" with "found when
-    shoppers ask the category question". Comparison-axis probes are excluded:
-    internal-first, and the coarse classifier would miscount them as branded."""
+    shoppers ask the category question". Comparison-axis probes are excluded
+    because they are internal-first (the coarse classifier no longer miscounts
+    them as branded — that was fixed with the scan-mode-aligned partition)."""
     counts = {QUERY_CLASS_BRANDED: 0, QUERY_CLASS_CATEGORY: 0}
     for run in _flatten_probe_runs(probe_runs):
         if _run_is_internal_comparison(run):
@@ -8929,10 +8929,10 @@ def build_authority_map(
                 or llm_report.get("sku_mentioned") is True
             )
             near = parsed.get("authority_near_variant_found") is True or llm_report.get("authority_near_variant_found") is True
-            # run_query_class defaults BRANDED on a missing/empty axis — a
-            # degraded run must not count as positive covers-merchant
-            # evidence, so the branded arm below requires the axis to be
-            # explicitly stamped (review round 2).
+            # run_query_class no longer defaults BRANDED on a missing axis (it
+            # fails UNBRANDED now), so this guard is belt-and-braces rather than
+            # the sole protection it was at review round 2. Kept: an unstamped
+            # run still must not buy positive covers-merchant evidence.
             _axis_meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
             axis_explicit = bool(str(_axis_meta.get("axis") or "").strip())
             excerpt = run.get("evidence_excerpt") or parsed.get("evidence_excerpt") or parsed.get("evidence_text")
