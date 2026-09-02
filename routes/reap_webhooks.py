@@ -73,6 +73,12 @@ from utils.logger import logger
 
 router = APIRouter(prefix="/webhooks", tags=["reap-webhooks"])
 
+# A CARD_AUTHORIZATION_REQUEST is a few hundred bytes. 64 KiB is ~100x headroom and still small
+# enough that hashing it cannot eat a meaningful share of Reap's 1.6-second budget. Scoped to
+# the authorization route deliberately: the notification receiver is async and retried, so a
+# large body there costs latency nobody is waiting on.
+MAX_AUTHORIZATION_BODY_BYTES = 64 * 1024
+
 
 def _outcome_values(
     card: Dict[str, Any], event: ReapEvent, outcome: str,
@@ -208,6 +214,7 @@ async def receive_reap_authorization(request: Request) -> Dict[str, str]:
 
       503  the feature switch is off, or the endpoint's secret is unset. Both are fail-closed
            dials: an unconfigured decision endpoint must decline, never approve.
+      413  body over MAX_AUTHORIZATION_BODY_BYTES, refused BEFORE the HMAC.
       401  bad or missing signature.
       400  signed body that is not JSON, is not a CARD_AUTHORIZATION_REQUEST, or carries no
            eventId/cardId — we cannot record a decision without an event id, and an unrecorded
@@ -233,7 +240,19 @@ async def receive_reap_authorization(request: Request) -> Dict[str, str]:
         # spending decisions with the notification receiver's key.
         raise HTTPException(status_code=503, detail="reap authorization receiver is not configured")
 
+    # SIZE CEILING BEFORE THE HMAC. verify_signature reads every byte it is given, so an
+    # unauthenticated caller can otherwise choose how much work we do — and this endpoint is the
+    # one place where spending that work late is itself the damage: hashing a large body eats
+    # the 1.6s budget for the REAL authorization queued behind it. Checked against the declared
+    # content-length first (cheap, refuses before the read) and then against what was actually
+    # read, because content-length is attacker-supplied and a chunked body has none.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_AUTHORIZATION_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="authorization request body too large")
     raw = await request.body()
+    if len(raw) > MAX_AUTHORIZATION_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="authorization request body too large")
+
     if not verify_signature(raw, request.headers.get(auth_signature_header_name()), secret):
         raise HTTPException(status_code=401, detail="invalid signature")
 

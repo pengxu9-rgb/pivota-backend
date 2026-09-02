@@ -13,6 +13,7 @@ unenforceable.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -99,18 +100,31 @@ def rig(monkeypatch: pytest.MonkeyPatch):
 
     state: Dict[str, Any] = {
         "card": _card(),
+        "live_cards": 1,        # rows with status='issued' for this issuer_card_ref
         "stored": {},           # event_id -> decision row (the ledger)
         "recorded": [],         # bind sets passed to record_decision
-        "approvals": set(),     # card_ids with a prior APPROVE (rule d)
+        "approvals": set(),     # card_ids with a prior SPEND approval (rule d)
+        "committed": {},        # card_id -> minor units already approved (rule f3)
         "descriptors": [],      # pinned rows for the card's merchant_domain
         "pins": [],
         "touches": [],
+        "unpins": [],
         "locks": [],
+        # Every DB-facing call in decide(), in order. The advisory lock has to come BEFORE the
+        # first read it protects; presence alone would be satisfied by a lock taken afterwards,
+        # which serializes nothing.
+        "calls": [],
     }
+
+    # Postgres by default: the lock and the SET LOCAL ceilings are dialect-gated on this flag,
+    # and under the sqlite test DATABASE_URL the real value is False — which would silently make
+    # every assertion about them vacuous. One test flips it back to prove the sqlite path.
+    monkeypatch.setattr(svc, "IS_POSTGRES", True)
 
     class _FakeTx:
         async def __aenter__(self):
             state["tx_entered"] = state.get("tx_entered", 0) + 1
+            state["calls"].append("BEGIN")
             return self
 
         async def __aexit__(self, *exc):
@@ -122,15 +136,24 @@ def rig(monkeypatch: pytest.MonkeyPatch):
 
         async def execute(self, sql, values=None):
             state["locks"].append((str(sql), values))
+            state["calls"].append(
+                "LOCK" if "pg_advisory_xact_lock" in str(sql) else f"SQL:{str(sql)[:24]}"
+            )
             return None
 
     monkeypatch.setattr(svc, "database", _FakeDB())
 
     async def fake_find_card(ref):
+        state["calls"].append("find_card")
         card = state["card"]
         return card if (card and card["issuer_card_ref"] == ref) else None
 
+    async def fake_count_issued(ref):
+        state["calls"].append("count_issued")
+        return state["live_cards"]
+
     async def fake_find_decision(event_id):
+        state["calls"].append("find_decision")
         return state["stored"].get(event_id)
 
     async def fake_record_decision(values):
@@ -141,9 +164,15 @@ def rig(monkeypatch: pytest.MonkeyPatch):
         return True
 
     async def fake_has_approval(card_id):
+        state["calls"].append("has_approval")
         return card_id in state["approvals"]
 
+    async def fake_approved_total(card_id):
+        state["calls"].append("approved_total")
+        return int(state["committed"].get(card_id, 0))
+
     async def fake_list_descriptors(domain):
+        state["calls"].append("list_descriptors")
         return [d for d in state["descriptors"] if d["merchant_domain"] == domain]
 
     async def fake_pin(merchant_domain, name_norm, country, city_norm, source):
@@ -159,9 +188,11 @@ def rig(monkeypatch: pytest.MonkeyPatch):
         state["touches"].append(descriptor_id)
 
     monkeypatch.setattr(svc, "find_by_issuer_ref", fake_find_card)
+    monkeypatch.setattr(svc, "count_issued_by_issuer_ref", fake_count_issued)
     monkeypatch.setattr(svc, "find_decision", fake_find_decision)
     monkeypatch.setattr(svc, "record_decision", fake_record_decision)
     monkeypatch.setattr(svc, "has_approval", fake_has_approval)
+    monkeypatch.setattr(svc, "approved_total_minor", fake_approved_total)
     monkeypatch.setattr(svc, "list_descriptors", fake_list_descriptors)
     monkeypatch.setattr(svc, "pin_descriptor", fake_pin)
     monkeypatch.setattr(svc, "touch_descriptor", fake_touch)
@@ -440,8 +471,9 @@ def test_a_zero_decimal_currency_is_not_multiplied(rig):
 @pytest.mark.parametrize("amount,currency,cap", [
     (1.005, "USD", 4250),      # three decimals in a two-decimal currency
     (5000.5, "JPY", 6000),     # a fraction of a zero-decimal currency
-    (0, "USD", 4250),          # not a spend
     (-42.50, "USD", 4250),     # a refund arriving down the authorization path
+    (1e20, "USD", 4250),       # F2: scales to 10^22 — no BIGINT holds it
+    (10 ** 16, "USD", 4250),   # F2: one order of magnitude over MAX_AMOUNT_MINOR
 ])
 def test_an_unroundable_amount_is_refused_not_rounded(rig, amount, currency, cap):
     """No rounding on a spending cap. Round down and 100.005 passes a cap of 100.00; round up
@@ -576,13 +608,82 @@ def test_the_approve_path_writes_a_complete_row(rig):
 def test_the_decision_runs_in_one_transaction_under_a_per_card_lock(rig):
     """The lock is what makes rule (d) a reservation rather than a read: without it two
     concurrent authorizations both see no prior APPROVE. Keyed on the Reap card id so different
-    cards stay concurrent. Proven end-to-end in test_reap_external_auth_postgres.py."""
+    cards stay concurrent. Proven to actually close the race in
+    test_reap_external_auth_postgres.py; proven to be TAKEN, and taken in the right ORDER,
+    here."""
     client, state = rig
     _post(client)
     assert state.get("tx_entered") == 1
-    (sql, values), = state["locks"]
-    assert "pg_advisory_xact_lock" in sql
-    assert values["lock_key"] == "reap_auth:reapcard_1"
+    lock_sql = [
+        (sql, values) for sql, values in state["locks"] if "pg_advisory_xact_lock" in sql
+    ]
+    assert len(lock_sql) == 1
+    assert lock_sql[0][1]["lock_key"] == "reap_auth:reapcard_1"
+
+
+def test_the_lock_is_taken_before_the_first_read_it_protects(rig):
+    """ORDER, not presence. A lock acquired AFTER find_decision/has_approval serializes nothing:
+    both racers have already read the ledger by the time either blocks, so both still see no
+    prior APPROVE and both approve. That mutant leaves the lock in the code, keeps every
+    presence assertion green, and re-opens the double-approve race — so the assertion has to be
+    about position in the call sequence."""
+    client, state = rig
+    _post(client)
+
+    calls = state["calls"]
+    assert "LOCK" in calls, calls
+    lock_at = calls.index("LOCK")
+    for read in ("find_decision", "has_approval", "find_card", "count_issued"):
+        assert read in calls, (read, calls)
+        assert lock_at < calls.index(read), (
+            f"the advisory lock is taken AFTER {read} — it serializes nothing: {calls}"
+        )
+    # ...and inside the transaction, not before it.
+    assert calls.index("BEGIN") < lock_at
+
+
+def test_the_transaction_arms_bounded_timeouts_on_postgres(rig):
+    """pg_advisory_xact_lock blocks indefinitely and DB_STATEMENT_TIMEOUT_SECONDS defaults to 0.
+    Unbounded, a contended or slow decision commits an APPROVE long after Reap gave up and
+    declined — reserving a single-use card against a purchase that never happened."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    _post(client)
+    issued = " | ".join(sql for sql, _ in state["locks"])
+    assert f"SET LOCAL lock_timeout = '{svc.LOCK_TIMEOUT_MS}ms'" in issued
+    assert f"SET LOCAL statement_timeout = '{svc.STATEMENT_TIMEOUT_MS}ms'" in issued
+    # Armed BEFORE the lock, or the lock they exist to bound is already blocking.
+    calls = state["calls"]
+    assert calls.index("BEGIN") < 2 and calls.index("LOCK") > 2
+
+
+def test_sqlite_skips_the_postgres_only_statements(rig, monkeypatch):
+    """The dialect gate is IS_POSTGRES, not a try/except. Catching would also swallow a real
+    lock_timeout on Postgres — the failure would look exactly like the fix, and the decision
+    would proceed unserialized."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    monkeypatch.setattr(svc, "IS_POSTGRES", False)
+    r = _post(client)
+    assert r.json() == {"decision": "APPROVE"}   # still decides
+    assert state["locks"] == []                  # ...without Postgres-only SQL
+
+
+def test_the_lock_is_not_wrapped_in_a_bare_except(rig):
+    """A swallowed lock_timeout is the specific regression: it proceeds UNSERIALIZED while
+    looking like a guard. Pinned at the source, because no behavioural test can distinguish
+    'the lock was skipped on sqlite' from 'the lock timed out and we carried on'."""
+    import ast
+    import inspect
+
+    import services.reap_external_auth as svc
+
+    for fn in (svc._take_card_lock, svc._arm_deadlines):
+        tree = ast.parse(inspect.getsource(fn).strip())
+        handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
+        assert handlers == [], f"{fn.__name__} catches — a lock_timeout would be swallowed"
 
 
 def test_the_card_row_is_never_touched_by_a_decision(rig):
@@ -603,7 +704,7 @@ def test_the_card_row_is_never_touched_by_a_decision(rig):
         if isinstance(node, ast.ImportFrom) and node.module == "db.agent_issued_cards"
         for alias in node.names
     }
-    assert from_cards == {"find_by_issuer_ref"}, from_cards
+    assert from_cards == {"count_issued_by_issuer_ref", "find_by_issuer_ref"}, from_cards
 
     # And no statement it executes writes to that table.
     for node in ast.walk(tree):
@@ -783,3 +884,455 @@ def test_parse_authorization_request_allowlists_the_body():
     assert parse_authorization_request({"type": "CARD_AUTHORIZATION_REQUEST"}) is None
     assert parse_authorization_request({"data": {"eventId": "e"}}) is None   # no cardId
     assert parse_authorization_request("not a dict") is None
+
+
+# --- F9: a size ceiling in front of the HMAC ---------------------------------------------------
+
+
+def test_an_oversized_body_is_413_before_the_signature_check(rig):
+    """verify_signature reads every byte it is handed, so without a ceiling an unauthenticated
+    caller chooses how much work we do — and on THIS endpoint that work is spent inside the
+    1.6s budget of whatever real authorization is queued behind it."""
+    from routes.reap_webhooks import MAX_AUTHORIZATION_BODY_BYTES
+
+    client, state = rig
+    body = _request()
+    body["data"]["merchant"]["name"] = "A" * (MAX_AUTHORIZATION_BODY_BYTES + 1)
+    raw = json.dumps(body).encode()
+    assert len(raw) > MAX_AUTHORIZATION_BODY_BYTES
+
+    # Correctly signed: only the size rule can be what refuses it.
+    r = client.post(
+        "/webhooks/reap/authorize", content=raw,
+        headers={"content-type": "application/json", HEADER: _sign(raw)},
+    )
+    assert r.status_code == 413
+    assert state["recorded"] == []
+
+
+def test_a_lying_content_length_is_refused_before_the_body_is_read(rig):
+    """content-length is attacker-supplied, so it is checked as a cheap FIRST gate and the
+    actual read is checked too. A declared size over the ceiling never reaches the HMAC."""
+    client, state = rig
+    from routes.reap_webhooks import MAX_AUTHORIZATION_BODY_BYTES
+
+    raw = json.dumps(_request()).encode()
+    r = client.post(
+        "/webhooks/reap/authorize", content=raw,
+        headers={
+            "content-type": "application/json",
+            HEADER: _sign(raw),
+            "content-length": str(MAX_AUTHORIZATION_BODY_BYTES + 1),
+        },
+    )
+    assert r.status_code == 413
+    assert state["recorded"] == []
+
+
+def test_a_normal_sized_body_is_unaffected(rig):
+    """The positive counterpart — a ceiling that refused everything would pass the two tests
+    above and break the endpoint."""
+    client, _ = rig
+    assert _post(client).status_code == 200
+
+
+# --- F2: the upper bound on an amount ----------------------------------------------------------
+
+
+def test_an_absurd_amount_declines_cleanly_instead_of_500ing(rig):
+    """Unbounded, 1e20 scales to 10^22, passes the cap comparison as an ordinary Python int and
+    then dies on the BIGINT bind — a 500 with NO ledger row, on a path whose whole premise is
+    that every decision is recorded, and with the amount in the logged traceback."""
+    client, state = rig
+    r = _post(client, _request(currency="USD", amount=1e20,
+                               originalCurrency="USD", originalAmount=1e20))
+    _assert_declined(r, state, "TRANSACTION_NOT_ALLOWED", "amount_unparseable")
+    assert _row(state)["amount_minor"] is None
+
+
+def test_the_amount_ceiling_is_the_issuance_ceiling():
+    """One number, one meaning. A ceiling here looser than the one mint-time enforces would let
+    an authorization be evaluated against a cap that could never have been issued."""
+    from services.agent_card_issuance import _MAX_CAP_MINOR
+    from services.reap_webhooks import MAX_AMOUNT_MINOR, major_to_minor
+
+    assert MAX_AMOUNT_MINOR == _MAX_CAP_MINOR
+    assert major_to_minor(Decimal(MAX_AMOUNT_MINOR) / 100, "USD") == MAX_AMOUNT_MINOR
+    assert major_to_minor(Decimal(MAX_AMOUNT_MINOR + 1) / 100, "USD") is None
+
+
+def test_an_absurd_amount_leaves_no_traceback_carrying_it(rig, caplog):
+    """The exception path was the one place authorization content reached a log line: the 500's
+    traceback contains the bind values. Now it is a 200 DECLINE and nothing is logged."""
+    client, state = rig
+    with _capture(caplog, logging.DEBUG):
+        r = _post(client, _request(currency="USD", amount=1e20,
+                                   originalCurrency="USD", originalAmount=1e20))
+    assert r.status_code == 200
+    text = caplog.text
+    assert "Traceback" not in text
+    for fragment in ("1e+20", "1e20", "100000000000000000000", "10000000000000000000000"):
+        assert fragment not in text, f"{fragment!r} reached a log line"
+
+
+# --- F6: both legs in the card's currency ------------------------------------------------------
+
+
+def test_when_both_legs_are_the_cards_currency_the_larger_one_is_enforced(rig):
+    """docs.reap.global/transactions/amounts (verified 2026-09-02): for a domestic transaction
+    "both currency pairs are identical". A request where they are NOT identical is anomalous,
+    and presentment-first would let originalAmount 0.01 pass a cap check while `amount`
+    999999.00 debits the account."""
+    client, state = rig
+    state["card"] = _card(currency="USD", amount_cap_minor=4250)
+    r = _post(client, _request(currency="USD", amount=999999.00,
+                               originalCurrency="USD", originalAmount=0.01))
+    _assert_declined(r, state, "INSUFFICIENT_BALANCE", "over_cap")
+    assert _row(state)["amount_minor"] == 99999900   # the billing leg, not the 1-cent decoy
+
+
+def test_the_max_rule_costs_nothing_when_the_legs_agree(rig):
+    """The normal domestic case: equal legs, max of equals, same answer as before."""
+    client, state = rig
+    state["card"] = _card(currency="USD", amount_cap_minor=4250)
+    assert _post(client).json() == {"decision": "APPROVE"}
+    assert _row(state)["amount_minor"] == 4250
+
+
+def test_presentment_still_wins_when_the_billing_leg_is_foreign(rig):
+    """The case presentment-first exists for is untouched: a foreign billing leg carries an FX
+    conversion, and the merchant's own number is the one our cap was quoted in."""
+    client, state = rig
+    state["card"] = _card(currency="EUR", amount_cap_minor=4000)
+    r = _post(client, _request(currency="USD", amount=42.50,
+                               originalCurrency="EUR", originalAmount=39.10))
+    assert r.json() == {"decision": "APPROVE"}
+    assert _row(state)["amount_minor"] == 3910
+
+
+# --- F7: zero-amount verification authorizations -----------------------------------------------
+
+
+def test_a_zero_amount_verification_approves(rig):
+    """A $0.00 auth is the routine live-card check a merchant runs BEFORE the real charge.
+    Declining it declines the purchase it precedes."""
+    client, state = rig
+    r = _post(client, _request(currency="USD", amount=0,
+                               originalCurrency="USD", originalAmount=0))
+    assert r.json() == {"decision": "APPROVE"}
+    row = _row(state)
+    assert row["reason_code"] == "zero_amount_verification"
+    assert row["amount_minor"] == 0
+
+
+def test_a_zero_amount_verification_pins_nothing(rig):
+    """A verification says the card works, not that this merchant is the one it was minted for.
+    Learning from it would let a zero-cost probe teach the registry."""
+    client, state = rig
+    _post(client, _request(currency="USD", amount=0,
+                           originalCurrency="USD", originalAmount=0))
+    assert state["pins"] == []
+    assert _row(state)["merchant_verified"] is False
+
+
+def test_a_verification_does_not_burn_the_single_use_card_it_checks(rig):
+    """The whole point. Rule (d) counts only approvals that MOVED MONEY, so the real charge
+    that follows a verification still approves — otherwise the verification would kill the
+    purchase it exists to enable."""
+    client, state = rig
+    r = _post(client, _request(eventId="evt_zero", currency="USD", amount=0,
+                               originalCurrency="USD", originalAmount=0))
+    assert r.json() == {"decision": "APPROVE"}
+    # The ledger now holds a zero-amount APPROVE; the fake reservation set is what
+    # db.has_approval's `amount_minor > 0` predicate decides, so it stays empty.
+    assert state["approvals"] == set()
+
+    second = _post(client, _request(eventId="evt_real"))
+    assert second.json() == {"decision": "APPROVE"}
+    assert len(state["recorded"]) == 2
+
+
+def test_a_verification_still_obeys_every_earlier_rule(rig):
+    """Zero-amount is not an escape hatch: card liveness, expiry, channel and the currency legs
+    are all decided before the amount is even looked at."""
+    client, state = rig
+    state["card"] = _card(status="revoked")
+    _assert_declined(
+        _post(client, _request(currency="USD", amount=0, originalCurrency="USD",
+                               originalAmount=0)),
+        state, "TRANSACTION_NOT_ALLOWED", "card_not_live",
+    )
+
+
+# --- F10: a cumulative bound for multi-use cards ------------------------------------------------
+
+
+def test_a_multi_use_card_is_bounded_cumulatively_not_per_authorization(rig):
+    """Without the SUM, amount_cap_minor bounds each authorization and not the card: ten
+    authorizations at the cap spend ten times the cap, which is not a cap."""
+    client, state = rig
+    state["card"] = _card(single_use=False, amount_cap_minor=5000)
+    state["committed"] = {"crd_authz1": 1000}    # already approved
+    r = _post(client, _request(currency="USD", amount=41.00,
+                               originalCurrency="USD", originalAmount=41.00))
+    _assert_declined(r, state, "INSUFFICIENT_BALANCE", "over_cap")
+    assert _row(state)["amount_minor"] == 4100   # 1000 + 4100 > 5000
+
+
+def test_a_multi_use_card_approves_inside_its_remaining_headroom(rig):
+    """The positive counterpart: the sum must not decline what still fits."""
+    client, state = rig
+    state["card"] = _card(single_use=False, amount_cap_minor=5000)
+    state["committed"] = {"crd_authz1": 1000}
+    r = _post(client, _request(currency="USD", amount=39.00,
+                               originalCurrency="USD", originalAmount=39.00))
+    assert r.json() == {"decision": "APPROVE"}   # 1000 + 3900 == 4900 <= 5000
+
+
+def test_the_cumulative_bound_is_exact_at_the_cap(rig):
+    client, state = rig
+    state["card"] = _card(single_use=False, amount_cap_minor=5000)
+    state["committed"] = {"crd_authz1": 750}
+    r = _post(client, _request(currency="USD", amount=42.50,
+                               originalCurrency="USD", originalAmount=42.50))
+    assert r.json() == {"decision": "APPROVE"}   # 750 + 4250 == 5000 exactly
+
+
+# --- the ambiguous-card finding ------------------------------------------------------------------
+
+
+def test_two_live_cards_for_one_issuer_ref_decline_rather_than_pick(rig, caplog):
+    """issuer_card_ref carries no unique constraint. Two 'issued' rows can hold different caps
+    at different merchants, and find_by_issuer_ref's ORDER BY picks one deterministically but
+    not correctly — enforcing the wrong instrument's limits silently."""
+    client, state = rig
+    state["live_cards"] = 2
+    with _capture(caplog, logging.ERROR):
+        r = _post(client)
+    _assert_declined(r, state, "TRANSACTION_NOT_ALLOWED", "ambiguous_card")
+    assert "CARD_AUTH_AMBIGUOUS_CARD" in caplog.text
+
+
+def test_one_live_card_is_not_ambiguous(rig):
+    client, _ = rig
+    assert _post(client).json() == {"decision": "APPROVE"}
+
+
+# --- F3: the deadline downgrade ------------------------------------------------------------------
+
+
+def test_a_late_approval_is_recorded_as_a_decline(rig, monkeypatch):
+    """Reap gave up at 1.6s and declined. An APPROVE recorded after that is a decision nobody
+    acted on, and on a single-use card it reserves the instrument against a purchase that was
+    already refused — the buyer's real retry then dies on `already_authorized`."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    monkeypatch.setenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", "1")
+    monkeypatch.setattr(svc, "_now_monotonic", lambda: time.monotonic() + 10.0)
+    r = _post(client)
+    _assert_declined(r, state, "TRANSACTION_NOT_ALLOWED", "deadline_exceeded")
+    row = _row(state)
+    assert row["decision"] == "DECLINE"
+    assert row["amount_minor"] == 4250      # the evidence survives the downgrade
+
+
+def test_the_downgrade_leaves_no_approval_to_reserve_the_card(rig, monkeypatch):
+    """The point of the downgrade: the row must not be able to act as a rule (d) reservation."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    monkeypatch.setenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", "1")
+    monkeypatch.setattr(svc, "_now_monotonic", lambda: time.monotonic() + 10.0)
+    _post(client)
+    assert all(r["decision"] != "APPROVE" for r in state["recorded"])
+
+
+def test_a_late_decline_keeps_its_own_reason_code(rig, monkeypatch):
+    """Declines are NOT downgraded. A late decline agrees with what Reap did, and rewriting its
+    reason_code would destroy the evidence of which rule actually fired."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+    state["card"] = _card(status="revoked")
+    monkeypatch.setenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", "1")
+    monkeypatch.setattr(svc, "_now_monotonic", lambda: time.monotonic() + 10.0)
+    r = _post(client)
+    _assert_declined(r, state, "TRANSACTION_NOT_ALLOWED", "card_not_live")
+
+
+def test_an_in_time_approval_is_not_downgraded(rig):
+    """The positive counterpart — a downgrade that fired always would pass the tests above and
+    approve nothing."""
+    client, state = rig
+    assert _post(client).json() == {"decision": "APPROVE"}
+    assert _row(state)["reason_code"] == "approved"
+
+
+@pytest.mark.parametrize("raw,expected", [(None, 1200), ("", 1200), ("400", 400),
+                                          ("nonsense", 1200), ("0", 1), ("-5", 1)])
+def test_the_deadline_dial_cannot_mean_approve_nothing(rig, monkeypatch, raw, expected):
+    """Floored at 1ms: a misconfigured 0 would downgrade EVERY approval on the rail to
+    deadline_exceeded, which is a total outage wearing the costume of a safety check."""
+    import services.reap_external_auth as svc
+
+    if raw is None:
+        monkeypatch.delenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", raising=False)
+    else:
+        monkeypatch.setenv("REAP_EXTERNAL_AUTH_DEADLINE_MS", raw)
+    assert svc.deadline_ms() == expected
+
+
+# --- F8: an unrecordable decision must not answer APPROVE ---------------------------------------
+
+
+def test_a_decision_that_is_neither_recorded_nor_found_raises(rig, monkeypatch):
+    """record_decision refused the insert AND the re-read found nothing. Falling through would
+    answer APPROVE with no row — an approval nothing can later explain, on a card whose
+    single-use reservation lives in exactly the row that does not exist. A 500 is a decline at
+    Reap's end, which is the right end of that trade."""
+    import services.reap_external_auth as svc
+
+    client, state = rig
+
+    async def refuse(values):
+        state["recorded"].append(values)
+        return False
+
+    async def find_nothing(event_id):
+        return None
+
+    monkeypatch.setattr(svc, "record_decision", refuse)
+    monkeypatch.setattr(svc, "find_decision", find_nothing)
+
+    response = _post(client)
+    assert response.status_code == 500
+    assert response.json().get("decision") is None, "a 500 must not carry a verdict"
+    # The attempted row was an APPROVE; what Reap receives is a 500, which it declines.
+    assert [r["decision"] for r in state["recorded"]] == ["APPROVE"]
+
+
+def test_the_unrecordable_decision_error_names_only_the_event_id(rig, monkeypatch):
+    """Driven at the unit seam because the route's error middleware swallows the message. The
+    exception text ends up in logs, so it carries the event id and nothing from the body."""
+    import services.reap_external_auth as svc
+
+    _, state = rig
+
+    async def refuse(values):
+        return False
+
+    async def find_nothing(event_id):
+        return None
+
+    monkeypatch.setattr(svc, "record_decision", refuse)
+    monkeypatch.setattr(svc, "find_decision", find_nothing)
+
+    request = svc.parse_authorization_request(_request())
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            svc.decide(request, time.monotonic())
+        )
+    message = str(excinfo.value)
+    assert "evt_authz_1" in message
+    for leaked in ("ACME", "Berlin", "4250", "acct_secret_value", "5732", "10115"):
+        assert leaked not in message
+
+
+# --- F4: descriptors that carry no merchant identity --------------------------------------------
+
+
+@pytest.mark.parametrize("descriptor,expected", [
+    ("SQ *HONEST SHOP", "honest shop"),
+    ("PAYPAL *ACME STORE", "acme store"),
+    ("TST* ACME STORE", "acme store"),
+    ("ACME Store*4471", "acme store"),
+    ("ACME STORE*SQ", "acme store"),
+])
+def test_the_longer_side_of_the_star_wins(descriptor, expected):
+    """Acquirers tag on EITHER side of the '*'. Always keeping the prefix mapped every Square
+    merchant to "sq"; always keeping the suffix would map "ACME Store*4471" to "4471". The tag
+    is short and the merchant name is not."""
+    assert normalize_descriptor(descriptor) == expected
+
+
+@pytest.mark.parametrize("descriptor", ["", "   ", "***", "!!!", "SQ *", "**", "-", "a*b"])
+def test_a_descriptor_with_no_identity_is_not_pinnable(descriptor):
+    from services.reap_external_auth import is_pinnable
+
+    assert is_pinnable(normalize_descriptor(descriptor)) is False, descriptor
+
+
+@pytest.mark.parametrize("descriptor", ["ACME", "SQ *HONEST SHOP", "abc"])
+def test_a_real_descriptor_is_pinnable(descriptor):
+    """The positive counterpart: a rule that refused everything would leave every domain
+    permanently unlearned and pass every test above."""
+    from services.reap_external_auth import is_pinnable
+
+    assert is_pinnable(normalize_descriptor(descriptor)) is True, descriptor
+
+
+@pytest.mark.parametrize("descriptor", ["", "***", "SQ *", "!!!"])
+def test_an_identityless_descriptor_approves_but_teaches_nothing(rig, descriptor):
+    """The mechanism the old comment denied. If a token like "sq" or "" becomes the pin for a
+    domain, the NEXT authorization from a different merchant behind the same acquirer matches
+    it and is approved merchant_verified=TRUE — the wrong pin manufactures positive evidence.
+    Refusing to learn keeps the domain at merchant_verified=false, still bounded by the cap,
+    the single use and the expiry."""
+    client, state = rig
+    body = _request()
+    body["data"]["merchant"]["name"] = descriptor
+    r = _post(client, body)
+    assert r.json() == {"decision": "APPROVE"}
+    assert _row(state)["merchant_verified"] is False
+    assert state["pins"] == [], f"{descriptor!r} was learned as a pin"
+
+
+def test_two_square_merchants_do_not_share_one_pin(rig):
+    """End to end, the collision that motivated F4: under the old prefix rule both of these
+    normalized to "sq", the first pinned it, and the second matched it verified."""
+    client, state = rig
+    body = _request()
+    body["data"]["merchant"]["name"] = "SQ *HONEST SHOP"
+    assert _post(client, body).json() == {"decision": "APPROVE"}
+    assert state["pins"][0]["name_norm"] == "honest shop"
+
+    state["recorded"].clear()
+    other = _request(eventId="evt_2")
+    other["data"]["merchant"]["name"] = "SQ *UNRELATED MERCHANT"
+    r = _post(client, other)
+    assert r.json() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert _row(state, "evt_2")["reason_code"] == "merchant_mismatch"
+
+
+def test_a_chunked_oversized_body_is_refused_with_no_content_length(rig):
+    """The post-read ceiling, with the content-length gate deliberately taken out of play.
+
+    A chunked request carries NO content-length, so the cheap declared-size check cannot fire
+    and only the check against what was actually read can refuse it. Without this test the
+    post-read `len(raw)` line was dead weight: every oversized body in the suite arrived with a
+    content-length and was caught by the first gate, so deleting the second changed nothing
+    (mutant R21 survived on exactly that).
+    """
+    from routes.reap_webhooks import MAX_AUTHORIZATION_BODY_BYTES
+
+    client, state = rig
+    body = _request()
+    body["data"]["merchant"]["name"] = "A" * (MAX_AUTHORIZATION_BODY_BYTES + 1)
+    raw = json.dumps(body).encode()
+    assert len(raw) > MAX_AUTHORIZATION_BODY_BYTES
+
+    def _chunks():
+        # An iterable body makes httpx use Transfer-Encoding: chunked and omit content-length.
+        for start in range(0, len(raw), 8192):
+            yield raw[start:start + 8192]
+
+    response = client.post(
+        "/webhooks/reap/authorize", content=_chunks(),
+        headers={"content-type": "application/json", HEADER: _sign(raw)},
+    )
+    assert "content-length" not in {k.lower() for k in response.request.headers}, (
+        "the request carried a content-length — the first gate, not the one under test"
+    )
+    assert response.status_code == 413
+    assert state["recorded"] == []

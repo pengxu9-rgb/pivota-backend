@@ -13,14 +13,13 @@ Two things only real Postgres can prove, and both are load-bearing:
    interleaving yielding exactly one APPROVE once the lock is taken. A concurrency test that
    only ever ran the safe version would be proving nothing.
 
-   THE SEAM, stated because it is where this pair stops: these two tests drive the critical
-   section against two named connections, because databases==0.7.0 shares one Connection across
-   child tasks of one Database and `decide()` can only be reached through the module-level
-   handle — gathering two `decide()` calls would serialize on that shared connection and prove
-   nothing about Postgres. So they prove the LOCK closes the race; that `decide()` actually
-   TAKES it, with the right key, is pinned separately at the seam by
-   test_reap_external_auth.test_the_decision_runs_in_one_transaction_under_a_per_card_lock.
-   Both halves are needed — neither alone survives deleting the lock.
+   BOTH RACERS RUN THE SHIPPED decide(). An earlier version of this file hand-copied decide()'s
+   critical section into a local helper and raced the copy, which proved the advisory lock works
+   — never in doubt — while executing none of the production path. Mutants that dead-coded rule
+   (d), bypassed the currency rule, or moved the lock to AFTER the reads it protects all passed
+   the entire suite. The obstacle was real (databases==0.7.0 shares one Connection across child
+   tasks, and decide() reaches the DB through three module globals) and _TaskLocalDatabase below
+   removes it with a per-task ContextVar rather than by re-implementing the subject.
 
     DATABASE_URL=postgresql://localhost/pivota_dialect_check \
         .venv/bin/python -m pytest tests/test_reap_external_auth_postgres.py -q
@@ -29,6 +28,7 @@ Two things only real Postgres can prove, and both are load-bearing:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import time
 import uuid
@@ -347,79 +347,429 @@ async def test_after_an_approve_the_webhook_transition_still_applies():
     )
     assert after_record["status"] == "exhausted" and after_record["auth_count"] == 1
 
+# --- more rules, through the REAL decide() on real rows ---------------------------------------
 
-# --- the single-use race, with and without the lock ------------------------------------------
+
+async def test_currency_mismatch_writes_a_decline_row():
+    """On Postgres and through decide(), not a hand-copy of it. The currency rule had no
+    real-engine test at all, which is how a mutant that bypassed it passed the whole suite."""
+    from decimal import Decimal
+
+    card = await _insert_card(currency="USD")
+    outcome, row = await _decide(
+        card["issuer_card_ref"], currency="GBP", amount=Decimal("33.10"),
+        original_currency="EUR", original_amount=Decimal("39.10"),
+    )
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["reason_code"] == "currency_mismatch"
+    assert row["amount_minor"] is None
 
 
-async def _authorize_on(db, card: Dict[str, Any], event_id: str, *, with_lock: bool,
-                        hold_seconds: float) -> str:
-    """The critical section of services.reap_external_auth.decide, run against ONE named
-    connection so two of them can genuinely interleave.
+async def test_both_legs_in_the_cards_currency_take_the_larger():
+    """F6, on real rows: presentment-first would pass a cap check on a 1-cent decoy while the
+    billing leg debits the account for the real amount."""
+    from decimal import Decimal
 
-    databases==0.7.0 shares a single Connection across child tasks of one Database, so
-    asyncio.gather over the module-level `database` would not race — it would serialize on the
-    shared connection and prove nothing. Each caller therefore brings its own Database.
+    card = await _insert_card(currency="USD", amount_cap_minor=4250)
+    outcome, row = await _decide(
+        card["issuer_card_ref"], currency="USD", amount=Decimal("999999.00"),
+        original_currency="USD", original_amount=Decimal("0.01"),
+    )
+    assert outcome.body() == {"decision": "DECLINE", "reason": "INSUFFICIENT_BALANCE"}
+    assert row["reason_code"] == "over_cap"
+    assert row["amount_minor"] == 99999900
 
-    `hold_seconds` between the read and the insert makes the interleaving deterministic rather
-    than timing-dependent: with the lock, the second caller is still blocked at the lock and
-    the sleep only extends the hold; without it, both callers read before either writes.
-    """
-    async with db.transaction():
-        if with_lock:
-            await db.execute(
-                "SELECT pg_advisory_xact_lock(CAST(hashtext(CAST(:lock_key AS text)) AS bigint))",
-                {"lock_key": f"reap_auth:{card['issuer_card_ref']}"},
-            )
-        prior = await db.fetch_one(
-            "SELECT event_id FROM agent_card_auth_decisions "
-            "WHERE card_id = :c AND decision = 'APPROVE' LIMIT 1",
-            {"c": card["card_id"]},
+
+async def test_an_absurd_amount_declines_instead_of_killing_the_bigint_bind():
+    """F2 on the real column. Unbounded, this scaled to 10^22, cleared the cap comparison as a
+    Python int, and died on the BIGINT bind — a 500 with NO row, and the amount in the logged
+    traceback. The bound turns it into an ordinary recorded decline."""
+    from decimal import Decimal
+
+    card = await _insert_card()
+    for amount in (Decimal("1e20"), Decimal(10 ** 16)):
+        outcome, row = await _decide(
+            card["issuer_card_ref"], currency="USD", amount=amount,
+            original_currency="USD", original_amount=amount,
         )
-        await asyncio.sleep(hold_seconds)
-        decision = "DECLINE" if prior is not None else "APPROVE"
-        await db.execute(
-            """
-            INSERT INTO agent_card_auth_decisions (
-                event_id, card_id, issuer_card_ref, decision, reason, reason_code,
-                amount_minor, currency, channel, merchant_verified, latency_ms
-            ) VALUES (
-                :event_id, :card_id, :issuer_card_ref, :decision, :reason, :reason_code,
-                4250, 'USD', 'ECOMMERCE', CAST(:merchant_verified AS boolean),
-                CAST(:latency_ms AS integer)
-            )
-            ON CONFLICT (event_id) DO NOTHING
-            """,
-            {
-                "event_id": event_id,
-                "card_id": card["card_id"],
-                "issuer_card_ref": card["issuer_card_ref"],
-                "decision": decision,
-                "reason": None if decision == "APPROVE" else "TRANSACTION_NOT_ALLOWED",
-                "reason_code": "approved" if decision == "APPROVE" else "already_authorized",
-                "merchant_verified": True,
-                "latency_ms": 1,
-            },
-        )
-    return decision
+        assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+        assert row["reason_code"] == "amount_unparseable"
+        assert row["amount_minor"] is None
 
 
-async def _race(card: Dict[str, Any], *, with_lock: bool) -> int:
-    """Two concurrent authorizations on one card. Returns how many APPROVE rows survived."""
+async def test_a_zero_amount_verification_approves_and_reserves_nothing():
+    """F7 end to end: the $0.00 live-card check approves, records amount_minor 0, pins nothing,
+    and — the point — does not burn the single-use card, so the real charge behind it still
+    goes through."""
+    from decimal import Decimal
+
+    from db.agent_card_auth_decisions import has_approval
+    from db.database import database
+
+    card = await _insert_card(merchant_domain="zeroauth.example")
+    outcome, row = await _decide(
+        card["issuer_card_ref"], currency="USD", amount=Decimal("0"),
+        original_currency="USD", original_amount=Decimal("0"),
+    )
+    assert outcome.body() == {"decision": "APPROVE"}
+    assert row["reason_code"] == "zero_amount_verification"
+    assert row["amount_minor"] == 0
+
+    # It is an APPROVE row, and it must still not act as a rule (d) reservation.
+    assert await has_approval(card["card_id"]) is False
+    pins = await database.fetch_all(
+        "SELECT id FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "zeroauth.example"},
+    )
+    assert pins == []
+
+    # ...and the real charge that follows still approves.
+    outcome, row = await _decide(card["issuer_card_ref"])
+    assert outcome.body() == {"decision": "APPROVE"}
+    assert row["reason_code"] == "approved"
+    assert await has_approval(card["card_id"]) is True
+
+
+async def test_a_multi_use_card_is_bounded_by_the_sum_of_its_approvals():
+    """F10 on real rows. Without the SUM, amount_cap_minor bounds each authorization and not the
+    card: these three at 42.50 against a 100.00 cap would all approve."""
+    from decimal import Decimal
+
+    card = await _insert_card(single_use=False, amount_cap_minor=10000)
+    first, row = await _decide(card["issuer_card_ref"])
+    assert first.decision == "APPROVE" and row["amount_minor"] == 4250
+
+    second, row = await _decide(card["issuer_card_ref"])
+    assert second.decision == "APPROVE"          # 4250 + 4250 = 8500 <= 10000
+
+    third, row = await _decide(card["issuer_card_ref"])
+    assert third.body() == {"decision": "DECLINE", "reason": "INSUFFICIENT_BALANCE"}
+    assert row["reason_code"] == "over_cap"      # 8500 + 4250 = 12750 > 10000
+
+
+async def test_zero_amount_approvals_do_not_consume_a_multi_use_cards_headroom():
+    """The two F7/F10 rules meeting: a verification adds 0 to the sum, so it neither reserves a
+    single-use card nor eats a multi-use card's headroom."""
+    from decimal import Decimal
+
+    from db.agent_card_auth_decisions import approved_total_minor
+
+    card = await _insert_card(single_use=False, amount_cap_minor=5000)
+    await _decide(
+        card["issuer_card_ref"], currency="USD", amount=Decimal("0"),
+        original_currency="USD", original_amount=Decimal("0"),
+    )
+    assert await approved_total_minor(card["card_id"]) == 0
+    outcome, _ = await _decide(card["issuer_card_ref"])
+    assert outcome.decision == "APPROVE"
+
+
+async def test_two_live_cards_for_one_issuer_ref_decline_ambiguous():
+    """issuer_card_ref has no unique constraint, so this is representable on the real table. The
+    two rows carry different caps at different merchants and find_by_issuer_ref's ORDER BY picks
+    one deterministically but not correctly."""
+    shared = f"ref_dupe_{uuid.uuid4().hex[:8]}"
+    await _insert_card(issuer_card_ref=shared, amount_cap_minor=1000,
+                       merchant_domain="one.example")
+    await _insert_card(issuer_card_ref=shared, amount_cap_minor=999999,
+                       merchant_domain="two.example")
+
+    outcome, row = await _decide(shared)
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["reason_code"] == "ambiguous_card"
+
+
+async def test_a_revoked_sibling_does_not_make_a_card_ambiguous():
+    """The positive counterpart: the count is scoped to 'issued'. Counting terminal siblings
+    would decline every perfectly unambiguous re-issue."""
+    shared = f"ref_reissue_{uuid.uuid4().hex[:8]}"
+    await _insert_card(issuer_card_ref=shared, status="revoked")
+    await _insert_card(issuer_card_ref=shared, status="issued")
+
+    outcome, row = await _decide(shared)
+    assert outcome.decision == "APPROVE", row["reason_code"]
+
+
+async def test_find_by_issuer_ref_returns_the_newest_row():
+    """ORDER BY created_at DESC LIMIT 1 — deterministic, not arbitrary. Not a safety property on
+    its own (that is ambiguous_card's job), but the tie has to break the same way every time."""
+    from db.agent_issued_cards import find_by_issuer_ref
+    from db.database import database
+
+    shared = f"ref_order_{uuid.uuid4().hex[:8]}"
+    older = await _insert_card(issuer_card_ref=shared, status="revoked", amount_cap_minor=111)
+    newer = await _insert_card(issuer_card_ref=shared, status="revoked", amount_cap_minor=222)
+    await database.execute(
+        "UPDATE agent_issued_cards SET created_at = now() - interval '1 day' WHERE card_id = :c",
+        {"c": older["card_id"]},
+    )
+    found = await find_by_issuer_ref(shared)
+    assert found["card_id"] == newer["card_id"] and found["amount_cap_minor"] == 222
+
+
+# --- F5: an operator can correct a wrong pin ---------------------------------------------------
+
+
+async def test_a_manual_pin_is_matched():
+    """The learned pin is a guess made under a 1.6s budget. When it is wrong, every later
+    authorization declines merchant_mismatch and nothing recovers on its own — this is the
+    recovery, and it has to actually match the decision path's normalization."""
+    from db.agent_card_auth_decisions import pin_descriptor_manual
+    from db.database import database
+
+    await pin_descriptor_manual("manualpin.example", "SQ *THE REAL SHOP", "DE")
+    row = await database.fetch_one(
+        "SELECT name_norm, country, source FROM agent_card_merchant_descriptors "
+        "WHERE merchant_domain = :d",
+        {"d": "manualpin.example"},
+    )
+    assert (row["name_norm"], row["country"], row["source"]) == ("the real shop", "DE", "manual")
+
+    card = await _insert_card(merchant_domain="manualpin.example")
+    outcome, decision = await _decide(card["issuer_card_ref"], merchant_name="SQ *THE REAL SHOP")
+    assert outcome.decision == "APPROVE"
+    assert decision["merchant_verified"] is True
+
+
+async def test_a_manual_pin_promotes_an_existing_learned_pin():
+    """An operator asserting a pin must end with that pin asserted, whatever was there before —
+    not with an integrity error because the domain had already learned it."""
+    from db.agent_card_auth_decisions import pin_descriptor_manual
+    from db.database import database
+
+    card = await _insert_card(merchant_domain="promote.example")
+    await _decide(card["issuer_card_ref"])   # learns 'acme store' / DE, source 'authorization'
+
+    await pin_descriptor_manual("promote.example", "ACME Store", "DE")
+    rows = await database.fetch_all(
+        "SELECT source FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "promote.example"},
+    )
+    assert [r["source"] for r in rows] == ["manual"]
+
+
+async def test_unpin_lets_a_domain_relearn():
+    """The other half of the recovery: remove the bad pin, and the next authorization teaches
+    the domain again."""
+    from db.agent_card_auth_decisions import unpin_descriptor
+    from db.database import database
+
+    first = await _insert_card(merchant_domain="relearn.example")
+    await _decide(first["issuer_card_ref"], merchant_name="WRONG MERCHANT")
+
+    second = await _insert_card(merchant_domain="relearn.example")
+    _, row = await _decide(second["issuer_card_ref"])
+    assert row["reason_code"] == "merchant_mismatch"   # locked to the wrong descriptor
+
+    assert await unpin_descriptor("relearn.example", "wrong merchant") == 1
+
+    third = await _insert_card(merchant_domain="relearn.example")
+    outcome, row = await _decide(third["issuer_card_ref"])
+    assert outcome.decision == "APPROVE"
+    pins = await database.fetch_all(
+        "SELECT name_norm FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "relearn.example"},
+    )
+    assert [p["name_norm"] for p in pins] == ["acme store"]
+
+
+async def test_unpin_of_an_absent_descriptor_is_a_no_op():
+    from db.agent_card_auth_decisions import unpin_descriptor
+
+    assert await unpin_descriptor("nothing.example", "not there") == 0
+
+
+async def test_an_identityless_descriptor_is_never_learned():
+    """F4 on real rows: "SQ *" normalizes to something with no merchant identity, and pinning it
+    would let the next Square merchant match it verified."""
+    from db.database import database
+
+    card = await _insert_card(merchant_domain="weak.example")
+    outcome, row = await _decide(card["issuer_card_ref"], merchant_name="SQ *")
+    assert outcome.decision == "APPROVE"
+    assert row["merchant_verified"] is False
+    pins = await database.fetch_all(
+        "SELECT id FROM agent_card_merchant_descriptors WHERE merchant_domain = :d",
+        {"d": "weak.example"},
+    )
+    assert pins == []
+
+
+# --- F3: the deadline, and the lock ceiling ----------------------------------------------------
+
+
+async def test_a_late_approval_is_downgraded_and_reserves_nothing():
+    """Reap declines at 1.6s. An APPROVE committed after that is a decision nobody acted on, and
+    on a single-use card it reserves the instrument against a purchase that was already refused
+    — the buyer's real retry then dies on already_authorized."""
+    import services.reap_external_auth as svc
+    from db.agent_card_auth_decisions import has_approval
+
+    card = await _insert_card()
+    # Move OUR clock, never the stdlib module object.
+    original = svc._now_monotonic
+    svc._now_monotonic = lambda: original() + 10.0
+    try:
+        outcome, row = await _decide(card["issuer_card_ref"])
+    finally:
+        svc._now_monotonic = original
+
+    assert outcome.body() == {"decision": "DECLINE", "reason": "TRANSACTION_NOT_ALLOWED"}
+    assert row["decision"] == "DECLINE" and row["reason_code"] == "deadline_exceeded"
+    assert row["amount_minor"] == 4250          # the evidence survives the downgrade
+    assert await has_approval(card["card_id"]) is False   # ...but it reserves nothing
+
+
+async def test_a_contended_lock_aborts_instead_of_committing_a_phantom_approval():
+    """pg_advisory_xact_lock blocks INDEFINITELY and DB_STATEMENT_TIMEOUT_SECONDS defaults to 0.
+    With SET LOCAL lock_timeout armed, a decision that cannot get the lock inside its budget
+    raises — which rolls back, returns 500, and leaves NO row. Reap declines either way; the
+    difference is whether a phantom APPROVE is left behind reserving the card."""
+    import asyncpg
     from databases import Database
 
     from db.database import database
+
+    card = await _insert_card()
+
+    holder = Database(DATABASE_URL)
+    await holder.connect()
+    try:
+        async with holder.transaction():
+            # Take the SAME advisory lock the decision will want, and hold it.
+            await holder.execute(
+                "SELECT pg_advisory_xact_lock(CAST(hashtext(CAST(:k AS text)) AS bigint))",
+                {"k": f"reap_auth:{card['issuer_card_ref']}"},
+            )
+            with pytest.raises((asyncpg.exceptions.LockNotAvailableError,
+                                asyncpg.exceptions.QueryCanceledError)):
+                await _decide(card["issuer_card_ref"])
+    finally:
+        await holder.disconnect()
+
+    left_behind = await database.fetch_val(
+        "SELECT COUNT(*) FROM agent_card_auth_decisions WHERE card_id = :c",
+        {"c": card["card_id"]},
+    )
+    assert left_behind == 0, "an aborted decision left a row behind"
+
+
+async def test_the_lock_timeout_is_actually_armed_on_the_transaction():
+    """The positive counterpart to the abort above: SET LOCAL really is in effect inside the
+    decision's transaction, rather than the abort coming from somewhere else."""
+    from databases import Database
+
+    import services.reap_external_auth as svc
+
+    db = Database(DATABASE_URL)
+    await db.connect()
+    try:
+        async with db.transaction():
+            original = svc.database
+            svc.database = db
+            try:
+                await svc._arm_deadlines()
+            finally:
+                svc.database = original
+            assert await db.fetch_val("SHOW lock_timeout") == f"{svc.LOCK_TIMEOUT_MS}ms"
+            assert await db.fetch_val("SHOW statement_timeout") == (
+                f"{svc.STATEMENT_TIMEOUT_MS}ms"
+            )
+    finally:
+        await db.disconnect()
+
+
+# --- the single-use race, through the REAL decide() ---------------------------------------------
+#
+# THE POINT OF THIS SECTION, and what an earlier version of it got wrong. It used to hand-copy
+# decide()'s critical section into a local helper and race THAT. It proved the advisory lock
+# works — which was never in doubt — while running none of the shipped code, so mutants that
+# dead-coded rule (d), bypassed the currency rule, or moved the lock to AFTER the reads it
+# protects all passed the whole Postgres suite. A concurrency test that races a copy of the
+# subject is testing the copy.
+#
+# The obstacle was real: databases==0.7.0 shares ONE Connection across child tasks of a Database,
+# and decide() reaches the database through THREE module globals
+# (services.reap_external_auth, db.agent_card_auth_decisions, db.agent_issued_cards). Gathering
+# two decide() calls on the shared handle serializes them on that connection and proves nothing.
+#
+# _TaskLocalDatabase solves it without touching production code: all three globals are pointed at
+# one proxy that resolves, per asyncio task, to whichever Database that task bound in a
+# ContextVar. asyncio.gather copies the context into each task, so the two racers genuinely run
+# on two connections against one Postgres.
+
+_ACTIVE_DB: contextvars.ContextVar = contextvars.ContextVar("reap_auth_active_db")
+
+
+class _TaskLocalDatabase:
+    """Forwards every call to the Database bound to the CURRENT TASK."""
+
+    def _target(self):
+        return _ACTIVE_DB.get()
+
+    def transaction(self, *args, **kwargs):
+        return self._target().transaction(*args, **kwargs)
+
+    async def execute(self, *args, **kwargs):
+        return await self._target().execute(*args, **kwargs)
+
+    async def fetch_one(self, *args, **kwargs):
+        return await self._target().fetch_one(*args, **kwargs)
+
+    async def fetch_all(self, *args, **kwargs):
+        return await self._target().fetch_all(*args, **kwargs)
+
+    async def fetch_val(self, *args, **kwargs):
+        return await self._target().fetch_val(*args, **kwargs)
+
+
+async def _race(card: Dict[str, Any], *, with_lock: bool) -> int:
+    """Two concurrent REAL decide() calls on one card. Returns how many APPROVE rows survived.
+
+    `with_lock=False` reproduces the bug by turning IS_POSTGRES off inside the service module,
+    which is the one flag both _take_card_lock and _arm_deadlines are gated on — the same code
+    path production takes on sqlite, and exactly the state the lock exists to rule out.
+
+    The interleaving is forced deterministically by delaying INSIDE has_approval, i.e. between
+    the reservation read and the write it is supposed to guard. Unlocked, both racers read
+    before either writes. Locked, the second is still blocked at the lock and the delay only
+    extends the first one's hold.
+    """
+    import db.agent_card_auth_decisions as decisions_db
+    import db.agent_issued_cards as cards_db
+    import services.reap_external_auth as svc
+    from databases import Database
+    from db.database import database
+
+    proxy = _TaskLocalDatabase()
+    real_has_approval = decisions_db.has_approval
+
+    async def slow_has_approval(card_id):
+        result = await real_has_approval(card_id)
+        await asyncio.sleep(0.25)
+        return result
+
+    saved = (svc.database, decisions_db.database, cards_db.database,
+             svc.has_approval, svc.IS_POSTGRES)
+    _ACTIVE_DB.set(database)
+    svc.database = decisions_db.database = cards_db.database = proxy
+    svc.has_approval = slow_has_approval
+    svc.IS_POSTGRES = with_lock
+
+    async def one(handle, event_id: str):
+        _ACTIVE_DB.set(handle)
+        await svc.decide(_request(card["issuer_card_ref"], event_id=event_id), time.monotonic())
 
     left, right = Database(DATABASE_URL), Database(DATABASE_URL)
     await left.connect()
     await right.connect()
     try:
-        await asyncio.gather(
-            _authorize_on(left, card, "evt_race_a", with_lock=with_lock, hold_seconds=0.25),
-            _authorize_on(right, card, "evt_race_b", with_lock=with_lock, hold_seconds=0.25),
-        )
+        await asyncio.gather(one(left, "evt_race_a"), one(right, "evt_race_b"))
     finally:
         await left.disconnect()
         await right.disconnect()
+        (svc.database, decisions_db.database, cards_db.database,
+         svc.has_approval, svc.IS_POSTGRES) = saved
 
     return await database.fetch_val(
         "SELECT COUNT(*) FROM agent_card_auth_decisions "
@@ -428,16 +778,30 @@ async def _race(card: Dict[str, Any], *, with_lock: bool) -> int:
     )
 
 
+async def test_the_race_helper_actually_runs_the_shipped_decide():
+    """Guards the guard. If _race ever stops calling services.reap_external_auth.decide, both
+    race tests keep passing while testing nothing — which is precisely the failure this section
+    was rewritten to fix, so it gets its own assertion rather than a comment."""
+    import inspect
+
+    import services.reap_external_auth as svc
+
+    source = inspect.getsource(_race)
+    assert "svc.decide(" in source
+    assert svc.decide.__module__ == "services.reap_external_auth"
+
+
 async def test_without_the_lock_both_authorizations_approve():
-    """The bug the lock exists to prevent, reproduced. A single-use card authorized TWICE is a
-    cap breached by 100%: two full-value charges on an instrument minted for one."""
+    """The bug the lock exists to prevent, reproduced against the real decide(). A single-use
+    card authorized TWICE is a cap breached by 100%: two full-value charges on an instrument
+    minted for one."""
     card = await _insert_card()
     assert await _race(card, with_lock=False) == 2
 
 
 async def test_the_advisory_lock_closes_the_race():
-    """Same interleaving, same two connections, lock taken: the second authorization blocks
-    until the first commits, then sees the reservation and declines."""
+    """Same interleaving, same two connections, same code — lock taken. The second authorization
+    blocks until the first commits, then sees the reservation and declines."""
     from db.database import database
 
     card = await _insert_card()
@@ -476,9 +840,19 @@ async def test_the_event_id_primary_key_refuses_a_second_decision():
     assert stored["decision"] == "APPROVE"   # the first verdict stands
 
 
-async def test_has_approval_reads_only_approvals():
-    """A negative assertion with its positive counterpart: declines must not reserve the card,
-    or the first failed authorization would kill a card the buyer can still legitimately use."""
+async def test_has_approval_reserves_only_on_an_approved_spend():
+    """Three things must NOT reserve the card, each for its own reason, and one must.
+
+      a DECLINE                  — the first failed authorization would otherwise kill a card
+                                   the buyer can still legitimately use;
+      an APPROVE with NULL amount — a decision that never resolved an amount moved no money;
+      a ZERO-amount APPROVE      — the routine $0.00 verification, which exists precisely to
+                                   precede the real charge and must not consume it;
+      an APPROVE with amount > 0 — the actual spend. This one reserves.
+
+    The NULL case is not incidental: `NULL > 0` is NULL, not false, so a predicate written any
+    other way would quietly include it.
+    """
     from db.agent_card_auth_decisions import has_approval, record_decision
 
     card = await _insert_card()
@@ -492,6 +866,16 @@ async def test_has_approval_reads_only_approvals():
                                reason="TRANSACTION_NOT_ALLOWED", reason_code="channel_not_allowed"))
     assert await has_approval(card["card_id"]) is False
 
-    await record_decision(dict(base, event_id="evt_a1", decision="APPROVE",
+    await record_decision(dict(base, event_id="evt_a_null", decision="APPROVE",
                                reason=None, reason_code="approved"))
+    assert await has_approval(card["card_id"]) is False, "a NULL-amount APPROVE reserved the card"
+
+    await record_decision(dict(base, event_id="evt_a_zero", decision="APPROVE", amount_minor=0,
+                               currency="USD", reason=None,
+                               reason_code="zero_amount_verification"))
+    assert await has_approval(card["card_id"]) is False, "a verification burned the card"
+
+    await record_decision(dict(base, event_id="evt_a_spend", decision="APPROVE",
+                               amount_minor=4250, currency="USD", reason=None,
+                               reason_code="approved"))
     assert await has_approval(card["card_id"]) is True

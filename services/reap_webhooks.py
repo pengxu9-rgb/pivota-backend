@@ -41,6 +41,12 @@ from utils.logger import logger
 
 _ZERO_DECIMAL_CURRENCIES = frozenset({"JPY", "KRW", "VND", "CLP", "ISK", "KMF", "XOF", "XAF"})
 
+# The largest amount, in minor units, this system will represent. Same value and same reason as
+# services/agent_card_issuance._MAX_CAP_MINOR: it is three orders of magnitude below what BIGINT
+# holds, so an amount that clears it can still be stored, summed and compared without any
+# arithmetic on this rail approaching the column's limit.
+MAX_AMOUNT_MINOR = 10 ** 15
+
 # Module-level reference so tests patch services.reap_webhooks._now and never the stdlib module
 # object (patching time.time globally breaks every other clock in the process).
 _now = time.time
@@ -211,12 +217,21 @@ def major_to_minor(value: Any, currency: str) -> Optional[int]:
       * the value is not an exact decimal (a binary float is refused outright — the route
         parses with parse_float=Decimal precisely so one never reaches here),
       * it is zero or negative,
-      * or it carries more decimal places than the currency has (1.005 USD, 500.5 JPY).
+      * it carries more decimal places than the currency has (1.005 USD, 500.5 JPY),
+      * or it exceeds MAX_AMOUNT_MINOR.
 
     The refusal is the point. This number is compared against a SPENDING CAP, and every
     rounding rule picks a direction: round down and an authorization for 100.005 passes a cap
     of 100.00; round up and an honest 100.004 is declined. A refusal is a visible decline with
     reason_code 'amount_unparseable' — one authorization lost, nothing over-spent.
+
+    THE UPPER BOUND IS NOT COSMETIC, and the failure it prevents is worse than the one it
+    reports. `is_finite() and > 0` alone admits 1e20, which scales to 10^22, clears the cap
+    comparison as an ordinary Python int, and then dies on the BIGINT bind
+    (asyncpg DataError, max 9.22e18) — a 500 with NO ledger row, on a path whose entire premise
+    is that every decision is recorded. Worse, middleware/error_handler.py logs the traceback,
+    and the traceback carries the amount: the one path that puts authorization content into a
+    log line. Bounded here it is a clean 200 DECLINE with a row and nothing logged.
     """
     if isinstance(value, bool) or value is None:
         return None
@@ -228,10 +243,15 @@ def major_to_minor(value: Any, currency: str) -> Optional[int]:
         amount = value if isinstance(value, Decimal) else Decimal(str(value).strip())
     except (InvalidOperation, TypeError, ValueError):
         return None
-    if not amount.is_finite() or amount <= 0:
+    if not amount.is_finite():
         return None
     exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
     scaled = amount * (Decimal(10) ** exponent)
+    # Bounds BEFORE the precision check, so an absurd value is refused even when it happens to
+    # be a whole number of minor units. Both ends matter: <= 0 is not a spend, and > the ceiling
+    # is a number no BIGINT column can hold.
+    if not (0 < scaled <= MAX_AMOUNT_MINOR):
+        return None
     if scaled != scaled.to_integral_value():
         return None
     return int(scaled)

@@ -78,7 +78,16 @@ async def record_decision(values: Dict[str, Any]) -> bool:
 
 
 async def has_approval(card_id: str) -> bool:
-    """Rule (d)'s reservation scan: has this card ever been approved?
+    """Rule (d)'s reservation scan: has this card ever been approved FOR A SPEND?
+
+    `amount_minor > 0` is the load-bearing half. A zero-amount verification authorization (the
+    routine $0.00 check a merchant runs before the real charge) is an APPROVE row, but it moved
+    no money and must not burn a single-use card — without this predicate the verification would
+    reserve the instrument and the purchase it precedes would be declined `already_authorized`,
+    which is the exact failure the verification exists to prevent.
+
+    NULL amount_minor rows (declines that never resolved an amount) are excluded by the same
+    comparison — NULL > 0 is NULL, not true.
 
     Served by idx_agent_card_auth_decisions_card_decision. It reads COMMITTED rows only, which
     is precisely why the decision runs under a per-card advisory lock: without serialization
@@ -88,12 +97,34 @@ async def has_approval(card_id: str) -> bool:
         """
         SELECT event_id
           FROM agent_card_auth_decisions
-         WHERE card_id = :card_id AND decision = 'APPROVE'
+         WHERE card_id = :card_id AND decision = 'APPROVE' AND amount_minor > 0
          LIMIT 1
         """,
         {"card_id": card_id},
     )
     return row is not None
+
+
+async def approved_total_minor(card_id: str) -> int:
+    """Rule (d)'s cumulative bound for MULTI-USE cards: everything already approved on this card.
+
+    A single-use card is bounded by the reservation above — one approval, then nothing. A
+    multi-use card has no such stop, so without this sum `amount_cap_minor` bounds each
+    authorization individually and not the card: ten authorizations at the cap spend ten times
+    the cap. The caller adds this authorization's amount and compares the total.
+
+    COALESCE because SUM over no rows is NULL, and a NULL total would make the comparison
+    vacuous rather than zero.
+    """
+    value = await database.fetch_val(
+        """
+        SELECT COALESCE(SUM(amount_minor), 0)
+          FROM agent_card_auth_decisions
+         WHERE card_id = :card_id AND decision = 'APPROVE'
+        """,
+        {"card_id": card_id},
+    )
+    return int(value or 0)
 
 
 # ── merchant descriptor registry ─────────────────────────────────────────────────────────────
@@ -141,6 +172,64 @@ async def pin_descriptor(
             "source": source,
         },
     )
+
+
+async def pin_descriptor_manual(merchant_domain: str, name: str, country: Optional[str]) -> None:
+    """An OPERATOR pin, source='manual'.
+
+    The learned pin is a guess made under a 1.6-second budget from one authorization. When it is
+    wrong — a merchant changes acquirer, or rebrands, or the first authorization arrived with a
+    descriptor that normalizes to something useless — every later authorization for that domain
+    declines `merchant_mismatch` and nothing in the system recovers on its own. This is the
+    other half of that recovery (unpin_descriptor is the first): the operator confirms the real
+    descriptor out of band and pins it deliberately.
+
+    `name` is the RAW descriptor as it appears on the authorization; normalization happens here,
+    through the same function the decision path uses, because a manual pin normalized any other
+    way would never match. ON CONFLICT DO UPDATE so re-pinning an existing descriptor promotes
+    it to 'manual' rather than failing — an operator asserting a pin should end with that pin
+    asserted, whatever was there before.
+
+    Imported lazily: services.reap_external_auth imports THIS module, so a module-level import
+    of the normalizer would be a cycle.
+    """
+    from services.reap_external_auth import normalize_descriptor
+
+    await database.execute(
+        """
+        INSERT INTO agent_card_merchant_descriptors (
+            merchant_domain, name_norm, country, city_norm, source
+        ) VALUES (
+            :merchant_domain, :name_norm, :country, NULL, 'manual'
+        )
+        ON CONFLICT (merchant_domain, name_norm, country)
+        DO UPDATE SET source = 'manual', last_seen_at = now()
+        """,
+        {
+            "merchant_domain": merchant_domain,
+            "name_norm": normalize_descriptor(name),
+            "country": _country(country),
+        },
+    )
+
+
+async def unpin_descriptor(merchant_domain: str, name_norm: str) -> int:
+    """Remove a pin. Returns how many rows went.
+
+    Keyed on (merchant_domain, name_norm) and NOT on country: an operator removing a bad pin
+    knows the descriptor, and making them also guess which of the country variants exists turns
+    a recovery step into a puzzle. Removing every country variant of a descriptor is the
+    conservative direction — the domain re-learns, or the operator pins the right one.
+    """
+    rows = await database.fetch_all(
+        """
+        DELETE FROM agent_card_merchant_descriptors
+         WHERE merchant_domain = :merchant_domain AND name_norm = :name_norm
+        RETURNING id
+        """,
+        {"merchant_domain": merchant_domain, "name_norm": name_norm},
+    )
+    return len(rows)
 
 
 async def touch_descriptor(descriptor_id: int) -> None:
