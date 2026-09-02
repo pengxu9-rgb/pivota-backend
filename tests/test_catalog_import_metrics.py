@@ -1,8 +1,9 @@
 """Import outcomes must be countable — `credentials_unavailable` above all.
 
 jobs/catalog_import_worker emitted NO metrics. `catalog_import_drain_tick`
-(#1964) is dormant behind CATALOG_IMPORT_DRAIN_ENABLED and, when armed, will
-walk a backlog nothing has ever drained. Without a counter the two outcomes that
+(#1964) is ON by default since #1997 (CATALOG_IMPORT_DRAIN_ENABLED=false is
+the kill switch) and on deploy walks a backlog nothing has ever drained. Nothing
+scrapes this counter yet (#1993). Without a counter the two outcomes that
 most need a human — a credential-resolution outage, and a backlog burning down
 into dead rows — are indistinguishable from a quiet queue.
 

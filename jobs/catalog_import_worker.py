@@ -617,6 +617,14 @@ async def _get_shopify_config_for_merchant(
         for store in stores:
             if (store.get("platform") or "").lower() != "shopify":
                 continue
+            # get_merchant_active_stores is not as active as its name: when the
+            # merchant_stores leg is empty it falls through to a legacy
+            # merchant_onboarding leg that appends a store LABELLED
+            # 'disconnected' when mcp_connected is false. Honour the label —
+            # the sibling writer (services/shopify_products_sync.py) refuses on
+            # exactly this, and this worker never did.
+            if (store.get("status") or "").lower() not in ("active", "connected"):
+                continue
             shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip()
             access_token, _ = await resolve_shopify_admin_access_token(
                 shop_domain=shop_domain,
@@ -773,9 +781,35 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             # platform's own products into this merchant's products_cache and
             # then expire their real rows in the full-sync sweep below — a
             # silent cross-merchant catalog overwrite, not a degraded import.
-            # Failing here is the correct outcome: ShopifyConfigError is
-            # terminal (see the retry handler), so a merchant with no
-            # credentials fails fast instead of retrying five times.
+            # Failing here raises ShopifyCredentialsUnavailableError, which is
+            # deliberately RETRYABLE (see its docstring): a DB blip is
+            # indistinguishable from "no credentials", so terminal would strand
+            # a connected merchant. Retrying costs zero Shopify calls.
+            #
+            # RE-ASSERT THE ENQUEUE PRECONDITION FIRST. The Sync endpoint only
+            # enqueues for a merchant with an active/connected Shopify store;
+            # the drain has no such gate and picks rows oldest-first, months
+            # after enqueue. In between, the merchant may have DETACHED — and
+            # "detached" does NOT mean "no credentials" in this repo:
+            # connector_credentials survives every detach path (nothing ever
+            # sets is_valid=False for shopify), and get_merchant_active_stores'
+            # legacy leg hands back a store merely LABELLED 'disconnected'.
+            # Resolving credentials for such a merchant and importing anyway
+            # would repopulate the catalog of a store they deliberately
+            # disconnected. So: no active/connected store, no import.
+            from services.merchant_store_service import get_merchant_active_stores
+
+            _live_stores = await get_merchant_active_stores(merchant_id)
+            if not any(
+                (s.get("platform") or "").lower() == "shopify"
+                and (s.get("status") or "").lower() in ("active", "connected")
+                for s in _live_stores
+            ):
+                raise ShopifyCredentialsUnavailableError(
+                    "Your Shopify store is not connected. Connect it in Integrations "
+                    "to run this import."
+                )
+
             cfg = await _get_shopify_config_for_merchant(
                 merchant_id, allow_global_fallback=False
             )
@@ -868,7 +902,25 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             page_info: Optional[str] = str(page_info_value) if page_info_value else None
 
             started_at = datetime.utcnow()
+            # full_sync_started_at is the start of the LOGICAL sync, which may
+            # span several runs: a catalog over SHOPIFY_MAX_PRODUCTS_PER_RUN
+            # returns retry_scheduled with a cursor and a continuation finishes
+            # it. The completion sweep below expires every products_cache row
+            # with cached_at older than this value — so if a continuation used
+            # ITS OWN start, it would expire exactly the rows the previous run
+            # imported, and a 12,000-product merchant would be left serving the
+            # tail of their catalog. Demonstrated, not theorised. Carry the
+            # first run's start through `counts` (persisted on every page
+            # heartbeat and on retry_scheduled) and reuse it when resuming.
             full_sync_started_at = started_at
+            if page_info:
+                carried = counts.get("full_sync_started_at")
+                if carried:
+                    try:
+                        full_sync_started_at = datetime.fromisoformat(str(carried))
+                    except (TypeError, ValueError):
+                        full_sync_started_at = started_at
+            counts["full_sync_started_at"] = full_sync_started_at.isoformat()
             total = int(counts.get("total", 0) or 0)
             succeeded = int(counts.get("succeeded", 0) or 0)
             failed = int(counts.get("failed", 0) or 0)
@@ -1106,8 +1158,18 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
                         {"merchant_id": merchant_id, "started_at": full_sync_started_at},
                     )
                     counts["expired_stale_cache_rows"] = int(expired or 0)
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001 — the sweep must not fail the import
+                    # Was a bare `pass`. This sweep uses NOW(), which sqlite lacks,
+                    # so it has never executed in the default test lane and a real
+                    # Postgres failure here left no trace. Log it.
+                    logger.warning(
+                        "Full-sync cache expiry sweep failed for merchant %s",
+                        merchant_id,
+                        exc_info=True,
+                    )
+                # The logical sync is complete; do not let this start leak into
+                # an unrelated future run of the same task.
+                counts.pop("full_sync_started_at", None)
 
             # If we still have a cursor, we didn't finish; schedule a continuation run.
             if page_info:
@@ -1505,7 +1567,8 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
             # Distinct from "config" on purpose: a spike in THIS category means
             # either a credential-resolution outage or a cohort of merchants
             # whose stores no longer resolve, and both want a human. It is the
-            # signal to watch when CATALOG_IMPORT_DRAIN_ENABLED is first armed.
+            # signal to watch after the drain's first deploy (ON by default
+            # since #1997) — once something scrapes the counter it feeds.
             counts["error_category"] = "credentials_unavailable"
         else:
             counts["error_category"] = "upstream"
@@ -1707,29 +1770,50 @@ async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
 def _catalog_import_drain_enabled() -> bool:
     """Whether the scheduler drain tick and its reaper may do anything.
 
-    DORMANT BY DEFAULT, matching the two closest precedents in
-    services/audit_scheduler.py — `catalog_onboard_queue_drain` ("OFF BY DEFAULT
-    ... so deploying never starts autonomous catalog writes") and
-    `payment_reconcile_tick` ("DORMANT unless ... enable deliberately"). Every
-    reason those give applies here and then some: this drains a queue nothing has
-    ever drained, so the backlog is unmeasured and may be months old; each task
-    calls a merchant's Shopify Admin API with stored credentials and rewrites
-    their products_cache; and prod and staging share one Postgres.
+    ON BY DEFAULT. CATALOG_IMPORT_DRAIN_ENABLED is a KILL SWITCH — set it to
+    false to stop the drain without a deploy — not an arming switch.
 
-    So arming it is a separate, deliberate act from deploying it. Measure the
-    backlog first:
+    It shipped dormant in #1964, and that was right at the time: the claim was
+    new, and _get_shopify_config_for_merchant still fell back to the PLATFORM's
+    own Shopify store for any merchant whose credentials did not resolve, so a
+    drain walking old rows for disconnected merchants would have overwritten
+    their catalogs with ours. #1989 closed that on the import path. With it
+    closed, the remaining backlog is benign by construction: a disconnected
+    merchant's row fails at ZERO Shopify calls (the resolver returns before any
+    fetch), and a connected merchant's row imports the LIVE catalog they clicked
+    Sync to get. There is nothing left for "dormant" to protect.
+
+    Meanwhile "dormant" had a cost the precedents it copied do not share. Those
+    guard AUTONOMOUS catalog writes the platform initiates for itself; this
+    drains work a merchant explicitly requested and was told succeeded. Every
+    day the flag stayed off, rows kept stranding `pending` on revision swaps
+    with nothing looking at them — the exact bug the drain was built to fix.
+
+    The default lives in CODE rather than in an env var deliberately: a deploy
+    on 2026-08-30 silently wiped five plain env vars on the gateway. A fix that
+    is armed by an env var can be disarmed by the next deploy without anyone
+    noticing; a fix that is armed by default cannot.
+
+    Before the first deploy that carries this, size what the first ticks will
+    chew on — one task per 30s, oldest first:
 
         SELECT status, source_type, connector, count(*), min(created_at)
         FROM platform_import_tasks GROUP BY 1, 2, 3;
 
-    then set CATALOG_IMPORT_DRAIN_ENABLED=true. Read per-run, so flipping it
-    takes effect on the next tick.
+    Two honest limits on the switch. It stops the SCHEDULER LANE ONLY: the Sync
+    endpoint's BackgroundTask and scripts/run_shopify_import_once.py run the
+    same import body and do not consult it. And on Cloud Run an env var change
+    is a new revision, not a live toggle — it takes a rolling restart, which on
+    the single-instance worker abandons whatever import is in flight into
+    `running` (the reaper below is NOT gated on this flag, so that row is
+    recovered rather than stranded). "Without a code change" is accurate;
+    "without a deploy" is not.
     """
-    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "false") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    return (os.getenv("CATALOG_IMPORT_DRAIN_ENABLED", "true") or "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
@@ -1758,9 +1842,18 @@ async def run_catalog_import_stale_reaper_tick() -> Dict[str, Any]:
     Separate from the drain tick on purpose: the drain tick holds
     `max_instances=1` for the length of a real import (up to
     SHOPIFY_MAX_RUNTIME_SECONDS), and recovery must not queue behind that.
+
+    NOT GATED ON CATALOG_IMPORT_DRAIN_ENABLED, and this is load-bearing. On
+    Cloud Run, pulling that switch is a new revision: the single-instance
+    worker restarts and whatever import was in flight is abandoned into
+    `running`. When the flag was an ARMING switch, "off" meant the lane had
+    never run and there was nothing to clean up. As a KILL switch, "off" means
+    the lane WAS running and left debris — exactly the moment the reaper is
+    needed. Gating it on the same flag would strand that row until the
+    merchant happened to click Sync again 15 minutes later, which is the
+    user-visible failure this whole lane exists to remove. The reaper makes
+    zero Shopify calls; running it while the drain is off is harmless.
     """
-    if not _catalog_import_drain_enabled():
-        return {"requeued": 0, "reason": "disabled"}
     requeued = await requeue_stale_running_tasks(
         stale_after_seconds=_env_int("CATALOG_IMPORT_STALE_AFTER_SECONDS", None),
         limit=_env_int("CATALOG_IMPORT_STALE_REQUEUE_LIMIT", 5) or 5,

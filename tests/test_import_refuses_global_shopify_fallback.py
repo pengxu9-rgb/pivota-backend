@@ -128,7 +128,10 @@ async def test_import_refuses_to_run_on_the_platform_store(monkeypatch):
         f"reached: {fetched}"
     )
     assert result["status"] == "retry_scheduled"
-    assert "reconnect it in Integrations" in recorded["error"]
+    # With no active/connected store the enqueue-precondition gate fires FIRST,
+    # before credential resolution — so this is the store message, not the
+    # token one. Either way it names Integrations as the action.
+    assert "Integrations" in recorded["error"]
     assert recorded["counts"]["error_category"] == "credentials_unavailable"
 
 

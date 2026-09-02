@@ -534,9 +534,11 @@ def record_catalog_import_task(
     ATTEMPT, not task — the distinction matters for anyone writing an alert.
 
     jobs/catalog_import_worker emitted NO metrics at all, which is why this
-    exists. `catalog_import_drain_tick` (#1964) is dormant behind
-    CATALOG_IMPORT_DRAIN_ENABLED, and the first thing it will do when armed is
-    walk a backlog nothing has ever drained. Without a counter, the two
+    exists. `catalog_import_drain_tick` (#1964) is ON by default since #1997
+    (CATALOG_IMPORT_DRAIN_ENABLED=false is the kill switch), and the first
+    thing it does on deploy is walk a backlog nothing has ever drained.
+    NOTE: as of #1993 nothing scrapes this counter — it is groundwork until a
+    collector exists. Without one, the two
     outcomes that most need a human are indistinguishable from a quiet queue:
 
       * a spike in error_category="credentials_unavailable" — either a
