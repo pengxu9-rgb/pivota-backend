@@ -217,8 +217,8 @@ class BeneficiaryRepo:
         query = """
         UPDATE agent_beneficiaries 
         SET 
-            verify_status = :status,
-            verified_at = CASE WHEN :status = 'verified' THEN NOW() ELSE verified_at END,
+            verify_status = CAST(:status AS text),
+            verified_at = CASE WHEN CAST(:status AS text) = 'verified' THEN NOW() ELSE verified_at END,
             updated_at = NOW()
         WHERE id = :id AND agent_id = :aid
         """
