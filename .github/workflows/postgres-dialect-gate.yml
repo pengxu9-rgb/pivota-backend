@@ -134,6 +134,7 @@ on:
       # this file would not run the job that gives it its Postgres arm — and the
       # Postgres arm is the half that tests the statements which actually ship.
       - "tests/test_quality_backfill_partial_update.py"
+      - "tests/test_quality_backfill_enqueue_dedupe.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
@@ -285,7 +286,7 @@ jobs:
           # KEEP THIS ENTRY LAST: one of those cases ALTERs the timestamp columns
           # of product_quality_backfill_jobs and restores them, so a ride-along
           # added after it would run while that switch is in flight.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_partial_update.py; do
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_partial_update.py tests/test_quality_backfill_enqueue_dedupe.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"

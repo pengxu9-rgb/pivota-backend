@@ -493,6 +493,67 @@ async def _run_market_currency_disagreement(db: Any) -> Dict[str, Any]:
 # so, which re-measures the count at exactly 1 on prod: the url_audit row, and
 # nothing else. Corpus-wide the predicate change flipped 2,051 rows to
 # renderable and ZERO rows away from it.
+# ── dead_quality_component ────────────────────────────────────────────────────
+# Shared CTE body. `recent` is the most recent 2,000 snapshots PER platform in
+# the last 30 days; `dead` is every (platform, component) with >=200 recent rows
+# and a zero maximum; the EXISTS keeps only pairs the lane has scored above zero
+# at some point (short-circuits on the first non-zero row). See the check.
+_DEAD_COMPONENT_CTE = """
+    WITH recent AS (
+        SELECT platform, details
+        FROM (
+            SELECT platform, details,
+                   ROW_NUMBER() OVER (PARTITION BY platform ORDER BY id DESC) AS rn
+            FROM product_quality_snapshot
+            WHERE snapshot_date > NOW() - INTERVAL '30 days'
+              AND details IS NOT NULL
+        ) windowed
+        WHERE rn <= 2000
+    ),
+    comps AS (
+        SELECT platform,
+               c->>'name' AS name,
+               COALESCE((c->>'score')::float, 0) AS score
+        FROM recent,
+             LATERAL jsonb_array_elements(
+                 (details::jsonb) -> 'components'
+             ) AS c
+    ),
+    dead AS (
+        SELECT platform, name
+        FROM comps
+        GROUP BY platform, name
+        HAVING count(*) >= 200 AND max(score) = 0
+    ),
+    dead_with_history AS (
+        SELECT d.platform, d.name
+        FROM dead d
+        WHERE EXISTS (
+            SELECT 1
+            FROM product_quality_snapshot h,
+                 LATERAL jsonb_array_elements(
+                     (h.details::jsonb) -> 'components'
+                 ) AS hc
+            WHERE h.platform = d.platform
+              AND h.details IS NOT NULL
+              AND hc->>'name' = d.name
+              AND COALESCE((hc->>'score')::float, 0) > 0
+        )
+    )
+"""
+
+_DEAD_COMPONENT_COUNT_SQL = _DEAD_COMPONENT_CTE + """
+    SELECT count(*) AS c FROM dead_with_history
+"""
+
+# `platform:component` — the operator needs to know WHICH lane went dead.
+_DEAD_COMPONENT_SAMPLE_SQL = _DEAD_COMPONENT_CTE + """
+    SELECT platform || ':' || name AS subject_key
+    FROM dead_with_history
+    ORDER BY platform, name
+    LIMIT 5
+"""
+
 _CHECKS: List[Dict[str, Any]] = [
     {
         # P1a (#1648). `suppressed_at` is THE gate column — every SQL lane, IPS
@@ -1179,9 +1240,9 @@ _CHECKS: List[Dict[str, Any]] = [
         "name": "dead_quality_component",
         "description": (
             "a quality-scorer component is identically zero across every recent "
-            "snapshot — i.e. nothing in any ingest lane produces it, so it is "
-            "silently dragging every product's score down for a signal that does "
-            "not exist"
+            "snapshot of a lane that has produced it before — i.e. something "
+            "that used to feed it stopped, so it is silently dragging every "
+            "product's score down for a signal nothing produces any more"
         ),
         "env": "CATALOG_INVARIANT_DEAD_COMPONENT_THRESHOLD",
         # 0 = no component may be dead. This is the standing detector for the
@@ -1192,58 +1253,24 @@ _CHECKS: List[Dict[str, Any]] = [
         # is indistinguishable from uniformly bad content unless you ask THIS
         # question. Removed from the mean 2026-07-28; this check is what stops
         # the next one lasting as long.
+        #
+        # PER LANE, WITH HISTORY — changed 2026-09-02. The first version took the
+        # 2,000 most recent snapshots across every lane. On 2026-09-01 that
+        # window was 1,960 rows from ONE Wix store (synced up to 16 times a day)
+        # plus a few seed rows, and it fired on `attributes` — a component the
+        # seed lane scores non-zero on 3,529 of 17,036 rows but the merchant-sync
+        # lanes cannot score at all (no seed data, no size/usage keys). That is
+        # not a dead component; it is one lane's structural zero read as the
+        # corpus. So the window is now the most recent 2,000 snapshots OF EACH
+        # `platform`, and a (lane, component) pair only counts as dead when that
+        # lane has scored the component above zero at some point. A lane that
+        # has never produced a component is a scorer-design question
+        # (what does `attributes` mean for a Shopify product?), not an outage.
         "default_threshold": 0,
-        # Sampled over recent snapshots only: an old rules_version that genuinely
-        # lacked a component would otherwise pin this alarm on forever. Requires
-        # a real sample (>=200) so a quiet period cannot manufacture a violation
-        # out of two rows.
-        "count_sql": """
-            WITH recent AS (
-                SELECT details
-                FROM product_quality_snapshot
-                WHERE snapshot_date > NOW() - INTERVAL '30 days'
-                  AND details IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 2000
-            ),
-            comps AS (
-                SELECT c->>'name' AS name,
-                       COALESCE((c->>'score')::float, 0) AS score
-                FROM recent,
-                     LATERAL jsonb_array_elements(
-                         (details::jsonb) -> 'components'
-                     ) AS c
-            )
-            SELECT count(*) AS c FROM (
-                SELECT name
-                FROM comps
-                GROUP BY name
-                HAVING count(*) >= 200 AND max(score) = 0
-            ) dead
-        """,
-        "sample_sql": """
-            WITH recent AS (
-                SELECT details
-                FROM product_quality_snapshot
-                WHERE snapshot_date > NOW() - INTERVAL '30 days'
-                  AND details IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 2000
-            ),
-            comps AS (
-                SELECT c->>'name' AS name,
-                       COALESCE((c->>'score')::float, 0) AS score
-                FROM recent,
-                     LATERAL jsonb_array_elements(
-                         (details::jsonb) -> 'components'
-                     ) AS c
-            )
-            SELECT name AS subject_key
-            FROM comps
-            GROUP BY name
-            HAVING count(*) >= 200 AND max(score) = 0
-            LIMIT 5
-        """,
+        # Requires a real sample (>=200 recent rows in the lane) so a quiet
+        # period cannot manufacture a violation out of two rows.
+        "count_sql": _DEAD_COMPONENT_COUNT_SQL,
+        "sample_sql": _DEAD_COMPONENT_SAMPLE_SQL,
     },
     {
         "name": "serving_eligible_not_renderable",

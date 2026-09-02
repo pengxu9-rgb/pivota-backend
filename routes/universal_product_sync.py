@@ -35,6 +35,10 @@ class UniversalSyncRequest(BaseModel):
     merchant_id: str
     force_refresh: bool = False
     limit: int = 50
+    # True for syncs no person is waiting on (the gateway's catalog auto-sync
+    # via routes/platform_products_sync_api). Only these are subject to the
+    # quality-backfill enqueue cooldown; a merchant's own Sync always enqueues.
+    unattended: bool = False
     # Optional platform hint: shopify, wix, woocommerce, etc.
     # When provided, we will try to sync that specific platform first.
     platform: Optional[str] = None
@@ -294,9 +298,9 @@ async def universal_product_sync(
                 # the sync that just succeeded.
                 try:
                     from db.product_quality_backfill_jobs import (
-                        create_quality_backfill_job,
+                        enqueue_quality_backfill_if_needed,
                     )
-                    await create_quality_backfill_job(
+                    await enqueue_quality_backfill_if_needed(
                         merchant_id=request.merchant_id,
                         platform=platform,
                         requested_by="universal_product_sync",
@@ -321,6 +325,11 @@ async def universal_product_sync(
                         # force_refresh=True and were silently downgraded here.
                         force_refresh=bool(request.force_refresh),
                         missing_only=True,
+                        # The gateway's auto-sync arrives here with
+                        # force_refresh=True several times a day; unattended
+                        # requests are folded into a recent job instead of
+                        # rescoring an unchanged catalog every time.
+                        unattended=bool(request.unattended),
                     )
                 except Exception as enqueue_error:  # noqa: BLE001 — best-effort
                     logger.warning(

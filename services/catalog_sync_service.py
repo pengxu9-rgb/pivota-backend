@@ -2665,13 +2665,17 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
         # serving-eligibility gate depend on it). Best-effort: never fail the
         # catalog sync on this hook.
         try:
-            from db.product_quality_backfill_jobs import create_quality_backfill_job
-            await create_quality_backfill_job(
+            from db.product_quality_backfill_jobs import enqueue_quality_backfill_if_needed
+            await enqueue_quality_backfill_if_needed(
                 merchant_id=merchant_id,
                 platform=str(scope.get("platform") or connector or "shopify"),
                 requested_by="catalog_sync_autodrain",
                 force_refresh=False,
                 missing_only=True,
+                # Scheduled reconciliation (jobs/agentic_commerce_reconciliation
+                # stamps scope.scheduled) is folded into a recent job; a job a
+                # person requested always enqueues.
+                unattended=bool(scope.get("scheduled")),
             )
         except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
             logger.warning(
