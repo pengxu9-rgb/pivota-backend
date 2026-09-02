@@ -63,12 +63,6 @@ def _json_type_sql() -> str:
     return "JSONB" if IS_POSTGRES else "JSON"
 
 
-def _json_assignment_sql() -> str:
-    if IS_POSTGRES:
-        return "CAST(:errors_sample AS JSONB)"
-    return ":errors_sample"
-
-
 def _json_param(value: Any) -> str:
     return json.dumps(value if value is not None else [])
 
@@ -230,6 +224,126 @@ async def claim_next_quality_backfill_job() -> Optional[Dict[str, Any]]:
     return await claim_quality_backfill_job(str(queued_payload.get("job_id") or ""))
 
 
+# ---------------------------------------------------------------------------
+# The three UPDATE ... RETURNING statements below, spelled out per dialect.
+#
+# WHY NOT ONE f-STRING. These used to be built with an f-string over a
+# `_json_assignment_sql()` helper (deleted with this change, it had no other
+# caller) — which reads fine and is invisible to
+# tests/test_repo_sql_prepare_postgres.py:
+# that sweep resolves a `database.*` first argument only when it is an
+# `ast.Constant` or a MODULE-level name, and an f-string is neither. Three
+# statements on the live backfill path were therefore never PREPAREd against the
+# real schema. Written out as module-level constants they are collected, and the
+# `if IS_POSTGRES:` split at each call site is a shape `_non_postgres_nodes()`
+# already understands, so the SQLite twin is skipped rather than planned.
+#
+# WHY THE DIALECTS CANNOT BE UNIFIED. The only difference is the errors_sample
+# assignment: Postgres needs `CAST(:errors_sample AS JSONB)`, SQLite must not
+# have it. SQLite's CAST resolves the unknown type name JSONB to NUMERIC
+# affinity, so `CAST('[{"error": ...}]' AS JSONB)` silently stores 0 — the JSON
+# payload is destroyed, without an error. The split is load-bearing.
+#
+# WHY COALESCE. `update_*` and `complete_*` used to join a list of `assignments`
+# built from whichever keyword arguments were not None, which is what made their
+# SQL dynamic. `COALESCE(:param, column)` expresses the same rule — NULL means
+# leave this column alone — in one static statement. Callers still pass None for
+# "do not touch" (routes/merchant_products.py relies on it, forwarding
+# `active_job.get(...)` straight through), so the contract is unchanged.
+
+_REQUEUE_STALE_SQL = """
+    UPDATE product_quality_backfill_jobs
+    SET status = 'queued',
+        started_at = NULL,
+        finished_at = NULL,
+        total_candidates = 0,
+        processed = 0,
+        skipped = 0,
+        failed = 0,
+        errors_sample = CAST(:errors_sample AS JSONB)
+    WHERE job_id IN (
+        SELECT job_id
+        FROM product_quality_backfill_jobs
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < :cutoff
+        ORDER BY started_at ASC
+        LIMIT :limit
+    )
+    """
+
+_REQUEUE_STALE_SQL_SQLITE = """
+    UPDATE product_quality_backfill_jobs
+    SET status = 'queued',
+        started_at = NULL,
+        finished_at = NULL,
+        total_candidates = 0,
+        processed = 0,
+        skipped = 0,
+        failed = 0,
+        errors_sample = :errors_sample
+    WHERE job_id IN (
+        SELECT job_id
+        FROM product_quality_backfill_jobs
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < :cutoff
+        ORDER BY started_at ASC
+        LIMIT :limit
+    )
+    """
+
+_UPDATE_PROGRESS_SQL = """
+    UPDATE product_quality_backfill_jobs
+    SET total_candidates = COALESCE(:total_candidates, total_candidates),
+        processed = COALESCE(:processed, processed),
+        skipped = COALESCE(:skipped, skipped),
+        failed = COALESCE(:failed, failed),
+        errors_sample = COALESCE(CAST(:errors_sample AS JSONB), errors_sample)
+    WHERE job_id = :job_id
+    RETURNING *
+    """
+
+_UPDATE_PROGRESS_SQL_SQLITE = """
+    UPDATE product_quality_backfill_jobs
+    SET total_candidates = COALESCE(:total_candidates, total_candidates),
+        processed = COALESCE(:processed, processed),
+        skipped = COALESCE(:skipped, skipped),
+        failed = COALESCE(:failed, failed),
+        errors_sample = COALESCE(:errors_sample, errors_sample)
+    WHERE job_id = :job_id
+    RETURNING *
+    """
+
+# errors_sample is NOT COALESCEd here: completing a job always rewrites it, and
+# `_json_param(None)` deliberately yields `[]` so a clean run clears the sample.
+_COMPLETE_SQL = """
+    UPDATE product_quality_backfill_jobs
+    SET status = :status,
+        finished_at = :finished_at,
+        errors_sample = CAST(:errors_sample AS JSONB),
+        total_candidates = COALESCE(:total_candidates, total_candidates),
+        processed = COALESCE(:processed, processed),
+        skipped = COALESCE(:skipped, skipped),
+        failed = COALESCE(:failed, failed)
+    WHERE job_id = :job_id
+    RETURNING *
+    """
+
+_COMPLETE_SQL_SQLITE = """
+    UPDATE product_quality_backfill_jobs
+    SET status = :status,
+        finished_at = :finished_at,
+        errors_sample = :errors_sample,
+        total_candidates = COALESCE(:total_candidates, total_candidates),
+        processed = COALESCE(:processed, processed),
+        skipped = COALESCE(:skipped, skipped),
+        failed = COALESCE(:failed, failed)
+    WHERE job_id = :job_id
+    RETURNING *
+    """
+
+
 async def requeue_stale_quality_backfill_jobs(
     *,
     stale_after_seconds: int = 300,
@@ -249,27 +363,10 @@ async def requeue_stale_quality_backfill_jobs(
             ]
         ),
     }
-    query = f"""
-    UPDATE product_quality_backfill_jobs
-    SET status = 'queued',
-        started_at = NULL,
-        finished_at = NULL,
-        total_candidates = 0,
-        processed = 0,
-        skipped = 0,
-        failed = 0,
-        errors_sample = {_json_assignment_sql()}
-    WHERE job_id IN (
-        SELECT job_id
-        FROM product_quality_backfill_jobs
-        WHERE status = 'running'
-          AND started_at IS NOT NULL
-          AND started_at < :cutoff
-        ORDER BY started_at ASC
-        LIMIT :limit
-    )
-    """
-    result = await database.execute(query, values)
+    if IS_POSTGRES:
+        result = await database.execute(_REQUEUE_STALE_SQL, values)
+    else:
+        result = await database.execute(_REQUEUE_STALE_SQL_SQLITE, values)
     try:
         return int(result or 0)
     except Exception:
@@ -312,34 +409,31 @@ async def update_quality_backfill_job_progress(
 ) -> Optional[Dict[str, Any]]:
     await ensure_product_quality_backfill_jobs_table()
 
-    assignments = []
-    values: Dict[str, Any] = {"job_id": job_id}
-    if total_candidates is not None:
-        assignments.append("total_candidates = :total_candidates")
-        values["total_candidates"] = total_candidates
-    if processed is not None:
-        assignments.append("processed = :processed")
-        values["processed"] = processed
-    if skipped is not None:
-        assignments.append("skipped = :skipped")
-        values["skipped"] = skipped
-    if failed is not None:
-        assignments.append("failed = :failed")
-        values["failed"] = failed
-    if errors_sample is not None:
-        assignments.append(f"errors_sample = {_json_assignment_sql()}")
-        values["errors_sample"] = _json_param(errors_sample)
-
-    if not assignments:
+    if (
+        total_candidates is None
+        and processed is None
+        and skipped is None
+        and failed is None
+        and errors_sample is None
+    ):
         return await get_quality_backfill_job(job_id)
 
-    query = f"""
-    UPDATE product_quality_backfill_jobs
-    SET {", ".join(assignments)}
-    WHERE job_id = :job_id
-    RETURNING *
-    """
-    row = await database.fetch_one(query, values)
+    # NULL means "leave this column alone" — see the COALESCE note above. Note
+    # `_json_param` is only applied when a sample was actually passed: it maps
+    # None to `[]`, which would clear the stored sample instead of keeping it.
+    values: Dict[str, Any] = {
+        "job_id": job_id,
+        "total_candidates": total_candidates,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "errors_sample": _json_param(errors_sample) if errors_sample is not None else None,
+    }
+
+    if IS_POSTGRES:
+        row = await database.fetch_one(_UPDATE_PROGRESS_SQL, values)
+    else:
+        row = await database.fetch_one(_UPDATE_PROGRESS_SQL_SQLITE, values)
     return _normalize_row(row)
 
 
@@ -359,30 +453,14 @@ async def complete_quality_backfill_job(
         "status": status,
         "finished_at": _utcnow(),
         "errors_sample": _json_param(errors_sample),
+        "total_candidates": total_candidates,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
     }
-    assignments = [
-        "status = :status",
-        "finished_at = :finished_at",
-        f"errors_sample = {_json_assignment_sql()}",
-    ]
-    if total_candidates is not None:
-        assignments.append("total_candidates = :total_candidates")
-        values["total_candidates"] = total_candidates
-    if processed is not None:
-        assignments.append("processed = :processed")
-        values["processed"] = processed
-    if skipped is not None:
-        assignments.append("skipped = :skipped")
-        values["skipped"] = skipped
-    if failed is not None:
-        assignments.append("failed = :failed")
-        values["failed"] = failed
 
-    query = f"""
-    UPDATE product_quality_backfill_jobs
-    SET {", ".join(assignments)}
-    WHERE job_id = :job_id
-    RETURNING *
-    """
-    row = await database.fetch_one(query, values)
+    if IS_POSTGRES:
+        row = await database.fetch_one(_COMPLETE_SQL, values)
+    else:
+        row = await database.fetch_one(_COMPLETE_SQL_SQLITE, values)
     return _normalize_row(row)
