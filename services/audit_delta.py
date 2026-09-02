@@ -37,6 +37,8 @@ def build_reaudit_delta(
     prior_report: Optional[Mapping[str, Any]],
     prior_row: Optional[Mapping[str, Any]],
     days_since: Optional[int],
+    current_basis: Optional[Mapping[str, Any]] = None,
+    prior_basis: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the honest "Since your last audit" payload.
 
@@ -58,6 +60,7 @@ def build_reaudit_delta(
             "movements": [],
             "measurement_basis": _measurement_basis(
                 current_report, prior_report, current, {},
+                current_basis, prior_basis,
             ),
             "tracked_metric_results": [
                 _not_measurable(
@@ -71,7 +74,9 @@ def build_reaudit_delta(
     # Resolve the measurement basis BEFORE diffing scores: if this run and the
     # prior one were measured on the same pinned prompt set, a smaller move counts
     # as material (W2). Categorical movements are exact-match and unaffected.
-    basis = _measurement_basis(current_report, prior_report, current, prior)
+    basis = _measurement_basis(
+        current_report, prior_report, current, prior, current_basis, prior_basis,
+    )
     material_delta = (
         MATERIAL_SCORE_DELTA_SAME_BASIS
         if basis.get("same") is True
@@ -123,6 +128,8 @@ def build_reaudit_delta(
 def measurement_basis_between(
     current_report: Optional[Mapping[str, Any]],
     prior_report: Optional[Mapping[str, Any]],
+    current_basis: Optional[Mapping[str, Any]] = None,
+    prior_basis: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The W2 measurement-basis verdict for an arbitrary report pair, exactly
     as build_reaudit_delta computes it — for callers (e.g. the per-SKU
@@ -135,6 +142,8 @@ def measurement_basis_between(
         prior_report,
         _primary_report(current_report),
         _primary_report(prior_report),
+        current_basis,
+        prior_basis,
     )
 
 
@@ -180,6 +189,8 @@ def _measurement_basis(
     prior_full: Optional[Mapping[str, Any]],
     current_primary: Mapping[str, Any],
     prior_primary: Mapping[str, Any],
+    current_basis: Optional[Mapping[str, Any]] = None,
+    prior_basis: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     current_id = _prompt_set_id(current_full, current_primary)
     prior_id = _prompt_set_id(prior_full, prior_primary or {})
@@ -199,15 +210,53 @@ def _measurement_basis(
             ),
         }
     same = current_id == prior_id
+    if not same:
+        return {
+            "same": False,
+            "prompt_set_id": current_id,
+            "note": (
+                "The prompt set changed between these runs (measurement basis "
+                "refreshed), so score movement partly reflects the new questions."
+            ),
+        }
+
+    # The prompt set matched. That is necessary but NOT sufficient: the prompt
+    # set says WHAT was asked, and says nothing about which model answered, at
+    # what temperature, against which official-domain set, or with what tier
+    # mix. Any of those moves the score with no merchant behaviour change —
+    # measured 2026-09-01, a model generation moved No-Destination 20.9% -> 0.0%
+    # and multi-host 50% -> 86%. Before this, such a run reported same=True and
+    # so tightened the materiality mask from 15 points to 5, which is the
+    # direction that manufactures movement rather than hiding it.
+    #
+    # Absent basis rows fall through to the prompt-set verdict unchanged: runs
+    # that predate audit_basis carry no evidence of a model change either way,
+    # and failing them closed would silently desensitise every merchant's next
+    # re-audit. This is strictly additive — it can only ever turn a True into a
+    # False, never the reverse.
+    if isinstance(current_basis, Mapping) and isinstance(prior_basis, Mapping):
+        from db.audit_basis import bases_are_comparable
+
+        if not bases_are_comparable(current_basis, prior_basis):
+            return {
+                "same": False,
+                "prompt_set_id": current_id,
+                "basis_divergence": "measurement_basis",
+                "note": (
+                    "The same questions were asked, but something else about "
+                    "how this audit was measured changed (the model, the "
+                    "official-domain set, the question mix or the market), so "
+                    "score movement partly reflects the new measurement rather "
+                    "than your store."
+                ),
+            }
+
     return {
-        "same": same,
+        "same": True,
         "prompt_set_id": current_id,
         "note": (
             "Measured on the same prompt set as your last audit — score "
             "movement is a real comparison."
-            if same else
-            "The prompt set changed between these runs (measurement basis "
-            "refreshed), so score movement partly reflects the new questions."
         ),
     }
 
