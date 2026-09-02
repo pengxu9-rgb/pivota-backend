@@ -1894,6 +1894,22 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # mig 207: merchant_order_sync_jobs.progress — the durable queue for
+            # post-payment merchant-order sync. The TABLE is born in mig 207 and
+            # also self-heals via
+            # db/merchant_order_sync_jobs.ensure_merchant_order_sync_jobs_table(),
+            # which every accessor calls; this heals the one column added after
+            # that file's first cut, since CREATE TABLE IF NOT EXISTS is a no-op
+            # on a table that already exists. ALTER ... IF EXISTS so it no-ops
+            # harmlessly wherever the table has not been created yet.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS merchant_order_sync_jobs
+                      ADD COLUMN IF NOT EXISTS progress TEXT;
+                    """
+                )
+            )
             # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
             # (derived from refund_amount_cents, added above). Emitted LAST so this
             # lone potential table-rewrite can't block the lightweight self-heals;
