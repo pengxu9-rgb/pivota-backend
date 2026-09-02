@@ -367,6 +367,36 @@ async def test_weak_key_cannot_nominate_loser_after_strong_match(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("weak_key", ["session_id", "cart_id", "payment_id"])
+@pytest.mark.parametrize("strong_key", ["quote_id", "refund_id", "return_id"])
+async def test_late_strong_key_is_resolved_before_any_weak_key(
+    monkeypatch, weak_key, strong_key
+):
+    from services import commerce_interaction_service as service
+
+    class FakeDB:
+        async def fetch_all(self, _query):
+            return [
+                {"interaction_id": "int_weak", weak_key: "weak_shared"},
+                {"interaction_id": "int_strong", strong_key: "strong_1"},
+            ]
+
+    monkeypatch.setattr(service, "database", FakeDB())
+    matches = await service._lookup_matching_interactions(
+        {
+            "merchant_id": "merchant_a",
+            "store_id": "store_a",
+            weak_key: "weak_shared",
+            strong_key: "strong_1",
+        }
+    )
+
+    assert matches == [
+        {"interaction_id": "int_strong", strong_key: "strong_1"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_event_lock_restarts_when_loser_resolves_to_new_winner(monkeypatch):
     from services import commerce_interaction_service as service
 

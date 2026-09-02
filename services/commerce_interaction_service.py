@@ -131,6 +131,9 @@ _STORE_SCOPED_LOOKUP_KEYS = {
 }
 
 _WEAK_INTERACTION_LOOKUP_KEYS = {"session_id", "cart_id", "payment_id"}
+_INTERACTION_SELECTION_KEYS = tuple(
+    key for key in _INTERACTION_LOOKUP_KEYS if key not in _WEAK_INTERACTION_LOOKUP_KEYS
+) + tuple(key for key in _INTERACTION_LOOKUP_KEYS if key in _WEAK_INTERACTION_LOOKUP_KEYS)
 
 
 def _interaction_lookup_conditions(
@@ -156,11 +159,13 @@ async def _lookup_matching_interactions(
 ) -> List[Dict[str, Any]]:
     """Return every interaction reached by the incoming stitch keys.
 
-    Lookup priority is intentionally preserved so the first row remains the
-    deterministic winner used by the legacy single-match path.
+    Strong-key priority is deterministic. Weak keys are fallback-only and may
+    confirm a strong match, but never nominate a destructive merge loser.
     """
     match_conditions = []
-    for key in _INTERACTION_LOOKUP_KEYS:
+    # Strong keys are resolved first regardless of their legacy lookup order.
+    # Weak keys may select one row only when no strong key matched at all.
+    for key in _INTERACTION_SELECTION_KEYS:
         if not refs.get(key):
             continue
         # Merchant scope is shared outside the OR; the remaining predicates
@@ -183,7 +188,7 @@ async def _lookup_matching_interactions(
     )
     matches: List[Dict[str, Any]] = []
     matched_ids: set[str] = set()
-    for key in _INTERACTION_LOOKUP_KEYS:
+    for key in _INTERACTION_SELECTION_KEYS:
         value = refs.get(key)
         if not value:
             continue
