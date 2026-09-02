@@ -374,7 +374,7 @@ async def fail_merchant_order_sync_job(
             """
             UPDATE merchant_order_sync_jobs
                SET status = :status, last_error = :error, updated_at = :now,
-                   next_attempt_at = :next_attempt_at,
+                   next_attempt_at = :next_attempt_at, attempts = :attempts,
                    claimed_by_worker = NULL, claimed_until = NULL
              WHERE job_id = :job_id AND claimed_by_worker = :worker_id
             RETURNING job_id
@@ -386,6 +386,9 @@ async def fail_merchant_order_sync_job(
                 "error": str(error or "")[:1000],
                 "now": now,
                 "next_attempt_at": next_attempt_at,
+                # Written so a terminally-spent row does not read
+                # "gave up with 9 attempts left" to whoever triages it.
+                "attempts": int(attempts),
             },
         )
         if row is None:

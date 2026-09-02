@@ -52,9 +52,6 @@ def _wire_refund_route(monkeypatch, module, *, store, bound_store=None,
     async def fake_get_primary_store(merchant_id: str):
         return store
 
-    async def fake_get_store_by_id(sid, *, merchant_id=None):
-        return bound_store
-
     async def fake_get_merchant_onboarding(merchant_id: str):
         return {"merchant_id": merchant_id}
 
@@ -66,7 +63,6 @@ def _wire_refund_route(monkeypatch, module, *, store, bound_store=None,
 
     monkeypatch.setattr(module, "get_order", fake_get_order)
     monkeypatch.setattr(module, "get_primary_store", fake_get_primary_store)
-    monkeypatch.setattr(module, "get_store_by_id", fake_get_store_by_id)
     monkeypatch.setattr(module, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(module, "_resolve_refund_adapter", fake_resolve_refund_adapter)
     monkeypatch.setattr(
@@ -354,6 +350,7 @@ def _payload(**over):
         "amount": 20.0,
         "currency": "USD",
         "is_partial": False,
+        "parent_transaction_id": None,
         "cancel_payload": {"reason": "customer", "email": False,
                            "refund": False, "restock": True},
     }
@@ -484,19 +481,22 @@ async def test_handler_prefers_the_bound_store_over_the_primary(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_handler_refuses_to_fall_back_when_the_bound_store_is_gone(monkeypatch):
-    """Cancelling on the wrong shop is worse than not cancelling — and this is
-    TERMINAL, not retryable: burning 10 attempts over 2h changes nothing and
-    would fire the GAVE UP incident hours after the operator could have acted."""
+    """Cancelling on the wrong shop is worse than not cancelling.
+
+    RETRYABLE, not terminal: `get_store_by_id` filters on
+    status IN ('active','connected'), so a merchant re-authing their Shopify app
+    flips disconnected -> active well inside the attempt budget.
+    """
     _wire_handler(monkeypatch, store=_SHOPIFY_STORE, bound_store=None)
 
-    with pytest.raises(drain._TerminalSyncError):
+    with pytest.raises(drain._RetryableSyncError):
         await drain._run_refund_sync_job(_payload(store_id="st_missing"), {}, None)
 
 
 @pytest.mark.asyncio
 async def test_a_terminal_error_spends_the_whole_budget_at_once(monkeypatch):
     async def handler(payload, progress=None, on_progress=None):
-        raise drain._TerminalSyncError("bound store is gone")
+        raise drain._TerminalSyncError("no store is connected for this merchant")
 
     seen = _wire_drain(monkeypatch, _job(attempts=1, max_attempts=10), handler=handler)
     summary = await drain.run_merchant_order_sync_worker_tick()
@@ -669,3 +669,139 @@ async def test_enqueue_gate_follows_the_bound_store_not_the_primary(monkeypatch)
     await _run_refund(module, "ORD_GATE_BOUND")
 
     assert len(calls) == 1, "primary is non-Shopify but the bound store is not"
+
+
+@pytest.mark.asyncio
+async def test_a_soft_skip_whose_annotation_also_failed_is_not_success(monkeypatch):
+    """`ok: True` does not mean the refund was mirrored.
+
+    `soft_skipped` means NO refund transaction was written and the writer
+    annotated the order instead — and that annotation returns ok:False on any
+    non-2xx. If neither landed, nothing at all reached Shopify, and completing
+    records success on an order the merchant can never reconcile.
+    """
+    _wire_handler(
+        monkeypatch,
+        store=_SHOPIFY_STORE,
+        sync_result={
+            "ok": True,
+            "created": False,
+            "soft_skipped": True,
+            "reason": "missing_parent_transaction",
+            "annotation": {"ok": False, "status": 500, "error": "Shopify 500"},
+        },
+    )
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_refund_sync_job(_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_a_soft_skip_whose_annotation_landed_completes(monkeypatch):
+    """Positive counterpart: a missing parent transaction is structural, so once
+    the order carries the reconciliation tag there is nothing left to retry."""
+    _wire_handler(
+        monkeypatch,
+        store=_SHOPIFY_STORE,
+        sync_result={
+            "ok": True,
+            "created": False,
+            "soft_skipped": True,
+            "reason": "missing_parent_transaction",
+            "annotation": {"ok": True, "status": 200},
+        },
+    )
+
+    result = await drain._run_refund_sync_job(_payload(), {}, None)
+
+    assert result["transaction_sync_soft_skipped"] == "missing_parent_transaction"
+
+
+@pytest.mark.asyncio
+async def test_the_handler_forwards_a_known_parent_transaction_id(monkeypatch):
+    calls = _wire_handler(monkeypatch, store=_SHOPIFY_STORE)
+
+    await drain._run_refund_sync_job(_payload(parent_transaction_id=1444), {}, None)
+
+    assert calls["sync"][0]["parent_transaction_id"] == 1444
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_failure_is_not_reported_as_a_requeue(monkeypatch):
+    """`write_failed` means the outcome was never written: the row keeps its live
+    lease and `last_error` stays NULL, so recovery is the lease expiry rather
+    than the 30s backoff. Counting it as `requeued` describes work that did not
+    happen."""
+
+    async def handler(payload, progress=None, on_progress=None):
+        raise RuntimeError("shopify 503")
+
+    seen = _wire_drain(monkeypatch, _job(attempts=1, max_attempts=10), handler=handler)
+
+    async def fail_write_fails(*, job_id, worker_id, attempts, max_attempts, error):
+        seen["failed"].append({"job_id": job_id, "status": "write_failed"})
+        return "write_failed"
+
+    monkeypatch.setattr(drain, "fail_merchant_order_sync_job", fail_write_fails)
+
+    summary = await drain.run_merchant_order_sync_worker_tick()
+
+    assert summary["write_failed"] == 1
+    assert summary["requeued"] == 0
+    assert summary["failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_op_that_loses_its_lease_is_not_counted_as_requeued(monkeypatch):
+    seen = _wire_drain(
+        monkeypatch, _job(op="op_from_the_future", attempts=1, max_attempts=10)
+    )
+
+    async def fail_lease_lost(*, job_id, worker_id, attempts, max_attempts, error):
+        seen["failed"].append({"job_id": job_id, "status": "lease_lost"})
+        return "lease_lost"
+
+    monkeypatch.setattr(drain, "fail_merchant_order_sync_job", fail_lease_lost)
+
+    summary = await drain.run_merchant_order_sync_worker_tick()
+
+    assert summary["lease_lost"] == 1
+    assert summary["requeued"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_connected_store_at_all_is_terminal(monkeypatch):
+    """Structural, not a blip: retrying for two hours and then paging says
+    "Shopify would not take it" when there was never a store to write to."""
+    _wire_handler(monkeypatch, store=None)
+
+    with pytest.raises(drain._TerminalSyncError):
+        await drain._run_refund_sync_job(_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_is_not_skipped_when_the_bound_store_cannot_be_resolved(monkeypatch):
+    """The one outcome this path must never produce. A stale bound store_id is a
+    documented production class; dropping the enqueue leaves a refunded order
+    with no job, no event and no log — nothing anyone can reconcile."""
+    import routes.refund_api as module
+
+    calls = []
+
+    async def fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return "job-1"
+
+    # Primary is NOT Shopify and the bound store is unresolvable — the worker
+    # decides, and a job that fails there is at least visible.
+    _wire_refund_route(
+        monkeypatch, module,
+        store={"platform": "woocommerce", "domain": "primary.example"},
+        store_id="st_stale",
+    )
+    monkeypatch.setattr(module, "enqueue_merchant_order_sync_job", fake_enqueue)
+
+    await _run_refund(module, "ORD_STALE_BOUND")
+
+    assert len(calls) == 1, "a refund with a bound store_id was silently dropped"
+    assert calls[0]["payload"]["store_id"] == "st_stale"

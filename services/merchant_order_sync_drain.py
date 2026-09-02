@@ -101,7 +101,12 @@ async def _resolve_store_for_refund(payload: Dict[str, Any]) -> Dict[str, Any]:
     if bound_store_id:
         store = await get_store_by_id(bound_store_id, merchant_id=merchant_id)
         if not store:
-            raise _TerminalSyncError(
+            # RETRYABLE, not terminal: `get_store_by_id` filters on
+            # status IN ('active','connected'), so a merchant re-authing their
+            # Shopify app flips disconnected -> active within minutes. The
+            # attempt budget absorbs that; giving up on the first attempt would
+            # fire the money-path incident for a condition that fixes itself.
+            raise _RetryableSyncError(
                 f"bound store {bound_store_id} is missing or inactive; refusing "
                 "to fall back to the primary store"
             )
@@ -109,7 +114,12 @@ async def _resolve_store_for_refund(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     store = await get_primary_store(merchant_id)
     if not store:
-        raise _RetryableSyncError("no primary store is readable for this merchant")
+        # TERMINAL: no bound store and no primary store is a structural gap, not
+        # a blip. Retrying for two hours and then paging says "Shopify would not
+        # take it" when the truth is there was never a store to write to.
+        raise _TerminalSyncError(
+            "no store is connected for this merchant; nothing to sync to"
+        )
     return store
 
 
@@ -171,6 +181,13 @@ async def _run_refund_sync_job(
             external_refund_ref=payload.get("refund_id"),
             amount=float(payload.get("amount") or 0),
             currency=str(payload.get("currency") or "USD"),
+            # Carried by producers that already know it. Without it the writer
+            # falls back to `_find_successful_parent_transaction`, which only
+            # accepts kind in (sale, capture) — so an `authorization`-kind
+            # parent recorded in order metadata is invisible to it, the writer
+            # soft-skips with ok:True, and the job completes having written
+            # nothing.
+            parent_transaction_id=payload.get("parent_transaction_id"),
             pivota_order_id=order_id,
         )
         result["transaction_sync"] = sync
@@ -187,6 +204,22 @@ async def _run_refund_sync_job(
             # Nothing to write and no retry can change that; record it as its
             # own outcome rather than letting it read as a clean success.
             result["transaction_sync_skipped"] = reason
+        elif sync.get("soft_skipped"):
+            # `ok: True` here means the writer could NOT write the refund
+            # transaction (no parent to attach it to) and fell back to
+            # annotating the order for a human. That annotation is itself
+            # best-effort: `annotate_shopify_order_best_effort` returns
+            # ok:False on any non-2xx. If neither landed, nothing at all
+            # reached Shopify, and completing would leave exactly the
+            # unreconcilable state this queue exists to prevent.
+            annotation = sync.get("annotation")
+            if not (isinstance(annotation, dict) and annotation.get("ok")):
+                raise _RetryableSyncError(
+                    "refund transaction was not written "
+                    f"(reason={sync.get('reason')}) and the fallback annotation "
+                    "did not land either"
+                )
+            result["transaction_sync_soft_skipped"] = str(sync.get("reason") or "")
         progress[_STEP_TRANSACTION] = True
         if on_progress is not None:
             await on_progress(progress)
@@ -269,7 +302,14 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
     re-claimed once the lease expires. That is the behaviour we want; noting it
     because "never raises" would be wrong.
     """
-    summary = {"claimed": 0, "done": 0, "requeued": 0, "failed": 0, "lease_lost": 0}
+    summary = {
+        "claimed": 0,
+        "done": 0,
+        "requeued": 0,
+        "failed": 0,
+        "lease_lost": 0,
+        "write_failed": 0,
+    }
     for _ in range(MAX_JOBS_PER_TICK):
         try:
             job = await claim_next_merchant_order_sync_job(worker_id=WORKER_ID)
@@ -306,6 +346,8 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
             )
             if status == "lease_lost":
                 summary["lease_lost"] += 1
+            elif status == "write_failed":
+                summary["write_failed"] += 1
             else:
                 summary["failed" if status == "failed" else "requeued"] += 1
             continue
@@ -350,6 +392,19 @@ async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:
             )
             if status == "lease_lost":
                 summary["lease_lost"] += 1
+            elif status == "write_failed":
+                # We could not record the outcome. The row keeps its live lease
+                # and `last_error` stays NULL, so recovery is the lease expiry
+                # rather than the 30s backoff — say so instead of reporting a
+                # requeue that did not happen.
+                summary["write_failed"] += 1
+                logger.error(
+                    "merchant_order_sync: could not record failure for job=%s "
+                    "order=%s; row stays leased until it expires: %s",
+                    job_id,
+                    job.get("order_id"),
+                    str(exc)[:300],
+                )
             elif status == "failed":
                 summary["failed"] += 1
                 # Terminal on this queue means the buyer was refunded and the

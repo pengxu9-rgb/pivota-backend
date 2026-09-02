@@ -3246,13 +3246,21 @@ def test_refund_defers_an_unwritable_transaction_mirror_to_the_durable_queue(mon
 
     assert response.status_code == 200
     body = response.json()
-    assert body["transaction_sync"]["deferred_to_queue"] is True
-    assert body["transaction_sync"]["deferred_job_id"] == "job-deferred-1"
-
+    # `.get()` deliberately: if the deferral stops happening these must fail on
+    # the assertion below, not on a KeyError before it is reached.
     assert len(enqueued) == 1, "the unwritable mirror was not handed to the queue"
+    assert body["transaction_sync"].get("deferred_to_queue") is True
+    assert body["transaction_sync"].get("deferred_job_id") == "job-deferred-1"
+
     job = enqueued[0]
     assert job["op"] == sync_jobs.OP_REFUND_SYNC
-    assert job["dedupe_key"] == "re_alpha_defer"
+    # Namespaced so this producer can never collide with refund_api's key for
+    # the same refund — that surface does NOT set skip_cancel, and whichever
+    # lost ON CONFLICT would have its payload silently discarded.
+    assert job["dedupe_key"] == "txn:re_alpha_defer"
+    # Carried, or the writer's fallback rejects an authorization-kind parent and
+    # the job soft-skips to `done` having written nothing.
+    assert job["payload"]["parent_transaction_id"] == 1444
     # This surface mirrors the transaction only; cancelling the merchant order
     # is the refund_api flow's business.
     assert job["payload"]["skip_cancel"] is True

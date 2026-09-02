@@ -3,11 +3,7 @@ Refund Processing API
 Handles full and partial refunds for orders
 """
 
-from services.merchant_store_service import (
-    get_merchant_active_stores,
-    get_primary_store,
-    get_store_by_id,
-)
+from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -468,26 +464,27 @@ async def process_refund(
         #
         # The guard mirrors the former task's early return, so a merchant with
         # no Shopify store still queues nothing.
-        # Gate on the store the WORKER will use, not the primary one. The worker
-        # resolves the order's bound store_id first (get_store_by_id's own
-        # guidance), so gating on the primary store both enqueues jobs the worker
-        # will refuse and skips jobs it could have completed.
-        enqueue_store = store_info
+        # Store resolution belongs to the WORKER, not to this gate.
+        #
+        # An earlier cut resolved the bound store here and skipped the enqueue
+        # when it came back empty — which is the one outcome this path must
+        # never produce, because a refund whose sync was never queued leaves no
+        # trace anyone can reconcile. A stale bound store_id is a documented
+        # production class (SHOPIFY_ORDER_SYNC_RUNBOOK.md), and
+        # `get_store_by_id` also filters on status IN ('active','connected'), so
+        # a merchant mid-reconnect hit it too. It also put a second DB call on
+        # the money path after the PSP had already moved funds.
+        #
+        # So: when the order carries a bound store_id, always enqueue and let
+        # the worker resolve it — a job that fails there is at least visible.
+        # Only when there is NO bound store does the primary store decide,
+        # which is exactly what the worker falls back to.
         _bound_store_id = str(order.get("store_id") or "").strip()
-        if _bound_store_id:
-            try:
-                enqueue_store = await get_store_by_id(
-                    _bound_store_id,
-                    merchant_id=str(order.get("merchant_id") or ""),
-                )
-            except Exception:
-                enqueue_store = None
+        _has_merchant_target = bool(_bound_store_id) or bool(
+            store_info and store_info.get("platform") == "shopify"
+        )
 
-        if (
-            order.get("shopify_order_id")
-            and enqueue_store
-            and enqueue_store.get("platform") == "shopify"
-        ):
+        if order.get("shopify_order_id") and _has_merchant_target:
             enqueued_job_id = await enqueue_merchant_order_sync_job(
                 order_id=str(order_id),
                 merchant_id=str(order.get("merchant_id") or ""),

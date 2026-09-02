@@ -2218,8 +2218,11 @@ async def create_refund_for_checkout(
                 order_id=str(order_id),
                 merchant_id=str(merchant_id),
                 op=OP_REFUND_SYNC,
-                dedupe_key=str(psp_refund_id or refund_id or "").strip()
-                or f"readiness-{checkout_id}",
+                dedupe_key="txn:"
+                + (
+                    str(psp_refund_id or refund_id or "").strip()
+                    or f"readiness-{checkout_id}"
+                ),
                 payload={
                     "order_id": str(order_id),
                     "merchant_id": str(merchant_id),
@@ -2231,7 +2234,9 @@ async def create_refund_for_checkout(
                     ).strip()
                     or None,
                     "psp_used": str(
-                        (refreshed_order or order_row).get("psp_used") or ""
+                        (refreshed_order or order_row).get("psp_used")
+                        or payload.get("payment_psp_used")
+                        or ""
                     ).strip()
                     or None,
                     "refund_id": psp_refund_id or refund_id,
@@ -2241,13 +2246,31 @@ async def create_refund_for_checkout(
                     ),
                     "is_partial": False,
                     "skip_cancel": True,
+                    # This surface already resolved the parent; the writer's
+                    # fallback only accepts kind in (sale, capture), so an
+                    # `authorization`-kind parent would otherwise be invisible
+                    # to the deferred job and it would soft-skip to `done`.
+                    "parent_transaction_id": known_parent_transaction_id,
                 },
             )
-            transaction_sync = {
-                **transaction_sync,
-                "deferred_to_queue": True,
-                "deferred_job_id": deferred_job_id,
-            }
+            if deferred_job_id is None:
+                transaction_sync = {
+                    **transaction_sync,
+                    "deferred_to_queue": False,
+                    "deferred_enqueue_failed": True,
+                }
+                logger.error(
+                    "readiness: could not defer refund transaction sync for "
+                    "checkout=%s order=%s — this work is now lost",
+                    checkout_id,
+                    order_id,
+                )
+            else:
+                transaction_sync = {
+                    **transaction_sync,
+                    "deferred_to_queue": True,
+                    "deferred_job_id": deferred_job_id,
+                }
         except Exception:
             logger.warning(
                 "Could not defer refund transaction sync for checkout=%s",
