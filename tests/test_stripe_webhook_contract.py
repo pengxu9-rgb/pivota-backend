@@ -471,6 +471,7 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     evidence_calls: list[tuple[str, str]] = []
     order_events: list[Dict[str, Any]] = []
     shopify_calls: list[str] = []
+    enqueued: list[Dict[str, Any]] = []
     merchant_webhook_calls: list[Dict[str, Any]] = []
 
     event = _stripe_event(
@@ -507,9 +508,13 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     async def fake_create_order_snapshot_evidence_pack(order_id: str, triggered_by: str) -> None:
         evidence_calls.append((order_id, triggered_by))
 
-    async def fake_get_primary_store(merchant_id: str) -> Dict[str, Any]:
-        assert merchant_id == "m_stripe"
-        return {"platform": "shopify"}
+    async def fake_enqueue(*, order_id, merchant_id, require_shopify_primary=False):
+        enqueued.append({
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "require_shopify_primary": require_shopify_primary,
+        })
+        return "job-1"
 
     async def fake_get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
         assert merchant_id == "m_stripe"
@@ -555,7 +560,12 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
         "create_order_snapshot_evidence_pack",
         fake_create_order_snapshot_evidence_pack,
     )
-    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fake_get_primary_store)
+    # The Stripe webhook no longer creates the merchant order inline (one
+    # attempt, failure swallowed, then a 200 that stopped Stripe retrying). It
+    # enqueues, and the worker makes the primary-store check.
+    monkeypatch.setattr(
+        webhook_routes_module, "enqueue_merchant_order_create", fake_enqueue
+    )
     monkeypatch.setattr(
         merchant_onboarding_module,
         "get_merchant_onboarding",
@@ -580,7 +590,15 @@ async def test_stripe_webhook_payment_intent_succeeded_marks_paid_and_creates_sh
     assert resp.json() == {"status": "success", "event": "payment_intent.succeeded"}
     assert paid_calls == ["ORD_STRIPE_SUCCESS"]
     assert evidence_calls == [("ORD_STRIPE_SUCCESS", "stripe_webhook")]
-    assert shopify_calls == ["ORD_STRIPE_SUCCESS"]
+    # The merchant-order create is now DURABLE rather than an inline attempt
+    # whose failure was swallowed before a 200 that stopped Stripe retrying.
+    # `require_shopify_primary` keeps this path's own guard.
+    assert shopify_calls == []
+    assert enqueued == [{
+        "order_id": "ORD_STRIPE_SUCCESS",
+        "merchant_id": "m_stripe",
+        "require_shopify_primary": True,
+    }]
     assert len(order_events) == 1
     assert order_events[0]["event_type"] == "payment_confirmed_webhook"
     assert order_events[0]["order_id"] == "ORD_STRIPE_SUCCESS"
@@ -690,7 +708,7 @@ async def test_stripe_webhook_payment_intent_succeeded_falls_back_to_order_metad
         "create_order_snapshot_evidence_pack",
         fake_create_order_snapshot_evidence_pack,
     )
-    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "enqueue_merchant_order_create", fail_if_called)
     monkeypatch.setattr(merchant_onboarding_module, "get_merchant_onboarding", fail_if_called)
     monkeypatch.setattr(order_routes_module, "create_shopify_order", fail_if_called)
 
@@ -765,7 +783,7 @@ async def test_stripe_webhook_payment_intent_succeeded_does_not_restore_paid_aft
     monkeypatch.setattr(webhook_routes_module, "mark_order_paid", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "log_order_event", fail_if_called)
     monkeypatch.setattr(webhook_routes_module, "create_order_snapshot_evidence_pack", fail_if_called)
-    monkeypatch.setattr(webhook_routes_module, "get_primary_store", fail_if_called)
+    monkeypatch.setattr(webhook_routes_module, "enqueue_merchant_order_create", fail_if_called)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
