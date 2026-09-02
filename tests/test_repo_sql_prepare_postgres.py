@@ -175,7 +175,12 @@ _FIXTURE_GAP = {
 #
 # Small slack on each so unrelated PRs that add or remove a query do not have to
 # touch this file; a real regression moves these by far more.
-_MIN_COLLECTED = 2050
+#
+# _MIN_COLLECTED last raised 2050 -> 2150 when the sweep was collecting 2227: the
+# floor had drifted 177 below actual, wider than the ~100 of headroom the prior
+# bump left, and a slack floor that keeps widening stops being a tripwire. Raise
+# it in coarse steps like this one, never by the delta of a single PR.
+_MIN_COLLECTED = 2150
 _MIN_PLANNED = 1950
 _MAX_UNCHECKED = 140
 

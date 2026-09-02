@@ -123,6 +123,10 @@ on:
       # needs its own entry or a change to it would not run its own gate.
       - "tests/test_pdp_renderability.py"
       - "tests/test_databases_textclause_params.py"
+      # Same reason, third ride-along: without its own entry, a PR touching only
+      # this file would not run the job that gives it its Postgres arm — and the
+      # Postgres arm is the half that tests the statements which actually ship.
+      - "tests/test_quality_backfill_partial_update.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
@@ -236,7 +240,22 @@ jobs:
           # this job's path filter — and both known occurrences sat inside
           # `except Exception`, so the symptom was a silent wrong answer rather
           # than a 500 that CI or logs would ever surface.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py; do
+          # test_quality_backfill_partial_update.py rides along because it is the
+          # only thing that executes db/product_quality_backfill_jobs.py's raw
+          # UPDATEs, and the half that ships is the Postgres half. Its statements
+          # are a dialect split -- `CAST(:errors_sample AS JSONB)` on Postgres, a
+          # bare bind on SQLite -- so running it only in backend-test-sweep (which
+          # sets no DATABASE_URL, hence SQLite) exercises the twin and never the
+          # production text. Demonstrated: reintroducing the "a None counter
+          # overwrites a live value" defect in the POSTGRES constant alone left
+          # the sweep, the -k "quality or backfill" selection AND this job's own
+          # PREPARE sweep all green -- PREPARE plans `SET x = $1` happily, and the
+          # SQLite twin is untouched. Renaming it to *_postgres.py is the wrong
+          # fix: backend-test-sweep --ignore-glob's that pattern, so it would swap
+          # the Postgres gap for a SQLite one, and the split needs BOTH sides.
+          # Checked SQLite-safe under this job's Postgres URL, against a jsonb
+          # column and a model-first json one, and it declares no skips.
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_partial_update.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"
