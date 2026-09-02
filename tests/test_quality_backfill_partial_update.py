@@ -36,13 +36,14 @@ sweep `--ignore-glob`s that pattern, which trades the gap for the opposite gap.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import os
+import time
+from datetime import datetime
 
 import pytest
 
-from db.database import database
+from db.database import IS_POSTGRES, database
 from db.product_quality_backfill_jobs import (
-    _utcnow,
     claim_quality_backfill_job,
     complete_quality_backfill_job,
     create_quality_backfill_job,
@@ -360,14 +361,9 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
     statement's own WHERE clause, evaluated with the same cutoff, so the two
     agree by construction whatever else is in the table.
 
-    NOTHING HERE ASSERTS THAT A FRESHLY CLAIMED JOB IS SPARED, which it should
-    be and on a UTC server is: `:cutoff` is a NAIVE `datetime.utcnow()`, and
-    asyncpg hands a naive datetime to a `timestamptz` column to be read in the
-    SESSION timezone. On a Postgres running America/Los_Angeles the cutoff lands
-    seven hours in the FUTURE and every `running` row is stale. Pre-existing, on
-    the WHERE clause rather than the count, and inert in production (UTC) — but
-    real enough that pinning it here would make this test fail on a developer's
-    machine for a reason that has nothing to do with what it measures.
+    A FRESHLY CLAIMED JOB BEING SPARED is a different claim, pinned by
+    test_a_non_utc_session_timezone_does_not_make_every_running_job_stale below
+    — it used to be false on any non-UTC server and could not be asserted here.
     """
     stale_ids = [await _new_job(), await _new_job()]
     for job_id in stale_ids:
@@ -380,13 +376,22 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
             {"old": datetime(2020, 1, 1), "j": job_id},
         )
 
-    # The helper floors staleness at 30s, so this is the cutoff it will use.
-    cutoff = _utcnow() - timedelta(seconds=30)
-    eligible = await database.fetch_all(
-        "SELECT job_id FROM product_quality_backfill_jobs "
-        "WHERE status = 'running' AND started_at IS NOT NULL AND started_at < :cutoff",
-        {"cutoff": cutoff},
-    )
+    # The statement's OWN eligibility predicate, copied per dialect, evaluated
+    # against the same server clock. The helper floors staleness at 30s.
+    if IS_POSTGRES:
+        eligible = await database.fetch_all(
+            "SELECT job_id FROM product_quality_backfill_jobs "
+            "WHERE status = 'running' AND started_at IS NOT NULL "
+            "AND started_at < CURRENT_TIMESTAMP - (:stale_seconds * INTERVAL '1 second')",
+            {"stale_seconds": 30},
+        )
+    else:
+        eligible = await database.fetch_all(
+            "SELECT job_id FROM product_quality_backfill_jobs "
+            "WHERE status = 'running' AND started_at IS NOT NULL "
+            "AND started_at < datetime('now', :stale_window)",
+            {"stale_window": "-30 seconds"},
+        )
     eligible_ids = {str(dict(row)["job_id"]) for row in eligible}
     assert set(stale_ids) <= eligible_ids, "the two backdated jobs must be eligible"
 
@@ -410,3 +415,104 @@ async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
     # at whatever the previous call returned. Pins the count to the ROWS, not to
     # a constant that happens to match above.
     assert await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5) == 0
+
+
+@pytest.mark.skipif(
+    not IS_POSTGRES,
+    reason="asyncpg encodes a naive datetime for timestamptz using the CLIENT timezone; SQLite binds no datetime here",
+)
+async def test_a_non_utc_process_timezone_does_not_make_every_running_job_stale():
+    """`stale_after_seconds` used to mean nothing unless the PROCESS ran UTC.
+
+    The cutoff was `_utcnow() - timedelta(...)`, a NAIVE datetime, and asyncpg
+    encodes a naive datetime for a `timestamptz` parameter as LOCAL wall time —
+    local to the CLIENT process, using its `TZ`. Measured on PG 15, against a
+    database and session both pinned to UTC, from a process in
+    America/Los_Angeles:
+
+        naive utcnow                  2026-09-02 02:45:32
+        true now                      2026-09-02 02:45:32+00
+        bound as $1::timestamptz  ->  2026-09-02 09:45:32+00
+
+    Seven hours in the FUTURE, so `started_at < :cutoff` held for every
+    `running` row: a job claimed one second ago was requeued by a call asking
+    for jobs stale for an hour.
+
+    IT IS THE CLIENT'S TIMEZONE, NOT THE SERVER'S. An earlier revision of this
+    test asserted the same behaviour by doing `SET TIME ZONE` on the connection,
+    which looked right and proved nothing: running the probe above before and
+    after `SET TIME ZONE 'America/Los_Angeles'` returns the SAME value both
+    times. Both machines happened to be on Pacific time when the bug was first
+    diagnosed, which made the two explanations indistinguishable. So the lever
+    here is `TZ` + `time.tzset()`, which is what actually moves the encoding —
+    and, unlike the session setting, makes this test fail on a UTC CI runner
+    against the broken implementation instead of quietly passing.
+
+    Production runs UTC (Cloud Run), which is why this never bit there.
+    """
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        assert time.tzname[0] != "UTC", "the process timezone did not change"
+
+        job_id = await _new_job()
+        # started_at = CURRENT_TIMESTAMP, i.e. one second old, in server time.
+        await claim_quality_backfill_job(job_id)
+
+        await requeue_stale_quality_backfill_jobs(stale_after_seconds=3600, limit=5)
+
+        assert (await get_quality_backfill_job(job_id))["status"] == "running", (
+            "a job claimed one second ago was requeued by a call asking for jobs "
+            "stale for an hour — a naive cutoff was encoded as the client "
+            "process's local wall time, not as UTC"
+        )
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+
+
+async def test_the_staleness_window_is_measured_in_seconds_against_the_server_clock():
+    """`stale_after_seconds` is now an INTERVAL built in SQL — pin its unit.
+
+    Every other case in this file backdates `started_at` to 2020, which is stale
+    under any unit and any direction: `INTERVAL '1 minute'` in place of
+    `INTERVAL '1 second'`, or a `+` for the `-`, survives all of them. This one
+    straddles the boundary, in both dialects, with both rows backdated by the
+    SERVER so no client clock enters the comparison.
+    """
+    stale_id = await _new_job()      # 120s old, asked for 60s  -> must move
+    recent_id = await _new_job()     #  45s old, asked for 600s -> must NOT move
+    for job_id, age in ((stale_id, 120), (recent_id, 45)):
+        await claim_quality_backfill_job(job_id)
+        if IS_POSTGRES:
+            await database.execute(
+                "UPDATE product_quality_backfill_jobs SET started_at = "
+                "CURRENT_TIMESTAMP - (:age * INTERVAL '1 second') WHERE job_id = :j",
+                {"age": age, "j": job_id},
+            )
+        else:
+            await database.execute(
+                "UPDATE product_quality_backfill_jobs "
+                "SET started_at = datetime('now', :age) WHERE job_id = :j",
+                {"age": f"-{age} seconds", "j": job_id},
+            )
+
+    # A limit big enough that neither row can be spared by the LIMIT instead of
+    # by the predicate — that would pass for the wrong reason.
+    await requeue_stale_quality_backfill_jobs(stale_after_seconds=60, limit=1000)
+    assert (await get_quality_backfill_job(stale_id))["status"] == "queued", (
+        "a job running for 120s was not stale at a 60s window — the interval is "
+        "not being measured in seconds"
+    )
+    assert (await get_quality_backfill_job(recent_id))["status"] == "running"
+
+    # The floor is max(30, stale_after_seconds), so 600 is honoured as given.
+    await requeue_stale_quality_backfill_jobs(stale_after_seconds=600, limit=1000)
+    assert (await get_quality_backfill_job(recent_id))["status"] == "running", (
+        "a job running for 45s was stale at a 600s window — the window is too "
+        "short, or the comparison runs the wrong way"
+    )
