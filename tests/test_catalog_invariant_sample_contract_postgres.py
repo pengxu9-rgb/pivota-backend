@@ -87,7 +87,13 @@ def test_the_contract_has_subjects():
     """A gate over zero checks is green for free. Pin that the SQL-driven
     checks are still registered as SQL (a `runner` check carries no sample_sql
     and is legitimately outside this contract)."""
-    assert len(_sql_checks()) >= 10
+    from services.catalog_invariant_checks import _CHECKS
+
+    sql_driven = _sql_checks()
+    assert len(sql_driven) >= 10
+    # And every check that is not runner-driven IS under the contract: a check
+    # with neither a runner nor a sample_sql would fall outside both.
+    assert len(sql_driven) == len([c for c in _CHECKS if c.get("runner") is None])
 
 
 @pytest.mark.parametrize("check", _sql_checks(), ids=lambda c: c["name"])

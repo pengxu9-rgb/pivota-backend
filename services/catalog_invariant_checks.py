@@ -1385,8 +1385,10 @@ def _sample_keys(check: Dict[str, Any], rows: Any) -> List[Any]:
     violations into two "check failed" tracebacks with no samples and no tally.
     Both are aliased now; this fallback exists so the next check that forgets
     degrades to a positional read plus a loud WARNING, not a lost verdict.
-    Column 0 is right by construction — one projected column — and the warning
-    names the check so the alias gets added rather than the tolerance relied on.
+    Column 0 is right for every check the Postgres contract gate has passed
+    (one projected column); a check that skipped the gate may carry more, so
+    the warning names the check and the alias gets added rather than the
+    tolerance relied on.
     """
     keys: List[Any] = []
     warned_once = False
@@ -1394,7 +1396,7 @@ def _sample_keys(check: Dict[str, Any], rows: Any) -> List[Any]:
         try:
             keys.append(row[SAMPLE_KEY_COLUMN])
             continue
-        except (KeyError, IndexError, TypeError):
+        except (KeyError, TypeError):
             pass
         if not warned_once:
             logger.warning(

@@ -293,3 +293,40 @@ def test_every_registered_sample_sql_names_subject_key():
         if c.get("sample_sql") is not None and "subject_key" not in c["sample_sql"]
     ]
     assert missing == [], f"sample_sql must project `... AS subject_key`: {missing}"
+
+
+class _SampleFetchRaisesDb:
+    """Count says over threshold; the sample fetch itself blows up."""
+
+    async def fetch_one(self, sql, values=None):
+        return _RecordLike(c=2)
+
+    async def fetch_all(self, sql, values=None):
+        if "FROM broken" in sql:
+            raise RuntimeError("sample_sql exploded")
+        return [_RecordLike(subject_key="pk_1")]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_sample_fetch_does_not_erase_the_verdict_from_the_tally(monkeypatch):
+    """The reorder: tally BEFORE sampling. `_sample_keys` cannot raise for a
+    missing alias any more, so the only way to reach the gap between marking
+    the entry and bumping the counter is the fetch itself raising. Before the
+    fix that left an entry with `violated: true` and a violated_count that
+    excluded it — the 2026-09-02 shape."""
+    import services.catalog_invariant_checks as cic
+
+    monkeypatch.setattr(cic, "_CHECKS", [
+        _sql_check("fine", "SELECT k AS subject_key FROM fine LIMIT 5"),
+        _sql_check("broken", "SELECT k AS subject_key FROM broken LIMIT 5"),
+    ])
+    report = await run_catalog_invariant_checks(_SampleFetchRaisesDb())
+    by_name = {c["name"]: c for c in report["checks"]}
+
+    assert by_name["broken"]["violated"] is True
+    assert "sample_sql exploded" in by_name["broken"]["error"]
+    assert "sample_keys" not in by_name["broken"]
+    assert by_name["fine"]["sample_keys"] == ["pk_1"]
+    # Both verdicts are in the total; the entries and the tally agree.
+    assert report["violated_count"] == 2
+    assert report["violated_count"] == sum(1 for c in report["checks"] if c.get("violated"))
