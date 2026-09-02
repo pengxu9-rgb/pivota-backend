@@ -199,15 +199,17 @@ async def get_active_quality_backfill_job(
 
 async def claim_quality_backfill_job(job_id: str) -> Optional[Dict[str, Any]]:
     await ensure_product_quality_backfill_jobs_table()
-    query = """
-    UPDATE product_quality_backfill_jobs
-    SET status = 'running',
-        started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
-    WHERE job_id = :job_id
-      AND status = 'queued'
-    RETURNING *
-    """
-    row = await database.fetch_one(query, {"job_id": job_id})
+    row = await database.fetch_one(
+        """
+        UPDATE product_quality_backfill_jobs
+        SET status = 'running',
+            started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
+        WHERE job_id = :job_id
+          AND status = 'queued'
+        RETURNING *
+        """,
+        {"job_id": job_id},
+    )
     return _normalize_row(row)
 
 
@@ -287,13 +289,15 @@ async def requeue_quality_backfill_job(job_id: str) -> bool:
     requeued job resumes cheaply rather than starting over.
     """
     await ensure_product_quality_backfill_jobs_table()
-    query = """
-    UPDATE product_quality_backfill_jobs
-    SET status = 'queued', started_at = NULL, finished_at = NULL
-    WHERE job_id = :job_id AND status = 'running'
-    RETURNING job_id
-    """
-    row = await database.fetch_one(query, {"job_id": job_id})
+    row = await database.fetch_one(
+        """
+        UPDATE product_quality_backfill_jobs
+        SET status = 'queued', started_at = NULL, finished_at = NULL
+        WHERE job_id = :job_id AND status = 'running'
+        RETURNING job_id
+        """,
+        {"job_id": job_id},
+    )
     return row is not None
 
 
