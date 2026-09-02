@@ -209,10 +209,14 @@ DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS = 6 * 3600
 # need this: it compares `started_at`, which claim_quality_backfill_job writes
 # with CURRENT_TIMESTAMP, so that column round-trips in the session zone.
 #
-# Strength is in the WHERE: the row returned is the newest job at least as
-# strong as the request (a force_refresh job satisfies any request; a
-# missing-only job satisfies only a missing-only request), so an intervening
-# weaker attended job cannot hide a stronger one.
+# Strength is in the WHERE: only a job at least as strong as the request
+# qualifies (a force_refresh job satisfies any request; a missing-only job
+# satisfies only a missing-only request), so an intervening weaker attended job
+# cannot hide a stronger one, and a force_refresh request is never folded into
+# a missing-only job. `_utcnow()` truncates to whole seconds, so same-second
+# ties are common; `job_id DESC` is a determinism tiebreak only — any row that
+# qualifies is a correct fold target, the reported id may be a same-second
+# sibling.
 _RECENT_JOB_SQL = """
     SELECT job_id
     FROM product_quality_backfill_jobs

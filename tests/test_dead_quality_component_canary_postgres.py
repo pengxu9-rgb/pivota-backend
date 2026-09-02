@@ -259,6 +259,63 @@ def test_malformed_historical_details_cannot_cost_the_check_its_verdict():
     assert names == ["external_seed:summary"]
 
 
+def test_malformed_history_alone_is_not_evidence_of_life():
+    """The counterpart: with NO genuine non-zero row, malformed history must
+    not satisfy the EXISTS either — `"n/a"` and `true` are 0, not > 0."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=250, summary_score=0.0)
+        for bad in (
+            {"components": [{"name": "summary", "score": "n/a"}]},
+            {"components": [{"name": "summary", "score": True}]},
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO product_quality_snapshot "
+                    "(merchant_id, platform, snapshot_date, details) "
+                    "VALUES ('merch_external_seed', 'external_seed', "
+                    "NOW() - INTERVAL '200 days', CAST(:dt AS json))"
+                ),
+                {"dt": json.dumps(bad)},
+            )
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 0
+
+
+def test_a_lone_store_has_slack_above_the_floor():
+    """Cap must exceed floor. A single-merchant lane whose component appears in
+    225 of its 250 recent rows is dead (history says it used to score); with a
+    200-row per-merchant window only 175 of those rows were visible and the
+    lane went silent. ORDER IS THE TEST: the 25 component-less rows are the
+    NEWEST, so a 200-row window holds 25 + 175 and misses the floor, while a
+    1,000-row window holds all 225. Inserted the other way round the window's
+    200 newest rows all carry the component and the cap mutant survives."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=1, summary_score=80.0, platform="wix", days_ago=60)
+        _seed(conn, rows=225, summary_score=0.0, platform="wix", reset=False)
+        # ...then 25 rows WITHOUT the component at all, newest of all.
+        for _ in range(25):
+            conn.execute(
+                text(
+                    "INSERT INTO product_quality_snapshot "
+                    "(merchant_id, platform, snapshot_date, details) "
+                    "VALUES ('merch_wix', 'wix', NOW(), CAST(:dt AS json))"
+                ),
+                {"dt": json.dumps({"components": [{"name": "title", "score": 100.0}]})},
+            )
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 1
+
+
 def test_the_window_is_per_lane_not_global():
     """A lane with history that goes dead is still caught even when another
     lane out-writes it by an order of magnitude — the failure mode of the

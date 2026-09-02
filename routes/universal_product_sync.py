@@ -330,13 +330,19 @@ async def universal_product_sync(
                         # force_refresh=True several times a day; unattended
                         # requests are folded into a recent job instead of
                         # rescoring an unchanged catalog every time.
-                        # ...and only the internal door can say so: the
-                        # merchant-facing endpoint parses the same body, and a
-                        # client must not be able to opt its own Sync out of
-                        # being the delivery path for its edits.
+                        # ...and only an admin caller can say so (ADMIN_ROLES,
+                        # the same set the merchant-scope check above trusts):
+                        # the merchant-facing endpoint parses the same body,
+                        # and a client must not be able to opt its own Sync
+                        # out of being the delivery path for its edits. The
+                        # isinstance guard keeps a malformed current_user from
+                        # raising INSIDE the best-effort try, which would
+                        # delete the whole readiness enqueue rather than the
+                        # dedupe.
                         unattended=(
                             bool(request.unattended)
-                            and str((current_user or {}).get("role") or "") == "admin"
+                            and isinstance(current_user, dict)
+                            and current_user.get("role") in ADMIN_ROLES
                         ),
                     )
                 except Exception as enqueue_error:  # noqa: BLE001 — best-effort

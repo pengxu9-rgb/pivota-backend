@@ -35,6 +35,35 @@ from db.product_quality_backfill_jobs import (
 _MERCHANT = "qbfdedupe_merchant"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _client_process_tz_utc():
+    """Pin the CLIENT PROCESS zone to UTC for this module, restore after.
+
+    Not part of what this file tests, and not something this PR changes: on a
+    gate database whose `requested_at` is TIMESTAMPTZ (a fresh one — prod's is
+    a naive `timestamp`), asyncpg encodes the naive `_utcnow()` the writer
+    binds using the client process zone, and `SET TIME ZONE` cannot reach
+    that. On a Los Angeles host a 1-second cooldown then never expires because
+    the row lands 7 hours in the future. That hazard predates this file (see
+    memory: a naive datetime binds with the client process tz) and is closed
+    only by the writer binding server-side; until then the local recipe runs
+    with TZ=UTC, and this makes that explicit instead of ambient."""
+    import os
+    import time
+
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = before
+        time.tzset()
+
+
 async def _reset() -> None:
     await database.execute(
         "DELETE FROM product_quality_backfill_jobs WHERE merchant_id = :m", {"m": _MERCHANT}
@@ -92,6 +121,22 @@ async def _backdate(job_id: str, hours: int) -> None:
         sql = (
             "UPDATE product_quality_backfill_jobs SET requested_at = "
             f"datetime('now', '-{int(hours)} hours') WHERE job_id = :j"
+        )
+    await database.execute(sql, {"j": job_id})
+
+
+async def _age(job_id: str, minutes: int) -> None:
+    """Move a job's requested_at INTO THE PAST relative to its stored value —
+    zone-free on both dialects because it never consults now()."""
+    if IS_POSTGRES:
+        sql = (
+            "UPDATE product_quality_backfill_jobs SET requested_at = "
+            f"requested_at - INTERVAL '{int(minutes)} minutes' WHERE job_id = :j"
+        )
+    else:
+        sql = (
+            "UPDATE product_quality_backfill_jobs SET requested_at = "
+            f"datetime(requested_at, '-{int(minutes)} minutes') WHERE job_id = :j"
         )
     await database.execute(sql, {"j": job_id})
 
@@ -226,21 +271,39 @@ async def test_an_intervening_weaker_job_does_not_hide_a_stronger_one():
     """Strength is in the WHERE, not on the newest row: gateway auto-sync
     (force_refresh) → merchant presses Sync (attended, missing-only, always
     enqueues) → next gateway auto-sync must still fold into the first job."""
-    await _auto(force_refresh=True)
-    await _auto(unattended=False, force_refresh=False, requested_by="merchant_button")
+    strong = await _auto(force_refresh=True)
+    # `_utcnow()` truncates to whole seconds, so without this the three jobs
+    # tie on requested_at and "newest" is arbitrary — the first version of
+    # this test passed against a newest-row rule for exactly that reason.
+    await _age(strong["job"]["job_id"], minutes=30)
+    weak = await _auto(unattended=False, force_refresh=False, requested_by="merchant_button")
     out = await _auto(force_refresh=True)
     assert out["enqueued"] is False
+    # ...and into the STRONG job, not the newer weak one: folding a
+    # force_refresh request into a missing-only job would lose the rescore.
+    assert out["job"]["job_id"] == strong["job"]["job_id"]
+    assert out["job"]["job_id"] != weak["job"]["job_id"]
     assert await _count() == 2
 
 
 # ---------------------------------------------------------------------------
 # Time zone. `requested_at` is written client-side as naive UTC (`_utcnow()`)
-# into a column that is a naive `timestamp` in prod and TIMESTAMPTZ on a fresh
-# gate database. The comparison must hold under EITHER declaration and ANY
-# session time zone — the first version compared the naive column to
+# into a column that is a naive `timestamp` in prod. The comparison must hold
+# under ANY session time zone — the first version compared the naive column to
 # `CURRENT_TIMESTAMP - interval`, which reinterprets stored UTC in the session
 # zone: under America/Los_Angeles the 6h cooldown became ~13h, under
 # Asia/Shanghai a brand-new job already failed it and the dedupe was a no-op.
+#
+# The matrix is over the NAIVE declaration only, switched in and restored:
+# that is prod's shape, and it is the only one a session zone can affect. A
+# TIMESTAMPTZ column compared to CURRENT_TIMESTAMP has no session-zone term,
+# so cells on it could not fail against the bug and would only re-test the
+# client-process encoding pinned by the module fixture above.
+#
+# Backdates are chosen to sit INSIDE the skew the bug produced: the "must not
+# fold" row is 10h old against a 6h cooldown, and under Los Angeles the old
+# comparison read that as ~3h old and folded it. A 20h backdate would step
+# over the bug and pass either way.
 # Postgres only: SQLite has neither session zones nor a timestamptz type.
 # ---------------------------------------------------------------------------
 
@@ -257,10 +320,9 @@ async def _with_requested_at_declared(kind: str):
 
 
 @_PG_ONLY
-@pytest.mark.parametrize("declared", ["TIMESTAMP", "TIMESTAMPTZ"])
 @pytest.mark.parametrize("zone", ["Asia/Shanghai", "America/Los_Angeles", "UTC"])
-async def test_cooldown_holds_under_any_session_zone_and_either_column_type(declared, zone):
-    before = await _with_requested_at_declared(declared)
+async def test_cooldown_holds_under_any_session_zone_on_the_naive_column(zone):
+    before = await _with_requested_at_declared("TIMESTAMP")
     try:
         async with database.connection() as conn:
             await conn.execute(f"SET TIME ZONE '{zone}'")
@@ -268,16 +330,17 @@ async def test_cooldown_holds_under_any_session_zone_and_either_column_type(decl
                 # Brand-new job: MUST fold whatever the zone (Shanghai broke this).
                 first = await _auto(cooldown_seconds=3600)
                 folded = await _auto(cooldown_seconds=3600)
-                assert folded["enqueued"] is False, (declared, zone)
-                # 20-hour-old job against a 6h cooldown: MUST NOT fold
-                # (Los Angeles broke this — the cooldown silently became ~13h).
-                await _backdate(first["job"]["job_id"], hours=20)
+                assert folded["enqueued"] is False, zone
+                # 10-hour-old job against a 6h cooldown: MUST NOT fold
+                # (Los Angeles broke this — the cooldown silently became ~13h,
+                # so a 10h-old row read as ~3h old).
+                await _backdate(first["job"]["job_id"], hours=10)
                 out = await _auto(cooldown_seconds=6 * 3600)
-                assert out["enqueued"] is True, (declared, zone)
+                assert out["enqueued"] is True, zone
                 # ...and a 5-hour-old one still does.
                 await _backdate(out["job"]["job_id"], hours=5)
                 out2 = await _auto(cooldown_seconds=6 * 3600)
-                assert out2["enqueued"] is False, (declared, zone)
+                assert out2["enqueued"] is False, zone
             finally:
                 await conn.execute("RESET TIME ZONE")
     finally:
