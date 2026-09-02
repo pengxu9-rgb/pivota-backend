@@ -381,6 +381,54 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # Multi-use partner invite links (migration 171). Production fast
+            # mode skips db/migrations/, so ensure the columns the invite-token
+            # service reads/writes (use_count, max_uses) exist at startup —
+            # otherwise list_for_partner/issue/consume 500 on the missing
+            # columns and the whole invite panel breaks.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS partner_invite_tokens
+                      ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0,
+                      ADD COLUMN IF NOT EXISTS max_uses INTEGER;
+                    """
+                )
+            )
+            # Allow 'partner_invite' in partner_send_log so the invite auto-email
+            # is recorded in "Recent sends" (migration 172). Prod fast mode skips
+            # db/migrations/, so widen the CHECK here on startup (DROP+ADD is
+            # idempotent). Without it the invite send-log INSERT violates the
+            # settlement-only template CHECK and is silently dropped.
+            await database.execute(
+                text(
+                    "ALTER TABLE IF EXISTS partner_send_log "
+                    "DROP CONSTRAINT IF EXISTS ck_partner_send_log_template;"
+                )
+            )
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS partner_send_log
+                      ADD CONSTRAINT ck_partner_send_log_template CHECK (
+                        template_id IN (
+                          'settlement_monthly',
+                          'settlement_skipped',
+                          'settlement_failed_notice',
+                          'partner_invite'
+                        )
+                      );
+                    """
+                )
+            )
+            # NOTE ON PLACEMENT: this block is deliberately NOT next to the
+            # merchant_psps ADD COLUMN statements above, which is where it
+            # naturally belongs by subject. That seam is where the sibling psp_id
+            # fix (20f4542c, migration 207) also inserts, and two independent
+            # additions at one anchor merge as a CONFLICT whose correct resolution
+            # is a UNION -- precisely the resolution someone drops a block during.
+            # Order does not matter here: the statement is self-guarding on
+            # to_regclass('orders') and touches nothing else in this function.
             # Migration 208: `orders.psp_used` must accept every provider this
             # code WRITES. Migration 006 froze the list at five names
             # ('stripe','adyen','checkout','paypal','braintree'); the code moved
@@ -438,46 +486,6 @@ async def ensure_required_schema_light() -> None:
                         )
                         NOT VALID;
                     END $$;
-                    """
-                )
-            )
-            # Multi-use partner invite links (migration 171). Production fast
-            # mode skips db/migrations/, so ensure the columns the invite-token
-            # service reads/writes (use_count, max_uses) exist at startup —
-            # otherwise list_for_partner/issue/consume 500 on the missing
-            # columns and the whole invite panel breaks.
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS partner_invite_tokens
-                      ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0,
-                      ADD COLUMN IF NOT EXISTS max_uses INTEGER;
-                    """
-                )
-            )
-            # Allow 'partner_invite' in partner_send_log so the invite auto-email
-            # is recorded in "Recent sends" (migration 172). Prod fast mode skips
-            # db/migrations/, so widen the CHECK here on startup (DROP+ADD is
-            # idempotent). Without it the invite send-log INSERT violates the
-            # settlement-only template CHECK and is silently dropped.
-            await database.execute(
-                text(
-                    "ALTER TABLE IF EXISTS partner_send_log "
-                    "DROP CONSTRAINT IF EXISTS ck_partner_send_log_template;"
-                )
-            )
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE IF EXISTS partner_send_log
-                      ADD CONSTRAINT ck_partner_send_log_template CHECK (
-                        template_id IN (
-                          'settlement_monthly',
-                          'settlement_skipped',
-                          'settlement_failed_notice',
-                          'partner_invite'
-                        )
-                      );
                     """
                 )
             )
