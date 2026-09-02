@@ -32,12 +32,18 @@ import json
 import logging
 import math
 import re
-from typing import AbstractSet, Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from services import agent_center_llm_client as llm_client
 from services.audit_delta import build_reaudit_delta, measurement_basis_between
 from services.outreach_outcomes import build_outreach_outcomes
+from services.selection_gap import (
+    build_selection_gap,
+    lost_queries_from_reports,
+    per_prompt_evidence,
+    won_queries_from_reports,
+)
 from services.prompt_basis import basis_meta_from_probe_runs, PROMPT_BASIS_VERSION
 from services.audit_facts import (
     AXIS_UNCLASSIFIED,
@@ -6281,6 +6287,57 @@ async def _winning_products_not_carried(
         out.append(entry)
     out.sort(key=lambda r: -r["times_named"])
     return out[:cap]
+
+
+async def _merchant_catalog_rows_for_selection_gap(
+    merchant_id: str, *, cap: int = 500
+) -> List[Dict[str, Any]]:
+    """C1 — the live catalog rows the selection gap matches lost queries against.
+    Best-effort (`_fetch_all_dicts` already swallows + logs); the caller emits no
+    section when this is empty rather than guessing at what the merchant sells."""
+    if not str(merchant_id or "").strip():
+        return []
+    return await _fetch_all_dicts(
+        """
+        SELECT product_key, title, brand, product_type, category,
+               category_label, category_path, tags, use_case_tags
+          FROM catalog_products
+         WHERE merchant_id = :merchant_id
+           AND sync_status = 'live'
+           AND title IS NOT NULL
+           AND title <> ''
+         ORDER BY product_key
+         LIMIT :cap
+        """,
+        {"merchant_id": str(merchant_id), "cap": int(cap)},
+    )
+
+
+async def _selection_gap_section(
+    merchant_id: str,
+    per_sku_reports: Sequence[Mapping[str, Any]],
+    *,
+    merchant_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """C1 — "products you sell × queries you lose".
+
+    Reads the merchant's catalog and joins it to the queries the audit already
+    measured: the lost side is `_failing_prompts`' output as carried on each
+    per-SKU report (consumed, never re-derived); the won side and the per-query
+    counts come from the per-prompt rows the opportunity scorer already built.
+    Returns None when there is no catalog to match against — a gap list is only
+    honest when we actually know what the merchant sells."""
+    catalog_rows = await _merchant_catalog_rows_for_selection_gap(str(merchant_id))
+    if not catalog_rows:
+        return None
+    reports = list(per_sku_reports or [])
+    return build_selection_gap(
+        catalog_rows=catalog_rows,
+        lost_queries=lost_queries_from_reports(reports),
+        won_queries=won_queries_from_reports(reports),
+        query_evidence=per_prompt_evidence(reports),
+        merchant_name=merchant_name,
+    )
 
 
 def _grounding_evidence(probe_runs: Any, cap: int = 12) -> List[Dict[str, Any]]:
@@ -13701,6 +13758,19 @@ async def run_brand_report(
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("C3 winning_products_not_carried failed", exc_info=True)
+        # C1 — the selection gap: the products the merchant SELLS crossed with
+        # the unbranded queries they LOSE ("you sell a niacinamide serum and AI
+        # never names you for 'best affordable niacinamide serum'"). A two-sided
+        # list of named queries, deliberately not a rate. Best-effort like the
+        # C3 sibling above: a failure logs and leaves the audit untouched.
+        try:
+            _selection_gap = await _selection_gap_section(
+                str(merchant_id), per_sku_reports, merchant_name=merchant_name
+            )
+            if _selection_gap is not None:
+                brand_rollup["selection_gap"] = _selection_gap
+        except Exception:  # noqa: BLE001
+            logger.warning("C1 selection_gap failed", exc_info=True)
         # Fix 3 — merchant-grade narrative assembled from the Fix 1 resolved
         # hosts + Fix 2 findability/endorsement split + verify rollup + the Fix 4
         # win-plan rollup. No fabrication: degrades to honest "not available"
