@@ -247,6 +247,15 @@ try:
     except ValueError:
         commerce_attribution_inferred_recovered_total = _existing_collector("commerce_attribution_inferred_recovered_total")
 
+    try:
+        catalog_import_task_total = Counter(
+            "catalog_import_task_total",
+            "Platform catalog import task outcomes by connector, terminal status and error category.",
+            ["connector", "status", "error_category"],
+        )
+    except ValueError:
+        catalog_import_task_total = _existing_collector("catalog_import_task_total")
+
 except Exception:  # pragma: no cover
     Counter = Gauge = Histogram = None  # type: ignore
     payment_attempt_total = None
@@ -273,6 +282,7 @@ except Exception:  # pragma: no cover
     traffic_taxonomy_diagnostics_warning_total = None
     commerce_attribution_silent_reject_total = None
     commerce_attribution_inferred_recovered_total = None
+    catalog_import_task_total = None
 
 
 def record_payment_attempt(
@@ -484,4 +494,38 @@ def record_commerce_attribution_inferred_recovered(*, merchant_id: Optional[str]
         return
     commerce_attribution_inferred_recovered_total.labels(
         merchant_id=str(merchant_id or "unknown"),
+    ).inc()
+
+
+def record_catalog_import_task(
+    *,
+    connector: Optional[str],
+    status: str,
+    error_category: Optional[str] = None,
+) -> None:
+    """Record one terminal outcome of a platform catalog import task.
+
+    jobs/catalog_import_worker emitted NO metrics at all, which is why this
+    exists. `catalog_import_drain_tick` (#1964) is dormant behind
+    CATALOG_IMPORT_DRAIN_ENABLED, and the first thing it will do when armed is
+    walk a backlog nothing has ever drained. Without a counter, the two
+    outcomes that most need a human are indistinguishable from a quiet queue:
+
+      * a spike in error_category="credentials_unavailable" — either a
+        credential-resolution outage or a cohort whose stores no longer
+        resolve (#1989);
+      * a spike in status="failed" generally, which on this path means the
+        backlog is burning down into dead rows rather than importing.
+
+    Labels are bounded by construction: `connector` comes from a small fixed
+    set of enqueue sites, `status` from the worker's three terminal states, and
+    `error_category` from the literals the retry handler assigns — so this
+    cannot become a high-cardinality series on merchant_id.
+    """
+    if catalog_import_task_total is None:
+        return
+    catalog_import_task_total.labels(
+        connector=str(connector or "unknown"),
+        status=str(status or "unknown"),
+        error_category=str(error_category or "none"),
     ).inc()

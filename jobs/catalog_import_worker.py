@@ -1611,6 +1611,39 @@ async def _process_import_task_record(task: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def _record_import_outcome(task: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Emit the terminal outcome of one import task to the metrics counter.
+
+    Called at the two ENTRY POINTS rather than inside
+    _process_import_task_record, which has a dozen return statements across five
+    exception handlers — one call site per entry point covers every path,
+    including ones added later, and cannot drift out of sync with a new branch.
+
+    Only ever called with a PROCESSED result: both call sites sit after
+    _process_import_task_record returns, and every one of its eight return paths
+    sets processed=True. The un-processed outcomes — no_pending_tasks,
+    task_not_found, task_not_ready — return earlier than this and are
+    deliberately not counted: a drain tick on an empty queue fires every 30s
+    forever, and counting those would swamp the series and make a real failure
+    rate unreadable. A `if not result.get("processed")` guard here would be
+    unreachable, so there isn't one.
+
+    Best-effort by construction: a metrics failure must never turn a successful
+    import into a failed one, so everything here is swallowed.
+    """
+    try:
+        from observability.reliability_metrics import record_catalog_import_task
+
+        counts = result.get("counts")
+        record_catalog_import_task(
+            connector=task.get("connector"),
+            status=str(result.get("status") or "unknown"),
+            error_category=(counts or {}).get("error_category") if isinstance(counts, dict) else None,
+        )
+    except Exception:  # noqa: BLE001 — observability must not break the import
+        logger.debug("Failed to record catalog import metrics", exc_info=True)
+
+
 async def process_next_import_task() -> Dict[str, Any]:
     """
     Claim and process the next ready ImportTask, if any.
@@ -1626,7 +1659,9 @@ async def process_next_import_task() -> Dict[str, Any]:
     task = await claim_next_ready_task()
     if not task:
         return {"processed": False, "reason": "no_pending_tasks"}
-    return await _process_import_task_record(task)
+    result = await _process_import_task_record(task)
+    _record_import_outcome(task, result)
+    return result
 
 
 async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
@@ -1642,7 +1677,9 @@ async def process_import_task_by_id(task_id: int) -> Dict[str, Any]:
     """
     task = await claim_ready_task_by_id(task_id)
     if task:
-        return await _process_import_task_record(task)
+        result = await _process_import_task_record(task)
+        _record_import_outcome(task, result)
+        return result
 
     # Claim failed: either the row is gone or it was not in a claimable state
     # (already running/succeeded/failed, or another runner just took it).
