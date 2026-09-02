@@ -3443,6 +3443,54 @@ async def _count_paid_merchant_order_failed_best_effort(
     return {"count": count, "available": True, "sampled": len(rows) >= 1000}
 
 
+async def _count_paid_orders_missing_merchant_order_best_effort(
+    *,
+    merchant_id: Optional[str],
+) -> Dict[str, Any]:
+    """Paid orders with no merchant-platform order, REGARDLESS of any marker.
+
+    `_count_paid_merchant_order_failed_best_effort` requires
+    `metadata -> 'merchant_order' ->> 'status' = 'paid_merchant_order_failed'`.
+    That marker is written only by `_mark_merchant_order_sync_failed_best_effort`
+    — i.e. only when the sync attempt RAN and FAILED. A
+    `background_tasks.add_task` that died with the API process (Cloud Run
+    revision swap, scale-down) writes no marker at all, so the marker-based count
+    is structurally blind to it. Measured against prod on 2026-09-01: 33 such
+    orders, of which only 4 carried the marker.
+
+    This is the count to page on. The marker-based one narrows to attempts that
+    were observed to fail, which is a strict subset.
+
+    The `platform_order_id` conjunct mirrors `_get_linked_platform_order`: an
+    order synced to WooCommerce/Wix/BigCommerce records its id in metadata and
+    leaves `shopify_order_id` empty, so counting on `shopify_order_id` alone
+    would page on orders the merchant already received.
+    """
+    if IS_POSTGRES:
+        sql = """
+            SELECT COUNT(*) AS count
+            FROM orders
+            WHERE COALESCE(is_deleted, false) = false
+              AND payment_status = 'paid'
+              AND COALESCE(shopify_order_id, '') = ''
+              AND COALESCE(metadata -> 'merchant_order' ->> 'platform_order_id', '') = ''
+        """
+        values: Dict[str, Any] = {}
+        if merchant_id:
+            sql += " AND merchant_id = :merchant_id"
+            values["merchant_id"] = merchant_id
+        result = await _count_sql_best_effort(sql, values)
+        if result.get("available"):
+            return result
+
+    try:
+        rows = await _fetch_paid_orders_missing_merchant_order(merchant_id=merchant_id, limit=1000)
+    except Exception as exc:  # noqa: BLE001
+        return {"count": None, "available": False, "error": str(exc)[:300]}
+    count = sum(1 for order in rows if not _get_linked_platform_order(order))
+    return {"count": count, "available": True, "sampled": len(rows) >= 1000}
+
+
 # ============================================================================
 # 订单创建（Agent 调用）
 # ============================================================================
@@ -4849,6 +4897,9 @@ async def get_transaction_safety_metrics(
     paid_merchant_order_failed_metric = await _count_paid_merchant_order_failed_best_effort(
         merchant_id=merchant_id,
     )
+    paid_missing_merchant_order_metric = await _count_paid_orders_missing_merchant_order_best_effort(
+        merchant_id=merchant_id,
+    )
     merchant_order_retry_success_event_metric = await _count_order_events_best_effort(
         event_type="merchant_order_retry_success",
         merchant_id=merchant_id,
@@ -4859,7 +4910,11 @@ async def get_transaction_safety_metrics(
     )
 
     metrics = {
-        # Active unresolved risk: paid Pivota orders that still lack a merchant-platform order.
+        # Active unresolved risk: paid Pivota orders that still lack a merchant-platform
+        # order. This is the complete figure — page on it.
+        "paid_missing_merchant_order_count": paid_missing_merchant_order_metric,
+        # Strict SUBSET of the above: only orders whose sync attempt ran and failed
+        # (a marker was written). Blind to a background task that died with the process.
         "paid_merchant_order_failed_count": paid_merchant_order_failed_metric,
         "paid_merchant_order_failed_active_count": dict(paid_merchant_order_failed_metric),
         # Historical event counters. These do not imply an active unresolved order.
@@ -4915,7 +4970,8 @@ async def get_transaction_safety_metrics(
         "merchant_id": merchant_id,
         "metrics": metrics,
         "alert_recommendations": {
-            "paid_merchant_order_failed_count": "page_if_greater_than_zero_for_live_merchants",
+            "paid_missing_merchant_order_count": "page_if_greater_than_zero_for_live_merchants",
+            "paid_merchant_order_failed_count": "subset_of_paid_missing_merchant_order_count_observed_failures_only_page_on_paid_missing_merchant_order_count",
             "paid_merchant_order_failed_active_count": "same_as_paid_merchant_order_failed_count_current_unresolved_risk",
             "merchant_order_retry_failed_count": "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count",
             "merchant_order_retry_failed_event_count": "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count",
@@ -4928,6 +4984,7 @@ async def get_transaction_safety_metrics(
         },
         "metric_semantics": {
             "active_unresolved_risk": [
+                "paid_missing_merchant_order_count",
                 "paid_merchant_order_failed_count",
                 "paid_merchant_order_failed_active_count",
                 "payment_capture_failed_count",
