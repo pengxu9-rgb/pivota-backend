@@ -55,6 +55,8 @@ async def test_a_caller_supplied_anchor_is_what_recall_boosts(captured_sql):
     # ...but the caller's anchor reaches the scoring SQL as a bound parameter.
     assert captured_sql["params"].get("brand_anchor_0") == "%murad%"
     assert "brand_anchor_0" in captured_sql["sql"]
+    # The boost must actually be worth something, and must reach the field that orders the page.
+    assert "THEN 180" in captured_sql["sql"]
 
 
 @pytest.mark.asyncio
@@ -81,6 +83,69 @@ async def test_an_empty_caller_anchor_is_not_a_missing_one(captured_sql):
 
 
 @pytest.mark.asyncio
+async def test_a_single_token_anchor_never_matches_the_TITLE(captured_sql):
+    """The guards that approve a token are exact-span equality tests; the boost consumes the
+    token as an UNANCHORED substring. For a 4-char brand those are different questions.
+
+    `lush` is a real catalog brand, and `category_path_prefix_for_query` correctly refuses
+    `blush` — then `%lush%` matches "Soft Pinch Liquid Blush", "Orgasm Powder Blush", "Baked
+    Blush Luminoso". At +180 that outranks exact-title (100) plus title-LIKE (90), so a
+    coincidental substring would lead the page. Identity fields only for a single token — which
+    is also exactly what the gateway post-filter matches on.
+    """
+    await svc._fetch_canonical_search_rows(
+        query="lush blush", merchant_id=None, limit=20, brand_anchor_terms=["lush"]
+    )
+    sql = captured_sql["sql"]
+    anchor_clause = sql[sql.index("brand_anchor_0") - 400 : sql.index("brand_anchor_0") + 200]
+    assert "p.brand" in anchor_clause
+    assert "p.title" not in anchor_clause, "a single-token anchor must never match the title"
+
+
+@pytest.mark.asyncio
+async def test_a_multi_token_anchor_KEEPS_the_title_clause(captured_sql):
+    """Unchanged behaviour. ANDed terms are far more selective, and the title is where a
+    two-word brand survives a missing `brand` column."""
+    await svc._fetch_canonical_search_rows(
+        query="knight unicorn blush", merchant_id=None, limit=20
+    )
+    assert captured_sql["params"].get("brand_anchor_1") == "%unicorn%"
+    # Scoped to the ANCHOR clause: `p.title` appears elsewhere in the scoring SQL, so an
+    # unscoped `"p.title" in sql` passes even when the anchor drops it — it did, and the
+    # over-correction mutant survived until this was narrowed.
+    sql = captured_sql["sql"]
+    anchor_clause = sql[sql.index("brand_anchor_0") - 400 : sql.index("brand_anchor_1") + 200]
+    assert "p.title" in anchor_clause
+
+
+@pytest.mark.asyncio
+async def test_wildcards_and_junk_terms_are_refused(captured_sql):
+    """`%` alone becomes LIKE '%%%' — true for every row — handing the whole candidate set +180
+    and flattening the ranking. Reachable from POST /v1/pivot/query, which binds the model."""
+    for junk in ["%", "_a_", "%murad%", "", "a b"]:
+        captured_sql.clear()
+        await svc._fetch_canonical_search_rows(
+            query="anything", merchant_id=None, limit=20, brand_anchor_terms=[junk]
+        )
+        assert "brand_anchor_0" not in captured_sql["params"], f"{junk!r} must be refused"
+
+
+@pytest.mark.asyncio
+async def test_the_term_list_is_bounded(captured_sql):
+    """Unbounded, 2000 terms produced a 719KB statement with 12k LIKE predicates over the
+    catalog join — a statement-timeout shaped like this service's known pool incidents."""
+    await svc._fetch_canonical_search_rows(
+        query="x", merchant_id=None, limit=20, brand_anchor_terms=[f"brand{i}" for i in range(50)]
+    )
+    bound = [k for k in captured_sql["params"] if k.startswith("brand_anchor_")]
+    assert len(bound) <= 8
+    await svc._fetch_canonical_search_rows(
+        query="x", merchant_id=None, limit=20, brand_anchor_terms=["a" * 5000]
+    )
+    assert "brand_anchor_0" not in captured_sql["params"]
+
+
+@pytest.mark.asyncio
 async def test_a_descriptor_still_never_boosts(captured_sql):
     await svc._fetch_canonical_search_rows(
         query="brightening blush", merchant_id=None, limit=20
@@ -100,6 +165,5 @@ def test_the_gateway_resolves_the_anchor_BEFORE_the_search() -> None:
     resolve_at = source.index("brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)")
     search_at = source.index("pivot_result = await search_pivot_catalog(")
     assert resolve_at < search_at, "the anchor must be resolved before the search that needs it"
-    assert "brand_anchor_terms=brand_anchor_terms or None," in source, (
-        "the resolved anchor must be threaded into the recall request"
+    assert "brand_anchor_terms=brand_anchor_terms," in source, ( "the resolved anchor must be threaded into the recall request AS RESOLVED — `or None` turns [] (no brand) into None (derive it yourself), the opposite of the documented contract"
     )

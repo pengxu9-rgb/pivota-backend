@@ -7075,7 +7075,10 @@ async def _handle_find_products_multi_via_pivot(
     pivot_result = await search_pivot_catalog(
         PivotQueryRequest(
             query=query,
-            brand_anchor_terms=brand_anchor_terms or None,
+            # The list is passed through AS RESOLVED. `or None` here would convert [] — a
+            # decision that this query has no brand — into "no opinion, derive it yourself",
+            # the exact opposite, and contradict the contract the field documents.
+            brand_anchor_terms=brand_anchor_terms,
             merchant_id=None,
             market=_pivot_market_from_payload(payload, request_metadata),
             limit=raw_limit,

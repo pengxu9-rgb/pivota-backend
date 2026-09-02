@@ -117,7 +117,10 @@ class PivotQueryRequest(BaseModel):
     # `_category_brand_anchor_terms`, so a caller that resolved a brand the recall SQL
     # could not was left post-filtering a candidate set that never contained the brand.
     # None means "decide it yourself" and preserves every other caller's behaviour.
-    brand_anchor_terms: Optional[List[str]] = None
+    # Bounded because POST /v1/pivot/query binds this model as the request body directly, and
+    # every term becomes three more LIKE predicates over the catalog join. The service clamps
+    # again — this is the outer bound, not the only one.
+    brand_anchor_terms: Optional[List[str]] = Field(default=None, max_length=8)
 
 
 class PivotPricing(BaseModel):
