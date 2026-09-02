@@ -64,12 +64,29 @@ async def _count() -> int:
     return int(row["c"])
 
 
+async def _requested_at_type() -> str:
+    row = await database.fetch_one(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'product_quality_backfill_jobs' AND column_name = 'requested_at'"
+    )
+    return str(row["data_type"])
+
+
 async def _backdate(job_id: str, hours: int) -> None:
-    """Server-side, per dialect — no client clock is bound (see #1990)."""
+    """Server-side, per dialect — no client clock is bound (see #1990).
+
+    On Postgres the written value must mean "N hours ago in UTC" under EITHER
+    column declaration: a naive column stores whatever wall clock it is handed,
+    so `CURRENT_TIMESTAMP - interval` (session zone) would store Los Angeles
+    wall clock — 7 hours further into the past than intended, which is the
+    exact skew the lookup itself is being tested against. Hand a naive column
+    UTC explicitly; hand a timestamptz column an instant."""
     if IS_POSTGRES:
+        naive = (await _requested_at_type()).startswith("timestamp without")
+        now_utc = "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')" if naive else "CURRENT_TIMESTAMP"
         sql = (
             "UPDATE product_quality_backfill_jobs SET requested_at = "
-            f"CURRENT_TIMESTAMP - INTERVAL '{int(hours)} hours' WHERE job_id = :j"
+            f"{now_utc} - INTERVAL '{int(hours)} hours' WHERE job_id = :j"
         )
     else:
         sql = (
@@ -175,7 +192,95 @@ def test_cooldown_env_parsing(monkeypatch):
 
 
 async def test_env_cooldown_is_what_the_helper_uses_when_none_is_passed(monkeypatch):
-    monkeypatch.setenv(QUALITY_BACKFILL_ENQUEUE_COOLDOWN_ENV, "3600")
+    """A 1-second cooldown from the env, then wait it out: the third call must
+    enqueue. Any positive default would fold it, so this distinguishes "reads
+    the env" from "uses some positive number" — the first version set 3600 and
+    could not tell those apart."""
+    import asyncio
+
+    monkeypatch.setenv(QUALITY_BACKFILL_ENQUEUE_COOLDOWN_ENV, "1")
     await _auto(cooldown_seconds=None)
+    folded = await _auto(cooldown_seconds=None)
+    assert folded["enqueued"] is False
+    # 2.5s, not 1.2s: `_utcnow()` truncates to whole seconds and SQLite's
+    # string comparison is inclusive at the exact second, so a 1-second window
+    # needs the clock to have moved at least two full seconds past the write.
+    await asyncio.sleep(2.5)
     out = await _auto(cooldown_seconds=None)
+    assert out["enqueued"] is True
+    assert await _count() == 2
+
+
+async def test_the_folded_job_is_the_full_row():
+    """Both paths return the same shape: a caller reading merchant_id or
+    missing_only off the folded job must not KeyError."""
+    first = await _auto()
+    second = await _auto()
+    assert second["enqueued"] is False
+    assert set(first["job"]) == set(second["job"])
+    assert second["job"]["merchant_id"] == _MERCHANT
+    assert second["job"]["platform"] == "wix"
+
+
+async def test_an_intervening_weaker_job_does_not_hide_a_stronger_one():
+    """Strength is in the WHERE, not on the newest row: gateway auto-sync
+    (force_refresh) → merchant presses Sync (attended, missing-only, always
+    enqueues) → next gateway auto-sync must still fold into the first job."""
+    await _auto(force_refresh=True)
+    await _auto(unattended=False, force_refresh=False, requested_by="merchant_button")
+    out = await _auto(force_refresh=True)
     assert out["enqueued"] is False
+    assert await _count() == 2
+
+
+# ---------------------------------------------------------------------------
+# Time zone. `requested_at` is written client-side as naive UTC (`_utcnow()`)
+# into a column that is a naive `timestamp` in prod and TIMESTAMPTZ on a fresh
+# gate database. The comparison must hold under EITHER declaration and ANY
+# session time zone — the first version compared the naive column to
+# `CURRENT_TIMESTAMP - interval`, which reinterprets stored UTC in the session
+# zone: under America/Los_Angeles the 6h cooldown became ~13h, under
+# Asia/Shanghai a brand-new job already failed it and the dedupe was a no-op.
+# Postgres only: SQLite has neither session zones nor a timestamptz type.
+# ---------------------------------------------------------------------------
+
+_PG_ONLY = pytest.mark.skipif(not IS_POSTGRES, reason="session time zones are a Postgres property")
+
+
+async def _with_requested_at_declared(kind: str):
+    """Switch `requested_at` to `kind` for the body, restore afterwards. Same
+    contract as test_quality_backfill_partial_update's helper; that file must
+    stay LAST on the ride-along list because of exactly this switch."""
+    before = await _requested_at_type()
+    await database.execute(f"ALTER TABLE product_quality_backfill_jobs ALTER COLUMN requested_at TYPE {kind}")
+    return before
+
+
+@_PG_ONLY
+@pytest.mark.parametrize("declared", ["TIMESTAMP", "TIMESTAMPTZ"])
+@pytest.mark.parametrize("zone", ["Asia/Shanghai", "America/Los_Angeles", "UTC"])
+async def test_cooldown_holds_under_any_session_zone_and_either_column_type(declared, zone):
+    before = await _with_requested_at_declared(declared)
+    try:
+        async with database.connection() as conn:
+            await conn.execute(f"SET TIME ZONE '{zone}'")
+            try:
+                # Brand-new job: MUST fold whatever the zone (Shanghai broke this).
+                first = await _auto(cooldown_seconds=3600)
+                folded = await _auto(cooldown_seconds=3600)
+                assert folded["enqueued"] is False, (declared, zone)
+                # 20-hour-old job against a 6h cooldown: MUST NOT fold
+                # (Los Angeles broke this — the cooldown silently became ~13h).
+                await _backdate(first["job"]["job_id"], hours=20)
+                out = await _auto(cooldown_seconds=6 * 3600)
+                assert out["enqueued"] is True, (declared, zone)
+                # ...and a 5-hour-old one still does.
+                await _backdate(out["job"]["job_id"], hours=5)
+                out2 = await _auto(cooldown_seconds=6 * 3600)
+                assert out2["enqueued"] is False, (declared, zone)
+            finally:
+                await conn.execute("RESET TIME ZONE")
+    finally:
+        await database.execute(
+            f"ALTER TABLE product_quality_backfill_jobs ALTER COLUMN requested_at TYPE {before.upper()}"
+        )

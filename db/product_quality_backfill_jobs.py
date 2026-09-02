@@ -193,27 +193,51 @@ DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS = 6 * 3600
 
 # Both twins are module-level constants so tests/test_repo_sql_prepare_postgres.py
 # plans the Postgres one. `CAST(:platform AS TEXT)` on both sides: asyncpg
-# cannot type a bare parameter that only appears in `IS NULL`. The interval is
-# computed on the server, like _REQUEUE_STALE_SQL — no client clock is bound.
+# cannot type a bare parameter that only appears in `IS NULL`.
+#
+# THE TIME COMPARISON IS IN EPOCH SECONDS, NOT `> CURRENT_TIMESTAMP - interval`.
+# `requested_at` is written CLIENT-side as `_utcnow()` into a column that is a
+# naive `timestamp` in prod (create_all builds it before migration 054 — see
+# tests/test_quality_backfill_partial_update.py). Comparing a naive column to
+# `CURRENT_TIMESTAMP - interval` (timestamptz) makes Postgres reinterpret the
+# stored UTC wall clock in the SESSION time zone, which nothing in this app
+# pins: under America/Los_Angeles the 6h cooldown silently became ~13h, under
+# Asia/Shanghai a brand-new job already failed the test and the dedupe was a
+# no-op (reviewed and measured on PR #2012). `EXTRACT(EPOCH FROM ...)` reads a
+# naive timestamp as UTC and a timestamptz as itself, so this is correct under
+# BOTH column declarations and any session zone. _REQUEUE_STALE_SQL does not
+# need this: it compares `started_at`, which claim_quality_backfill_job writes
+# with CURRENT_TIMESTAMP, so that column round-trips in the session zone.
+#
+# Strength is in the WHERE: the row returned is the newest job at least as
+# strong as the request (a force_refresh job satisfies any request; a
+# missing-only job satisfies only a missing-only request), so an intervening
+# weaker attended job cannot hide a stronger one.
 _RECENT_JOB_SQL = """
-    SELECT job_id, status, requested_at, force_refresh, missing_only
+    SELECT job_id
     FROM product_quality_backfill_jobs
     WHERE merchant_id = :merchant_id
       AND (CAST(:platform AS TEXT) IS NULL OR platform = CAST(:platform AS TEXT))
       AND status IN ('queued', 'running', 'completed')
-      AND requested_at > CURRENT_TIMESTAMP - (:cooldown_seconds * INTERVAL '1 second')
-    ORDER BY requested_at DESC
+      AND (force_refresh OR NOT CAST(:force_refresh AS BOOLEAN))
+      AND EXTRACT(EPOCH FROM requested_at)
+          > EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) - CAST(:cooldown_seconds AS DOUBLE PRECISION)
+    ORDER BY requested_at DESC, job_id DESC
     LIMIT 1
     """
 
+# SQLite stores `_utcnow()` as 'YYYY-MM-DD HH:MM:SS[.ffffff]' and datetime('now')
+# is UTC in the same format, so the string comparison is exact. force_refresh
+# is an INTEGER 0/1 there; `NOT :force_refresh` with a bound bool is fine.
 _RECENT_JOB_SQL_SQLITE = """
-    SELECT job_id, status, requested_at, force_refresh, missing_only
+    SELECT job_id
     FROM product_quality_backfill_jobs
     WHERE merchant_id = :merchant_id
       AND (CAST(:platform AS TEXT) IS NULL OR platform = CAST(:platform AS TEXT))
       AND status IN ('queued', 'running', 'completed')
+      AND (force_refresh OR NOT :force_refresh)
       AND requested_at > datetime('now', :cooldown_window)
-    ORDER BY requested_at DESC
+    ORDER BY requested_at DESC, job_id DESC
     LIMIT 1
     """
 
@@ -230,10 +254,14 @@ def quality_backfill_enqueue_cooldown_seconds() -> int:
         return DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS
 
 
-async def _recent_quality_backfill_job(
-    merchant_id: str, platform: Optional[str], cooldown_seconds: int
-) -> Optional[Dict[str, Any]]:
-    values = {"merchant_id": merchant_id, "platform": platform or None}
+async def _recent_quality_backfill_job_id(
+    merchant_id: str, platform: Optional[str], force_refresh: bool, cooldown_seconds: int
+) -> Optional[str]:
+    values = {
+        "merchant_id": merchant_id,
+        "platform": platform or None,
+        "force_refresh": bool(force_refresh),
+    }
     if IS_POSTGRES:
         row = await database.fetch_one(
             _RECENT_JOB_SQL, {**values, "cooldown_seconds": int(cooldown_seconds)}
@@ -243,7 +271,7 @@ async def _recent_quality_backfill_job(
             _RECENT_JOB_SQL_SQLITE,
             {**values, "cooldown_window": f"-{int(cooldown_seconds)} seconds"},
         )
-    return dict(row) if row is not None else None
+    return str(row["job_id"]) if row is not None else None
 
 
 async def enqueue_quality_backfill_if_needed(
@@ -258,9 +286,10 @@ async def enqueue_quality_backfill_if_needed(
 ) -> Dict[str, Any]:
     """Enqueue a backfill unless an unattended request would only repeat one.
 
-    Returns {"job", "enqueued", "reason"}. `job` is the created job, or the
-    recent job the request was folded into. Attended requests (unattended=False)
-    always enqueue, exactly as create_quality_backfill_job did.
+    Returns {"job", "enqueued", "reason"}. `job` is the full job row on BOTH
+    paths: the created job, or the recent job the request was folded into.
+    Attended requests (unattended=False) always enqueue, exactly as
+    create_quality_backfill_job did.
     """
     await ensure_product_quality_backfill_jobs_table()
     seconds = (
@@ -269,13 +298,24 @@ async def enqueue_quality_backfill_if_needed(
         else max(0, int(cooldown_seconds))
     )
     if unattended and seconds > 0:
-        recent = await _recent_quality_backfill_job(merchant_id, platform, seconds)
-        if recent is not None and (bool(recent.get("force_refresh")) or not force_refresh):
-            return {
-                "job": _normalize_row(recent) or recent,
-                "enqueued": False,
-                "reason": "recent_job_within_cooldown",
-            }
+        recent_id = await _recent_quality_backfill_job_id(
+            merchant_id, platform, bool(force_refresh), seconds
+        )
+        if recent_id is not None:
+            recent = await get_quality_backfill_job(recent_id)
+            if recent is not None:
+                # Not silent: an operator who curls the internal sync API to
+                # force a rescore needs to be able to read that it was folded.
+                logger.info(
+                    "quality backfill enqueue folded into recent job %s "
+                    "(merchant=%s platform=%s requested_by=%s cooldown=%ss)",
+                    recent_id, merchant_id, platform, requested_by, seconds,
+                )
+                return {
+                    "job": recent,
+                    "enqueued": False,
+                    "reason": "recent_job_within_cooldown",
+                }
     job = await create_quality_backfill_job(
         merchant_id=merchant_id,
         platform=platform,

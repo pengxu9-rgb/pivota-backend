@@ -91,6 +91,7 @@ def _seed(
     description_score: float = 100.0,
     attributes_score: float = 100.0,
     platform: str = "external_seed",
+    merchant: str | None = None,
     days_ago: int = 0,
     reset: bool = True,
 ):
@@ -115,7 +116,8 @@ def _seed(
                 "(merchant_id, platform, snapshot_date, details) "
                 "VALUES (:m, :p, NOW() - make_interval(days => :d), CAST(:dt AS json))"
             ),
-            {"m": f"merch_{platform}", "p": platform, "d": int(days_ago), "dt": json.dumps(details)},
+            {"m": merchant or f"merch_{platform}", "p": platform, "d": int(days_ago),
+             "dt": json.dumps(details)},
         )
 
 
@@ -180,6 +182,81 @@ def test_another_lanes_history_does_not_make_this_lanes_zero_a_death():
         count = conn.execute(text(chk["count_sql"])).scalar()
     eng.dispose()
     assert count == 0
+
+
+def test_one_chatty_merchant_cannot_convict_its_lane():
+    """The window is per (platform, merchant), not per platform. A Wix store
+    rescored 2,500 times with `summary` at zero must not read as "wix:summary
+    is dead" while another Wix merchant is scoring it 90 right now — and that
+    healthier merchant's rows are exactly what would otherwise satisfy the
+    history EXISTS. Healthy rows go in FIRST (lower ids), chatty rows on top."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=300, summary_score=90.0, platform="wix", merchant="wix_healthy")
+        _seed(conn, rows=2500, summary_score=0.0, platform="wix", merchant="wix_chatty",
+              reset=False)
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 0
+
+
+def test_a_lane_dead_across_every_merchant_is_still_caught():
+    """The verdict grain is the LANE: two merchants both at zero on a component
+    the lane used to produce is the outage, and each contributes to the >=200
+    floor."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=1, summary_score=80.0, platform="wix", merchant="wix_a", days_ago=60)
+        _seed(conn, rows=120, summary_score=0.0, platform="wix", merchant="wix_a", reset=False)
+        _seed(conn, rows=120, summary_score=0.0, platform="wix", merchant="wix_b", reset=False)
+        count = conn.execute(text(chk["count_sql"])).scalar()
+        names = [r[0] for r in conn.execute(text(chk["sample_sql"])).fetchall()]
+    eng.dispose()
+    assert count == 1
+    assert names == ["wix:summary"]
+
+
+def test_malformed_historical_details_cannot_cost_the_check_its_verdict():
+    """The history EXISTS reads the platform's whole history, so one old row
+    with a non-numeric score or a non-array `components` used to raise — and a
+    check that raises reports {"error": ...} instead of a verdict, the failure
+    mode #2007 exists to stop. Such rows must count as nothing, not as an
+    exception."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=1, summary_score=80.0, days_ago=60)
+        _seed(conn, rows=250, summary_score=0.0, reset=False)
+        for bad in (
+            {"components": [{"name": "summary", "score": "n/a"}]},
+            {"components": [{"name": "summary", "score": True}]},
+            {"components": {"summary": 1}},
+            "just a string",
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO product_quality_snapshot "
+                    "(merchant_id, platform, snapshot_date, details) "
+                    "VALUES ('merch_external_seed', 'external_seed', "
+                    "NOW() - INTERVAL '200 days', CAST(:dt AS json))"
+                ),
+                {"dt": json.dumps(bad)},
+            )
+        count = conn.execute(text(chk["count_sql"])).scalar()
+        names = [r[0] for r in conn.execute(text(chk["sample_sql"])).fetchall()]
+    eng.dispose()
+    # The malformed rows are neither evidence of life ("n/a" is not > 0) nor a
+    # crash: the genuinely dead component is still reported.
+    assert count == 1
+    assert names == ["external_seed:summary"]
 
 
 def test_the_window_is_per_lane_not_global():

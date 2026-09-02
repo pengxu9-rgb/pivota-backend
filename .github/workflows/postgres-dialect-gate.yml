@@ -283,10 +283,14 @@ jobs:
           # (`skipif(not IS_POSTGRES)`, on cases about asyncpg's datetime
           # encoding), inert here because IS_POSTGRES is true — the preflight
           # asserts that — so the zero-skip check below still holds.
-          # KEEP THIS ENTRY LAST: one of those cases ALTERs the timestamp columns
-          # of product_quality_backfill_jobs and restores them, so a ride-along
-          # added after it would run while that switch is in flight.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_partial_update.py tests/test_quality_backfill_enqueue_dedupe.py; do
+          # KEEP test_quality_backfill_partial_update.py LAST: one of its cases
+          # ALTERs the timestamp columns of product_quality_backfill_jobs and
+          # restores them, so a ride-along added after it would run while that
+          # switch is in flight. test_quality_backfill_enqueue_dedupe.py rides
+          # along for the same reason it exists: the cooldown lookup has a
+          # Postgres twin that is different text from the SQLite one, and its
+          # time-zone cases can only fail here.
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_enqueue_dedupe.py tests/test_quality_backfill_partial_update.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"

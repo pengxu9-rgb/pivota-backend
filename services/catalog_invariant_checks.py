@@ -494,26 +494,42 @@ async def _run_market_currency_disagreement(db: Any) -> Dict[str, Any]:
 # nothing else. Corpus-wide the predicate change flipped 2,051 rows to
 # renderable and ZERO rows away from it.
 # ── dead_quality_component ────────────────────────────────────────────────────
-# Shared CTE body. `recent` is the most recent 2,000 snapshots PER platform in
-# the last 30 days; `dead` is every (platform, component) with >=200 recent rows
-# and a zero maximum; the EXISTS keeps only pairs the lane has scored above zero
-# at some point (short-circuits on the first non-zero row). See the check.
+# Shared CTE body. `recent` is the most recent 200 snapshots of EACH
+# (platform, merchant) in the last 30 days — bounding a single chatty store's
+# share of its lane's window (one 20-product Wix store rescored 20-320 rows a
+# day owned the whole `wix` window on 2026-09-01; with a platform-only window
+# it would go on owning it, and its zeros would convict the lane while a
+# healthier Wix merchant's own rows supplied the "history" that convicts it).
+# `dead` is every (platform, component) with >=200 windowed rows and a zero
+# maximum; the EXISTS keeps only pairs the lane has scored above zero at some
+# point (short-circuits on the first non-zero row). The verdict grain stays the
+# LANE — a component that is zero for every merchant of a platform that used
+# to produce it is the outage; one merchant's zero among scoring peers is not.
+#
+# `jsonb_typeof` guards: the EXISTS reads the platform's whole history, so one
+# old row with `score: "n/a"` or `components` as an object would raise and cost
+# the check its verdict — the failure mode #2007 exists to stop. A non-numeric
+# score counts as 0 (not evidence of life); a non-array `components` is skipped.
 _DEAD_COMPONENT_CTE = """
     WITH recent AS (
         SELECT platform, details
         FROM (
             SELECT platform, details,
-                   ROW_NUMBER() OVER (PARTITION BY platform ORDER BY id DESC) AS rn
+                   ROW_NUMBER() OVER (
+                       PARTITION BY platform, merchant_id ORDER BY id DESC
+                   ) AS rn
             FROM product_quality_snapshot
             WHERE snapshot_date > NOW() - INTERVAL '30 days'
               AND details IS NOT NULL
+              AND jsonb_typeof((details::jsonb) -> 'components') = 'array'
         ) windowed
-        WHERE rn <= 2000
+        WHERE rn <= 200
     ),
     comps AS (
         SELECT platform,
                c->>'name' AS name,
-               COALESCE((c->>'score')::float, 0) AS score
+               CASE WHEN jsonb_typeof(c->'score') = 'number'
+                    THEN (c->>'score')::float ELSE 0 END AS score
         FROM recent,
              LATERAL jsonb_array_elements(
                  (details::jsonb) -> 'components'
@@ -536,8 +552,10 @@ _DEAD_COMPONENT_CTE = """
                  ) AS hc
             WHERE h.platform = d.platform
               AND h.details IS NOT NULL
+              AND jsonb_typeof((h.details::jsonb) -> 'components') = 'array'
               AND hc->>'name' = d.name
-              AND COALESCE((hc->>'score')::float, 0) > 0
+              AND jsonb_typeof(hc->'score') = 'number'
+              AND (hc->>'score')::float > 0
         )
     )
 """
@@ -1261,13 +1279,14 @@ _CHECKS: List[Dict[str, Any]] = [
         # seed lane scores non-zero on 3,529 of 17,036 rows but the merchant-sync
         # lanes cannot score at all (no seed data, no size/usage keys). That is
         # not a dead component; it is one lane's structural zero read as the
-        # corpus. So the window is now the most recent 2,000 snapshots OF EACH
-        # `platform`, and a (lane, component) pair only counts as dead when that
-        # lane has scored the component above zero at some point. A lane that
+        # corpus. So the window is now the most recent 200 snapshots OF EACH
+        # (platform, merchant), and a (lane, component) pair only counts as dead
+        # when that lane has scored the component above zero at some point
+        # (see _DEAD_COMPONENT_CTE for why the window is per merchant). A lane that
         # has never produced a component is a scorer-design question
         # (what does `attributes` mean for a Shopify product?), not an outage.
         "default_threshold": 0,
-        # Requires a real sample (>=200 recent rows in the lane) so a quiet
+        # Requires a real sample (>=200 windowed rows in the lane) so a quiet
         # period cannot manufacture a violation out of two rows.
         "count_sql": _DEAD_COMPONENT_COUNT_SQL,
         "sample_sql": _DEAD_COMPONENT_SAMPLE_SQL,

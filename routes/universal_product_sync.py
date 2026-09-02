@@ -38,6 +38,7 @@ class UniversalSyncRequest(BaseModel):
     # True for syncs no person is waiting on (the gateway's catalog auto-sync
     # via routes/platform_products_sync_api). Only these are subject to the
     # quality-backfill enqueue cooldown; a merchant's own Sync always enqueues.
+    # Honoured only when the caller is the admin/internal role — see the hook.
     unattended: bool = False
     # Optional platform hint: shopify, wix, woocommerce, etc.
     # When provided, we will try to sync that specific platform first.
@@ -329,7 +330,14 @@ async def universal_product_sync(
                         # force_refresh=True several times a day; unattended
                         # requests are folded into a recent job instead of
                         # rescoring an unchanged catalog every time.
-                        unattended=bool(request.unattended),
+                        # ...and only the internal door can say so: the
+                        # merchant-facing endpoint parses the same body, and a
+                        # client must not be able to opt its own Sync out of
+                        # being the delivery path for its edits.
+                        unattended=(
+                            bool(request.unattended)
+                            and str((current_user or {}).get("role") or "") == "admin"
+                        ),
                     )
                 except Exception as enqueue_error:  # noqa: BLE001 — best-effort
                     logger.warning(
