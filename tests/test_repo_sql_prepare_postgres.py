@@ -269,7 +269,26 @@ def _is_known_unplannable(label: str, message: str, sql: str) -> bool:
 # Known escapes, measured: a CTE (`WITH c AS (...)`) contributes `c`; a statement
 # with no FROM at all yields an empty `named` and is excluded by the `named and`
 # guard in the classifier. Each is a statement this gate does not column-check.
-_NOT_A_TABLE = frozenset({"lateral", "only", "unnest", "select"})
+#
+# `set` earns its place here for a reason worth spelling out, because it is the
+# over-inclusion hazard above happening for real rather than in principle. The
+# regex below matches `UPDATE` — and an upsert's conflict arm reads
+# `ON CONFLICT (...) DO UPDATE SET col = ...`, so `UPDATE\s+SET` captured the
+# literal token `set` as a table name. `set` is in no schema, so `named` could
+# never be a subset of `faithful`, so EVERY upsert in the repo was quietly
+# demoted out of the wrong-column check: measured, 83 of the collected
+# statements. The demotion is invisible — a masked statement is reported as
+# "unchecked (fixture gap)", which reads like a missing table rather than a
+# check that switched itself off.
+#
+# Nothing in the current corpus was hiding behind it (measured: adding `set`
+# moves neither the planned nor the unchecked count), so this is a preventive
+# fix — but it is not hypothetical. The upsert in
+# routes/admin_protocol_sync.py, which INSERTs `from_currency, to_currency,
+# rate` into a table whose real shape is a `base_currency` + `rates` jsonb
+# snapshot, is masked by exactly this token the moment the collector can resolve
+# it, and it is a statement that cannot ever have run.
+_NOT_A_TABLE = frozenset({"lateral", "only", "unnest", "select", "set"})
 
 _TABLE_REF_RE = re.compile(
     # The leading quote is load-bearing: `FROM "catalog_products"` matched ZERO
@@ -1088,9 +1107,40 @@ def test_no_declared_column_is_parse_debris() -> None:
     ("SELECT 1 FROM a JOIN LATERAL (SELECT 1) s ON true", {"a"}),
     # a FROM inside a string literal must not be scanned
     ("SELECT 1 FROM a WHERE x = 'FROM zzz'", {"a"}),
+    # `DO UPDATE SET` is an upsert's conflict arm, not a reference to a table
+    # called `set`. Capturing it exempted all 83 upserts in the repo from the
+    # wrong-column check — see the note on _NOT_A_TABLE.
+    ("INSERT INTO a (x) VALUES (1) ON CONFLICT (x) DO UPDATE SET y = 2", {"a"}),
+    # the same statement joined to another table still reports that table, so
+    # the exclusion is not swallowing real references
+    ("INSERT INTO a (x) SELECT x FROM b ON CONFLICT (x) DO UPDATE SET y = 2",
+     {"a", "b"}),
+    # a plain UPDATE is unaffected — `set` is excluded, `agent_wallets` is not
+    ("UPDATE agent_wallets SET status = :s WHERE id = :i", {"agent_wallets"}),
 ])
 def test_table_reference_extraction(sql: str, expected: set) -> None:
     assert _tables_named_in(sql) == expected
+
+
+def test_an_upsert_is_column_checked_rather_than_written_off() -> None:
+    """The property the `set` exclusion buys, stated as the gate states it.
+
+    The classifier only calls a column error REAL when every name the statement
+    mentions is a table the fixture built faithfully. While `set` was captured,
+    an upsert's `named` always carried a token no schema can contain, so that
+    subset test could never hold and the statement was filed as a fixture gap.
+    This asserts the outcome directly rather than the token list, so it keeps
+    holding if the exclusion is later implemented some other way.
+    """
+    upsert = (
+        "INSERT INTO agent_wallets (wallet_id, status) VALUES (:w, :s) "
+        "ON CONFLICT (wallet_id) DO UPDATE SET status = :s"
+    )
+    named = _tables_named_in(upsert)
+    assert named == {"agent_wallets"}
+    # ...and that IS a subset of a plausible faithful set, which is the whole
+    # point: before the fix, `{"agent_wallets", "set"}` never could be.
+    assert named <= {"agent_wallets", "merchant_wallets"}
 
 
 def test_a_cte_name_is_still_mistaken_for_a_table() -> None:
