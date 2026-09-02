@@ -45,9 +45,46 @@ class WalletBalanceUpdate(BaseModel):
     reason: Optional[str] = Field(None, description="Reason for update")
 
 
+# The ONLY values merchant_wallets.status and agent_wallets.status can hold.
+#
+# Not a style choice — db/migrations/022_wallet_infrastructure.sql declares
+#   status VARCHAR(20) CHECK (status IN ('pending', 'active', 'inactive'))
+# on BOTH tables, so anything else is rejected by the database, not merely
+# unusual. These two endpoints used to accept ("active", "suspended", "closed"),
+# which meant two of their three documented values could not be written at all,
+# while `inactive` — which the column does allow — was refused with a 400.
+#
+# THERE WERE TWO VALID FIXES and this is the lower-risk one, not the only one.
+# Widening the CHECK to admit 'suspended' is a shape this repo already uses:
+# db/migrations/108_channel_partners.sql declares a four-value status CHECK
+# including 'suspended', mirrored by `_PARTNER_STATUSES` in
+# routes/admin_partners.py. Converging on the database was chosen because
+# nothing reads a suspended or closed wallet, and shipping an ALTER against a
+# live table to support a state no code consumes is the more speculative change.
+#
+# What makes converging cheap here is that this file already agreed with the
+# database everywhere else: the wallet-stats endpoint below counts `active`,
+# `pending` and `inactive`, so a wallet set to "suspended" would not have
+# appeared in ANY of its three buckets even if the write had succeeded, and
+# services/wallet_service.py reads only `status = 'active'`. Neither word appears
+# anywhere else in the WALLET lane — they are common elsewhere in the repo, which
+# is the point above.
+#
+# Mapping for anyone who was relying on the old words. "suspended" is `inactive`,
+# and that one is exact: every non-active value denies identically, because
+# `status = 'active'` is the only read. "closed" is NOT exact — the nearest thing
+# is the DELETE endpoint on this router, which removes the row rather than
+# marking it terminal, and `wallet_verification_logs.wallet_id` carries no
+# foreign key, so its audit rows survive as orphans. If a durable closed state is
+# ever wanted, widen the CHECK; do not reach for DELETE.
+_WALLET_STATUSES = ("active", "inactive", "pending")
+
+
 class WalletStatusUpdate(BaseModel):
     """Update wallet status"""
-    status: str = Field(..., description="New status (active, suspended, closed)")
+    # Matches the CHECK on merchant_wallets.status / agent_wallets.status in
+    # db/migrations/022_wallet_infrastructure.sql. See the note on the validators.
+    status: str = Field(..., description="New status (active, inactive, pending)")
     reason: Optional[str] = Field(None, description="Reason for status change")
 
 
@@ -260,10 +297,10 @@ async def update_merchant_wallet_status(
     
     Admin only - no authentication implemented yet
     """
-    if status_update.status not in ["active", "suspended", "closed"]:
+    if status_update.status not in _WALLET_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid status. Must be: active, suspended, or closed"
+            detail=f"Invalid status. Must be one of: {', '.join(sorted(_WALLET_STATUSES))}"
         )
     
     update_query = """
@@ -533,10 +570,10 @@ async def update_agent_wallet_status(
     
     Admin only - no authentication implemented yet
     """
-    if status_update.status not in ["active", "suspended", "closed"]:
+    if status_update.status not in _WALLET_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid status. Must be: active, suspended, or closed"
+            detail=f"Invalid status. Must be one of: {', '.join(sorted(_WALLET_STATUSES))}"
         )
     
     update_query = """
