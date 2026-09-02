@@ -168,6 +168,10 @@ _JOB_RUN_DEADLINES = {
     # than stranded.
     "merchant_order_sync_worker_tick": 280,
     "merchant_order_sync_lease_reaper": 120,
+    # Two COUNT(*)s over `orders` plus a bounded listing.
+    "merchant_order_gap_alert": 300,
+    # A bounded SELECT plus one INSERT per lost enqueue; no platform calls.
+    "merchant_order_create_reconcile": 300,
 }
 
 
@@ -1049,6 +1053,44 @@ async def start_scheduler() -> None:
             max_instances=1,
         )
 
+        # Makes `paid_missing_merchant_order_count` an actual signal. It has
+        # carried `page_if_greater_than_zero_for_live_merchants` since #1967
+        # while being served only by an admin pull that nothing scrapes — and
+        # the durable-queue work leaned on it three times as the standing trace
+        # for a create that cannot be retried. Read-only, so not flag-gated.
+        from services.merchant_order_gap_alert import run_merchant_order_gap_alert_tick
+        _add_job(
+            run_merchant_order_gap_alert_tick,
+            "interval",
+            seconds=900,
+            id="merchant_order_gap_alert",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
+        # Repairs orders whose merchant-order create was never QUEUED — an
+        # enqueue lost to a DB failure, or an order predating the queue. It
+        # ENQUEUES rather than creating, and skips any order that already has a
+        # create job in any state, so it cannot re-attempt work the queue owns.
+        #
+        # Flag-gated anyway: it writes on the money path, staging shares the
+        # prod Postgres, and its first prod run will pick up the pre-queue
+        # backlog. Arm it deliberately after a `--dry-run` has sized that.
+        from jobs.agentic_commerce_reconciliation import (
+            run_merchant_order_create_reconcile_tick,
+        )
+        _add_job(
+            run_merchant_order_create_reconcile_tick,
+            "interval",
+            seconds=900,
+            id="merchant_order_create_reconcile",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=120,
+        )
+
         # ADR-010 D-2 Phase B: weekly catalog identity-reconcile sweep —
         # classify -> propose -> auto-apply ONLY the mechanical allowlist
         # (same_url_dup, junk_url) -> review batches for the rest -> alert
@@ -1136,6 +1178,9 @@ async def start_scheduler() -> None:
             "+ payment_reconcile_tick (5min, flag-gated PAYMENT_RECONCILE_SWEEP_ENABLED) "
             "+ merchant_order_sync_worker_tick (30s, ACTIVE) "
             "+ merchant_order_sync_lease_reaper (60s, ACTIVE) "
+            "+ merchant_order_gap_alert (15min, ACTIVE) "
+            "+ merchant_order_create_reconcile (15min, flag-gated "
+            "MERCHANT_ORDER_CREATE_RECONCILE_ENABLED) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP) "
             # Both listed so a mistyped kill switch is not indistinguishable from
             # a working one: the drain resolves its flag per-run and returns

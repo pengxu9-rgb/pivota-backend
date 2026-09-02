@@ -93,7 +93,39 @@ async def reconcile_paid_orders_missing_merchant_order(
     min_age_seconds: int,
     dry_run: bool,
 ) -> Dict[str, Any]:
-    from routes.order_routes import create_shopify_order
+    """Repair orders whose merchant-order create was never QUEUED.
+
+    This used to call `create_shopify_order` directly on every candidate. That
+    was safe only because it ran by hand: on a schedule it re-POSTs, and the
+    create is not remotely idempotent on WooCommerce, Wix or BigCommerce — none
+    of them looks for an existing order first. An order whose create partially
+    landed (a real Wix order written, the link write timing out) matches this
+    query forever, so every tick would have made another merchant order and
+    another shipment for the same buyer.
+
+    So it now ENQUEUES onto the durable queue instead of creating, and only for
+    orders that have no create job at all. That confines it to exactly the gap
+    it exists for — an enqueue that was lost — and inherits the queue's
+    at-most-once guarantee.
+
+    An order whose job already ran is not re-attempted here, whatever the
+    outcome — and note that includes a job marked `done` on the contended-lock
+    path, where the handler returns `create_in_progress_elsewhere` having
+    created nothing. If that lock holder then died, the order sits outside this
+    lane permanently. It stays visible through
+    `paid_missing_merchant_order_count`, and the ops retry endpoint repairs it
+    by calling `sync_order_to_connected_store` directly. A `failed` job is the
+    same story. Neither is re-attempted automatically, because retrying a
+    create on a platform that cannot dedupe it is the duplicate-order problem.
+    """
+    from db.merchant_order_sync_jobs import (
+        OP_MERCHANT_ORDER_CREATE,
+        MERCHANT_ORDER_CREATE_DEDUPE_KEY,
+        ensure_merchant_order_sync_jobs_table,
+        enqueue_merchant_order_create,
+    )
+
+    await ensure_merchant_order_sync_jobs_table()
 
     cutoff = datetime.utcnow() - timedelta(seconds=int(min_age_seconds))
     merchant_clause = "AND merchant_id = :merchant_id" if merchant_id else ""
@@ -101,19 +133,38 @@ async def reconcile_paid_orders_missing_merchant_order(
     # this dict straight to text().bindparams(), which raises ArgumentError for
     # a parameter the query never declared — and the scheduled caller always
     # passes merchant_id=None, so an unconditional bind fails every real run.
-    values: Dict[str, Any] = {"cutoff": cutoff, "limit": int(limit)}
+    values: Dict[str, Any] = {
+        "cutoff": cutoff,
+        "limit": int(limit),
+        "op": OP_MERCHANT_ORDER_CREATE,
+        "dedupe_key": MERCHANT_ORDER_CREATE_DEDUPE_KEY,
+    }
     if merchant_id:
         values["merchant_id"] = merchant_id
     rows = await database.fetch_all(
         f"""
-        SELECT order_id
+        SELECT order_id, merchant_id
         FROM orders
-        WHERE is_deleted = false
+        WHERE COALESCE(is_deleted, false) = false
           AND payment_status = 'paid'
           AND (shopify_order_id IS NULL OR shopify_order_id = '')
+          -- A WooCommerce/Wix/BigCommerce order records its id in metadata and
+          -- leaves shopify_order_id empty, so without this every successfully
+          -- delivered non-Shopify order matched this query forever.
+          AND COALESCE(metadata -> 'merchant_order' ->> 'platform_order_id', '') = ''
           AND (
             (paid_at IS NOT NULL AND paid_at <= :cutoff)
             OR (paid_at IS NULL AND created_at <= :cutoff)
+          )
+          -- Only orders the queue has never been told about. A job in ANY state
+          -- means the queue owns this order; re-enqueuing would revive it for
+          -- another attempt on every tick, which is the amplification this
+          -- lane must not reintroduce.
+          AND NOT EXISTS (
+            SELECT 1 FROM merchant_order_sync_jobs j
+             WHERE j.order_id = orders.order_id
+               AND j.op = :op
+               AND j.dedupe_key = :dedupe_key
           )
           {merchant_clause}
         ORDER BY created_at ASC
@@ -121,27 +172,40 @@ async def reconcile_paid_orders_missing_merchant_order(
         """,
         values,
     )
-    order_ids = [str(dict(row).get("order_id") or "") for row in rows or []]
-    order_ids = [order_id for order_id in order_ids if order_id]
+    candidates = [
+        (str(d.get("order_id") or ""), str(d.get("merchant_id") or ""))
+        for d in (dict(r) for r in rows or [])
+    ]
+    candidates = [c for c in candidates if c[0]]
+    order_ids = [c[0] for c in candidates]
     if dry_run:
         return {"dry_run": True, "candidates": order_ids, "count": len(order_ids)}
 
-    succeeded: List[str] = []
+    queued: List[str] = []
     failed: List[Dict[str, str]] = []
-    for order_id in order_ids:
+    for order_id, order_merchant_id in candidates:
         try:
-            ok = await create_shopify_order(order_id)
-            if ok:
-                succeeded.append(order_id)
+            job_id = await enqueue_merchant_order_create(
+                order_id=order_id, merchant_id=order_merchant_id
+            )
+            if job_id:
+                queued.append(order_id)
+                logger.warning(
+                    "agentic_commerce_reconciliation: order %s was paid with no "
+                    "merchant order and no create job — the enqueue was lost; "
+                    "queued as %s",
+                    order_id,
+                    job_id,
+                )
             else:
-                failed.append({"order_id": order_id, "error": "create_shopify_order returned false"})
+                failed.append({"order_id": order_id, "error": "enqueue returned None"})
         except Exception as exc:
             failed.append({"order_id": order_id, "error": f"{type(exc).__name__}: {str(exc)}"})
 
     return {
         "dry_run": False,
         "attempted": len(order_ids),
-        "succeeded": len(succeeded),
+        "queued": len(queued),
         "failed": len(failed),
         "failed_orders": failed[:50],
     }
@@ -225,3 +289,31 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _create_reconcile_enabled() -> bool:
+    """OFF by default. This lane enqueues merchant-order creates on the money
+    path, staging shares the prod Postgres, and its first prod run will pick up
+    every pre-queue order that never got one — so it is armed deliberately,
+    after a `--dry-run` has sized that backlog."""
+    return str(
+        os.getenv("MERCHANT_ORDER_CREATE_RECONCILE_ENABLED", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def run_merchant_order_create_reconcile_tick() -> Dict[str, Any]:
+    """Scheduler entrypoint. Best-effort; never raises."""
+    if not _create_reconcile_enabled():
+        return {"status": "disabled"}
+    try:
+        return await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=None,
+            limit=50,
+            min_age_seconds=600,
+            dry_run=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "merchant_order_create_reconcile: tick failed: %s", str(exc)[:300]
+        )
+        return {"status": "error", "error": str(exc)[:300]}
