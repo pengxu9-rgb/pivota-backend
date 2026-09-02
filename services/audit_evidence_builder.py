@@ -963,7 +963,10 @@ async def record_audit_basis(
     (db/audit_basis.record_basis), so a worker reclaim after a crash re-enters
     this path safely.
     """
-    if not audit_run_id or not merchant_id:
+    # audit_run_id is only needed to WRITE. The comparability path builds the
+    # current run's basis before that run has an id to write under, and passes
+    # "" deliberately — gating on it there made this whole feature inert.
+    if not merchant_id or (persist and not audit_run_id):
         return None
     from db.audit_basis import METHODOLOGY_VERSION, record_basis
     from db.merchant_official_domains import is_excluded, list_official_domains
@@ -1006,6 +1009,14 @@ async def record_audit_basis(
             language = locale
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning("record_audit_basis: locale read failed: %s", str(exc)[:200])
+
+    # Normalise EXACTLY as db.audit_basis.record_basis does before storing.
+    # It writes sorted({lower(strip(d))}); this path returned the raw
+    # list_official_domains order, which has no ORDER BY. Comparing the two
+    # shapes made a run non-comparable with ITSELF, so every multi-domain
+    # merchant would have been told their basis changed on every re-audit —
+    # the same defect as the one being fixed, pointing the other way.
+    domains = sorted({str(d).strip().lower() for d in domains if str(d).strip()})
 
     payload = {
         "providers_and_models": build_providers_and_models(brand_report),

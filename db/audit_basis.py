@@ -397,6 +397,16 @@ def _normalized_component(field: str, basis: Mapping[str, Any]) -> Any:
     return out
 
 
+def _order_insensitive(value: Any) -> Any:
+    """A recorded SET must not compare unequal because two writers emitted it in
+    different orders. official_domains is a set by meaning — db.audit_basis
+    stores it sorted, and any caller building the payload in memory must not be
+    able to reintroduce the skew by handing over raw row order."""
+    if isinstance(value, list):
+        return sorted(str(v) for v in value)
+    return value
+
+
 # Components whose ABSENCE cannot support a comparability claim. market/
 # language/currency are excluded: a legitimately unset locale is a real,
 # equal state on both sides, not missing evidence.
@@ -436,8 +446,8 @@ def bases_are_comparable(
     if not isinstance(a, Mapping) or not isinstance(b, Mapping):
         return False
     for field in COMPARABILITY_FIELDS:
-        left = _normalized_component(field, a)
-        right = _normalized_component(field, b)
+        left = _order_insensitive(_normalized_component(field, a))
+        right = _order_insensitive(_normalized_component(field, b))
         if left != right:
             return False
         # Review: two bases that are BOTH missing a component used to compare

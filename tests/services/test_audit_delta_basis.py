@@ -139,7 +139,11 @@ async def test_the_caller_supplies_both_bases(monkeypatch):
             "the CURRENT run's basis must be built in memory — its row is "
             "written later, by the worker, so a read would always be None"
         )
-        return {"methodology_version": "1", "providers_and_models": {}}
+        return {
+            "methodology_version": "1",
+            "providers_and_models": {"gemini": {"model_id": "g"}},
+            "selected_set_id": "sel_current",
+        }
 
     import db.audit_basis as ab
     import services.audit_evidence_builder as eb
@@ -147,7 +151,12 @@ async def test_the_caller_supplies_both_bases(monkeypatch):
     monkeypatch.setattr(eb, "record_audit_basis", _build)
 
     current, prior = await acbd._basis_pair_for_delta({}, "m1", "prior-run")
-    assert current is not None and prior is prior_row
+    assert prior is prior_row
+    # Distinguishable on purpose: a mutant returning (prior, prior) — comparing
+    # the prior run against ITSELF, so `same` is always True and the feature is
+    # inert — satisfied the old `current is not None` assertion.
+    assert current is not prior_row
+    assert current["selected_set_id"] == "sel_current"
 
 
 async def test_a_prior_run_with_no_basis_falls_through(monkeypatch):
@@ -174,3 +183,104 @@ async def test_a_basis_lookup_failure_never_sinks_the_audit(monkeypatch):
 
     monkeypatch.setattr(ab, "get_basis_for_run", _boom)
     assert await acbd._basis_pair_for_delta({}, "m1", "prior-run") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# The two blockers review found, each with the test that would have caught it.
+# ---------------------------------------------------------------------------
+async def test_the_comparability_path_can_build_a_basis_without_a_run_id():
+    """BLOCKER 1. record_audit_basis guarded `if not audit_run_id ... return
+    None` — above the persist=False branch — and the comparability path calls it
+    with "" by design, because the current run has no row to write under yet. So
+    the current basis was ALWAYS None and the whole feature was inert while
+    every test passed."""
+    import services.audit_evidence_builder as eb
+
+    payload = await eb.record_audit_basis(
+        audit_run_id="", brand_report={}, merchant_id="m1", persist=False,
+    )
+    assert payload is not None, "an empty run id must not defeat the build-only path"
+    assert payload["methodology_version"]
+
+
+async def test_persisting_still_requires_a_run_id():
+    """Positive counterpart: relaxing the guard must not let a WRITE through
+    without the id it writes under."""
+    import services.audit_evidence_builder as eb
+
+    assert await eb.record_audit_basis(
+        audit_run_id="", brand_report={}, merchant_id="m1", persist=True,
+    ) is None
+
+
+async def test_a_run_is_comparable_with_its_own_stored_basis():
+    """BLOCKER 2. The current basis is built in memory; the prior one is read
+    back from the DB. If those shapes do not compare equal, the check fires on
+    EVERY re-audit and every merchant is told their basis changed — the same
+    defect as the bug being fixed, pointing the other way.
+
+    official_domains was the live vector: record_basis stores sorted({lower}),
+    the in-memory path returned list_official_domains order verbatim, and that
+    query has no ORDER BY.
+    """
+    import db.audit_basis as ab
+
+    await ab.ensure_audit_basis_table()
+    payload = {
+        "providers_and_models": {"gemini": {"model_id": "gemini-2.5-flash"}},
+        "prompt_set_id": "ps_rt", "selected_set_id": "sel_rt",
+        "tier_mix": {"category_head": 2},
+        "official_domains": ["shop.anua.com", "anua.com"],  # NOT alphabetical
+        "primary_destination_version": 1,
+        "market": "US", "language": "en", "currency": None,
+    }
+    await ab.record_basis(audit_run_id="rt-self", merchant_id="m1", **payload)
+    stored = await ab.get_basis_for_run("rt-self")
+    in_memory = dict(payload, methodology_version=ab.METHODOLOGY_VERSION)
+
+    assert ab.bases_are_comparable(in_memory, stored) is True, (
+        "a run must be comparable with its own stored basis"
+    )
+
+
+async def test_a_genuinely_different_domain_set_is_still_not_comparable():
+    """Positive counterpart: order-insensitivity must not blunt the check."""
+    import db.audit_basis as ab
+
+    base = {
+        "methodology_version": ab.METHODOLOGY_VERSION,
+        "providers_and_models": {"gemini": {"model_id": "g"}},
+        "primary_destination_version": 1,
+        "prompt_set_id": "p", "selected_set_id": "s",
+        "official_domains": ["a.com", "b.com"],
+        "tier_mix": {"category_head": 1}, "market": "US", "language": "en",
+    }
+    assert ab.bases_are_comparable(base, dict(base, official_domains=["a.com"])) is False
+
+
+async def test_the_built_payload_normalises_domains_like_the_writer_does(monkeypatch):
+    """Both halves of the ordering fix are pinned, not just the comparison one.
+
+    bases_are_comparable now sorts lists, so it compensates for an unnormalised
+    payload — which means a mutant dropping the normalisation HERE survives
+    unless the payload shape is asserted directly. Two writers emitting the same
+    set in different shapes is the defect; keeping them identical at the source
+    is the fix, and the sort in the comparison is the belt.
+    """
+    import services.audit_evidence_builder as eb
+    import db.merchant_official_domains as mod
+
+    async def _domains(merchant_id):
+        return [
+            {"domain": "shop.anua.com", "liveness_status": "live"},
+            {"domain": "ANUA.com", "liveness_status": "unchecked"},
+            {"domain": "anua.us", "liveness_status": "dead"},  # excluded
+        ]
+
+    monkeypatch.setattr(mod, "list_official_domains", _domains)
+    payload = await eb.record_audit_basis(
+        audit_run_id="", brand_report={}, merchant_id="m1", persist=False,
+    )
+    assert payload["official_domains"] == ["anua.com", "shop.anua.com"], (
+        "sorted, lower-cased, dead excluded — exactly what record_basis stores"
+    )
