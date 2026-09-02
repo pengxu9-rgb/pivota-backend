@@ -1468,9 +1468,9 @@ async def get_finance_overview(
         finance_query = """
             SELECT 
                 COUNT(*) as total_transactions,
-                COALESCE(SUM(amount), 0) as gross_revenue,
-                COALESCE(SUM(CASE WHEN status IN ('completed', 'delivered') THEN amount ELSE 0 END), 0) as net_revenue,
-                COALESCE(AVG(amount), 0) as avg_transaction_value,
+                COALESCE(SUM(total), 0) as gross_revenue,
+                COALESCE(SUM(CASE WHEN status IN ('completed', 'delivered') THEN total ELSE 0 END), 0) as net_revenue,
+                COALESCE(AVG(total), 0) as avg_transaction_value,
                 COUNT(DISTINCT merchant_id) as active_merchants,
                 COUNT(DISTINCT DATE(created_at)) as active_days
             FROM orders
@@ -1489,7 +1489,7 @@ async def get_finance_overview(
             SELECT 
                 DATE_TRUNC('month', created_at) as month,
                 COUNT(*) as transactions,
-                COALESCE(SUM(amount), 0) as revenue
+                COALESCE(SUM(total), 0) as revenue
             FROM orders
             WHERE created_at >= CURRENT_DATE - INTERVAL '6 months'
             GROUP BY DATE_TRUNC('month', created_at)
