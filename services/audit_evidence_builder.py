@@ -34,7 +34,8 @@ skip):
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from typing import Any, Dict, List, Mapping, Optional
 
 from observability.citation_deposit_metrics import record_deposit_dropped
 
@@ -211,6 +212,22 @@ def extract_evidence_items(
     return out
 
 
+def _clean_destination_rank(value: Any) -> Optional[int]:
+    """B3: the stored position must be a non-negative int or absent. A report
+    written before B3 carries no rank at all, and NULL is the honest answer for
+    it — coercing a missing position to 0 would say "the answer's first
+    citation", which is a claim the old payload never made.
+
+    STRICTLY `int`, not "anything int() accepts". The only producer is
+    build_authority_map's `enumerate`, so being strict drops nothing real —
+    whereas a permissive coercion would turn 2.9 into position 2 and a stray
+    `True` into position 1 (bool is an int subclass, hence the explicit check
+    first), inventing an ordering no answer ever had."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 def extract_citation_observations(
     brand_report: Dict[str, Any],
     content_key_map: Optional[Dict[str, Any]] = None,
@@ -224,6 +241,16 @@ def extract_citation_observations(
     accrete). Without a map (pure tests), the sku-entry's own content_key is
     used with basis 'unknown'. Rows missing a query or provider are skipped
     (both are NOT NULL in citation_observations).
+
+    B3: each observation also carries `destination_rank` (the host's zero-based
+    position in that response's citation list) and `is_primary_destination`
+    (services/primary_destination.py picked it as the one place the answer sent
+    the buyer). AT MOST ONE row per response may claim primary, and that is
+    ENFORCED HERE rather than assumed: build_authority_map guarantees it by
+    construction, but this function also runs over authority maps loaded from
+    stored report_jsonb written by other builds, and a second primary would make
+    every "AI sends buyers to X" count double-book. A duplicate claim is demoted
+    to False and logged.
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(brand_report, dict):
@@ -231,6 +258,12 @@ def extract_citation_observations(
     authority = brand_report.get("authority_map")
     if not isinstance(authority, dict):
         return out
+
+    # Response identity within one audit run: (content_key, provider, query) —
+    # the citation_observations key minus audit_run_id (constant per call) and
+    # cited_host (the thing being ranked).
+    primary_claimed: set = set()
+    demoted_primaries = 0
 
     dropped_skus = 0
     dropped_observations = 0
@@ -271,6 +304,17 @@ def extract_citation_observations(
                 provider = obs.get("provider")
                 if not q or not provider:
                     continue
+                is_primary = bool(obs.get("is_primary_destination"))
+                if is_primary:
+                    response_key = (content_key, provider, q)
+                    if response_key in primary_claimed:
+                        # Second claim on the same response — demote, don't
+                        # persist. Two primaries would mean one answer sent the
+                        # buyer to two places, which the signal cannot express.
+                        is_primary = False
+                        demoted_primaries += 1
+                    else:
+                        primary_claimed.add(response_key)
                 out.append({
                     "content_key": content_key,
                     "product_key": product_key,
@@ -285,7 +329,18 @@ def extract_citation_observations(
                     "first_party": host.get("first_party"),
                     "is_competitor": host.get("is_competitor"),
                     "evidence_url": evidence_url,
+                    "destination_rank": _clean_destination_rank(
+                        obs.get("destination_rank")
+                    ),
+                    "is_primary_destination": is_primary,
                 })
+    if demoted_primaries:
+        logger.warning(
+            "citation_deposit.duplicate_primary_destination demoted=%d — an "
+            "authority map claimed more than one primary destination for the "
+            "same (content_key, provider, query); only the first was kept",
+            demoted_primaries,
+        )
     if dropped_skus:
         logger.info(
             "citation_deposit.dropped skus=%d observations=%d "
@@ -786,6 +841,182 @@ async def _resolve_content_keys(
     return out
 
 
+# =====================================================================
+# A3 — the run-level audit basis
+# =====================================================================
+
+
+def _per_sku_reports(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    reports = brand_report.get("per_sku_reports")
+    if not isinstance(reports, list):
+        return []
+    return [r for r in reports if isinstance(r, Mapping)]
+
+
+def build_providers_and_models(
+    brand_report: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """A3: `{provider_id: {"model_id": str, "temperature": float|None}}`.
+
+    Read from the report's own `provider_models` block (written by
+    services/coverage_profiles.resolve_provider_models plus any per-run
+    override), so the recorded model is the one the run actually used rather
+    than whatever the config says at read time.
+
+    TEMPERATURE IS RECORDED AS NULL, and that is a fact rather than a gap: the
+    audit probe path pins a temperature in exactly one place
+    (services/llm_providers/deepseek_probe.py, 0.2, inside the request body) and
+    passes none for the other providers, which therefore run at whatever the
+    provider's default is. Inventing a number here would put a value in an
+    immutable record that no code ever set. Recording null means that if the
+    probe path ever starts pinning temperatures, the basis changes and
+    `bases_are_comparable` correctly refuses to compare across the change.
+    """
+    raw = brand_report.get("provider_models")
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for provider, payload in raw.items():
+        provider_id = str(provider or "").strip().lower()
+        if not provider_id:
+            continue
+        if isinstance(payload, Mapping):
+            model_id = str(payload.get("model") or payload.get("model_id") or "").strip()
+        else:
+            model_id = str(payload or "").strip()
+        if not model_id:
+            continue
+        out[provider_id] = {"model_id": model_id, "temperature": None}
+    return out
+
+
+def build_tier_mix(brand_report: Mapping[str, Any]) -> Dict[str, int]:
+    """A3: counts per QUERY CLASS over the questions the run actually probed.
+
+    The vocabulary is `services.audit_facts.intent_axis_for` — the CURRENT one,
+    imported rather than restated, so this can never drift into a parallel
+    taxonomy. It reads the pinned `selected_specs` (W2.1: the exact
+    `{query, axis}` records that were probed), which is the only record of the
+    mix that survives into the report.
+
+    Why the mix matters on top of `selected_set_id`: two runs can carry the same
+    prompt-set identity and still be measured differently if the branded /
+    discovery balance moved (PROMPT_BASIS_VERSION 3 rebalanced exactly that),
+    and every share-style number in the report is a function of that balance.
+    """
+    from services.audit_facts import intent_axis_for
+
+    counts: Counter = Counter()
+    for sku_report in _per_sku_reports(brand_report):
+        basis = sku_report.get("prompt_basis")
+        if not isinstance(basis, Mapping):
+            continue
+        for spec in basis.get("selected_specs") or []:
+            if not isinstance(spec, Mapping):
+                continue
+            query = spec.get("query")
+            if not query:
+                continue
+            counts[intent_axis_for(query, spec.get("axis"))] += 1
+    return dict(sorted(counts.items()))
+
+
+def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
+    """The first non-empty `prompt_set_id` / `selected_set_id` across the run's
+    per-SKU bases. Each is taken independently: a run whose SKUs predate W2.1
+    has a prompt_set_id and no selected_set_id, and recording the one it has is
+    strictly better than recording neither."""
+    prompt_set_id: Optional[str] = None
+    selected_set_id: Optional[str] = None
+    for sku_report in _per_sku_reports(brand_report):
+        basis = sku_report.get("prompt_basis")
+        if not isinstance(basis, Mapping):
+            continue
+        if not prompt_set_id:
+            prompt_set_id = str(basis.get("prompt_set_id") or "") or None
+        if not selected_set_id:
+            selected_set_id = str(basis.get("selected_set_id") or "") or None
+        if prompt_set_id and selected_set_id:
+            break
+    return {"prompt_set_id": prompt_set_id, "selected_set_id": selected_set_id}
+
+
+async def record_audit_basis(
+    *,
+    audit_run_id: str,
+    brand_report: Mapping[str, Any],
+    merchant_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """A3: record, immutably, what this run was measured WITH.
+
+    Called at audit completion, from `persist_canonical_evidence` — the one
+    place that already receives the assembled report, the run id and the
+    merchant id together. Best-effort in the same way every other write here is:
+    a failure logs and returns None, and never touches the audit lifecycle.
+
+    A second call for the same run is a no-op that returns the stored row
+    (db/audit_basis.record_basis), so a worker reclaim after a crash re-enters
+    this path safely.
+    """
+    if not audit_run_id or not merchant_id:
+        return None
+    from db.audit_basis import record_basis
+    from db.merchant_official_domains import is_excluded, list_official_domains
+    from services.primary_destination import PRIMARY_DESTINATION_VERSION
+
+    try:
+        # The official-domain set AS IT STOOD AT RUN TIME. Snapshotting it is
+        # the whole point: this set decides `first_party` on every cited host,
+        # so a domain added between two runs moves the headline number with no
+        # change in the world. `dead` rows are excluded here for the same reason
+        # the report excludes them — the set recorded must be the set used.
+        domains = [
+            row.get("domain")
+            for row in (await list_official_domains(str(merchant_id)))
+            if row.get("domain") and not is_excluded(row.get("liveness_status"))
+        ]
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "record_audit_basis: official-domain snapshot failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        domains = []
+
+    set_ids = _pinned_set_ids(brand_report)
+    # Market/language come from the audit's single-market default
+    # (config.settings.audit_default_market_locale, e.g. "en-US"); the multi-
+    # market path (services/multi_market_audit.py) is flag-off in production.
+    # CURRENCY IS RECORDED AS NULL: the audit measures citations, not prices, and
+    # no currency is pinned anywhere on this path. A guessed "USD" in an
+    # immutable record would be a fabrication.
+    market: Optional[str] = None
+    language: Optional[str] = None
+    try:
+        from config.settings import settings
+
+        locale = str(getattr(settings, "audit_default_market_locale", "") or "").strip()
+        if "-" in locale:
+            language, market = locale.split("-", 1)
+        elif locale:
+            language = locale
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("record_audit_basis: locale read failed: %s", str(exc)[:200])
+
+    return await record_basis(
+        audit_run_id=str(audit_run_id),
+        merchant_id=str(merchant_id),
+        providers_and_models=build_providers_and_models(brand_report),
+        prompt_set_id=set_ids["prompt_set_id"],
+        selected_set_id=set_ids["selected_set_id"],
+        tier_mix=build_tier_mix(brand_report),
+        official_domains=domains,
+        primary_destination_version=PRIMARY_DESTINATION_VERSION,
+        market=market,
+        language=language,
+        currency=None,
+    )
+
+
 async def persist_canonical_evidence(
     *,
     audit_run_id: str,
@@ -1012,12 +1243,32 @@ async def persist_canonical_evidence(
             is_competitor=obs.get("is_competitor"),
             evidence_url=obs.get("evidence_url"),
             content_key_basis=obs.get("content_key_basis") or "unknown",
+            destination_rank=obs.get("destination_rank"),
+            is_primary_destination=obs.get("is_primary_destination"),
             idempotency_key=idem_key,
         )
         if new_obs_id is None:
             summary["citation_observations_skipped"] += 1
         else:
             summary["citation_observations_inserted"] += 1
+
+    # A3: record what this run was measured WITH, once and immutably. Placed
+    # AFTER the citation deposit so the basis describes a run whose evidence has
+    # landed; a failure here is logged inside record_audit_basis and only shows
+    # up as basis_recorded=False.
+    try:
+        basis_row = await record_audit_basis(
+            audit_run_id=audit_run_id,
+            brand_report=brand_report,
+            merchant_id=merchant_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive; must not fail the audit
+        logger.warning(
+            "persist_canonical_evidence: record_audit_basis raised for "
+            "audit=%s: %s", audit_run_id, str(exc)[:200],
+        )
+        basis_row = None
+    summary["basis_recorded"] = basis_row is not None
 
     return summary
 

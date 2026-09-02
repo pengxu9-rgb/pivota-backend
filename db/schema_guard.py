@@ -1910,6 +1910,23 @@ async def ensure_required_schema_light() -> None:
                     """
                 )
             )
+            # mig 209: citation_observations.destination_rank +
+            # .is_primary_destination — B3's "where did the answer send the
+            # buyer?" columns. The audit deposit path INSERTs both on every
+            # citation it writes, and it builds that INSERT from the SQLAlchemy
+            # Table, so a deploy that skipped migrations would name a column the
+            # database does not have and fail every citation write in the run.
+            # db/audit_evidence.py carries the same two ALTERs in its own inline
+            # backstop; this is the startup half of the pair.
+            await database.execute(
+                text(
+                    """
+                    ALTER TABLE IF EXISTS citation_observations
+                      ADD COLUMN IF NOT EXISTS destination_rank INTEGER,
+                      ADD COLUMN IF NOT EXISTS is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE;
+                    """
+                )
+            )
             # mig 109: commerce_attribution_edges.net_attributed_gmv_cents — STORED generated column
             # (derived from refund_amount_cents, added above). Emitted LAST so this
             # lone potential table-rewrite can't block the lightweight self-heals;
