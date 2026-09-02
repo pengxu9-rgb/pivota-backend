@@ -263,7 +263,13 @@ async def claim_next_quality_backfill_job() -> Optional[Dict[str, Any]]:
 # SQL dynamic. `COALESCE(:param, column)` expresses the same rule — NULL means
 # leave this column alone — in one static statement. Callers still pass None for
 # "do not touch" (routes/merchant_products.py relies on it, forwarding
-# `active_job.get(...)` straight through), so the contract is unchanged.
+# `active_job.get(...)` straight through), so the contract is unchanged for every
+# caller. One nuance on errors_sample: where COALESCE keeps the existing value it
+# now REWRITES it with itself, which is byte-identical on a jsonb column but not
+# on a json one (jsonb normalises key order, drops duplicate keys, and rejects a
+# stored \u0000). Production and the runtime DDL are jsonb, so this is inert
+# there; it is only reachable on a model-first database, and it is another reason
+# to close the drift above rather than live with it.
 
 _REQUEUE_STALE_SQL = """
     UPDATE product_quality_backfill_jobs

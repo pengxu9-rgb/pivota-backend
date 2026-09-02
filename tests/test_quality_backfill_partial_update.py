@@ -23,6 +23,15 @@ None reaches these functions whenever the stale job's row lacks the key.
 Runs against whatever DATABASE_URL is configured; on the default SQLite that is
 the `else` branch of each dialect split, on the Postgres dialect job the
 `CAST(:errors_sample AS JSONB)` branch.
+
+BOTH HALVES ARE LOAD-BEARING, so this file is named to run in the sweep AND is
+listed explicitly in the ride-along loop in `.github/workflows/postgres-dialect-
+gate.yml`. If you remove it from that list, this file silently stops testing the
+statements that actually ship: the sweep sets no DATABASE_URL, so it would only
+ever exercise the SQLite twins. That was the state this file shipped in for one
+commit, and a defect reintroduced in the POSTGRES constant alone stayed green
+across every job. Renaming it to `*_postgres.py` is NOT the fix either — the
+sweep `--ignore-glob`s that pattern, which trades the gap for the opposite gap.
 """
 
 from __future__ import annotations
@@ -156,6 +165,51 @@ async def test_completing_a_job_always_rewrites_errors_sample():
     assert row["processed"] == 5
     assert row["errors_sample"] == [], (
         "a clean completion must clear the sample — _json_param(None) -> []"
+    )
+
+
+async def test_completing_a_job_with_no_counters_keeps_every_one_of_them():
+    """Closes a mutant that survived: no test completed a job without counters.
+
+    With every counter omitted, a wrong COALESCE fallback column — `failed =
+    COALESCE(:failed, skipped)` — is invisible to every other test here, because
+    they all pass `failed` explicitly and the bind wins.
+    """
+    job_id = await _new_job()
+    await update_quality_backfill_job_progress(
+        job_id, total_candidates=40, processed=7, skipped=2, failed=1
+    )
+
+    await complete_quality_backfill_job(job_id, status="completed")
+
+    row = await get_quality_backfill_job(job_id)
+    assert row["status"] == "completed"
+    assert (
+        row["total_candidates"],
+        row["processed"],
+        row["skipped"],
+        row["failed"],
+    ) == (40, 7, 2, 1), "completion with no counters must preserve all four"
+
+
+async def test_an_empty_errors_sample_list_is_written_not_ignored():
+    """`[]` is not `None`, and the whole rewrite hinges on that distinction.
+
+    This is the real first-tick shape: services/product_quality_backfill_service
+    passes the accumulator list, which is empty on the first call. `[]` must
+    reach the column (clearing a previous sample); only None means "leave it".
+    """
+    job_id = await _new_job()
+    await update_quality_backfill_job_progress(
+        job_id, errors_sample=[{"error": "boom", "message": "first failure"}]
+    )
+
+    await update_quality_backfill_job_progress(job_id, errors_sample=[])
+
+    row = await get_quality_backfill_job(job_id)
+    assert row["errors_sample"] == [], (
+        "an explicitly empty sample must overwrite the stored one — only None "
+        "means 'leave this column alone'"
     )
 
 
