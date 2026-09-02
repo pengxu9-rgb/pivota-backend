@@ -91,6 +91,10 @@ def _order_metadata(
         "native_financial_status": _text(order.get("financial_status")),
         "native_fulfillment_status": _text(order.get("fulfillment_status")),
         "native_payment_method": _text(order.get("gateway")),
+        # Shopify pixels expose checkout.token, while order webhooks can expose
+        # both checkout_token and the numeric checkout_id. Keep the numeric ID
+        # for diagnostics without using it as the cross-source stitch key.
+        "native_checkout_id": _text(order.get("checkout_id")),
         "native_line_items": _line_items(order.get("line_items")),
         "native_discount_total": order.get("current_total_discounts")
         or order.get("total_discounts"),
@@ -147,7 +151,7 @@ def _order_events(
                 buyer_id=_text(customer.get("id")),
                 click_id=extract_click_id_from_note_attributes(order.get("note_attributes")),
                 cart_id=_text(order.get("cart_token")),
-                checkout_id=_text(order.get("checkout_id") or order.get("checkout_token")),
+                checkout_id=_text(order.get("checkout_token") or order.get("checkout_id")),
                 order_id=order_id,
                 trace_id=trace_id,
                 amount_cents=amount_cents,
