@@ -393,16 +393,28 @@ async def requeue_stale_quality_backfill_jobs(
     the database and session both UTC, from a process on Pacific time, a
     `utcnow()` bound as `$1::timestamptz` lands SEVEN HOURS in the future. Every
     `running` row was therefore stale whenever the app process ran off UTC,
-    whatever `stale_after_seconds` said. (Production is UTC, so this was inert
-    there — and the same probe run before and after `SET TIME ZONE` on the
-    connection returns the same value, which is how the session was ruled out.)
-    Binding a tz-AWARE datetime instead fixes that arithmetic and introduces a
-    worse failure: asyncpg refuses an aware datetime against a plain `timestamp`
-    column (`DataError: can't subtract offset-naive and offset-aware`), which is
-    what these columns are in any database built from `metadata.create_all` —
-    the SQLAlchemy Column above is `DateTime`, naive, while this module's DDL
-    and migration 054 say TIMESTAMPTZ. `CURRENT_TIMESTAMP - interval` binds no
-    datetime at all, so it is correct under either declaration, and it compares
+    whatever `stale_after_seconds` said. (The same probe before and after `SET
+    TIME ZONE` on the connection returns the same value, which is how the
+    database session was ruled out as the cause.)
+
+    THAT CONVERSION ONLY HAPPENS FOR A `timestamptz` PARAMETER, and `started_at`
+    is NOT one in the deployed database, so this was latent rather than live.
+    main.py runs `metadata.create_all` (line 1857) before `run_sql_migrations`
+    (line 1880) and this module is in metadata by then, so the table is built
+    from the bare `DateTime` Column as naive `timestamp` and migration 054's
+    `CREATE TABLE IF NOT EXISTS` — which does say TIMESTAMPTZ — never runs.
+    Verified by building a database in that order. Against a naive column
+    asyncpg passes a naive datetime through untouched, so the old arithmetic
+    happened to be right.
+
+    IT IS FIXED ANYWAY BECAUSE THE DRIFT IS BEING RESOLVED. Aligning the model
+    to the migrations is live work; the moment these columns become TIMESTAMPTZ,
+    a naive bind here becomes a real defect that no test would have to
+    introduce. Binding a tz-AWARE datetime is not the way out either: asyncpg
+    REFUSES one against a plain `timestamp` column (`DataError`), which is what
+    the columns are today — so aware is correct after the alignment and raises
+    before it. `CURRENT_TIMESTAMP - interval` binds no datetime at all, so it is
+    correct under either declaration, and it compares
     `started_at` against the same clock that WROTE it (`claim_quality_backfill
     _job` sets `started_at = COALESCE(started_at, CURRENT_TIMESTAMP)`), which
     the old form did not: it measured a server timestamp against a client one.
