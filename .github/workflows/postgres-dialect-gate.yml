@@ -123,6 +123,13 @@ on:
       # needs its own entry or a change to it would not run its own gate.
       - "tests/test_pdp_renderability.py"
       - "tests/test_databases_textclause_params.py"
+      # Rides along too, and for a sharper reason than the other two: its
+      # assertions about `requeue_stale_quality_backfill_jobs`' RETURN VALUE pass
+      # on SQLite against a BROKEN implementation. `database.execute` yields no
+      # rowcount for an UPDATE without RETURNING on the asyncpg backend, so the
+      # helper reported 0 rows moved on Postgres and the truth on SQLite. Run
+      # anywhere but here, that test proves nothing.
+      - "tests/test_quality_backfill_partial_update.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
@@ -236,7 +243,22 @@ jobs:
           # this job's path filter — and both known occurrences sat inside
           # `except Exception`, so the symptom was a silent wrong answer rather
           # than a 500 that CI or logs would ever surface.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py; do
+          #
+          # tests/test_quality_backfill_partial_update.py is a THIRD kind of
+          # ride-along: not a compile-shape guard but a suite that DRIVES
+          # db/product_quality_backfill_jobs.py against whatever DATABASE_URL is
+          # configured. It is in the SQLite sweep as well, and has to be in both,
+          # because one of its cases can only fail here: on the asyncpg backend
+          # an UPDATE without a RETURNING clause reports no rowcount, so
+          # `requeue_stale_quality_backfill_jobs` answered 0 for every row it
+          # moved on Postgres while answering correctly on SQLite. Naming it
+          # `*_postgres.py` instead would have bought this coverage by giving up
+          # the SQLite half, which exercises the other side of the module's
+          # dialect split (`errors_sample = :errors_sample`, no JSONB cast).
+          # Checked SQLite-safe under this job's Postgres URL, per the header
+          # warning about SQLite-fixture suites.
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py \
+                   tests/test_quality_backfill_partial_update.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"

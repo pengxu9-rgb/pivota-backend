@@ -265,6 +265,10 @@ async def claim_next_quality_backfill_job() -> Optional[Dict[str, Any]]:
 # "do not touch" (routes/merchant_products.py relies on it, forwarding
 # `active_job.get(...)` straight through), so the contract is unchanged.
 
+# `RETURNING job_id` on both requeue variants is NOT decoration: it is the only
+# way this statement can report how many rows it moved. See
+# `requeue_stale_quality_backfill_jobs` below — dropping it makes the helper
+# return 0 on Postgres while still doing the work.
 _REQUEUE_STALE_SQL = """
     UPDATE product_quality_backfill_jobs
     SET status = 'queued',
@@ -284,6 +288,7 @@ _REQUEUE_STALE_SQL = """
         ORDER BY started_at ASC
         LIMIT :limit
     )
+    RETURNING job_id
     """
 
 _REQUEUE_STALE_SQL_SQLITE = """
@@ -305,6 +310,7 @@ _REQUEUE_STALE_SQL_SQLITE = """
         ORDER BY started_at ASC
         LIMIT :limit
     )
+    RETURNING job_id
     """
 
 _UPDATE_PROGRESS_SQL = """
@@ -363,6 +369,17 @@ async def requeue_stale_quality_backfill_jobs(
     stale_after_seconds: int = 300,
     limit: int = 5,
 ) -> int:
+    """Put timed-out `running` jobs back to `queued`; return how many moved.
+
+    THE COUNT COMES FROM `RETURNING job_id`, NOT FROM THE DRIVER. This used to
+    be `int(await database.execute(...) or 0)`, which reports the truth on
+    SQLite and 0 on Postgres however many rows it moved: the asyncpg backend
+    yields no rowcount for an UPDATE without a RETURNING clause. The requeue
+    itself was always correct — only the number was wrong, and the number is
+    the only thing anyone reads. `jobs/product_quality_backfill_worker.py`
+    gates its "Requeued %s stale quality backfill job(s)" warning on it, so a
+    stale-job requeue was silent in production and loud in the SQLite suite.
+    """
     await ensure_product_quality_backfill_jobs_table()
     cutoff = _utcnow() - timedelta(seconds=max(30, stale_after_seconds))
     values: Dict[str, Any] = {
@@ -378,13 +395,10 @@ async def requeue_stale_quality_backfill_jobs(
         ),
     }
     if IS_POSTGRES:
-        result = await database.execute(_REQUEUE_STALE_SQL, values)
+        rows = await database.fetch_all(_REQUEUE_STALE_SQL, values)
     else:
-        result = await database.execute(_REQUEUE_STALE_SQL_SQLITE, values)
-    try:
-        return int(result or 0)
-    except Exception:
-        return 0
+        rows = await database.fetch_all(_REQUEUE_STALE_SQL_SQLITE, values)
+    return len(rows)
 
 
 async def requeue_quality_backfill_job(job_id: str) -> bool:

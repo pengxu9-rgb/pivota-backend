@@ -23,16 +23,25 @@ None reaches these functions whenever the stale job's row lacks the key.
 Runs against whatever DATABASE_URL is configured; on the default SQLite that is
 the `else` branch of each dialect split, on the Postgres dialect job the
 `CAST(:errors_sample AS JSONB)` branch.
+
+IT RUNS IN BOTH JOBS ON PURPOSE, and the Postgres half is not automatic: this
+file is not named `test_*_postgres.py`, so `.github/workflows/
+postgres-dialect-gate.yml` only executes it because it is named there as a
+ride-along AND in that workflow's `paths:` filter. Both entries are load-bearing
+for the last case in this file, which passes on SQLite against the broken
+implementation it exists to catch. Renaming or unlisting it puts that case back
+to proving nothing.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from db.database import database
 from db.product_quality_backfill_jobs import (
+    _utcnow,
     claim_quality_backfill_job,
     complete_quality_backfill_job,
     create_quality_backfill_job,
@@ -193,13 +202,11 @@ async def test_requeue_stale_resets_a_running_job_and_stamps_the_reason():
 
     await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5)
 
-    # Asserted on the ROW, not on the return value. `database.execute` yields no
-    # rowcount for an UPDATE without RETURNING on the asyncpg backend, so this
-    # helper returns 0 on Postgres however many rows it moved — pre-existing, and
-    # only ever read for a log line in jobs/product_quality_backfill_worker.py
-    # ("Requeued %s stale ... job(s)" therefore never fires in production). An
-    # `assert requeued >= 1` here would pass on SQLite and fail on Postgres while
-    # the requeue itself worked perfectly.
+    # This case is about the ROW: status, counters, timestamps, and the JSON
+    # payload round trip. The RETURN VALUE — which used to be 0 on Postgres
+    # however many rows moved, because `database.execute` yields no rowcount for
+    # an UPDATE without RETURNING on the asyncpg backend — is pinned separately
+    # by test_requeue_stale_returns_the_number_of_rows_it_actually_moved below.
     row = await get_quality_backfill_job(job_id)
     assert row["status"] == "queued"
     assert row["started_at"] is None and row["finished_at"] is None
@@ -209,3 +216,82 @@ async def test_requeue_stale_resets_a_running_job_and_stamps_the_reason():
         "the JSON payload was mangled — on SQLite a CAST(... AS JSONB) silently "
         "stores 0, which is why the dialect split exists"
     )
+
+
+async def test_requeue_stale_returns_the_number_of_rows_it_actually_moved():
+    """The count, not the row — the half the case above deliberately skips.
+
+    `requeue_stale_quality_backfill_jobs` returned `int(await
+    database.execute(...) or 0)`, and the asyncpg backend yields no rowcount for
+    an UPDATE without a RETURNING clause: on Postgres the helper answered 0 for
+    every requeue it performed, while on SQLite it answered correctly. That is
+    exactly the split this suite exists to catch, and it is why the assertion
+    below has to run on a real Postgres to prove anything — on SQLite it passes
+    against the BROKEN implementation.
+
+    The only reader is jobs/product_quality_backfill_worker.py, twice:
+
+        if requeued:
+            logger.warning("Requeued %s stale quality backfill job(s)", requeued)
+
+    so a falsy count does not merely misreport, it deletes the log line. The
+    worker loop is dormant (nothing imports it), which is why this is an
+    observability bug rather than an outage.
+
+    THE EXPECTED COUNT IS READ OUT OF THE TABLE, NOT ASSUMED TO BE 2. The
+    statement is table-wide — there is no merchant filter — and the shared
+    Postgres database this job runs against can carry stale `running` rows from
+    other files and from earlier runs. The eligibility query below is the
+    statement's own WHERE clause, evaluated with the same cutoff, so the two
+    agree by construction whatever else is in the table.
+
+    NOTHING HERE ASSERTS THAT A FRESHLY CLAIMED JOB IS SPARED, which it should
+    be and on a UTC server is: `:cutoff` is a NAIVE `datetime.utcnow()`, and
+    asyncpg hands a naive datetime to a `timestamptz` column to be read in the
+    SESSION timezone. On a Postgres running America/Los_Angeles the cutoff lands
+    seven hours in the FUTURE and every `running` row is stale. Pre-existing, on
+    the WHERE clause rather than the count, and inert in production (UTC) — but
+    real enough that pinning it here would make this test fail on a developer's
+    machine for a reason that has nothing to do with what it measures.
+    """
+    stale_ids = [await _new_job(), await _new_job()]
+    for job_id in stale_ids:
+        await claim_quality_backfill_job(job_id)
+        # A real datetime, not a string: asyncpg rejects a str bound to a
+        # timestamp column outright, while SQLite accepts it.
+        await database.execute(
+            "UPDATE product_quality_backfill_jobs "
+            "SET started_at = :old WHERE job_id = :j",
+            {"old": datetime(2020, 1, 1), "j": job_id},
+        )
+
+    # The helper floors staleness at 30s, so this is the cutoff it will use.
+    cutoff = _utcnow() - timedelta(seconds=30)
+    eligible = await database.fetch_all(
+        "SELECT job_id FROM product_quality_backfill_jobs "
+        "WHERE status = 'running' AND started_at IS NOT NULL AND started_at < :cutoff",
+        {"cutoff": cutoff},
+    )
+    eligible_ids = {str(dict(row)["job_id"]) for row in eligible}
+    assert set(stale_ids) <= eligible_ids, "the two backdated jobs must be eligible"
+
+    # limit == the eligible count, so every eligible row moves and the expected
+    # answer is exact rather than a floor.
+    requeued = await requeue_stale_quality_backfill_jobs(
+        stale_after_seconds=30, limit=len(eligible_ids)
+    )
+
+    assert requeued == len(eligible_ids), (
+        f"requeue moved {len(eligible_ids)} row(s) and reported {requeued}. On the "
+        "asyncpg backend a rowcount-less UPDATE reports None -> 0, which is why "
+        "the statement carries RETURNING job_id and the helper counts the rows."
+    )
+    for job_id in stale_ids:
+        assert (await get_quality_backfill_job(job_id))["status"] == "queued", (
+            "the count must be the count of rows this call actually moved"
+        )
+
+    # Nothing is stale any more, so the answer must fall to 0 rather than stay
+    # at whatever the previous call returned. Pins the count to the ROWS, not to
+    # a constant that happens to match above.
+    assert await requeue_stale_quality_backfill_jobs(stale_after_seconds=30, limit=5) == 0
