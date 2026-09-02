@@ -20,9 +20,12 @@ So the only check that actually models production is executing the real route
 against a real engine. A predicate can be individually valid and still be
 un-preparable in the statement that ships it.
 
-RUNNING THIS. Skipped unless DATABASE_URL points at a Postgres — the module
-also selects JSONB_TYPE from that URL at import time, so a Postgres URL is
-what makes this exercise the production types rather than generic JSON.
+RUNNING THIS. Skipped unless DATABASE_URL points at a Postgres, because the
+point is to PREPARE against a real server. (Until 2026-09-01 the URL mattered
+for a second reason: db/database.py picked JSONB_TYPE from it at import time, so
+a non-Postgres URL silently exercised generic JSON. JSONB_TYPE is now a
+`with_variant`, resolved by the compiling dialect, so the column types are right
+either way — but the server is still required.)
 
     createdb pivota_dialect_check
     DATABASE_URL=postgresql://localhost/pivota_dialect_check \

@@ -21,6 +21,7 @@ from sqlalchemy import (
     Table,
     create_engine,
 )
+from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
 
 from config.platform import is_deployed
 from config.settings import settings
@@ -70,43 +71,52 @@ if not (IS_POSTGRES or IS_SQLITE):
         "Supported URL schemes: postgresql://, postgres://, sqlite://, sqlite+aiosqlite://"
     )
 
-# Dialect-aware JSONB type: use JSON for non-Postgres engines.
-JSONB_TYPE = JSON
-if IS_POSTGRES:
-    try:
-        from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
+# Dialect-aware JSONB type: `jsonb` on Postgres, `JSON` on everything else.
+#
+# ⚠️ RESOLVED AT COMPILE TIME, BY DIALECT — deliberately NOT at import time from
+# DATABASE_URL, which is what this used to do (`JSONB_TYPE = JSONB if
+# IS_POSTGRES else JSON`). That older form was correct in each of the two pure
+# configurations and WRONG in the mixed one: with a Postgres DATABASE_URL the
+# `else` branch never ran, so the sqlite compiler shims below were never
+# registered, and any test that builds its own SQLite fixture died with
+#     CompileError: SQLiteTypeCompiler can't render element of type JSONB
+# That is the trap documented at length in
+# .github/workflows/postgres-dialect-gate.yml ("AND ITS MIRROR"), which is why
+# adding a SQLite-fixture suite to that job's ride-along list required checking
+# it under a Postgres URL first. `with_variant` has no such failure mode: the
+# dialect doing the compiling picks the type, so one declaration is correct
+# under both engines no matter what DATABASE_URL says.
+JSONB_TYPE = JSON().with_variant(_PG_JSONB, "postgresql")
 
-        JSONB_TYPE = _PG_JSONB
-    except Exception:
-        JSONB_TYPE = JSON
-else:
-    # Compatibility: some modules still declare columns using Postgres JSONB.
-    # When running on SQLite for local dev/tests, compile that JSONB type as JSON
-    # so metadata.create_all does not fail.
-    try:
-        from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB  # type: ignore
-        from sqlalchemy.dialects.postgresql import UUID as _PG_UUID  # type: ignore
-        from sqlalchemy.sql.sqltypes import ARRAY as _SA_ARRAY  # type: ignore
-        from sqlalchemy.ext.compiler import compiles  # type: ignore
+# The sqlite shims are now registered UNCONDITIONALLY, for the same reason.
+# They only ever affect the *sqlite* compiler, so registering them under a
+# Postgres URL is a no-op there — while NOT registering them is the bug above.
+# They remain necessary because ~133 columns across the repo still declare a
+# bare `postgresql.JSONB` (and some a Postgres UUID or ARRAY) rather than going
+# through JSONB_TYPE; those have no variant of their own to fall back on.
+try:
+    from sqlalchemy.dialects.postgresql import UUID as _PG_UUID  # type: ignore
+    from sqlalchemy.sql.sqltypes import ARRAY as _SA_ARRAY  # type: ignore
+    from sqlalchemy.ext.compiler import compiles  # type: ignore
 
-        @compiles(_PG_JSONB, "sqlite")  # type: ignore[misc]
-        def _compile_jsonb_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
-            return "JSON"
+    @compiles(_PG_JSONB, "sqlite")  # type: ignore[misc]
+    def _compile_jsonb_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+        return "JSON"
 
-        # Some tables declare Postgres UUID columns (e.g. merchant_audit_runs.run_id).
-        # SQLite has no UUID type; store as text so metadata.create_all does not fail.
-        @compiles(_PG_UUID, "sqlite")  # type: ignore[misc]
-        def _compile_uuid_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
-            return "CHAR(36)"
+    # Some tables declare Postgres UUID columns (e.g. merchant_audit_runs.run_id).
+    # SQLite has no UUID type; store as text so metadata.create_all does not fail.
+    @compiles(_PG_UUID, "sqlite")  # type: ignore[misc]
+    def _compile_uuid_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+        return "CHAR(36)"
 
-        # Some tables declare ARRAY columns (Postgres-only). For local SQLite dev,
-        # compile ARRAY as JSON so metadata.create_all does not fail.
-        @compiles(_SA_ARRAY, "sqlite")  # type: ignore[misc]
-        def _compile_array_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
-            return "JSON"
+    # Some tables declare ARRAY columns (Postgres-only). For local SQLite dev,
+    # compile ARRAY as JSON so metadata.create_all does not fail.
+    @compiles(_SA_ARRAY, "sqlite")  # type: ignore[misc]
+    def _compile_array_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+        return "JSON"
 
-    except Exception:
-        pass
+except Exception:
+    pass
 
 # Initialize DB connection (databases library handles pooling)
 from utils.transient_errors import PoolCheckoutTimeout  # noqa: E402

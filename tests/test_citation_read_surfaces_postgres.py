@@ -18,9 +18,12 @@ sharper: there, an expression compiled fine and only the full statement failed t
 PREPARE. Here the fragment itself was not valid SQL and no amount of inspecting
 it in Python said so. Only a real server parsing the real statement does.
 
-RUNNING THIS. Skipped unless DATABASE_URL points at a Postgres. `db/database.py`
-picks JSONB_TYPE from that URL AT IMPORT, so it must be set before pytest imports
-anything or the test silently exercises generic JSON and proves nothing.
+RUNNING THIS. Skipped unless DATABASE_URL points at a Postgres — only a real
+server parses the real statement. (`db/database.py` used to pick JSONB_TYPE from
+that URL AT IMPORT, so before 2026-09-01 the URL also had to be set before pytest
+imported anything or the test silently exercised generic JSON. JSONB_TYPE is now
+a `with_variant` resolved by the compiling dialect, so import order no longer
+decides the column type.)
 
     createdb pivota_dialect_check
     DATABASE_URL=postgresql://localhost/pivota_dialect_check \
