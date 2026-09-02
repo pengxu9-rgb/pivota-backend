@@ -34,6 +34,7 @@ from db.merchant_onboarding import get_merchant_onboarding
 from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
 from db.products import log_order_event
 from db.database import database, IS_POSTGRES
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from utils.auth import require_admin, require_admin_or_key, get_current_user
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
@@ -4908,20 +4909,13 @@ async def confirm_payment(
                 }
             )
             
-            # 后台任务：创建 Shopify 订单
-            async def create_shopify_order_task():
-                """创建 Shopify 订单通知商户发货"""
-                try:
-                    logger.info(f"Creating Shopify order for {payment_request.order_id}")
-                    success = await create_shopify_order(payment_request.order_id)
-                    if success:
-                        logger.info(f"Shopify order created successfully for {payment_request.order_id}")
-                    else:
-                        logger.error(f"Failed to create Shopify order for {payment_request.order_id}")
-                except Exception as e:
-                    logger.error(f"Error in Shopify order creation task: {e}")
-            
-            background_tasks.add_task(create_shopify_order_task)
+            # Durable enqueue — replaces `background_tasks.add_task`, which ran
+            # after the response in this process, with no retry, and died with a
+            # Cloud Run revision swap while the buyer was already charged.
+            await enqueue_merchant_order_create(
+                order_id=payment_request.order_id,
+                merchant_id=str(order.get("merchant_id") or ""),
+            )
 
             # Legacy Phase 5.5/6 merchant→agent commission system was deprecated
             # 2026-05-23. See docs/monetization/LEGACY_COMMISSION_SYSTEM_AUDIT.md.

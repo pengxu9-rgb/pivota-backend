@@ -630,3 +630,149 @@ async def test_checkout_webhook_missing_order_marks_event_failed(
     assert resp.json()["detail"] == "Order not found"
     assert recorded_events[0]["status"] == "pending"
     assert status_updates == [("evt_missing_order", "failed", "Order not found")]
+
+
+@pytest.mark.asyncio
+async def test_checkout_webhook_enqueues_the_merchant_order_durably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two sites in this webhook used to dispatch the merchant-order create
+    through BackgroundTasks, which died with the process. They now enqueue, and
+    must carry `require_shopify_primary` — this path has only ever created
+    merchant orders for a Shopify PRIMARY store, unlike the sync it calls."""
+    import db.orders as orders_module
+    import routes.order_routes as order_routes_module
+    import routes.payment_routes as payment_routes_module
+    import services.webhook_service as webhook_module
+
+    enqueued: list[Dict[str, Any]] = []
+
+    async def fake_check_duplicate_event(event_id: str, order_id: str | None = None):
+        return False, None
+
+    async def fake_record_webhook_event(**kwargs: Any) -> int:
+        return 21
+
+    async def fake_update_event_status(event_id: str, status: str, error_message: str | None = None) -> None:
+        return None
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any] | None:
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_webhook",
+            "payment_status": "awaiting_payment",
+            "shopify_order_id": None,
+            "payment_intent_id": "pi_enqueue",
+            "client_secret": "cs_enqueue",
+            "total": "45.20",
+            "currency": "USD",
+        }
+
+    async def fake_update_payment_info(**kwargs: Any) -> None:
+        return None
+
+    async def fake_mark_order_paid(order_id: str) -> bool:
+        return True
+
+    async def fake_log_order_event(**kwargs: Any) -> None:
+        return None
+
+    async def fake_enqueue(*, order_id, merchant_id, require_shopify_primary=False):
+        enqueued.append({
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "require_shopify_primary": require_shopify_primary,
+        })
+        return "job-1"
+
+    monkeypatch.delenv("CHECKOUT_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setattr(webhook_module.WebhookService, "check_duplicate_event", staticmethod(fake_check_duplicate_event))
+    monkeypatch.setattr(webhook_module.WebhookService, "record_webhook_event", staticmethod(fake_record_webhook_event))
+    monkeypatch.setattr(webhook_module.WebhookService, "update_event_status", staticmethod(fake_update_event_status))
+    monkeypatch.setattr(orders_module, "get_order", fake_get_order)
+    monkeypatch.setattr(orders_module, "update_payment_info", fake_update_payment_info)
+    monkeypatch.setattr(orders_module, "mark_order_paid", fake_mark_order_paid)
+    monkeypatch.setattr(order_routes_module, "log_order_event", fake_log_order_event)
+    # Patch where the name is USED: payment_routes binds it with a module-level
+    # `from ... import`, so patching the source module would not reach it.
+    monkeypatch.setattr(payment_routes_module, "enqueue_merchant_order_create", fake_enqueue)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/payments/webhooks/checkout",
+            json=_checkout_payload("ORD_ENQUEUE", event_id="evt_enqueue"),
+        )
+
+    assert resp.status_code == 200
+    assert enqueued == [{
+        "order_id": "ORD_ENQUEUE",
+        "merchant_id": "m_webhook",
+        "require_shopify_primary": True,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_checkout_webhook_already_paid_branch_also_enqueues_durably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The already-paid branch is the SECOND of this webhook's two create sites.
+    It is reached on a redelivered webhook for an order that was finalized by
+    another path — precisely when the first attempt's background task may have
+    been the thing that died."""
+    import db.orders as orders_module
+    import routes.payment_routes as payment_routes_module
+    import services.webhook_service as webhook_module
+
+    enqueued: list[Dict[str, Any]] = []
+
+    async def fake_check_duplicate_event(event_id: str, order_id: str | None = None):
+        return False, None
+
+    async def fake_record_webhook_event(**kwargs: Any) -> int:
+        return 22
+
+    async def fake_update_event_status(event_id: str, status: str, error_message: str | None = None) -> None:
+        return None
+
+    async def fake_get_order(order_id: str) -> Dict[str, Any] | None:
+        return {
+            "order_id": order_id,
+            "merchant_id": "m_already",
+            # already paid, and no merchant order yet
+            "payment_status": "paid",
+            "shopify_order_id": None,
+            "payment_intent_id": "pi_already",
+            "total": "45.20",
+            "currency": "USD",
+        }
+
+    async def fake_enqueue(*, order_id, merchant_id, require_shopify_primary=False):
+        enqueued.append({
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "require_shopify_primary": require_shopify_primary,
+        })
+        return "job-1"
+
+    monkeypatch.delenv("CHECKOUT_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setattr(webhook_module.WebhookService, "check_duplicate_event", staticmethod(fake_check_duplicate_event))
+    monkeypatch.setattr(webhook_module.WebhookService, "record_webhook_event", staticmethod(fake_record_webhook_event))
+    monkeypatch.setattr(webhook_module.WebhookService, "update_event_status", staticmethod(fake_update_event_status))
+    monkeypatch.setattr(orders_module, "get_order", fake_get_order)
+    monkeypatch.setattr(payment_routes_module, "enqueue_merchant_order_create", fake_enqueue)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/payments/webhooks/checkout",
+            json=_checkout_payload("ORD_ALREADY", event_id="evt_already_enqueue"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "already_paid"
+    assert enqueued == [{
+        "order_id": "ORD_ALREADY",
+        "merchant_id": "m_already",
+        "require_shopify_primary": True,
+    }]

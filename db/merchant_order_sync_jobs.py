@@ -29,9 +29,17 @@ from db._ddl_guard import apply_ddl_statements
 from db.database import database
 from utils.logger import logger
 
-# Operations. Only OP_REFUND_SYNC is wired today; the five create sites can move
-# onto this queue without a schema change.
+# Operations.
 OP_REFUND_SYNC = "refund_sync"
+# The post-payment merchant-order create, previously dispatched through
+# `background_tasks.add_task` at five call sites.
+OP_MERCHANT_ORDER_CREATE = "merchant_order_create"
+
+# One create job per order, ever. The unique index is
+# (order_id, op, dedupe_key), so a constant key means five call sites racing on
+# the same order — an agent confirm and a PSP webhook both landing — enqueue
+# once rather than five times.
+MERCHANT_ORDER_CREATE_DEDUPE_KEY = "order"
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -208,6 +216,32 @@ async def enqueue_merchant_order_sync_job(
             str(exc)[:300],
         )
         return None
+
+
+async def enqueue_merchant_order_create(
+    *,
+    order_id: str,
+    merchant_id: str,
+    require_shopify_primary: bool = False,
+) -> Optional[str]:
+    """Queue the post-payment merchant-order create for one order.
+
+    Thin wrapper so the five call sites that used to build their own
+    `background_tasks` closure now share one shape. Best-effort like every
+    enqueue on this path: returns None (logged at ERROR) rather than raising,
+    because it runs after the buyer has already been charged.
+    """
+    return await enqueue_merchant_order_sync_job(
+        order_id=str(order_id),
+        merchant_id=str(merchant_id),
+        op=OP_MERCHANT_ORDER_CREATE,
+        dedupe_key=MERCHANT_ORDER_CREATE_DEDUPE_KEY,
+        payload={
+            "order_id": str(order_id),
+            "merchant_id": str(merchant_id),
+            "require_shopify_primary": bool(require_shopify_primary),
+        },
+    )
 
 
 async def claim_next_merchant_order_sync_job(

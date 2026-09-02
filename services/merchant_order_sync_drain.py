@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from db.merchant_order_sync_jobs import (
+    OP_MERCHANT_ORDER_CREATE,
     OP_REFUND_SYNC,
     claim_next_merchant_order_sync_job,
     complete_merchant_order_sync_job,
@@ -308,7 +309,77 @@ async def _run_refund_sync_job(
     )
 
 
-_HANDLERS = {OP_REFUND_SYNC: _run_refund_sync_job}
+async def _run_merchant_order_create_job(
+    payload: Dict[str, Any],
+    progress: Optional[Dict[str, Any]] = None,
+    on_progress=None,
+) -> Dict[str, Any]:
+    """Create the merchant-side order for an order the buyer has already paid.
+
+    Replaces the `background_tasks.add_task(create_shopify_order, ...)` at five
+    call sites. Safe to retry: `sync_order_to_connected_store` returns early
+    when the order already carries a linked platform order, and takes an
+    advisory lock around the create itself.
+    """
+    from db.orders import get_order
+    from routes.order_routes import sync_order_to_connected_store
+
+    order_id = str(payload.get("order_id") or "")
+    merchant_id = str(payload.get("merchant_id") or "")
+    if not order_id:
+        return {"skipped": "no_order_id"}
+
+    if payload.get("require_shopify_primary"):
+        # Preserves the Checkout.com webhook's own narrower guard. That path
+        # only ever created merchant orders for a Shopify PRIMARY store, even
+        # though `sync_order_to_connected_store` also dispatches WooCommerce,
+        # BigCommerce and Wix. Widening it here would silently start creating
+        # orders on platforms that webhook has never served.
+        from services.merchant_store_service import get_primary_store
+
+        store = await get_primary_store(merchant_id)
+        if not (store and str(store.get("platform") or "").lower() == "shopify"):
+            return {"skipped": "primary_store_not_shopify"}
+
+    if await sync_order_to_connected_store(order_id):
+        return {"created": True}
+
+    # It returned False, and on the way it wrote a `merchant_order` marker
+    # saying whether the condition is worth retrying. Read that rather than
+    # guessing: `wix_order_writeback_not_ready` and a missing bound store are
+    # both marked retryable=False, and burning ten attempts on either only
+    # delays a page for something no retry fixes.
+    order = await get_order(order_id) or {}
+    metadata = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+    merchant_order = metadata.get("merchant_order") or {}
+    reason = str(merchant_order.get("last_failure_reason") or "unknown")
+
+    if merchant_order.get("retryable") is False:
+        # Completing here does NOT mean the merchant received the order — it
+        # means no retry can change that. Unlike the refund path, this failure
+        # leaves a queryable trace: the order stays paid with no merchant order,
+        # so `paid_missing_merchant_order_count` keeps counting it and the ops
+        # retry endpoint can still act on it. That standing signal is what makes
+        # completing safe here.
+        logger.error(
+            "merchant_order_sync: %s cannot be created for order %s (reason=%s, "
+            "not retryable); it remains counted by "
+            "paid_missing_merchant_order_count",
+            OP_MERCHANT_ORDER_CREATE,
+            order_id,
+            reason,
+        )
+        return {"created": False, "skipped": reason}
+
+    raise _RetryableSyncError(
+        f"merchant order creation returned false for {order_id} (reason={reason})"
+    )
+
+
+_HANDLERS = {
+    OP_REFUND_SYNC: _run_refund_sync_job,
+    OP_MERCHANT_ORDER_CREATE: _run_merchant_order_create_job,
+}
 
 
 async def run_merchant_order_sync_worker_tick() -> Dict[str, Any]:

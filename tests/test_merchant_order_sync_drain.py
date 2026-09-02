@@ -905,3 +905,119 @@ async def test_enqueue_is_not_skipped_when_the_bound_store_cannot_be_resolved(mo
 
     assert len(calls) == 1, "a refund with a bound store_id was silently dropped"
     assert calls[0]["payload"]["store_id"] == "st_stale"
+
+
+# ---------------------------------------------------------------------------
+# The merchant-order CREATE op, which replaced `background_tasks.add_task` at
+# five call sites.
+# ---------------------------------------------------------------------------
+
+
+def _wire_create(monkeypatch, *, sync_returns=True, order=None, primary=None):
+    import db.orders as orders_module
+    import routes.order_routes as order_routes
+    import services.merchant_store_service as store_svc
+
+    calls = {"sync": [], "primary": []}
+
+    async def fake_sync(order_id):
+        calls["sync"].append(order_id)
+        return sync_returns
+
+    async def fake_get_order(order_id):
+        return order or {}
+
+    async def fake_primary(merchant_id):
+        calls["primary"].append(merchant_id)
+        return primary
+
+    monkeypatch.setattr(order_routes, "sync_order_to_connected_store", fake_sync)
+    monkeypatch.setattr(orders_module, "get_order", fake_get_order)
+    monkeypatch.setattr(store_svc, "get_primary_store", fake_primary)
+    return calls
+
+
+def _create_payload(**over):
+    base = {"order_id": "ORD_1", "merchant_id": "merch_1",
+            "require_shopify_primary": False}
+    base.update(over)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_create_job_syncs_the_order(monkeypatch):
+    calls = _wire_create(monkeypatch, sync_returns=True)
+
+    result = await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+    assert result == {"created": True}
+    assert calls["sync"] == ["ORD_1"]
+
+
+@pytest.mark.asyncio
+async def test_create_job_retries_a_recoverable_failure(monkeypatch):
+    """`sync_order_to_connected_store` returns False and writes a marker saying
+    whether the condition is worth retrying."""
+    _wire_create(
+        monkeypatch,
+        sync_returns=False,
+        order={"metadata": {"merchant_order": {
+            "retryable": True, "last_failure_reason": "merchant_order_create_returned_false",
+        }}},
+    )
+
+    with pytest.raises(drain._RetryableSyncError):
+        await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+
+@pytest.mark.asyncio
+async def test_create_job_does_not_burn_the_budget_on_an_unretryable_failure(monkeypatch):
+    """`wix_order_writeback_not_ready` and a missing bound store are both marked
+    retryable=False. Unlike the refund path this leaves a queryable trace — the
+    order stays paid with no merchant order — so completing is safe and the
+    standing `paid_missing_merchant_order_count` signal keeps counting it."""
+    _wire_create(
+        monkeypatch,
+        sync_returns=False,
+        order={"metadata": {"merchant_order": {
+            "retryable": False, "last_failure_reason": "wix_order_writeback_not_ready",
+        }}},
+    )
+
+    result = await drain._run_merchant_order_create_job(_create_payload(), {}, None)
+
+    assert result["created"] is False
+    assert result["skipped"] == "wix_order_writeback_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_create_job_honours_the_webhooks_shopify_primary_guard(monkeypatch):
+    """The Checkout.com webhook only ever created merchant orders for a Shopify
+    PRIMARY store, even though the sync also dispatches Woo/BigCommerce/Wix.
+    Widening that here would start creating orders on platforms it never served."""
+    calls = _wire_create(
+        monkeypatch, sync_returns=True,
+        primary={"platform": "woocommerce", "domain": "shop.example"},
+    )
+
+    result = await drain._run_merchant_order_create_job(
+        _create_payload(require_shopify_primary=True), {}, None
+    )
+
+    assert result == {"skipped": "primary_store_not_shopify"}
+    assert calls["sync"] == [], "the sync must not run behind this guard"
+
+
+@pytest.mark.asyncio
+async def test_create_job_proceeds_when_the_primary_is_shopify(monkeypatch):
+    calls = _wire_create(
+        monkeypatch, sync_returns=True,
+        primary={"platform": "shopify", "domain": "x.myshopify.com"},
+    )
+
+    result = await drain._run_merchant_order_create_job(
+        _create_payload(require_shopify_primary=True), {}, None
+    )
+
+    assert result == {"created": True}
+    assert calls["sync"] == ["ORD_1"]

@@ -336,3 +336,42 @@ async def test_complete_is_lease_fenced_and_reports_why():
         {"j": a["job_id"]},
     ))
     assert row["status"] == "done"
+
+
+async def test_five_call_sites_racing_on_one_order_enqueue_once():
+    """The create op keys on a constant, so an agent confirm and a PSP webhook
+    both landing for the same order produce ONE job, not five."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    ids = []
+    for _ in range(5):
+        ids.append(await enqueue_merchant_order_create(
+            order_id=order_id, merchant_id="merch_test",
+        ))
+
+    assert all(i is not None for i in ids)
+    assert len(set(ids)) == 1, f"five enqueues produced {len(set(ids))} distinct jobs"
+
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS c FROM merchant_order_sync_jobs WHERE order_id = :o",
+        {"o": order_id},
+    )
+    assert dict(row)["c"] == 1
+
+
+async def test_a_create_and_a_refund_job_coexist_for_one_order():
+    """Different ops, so the create must not dedupe against a refund_sync job."""
+    from db.database import database
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+
+    order_id = _order_id()
+    await enqueue_merchant_order_create(order_id=order_id, merchant_id="merch_test")
+    await _enqueue(order_id, dedupe="re_1")
+
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS c FROM merchant_order_sync_jobs WHERE order_id = :o",
+        {"o": order_id},
+    )
+    assert dict(row)["c"] == 2
