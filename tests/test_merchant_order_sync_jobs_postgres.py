@@ -490,3 +490,59 @@ async def test_a_revive_does_not_disturb_a_running_job():
     assert row["status"] == "running", "a running job must not be revived"
     assert row["attempts"] == 1
     assert row["claimed_by_worker"] == "worker-a", "the lease must survive"
+
+
+async def test_the_reconciler_only_repairs_orders_the_queue_never_heard_of():
+    """It used to call `create_shopify_order` directly on every candidate. On a
+    schedule that re-POSTs, and the create is not remotely idempotent on
+    Woo/Wix/BigCommerce — an order whose create partially landed matches the
+    query forever, so every tick would make another merchant order."""
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import postgresql
+    from datetime import datetime, timedelta, timezone
+
+    from db.database import database
+    from db.orders import orders as orders_table
+    from db.merchant_order_sync_jobs import enqueue_merchant_order_create
+    from jobs.agentic_commerce_reconciliation import (
+        reconcile_paid_orders_missing_merchant_order,
+    )
+
+    try:
+        await database.execute(
+            str(CreateTable(orders_table).compile(dialect=postgresql.dialect())))
+    except Exception:
+        pass
+
+    merchant = f"merch_recon_{uuid.uuid4().hex[:6]}"
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+
+    async def ins(oid, meta=None):
+        await database.execute(orders_table.insert().values(
+            order_id=oid, merchant_id=merchant, customer_email="r@x.test",
+            shipping_address={}, items=[], subtotal=10, total=10, currency="USD",
+            payment_status="paid", status="paid", shopify_order_id=None,
+            metadata=meta or {}, is_deleted=False, created_at=old, paid_at=old))
+
+    await ins("ORD_LOST_ENQUEUE")                       # must be repaired
+    await ins("ORD_ALREADY_QUEUED")                     # queue owns it
+    await ins("ORD_ON_WOO", {"merchant_order": {"platform_order_id": "woo-5"}})
+    await enqueue_merchant_order_create(
+        order_id="ORD_ALREADY_QUEUED", merchant_id=merchant)
+
+    try:
+        result = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=True)
+        assert result["candidates"] == ["ORD_LOST_ENQUEUE"], result
+
+        done = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=False)
+        assert done["queued"] == 1
+
+        # And it is now inert for that order: a second pass sees the job it made.
+        again = await reconcile_paid_orders_missing_merchant_order(
+            merchant_id=merchant, limit=50, min_age_seconds=60, dry_run=True)
+        assert again["candidates"] == [], "the reconciler re-attempted its own work"
+    finally:
+        await database.execute(
+            "DELETE FROM orders WHERE merchant_id = :m", {"m": merchant})
