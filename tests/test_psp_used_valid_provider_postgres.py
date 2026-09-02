@@ -32,6 +32,15 @@ two ends are fixed differently and both halves are asserted below: 'antom' is
 real, so migration 208 widens the constraint to admit it; 'square' is not, so the
 endpoint refuses it with a 400 at onboarding.
 
+A SECOND writer/reader disagreement on the same row, fixed here too: this route
+also minted `f"psp_{psp_type}_{uuid4().hex[:8]}"` for a NEW psp_id — an EIGHT-char
+suffix, where check_psp_id_format demands twelve. Same silent shape, same row,
+same 500 at first sale. It now delegates to the canonical generator. (The same
+one-line fix is on claude/elastic-knuth-d1c1d1 as 20f4542c; the hunks are
+byte-identical so the two converge rather than conflict. That branch additionally
+constrains merchant_psps.psp_id at write time — the deeper fix — which is NOT
+duplicated here.)
+
 A THIRD instance, latent: the capability-gated deferred lane writes
 CAPABILITY_DEFERRED_PSP_PROVIDER ('protocol_deferred') to psp_used and
 `_capability_deferred_psp_id()` to psp_id, and BOTH violated their constraints —
@@ -54,6 +63,10 @@ MUTANTS THESE KILL:
   -> the same test fails at the INSERT, for the same reason.
 * drop 'antom' from migration 208's list
   -> test_antom_onboards_and_then_really_sells fails at the real INSERT.
+* restore the inline `uuid.uuid4().hex[:8]` psp_id mint in
+  routes/employee_store_psp_fixes.py
+  -> test_antom_onboards_and_then_really_sells fails at the real INSERT, with the
+     production error verbatim.
 * revert _capability_deferred_psp_id to `f"{merchant_id}:protocol_deferred"`
   -> test_the_deferred_lane_sentinel_is_insertable fails on check_psp_id_format.
 * drop 'protocol_deferred' from migration 208's list
@@ -380,47 +393,74 @@ async def test_the_schema_guard_twin_really_installs_it() -> None:
 
 
 async def test_antom_onboards_and_then_really_sells() -> None:
-    """THE regression, half one. 'antom' is real; onboard, then really sell.
+    """THE regression. Onboard through the real route, then really sell.
 
-    SCOPE — and one thing this deliberately does NOT assert. The pair that reaches
-    `create_order` is (merchant_psps.provider, merchant_psps.psp_id). This file's
-    subject is the PROVIDER half. The psp_id half has its own live defect on this
-    branch: setup-psp still mints `f"psp_{psp_type}_{uuid4().hex[:8]}"` — an
-    EIGHT-character suffix that `orders.check_psp_id_format` (twelve) refuses.
-    That is the defect commit 20f4542c fixes, and 20f4542c is NOT an ancestor of
-    this branch (it lives on claude/elastic-knuth-d1c1d1, unmerged). Asserting on
-    the route-minted psp_id here would either duplicate that fix or ship a
-    permanently red test, so the INSERT below carries a psp_id from the repo's own
-    canonical generator — the exact value the route will pass once 20f4542c lands.
-    tests/test_psp_id_format_constraint_postgres.py on that branch owns the psp_id
-    axis. Both must land for a self-service-onboarded merchant to sell.
+    Both halves of the pair that reaches `create_order` are the route's own:
+    merchant_psps.provider AND merchant_psps.psp_id. Nothing is substituted here,
+    so this is the whole merchant journey — self-service onboarding to first
+    order — executed against the engine production runs.
+
+    The psp_id half is its own defect, and it is a second writer/reader
+    disagreement on the same row: `check_psp_id_format` demands
+    `^psp_[a-z0-9]+_[a-z0-9]{12}$` and this route minted
+    `f"psp_{psp_type}_{uuid4().hex[:8]}"` — EIGHT characters. Both must be fixed
+    for the merchant to sell, which is why both are asserted in one flow: a test
+    that stubbed either half would go green while the merchant still 500s.
     """
     from db.orders import create_order
-    from services.merchant_psp_config_service import _generate_psp_id
 
     response = await _run_self_service_onboarding("antom")
     assert response["status"] == "success", response
 
-    # The route wrote an ACTIVE row, and the real resolver hands its provider to
-    # order creation. No allowlist stands between the two.
+    # The route wrote an ACTIVE row, and the real resolver hands BOTH of its
+    # values to order creation. No allowlist stands between the two.
     from routes.order_routes import _resolve_active_order_psp
 
-    provider, _resolved_psp_id = await _resolve_active_order_psp(_MERCHANT_ID, None)
+    provider, psp_id = await _resolve_active_order_psp(_MERCHANT_ID, None)
     assert provider == "antom"
+    assert psp_id == response["psp_id"], "the route and the resolver disagree"
 
-    # Because an allowlist in Python is not the database, the real INSERT the real
-    # order route performs must actually land.
-    order_id = await create_order(_order_values(provider, _generate_psp_id(provider)))
+    # The id the route minted must satisfy the rule `orders` enforces...
+    assert re.fullmatch(r"psp_[a-z0-9]+_[a-z0-9]{12}", psp_id, re.IGNORECASE), psp_id
+    assert len(psp_id.rsplit("_", 1)[1]) == 12, (
+        f"{psp_id!r} — the defect was an EIGHT-character suffix"
+    )
+
+    # ...and, because a regex in a test is not the database and an allowlist in
+    # Python is not the database either, the real INSERT the real order route
+    # performs must actually land.
+    order_id = await create_order(_order_values(provider, psp_id))
     assert order_id
 
     from db.database import database
 
     stored = dict(
         await database.fetch_one(
-            "SELECT psp_used FROM orders WHERE order_id = :o", {"o": order_id}
+            "SELECT psp_used, psp_id FROM orders WHERE order_id = :o", {"o": order_id}
         )
     )
     assert stored["psp_used"] == "antom"
+    assert stored["psp_id"] == psp_id
+
+
+async def test_the_pre_fix_psp_id_shape_is_still_rejected_by_orders() -> None:
+    """The control for the psp_id half.
+
+    Without it, the test above passes on a database whose check_psp_id_format was
+    never installed — and the fixture, not the constraint, would be doing the work.
+    """
+    import uuid
+
+    from db.orders import create_order
+
+    # Byte-for-byte the expression this route used to run.
+    pre_fix_psp_id = f"psp_antom_{uuid.uuid4().hex[:8]}"
+    assert not re.fullmatch(r"psp_[a-z0-9]+_[a-z0-9]{12}", pre_fix_psp_id)
+
+    with pytest.raises(Exception) as excinfo:
+        await create_order(_order_values("antom", pre_fix_psp_id))
+    # Named, so a fixture defect cannot masquerade as the constraint firing.
+    assert ORDERS_PSP_ID_CONSTRAINT in str(excinfo.value), str(excinfo.value)
 
 
 async def test_square_is_refused_at_onboarding() -> None:
