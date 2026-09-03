@@ -117,7 +117,15 @@ merchant_audit_runs = Table(
     "merchant_audit_runs",
     metadata,
     Column("run_id", UUID(as_uuid=False), primary_key=True),
-    Column("merchant_id", Text, nullable=False),
+    # NULL until a merchant claims the run. An anonymous run is created by
+    # the public funnel before anyone has registered; conversion claims the
+    # SAME row (never a copy) via claim_audit_run_for_merchant.
+    #
+    # Read safety: nothing grants on a NULL owner. Every ownership check
+    # compares `row.get("merchant_id") != merchant_id` against an id from
+    # get_current_merchant, which raises 401 on a falsy claim and so can
+    # never itself be None — so None != "<real id>" rejects.
+    Column("merchant_id", Text, nullable=True),
     Column("requested_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("status", Text, nullable=False),
@@ -131,6 +139,7 @@ merchant_audit_runs = Table(
     # product_key resolution basis (migration 158).
     Column("content_keys", ARRAY(Text), nullable=True),
     Column("content_key_basis", JSONB, nullable=True),
+    Column("merchant_claimed_at", DateTime(timezone=True), nullable=True),
     Column("report_jsonb", JSONB, nullable=True),
     Column("error_message", Text, nullable=True),
     # P2.1: async lifecycle columns (migration 083). See
@@ -214,7 +223,7 @@ _DDL_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS merchant_audit_runs (
       run_id                        UUID PRIMARY KEY,
-      merchant_id                   TEXT NOT NULL,
+      merchant_id                   TEXT NULL,
       requested_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at                  TIMESTAMPTZ NULL,
       status                        TEXT NOT NULL,
@@ -262,6 +271,19 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS claimed_by_worker TEXT;",
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;",
+    # C3 (migration 210): anonymous runs. The CREATE TABLE above still
+    # declares merchant_id NOT NULL for fresh databases built from this
+    # backstop, so the constraint has to be dropped explicitly for any
+    # database that already has the table. DROP NOT NULL is idempotent on
+    # Postgres and fails-and-skips on SQLite, where create_all builds the
+    # table from the model (already nullable) instead.
+    "ALTER TABLE merchant_audit_runs "
+    "ALTER COLUMN merchant_id DROP NOT NULL;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_unclaimed "
+    "ON merchant_audit_runs (requested_at DESC) "
+    "WHERE merchant_id IS NULL;",
     "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_worker_pull "
     "ON merchant_audit_runs (stage, claimed_until, requested_at) "
     "WHERE stage IN ('queued', 'discovering', 'probing', 'scoring', "
@@ -303,9 +325,54 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def claim_audit_run_for_merchant(
+    *,
+    run_id: str,
+    merchant_id: str,
+) -> bool:
+    """Claim ONE unclaimed run for a merchant. Returns True iff this call
+    is the one that claimed it.
+
+    Claim-by-one-UPDATE, the pattern `claim_prospects_for_merchant` already
+    uses: the guard lives in the WHERE clause, so two concurrent claims can
+    never both succeed and the row is never duplicated. A run that already
+    has an owner is NOT re-claimable — `merchant_id IS NULL` is what makes
+    this a claim rather than a takeover.
+    """
+    if not run_id or not merchant_id:
+        return False
+    owner = str(merchant_id).strip()
+    if not owner:
+        return False
+    await ensure_merchant_audit_runs_table()
+    try:
+        # Plain UPDATE ... RETURNING rather than the data-modifying CTE the
+        # prospect_products claim uses: the CTE form is Postgres-only, and
+        # this statement is exercised on SQLite too. The guard is unchanged —
+        # it lives in the WHERE clause either way.
+        rows = await database.fetch_all(
+            """
+            UPDATE merchant_audit_runs
+               SET merchant_id = :merchant_id,
+                   merchant_claimed_at = :now
+             WHERE run_id = :run_id
+               AND merchant_id IS NULL
+            RETURNING run_id
+            """,
+            {"run_id": str(run_id), "merchant_id": owner, "now": _now_utc()},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "claim_audit_run_for_merchant failed for run_id=%s merchant=%s: %s",
+            run_id, owner, str(exc)[:200],
+        )
+        return False
+    return len(rows or []) > 0
+
+
 async def record_audit_run_started(
     *,
-    merchant_id: str,
+    merchant_id: Optional[str],
     product_keys: List[str],
     subject_type: str = "merchant",
 ) -> Optional[str]:
@@ -316,14 +383,20 @@ async def record_audit_run_started(
 
     `subject_type` marks the run kind (e.g. "merchant_url" for the free
     URL-audit wedge) so callers can count a specific kind of run.
+
+    C3: `merchant_id` may be None for a run started by the public funnel
+    before anyone has registered. An empty string is normalized to None so
+    a falsy caller id can never write "" and make the row look claimed to
+    a `merchant_id IS NULL` guard.
     """
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
+    owner = str(merchant_id).strip() if merchant_id is not None else ""
     try:
         await database.execute(
             merchant_audit_runs.insert().values(
                 run_id=run_id,
-                merchant_id=merchant_id,
+                merchant_id=owner or None,
                 requested_at=_now_utc(),
                 status="running",
                 subject_type=subject_type,
@@ -826,7 +899,7 @@ async def enqueue_audit_run(
 
 async def enqueue_audit_run_with_replay(
     *,
-    merchant_id: str,
+    merchant_id: Optional[str],
     product_keys: List[str],
     subject_type: str = "merchant",
     idempotency_key: Optional[str] = None,
@@ -849,6 +922,31 @@ async def enqueue_audit_run_with_replay(
     an active stage). The DB-level uniqueness closes the check-then-
     insert race that the route-layer find_in_flight could not.
     """
+    # C3: same "" -> NULL normalization as record_audit_run_started, so this
+    # path cannot mint the other orphan class — a row that is unowned AND
+    # permanently unclaimable, because `merchant_id IS NULL` never matches "".
+    owner = str(merchant_id).strip() if merchant_id is not None else ""
+    merchant_id = owner or None
+
+    # An idempotency key is MEANINGLESS without an owner, and silently
+    # proceeding would be worse than refusing: Postgres unique indexes are
+    # NULLS DISTINCT, so uniq_merchant_audit_runs_active_idempotency_key
+    # (merchant_id, idempotency_key) does not constrain NULL-owner rows at
+    # all — measured on PG 15: three inserts of the same key all landed,
+    # where a real owner deduped to one. ON CONFLICT DO NOTHING never fires,
+    # and the docstring's "the DB-level uniqueness closes the check-then-
+    # insert race" stops being true for exactly this row class.
+    #
+    # Unreachable today (services/idempotency.py raises on a falsy id, so no
+    # such key can be derived), and this keeps it that way rather than
+    # leaving an unauthenticated, cost-bearing insert path one wiring slice
+    # from silently duplicating runs.
+    if idempotency_key and not merchant_id:
+        raise ValueError(
+            "merchant_id is required to use an idempotency key: the unique "
+            "index is NULLS DISTINCT and would not dedupe an unowned run"
+        )
+
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
     now = _now_utc()
