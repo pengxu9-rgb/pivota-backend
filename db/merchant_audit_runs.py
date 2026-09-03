@@ -647,6 +647,13 @@ async def count_runs_in_window(
             select(func.count())
             .select_from(merchant_audit_runs)
             .where(
+                # A funnel run is not a merchant-requested audit, so it must
+                # not consume their rate-limit budget. Once claimed it carries
+                # their merchant_id, and without this a visitor's own probe of
+                # their storefront would spend the allowance they get AFTER
+                # registering.
+                merchant_audit_runs.c.subject_type
+                != SUBJECT_TYPE_PUBLIC_FUNNEL,
                 merchant_audit_runs.c.merchant_id == merchant_id,
                 merchant_audit_runs.c.requested_at >= cutoff,
             )
@@ -676,7 +683,12 @@ async def audit_status_counts_in_window(*, window_seconds: int) -> Dict[str, int
         )
         rows = await database.fetch_all(
             "SELECT status, COUNT(*) AS n FROM merchant_audit_runs "
-            "WHERE requested_at >= :cutoff GROUP BY status",
+            "WHERE requested_at >= :cutoff "
+            # The funnel lane writes terminal rows that never move through the
+            # worker's stages; counting them skews the operational picture of
+            # the lane this metric exists to watch.
+            "AND subject_type <> 'public_funnel' "
+            "GROUP BY status",
             {"cutoff": cutoff},
         )
         return {str(r["status"]): int(r["n"] or 0) for r in rows or []}
@@ -860,7 +872,14 @@ async def count_runs_for_merchant_by_subject(
         row = await database.fetch_one(
             select(func.count())
             .select_from(merchant_audit_runs)
-            .where(*conditions)
+            .where(
+                # A funnel run is not a merchant-requested audit, so it must
+                # not consume their rate-limit budget. Once claimed it carries
+                # their merchant_id, and without this a visitor's own probe of
+                # their storefront would spend the allowance they get AFTER
+                # registering.
+                merchant_audit_runs.c.subject_type
+                != SUBJECT_TYPE_PUBLIC_FUNNEL,*conditions)
         )
         if row is None:
             return 0
@@ -914,6 +933,14 @@ async def recent_runs_for_merchant(
         )
         if subject_type:
             query = query.where(merchant_audit_runs.c.subject_type == subject_type)
+        else:
+            # Unscoped means "this merchant's audits". A claimed funnel run is
+            # a public-lane artifact with no report_jsonb, and it reaches the
+            # history list, the trend inputs and the tasks lookup through this
+            # function — naming it explicitly beats every caller remembering.
+            query = query.where(
+                merchant_audit_runs.c.subject_type != SUBJECT_TYPE_PUBLIC_FUNNEL
+            )
         rows = await database.fetch_all(
             query.order_by(merchant_audit_runs.c.requested_at.desc()).limit(limit)
         )

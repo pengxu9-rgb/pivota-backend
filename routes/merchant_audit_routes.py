@@ -1593,10 +1593,30 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
     # The sideways-wedge recommendation ("where you can win") lives in three
     # places: the top-level key, brand_rollup, and the raw brand_report. The
     # top-level usually aliases brand_rollup's object, so strip every home.
-    wcw_homes = [shaped, shaped.get("brand_rollup"), shaped.get("brand_report")]
-    rollup_in_report = (shaped.get("brand_report") or {}).get("brand_rollup")
-    if isinstance(rollup_in_report, dict):
-        wcw_homes.append(rollup_in_report)
+    # `brand_report` is _shape_url_audit_response's envelope key; `report_jsonb`
+    # is the RAW ROW key, which is what audit_runs_routes serves. This helper
+    # now runs on both shapes, so it has to walk both — stripping only the
+    # envelope form left the whole paid layer intact inside report_jsonb.
+    wcw_homes = [
+        shaped,
+        shaped.get("brand_rollup"),
+        shaped.get("brand_report"),
+        shaped.get("report_jsonb"),
+    ]
+    for container_key in ("brand_report", "report_jsonb"):
+        nested = (shaped.get(container_key) or {})
+        if isinstance(nested, dict):
+            rollup_in_report = nested.get("brand_rollup")
+            if isinstance(rollup_in_report, dict):
+                wcw_homes.append(rollup_in_report)
+            narrative_in_report = nested.get("merchant_narrative")
+            if isinstance(narrative_in_report, dict):
+                _actions = narrative_in_report.get("prioritized_actions")
+                if isinstance(_actions, list) and _actions:
+                    counts["prioritized_actions"] = max(
+                        counts["prioritized_actions"], len(_actions)
+                    )
+                    narrative_in_report["prioritized_actions"] = []
     for home in wcw_homes:
         if isinstance(home, dict) and home.get("where_you_can_win") is not None:
             home["where_you_can_win"] = None
@@ -1634,9 +1654,10 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
 
     # brand_report is the raw report dict — its narrative/per-SKU branches are
     # aliases (already stripped above), but the full win_plan is its own tree.
-    brand_report = shaped.get("brand_report")
-    if isinstance(brand_report, dict) and brand_report.get("win_plan") is not None:
-        brand_report["win_plan"] = None
+    for container_key in ("brand_report", "report_jsonb"):
+        container = shaped.get(container_key)
+        if isinstance(container, dict) and container.get("win_plan") is not None:
+            container["win_plan"] = None
 
     summary = shaped.get("report_summary")
     if isinstance(summary, dict):
@@ -1663,6 +1684,20 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         for key in _LOCKED_PER_SKU_ACTION_KEYS:
             if sku.get(key) is not None:
                 sku[key] = None
+
+    # The revenue_recovery projection (C2) carries actions under
+    # stages[].actions — a shape that did not exist when this helper was
+    # written, and one audit_runs_routes serves. Findings stay: they are the
+    # "what's wrong" layer, which is free.
+    for stage in shaped.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        stage_actions = stage.get("actions")
+        if isinstance(stage_actions, list) and stage_actions:
+            counts["prioritized_actions"] = max(
+                counts["prioritized_actions"], len(stage_actions)
+            )
+            stage["actions"] = []
 
     shaped["actions_locked"] = True
     shaped["locked_counts"] = counts
