@@ -31,12 +31,21 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Deque, Dict, Literal, Optional
+from typing import Any, Deque, Dict, Literal, Optional
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from utils.auth import get_current_merchant
+
+from db.merchant_audit_runs import (
+    SUBJECT_TYPE_PUBLIC_FUNNEL,
+    claim_audit_run_for_merchant,
+    find_unclaimed_funnel_run_for_domain,
+    funnel_domain_of,
+    record_anonymous_funnel_run,
+)
 from db.audit_evidence import (
     EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
     ROUTE_KIND_UCP,
@@ -51,6 +60,11 @@ from db.audit_evidence import (
 )
 
 router = APIRouter(prefix="/public/store-audit", tags=["store-audit-public"])
+# The claim is AUTHENTICATED, so it must not live under /public/*. Separate
+# router, separate prefix, mounted alongside in main.py.
+claim_router = APIRouter(
+    prefix="/api/merchant-center", tags=["store-audit-claim"],
+)
 
 _INTAKE_IDEMPOTENCY_PREFIX = "public_intake:"
 _ACTIVE_RUN_STATUSES = ("pending", "claimed")
@@ -202,6 +216,10 @@ class PublicTeaserResponse(BaseModel):
     agent_ready: Optional[bool] = None
     evidence_level: Optional[Literal["detected", "tested"]] = None
     checked_at: Optional[datetime] = None
+    # The unowned run this domain's evidence is deposited against. The visitor
+    # holds it to read the deterministic projection, and the merchant claims it
+    # at conversion. Absent on the teaser GET, which is domain-keyed only.
+    audit_run_id: Optional[str] = None
 
 
 def _now() -> datetime:
@@ -254,6 +272,20 @@ async def _teaser_for_domain(domain: str) -> PublicTeaserResponse:
             checked_at=run.get("completed_at") or run.get("created_at"),
         )
     return PublicTeaserResponse(domain=domain, state="inconclusive")
+
+
+def _reuse_window_hours() -> int:
+    """How long an unclaimed funnel run is reused for a domain.
+
+    Deliberately NOT the negative-evidence TTL (168h): the reuse lookup scans
+    a bounded candidate set, and a week's worth of runs can exceed it, so a
+    long window silently stops reusing and mints duplicates instead. A day
+    keeps the candidate set well inside the bound at the intake cap.
+    """
+    try:
+        return max(1, int(os.getenv("STORE_AUDIT_FUNNEL_REUSE_HOURS", "24")))
+    except (TypeError, ValueError):
+        return 24
 
 
 def _negative_is_fresh(teaser: PublicTeaserResponse) -> bool:
@@ -324,7 +356,42 @@ async def public_store_audit_intake(
             detail={"error": "INTAKE_UNAVAILABLE"},
         )
 
-    audit_run_id = str(route.get("last_audit_run_id") or "") or str(uuid.uuid4())
+    # C3 producer. Until now this id was a bare UUID with no row behind it, so
+    # the evidence the probe deposits belonged to nothing a merchant could ever
+    # claim. It is now a real UNOWNED merchant_audit_runs row, reused per
+    # domain inside the reuse window so refreshing the form does not mint a row
+    # per keystroke.
+    #
+    # The run is created in a terminal state and is NOT queued for the worker:
+    # an unauthenticated endpoint must never be able to spend model credits.
+    #
+    # ONLY FOR A ROUTE THAT POINTS AT NOTHING. If the route already carries a
+    # last_audit_run_id, that domain is already known to the system — very
+    # possibly a real merchant's — and this lane must not touch it. The receipt
+    # path calls upsert_execution_route(audit_run_id=...) and
+    # db/audit_evidence.py's ON CONFLICT does
+    # `COALESCE(EXCLUDED.last_audit_run_id, ...)`, so a non-null value
+    # OVERWRITES. fetch_route_for_domain deliberately ignores merchant_id, so
+    # without this guard any anonymous visitor typing a live merchant's domain
+    # would repoint that merchant's route at an unowned run — and
+    # jobs/scheduled_ucp_reprobe_job.py reads last_audit_run_id, so every
+    # future reprobe would deposit that merchant's acceptance evidence on a run
+    # readable at GET /public/store-audit/run/{id} by anyone.
+    existing_run_id = str(route.get("last_audit_run_id") or "")
+    audit_run_id = existing_run_id
+    funnel_run_id: Optional[str] = None
+    if not existing_run_id:
+        funnel_run = await find_unclaimed_funnel_run_for_domain(
+            domain=domain, since=_now() - timedelta(hours=_reuse_window_hours()),
+        )
+        funnel_run_id = str((funnel_run or {}).get("run_id") or "") or None
+        if not funnel_run_id:
+            funnel_run_id = await record_anonymous_funnel_run(domain=domain)
+        # A persistence failure falls back to a FRESH uuid, never to the
+        # route's id: returning that in the unauthenticated body would hand a
+        # real merchant's audit run id to a stranger.
+        audit_run_id = funnel_run_id or str(uuid.uuid4())
+
     await enqueue_verification_run(
         audit_run_id=audit_run_id,
         verifier_id=VERIFIER_UCP_PROBE,
@@ -337,7 +404,12 @@ async def public_store_audit_intake(
     # A failed enqueue here is overwhelmingly the 196 unique partial index
     # refusing a second active run for the route — someone else just queued
     # the same domain. Either way the honest answer is "pending".
-    return PublicTeaserResponse(domain=domain, state="pending")
+    # Only a run THIS lane owns is handed back. An existing route's id, or a
+    # fallback uuid with no row, would be unreadable at best and someone
+    # else's at worst.
+    return PublicTeaserResponse(
+        domain=domain, state="pending", audit_run_id=funnel_run_id,
+    )
 
 
 @router.get("/teaser", response_model=PublicTeaserResponse)
@@ -355,3 +427,136 @@ async def public_store_audit_teaser(
             detail={"error": "INVALID_STORE_URL"},
         )
     return await _teaser_for_domain(domain)
+
+
+class PublicAuditResponse(BaseModel):
+    """The deterministic projection an unregistered visitor may read."""
+    audit_run_id: str
+    domain: str
+    projection: Dict[str, Any]
+
+
+@router.get("/run/{run_id}", response_model=PublicAuditResponse)
+async def public_store_audit_run(
+    run_id: str, request: Request,
+) -> PublicAuditResponse:
+    """Read the public_anonymous projection for one unowned funnel run.
+
+    UNAUTHENTICATED, so the shape is everything. It serves ONLY the
+    public_anonymous audience — never a merchant or internal one — and only
+    for a run this lane created and nobody has claimed. A claimed run stops
+    answering here: it belongs to a merchant now and is read through the
+    authenticated surface, which is what keeps a claimed audit from staying
+    publicly readable to anyone who kept the URL.
+    """
+    _require_enabled()
+    _require_rate(_teaser_limiter, request)
+
+    from db.audit_evidence import (
+        AUDIENCE_PUBLIC_ANONYMOUS,
+        list_actions_for_run,
+        list_evidence_for_run,
+        list_findings_for_run,
+    )
+    from db.merchant_audit_runs import fetch_audit_run_by_id
+    from services.audit_projection_builder import build_projection
+
+    row = await fetch_audit_run_by_id(run_id=run_id)
+    domain = funnel_domain_of(row or {}) if row else None
+    # Three refusals, one status. A run from another lane, a claimed run, and
+    # a run that does not exist are indistinguishable to an anonymous caller
+    # by design — otherwise this endpoint enumerates which run ids are real.
+    if (
+        not row
+        or row.get("subject_type") != SUBJECT_TYPE_PUBLIC_FUNNEL
+        or row.get("merchant_id")
+        or not domain
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    projection = build_projection(
+        audience=AUDIENCE_PUBLIC_ANONYMOUS,
+        evidence=await list_evidence_for_run(audit_run_id=run_id),
+        findings=await list_findings_for_run(audit_run_id=run_id),
+        actions=await list_actions_for_run(audit_run_id=run_id),
+        audit_run_row=row,
+    )
+    if projection is None:  # pragma: no cover - audience is a constant
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return PublicAuditResponse(
+        audit_run_id=run_id, domain=domain, projection=projection,
+    )
+
+
+class ClaimRunResponse(BaseModel):
+    claimed: bool
+    audit_run_id: str
+
+
+@claim_router.post("/audit/claim/{run_id}", response_model=ClaimRunResponse)
+async def claim_public_audit_run(
+    run_id: str,
+    merchant_id: str = Depends(get_current_merchant),
+) -> ClaimRunResponse:
+    """Attach an anonymous funnel run to the merchant who owns that domain.
+
+    AUTHORIZATION. The run id is NOT a capability. It is handed to whoever
+    submits the domain, and the domain is public — two visitors typing the
+    same store get the same run. So the claim is gated on the domain instead:
+    it must be in `merchant_bound_domains(merchant_id)`, the binding set built
+    in #1994, which excludes a self-asserted domain unless something
+    independent also inferred it.
+
+    KNOWN LIMIT, and it is wider than one field. For a merchant with no
+    merchant_official_domains rows, EVERY host in the bound set comes from the
+    inferred path, so the "asserted" exclusion never fires — and that path is
+    onboarding store_url/website (self-declared, issue #2000) PLUS
+    catalog_products.source_domain / canonical_url for that merchant. So the
+    gate is zero-proof by two routes, not one. This claim is deliberately no
+    stronger than the brand-claim gate it reuses rather than a second, weaker
+    rule invented here; strengthening it is #2000's job and lifts both.
+
+    What a wrongful claim wins is a deterministic fact about a public
+    storefront, plus denying the real owner that row. It exposes nothing
+    private, because the public tier holds nothing private.
+    """
+    _require_enabled()
+    from db.merchant_audit_runs import fetch_audit_run_by_id
+    from services.brand_claim_service import merchant_bound_domains
+
+    row = await fetch_audit_run_by_id(run_id=run_id)
+    domain = funnel_domain_of(row or {}) if row else None
+    if (
+        not row
+        or row.get("subject_type") != SUBJECT_TYPE_PUBLIC_FUNNEL
+        or not domain
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    # The domain gate runs FIRST. An earlier cut raised ALREADY_CLAIMED before
+    # it and echoed the domain in the refusal, so any authenticated merchant
+    # holding a run id learned whether it was claimed and what domain it was
+    # for — while the docstring claimed the opposite. Gate first, and say
+    # nothing back that the caller did not already supply.
+    try:
+        bound = await merchant_bound_domains(merchant_id)
+    except Exception:  # noqa: BLE001
+        # Fail CLOSED: a binding lookup that fails claims nothing.
+        bound = set()
+    if domain not in {str(d).strip().lower() for d in bound or set()}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "DOMAIN_NOT_BOUND"},
+        )
+
+    if row.get("merchant_id"):
+        # Already claimed, and the caller has passed the domain gate, so this
+        # tells them nothing they could not already establish.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "ALREADY_CLAIMED"},
+        )
+
+    claimed = await claim_audit_run_for_merchant(
+        run_id=run_id, merchant_id=merchant_id,
+    )
+    return ClaimRunResponse(claimed=bool(claimed), audit_run_id=run_id)
