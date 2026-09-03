@@ -68,6 +68,56 @@ HUMAN_CO_REVIEW_MODULES = {
     "reviews",
 }
 
+# Modules an LLM-ONLY review may auto-publish.
+#
+# review_module_version() runs its whole role check -- allowed_pdp_review_actions,
+# senior/employee/outsourced, the checklist and policy-label demands -- inside
+# `if actor_type == REVIEW_ACTOR_HUMAN`. The GPT-5.5 lane passes
+# REVIEW_ACTOR_GPT55 and no actor_role at all, so NOTHING on that path consults
+# who is calling. MACHINE_PUBLISH_MODULES is a statement about what the machine
+# gate is capable of grading; it is not an authorization boundary, and on its
+# own it let an LLM-only pass publish offers and identity.
+#
+# This set is that boundary, and it is the one every LLM-only caller reads:
+# routes/merchant_pdp.py (merchant self-approve) and
+# routes/employee_pdp_governance.py (employee gpt55-review). v1 is 'copy' only
+# -- the one module whose blast radius is prose. Widen deliberately: adding a
+# module here hands it to an unauthenticated-by-role publish path.
+LLM_ONLY_PUBLISH_MODULES = {"copy"}
+
+# Why each remaining module is NOT in the set above. Every module in
+# PDP_MODULE_KEYS must appear in exactly one of the two (enforced by
+# tests/test_employee_pdp_gpt55_module_allowlist.py), so a module added to the
+# registry -- or promoted into MACHINE_PUBLISH_MODULES -- cannot drift into the
+# LLM-only lane by omission.
+LLM_ONLY_PUBLISH_EXCLUSIONS: Dict[str, str] = {
+    "identity": (
+        "identity re-keys the product group and the public PDP subject; a wrong "
+        "pass merges or splits real products"
+    ),
+    "variants": (
+        "variant identity is what checkout buys; a wrong pass sells the wrong SKU"
+    ),
+    "offers": (
+        "money-bearing (price, availability, seller); publishing an offer is a "
+        "commercial claim and needs a human publish authority"
+    ),
+    "pivota_insights": (
+        "editorial claims that can carry external proof badges; substantiation is "
+        "a human judgement"
+    ),
+    "external_sources": (
+        "provenance of everything we cite; a bad source launders every downstream "
+        "claim"
+    ),
+    "quality": (
+        "feeds the serving and ranking gates, so a pass here changes what the "
+        "catalog shows without touching catalog content"
+    ),
+    "gallery": "human co-review module -- third-party image rights (HUMAN_CO_REVIEW_MODULES)",
+    "reviews": "human co-review module -- review provenance / fake-review risk (HUMAN_CO_REVIEW_MODULES)",
+}
+
 SENIOR_REVIEW_ROLES = {"senior_employee", "admin", "super_admin", "superadmin"}
 EMPLOYEE_REVIEW_ROLES = {"employee", *SENIOR_REVIEW_ROLES}
 OUTSOURCED_REVIEW_ROLES = {"outsourced"}
