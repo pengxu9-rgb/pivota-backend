@@ -16,6 +16,24 @@
 # Scope is `web` only. `worker` is the single-instance drainer and rolling it has queue semantics
 # this does not model; `proof-issuer` runs a different ASGI app from the same image; the gateway
 # ships from the PIVOTA-Agent repo entirely. Those stay manual on purpose.
+#
+# ── AND IT NOW WAITS FOR THE TESTS ─────────────────────────────────────────────────────────────
+# Measured on 2026-09-03. `Backend Test Sweep` was RED on main for six consecutive commits -
+# d2cbc8ae5, f624e3b0e, a11521e99, eb4a298d3, 4a45c5d55, 61b97f8bd - and this workflow ran on the
+# same commits and SUCCEEDED on every one it was not concurrency-cancelled out of (d2cbc8ae5,
+# f624e3b0e, 61b97f8bd). Production shipped code whose test suite was failing, three times in
+# thirty-three minutes, and nothing anywhere said so.
+#
+# The comment above says "the gate that matters is the required PR check before merge". That is
+# true of the check, and it is not true of the SWEEP: `CI Entrypoint` only enforces the gates whose
+# `on.pull_request.paths` match a given PR's diff, so a PR that matches none of them merges green
+# with the sweep never having run - and the sweep's push-to-main run, which has no paths filter and
+# therefore always runs, had no consumer at all. It reported into the void.
+#
+# So the `test-gate` job below is that consumer: it waits for the sweep AND the Postgres dialect
+# gate to report on THIS EXACT SHA and refuses to release the deploy unless both concluded
+# `success`. Nothing but `success` releases it - see the job for why silence, cancellation and
+# `skipped` all have to block rather than pass.
 name: deploy prod
 
 on:
@@ -34,10 +52,28 @@ on:
         required: true
         type: boolean
         default: true
+      reason:
+        # `required: true` is the UI's half of this. It is NOT enforcement: Actions accepts an
+        # EMPTY string for a required string input from `gh workflow run` and from the API, so the
+        # non-blank check lives in the gate job's script where it can actually refuse.
+        description: 'Why this deploy is being run by hand. Recorded in the run summary and the deploy log.'
+        required: true
+        type: string
+      bypass_test_gate:
+        # DEFAULT FALSE, and it is a separate switch from `reason` on purpose. A dispatch is a
+        # normal, frequent operation here (rollbacks, 0%-traffic candidates) and those must keep
+        # going through the same gate a push does. Only this box skips it, only on a dispatch, and
+        # even then the gate still QUERIES both workflows and prints what it found - there is no
+        # path through this file that ships without the sweep's verdict appearing in the log.
+        description: 'EMERGENCY ONLY. Deploy even if the test sweep is red, absent or still running. Requires a substantive reason.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   id-token: write   # required to mint the OIDC token WIF exchanges - without it auth fails
+  actions: read     # test-gate reads other workflows' run conclusions for this SHA
 
 # Two concurrent deploys race on the same service and can leave traffic pointed at the older of
 # the two. Queue instead of cancelling: a half-finished deploy should be allowed to land or fail
@@ -52,7 +88,258 @@ env:
   REGION: us-west1
 
 jobs:
+  # ── THE GATE ───────────────────────────────────────────────────────────────────────────────────
+  # WHY A POLL AND NOT A `workflow_run` TRIGGER, which is the obvious shape and was rejected:
+  #
+  #   1. Under `workflow_run`, `github.sha` is the LAST COMMIT ON THE DEFAULT BRANCH, not the
+  #      commit the triggering run tested (GitHub documents this in the events table; the tested
+  #      commit is `github.event.workflow_run.head_sha`). This file reads `github.sha` for both the
+  #      SHA it deploys and the ref of its build-source checkout, so swapping the trigger would
+  #      silently turn "deploy the commit whose tests passed" into "deploy whatever is on main
+  #      now" - the precise failure the gate exists to prevent, introduced by an edit that looks
+  #      like a trigger change and reads like one in review.
+  #   2. It cannot gate on TWO workflows. `workflow_run` fires once per completing workflow, so
+  #      gating on the sweep and the dialect gate means this workflow starts twice per commit, and
+  #      each start still has to query the API for the other one's verdict - the poll comes back
+  #      anyway, now with two runs racing for one concurrency slot.
+  #   3. The polling shape already exists in this repo, in `ci-entrypoint.yml`, with its traps
+  #      found and written down (gh's page concatenation for object endpoints, a deadline that has
+  #      to sit above every gate's own `timeout-minutes`). Reusing a reviewed implementation beats
+  #      a second, differently-buggy one.
+  #
+  # Also rejected: making this a required status check on the branch instead. A check produced
+  # outside a `pull_request` event does not satisfy a required status check (measured, PIVOTA-Agent
+  # #306), and branch protection gates the MERGE, which is exactly the layer that was already there
+  # and did not stop this.
+  test-gate:
+    name: require a green test sweep on this commit
+    runs-on: ubuntu-latest
+    # Above the DEADLINE below, so the script's own diagnostic prints before GitHub kills the job.
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      # THE SAME SHA THE DEPLOY JOB USES. Written identically in both jobs rather than passed as an
+      # output: a gate that resolves a different commit from the one the handler ships is not a
+      # gate, and an output plumbed between jobs is one more place for the two to drift apart.
+      GATE_SHA: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
+      ACTOR: ${{ github.actor }}
+      REASON: ${{ inputs.reason }}
+      BYPASS: ${{ (github.event_name == 'workflow_dispatch' && inputs.bypass_test_gate) && '1' || '0' }}
+    steps:
+      - name: Record why this deploy was run by hand
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `tr -d`, not a glob substitution: a reason of only tabs or newlines is blank too.
+          # Single quotes on the error strings - a backtick inside double quotes is command
+          # substitution, and the words being quoted here are `reason` and `required:`.
+          if [ -z "$(printf '%s' "$REASON" | tr -d '[:space:]')" ]; then
+            echo '::error::the `reason` input is blank. Actions does not enforce `required:` for a'
+            echo '::error::string input, so it is enforced here. Say what this deploy is for.'
+            exit 1
+          fi
+          {
+            echo "### Manual production deploy"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| dispatched by | \`${ACTOR}\` |"
+            echo "| commit | \`${GATE_SHA}\` |"
+            echo "| reason | ${REASON} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::manual deploy of ${GATE_SHA} by ${ACTOR}: ${REASON}"
+
+      - name: Require Backend Test Sweep and Postgres Dialect Gate to be green on this SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, time
+
+          REPO = os.environ["REPO"]
+          SHA = os.environ["GATE_SHA"]
+          ACTOR = os.environ.get("ACTOR") or "unknown"
+          REASON = (os.environ.get("REASON") or "").strip()
+          BYPASS = os.environ.get("BYPASS") == "1"
+
+          # BY WORKFLOW `name:`, matching those files' own `name:` lines exactly.
+          # tests/test_deploy_prod_gates_on_the_test_sweep.py reads both workflows off disk and
+          # asserts these two strings still equal their `name:` - so renaming a workflow without
+          # updating this list fails in CI rather than turning the gate into a no-op that waits for
+          # a workflow nobody publishes any more.
+          REQUIRED = ("Backend Test Sweep", "Postgres Dialect Gate")
+
+          # WHY BOTH. The sweep runs the whole suite EXCEPT tests/test_*_postgres.py, which it
+          # `--ignore-glob`s deliberately because they need a live server. Those excluded files are
+          # the entire content of the dialect gate, and they exist because #1588 shipped a green
+          # SQLite build that returned a hard 500 from production Postgres on deploy - a 16-minute
+          # outage. Gating on the sweep alone would leave the one failure class that has actually
+          # taken this service down outside the gate. The dialect gate already runs unconditionally
+          # on push to main (no paths filter on its push trigger), so requiring it adds no new way
+          # for this deploy to wait on something that never reports.
+          #
+          # NOT required: `V3 Audit Gate`, `PDP Production Smoke`, `prod deploy drift`. The first
+          # is path-filtered on push and would hang this gate on the commits it skips; the other
+          # two probe PRODUCTION, so requiring them would make every deploy conditional on the
+          # state of the thing it is about to replace - a red prod would become undeployable.
+
+          # ONLY `success` RELEASES. This is an allow-list, and the table below is only for saying
+          # what was seen: a conclusion GitHub adds tomorrow that this file has never heard of
+          # blocks by default. A deny-list of "bad" conclusions would ship on the unknown one.
+          MEANING = {
+              "failure": "the tests failed",
+              "cancelled": "the run was cancelled before it reached a verdict",
+              "timed_out": "the run hit its own timeout-minutes and was killed",
+              "skipped": "the run did not execute - silence is not success",
+              "action_required": "the run is parked waiting for a manual approval",
+              "stale": "GitHub discarded the run without completing it",
+              "startup_failure": "the workflow file failed to load, so no test ran",
+              "neutral": "the run finished without reporting a verdict",
+          }
+
+          # Above both required workflows' `timeout-minutes` (15 each) plus runner queueing. A hung
+          # sweep is killed by its own timeout and arrives here as a blocking conclusion long
+          # before this fires; this deadline is for the run that NEVER STARTS.
+          DEADLINE_MINUTES = 30
+          POLL_SECONDS = 20
+
+          if not re.fullmatch(r"[0-9a-f]{40}", SHA or ""):
+              sys.exit(f"::error::GATE_SHA {SHA!r} is not a full 40-character lowercase SHA")
+
+          def gh_json(path):
+              """Every JSON document `gh api --paginate` emits, decoded.
+
+              For an OBJECT-returning endpoint gh concatenates one document per page with no
+              separator, so splitting on newlines hands json.loads the whole blob and raises.
+              Same decoder as ci-entrypoint.yml, for the same reason.
+              """
+              out = subprocess.run(["gh", "api", path, "--paginate"],
+                                   capture_output=True, text=True)
+              if out.returncode != 0:
+                  # NOT tolerated. An unreadable API is an unknown test state, and an unknown test
+                  # state must not deploy.
+                  sys.exit(f"::error::gh api {path} failed: {out.stderr.strip()[:300]}")
+              dec, idx, docs = json.JSONDecoder(), 0, []
+              raw = out.stdout.strip()
+              while idx < len(raw):
+                  obj, end = dec.raw_decode(raw, idx)
+                  docs.append(obj)
+                  idx = end
+                  while idx < len(raw) and raw[idx].isspace():
+                      idx += 1
+              return docs
+
+          def latest():
+              """Required workflow name -> its newest push run for THIS sha, if any.
+
+              `event=push` on purpose. A re-run of a red push run keeps the same run id and flips
+              its conclusion in place, so "I believe that was a flake, re-run it" works and is the
+              supported path. A freshly DISPATCHED sweep run is excluded: its ref and inputs are
+              operator-chosen, so accepting it would make an unlogged bypass out of a workflow that
+              is not this one. The logged bypass is `bypass_test_gate`.
+              """
+              path = (f"repos/{REPO}/actions/runs"
+                      f"?head_sha={SHA}&event=push&per_page=100")
+              best = {}
+              for doc in gh_json(path):
+                  for run in doc.get("workflow_runs") or []:
+                      name = run.get("name")
+                      if name not in REQUIRED:
+                          continue
+                      prev = best.get(name)
+                      if prev is None or (run.get("run_number") or 0) > (prev.get("run_number") or 0):
+                          best[name] = run
+              return best
+
+          def state_of(run):
+              if run is None:
+                  return "NEVER STARTED"
+              if run.get("status") != "completed":
+                  return str(run.get("status"))
+              return str(run.get("conclusion"))
+
+          print(f"gating {SHA} on: {', '.join(REQUIRED)}")
+
+          if BYPASS:
+              # The bypass does NOT skip the query. It reports the same verdict a blocking run
+              # would, then ships anyway, loudly and attributably.
+              if len(REASON) < 10:
+                  sys.exit("::error::bypass_test_gate needs a substantive reason "
+                           "(at least 10 characters). Say what is on fire.")
+              found = latest()
+              rows = [f"| `{n}` | {state_of(found.get(n))} |" for n in REQUIRED]
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+                  fh.write("### 🚨 TEST GATE BYPASSED\n\n"
+                           f"`{ACTOR}` deployed `{SHA}` without a green test sweep.\n\n"
+                           f"**Reason:** {REASON}\n\n"
+                           "| workflow | state at bypass |\n|---|---|\n"
+                           + "\n".join(rows) + "\n")
+              for name in REQUIRED:
+                  print(f"  {name}: {state_of(found.get(name))}")
+              print(f"::warning::TEST GATE BYPASSED by {ACTOR} for {SHA}: {REASON}")
+              sys.exit(0)
+
+          deadline = time.time() + DEADLINE_MINUTES * 60
+          while True:
+              found = latest()
+              blocked, pending = [], []
+              for name in REQUIRED:
+                  run = found.get(name)
+                  if run is None:
+                      pending.append(f"{name}: NEVER STARTED")
+                      continue
+                  if run.get("status") != "completed":
+                      pending.append(f"{name}: {run.get('status')}")
+                      continue
+                  concl = run.get("conclusion")
+                  if concl != "success":
+                      why = MEANING.get(
+                          concl,
+                          "unrecognised conclusion - anything that is not exactly 'success' blocks",
+                      )
+                      blocked.append(f"{name} concluded '{concl}' - {why}\n"
+                                     f"    {run.get('html_url')}")
+                  else:
+                      print(f"  {name}: success  {run.get('html_url')}")
+
+              if blocked:
+                  # FAIL FAST. Once a required workflow has CONCLUDED non-success there is nothing
+                  # left to wait for, and waiting out the deadline would only make the log harder
+                  # to read.
+                  for entry in blocked:
+                      print(f"::error::{entry}")
+                  sys.exit(f"refusing to deploy {SHA}: a required test workflow is not green")
+
+              if not pending:
+                  break
+
+              if time.time() > deadline:
+                  # A workflow that never reports BLOCKS. This is the whole reason the deadline
+                  # ends in a non-zero exit rather than a warning: a sweep that was never triggered
+                  # (a paths filter added to its push trigger, a workflow file that failed to load,
+                  # a run GitHub dropped) is an ABSENCE of evidence, and this file must not read an
+                  # absence as a pass.
+                  print(f"::error::waited {DEADLINE_MINUTES}m and these never reported on {SHA}:")
+                  for entry in pending:
+                      print(f"::error::  {entry}")
+                  sys.exit("refusing to deploy on the strength of a test run that did not happen")
+
+              print(f"  waiting on {len(pending)}: {', '.join(pending)}")
+              time.sleep(POLL_SECONDS)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"### Test gate passed\n\n`{SHA}` is green on: "
+                       + ", ".join(f"`{n}`" for n in REQUIRED) + "\n")
+          print(f"all {len(REQUIRED)} required workflow(s) green on {SHA} - releasing the deploy")
+          PY
+
   deploy:
+    # NO `if:` HERE, and no `always()`. A `needs:` alone means this job does not start unless
+    # test-gate concluded success - a gate that a downstream `if: always()` can outvote is
+    # decoration, and this repo has already shipped that shape once.
+    needs: [test-gate]
     runs-on: ubuntu-latest
     # Named so required reviewers can be added later without touching this file (Settings ->
     # Environments -> gcp-prod). Protection rules on a private repo need a paid plan; without one
@@ -67,7 +354,21 @@ jobs:
       # push: the pushed merge commit, always promoted. dispatch: the operator's choice of both.
       SHA: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
       PROMOTE_FLAG: ${{ (github.event_name == 'push' || inputs.promote) && 1 || 0 }}
+      REASON: ${{ inputs.reason }}
+      ACTOR: ${{ github.actor }}
+      BYPASSED: ${{ (github.event_name == 'workflow_dispatch' && inputs.bypass_test_gate) && 'yes' || 'no' }}
     steps:
+      # The reason belongs in THIS job's log, not only the gate's. Whoever is reading a deploy log
+      # after an incident is reading this job; a note in a sibling job's summary is a click away
+      # and therefore not there.
+      - name: Say who dispatched this and why
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          echo "manual deploy of $SHA by $ACTOR"
+          echo "reason: $REASON"
+          echo "test gate bypassed: $BYPASSED"
+
       # TWO checkouts, and the split is deliberate.
       #
       # This one is the DEPLOY TOOLING: deploy_backend.sh, the ancestry check, full history. It
