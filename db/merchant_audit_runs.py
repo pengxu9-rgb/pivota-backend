@@ -34,11 +34,12 @@ import asyncio
 import json
 import logging
 import os
+import json as _json
 import uuid
 from datetime import datetime, timezone
 
 from db._jsonb_safe import _json_safe
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 
 def _decode_jsonb_field(value: Any) -> Optional[Dict[str, Any]]:
@@ -98,6 +99,7 @@ def _provider_scores_from_report(report_jsonb: Any) -> Optional[Dict[str, int]]:
 from sqlalchemy import (
     ARRAY,
     Column,
+    select as sa_select,
     DateTime,
     Integer,
     Index,
@@ -323,6 +325,133 @@ async def ensure_merchant_audit_runs_table() -> None:
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+SUBJECT_TYPE_PUBLIC_FUNNEL = "public_funnel"
+
+# Where an anonymous funnel run records the domain it is about. NOT a column:
+# merchant_audit_runs has no domain field, and adding one for a lane that may
+# not survive contact with real traffic is the wrong trade. partial_result_jsonb
+# already carries lane-specific payload for the URL wedge.
+_FUNNEL_DOMAIN_PATH = ("funnel", "domain")
+
+
+def funnel_domain_of(row: Mapping[str, Any]) -> Optional[str]:
+    """The domain an anonymous funnel run is about, or None."""
+    partial = row.get("partial_result_jsonb")
+    if isinstance(partial, str):
+        try:
+            partial = _json.loads(partial)
+        except Exception:  # noqa: BLE001
+            return None
+    if not isinstance(partial, Mapping):
+        return None
+    node: Any = partial
+    for key in _FUNNEL_DOMAIN_PATH:
+        if not isinstance(node, Mapping):
+            return None
+        node = node.get(key)
+    if not isinstance(node, str):
+        return None
+    # Re-normalize on READ. This value is echoed to anonymous callers and is
+    # the authorization key the claim gate compares against, so it must not be
+    # trusted just because it came out of our own column. The only writer
+    # normalizes on the way in; this makes the read side independently safe.
+    from routes.store_audit_public_intake import normalize_store_domain
+    return normalize_store_domain(node)
+
+
+async def record_anonymous_funnel_run(*, domain: str) -> Optional[str]:
+    """Start an UNOWNED run for a public-funnel visitor. Returns the run_id.
+
+    Deliberately NOT queued for the worker: `stage` keeps its 'completed'
+    server default, so claim_next_pending_run never picks it up. An
+    unauthenticated endpoint must not be able to spend model credits, which is
+    the whole reason the public tier is deterministic.
+    """
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return None
+    await ensure_merchant_audit_runs_table()
+    run_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            merchant_audit_runs.insert().values(
+                run_id=run_id,
+                merchant_id=None,
+                requested_at=_now_utc(),
+                status="succeeded",
+                subject_type=SUBJECT_TYPE_PUBLIC_FUNNEL,
+                product_keys=[],
+                partial_result_jsonb=_json_safe(
+                    {"funnel": {"domain": normalized}}
+                ),
+            )
+        )
+        return run_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "record_anonymous_funnel_run failed for domain=%s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+
+
+async def find_unclaimed_funnel_run_for_domain(
+    *, domain: str, since: datetime, limit: int = 2000,
+) -> Optional[Dict[str, Any]]:
+    """The freshest unclaimed funnel run for a domain, or None.
+
+    Matching happens in PYTHON, not SQL: the domain lives inside
+    partial_result_jsonb and `->>` is Postgres-only, while this module is
+    exercised on SQLite too.
+
+    THE BOUND MUST EXCEED WHAT THE WINDOW CAN HOLD. The candidate set is
+    subject_type + unclaimed + a time window, newest first. If `limit` is
+    smaller than the number of unclaimed runs inside `since`, an older run
+    for the domain falls off the end and the caller mints a DUPLICATE
+    instead of reusing — silently, and worse the busier the funnel gets. At
+    the intake route's daily cap this bound covers well over the 24h reuse
+    window it is called with.
+    """
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return None
+    await ensure_merchant_audit_runs_table()
+    try:
+        # Named columns, not select(): this reads a table whose other columns
+        # (ARRAY, JSONB) are dialect-specific, and the lookup needs three.
+        rows = await database.fetch_all(
+            sa_select(
+                merchant_audit_runs.c.run_id,
+                merchant_audit_runs.c.merchant_id,
+                merchant_audit_runs.c.partial_result_jsonb,
+                merchant_audit_runs.c.requested_at,
+            )
+            .where(
+                merchant_audit_runs.c.subject_type == SUBJECT_TYPE_PUBLIC_FUNNEL,
+            )
+            .where(merchant_audit_runs.c.merchant_id.is_(None))
+            .where(merchant_audit_runs.c.requested_at >= since)
+            .order_by(merchant_audit_runs.c.requested_at.desc())
+            .limit(int(limit)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "find_unclaimed_funnel_run_for_domain failed for domain=%s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+    for row in rows or []:
+        d = dict(row)
+        if funnel_domain_of(d) == normalized:
+            # asyncpg hands a UUID column back as uuid.UUID; SQLite hands back
+            # a str. Normalize here so callers cannot compare the two shapes
+            # and silently never match on one dialect.
+            if d.get("run_id") is not None:
+                d["run_id"] = str(d["run_id"])
+            return d
+    return None
 
 
 async def claim_audit_run_for_merchant(
