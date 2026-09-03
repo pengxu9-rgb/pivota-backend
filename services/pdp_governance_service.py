@@ -5571,6 +5571,64 @@ async def materialize_overlay_from_module(
     return written
 
 
+async def active_overlay_fields_for_product(
+    *,
+    merchant_id: str,
+    source_product_id: str,
+    module_key: str = "copy",
+) -> Dict[str, Any]:
+    """What the public PDP merge hook would serve for this product, as {field_key: value}.
+
+    This is the READER side of the same contract materialize_overlay_from_module writes.
+    The serving read itself is NOT in this repo -- it is
+    PIVOTA-Agent `src/services/catalogPdpContentFields.js`
+    `readMerchantProductOverlayByProductRefs`, whose selection is reproduced here:
+
+        WHERE approval_status = 'active' AND module_key = 'copy'
+          AND split_part(product_key, '|', 1) = <merchant>
+          AND split_part(product_key, '|', 3) = <source_product_id>
+        ORDER BY ... approved_at DESC NULLS LAST      -- first row per field_key wins
+
+    Kept here so a writer-side lane (and its tests) can state what the live PDP shows
+    after a write without re-deriving that predicate at each call site. `split_part` is
+    Postgres-only, so the segment match is done in Python over the active rows for this
+    merchant -- the same rows, the same order, on either dialect.
+    """
+    merchant_id = str(merchant_id or "")
+    source_product_id = str(source_product_id or "")
+    if not merchant_id or not source_product_id:
+        return {}
+    rows = await database.fetch_all(
+        merchant_product_overlay.select().where(
+            (merchant_product_overlay.c.approval_status == "active")
+            & (merchant_product_overlay.c.module_key == module_key)
+            & (merchant_product_overlay.c.product_key.startswith(f"{merchant_id}|", autoescape=True))
+        )
+    )
+    matched: List[Dict[str, Any]] = []
+    for row in rows:
+        record = _row_dict(row)
+        try:
+            row_merchant, _, row_product_id = parse_product_key(str(record.get("product_key") or ""))
+        except ValueError:
+            continue
+        if row_merchant != merchant_id or row_product_id != source_product_id:
+            continue
+        matched.append(record)
+    # approved_at DESC, NULLS LAST -- mirrors the merge hook's ORDER BY so that the
+    # first row seen for a field_key is the one it would serve.
+    dated = [r for r in matched if r.get("approved_at") is not None]
+    undated = [r for r in matched if r.get("approved_at") is None]
+    dated.sort(key=lambda r: r["approved_at"], reverse=True)
+    served: Dict[str, Any] = {}
+    for record in dated + undated:
+        field_key = str(record.get("field_key") or "")
+        if not field_key or field_key in served:
+            continue
+        served[field_key] = record.get("value_jsonb")
+    return served
+
+
 async def publish_module_version(
     *,
     pdp_id: str,
@@ -5687,17 +5745,24 @@ async def rollback_module(
     target = await _fetch_module_version(pdp_id, module_key, target_version_id)
     if target.get("stage") != "published":
         raise ValueError("ROLLBACK_TARGET_MUST_BE_PUBLISHED")
-    now = _now()
-    await database.execute(
-        pdp_module_versions.update()
-        .where(
-            (pdp_module_versions.c.pdp_id == pdp_id)
-            & (pdp_module_versions.c.module_key == module_key)
-            & (pdp_module_versions.c.stage == "published")
-            & (pdp_module_versions.c.superseded_at.is_(None))
-        )
-        .values(status="superseded", superseded_at=now)
+    target_payload = _json_dict(target.get("payload"))
+
+    # APPLY-time guardrails, exactly as publish_module_version runs them, and for the
+    # same reason: a rollback re-applies this payload to merchant-visible state (the
+    # merchant_product_overlay row the public PDP merge hook serves), so the blueprint's
+    # rule -- re-check at apply against the config in force AT APPLY TIME, because the
+    # limits may have tightened since -- applies to it too. Being approved once does not
+    # carry an exemption; the payload is being made live again, now.
+    _enforce_module_write_guardrails(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        payload=target_payload,
+        before=_json_dict((await _current_published_version(pdp_id, module_key) or {}).get("payload")),
+        actor_type=actor_type,
+        at_apply=True,
     )
+
+    now = _now()
     rollback_row = {
         "id": f"pdpmod_{uuid.uuid4().hex}",
         "pdp_id": pdp_id,
@@ -5705,7 +5770,7 @@ async def rollback_module(
         "stage": "published",
         "version": await _next_module_version(pdp_id, module_key),
         "status": "published",
-        "payload": _json_dict(target.get("payload")),
+        "payload": target_payload,
         "source_refs": _json_list(target.get("source_refs")),
         "review_actor_type": actor_type,
         "review_actor_id": actor_id,
@@ -5713,7 +5778,7 @@ async def rollback_module(
         "review_decision": "pass",
         "review_confidence": 1.0,
         "review_rubric": {"rollback_from_version_id": target_version_id},
-        "risk_level": target.get("risk_level") or module_risk_level(module_key, _json_dict(target.get("payload"))),
+        "risk_level": target.get("risk_level") or module_risk_level(module_key, target_payload),
         "requires_human": bool(target.get("requires_human")),
         "generated_by": target.get("generated_by"),
         "generation_ref": target.get("generation_ref"),
@@ -5722,15 +5787,83 @@ async def rollback_module(
         "published_at": now,
         "superseded_at": None,
     }
-    await database.execute(pdp_module_versions.insert().values(**rollback_row))
-    await _audit(
-        pdp_id=pdp_id,
-        module_key=module_key,
-        action="module_rolled_back",
-        actor_type=actor_type,
-        actor_id=actor_id,
-        details={"target_version_id": target_version_id, "published_version_id": rollback_row["id"]},
-    )
+
+    # ONE transaction over the whole rollback. The published-version rows and the
+    # overlay rows are two views of the same fact -- "what this PDP serves" -- and a
+    # crash between them leaves the public PDP serving content an operator has just
+    # revoked, with the version history claiming otherwise. That divergence is the bug
+    # this transaction closes; it also means a failed overlay write UNDOES the version
+    # rollback rather than half-applying it.
+    #
+    # Nested with the per-field transaction inside materialize_overlay_from_module: the
+    # inner one becomes a SAVEPOINT, so its retry loop still rolls back only its own
+    # supersede+insert pair.
+    served_after: Dict[str, Any] = {}
+    async with database.transaction():
+        await database.execute(
+            pdp_module_versions.update()
+            .where(
+                (pdp_module_versions.c.pdp_id == pdp_id)
+                & (pdp_module_versions.c.module_key == module_key)
+                & (pdp_module_versions.c.stage == "published")
+                & (pdp_module_versions.c.superseded_at.is_(None))
+            )
+            .values(status="superseded", superseded_at=now)
+        )
+        await database.execute(pdp_module_versions.insert().values(**rollback_row))
+        if SKU_OPT_OVERLAY_V1_ENABLED:
+            # Reuse the publish-path flattener so the rolled-back version's overlay row
+            # is superseded and the restored version's row inserted by the SAME code
+            # that maintains the "at most one active row per (product_key, module_key,
+            # field_key)" invariant. Provenance comes from _OVERLAY_PROVENANCE_BY_ACTOR
+            # on the ROLLBACK actor (a senior employee -> ops_approved), and the row's
+            # source_version_id is this rollback version -- whose review_rubric carries
+            # rollback_from_version_id -- so the row is traceable to the rollback that
+            # restored it without a new provenance vocabulary.
+            #
+            # NOT best-effort here, unlike publish. A publish whose overlay write fails
+            # leaves the PREVIOUS approved content live; a rollback whose overlay write
+            # fails leaves the content the operator just revoked live. Only the second
+            # is a content-integrity failure, so it must not be swallowed.
+            await materialize_overlay_from_module(
+                pdp_id=pdp_id,
+                module_key=module_key,
+                published_version_id=rollback_row["id"],
+                payload=target_payload,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
+            subject = await database.fetch_one(
+                pdp_subject_index.select().where(pdp_subject_index.c.pdp_id == pdp_id)
+            )
+            product_key = _row_dict(subject).get("representative_product_key") if subject else None
+            if product_key:
+                try:
+                    subject_merchant_id, _, subject_product_id = parse_product_key(str(product_key))
+                except ValueError:
+                    subject_merchant_id = subject_product_id = ""
+                if subject_merchant_id and subject_product_id:
+                    served_after = await active_overlay_fields_for_product(
+                        merchant_id=subject_merchant_id,
+                        source_product_id=subject_product_id,
+                        module_key=module_key,
+                    )
+        details: Dict[str, Any] = {
+            "target_version_id": target_version_id,
+            "published_version_id": rollback_row["id"],
+        }
+        if SKU_OPT_OVERLAY_V1_ENABLED:
+            # Record what the public PDP serves AFTER the rollback. The failure this PR
+            # fixes was invisible precisely because nothing wrote that down.
+            details["overlay_served_fields"] = sorted(served_after.keys())
+        await _audit(
+            pdp_id=pdp_id,
+            module_key=module_key,
+            action="module_rolled_back",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            details=details,
+        )
     return _serialize_module(rollback_row)
 
 
