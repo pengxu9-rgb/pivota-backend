@@ -106,8 +106,10 @@ pip install -e /tmp/commerce-agents/commerce-common -e /tmp/commerce-agents/shop
 cd integrations/commerce-agents && PYTHONPATH=. pytest
 ```
 
-These tests are not part of the backend's CI sweep (`tests/` and `readiness/tests/`),
-because the sweep's environment does not carry the blueprint's packages.
+In CI these run in the `commerce-agents-adapter` job of
+`.github/workflows/backend-test-sweep.yml`, which installs the blueprint's packages from
+its repo at a pinned commit. The main sweep job cannot collect them, because its
+environment does not carry those packages.
 
 ## What is verified, and what is not
 
