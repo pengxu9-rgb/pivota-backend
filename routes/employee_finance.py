@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from db.database import database
 from db.payout_repo import PayoutRepo
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 router = APIRouter(prefix="/employee/finance", tags=["Employee Finance"])
 
@@ -47,7 +47,7 @@ async def get_finance_summary(
     Get financial summary for employee dashboard
     Real data from orders table
     """
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

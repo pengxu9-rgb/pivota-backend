@@ -336,6 +336,21 @@ async def get_current_employee(current_user: Dict[str, Any] = Depends(get_curren
 EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
 ADMIN_ROLES = ["super_admin", "admin"]
 
+# Staff-only employee-portal surfaces: everything in EMPLOYEE_ROLES except
+# `outsourced`. Route guards used to spell this inline as ["employee", "admin"],
+# which silently omitted `super_admin` -- the MOST privileged role, and one that
+# `/auth/signin` happily issues (see routes.auth.EMPLOYEE_AUTH_ROLES). A
+# super_admin could therefore sign into the employee portal and then be 403'd by
+# 73 of the pages behind it. Guard against that spelling drift with this
+# constant rather than another literal; `outsourced` stays out deliberately, so
+# contractor access keeps whatever narrower scope each route already gave it.
+EMPLOYEE_STAFF_ROLES = ["super_admin", "admin", "employee"]
+
+# Same set, plus merchants -- for surfaces a merchant reaches for their own data
+# and staff reach for anyone's. Was spelled ["merchant", "employee", "admin"],
+# and carried the identical super_admin omission.
+MERCHANT_OR_EMPLOYEE_STAFF_ROLES = ["merchant"] + EMPLOYEE_STAFF_ROLES
+
 # Permission guarding /api/operations/* (merchant & agent onboarding, approval,
 # verification, API-key issuance, audit log). A named permission, not a role
 # name — see the note in check_permission's permission_map.

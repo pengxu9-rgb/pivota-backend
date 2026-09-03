@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import require_admin, get_current_employee, get_current_user, verify_jwt_token
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin, verify_jwt_token
 from utils.logger import logger
 
 
@@ -196,7 +196,7 @@ async def update_agent_tier(
     Only employees/admins can change agent tiers.
     Valid values: 'basic', 'premium'
     """
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -471,7 +471,7 @@ async def get_agent_conversion_funnel(
     """
     try:
         # Verify access (allow agent via agent_id/email fallback)
-        if current_user.get("role") not in ["admin", "employee"]:
+        if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             user_agent_id = current_user.get("agent_id") or current_user.get("email")
             if user_agent_id != agent_id:
                 raise HTTPException(status_code=403, detail="Not authorized")
@@ -553,7 +553,7 @@ async def get_agent_query_analytics(
     """
     try:
         # Verify access
-        if current_user.get("role") not in ["admin", "employee"]:
+        if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             user_agent_id = current_user.get("agent_id") or current_user.get("email")
             if user_agent_id != agent_id:
                 raise HTTPException(status_code=403, detail="Not authorized")
@@ -686,7 +686,7 @@ async def get_agent_merchant_authorizations(
     """
     try:
         # Verify access
-        if current_user.get("role") not in ["admin", "employee"]:
+        if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             user_agent_id = current_user.get("agent_id") or current_user.get("email")
             if user_agent_id != agent_id:
                 raise HTTPException(status_code=403, detail="Not authorized")

@@ -29,7 +29,7 @@ from urllib.parse import quote, urlparse, urlencode
 
 from db.database import IS_POSTGRES, database
 from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
-from utils.auth import get_current_user, hash_password, verify_password as verify_bcrypt_password
+from utils.auth import MERCHANT_OR_EMPLOYEE_STAFF_ROLES, get_current_user, hash_password, verify_password as verify_bcrypt_password
 from config.settings import settings
 from config.settings import resolve_public_api_base_url
 from services.merchant_web_collector_service import (
@@ -2155,7 +2155,7 @@ async def list_shopify_webhook_events(
     Read-only debug: list latest ingested Shopify webhook events for a merchant.
     Does NOT return payload_json (to avoid leaking PII).
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = merchant_id or current_user.get("merchant_id")
@@ -2216,7 +2216,7 @@ async def merchant_sync_shopify_products(
     Sync Shopify products for a merchant.
     Mirrors /merchant/integrations/shopify/sync so legacy front-ends keep working.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = request.merchant_id or current_user.get("merchant_id")
@@ -2396,7 +2396,7 @@ async def merchant_connect_wix(
 ):
     """Allow merchant to connect their Wix store"""
     # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # If merchant role, verify they can only connect their own store
@@ -2475,7 +2475,7 @@ async def merchant_connect_woocommerce(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their WooCommerce store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     if current_user["role"] == "merchant":
@@ -2643,7 +2643,7 @@ async def merchant_connect_bigcommerce(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their BigCommerce store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     if current_user["role"] == "merchant":
@@ -2740,7 +2740,7 @@ async def merchant_connect_prestashop(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their PrestaShop store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     if current_user["role"] == "merchant":
@@ -2825,7 +2825,7 @@ async def merchant_update_store_support_email(
     current_user: dict = Depends(get_current_user),
 ):
     """Allow merchant to set a support email for review invitations."""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = request.merchant_id or current_user.get("merchant_id")
@@ -2881,7 +2881,7 @@ async def merchant_get_store_support_email(
     current_user: dict = Depends(get_current_user),
 ):
     """Get the current (and effective) support email used for review invitations."""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()

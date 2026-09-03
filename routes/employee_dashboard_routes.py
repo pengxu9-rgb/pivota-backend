@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from utils.auth import get_current_employee, get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user
 from utils.encryption import mask_credential
 from db.database import database
 from readiness.summary import (
@@ -518,7 +518,7 @@ async def get_analytics_dashboard(
     current_user: dict = Depends(get_current_user)
 ):
     """Get analytics dashboard for employee portal"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1119,7 +1119,7 @@ async def get_all_agents(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all agents in the system"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1189,7 +1189,7 @@ async def get_system_status(
     current_user: dict = Depends(get_current_user)
 ):
     """Get system health status"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1242,7 +1242,7 @@ async def get_all_transactions(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all transactions across all merchants"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1322,7 +1322,7 @@ async def get_all_psps(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all PSPs across all merchants"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1424,7 +1424,7 @@ async def test_psp_connection(
     current_user: dict = Depends(get_current_user)
 ):
     """Test PSP connection"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1460,7 +1460,7 @@ async def get_finance_overview(
     current_user: dict = Depends(get_current_user)
 ):
     """Get finance overview for employee portal"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from datetime import datetime
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, MERCHANT_OR_EMPLOYEE_STAFF_ROLES, get_current_user
 from db.database import database
 from services.merchant_psp_config_service import persist_canonical_merchant_psp
 from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
@@ -55,7 +55,7 @@ async def connect_shopify_store_employee(
     request: ConnectShopifyRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # Reuse the canonical merchant Shopify connect logic so employee and merchant
@@ -79,7 +79,7 @@ async def connect_wix_store_employee(
 ):
     """Employee-only version. Merchants should use /integrations/wix/connect from merchant_store_connections.py"""
     """Connect Wix store for a merchant (Employee action)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -189,7 +189,7 @@ async def setup_merchant_psp(
     self-service is still supported - `merchant` remains in the allowed roles -
     it just has to be a merchant who is signed in.
     """
-    if current_user.get("role") not in ["employee", "admin", "merchant"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -294,7 +294,7 @@ async def sync_merchant_products(
     current_user: dict = Depends(get_current_user)
 ):
     """Sync products for a merchant store (Employee action)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     if platform not in ["shopify", "wix", "woocommerce", "bigcommerce"]:
@@ -388,7 +388,7 @@ async def test_store_connection(
     current_user: dict = Depends(get_current_user)
 ):
     """Test store connection (Employee action)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
