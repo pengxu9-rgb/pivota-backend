@@ -419,6 +419,54 @@ async def record_anonymous_funnel_run(*, domain: str) -> Optional[str]:
         return None
 
 
+async def list_claimed_funnel_runs_for_merchant(
+    *, merchant_id: str, limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """The funnel checks this merchant claimed, newest claim first.
+
+    A SEPARATE read on purpose. recent_runs_for_merchant deliberately excludes
+    this lane because it feeds the history list, the visibility trend and the
+    tasks lookup, and a funnel run has no scores and no report_jsonb — folding
+    it in there would put an empty row in a trend line. A protocol check is a
+    different artifact from a GEO audit, so it gets its own surface rather than
+    being smuggled into one that means something else.
+
+    Returns the row fields only; the caller joins the deterministic evidence.
+    """
+    if not merchant_id:
+        return []
+    await ensure_merchant_audit_runs_table()
+    try:
+        # Explicit columns, not select(). A select() over the full Table breaks
+        # against any environment whose merchant_audit_runs is missing a
+        # modeled column, and this function swallows — so the merchant would be
+        # told they have NO claimed checks, which is a wrong answer wearing the
+        # shape of a right one. Naming what it reads makes that impossible.
+        rows = await database.fetch_all(
+            sa_select(
+                merchant_audit_runs.c.run_id,
+                merchant_audit_runs.c.merchant_id,
+                merchant_audit_runs.c.requested_at,
+                merchant_audit_runs.c.merchant_claimed_at,
+                merchant_audit_runs.c.partial_result_jsonb,
+            )
+            .where(
+                merchant_audit_runs.c.merchant_id == merchant_id,
+                merchant_audit_runs.c.subject_type == SUBJECT_TYPE_PUBLIC_FUNNEL,
+                merchant_audit_runs.c.merchant_claimed_at.isnot(None),
+            )
+            .order_by(merchant_audit_runs.c.merchant_claimed_at.desc())
+            .limit(max(1, int(limit)))
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_claimed_funnel_runs_for_merchant failed for merchant_id=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in rows or []]
+
+
 async def find_unclaimed_funnel_run_for_domain(
     *, domain: str, since: datetime, limit: int = 2000,
 ) -> Optional[Dict[str, Any]]:
