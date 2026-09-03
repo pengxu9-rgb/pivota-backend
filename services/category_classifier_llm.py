@@ -41,6 +41,7 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from config.settings import settings
+from services.llm_fence import PRODUCT_DATA_FENCE
 
 logger = logging.getLogger(__name__)
 
@@ -96,21 +97,25 @@ _SYSTEM_PROMPT = (
     "'beauty/skincare/treat/serum', 'fashion/apparel/tops/sweater', "
     "'electronics/audio/headphones', 'home/kitchen/cookware/pan', "
     "'pet/accessory/leash'. If genuinely unclassifiable, return "
-    "value=null and reason='insufficient_signal'."
+    "value=null and reason='insufficient_signal'. "
+    + PRODUCT_DATA_FENCE.notice
 )
 
 
 def _build_user_message(*, category: Optional[str], product_type: Optional[str], title: Optional[str], description: Optional[str]) -> str:
+    # Every value is merchant text; the field labels are ours. The block is
+    # fenced as one unit and the instruction that follows stays outside it.
+    clean = PRODUCT_DATA_FENCE.sanitize_text
     parts = []
-    if title: parts.append(f"Title: {title}")
-    if product_type: parts.append(f"Product type: {product_type}")
-    if category: parts.append(f"Merchant category hint: {category}")
+    if title: parts.append(f"Title: {clean(title)}")
+    if product_type: parts.append(f"Product type: {clean(product_type)}")
+    if category: parts.append(f"Merchant category hint: {clean(category)}")
     if description:
         # Cap description to avoid blowing up the prompt — first 500 chars
         # is plenty for classification.
-        snippet = description[:500].replace("\n", " ")
+        snippet = clean(description[:500].replace("\n", " "))
         parts.append(f"Description: {snippet}")
-    body = "\n".join(parts) if parts else "(no signal)"
+    body = PRODUCT_DATA_FENCE.wrap("\n".join(parts) if parts else "(no signal)")
     return (
         f"{body}\n\n"
         "Return JSON only: "
