@@ -31,7 +31,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Deque, Dict, Literal, Optional
+from typing import Any, Deque, Dict, List, Literal, Optional
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -545,6 +545,85 @@ async def public_store_audit_run(
 class ClaimRunResponse(BaseModel):
     claimed: bool
     audit_run_id: str
+
+
+class FunnelCheckResponse(BaseModel):
+    """One claimed funnel check, as its owner sees it."""
+    audit_run_id: str
+    domain: Optional[str] = None
+    checked_at: Optional[datetime] = None
+    claimed_at: Optional[datetime] = None
+    observed_signals: List[Dict[str, Any]] = []
+
+
+class FunnelChecksResponse(BaseModel):
+    checks: List[FunnelCheckResponse] = []
+
+
+@claim_router.get("/audit/funnel-checks", response_model=FunnelChecksResponse)
+async def list_claimed_funnel_checks(
+    merchant_id: str = Depends(get_current_merchant),
+) -> FunnelChecksResponse:
+    """The funnel checks this merchant claimed.
+
+    WHY THIS EXISTS — stated precisely, because the first draft overclaimed.
+    The run itself was never invisible: GET /api/audits/{run_id} has no
+    subject_type gate, and GET /api/audits?subject_type=public_funnel forwards
+    the caller's scope, so recent_runs_for_merchant's funnel exclusion applies
+    only to the UNSCOPED call. What was invisible is the thing that makes the
+    check worth claiming — its deterministic SIGNALS. The merchant projection
+    is never built for a funnel run (no worker ever touches it), so
+    ?audience=merchant answers 409 and no surface anywhere reported what the
+    probe observed. That is what this adds.
+
+    It reports the SAME deterministic tier the visitor saw before registering —
+    protocol facts we observed, not model output — because that is all a funnel
+    run ever holds. The owner sees no more than the anonymous visitor did, and
+    that is correct: nothing else was ever measured. Their GEO audit is a
+    separate, richer thing they run from the dashboard.
+    """
+    _require_enabled()
+    from db.audit_evidence import list_evidence_for_run
+    from db.merchant_audit_runs import list_claimed_funnel_runs_for_merchant
+    from services.audit_projection_builder import _DETERMINISTIC_EVIDENCE_TYPES
+
+    rows = await list_claimed_funnel_runs_for_merchant(merchant_id=merchant_id)
+    checks: List[FunnelCheckResponse] = []
+    for row in rows:
+        run_id = str(row.get("run_id") or "")
+        if not run_id:
+            continue
+        try:
+            evidence = await list_evidence_for_run(audit_run_id=run_id)
+        except Exception:  # noqa: BLE001
+            evidence = []
+        # NEWEST wins per signal. list_evidence_for_run returns oldest first,
+        # and the reprobe job deposits onto the same run — so first-wins showed
+        # the merchant the ORIGINAL probe's level forever, and a store whose
+        # second probe upgraded detected -> tested kept reading "detected".
+        signals: List[Dict[str, Any]] = []
+        seen: set = set()
+        for item in reversed(list(evidence or [])):
+            etype = str((item or {}).get("evidence_type") or "")
+            # The SAME allowlist the public projection uses, imported rather
+            # than restated: two copies of an evidence allowlist drift, and the
+            # drift is silent because both look reviewed.
+            if etype not in _DETERMINISTIC_EVIDENCE_TYPES or etype in seen:
+                continue
+            seen.add(etype)
+            level = (item or {}).get("evidence_level")
+            signals.append({
+                "signal": etype,
+                "evidence_level": level if level in ("detected", "tested") else None,
+            })
+        checks.append(FunnelCheckResponse(
+            audit_run_id=run_id,
+            domain=funnel_domain_of(row),
+            checked_at=row.get("requested_at"),
+            claimed_at=row.get("merchant_claimed_at"),
+            observed_signals=signals,
+        ))
+    return FunnelChecksResponse(checks=checks)
 
 
 @claim_router.post("/audit/claim/{run_id}", response_model=ClaimRunResponse)
