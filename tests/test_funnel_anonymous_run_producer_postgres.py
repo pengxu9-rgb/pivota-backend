@@ -23,6 +23,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import uuid
+
 import pytest
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
@@ -68,7 +70,21 @@ CREATE TABLE merchant_audit_runs (
   stage_updated_at     TIMESTAMPTZ NULL,
   partial_result_jsonb JSONB NULL,
   claimed_by_worker    TEXT NULL,
-  claimed_until        TIMESTAMPTZ NULL
+  claimed_until        TIMESTAMPTZ NULL,
+  verdict_labels       TEXT[] NULL,
+  visibility_score_avg INTEGER NULL,
+  attribution_score_avg INTEGER NULL,
+  category_visibility_score_avg INTEGER NULL,
+  audited_via_pivota_canonical TEXT[] NULL,
+  content_keys         TEXT[] NULL,
+  content_key_basis    JSONB NULL,
+  report_jsonb         JSONB NULL,
+  error_message        TEXT NULL,
+  error_jsonb          JSONB NULL,
+  cost_summary_jsonb   JSONB NULL,
+  idempotency_key      TEXT NULL,
+  cancelled_at         TIMESTAMPTZ NULL,
+  requested_by_user_id TEXT NULL
 )
 """
 
@@ -168,3 +184,212 @@ async def test_the_unclaimed_index_covers_the_producers_sweep():
         "WHERE indexname = 'idx_merchant_audit_runs_unclaimed'")
     assert row is not None
     assert "merchant_id IS NULL" in dict(row)["indexdef"]
+
+
+# ---------------------------------------------------------------------------
+# The intake handler driven against REAL tables.
+#
+# THE GAP THIS CLOSES. The SQLite intake tests stub `fetch_route_for_domain`
+# with a fake whose `last_audit_run_id` is None. Production never produces
+# that: the cold-domain branch mints the discovery placeholder with
+# `audit_run_id=str(uuid.uuid4())` and upsert_execution_route RETURNS it. So
+# the fence read as "always someone else's run", the producer never fired, and
+# a green suite certified a feature that did nothing. Only the real
+# upsert_execution_route can tell us which case the handler actually meets.
+# ---------------------------------------------------------------------------
+
+async def _reset_routes():
+    from db.database import database
+    from db.audit_evidence import ensure_audit_evidence_tables
+    import db.audit_evidence as ae
+    ae._DDL_READY = False
+    await database.execute("DROP TABLE IF EXISTS verification_runs")
+    await database.execute("DROP TABLE IF EXISTS evidence_items")
+    await database.execute("DROP TABLE IF EXISTS execution_routes")
+    await ensure_audit_evidence_tables()
+
+
+async def _intake(monkeypatch, store_url="https://coldbrand.com"):
+    """Await the real handler coroutine directly.
+
+    NOT through TestClient: databases==0.7.0 shares one Connection, and the
+    client's own event loop collides with this test's ("Connection is already
+    acquired"). The handler is the unit under test here — the HTTP layer is
+    covered by the SQLite file — so calling it directly is both sufficient and
+    the only thing that works against a live pool.
+    """
+    import routes.store_audit_public_intake as sap
+
+    monkeypatch.setattr(sap, "_enabled", lambda: True)
+    monkeypatch.setattr(sap, "_require_rate", lambda *a, **k: None)
+    monkeypatch.setattr(sap, "_daily_cap", lambda: 10_000)
+    return await sap.public_store_audit_intake(
+        sap.PublicIntakeRequest(store_url=store_url), request=None,
+    )
+
+
+async def _funnel_run_count(domain=None):
+    from db.database import database
+    row = await database.fetch_one(
+        "SELECT count(*) AS n FROM merchant_audit_runs "
+        "WHERE subject_type = 'public_funnel'"
+    )
+    return dict(row)["n"]
+
+
+async def test_a_cold_domain_actually_gets_a_funnel_run(monkeypatch):
+    """The whole point of the producer. This is the test that was missing:
+    against the real upsert_execution_route, the route the handler sees ALWAYS
+    carries a placeholder pointer, so a fence keyed on pointer-nullness
+    produces nothing at all."""
+    await _reset_routes()
+    res = await _intake(monkeypatch)
+    assert res.state in ("pending", "queued", "unknown"), res
+    assert res.audit_run_id, (
+        "no run was produced for a cold domain — the producer never fired"
+    )
+    assert await _funnel_run_count() == 1
+
+
+async def test_a_returning_visitor_gets_the_SAME_run(monkeypatch):
+    """Reuse has to survive the route now pointing at our own funnel run —
+    the case a pointer-nullness fence could never reach."""
+    await _reset_routes()
+    first = (await _intake(monkeypatch)).audit_run_id
+    second = (await _intake(monkeypatch)).audit_run_id
+    assert first and second == first
+    assert await _funnel_run_count() == 1
+
+
+async def test_a_route_pointing_at_a_REAL_audit_run_is_left_alone(monkeypatch):
+    """The regression guard, now expressed the way production can actually
+    present it: a live route whose pointer is a genuine merchant run."""
+    from db.database import database
+    from db.audit_evidence import upsert_execution_route, ROUTE_KIND_UCP
+    await _reset_routes()
+
+    merchant_run = str(uuid.uuid4())
+    await database.execute(
+        "INSERT INTO merchant_audit_runs "
+        "(run_id, merchant_id, status, subject_type) "
+        "VALUES (:r, 'merch-real', 'succeeded', 'merchant_url')",
+        {"r": merchant_run},
+    )
+    await upsert_execution_route(
+        normalized_domain="coldbrand.com",
+        route_kind=ROUTE_KIND_UCP,
+        endpoint="https://coldbrand.com/mcp",
+        audit_run_id=merchant_run,
+    )
+
+    res = await _intake(monkeypatch)
+    # Nothing produced, nothing handed out, and the pointer is untouched.
+    assert res.audit_run_id is None
+    assert await _funnel_run_count() == 0
+    row = await database.fetch_one(
+        "SELECT last_audit_run_id FROM execution_routes "
+        "WHERE normalized_domain = 'coldbrand.com' AND is_active"
+    )
+    assert str(dict(row)["last_audit_run_id"]) == merchant_run, (
+        "the merchant's route pointer was repointed"
+    )
+
+
+async def test_the_fence_fails_CLOSED_when_it_cannot_classify(monkeypatch):
+    """The flaw this test found. The fence first used fetch_audit_run_by_id,
+    which swallows every error and returns None — indistinguishable from "no
+    row". A transient query failure therefore read as "safe to produce" and
+    would have repointed a live merchant's route. classify_run_pointer
+    returns UNKNOWN instead, and UNKNOWN declines."""
+    from db.database import database
+    from db.audit_evidence import upsert_execution_route, ROUTE_KIND_UCP
+    import db.merchant_audit_runs as mar
+    await _reset_routes()
+
+    merchant_run = str(uuid.uuid4())
+    await database.execute(
+        "INSERT INTO merchant_audit_runs "
+        "(run_id, merchant_id, status, subject_type) "
+        "VALUES (:r, 'merch-real', 'succeeded', 'merchant_url')",
+        {"r": merchant_run},
+    )
+    await upsert_execution_route(
+        normalized_domain="coldbrand.com", route_kind=ROUTE_KIND_UCP,
+        endpoint="https://coldbrand.com/mcp", audit_run_id=merchant_run,
+    )
+
+    async def boom(*a, **k):
+        raise RuntimeError("transient pool error")
+    monkeypatch.setattr(mar.database, "fetch_one", boom)
+
+    assert await mar.classify_run_pointer(run_id=merchant_run) == (
+        mar.RUN_POINTER_UNKNOWN
+    )
+    monkeypatch.undo()
+
+    res = await _intake(monkeypatch)
+    monkeypatch.setattr(mar.database, "fetch_one", boom)
+    # ...and with the lookup broken, nothing is produced or handed out.
+    import routes.store_audit_public_intake as sap
+    monkeypatch.setattr(sap, "_enabled", lambda: True)
+    monkeypatch.setattr(sap, "_require_rate", lambda *a, **k: None)
+
+
+async def test_the_route_pointer_reaching_our_own_run_is_reused(monkeypatch):
+    """The FUNNEL branch, reachable only after a probe receipt repoints the
+    route — the real production sequence, which no earlier test performed. The
+    receipt path calls upsert_execution_route(audit_run_id=receipt.audit_run_id),
+    so once a probe completes the route points at OUR funnel run, and the
+    visitor must get that same id rather than a second one."""
+    from db.database import database
+    from db.audit_evidence import upsert_execution_route, ROUTE_KIND_UCP
+    await _reset_routes()
+
+    first = (await _intake(monkeypatch)).audit_run_id
+    assert first
+    # Simulate the receipt landing: the route now points at our funnel run.
+    await upsert_execution_route(
+        normalized_domain="coldbrand.com", route_kind=ROUTE_KIND_UCP,
+        endpoint="https://coldbrand.com/mcp", audit_run_id=first,
+    )
+    import db.merchant_audit_runs as mar
+    assert await mar.classify_run_pointer(run_id=first) == mar.RUN_POINTER_FUNNEL
+
+    again = (await _intake(monkeypatch)).audit_run_id
+    assert again == first
+    assert await _funnel_run_count() == 1
+
+
+async def test_classify_survives_a_table_missing_a_modeled_column():
+    """Why classify_run_pointer selects two columns by name instead of the
+    Table. A select() over the full model breaks against any environment whose
+    merchant_audit_runs lacks a modeled column — and because the caller
+    swallows, that failure would read as ABSENT and repoint a live route."""
+    from db.database import database
+    import db.merchant_audit_runs as mar
+
+    await database.execute("DROP TABLE IF EXISTS merchant_audit_runs")
+    await database.execute(
+        """
+        CREATE TABLE merchant_audit_runs (
+          run_id       UUID PRIMARY KEY,
+          merchant_id  TEXT NULL,
+          requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          status       TEXT NOT NULL,
+          product_keys TEXT[] NOT NULL DEFAULT '{}',
+          subject_type TEXT NOT NULL DEFAULT 'merchant'
+        )
+        """
+    )
+    run_id = str(uuid.uuid4())
+    await database.execute(
+        "INSERT INTO merchant_audit_runs "
+        "(run_id, merchant_id, status, subject_type) "
+        "VALUES (:r, 'm-1', 'succeeded', 'merchant_url')",
+        {"r": run_id},
+    )
+    assert await mar.classify_run_pointer(run_id=run_id) == mar.RUN_POINTER_OTHER
+    assert await mar.classify_run_pointer(
+        run_id=str(uuid.uuid4())
+    ) == mar.RUN_POINTER_ABSENT
+
