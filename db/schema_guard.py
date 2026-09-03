@@ -414,6 +414,21 @@ async def ensure_required_schema_light() -> None:
                         "WHERE merchant_id IS NULL;"
                     )
                 )
+                # mig 211 (#2020): one unclaimed funnel run per domain. NOT
+                # CONCURRENTLY here — this path runs inside the guard's own
+                # transaction, where CONCURRENTLY is illegal. On a database
+                # that reaches this code the table is small or the index
+                # already exists; the migration carries the CONCURRENTLY form
+                # for the hot production table.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_funnel_run_one_per_domain ON merchant_audit_runs "
+                        "((partial_result_jsonb->'funnel'->>'domain')) "
+                        "WHERE merchant_id IS NULL "
+                        "AND subject_type = 'public_funnel';"
+                    )
+                )
             except Exception:
                 # Best-effort, like every sibling. Failing here is fail-CLOSED
                 # (anonymous inserts error); it must not starve what follows.
