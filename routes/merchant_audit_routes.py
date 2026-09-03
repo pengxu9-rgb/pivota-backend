@@ -1554,6 +1554,9 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         "outreach_moves": 0,
         "pitch_targets": 0,
         "top_actions": 0,
+        # Number of catalogue gaps found, so the locked panel can say "6 gaps"
+        # instead of rendering as an empty section.
+        "selection_gap": 0,
     }
     teaser_headline = None
 
@@ -1602,6 +1605,32 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         # "what to do" layer when present.
         if isinstance(home, dict) and home.get("winning_products_not_carried") is not None:
             home["winning_products_not_carried"] = None
+        # C1 selection gap: the merchant's own catalogue joined against the
+        # queries it loses ("you sell X and you are absent from query Y").
+        # Same paid layer as where_you_can_win, and strictly more actionable.
+        # It reached the wire before this lock because brand_rollup is served
+        # wholesale and no inner-key allowlist filters it.
+        if isinstance(home, dict):
+            _sg = home.get("selection_gap")
+            if _sg is not None:
+                if isinstance(_sg, dict):
+                    # The section's OWN lost_queries, not len(gaps): a shape
+                    # with no matched products but a populated
+                    # lost_queries_without_product is routine (build_selection_
+                    # gap sets available=True for it), and counting only gaps
+                    # would stamp "0" — the empty-panel render this count
+                    # exists to prevent.
+                    _sg_counts = _sg.get("counts")
+                    if isinstance(_sg_counts, dict):
+                        _n = _sg_counts.get("lost_queries")
+                    else:
+                        _n = None
+                    if not isinstance(_n, int):
+                        _n = len(_sg.get("gaps") or []) + len(
+                            _sg.get("lost_queries_without_product") or []
+                        )
+                    counts["selection_gap"] = max(counts["selection_gap"], _n)
+                home["selection_gap"] = None
 
     # brand_report is the raw report dict — its narrative/per-SKU branches are
     # aliases (already stripped above), but the full win_plan is its own tree.
@@ -1714,6 +1743,13 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
             brand_rollup.get("where_you_can_win")
             or report.get("where_you_can_win")
         ),
+        # C1 selection gap. Lifted out of brand_rollup so the portal reads one
+        # documented key rather than reaching into the rollup; the rollup keeps
+        # its copy, and the free-tier strip nulls BOTH homes. No report-level
+        # fallback: the only writer is brand_rollup["selection_gap"], so a
+        # `or report.get(...)` arm would be an uncovered defensive default that
+        # reads as a delivering line.
+        "selection_gap": brand_rollup.get("selection_gap"),
         "suggested_prompts": report.get("suggested_prompts"),
         # Merchant's own test prompts ("Your prompts"), probed once brand-level.
         "custom_prompts": report.get("custom_prompts") or [],
@@ -2591,6 +2627,7 @@ _SHARE_ALLOWED_TOP_KEYS = (
     "brand_rollup",
     "authority_map",
     "where_you_can_win",
+    "selection_gap",
     "suggested_prompts",
     "where_youre_losing",
     "merchant_narrative",
