@@ -31,6 +31,10 @@ from services.pdp_governance_service import (
 )
 from services.pdp_copy_review import generate_copy_review_rubric
 from utils.auth import get_current_user
+from services.merchant_write_guardrails import (
+    GuardrailViolation,
+    guardrail_block_message,
+)
 
 
 router = APIRouter(prefix="/merchant/pdps", tags=["merchant-pdp-governance"])
@@ -53,6 +57,17 @@ def _merchant_id(current_user: Dict[str, Any]) -> str:
 
 
 def _map_error(exc: Exception) -> HTTPException:
+    # A guardrail refusal is an operator-readable 422, never a 500 traceback:
+    # the write was refused on purpose and the caller needs the reasons.
+    if isinstance(exc, GuardrailViolation):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "MERCHANT_WRITE_GUARDRAIL",
+                "message": guardrail_block_message(exc.violations),
+                "violations": exc.violations,
+            },
+        )
     message = str(exc)
     if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)

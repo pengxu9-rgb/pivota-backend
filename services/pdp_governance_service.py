@@ -24,6 +24,17 @@ from db.pdp_governance import (
 )
 from db.merchant_product_overlay import merchant_product_overlay
 from db.products import products_cache
+from services.merchant_write_guardrails import (
+    ACTOR_HUMAN,
+    ACTOR_MODEL,
+    ACTOR_SYSTEM,
+    KIND_PDP_MODULE_CONTENT,
+    GuardrailViolation,
+    check_guardrails,
+    check_host_approval,
+    current_config,
+    items_from_payload,
+)
 
 
 DEFAULT_MARKET = "US"
@@ -32,6 +43,60 @@ GPT55_REVIEW_MODEL = "gpt-5.5"
 REVIEW_ACTOR_HUMAN = "human_employee"
 REVIEW_ACTOR_GPT55 = "gpt55_quality_gate"
 REVIEW_ACTOR_SYSTEM = "system_policy"
+
+
+def _guardrail_actor_kind(actor_type: Optional[str]) -> str:
+    """Map this service's review actor onto the guardrail module's actor kinds.
+
+    REVIEW_ACTOR_GPT55 is a MODEL, whatever `actor_id` says. The merchant self-approve
+    route (routes/merchant_pdp.py) passes actor_id="merchant:<id>" with actor_type
+    REVIEW_ACTOR_GPT55 because the LLM gate — not the merchant — is the publish
+    authority there; reading the id instead of the type would let a model-decided
+    publish present itself as a human one.
+    """
+    if actor_type == REVIEW_ACTOR_HUMAN:
+        return ACTOR_HUMAN
+    if actor_type == REVIEW_ACTOR_SYSTEM:
+        return ACTOR_SYSTEM
+    return ACTOR_MODEL
+
+
+def _module_write_items(pdp_id: str, module_key: str, payload: Dict[str, Any], before: Optional[Dict[str, Any]] = None):
+    """The change lines an operator would approve: one per top-level payload key."""
+    return items_from_payload(f"{pdp_id}:{module_key}", payload, before=before)
+
+
+def _enforce_module_write_guardrails(
+    *,
+    pdp_id: str,
+    module_key: str,
+    payload: Dict[str, Any],
+    before: Optional[Dict[str, Any]] = None,
+    actor_type: Optional[str] = None,
+    at_apply: bool = False,
+) -> None:
+    """Refuse a module write that breaks the guardrails.
+
+    Called twice per lane, exactly as the blueprint requires: once when the payload is
+    STAGED (create_module_draft) and again at APPLY (publish_module_version) against
+    `current_config()` — the config in force at apply time, not the one that was in
+    force when the draft was written. At apply the host-approval switch is checked too;
+    at staging it is not, because staging approves nothing.
+    """
+    config = current_config()
+    violations = check_guardrails(
+        KIND_PDP_MODULE_CONTENT,
+        _module_write_items(pdp_id, module_key, payload, before=before),
+        config,
+    )
+    if at_apply:
+        violations = violations + check_host_approval(
+            KIND_PDP_MODULE_CONTENT,
+            actor_kind=_guardrail_actor_kind(actor_type),
+            config=config,
+        )
+    if violations:
+        raise GuardrailViolation(violations)
 
 PDP_MODULE_KEYS: Tuple[str, ...] = (
     "identity",
@@ -4910,6 +4975,13 @@ async def create_module_draft(
     subject = await resolve_pdp_subject(pdp_id=pdp_id)
     payload = payload if isinstance(payload, dict) else {}
     source_refs = source_refs if isinstance(source_refs, list) else []
+    # STAGE-time guardrails. The payload arriving here is free-form (a merchant
+    # contribution or an LLM candidate both land in it unvalidated), so this is where a
+    # price or an identity key riding inside a copy edit is refused — before it is
+    # persisted as a version anyone can then approve.
+    _enforce_module_write_guardrails(
+        pdp_id=subject["pdp_id"], module_key=module_key, payload=payload
+    )
     version = await _next_module_version(subject["pdp_id"], module_key)
     requires_human = module_requires_human_review(module_key, payload)
     risk_level = module_risk_level(module_key, payload)
@@ -5465,6 +5537,19 @@ async def publish_module_version(
     source_refs = _json_list(version.get("source_refs"))
     if actor_type == REVIEW_ACTOR_GPT55 and module_requires_human_review(module_key, payload):
         raise PermissionError("PDP_MODULE_REQUIRES_HUMAN_REVIEW")
+
+    # APPLY-time guardrails, before the first write. Re-checked here rather than trusted
+    # from staging for two reasons: the limits may have been tightened while this
+    # version sat staged, and a version's payload can be rewritten in place by the
+    # identity-review path without passing through create_module_draft again.
+    _enforce_module_write_guardrails(
+        pdp_id=pdp_id,
+        module_key=module_key,
+        payload=payload,
+        before=_json_dict((await _current_published_version(pdp_id, module_key) or {}).get("payload")),
+        actor_type=actor_type,
+        at_apply=True,
+    )
 
     now = _now()
     await database.execute(
