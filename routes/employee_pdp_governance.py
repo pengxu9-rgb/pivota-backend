@@ -31,6 +31,10 @@ from services.pdp_governance_service import (
     upload_pdp_gallery_image,
 )
 from utils.auth import get_current_employee
+from services.merchant_write_guardrails import (
+    GuardrailViolation,
+    guardrail_block_message,
+)
 
 
 router = APIRouter(prefix="/employee/pdps", tags=["employee-pdp-governance"])
@@ -127,6 +131,17 @@ def _employee_role(current_user: Dict[str, Any]) -> str:
 
 
 def _map_error(exc: Exception) -> HTTPException:
+    # A guardrail refusal is an operator-readable 422, never a 500 traceback:
+    # the write was refused on purpose and the caller needs the reasons.
+    if isinstance(exc, GuardrailViolation):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "MERCHANT_WRITE_GUARDRAIL",
+                "message": guardrail_block_message(exc.violations),
+                "violations": exc.violations,
+            },
+        )
     message = str(exc)
     if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND", "PDP_REVIEW_TASK_NOT_FOUND", "PDP_IDENTITY_CANDIDATE_NOT_FOUND", "PDP_PRODUCT_GROUP_MEMBER_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)
