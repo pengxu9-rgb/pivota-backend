@@ -27,7 +27,7 @@ import os
 # Database import for employee authentication
 from config.platform import is_production
 from db.database import database
-from utils.auth import verify_password as verify_bcrypt_password
+from utils.auth import EMPLOYEE_STAFF_ROLES, verify_password as verify_bcrypt_password
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
@@ -127,7 +127,7 @@ def require_admin(current_user: dict = Depends(verify_jwt_token)):
 
 def require_employee(current_user: dict = Depends(verify_jwt_token)):
     """Require employee or admin role for access"""
-    if current_user["role"] not in ["admin", "employee"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Employee access required"

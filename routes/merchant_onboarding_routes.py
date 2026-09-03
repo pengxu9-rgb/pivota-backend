@@ -29,7 +29,7 @@ from db.payment_router import register_merchant_psp_route
 from db.auth_identity import upsert_membership
 from db.database import database
 from readiness.summary import build_readiness_summary
-from utils.auth import ADMIN_ROLES, get_current_user, get_current_employee, require_admin
+from utils.auth import ADMIN_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin
 from routes.manage_integrations import sync_legacy_primary_store_fields
 from urllib.parse import urlparse
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
@@ -1613,7 +1613,7 @@ async def get_merchant_kyb_documents(
     current_user: dict = Depends(get_current_user)
 ):
     """Get KYB documents for a merchant"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1651,7 +1651,7 @@ async def restore_merchant(
     current_user: dict = Depends(get_current_user)
 ):
     """Restore a soft-deleted merchant"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

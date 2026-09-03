@@ -3,7 +3,7 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
-from utils.auth import get_current_user
+from utils.auth import MERCHANT_OR_EMPLOYEE_STAFF_ROLES, get_current_user
 from db.database import database
 from datetime import datetime
 import uuid
@@ -35,7 +35,7 @@ async def _sync_connected_platform_products(
 ):
     platform_label = _PLATFORM_LABELS.get(platform, platform.title())
 
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     merchant_id = current_user.get("merchant_id")
@@ -246,7 +246,7 @@ async def merchant_sync_status(
     exception ([portal-sync] lines), and the honest client message is
     "still running or failed — retry", not a fabricated success.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     merchant_id = current_user.get("merchant_id")
@@ -292,7 +292,7 @@ async def connect_wix_store_sync(
     current_user: dict = Depends(get_current_user)
 ):
     """Connect a Wix store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -386,7 +386,7 @@ async def test_wix_connection(
     current_user: dict = Depends(get_current_user)
 ):
     """Test Wix store connection"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

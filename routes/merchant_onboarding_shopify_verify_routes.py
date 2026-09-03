@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from db.database import database
 from services.shopify_integration_verify import verify_shopify_integration
-from utils.auth import can_access_merchant, get_current_user
+from utils.auth import MERCHANT_OR_EMPLOYEE_STAFF_ROLES, can_access_merchant, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ async def merchant_onboarding_verify_shopify(
     Merchant-facing onboarding facade for Shopify integration verify.
     Delegates to the canonical verify service but returns a redacted report (no raw bodies/error payloads).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Can only verify your own merchant")
@@ -111,7 +111,7 @@ async def merchant_get_latest_shopify_capability_report(
     """
     Merchant-facing read-only: return the latest stored capability snapshot (redacted).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Not authorized for merchant")

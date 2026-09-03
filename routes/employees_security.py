@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from textwrap import dedent
 import logging
 from db.auth_identity import upsert_membership
-from utils.auth import get_current_user, hash_password as hash_user_password
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user, hash_password as hash_user_password
 from db.database import database
 from config.settings import settings
 import uuid
@@ -92,7 +92,7 @@ async def get_all_employees(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all employees"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from utils.runtime_safety import require_runtime_gate
 import logging
 
@@ -12,9 +12,20 @@ def _require_admin_store_mutation_access(current_user: dict, *, mutation: bool) 
     require_runtime_gate("ALLOW_PROD_ADMIN_STORE_MUTATION")
     role = str((current_user or {}).get("role") or "").strip().lower()
     if mutation:
+        # NOTE: "superadmin" (no underscore) is NOT a role this system can mint
+        # -- the canonical spelling is `super_admin` (utils.auth.ADMIN_ROLES,
+        # routes.auth._validate_role_value). This comparison therefore never
+        # matches and the mutation lane is closed to everyone, including real
+        # super_admins. Left AS-IS on purpose: correcting the spelling would not
+        # restore lost access, it would newly OPEN destructive prod store
+        # mutation behind nothing but ALLOW_PROD_ADMIN_STORE_MUTATION. Opening
+        # it is a deliberate decision, not a typo fix -- see the PR that added
+        # this note.
         if role != "superadmin":
             raise HTTPException(status_code=403, detail="Superadmin access required")
-    elif role not in {"admin", "superadmin"}:
+    # Read-only branch: `admin` already worked here, so spelling `super_admin`
+    # correctly only restores the privileged role that was wrongly excluded.
+    elif role not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
 
 @router.get("/stores/wix")
