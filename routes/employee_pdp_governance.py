@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from services.pdp_governance_service import (
     DEFAULT_MARKET,
+    LLM_ONLY_PUBLISH_MODULES,
     REVIEW_ACTOR_GPT55,
     REVIEW_ACTOR_HUMAN,
     audit_pdp_identity_groups,
@@ -551,6 +552,25 @@ async def run_gpt55_review(
     body: ModuleVersionRequest,
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    """Run the LLM-only GPT-5.5 gate over a staged module; a pass auto-publishes.
+
+    This lane has NO human-actor RBAC behind it. review_module_version() gates
+    on allowed_pdp_review_actions only inside `if actor_type ==
+    REVIEW_ACTOR_HUMAN`, and we call it with REVIEW_ACTOR_GPT55 and no
+    actor_role -- so the caller's role (admin, employee, or outsourced; see
+    get_current_employee) is never consulted and every module in
+    MACHINE_PUBLISH_MODULES was auto-publishable from an employee token,
+    `offers` and `identity` included.
+
+    The module fence is therefore the whole authorization for this route, and it
+    runs HERE, before the service call, so a refused module writes nothing at
+    all. It is the same shared set the merchant self-approve twin reads
+    (routes/merchant_pdp.py -- "Merchants are NOT direct publish authorities;
+    the gate is"). Employees who need to publish a fenced-off module still can,
+    through /review and /publish, where their role IS checked.
+    """
+    if module_key not in LLM_ONLY_PUBLISH_MODULES:
+        raise HTTPException(status_code=400, detail="MODULE_NOT_LLM_REVIEWABLE")
     try:
         return await review_module_version(
             pdp_id=pdp_id,
