@@ -1440,12 +1440,35 @@ async def get_audit_run(
                     ),
                 },
             )
-        return sanitize_report_for_merchant(
-            _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+        # PAYWALL. Both returns on this route served the paid "what to do"
+        # layer — selection_gap, where_you_can_win, win_plan,
+        # prioritized_actions — while the sibling poll in
+        # merchant_audit_routes stripped it for free-tier owners. A free
+        # merchant could read the locked layer by fetching the same run here.
+        #
+        # Keyed to the run's OWNER, not the caller: ownership is already
+        # enforced above (404 on mismatch), so they are the same merchant,
+        # and using the row's value keeps this correct if that ever changes.
+        # Reusing merchant_audit_routes' helper rather than reimplementing —
+        # a second copy of a paywall is how the two drift apart.
+        from routes.merchant_audit_routes import _apply_actions_paywall
+
+        return await _apply_actions_paywall(
+            sanitize_report_for_merchant(
+                _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+            ),
+            str(row.get("merchant_id") or ""),
         )
 
+    from routes.merchant_audit_routes import _apply_actions_paywall
+
     return AuditRunDetail(
-        **sanitize_report_for_merchant(_strip_brand_facing_internal_money(dict(row)))
+        **await _apply_actions_paywall(
+            sanitize_report_for_merchant(
+                _strip_brand_facing_internal_money(dict(row))
+            ),
+            str(row.get("merchant_id") or ""),
+        )
     )
 
 
