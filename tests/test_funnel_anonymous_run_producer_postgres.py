@@ -393,3 +393,88 @@ async def test_classify_survives_a_table_missing_a_modeled_column():
         run_id=str(uuid.uuid4())
     ) == mar.RUN_POINTER_ABSENT
 
+
+
+# ---------------------------------------------------------------------------
+# #2020: one unclaimed funnel run per domain.
+#
+# The reuse was SELECT-then-INSERT with nothing atomic behind it, on an
+# UNAUTHENTICATED endpoint that creates rows. Measured before the fix: 50
+# concurrent requests for one domain -> 50 rows. Only a real database can
+# show this; SQLite serialises these writes and reports a green race whatever
+# the code does.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_211 = (
+    Path(__file__).resolve().parent.parent
+    / "db/migrations" / "211_funnel_run_one_per_domain.sql"
+)
+
+
+async def _apply_211():
+    from db.database import database
+    from db.sql_migrations import split_statements
+    for statement in split_statements(_MIGRATION_211.read_text()):
+        # CONCURRENTLY is illegal inside this test's transaction; the runner
+        # gives the real migration an AUTOCOMMIT connection. The INDEX itself
+        # is what is under test, not the build strategy.
+        await database.execute(statement.replace("CONCURRENTLY ", ""))
+
+
+async def test_concurrent_producers_create_exactly_one_run_per_domain():
+    import db.merchant_audit_runs as mar
+    from db.database import database
+    await _apply_211()
+
+    results = await asyncio.gather(*[
+        mar.record_anonymous_funnel_run(domain="raced.com") for _ in range(25)
+    ])
+    row = await database.fetch_one(
+        "SELECT count(*) AS n FROM merchant_audit_runs "
+        "WHERE subject_type = 'public_funnel'"
+    )
+    assert dict(row)["n"] == 1, (
+        f"{dict(row)['n']} rows for one domain — the reuse is not atomic"
+    )
+    # Every caller gets a usable id, and they all agree on which run it is.
+    assert all(r for r in results), "a losing racer returned nothing"
+    assert len(set(results)) == 1, f"racers disagree on the run: {set(results)}"
+
+
+async def test_the_constraint_only_binds_UNCLAIMED_runs_in_this_lane():
+    import db.merchant_audit_runs as mar
+    """Once a run is claimed it belongs to a merchant, and the next visitor to
+    that domain must be able to start a fresh one."""
+    import db.merchant_audit_runs as mar
+    from db.database import database
+    await _apply_211()
+
+    first = await mar.record_anonymous_funnel_run(domain="claimed.com")
+    assert first
+    assert await mar.claim_audit_run_for_merchant(
+        run_id=first, merchant_id="m-1"
+    ) is True
+
+    second = await mar.record_anonymous_funnel_run(domain="claimed.com")
+    assert second and second != first, (
+        "a claimed run must not block the next visitor's"
+    )
+    row = await database.fetch_one(
+        "SELECT count(*) AS n FROM merchant_audit_runs "
+        "WHERE subject_type = 'public_funnel'"
+    )
+    assert dict(row)["n"] == 2
+
+
+async def test_different_domains_are_unaffected():
+    import db.merchant_audit_runs as mar
+    from db.database import database
+    await _apply_211()
+    a = await mar.record_anonymous_funnel_run(domain="one.com")
+    b = await mar.record_anonymous_funnel_run(domain="two.com")
+    assert a and b and a != b
+    row = await database.fetch_one(
+        "SELECT count(*) AS n FROM merchant_audit_runs "
+        "WHERE subject_type = 'public_funnel'"
+    )
+    assert dict(row)["n"] == 2

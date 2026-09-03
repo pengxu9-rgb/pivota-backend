@@ -36,7 +36,7 @@ import logging
 import os
 import json as _json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from db._jsonb_safe import _json_safe
 from typing import Any, Dict, List, Optional, Tuple, Mapping
@@ -390,6 +390,28 @@ async def record_anonymous_funnel_run(*, domain: str) -> Optional[str]:
         )
         return run_id
     except Exception as exc:  # noqa: BLE001
+        # #2020: a concurrent request may have won the race for this domain.
+        # idx_funnel_run_one_per_domain (migration 211) turns that into a
+        # unique violation instead of a second row, so re-read the winner's
+        # run rather than reporting failure — the caller wants A run for this
+        # domain, not specifically the one it tried to insert.
+        #
+        # Re-reading on ANY error, not just a unique violation: the driver's
+        # exception types differ across backends, and the question this asks
+        # ("is there an unclaimed run for this domain now?") is the right one
+        # either way. If there is none, the original failure stands.
+        try:
+            winner = await find_unclaimed_funnel_run_for_domain(
+                domain=normalized, since=_now_utc() - timedelta(days=1),
+            )
+        except Exception:  # noqa: BLE001
+            winner = None
+        if winner and winner.get("run_id"):
+            logger.info(
+                "record_anonymous_funnel_run: lost the race for domain=%s, "
+                "reusing the winning run", normalized,
+            )
+            return str(winner["run_id"])
         logger.warning(
             "record_anonymous_funnel_run failed for domain=%s: %s",
             normalized, str(exc)[:200],
