@@ -252,11 +252,18 @@ AUDIENCE_MERCHANT = "merchant"
 AUDIENCE_INTERNAL_OPS = "internal_ops"
 AUDIENCE_PIVOTA_PDP_FEED = "pivota_pdp_feed"
 AUDIENCE_FRONTEND_AGENT_FEED = "frontend_agent_feed"
+# C2. revenue_recovery: the merchant-facing three-stage funnel view.
+# public_anonymous: the ONLY projection an unauthenticated visitor may read,
+# deterministic tier only — see build_public_anonymous_projection for what
+# that excludes and why.
+AUDIENCE_REVENUE_RECOVERY = "revenue_recovery"
+AUDIENCE_PUBLIC_ANONYMOUS = "public_anonymous"
 
 VALID_AUDIENCES = frozenset({
     AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
     AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
     AUDIENCE_FRONTEND_AGENT_FEED,
+    AUDIENCE_REVENUE_RECOVERY, AUDIENCE_PUBLIC_ANONYMOUS,
 })
 
 # P0-4: role-gated audience access. Merchant JWTs may only read the
@@ -276,7 +283,17 @@ VALID_AUDIENCES = frozenset({
 # follow-up PR can introduce role-aware dependencies; until then
 # the route returns 403 for any audience outside this allow list
 # and the projections stay merchant-invisible.
-MERCHANT_ALLOWED_AUDIENCES = frozenset({AUDIENCE_MERCHANT})
+# revenue_recovery joins it: same merchant, same run, a different arrangement
+# of what they may already read. public_anonymous does NOT need to be here — it
+# is readable WITHOUT auth, and a merchant reading it would only get less.
+MERCHANT_ALLOWED_AUDIENCES = frozenset({
+    AUDIENCE_MERCHANT, AUDIENCE_REVENUE_RECOVERY,
+})
+
+# C2: audiences an UNAUTHENTICATED caller may read. Exactly one, and it is an
+# allowlist for the same reason _SHARE_ALLOWED_TOP_KEYS is: a denylist on an
+# unauthenticated surface ships every future audience by default.
+PUBLIC_ALLOWED_AUDIENCES = frozenset({AUDIENCE_PUBLIC_ANONYMOUS})
 
 
 # =====================================================================
