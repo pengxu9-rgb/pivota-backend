@@ -55,9 +55,37 @@ def _shaped_fixture():
     per_sku[0]["opportunity"] = {"open_lanes": [{"query": "best beginner drone"}]}
     per_sku[0]["suggested_prompts"] = ["best drone under $300"]
     wcw = {"niches": [{"query": "travel drone", "action": "create_answer"}]}
+    # C1 selection gap: the merchant's OWN catalogue joined against the
+    # queries they lose. Names their product and the query it should have
+    # won — the paid "what to do" layer in its most actionable form.
+    selection_gap = {
+        "version": 1,
+        "available": True,
+        "gaps": [
+            {
+                "query": "best beginner drone under 300",
+                "evidence": {"grounded_responses": 0,
+                             "responses_citing_your_product": 0,
+                             "engines": ["gemini"]},
+                "matched_products": [
+                    {"product_key": "x1-drone", "title": "X1 Drone",
+                     "matched_terms": ["drone"], "matched_form": "drone",
+                     "match_reason": 'Your "X1 Drone" is a drone.'},
+                ],
+            }
+        ],
+        "lost_queries_without_product": [],
+        "won_queries": [{"query": "best travel drone",
+                         "evidence": {"grounded_responses": 3,
+                                      "responses_citing_your_product": 3,
+                                      "engines": ["gemini"]}}],
+        "counts": {"catalog_products_indexed": 1, "lost_queries": 1,
+                   "lost_queries_with_matched_product": 1, "won_queries": 1},
+    }
     brand_rollup = {
         "avg_visibility": 40,
         "where_you_can_win": wcw,
+        "selection_gap": selection_gap,
         # Reseller-only stocking recommendation — must be stripped when present.
         "winning_products_not_carried": [
             {"title": "DJI Mini 5", "recommend_stocking": True}
@@ -82,6 +110,9 @@ def _shaped_fixture():
         "per_sku_reports": per_sku,
         "brand_rollup": brand_rollup,
         "where_you_can_win": wcw,
+        # No report-level home: build_selection_gap only ever lands the section
+        # in brand_rollup, and a fixture that invents a shape production does
+        # not produce buys coverage for a branch nothing reaches.
         "brand_report": report,
         "report_summary": {
             "score": {"display": 4.0},
@@ -113,6 +144,9 @@ def test_strip_empties_actions_and_stamps_lock():
         "outreach_moves": 2,
         "pitch_targets": 1,
         "top_actions": 1,
+        # One catalogue gap in the fixture — the count survives so the locked
+        # panel can name a number without handing over the gap itself.
+        "selection_gap": 1,
     }
     assert out["locked_teaser_headline"] == "Fix PDP variant clarity"
 
@@ -143,6 +177,10 @@ _FORBIDDEN_ACTION_KEYS = {
     "win_condition",
     "action_headline",
     "where_you_can_win",
+    # C1: names the merchant's own SKU against a query it loses. Same
+    # "what to do" class as where_you_can_win, and it reached the wire
+    # through brand_rollup's wholesale pass-through before this lock.
+    "selection_gap",
     "outreach_moves",
     "pitch_targets",
     "win_plan_summary",
@@ -321,3 +359,83 @@ def test_share_redaction_without_lock_keeps_full_report():
     redacted = mar._redact_shared_report(shaped)
     assert "actions_locked" not in redacted
     assert len(redacted["merchant_narrative"]["prioritized_actions"]) == 2
+
+
+# ---- C1 selection gap: served first-class, locked for free ------------------
+
+def _row_for_real_shape():
+    fixture = _shaped_fixture()
+    return {
+        "run_id": "r-sg",
+        "status": "succeeded",
+        "report_jsonb": fixture["brand_report"],
+        "partial_result_jsonb": {"launch": {"wedge_base_payload": {}}},
+    }
+
+
+def test_selection_gap_is_served_as_a_top_level_key():
+    """The portal reads one documented key. Before this, the section existed
+    only inside brand_rollup and no route named it."""
+    shaped = mar._shape_url_audit_response(_row_for_real_shape())
+    section = shaped["selection_gap"]
+    assert section["version"] == 1
+    assert [g["query"] for g in section["gaps"]] == [
+        "best beginner drone under 300"
+    ]
+    assert [m["product_key"] for m in section["gaps"][0]["matched_products"]] == [
+        "x1-drone"
+    ]
+
+
+def test_the_free_tier_strip_reaches_both_homes_of_the_gap():
+    """Nulling only the top-level key would leave brand_rollup's copy on the
+    wire — which is how it shipped unpaywalled in the first place."""
+    shaped = mar._shape_url_audit_response(_row_for_real_shape())
+    assert shaped["brand_rollup"]["selection_gap"] is not None
+    mar._strip_actions_for_free_tier(shaped)
+    assert shaped["selection_gap"] is None
+    assert shaped["brand_rollup"]["selection_gap"] is None
+    assert shaped["brand_report"]["brand_rollup"]["selection_gap"] is None
+    assert shaped["locked_counts"]["selection_gap"] == 1
+
+
+def test_the_share_view_carries_the_gap_for_a_paid_owner():
+    shaped = mar._shape_url_audit_response(_row_for_real_shape())
+    shared = mar._redact_shared_report(shaped)
+    assert shared["selection_gap"]["gaps"], (
+        "selection_gap must be in _SHARE_ALLOWED_TOP_KEYS or the shared view "
+        "silently drops the top-level key while brand_rollup still carries it"
+    )
+
+
+def test_the_share_view_of_a_free_owner_leaks_no_gap():
+    """The share view is keyed to the OWNER's tier: a free owner's link must
+    not hand out the paid layer to anyone who has the URL."""
+    shaped = mar._shape_url_audit_response(_row_for_real_shape())
+    mar._strip_actions_for_free_tier(shaped)
+    shared = mar._redact_shared_report(shaped)
+    assert shared["selection_gap"] is None
+    assert shared["brand_rollup"]["selection_gap"] is None
+    assert _find_leaks(shared) == []
+
+
+def test_the_locked_count_survives_a_section_with_no_matched_products():
+    """A lost query the merchant has NO product for is a routine shape —
+    build_selection_gap sets available=True for it. Counting only `gaps` would
+    stamp locked_counts["selection_gap"] = 0 and render the empty panel this
+    count exists to prevent."""
+    shaped = _shaped_fixture()
+    shaped["brand_rollup"]["selection_gap"] = {
+        "version": 1,
+        "available": True,
+        "gaps": [],
+        "lost_queries_without_product": [{"query": "best drone for kids"}],
+        "won_queries": [],
+        "counts": {"catalog_products_indexed": 1, "lost_queries": 1,
+                   "lost_queries_with_matched_product": 0, "won_queries": 0},
+    }
+    shaped["brand_report"]["brand_rollup"] = shaped["brand_rollup"]
+    mar._strip_actions_for_free_tier(shaped)
+    assert shaped["brand_rollup"]["selection_gap"] is None
+    assert shaped["locked_counts"]["selection_gap"] == 1
+
