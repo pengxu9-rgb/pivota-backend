@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -164,6 +165,169 @@ async def create_quality_backfill_job(
         product_quality_backfill_jobs.select().where(product_quality_backfill_jobs.c.job_id == job_id)
     )
     return _normalize_row(row) or {}
+
+
+# ---------------------------------------------------------------------------
+# Unattended enqueue dedupe.
+#
+# Every sync enqueues a backfill (the readiness hooks in
+# services/catalog_sync_service and routes/universal_product_sync), and the
+# gateway's catalog auto-sync reaches the second hook through
+# routes/platform_products_sync_api with force_refresh=True — deliberately, so a
+# product that newly gained a field gets rescored. The cost, measured on prod
+# 2026-09-02: one 20-product Wix store synced up to 16 times a day and wrote 20
+# fresh product_quality_snapshot rows per sync (20 to 320 a day) for products
+# that had not changed, and those rows became the whole recent window of the
+# dead_quality_component invariant.
+#
+# "Skip when the sync changed nothing" is not available at the hook: the sync
+# stats count rows touched, not rows changed. So this is a per-(merchant,
+# platform) cooldown for UNATTENDED requests only. A merchant pressing Sync is
+# never deduped — that request is the delivery path for their own edits. A
+# request stronger than the job it would collide with (force_refresh after a
+# missing-only job) is never deduped either, for the same reason the universal
+# hook honours force_refresh at all.
+# ---------------------------------------------------------------------------
+QUALITY_BACKFILL_ENQUEUE_COOLDOWN_ENV = "QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS"
+DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS = 6 * 3600
+
+# Both twins are module-level constants so tests/test_repo_sql_prepare_postgres.py
+# plans the Postgres one. `CAST(:platform AS TEXT)` on both sides: asyncpg
+# cannot type a bare parameter that only appears in `IS NULL`.
+#
+# THE TIME COMPARISON IS IN EPOCH SECONDS, NOT `> CURRENT_TIMESTAMP - interval`.
+# `requested_at` is written CLIENT-side as `_utcnow()` into a column that is a
+# naive `timestamp` in prod (create_all builds it before migration 054 — see
+# tests/test_quality_backfill_partial_update.py). Comparing a naive column to
+# `CURRENT_TIMESTAMP - interval` (timestamptz) makes Postgres reinterpret the
+# stored UTC wall clock in the SESSION time zone, which nothing in this app
+# pins: under America/Los_Angeles the 6h cooldown silently became ~13h, under
+# Asia/Shanghai a brand-new job already failed the test and the dedupe was a
+# no-op (reviewed and measured on PR #2012). `EXTRACT(EPOCH FROM ...)` reads a
+# naive timestamp as UTC and a timestamptz as itself, so this is correct under
+# BOTH column declarations and any session zone. _REQUEUE_STALE_SQL does not
+# need this: it compares `started_at`, which claim_quality_backfill_job writes
+# with CURRENT_TIMESTAMP, so that column round-trips in the session zone.
+#
+# Strength is in the WHERE: only a job at least as strong as the request
+# qualifies (a force_refresh job satisfies any request; a missing-only job
+# satisfies only a missing-only request), so an intervening weaker attended job
+# cannot hide a stronger one, and a force_refresh request is never folded into
+# a missing-only job. `_utcnow()` truncates to whole seconds, so same-second
+# ties are common; `job_id DESC` is a determinism tiebreak only — any row that
+# qualifies is a correct fold target, the reported id may be a same-second
+# sibling.
+_RECENT_JOB_SQL = """
+    SELECT job_id
+    FROM product_quality_backfill_jobs
+    WHERE merchant_id = :merchant_id
+      AND (CAST(:platform AS TEXT) IS NULL OR platform = CAST(:platform AS TEXT))
+      AND status IN ('queued', 'running', 'completed')
+      AND (force_refresh OR NOT CAST(:force_refresh AS BOOLEAN))
+      AND EXTRACT(EPOCH FROM requested_at)
+          > EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) - CAST(:cooldown_seconds AS DOUBLE PRECISION)
+    ORDER BY requested_at DESC, job_id DESC
+    LIMIT 1
+    """
+
+# SQLite stores `_utcnow()` as 'YYYY-MM-DD HH:MM:SS[.ffffff]' and datetime('now')
+# is UTC in the same format, so the string comparison is exact. force_refresh
+# is an INTEGER 0/1 there; `NOT :force_refresh` with a bound bool is fine.
+_RECENT_JOB_SQL_SQLITE = """
+    SELECT job_id
+    FROM product_quality_backfill_jobs
+    WHERE merchant_id = :merchant_id
+      AND (CAST(:platform AS TEXT) IS NULL OR platform = CAST(:platform AS TEXT))
+      AND status IN ('queued', 'running', 'completed')
+      AND (force_refresh OR NOT :force_refresh)
+      AND requested_at > datetime('now', :cooldown_window)
+    ORDER BY requested_at DESC, job_id DESC
+    LIMIT 1
+    """
+
+
+def quality_backfill_enqueue_cooldown_seconds() -> int:
+    """0 disables the dedupe. An unparseable value falls back to the default
+    rather than to 0 — a typo must not silently turn the churn back on."""
+    raw = os.getenv(QUALITY_BACKFILL_ENQUEUE_COOLDOWN_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_QUALITY_BACKFILL_ENQUEUE_COOLDOWN_SECONDS
+
+
+async def _recent_quality_backfill_job_id(
+    merchant_id: str, platform: Optional[str], force_refresh: bool, cooldown_seconds: int
+) -> Optional[str]:
+    values = {
+        "merchant_id": merchant_id,
+        "platform": platform or None,
+        "force_refresh": bool(force_refresh),
+    }
+    if IS_POSTGRES:
+        row = await database.fetch_one(
+            _RECENT_JOB_SQL, {**values, "cooldown_seconds": int(cooldown_seconds)}
+        )
+    else:
+        row = await database.fetch_one(
+            _RECENT_JOB_SQL_SQLITE,
+            {**values, "cooldown_window": f"-{int(cooldown_seconds)} seconds"},
+        )
+    return str(row["job_id"]) if row is not None else None
+
+
+async def enqueue_quality_backfill_if_needed(
+    *,
+    merchant_id: str,
+    platform: Optional[str],
+    requested_by: Optional[str],
+    force_refresh: bool = False,
+    missing_only: bool = True,
+    unattended: bool = False,
+    cooldown_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Enqueue a backfill unless an unattended request would only repeat one.
+
+    Returns {"job", "enqueued", "reason"}. `job` is the full job row on BOTH
+    paths: the created job, or the recent job the request was folded into.
+    Attended requests (unattended=False) always enqueue, exactly as
+    create_quality_backfill_job did.
+    """
+    await ensure_product_quality_backfill_jobs_table()
+    seconds = (
+        quality_backfill_enqueue_cooldown_seconds()
+        if cooldown_seconds is None
+        else max(0, int(cooldown_seconds))
+    )
+    if unattended and seconds > 0:
+        recent_id = await _recent_quality_backfill_job_id(
+            merchant_id, platform, bool(force_refresh), seconds
+        )
+        if recent_id is not None:
+            recent = await get_quality_backfill_job(recent_id)
+            if recent is not None:
+                # Not silent: an operator who curls the internal sync API to
+                # force a rescore needs to be able to read that it was folded.
+                logger.info(
+                    "quality backfill enqueue folded into recent job %s "
+                    "(merchant=%s platform=%s requested_by=%s cooldown=%ss)",
+                    recent_id, merchant_id, platform, requested_by, seconds,
+                )
+                return {
+                    "job": recent,
+                    "enqueued": False,
+                    "reason": "recent_job_within_cooldown",
+                }
+    job = await create_quality_backfill_job(
+        merchant_id=merchant_id,
+        platform=platform,
+        requested_by=requested_by,
+        force_refresh=force_refresh,
+        missing_only=missing_only,
+    )
+    return {"job": job, "enqueued": True, "reason": "created"}
 
 
 async def get_quality_backfill_job(job_id: str) -> Optional[Dict[str, Any]]:
