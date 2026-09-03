@@ -18,6 +18,11 @@ commerce_interactions = Table(
     Column("prompt_id", String(64), nullable=True, index=True),
     Column("result_id", String(64), nullable=True, index=True),
     Column("click_id", String(64), nullable=True, index=True),
+    # The recovery action this interaction can be attributed to, carried in on
+    # the attributed link the agent followed. Indexed because the question it
+    # answers — "did the fix we recommended produce an order?" — is a lookup
+    # by key, and it is the only reason this column exists.
+    Column("recovery_key", String(40), nullable=True, index=True),
     Column("cart_id", String(128), nullable=True, index=True),
     Column("quote_id", String(64), nullable=True, index=True),
     Column("checkout_id", String(128), nullable=True, index=True),

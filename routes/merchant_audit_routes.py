@@ -3571,7 +3571,7 @@ async def list_merchant_tasks(
 
 
 class _TaskStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(pending|in_progress|done|failed)$")
+    status: str = Field(..., pattern="^(pending|in_progress|done|failed|ready_for_retest|verifying|verified|regressed)$")
     assigned_to_human: Optional[str] = Field(None, max_length=200)
     evidence: Optional[Dict[str, Any]] = None
 
