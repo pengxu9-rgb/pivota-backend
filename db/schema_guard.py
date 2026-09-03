@@ -369,6 +369,30 @@ async def ensure_required_schema_light() -> None:
                 # first authorization 500s inside Reap's 1.6s budget, which Reap
                 # renders as a declined card — not a silent wrong answer.
                 pass
+            # mig 212: the recovery key — the join the Prove stage rests on.
+            # Early and wrapped for the same reason as mig 210 below: this
+            # branch is ONE try, and an unguarded CREATE INDEX further down
+            # abandons everything after it on a partial database.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_tasks
+                          ADD COLUMN IF NOT EXISTS recovery_key TEXT NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS recovery_key VARCHAR(40) NULL;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
             # mig 210: anonymous audit runs. Position and wrapping are BOTH
             # load-bearing, and neither alone is enough — measured, not assumed.
             #
