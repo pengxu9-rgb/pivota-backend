@@ -40,6 +40,9 @@ from pydantic import BaseModel, Field
 from utils.auth import get_current_merchant
 
 from db.merchant_audit_runs import (
+    RUN_POINTER_ABSENT,
+    RUN_POINTER_FUNNEL,
+    classify_run_pointer,
     SUBJECT_TYPE_PUBLIC_FUNNEL,
     claim_audit_run_for_merchant,
     find_unclaimed_funnel_run_for_domain,
@@ -288,6 +291,22 @@ def _reuse_window_hours() -> int:
         return 24
 
 
+async def _existing_funnel_run_id(domain: str) -> Optional[str]:
+    """The unclaimed funnel run for this domain, if one is still in window.
+
+    Read-only: the early-return paths must not mint anything, only surface
+    what a previous intake already created.
+    """
+    try:
+        row = await find_unclaimed_funnel_run_for_domain(
+            domain=domain,
+            since=_now() - timedelta(hours=_reuse_window_hours()),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return str((row or {}).get("run_id") or "") or None
+
+
 def _negative_is_fresh(teaser: PublicTeaserResponse) -> bool:
     checked = _as_aware(teaser.checked_at)
     if checked is None:
@@ -314,11 +333,15 @@ async def public_store_audit_intake(
         )
 
     teaser = await _teaser_for_domain(domain)
-    if teaser.state == "pending":
-        return teaser
-    if teaser.state == "ready" and (
-        teaser.agent_ready or _negative_is_fresh(teaser)
+    if teaser.state == "pending" or (
+        teaser.state == "ready"
+        and (teaser.agent_ready or _negative_is_fresh(teaser))
     ):
+        # These are the COMMON paths — a domain someone already probed, which
+        # includes every returning visitor. They must still carry the run id,
+        # or the page has a result it cannot read and nothing to claim: the
+        # early return happens before the producer below ever runs.
+        teaser.audit_run_id = await _existing_funnel_run_id(domain)
         return teaser
 
     today = _now()
@@ -378,11 +401,42 @@ async def public_store_audit_intake(
     # future reprobe would deposit that merchant's acceptance evidence on a run
     # readable at GET /public/store-audit/run/{id} by anyone.
     existing_run_id = str(route.get("last_audit_run_id") or "")
+    pointer = await classify_run_pointer(run_id=existing_run_id)
+    # WHAT the pointer points AT decides this, not whether it is set.
+    #
+    # An earlier cut fenced on `not existing_run_id`, which never fired: the
+    # cold-domain branch above mints the discovery placeholder with
+    # `audit_run_id=str(uuid.uuid4())`, and upsert_execution_route RETURNS
+    # that as last_audit_run_id. Every route this lane sees therefore already
+    # has a pointer, the producer never ran, and #2019 shipped a feature that
+    # did nothing — green, because its test used a fake route with
+    # last_audit_run_id=None, a shape production never produces.
+    #
+    #   ABSENT  — a pointer with no row behind it is our own synthetic
+    #             placeholder. Nothing to clobber; produce.
+    #   FUNNEL  — already ours. Reuse it, which is also what makes a returning
+    #             visitor get the same id back.
+    #   OTHER   — belongs to someone. Leave it completely alone:
+    #             fetch_route_for_domain ignores merchant_id, the receipt
+    #             path's ON CONFLICT does COALESCE(EXCLUDED.last_audit_run_id,
+    #             ...) so a non-null value OVERWRITES, and the reprobe job
+    #             reads that pointer — touching it would redirect a real
+    #             merchant's future acceptance evidence onto an unowned,
+    #             publicly readable run.
+    #   UNKNOWN — the lookup failed. Decline, for the same reason as OTHER:
+    #             a swallowed error must not be read as "nothing there".
+    #
+    # ABSENT and FUNNEL take the SAME path deliberately. A separate
+    # "reuse the pointed-at run" branch is redundant — the lookup below finds
+    # that same run by domain — and it was unreachable in every test, because
+    # the early return above already hands the id back on the common paths. An
+    # unexercised shortcut reads as protection that does not exist.
     audit_run_id = existing_run_id
     funnel_run_id: Optional[str] = None
-    if not existing_run_id:
+    if pointer in (RUN_POINTER_ABSENT, RUN_POINTER_FUNNEL):
         funnel_run = await find_unclaimed_funnel_run_for_domain(
-            domain=domain, since=_now() - timedelta(hours=_reuse_window_hours()),
+            domain=domain,
+            since=_now() - timedelta(hours=_reuse_window_hours()),
         )
         funnel_run_id = str((funnel_run or {}).get("run_id") or "") or None
         if not funnel_run_id:

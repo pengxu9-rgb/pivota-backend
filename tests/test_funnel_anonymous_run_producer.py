@@ -337,8 +337,15 @@ def test_the_claim_route_is_not_under_the_public_prefix():
 # `audit_run_id=` from the 202 response passes the whole suite.
 
 def _intake_client(monkeypatch, *, route_run_id=None, produced="new-run-1",
-                   reused=None):
-    """The intake handler with its DB seams stubbed."""
+                   reused=None, pointer=None):
+    """The intake handler with its DB seams stubbed.
+
+    `pointer` states what the route's last_audit_run_id POINTS AT, which is
+    what the fence actually keys on. It must be explicit: classify_run_pointer
+    reads through db.merchant_audit_runs.database, a different handle from the
+    ones stubbed here, so leaving it unstubbed makes the verdict depend on
+    suite state — the test then passes alone and fails in the full run.
+    """
     seen = {"created": [], "enqueued": []}
 
     async def fake_find(*, domain, since, limit=2000):
@@ -363,7 +370,16 @@ def _intake_client(monkeypatch, *, route_run_id=None, produced="new-run-1",
     async def fake_count(**_k):
         return 0
 
+    async def fake_classify(*, run_id):
+        from db.merchant_audit_runs import (
+            RUN_POINTER_ABSENT, RUN_POINTER_OTHER,
+        )
+        if pointer is not None:
+            return pointer
+        return RUN_POINTER_OTHER if run_id else RUN_POINTER_ABSENT
+
     monkeypatch.setattr(sap, "_enabled", lambda: True)
+    monkeypatch.setattr(sap, "classify_run_pointer", fake_classify)
     monkeypatch.setattr(sap, "find_unclaimed_funnel_run_for_domain", fake_find)
     monkeypatch.setattr(sap, "record_anonymous_funnel_run", fake_record)
     monkeypatch.setattr(sap, "fetch_latest_route_evidence_for_domain", no_evidence)
@@ -407,7 +423,10 @@ def test_a_route_that_already_points_somewhere_is_never_repointed(monkeypatch):
     typing a live merchant's domain repoints that merchant's route at an
     unowned run, and every future reprobe deposits their acceptance evidence
     somewhere anyone can read."""
-    client, seen = _intake_client(monkeypatch, route_run_id="merchant-run-7")
+    from db.merchant_audit_runs import RUN_POINTER_OTHER
+    client, seen = _intake_client(
+        monkeypatch, route_run_id="merchant-run-7", pointer=RUN_POINTER_OTHER,
+    )
     res = client.post("/public/store-audit/intake",
                       json={"store_url": "https://anua.com"})
     assert res.status_code == 202

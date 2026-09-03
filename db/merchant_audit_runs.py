@@ -454,6 +454,50 @@ async def find_unclaimed_funnel_run_for_domain(
     return None
 
 
+# What a route's last_audit_run_id points AT. Tri-state on purpose:
+# fetch_audit_run_by_id() swallows every error and returns None, which is
+# indistinguishable from "no such row" — and those two need OPPOSITE answers.
+# A missing row is this lane's own synthetic placeholder (safe to replace); a
+# failed lookup means we do not know, and guessing wrong repoints a live
+# merchant's route.
+RUN_POINTER_ABSENT = "absent"
+RUN_POINTER_FUNNEL = "funnel"
+RUN_POINTER_OTHER = "other"
+RUN_POINTER_UNKNOWN = "unknown"
+
+
+async def classify_run_pointer(*, run_id: str) -> str:
+    """Classify what a run id refers to, failing CLOSED.
+
+    Returns RUN_POINTER_UNKNOWN when the lookup itself fails, so callers can
+    decline to act rather than treat a database hiccup as "nothing there".
+    Deliberately selects ONLY the two columns it needs: a select() over the
+    full Table breaks against any environment whose merchant_audit_runs is
+    missing a modeled column, and that failure would otherwise read as absent.
+    """
+    if not run_id:
+        return RUN_POINTER_ABSENT
+    await ensure_merchant_audit_runs_table()
+    try:
+        row = await database.fetch_one(
+            "SELECT subject_type, merchant_id FROM merchant_audit_runs "
+            "WHERE run_id = :r",
+            {"r": str(run_id)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "classify_run_pointer failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return RUN_POINTER_UNKNOWN
+    if row is None:
+        return RUN_POINTER_ABSENT
+    d = dict(row)
+    if str(d.get("subject_type") or "") == SUBJECT_TYPE_PUBLIC_FUNNEL:
+        return RUN_POINTER_FUNNEL
+    return RUN_POINTER_OTHER
+
+
 async def claim_audit_run_for_merchant(
     *,
     run_id: str,
