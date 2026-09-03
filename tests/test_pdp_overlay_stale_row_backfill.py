@@ -358,6 +358,27 @@ async def test_no_current_published_version_is_reported_and_never_written():
     assert await _overlay_rows(product_key) == before
 
 
+async def test_limit_bounds_the_run_and_says_how_much_it_left_behind():
+    """A capped run must not read as "nothing left": the groups past --limit are counted."""
+    first = await _stale_state()
+    second = await _stale_state()
+    argv = ["--apply", "--limit", "1", "--pdp-id", first["pdp_id"], "--pdp-id", second["pdp_id"]]
+
+    report = await backfill.run(backfill.parse_args(argv))
+    assert report["counts"]["repair_groups"] == 1
+    assert report["counts"]["groups_deferred_by_limit"] == 1
+    assert report["counts"]["applied"] == 1
+    repaired = {group["pdp_id"] for group in report["groups"]}
+    left = ({first["pdp_id"], second["pdp_id"]} - repaired).pop()
+
+    # The deferred one is untouched, and a second run picks it up.
+    again = await backfill.run(backfill.parse_args(argv))
+    assert again["counts"]["repair_groups"] == 1
+    assert again["counts"]["groups_deferred_by_limit"] == 0
+    assert again["groups"][0]["pdp_id"] == left
+    assert again["counts"]["applied"] == 1
+
+
 async def test_a_repair_that_fails_part_way_through_a_module_leaves_the_overlay_untouched(
     monkeypatch,
 ):

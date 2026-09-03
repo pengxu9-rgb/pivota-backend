@@ -363,7 +363,9 @@ async def _classify(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def _collect(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+async def _collect(
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, str]]]:
     """Find the stale rows, classify each, and group them by (pdp_id, module_key)."""
     stale = [svc._row_dict(row) for row in await database.fetch_all(STALE_SQL)]
     if args.pdp_id:
@@ -373,6 +375,7 @@ async def _collect(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     rows_out: List[Dict[str, Any]] = []
     ordered_keys: List[Tuple[str, str]] = []
+    deferred: set = set()
 
     for row in stale:
         pdp_id = str(row.get("pdp_id") or "")
@@ -381,7 +384,9 @@ async def _collect(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List
         if key not in groups and len(ordered_keys) >= args.limit:
             # --limit bounds the number of REPAIRS (one per pdp/module), never a
             # fraction of a module's fields: repairing half a module would leave a
-            # module split across two source versions.
+            # module split across two source versions. Groups past the cap are counted,
+            # not silently dropped, so a capped run cannot read as "nothing left".
+            deferred.add(key)
             continue
 
         if key not in groups:
@@ -458,7 +463,7 @@ async def _collect(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List
             )
         group["causes"] = sorted(causes)
 
-    return rows_out, [groups[key] for key in ordered_keys]
+    return rows_out, [groups[key] for key in ordered_keys], sorted(deferred)
 
 
 async def _repair(group: Dict[str, Any]) -> Dict[str, Any]:
@@ -535,7 +540,7 @@ async def _repair(group: Dict[str, Any]) -> Dict[str, Any]:
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     totals = await _overlay_totals()
     orphans = [svc._row_dict(row) for row in await database.fetch_all(ORPHAN_SQL)]
-    rows, groups = await _collect(args)
+    rows, groups, deferred = await _collect(args)
 
     by_cause: Dict[str, int] = {}
     for row in rows:
@@ -588,6 +593,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
             "groups_skipped_no_current_version": sum(
                 1 for g in groups if g["decision"] == DECISION_SKIP_NO_CURRENT
             ),
+            "groups_deferred_by_limit": len(deferred),
             "applied": applied,
             "refused_by_guardrails": refused,
             "errored": errored,
@@ -625,6 +631,11 @@ def _print_summary(report: Dict[str, Any]) -> None:
         )
     print(f"  stale rows found:        {counts['stale_rows_found']}")
     print(f"  repair groups:           {counts['repair_groups']}")
+    if counts["groups_deferred_by_limit"]:
+        print(
+            f"  !! --limit ({report['limit']}) reached: {counts['groups_deferred_by_limit']} more "
+            f"pdp/module group(s) were NOT examined. Re-run to cover the rest."
+        )
     for cause, count in sorted(counts["by_cause"].items(), key=lambda kv: -kv[1]):
         print(f"    {cause:34s} {count}")
     print(f"  groups to repair:        {counts['groups_to_repair']}")
