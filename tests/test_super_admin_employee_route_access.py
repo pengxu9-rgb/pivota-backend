@@ -119,7 +119,8 @@ def test_super_admin_is_not_told_it_is_unauthorized(client, db_spy):
         _ROUTE, headers={"Authorization": f"Bearer {_token('super_admin')}"}
     )
 
-    assert resp.status_code != 403
+    # `!= 403` alone would also pass on a 500, so pin the success status too.
+    assert resp.status_code == 200, resp.text
     assert "Not authorized" not in resp.text
 
 
@@ -144,10 +145,66 @@ def test_unauthenticated_is_still_rejected(client, db_spy):
 
 
 # ---------------------------------------------------------------------------
+# The constants themselves. Route tests above only exercise
+# EMPLOYEE_STAFF_ROLES; its two siblings are guarded by nothing but their
+# derivation from it. Respell MERCHANT_OR_EMPLOYEE_STAFF_ROLES as the literal
+# ["merchant", "employee", "admin"] and the original prod defect returns across
+# 15 sites with no route test and no ratchet line firing -- a review caught
+# exactly that mutant surviving. These pin the invariant directly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("EMPLOYEE_STAFF_ROLES", "MERCHANT_OR_EMPLOYEE_STAFF_ROLES",
+     "AGENT_OR_EMPLOYEE_STAFF_ROLES"),
+)
+def test_every_staff_constant_admits_every_admin_role(name):
+    """Kills: respelling any staff constant as a literal that drops super_admin.
+
+    ADMIN_ROLES is the system's own answer to "who is an admin" (utils.auth,
+    and what require_admin enforces). A staff surface that admits `admin` while
+    refusing `super_admin` contradicts it -- that contradiction WAS the bug.
+    """
+    import utils.auth as auth
+
+    roles = getattr(auth, name)
+    missing = [r for r in auth.ADMIN_ROLES if r not in roles]
+    assert not missing, f"{name} omits admin role(s) {missing}: {roles}"
+
+
+def test_staff_constants_still_exclude_outsourced():
+    """The deliberate scoping decision, pinned.
+
+    Kills a well-meaning "just use EMPLOYEE_ROLES everywhere" cleanup, which
+    would silently widen 88 staff surfaces to contractors.
+    """
+    import utils.auth as auth
+
+    for name in (
+        "EMPLOYEE_STAFF_ROLES",
+        "MERCHANT_OR_EMPLOYEE_STAFF_ROLES",
+        "AGENT_OR_EMPLOYEE_STAFF_ROLES",
+    ):
+        assert "outsourced" not in getattr(auth, name), (
+            f"{name} now admits contractors -- that is a scope decision, not a "
+            "refactor"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Ratchet: the inline spelling must not come back.
 # ---------------------------------------------------------------------------
 
-_ALLOWLIST_RE = re.compile(r'not in \[((?:\s*"[a-z_]+"\s*,?)+)\]')
+# Lists, tuples AND sets, single- or double-quoted. The first cut of this
+# ratchet matched only double-quoted lists, and a review caught what that missed:
+# agent_management.py guarded GET /agents/{id} with a TUPLE, ("agent",
+# "employee", "admin"), so the same super_admin omission survived in a module
+# this very change had already edited five times. Container delimiters are not
+# matched as a pair here -- role allowlists in real source are well-formed, and
+# a lint heuristic that over-matches is the safe direction.
+_ALLOWLIST_RE = re.compile(r"""not in [\[({]((?:\s*["'][a-z_]+["']\s*,?)+)[\])}]""")
+_ROLE_RE = re.compile(r"""["']([a-z_]+)["']""")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -164,7 +221,7 @@ def test_no_route_hardcodes_an_employee_allowlist_missing_super_admin():
             continue
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
             for match in _ALLOWLIST_RE.finditer(line):
-                roles = set(re.findall(r'"([a-z_]+)"', match.group(1)))
+                roles = set(_ROLE_RE.findall(match.group(1)))
                 if {"employee", "admin"} <= roles and "super_admin" not in roles:
                     offenders.append(f"{rel}:{lineno}")
 

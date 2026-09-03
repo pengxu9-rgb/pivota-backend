@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin, verify_jwt_token
+from utils.auth import AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin, verify_jwt_token
 from utils.logger import logger
 
 
@@ -108,7 +108,7 @@ async def get_agent_details(
         f"requested={agent_id}"
     )
     
-    if current_role not in ("agent", "employee", "admin"):
+    if current_role not in AGENT_OR_EMPLOYEE_STAFF_ROLES:
         logger.error(f"[GET /agents/{{id}}] Role '{current_role}' not allowed")
         raise HTTPException(status_code=403, detail=f"Access denied - invalid role: {current_role}")
     
@@ -142,7 +142,7 @@ async def update_agent(
 
         current_role = current_user.get("role")
         current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
-        if current_role not in ("admin", "employee", "super_admin") and str(current_agent_id or "") != str(agent_id):
+        if current_role not in EMPLOYEE_STAFF_ROLES and str(current_agent_id or "") != str(agent_id):
             raise HTTPException(status_code=403, detail="Not authorized")
         
         # 构建更新数据
