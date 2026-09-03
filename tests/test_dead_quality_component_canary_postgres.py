@@ -358,13 +358,20 @@ def test_small_samples_cannot_manufacture_a_violation():
 
     The >=200 floor exists so that two rows scoring zero on a component do not
     trip an alarm whose default threshold is 0.
+
+    The lane is given HISTORY on purpose: without it the history EXISTS
+    filters the five rows out for an unrelated reason and this test is green
+    whatever the floor is (a `HAVING count(*) >= 1` mutant survived it at one
+    point). With history, only the floor stands between five zeros and an
+    alarm.
     """
     chk = _check("dead_quality_component")
     _assert_throwaway_database()
     eng = _engine()
     with eng.begin() as conn:
         conn.execute(text(DDL))
-        _seed(conn, rows=5, summary_score=0.0)
+        _seed(conn, rows=1, summary_score=80.0, days_ago=60)
+        _seed(conn, rows=5, summary_score=0.0, reset=False)
         count = conn.execute(text(chk["count_sql"])).scalar()
     eng.dispose()
     assert count == 0
