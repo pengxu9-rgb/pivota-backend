@@ -415,10 +415,11 @@ async def _apply_211():
     from db.database import database
     from db.sql_migrations import split_statements
     for statement in split_statements(_MIGRATION_211.read_text()):
-        # CONCURRENTLY is illegal inside this test's transaction; the runner
-        # gives the real migration an AUTOCOMMIT connection. The INDEX itself
-        # is what is under test, not the build strategy.
-        await database.execute(statement.replace("CONCURRENTLY ", ""))
+        # Executed verbatim. The migration is deliberately non-CONCURRENT so
+        # that the admin runner — which wraps a file in engine.begin() — can
+        # apply it at all; stripping a keyword here would mean this gate never
+        # tested the statement production actually runs.
+        await database.execute(statement)
 
 
 async def test_concurrent_producers_create_exactly_one_run_per_domain():
@@ -478,3 +479,36 @@ async def test_different_domains_are_unaffected():
         "WHERE subject_type = 'public_funnel'"
     )
     assert dict(row)["n"] == 2
+
+
+def test_the_migration_can_be_applied_by_the_admin_runner():
+    """routes/admin_run_migration_pending.py executes a file inside
+    engine.begin(), and Postgres refuses CREATE INDEX CONCURRENTLY in a
+    transaction. That runner is how migrations actually reach production here
+    ("CI is billing-blocked, so there is no automatic migrate-on-deploy"), so
+    a CONCURRENTLY migration is one that cannot be applied at all.
+
+    Uses the repo's own quote/comment-aware splitter rather than a naive
+    split on ";" — the header's example SQL and its comments contain both.
+    """
+    from db.sql_migrations import needs_autocommit, split_statements
+
+    body = _MIGRATION_211.read_text()
+    executable = []
+    for stmt in split_statements(body):
+        lines = [
+            ln for ln in stmt.splitlines()
+            if ln.strip() and not ln.strip().startswith("--")
+        ]
+        if lines:
+            executable.append("\n".join(lines))
+
+    assert len(executable) == 1, f"expected one statement, got {executable}"
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS" in executable[0]
+    assert "CONCURRENTLY" not in executable[0], (
+        "the executable statement must not use CONCURRENTLY — the admin "
+        "runner applies it inside a transaction"
+    )
+    # And the runner's own autocommit detector must agree, or it would route
+    # the file down the statement-at-a-time path for no reason.
+    assert needs_autocommit("\n".join(executable)) is False
