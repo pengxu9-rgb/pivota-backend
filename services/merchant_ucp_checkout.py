@@ -376,8 +376,19 @@ _MCP_PATH = "/api/ucp/mcp"
 # a POST either. An apex<->www edge redirect is always one of these four.
 _HOP_STATUSES = frozenset({301, 302, 307, 308})
 
+_WELL_KNOWN_PATH = "/.well-known/ucp"
 
-def _sibling_host(domain: str, location: str) -> Optional[str]:
+# The pinned path is a SHOPIFY convention, and platforms do not agree on one. When it answers
+# with one of these — "there is no door at this path" — we fall back to reading the endpoint out
+# of the merchant's own profile. Wix serves a real UCP door at
+# `https://www.wixapis.com/ecom/ucp/<siteId>/mcp` and answers the pinned path 403, so before this
+# fallback every Wix merchant was recorded as having no door at all.
+_DISCOVER_STATUSES = frozenset({403, 404, 405})
+
+
+def _sibling_host(
+    domain: str, location: str, expected_path: str = _MCP_PATH
+) -> Optional[str]:
     """The ONE redirect we follow: apex <-> www on the same registrable domain.
 
     A merchant whose door lives on `www` answers the apex with a 301, and refusing every 30x
@@ -408,7 +419,7 @@ def _sibling_host(domain: str, location: str) -> Optional[str]:
         parsed = urlsplit(location)
     except ValueError:
         return None
-    if parsed.scheme != "https" or parsed.path != _MCP_PATH:
+    if parsed.scheme != "https" or parsed.path != expected_path:
         return None
     try:
         if parsed.port not in (None, 443):
@@ -422,6 +433,95 @@ def _sibling_host(domain: str, location: str) -> Optional[str]:
     if host != sibling:
         return None
     return host
+
+
+def _validated_endpoint(url: str) -> Optional[str]:
+    """Admit a merchant-DECLARED MCP endpoint, or None.
+
+    This is the hop the long note in `_call_tool` said was "the more correct hop" and deliberately
+    not taken, because a discovered endpoint is merchant-controlled input that we then fetch. The
+    note also said what doing it properly requires — "validating the discovered host with the same
+    two guards" — and that is exactly what happens here and at the call site.
+
+    The PATH is deliberately NOT pinned. Pinning it is what created the gap: `/api/ucp/mcp` is a
+    Shopify convention, and Wix serves `/ecom/ucp/<siteId>/mcp` on a different host entirely.
+    Everything that bounds SSRF is host-level, so nothing is lost by letting the platform choose
+    its own path: https only, no userinfo, no port of its own, and a hostname that clears
+    `validate_merchant_domain` and `resolves_only_public`.
+
+    Note this admits a host OTHER than the merchant's own — `*.myshopify.com`, `www.wixapis.com`.
+    That is the point, and it is the same capability the caller already has: `merchant_domain`
+    arrives from a request body and any public host may be named there. What must never widen is
+    the guard set, and it does not.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parsed.scheme != "https":
+        return None
+    if parsed.username or parsed.password:
+        return None
+    try:
+        if parsed.port not in (None, 443):
+            return None
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or validate_merchant_domain(host) != host:
+        return None
+    if not resolves_only_public(host):
+        return None
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    # Rebuilt from validated parts — the fragment and any userinfo never reach the wire.
+    return f"https://{host}{path}{query}"
+
+
+def _endpoint_from_profile(profile: Any) -> Optional[str]:
+    """Pull the `dev.ucp.shopping` MCP endpoint out of a UCP profile document."""
+    if not isinstance(profile, dict):
+        return None
+    services = ((profile.get("ucp") or {}).get("services") or {})
+    entries = services.get("dev.ucp.shopping")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("transport") == "mcp":
+            endpoint = entry.get("endpoint")
+            if isinstance(endpoint, str) and endpoint:
+                return endpoint
+    return None
+
+
+async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
+    """Read the merchant's profile and return a validated MCP endpoint, or None.
+
+    Never raises: discovery is a fallback, so a merchant that serves no profile, serves HTML, or
+    serves a profile naming an endpoint we refuse must look exactly like "no door" — not like an
+    error from the tool the caller asked for.
+    """
+    url = f"https://{domain}{_WELL_KNOWN_PATH}"
+    try:
+        resp = await client.get(url)
+        if resp.status_code in _HOP_STATUSES:
+            sibling = _sibling_host(
+                domain, resp.headers.get("location", ""), _WELL_KNOWN_PATH
+            )
+            if (
+                sibling
+                and validate_merchant_domain(sibling) == sibling
+                and resolves_only_public(sibling)
+            ):
+                resp = await client.get(f"https://{sibling}{_WELL_KNOWN_PATH}")
+        if resp.status_code != 200:
+            return None
+        profile = resp.json()
+    except Exception:
+        return None
+    return _validated_endpoint(_endpoint_from_profile(profile))
 
 
 async def _call_tool(
@@ -438,12 +538,18 @@ async def _call_tool(
     the sibling host is put through both guards before we fetch it (see _sibling_host). Any
     other 30x is still not a merchant door.
 
-    NOTE ON THE ENDPOINT. We pin `https://{domain}/api/ucp/mcp` rather than reading the endpoint
-    out of the merchant's `/.well-known/ucp`. Verified working on the apex 2026-08-31 (cosrx.com
-    answers directly, though its profile names cosrx-renewal.myshopify.com). Discovery is the
-    more correct hop and is deliberately NOT done yet: the endpoint URL would then be
-    merchant-controlled input that we fetch, which reopens the SSRF surface the guards above
-    close. Doing it properly means validating the discovered host with the same two guards.
+    NOTE ON THE ENDPOINT. We TRY `https://{domain}/api/ucp/mcp` first — a Shopify convention that
+    answers directly on the apex for most of the corpus (verified on cosrx.com 2026-08-31, whose
+    profile names cosrx-renewal.myshopify.com yet whose apex answers anyway). That pin used to be
+    the only thing we tried, and this note used to say discovery was deliberately not done because
+    a discovered endpoint is merchant-controlled input that we fetch. It also said what doing it
+    properly would require: validating the discovered host with the same two guards.
+
+    That is now done, because the pin was not merely incomplete, it was WRONG for a whole platform:
+    Wix serves a real UCP door at `https://www.wixapis.com/ecom/ucp/<siteId>/mcp` and answers the
+    pinned path 403, so every Wix merchant was recorded as having no door. On `_DISCOVER_STATUSES`
+    we read the merchant's profile and re-validate whatever it names through `_validated_endpoint`,
+    which is host-first and does NOT pin the path — pinning the path is what caused the gap.
     """
     if tool not in _ALLOWED_TOOLS:
         # BEFORE the guards and before any I/O: an unlisted tool is a bug in this module, not a
@@ -500,6 +606,22 @@ async def _call_tool(
                     resp = await client.post(
                         f"https://{sibling}{_MCP_PATH}", json=body
                     )
+            # The pinned path is Shopify's. When it says "no door here", ask the merchant's own
+            # profile where the door is — the hop the note below called more correct. The
+            # discovered endpoint is re-validated host-first by `_validated_endpoint`, and a
+            # discovery that yields nothing leaves the original response untouched, so a merchant
+            # with genuinely no door still reports its own status rather than a discovery error.
+            if resp.status_code in _DISCOVER_STATUSES:
+                discovered = await _discover_endpoint(client, domain)
+                if discovered and discovered != f"https://{fetched}{_MCP_PATH}":
+                    logger.info(
+                        "merchant-ucp %s using discovered endpoint domain=%s -> %s",
+                        tool,
+                        domain,
+                        discovered,
+                    )
+                    fetched = urlsplit(discovered).hostname or fetched
+                    resp = await client.post(discovered, json=body)
     except httpx.HTTPError as err:
         logger.warning(
             "merchant-ucp %s failed domain=%s host=%s: %s",

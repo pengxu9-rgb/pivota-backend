@@ -728,15 +728,19 @@ class _Redirector:
 
     def __init__(self, script):
         self.script = script
-        self.calls = []
+        self.calls = []  # (method, url, body)
 
     @property
     def urls(self):
-        return [u for u, _ in self.calls]
+        return [u for _, u, _ in self.calls]
 
     @property
     def bodies(self):
-        return [b for _, b in self.calls]
+        return [b for m, _, b in self.calls if m == "POST"]
+
+    @property
+    def methods(self):
+        return [m for m, _, _ in self.calls]
 
     def install(self, monkeypatch, *, resolves=lambda d: True, real_hostname_guard=True):
         outer = self
@@ -762,9 +766,18 @@ class _Redirector:
                 return False
 
             async def post(self, url, json=None):
-                outer.calls.append((url, json))
+                outer.calls.append(("POST", url, json))
                 if url not in outer.script:
                     raise AssertionError(f"unscripted POST to {url}")
+                entry = outer.script[url]
+                if isinstance(entry, BaseException):
+                    raise entry
+                return _Resp(*entry)
+
+            async def get(self, url):
+                outer.calls.append(("GET", url, None))
+                if url not in outer.script:
+                    raise AssertionError(f"unscripted GET to {url}")
                 entry = outer.script[url]
                 if isinstance(entry, BaseException):
                     raise entry
@@ -779,6 +792,8 @@ class _Redirector:
 
 APEX = "https://robinsons.com.sg/api/ucp/mcp"
 WWW = "https://www.robinsons.com.sg/api/ucp/mcp"
+WK = "https://robinsons.com.sg/.well-known/ucp"
+WK_WWW = "https://www.robinsons.com.sg/.well-known/ucp"
 
 
 @pytest.mark.asyncio
@@ -978,11 +993,17 @@ async def test_a_303_is_refused_because_the_write_already_happened(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [200, 403, 503])
 async def test_a_location_on_a_non_redirect_status_is_never_followed(monkeypatch, status):
-    """Widening the bound to `>= 200` or `< 500` survived #2044's suite, because every
-    non-redirect test had an empty header dict and short-circuited on the missing Location."""
+    """Widening the hop bound to `>= 200` or `< 500` survived #2044's suite, because every
+    non-redirect test had an empty header dict and short-circuited on the missing Location.
+
+    A 403 additionally triggers ENDPOINT DISCOVERY (it is in `_DISCOVER_STATUSES`), so the
+    well-known GET is scripted absent here — the point being that a Location header still never
+    causes a sibling hop, whatever else the status sets in motion.
+    """
     r = _Redirector({
         APEX: (status, {"location": WWW}, _ok({"id": "apex"})),
         WWW: (200, {}, _ok({"id": "pwned"})),
+        WK: (404, {}, None),
     }).install(monkeypatch)
 
     if status == 200:
@@ -992,7 +1013,9 @@ async def test_a_location_on_a_non_redirect_status_is_never_followed(monkeypatch
         with pytest.raises(MerchantUcpError) as excinfo:
             await muc.get_checkout("robinsons.com.sg", "chk_1")
         assert str(status) in str(excinfo.value)
-    assert r.urls == [APEX], "a Location header outside a redirect status means nothing"
+
+    assert WWW not in r.urls, "a Location outside a redirect status must never be followed"
+    assert [u for m, u, _ in r.calls if m == "POST"] == [APEX]
 
 
 @pytest.mark.asyncio
@@ -1120,4 +1143,213 @@ async def test_a_transport_error_after_the_hop_is_logged_against_the_hopped_host
     )
     assert "domain=robinsons.com.sg" in warnings[0], (
         "and still name the host the caller asked for"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Endpoint discovery. The pinned `/api/ucp/mcp` is a SHOPIFY convention; Wix serves a real
+# door at `https://www.wixapis.com/ecom/ucp/<siteId>/mcp` and answers the pinned path 403, so
+# every Wix merchant was recorded as having no door. Discovery reads the merchant's profile
+# and re-validates whatever it names — host-first, path deliberately unpinned.
+# --------------------------------------------------------------------------------------
+
+WIX = "https://www.wixapis.com/ecom/ucp/53b84487-site/mcp"
+
+
+def _profile(endpoint, transport="mcp"):
+    return {"ucp": {"version": "2026-04-08",
+                    "services": {"dev.ucp.shopping": [
+                        {"transport": transport, "endpoint": endpoint}]}}}
+
+
+@pytest.mark.asyncio
+async def test_a_wix_door_is_reached_through_discovery(monkeypatch):
+    """The whole point: before this, `sgbeauty.com.sg` answered the pinned path 403 and was
+    filed as having no door, while serving a perfectly good one on another host."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.calls == [("POST", APEX, r.bodies[0]), ("GET", WK, None), ("POST", WIX, r.bodies[1])]
+    assert r.bodies[1] == r.bodies[0], "discovery must replay the same request"
+
+
+@pytest.mark.asyncio
+async def test_discovery_is_not_attempted_when_the_pinned_path_answers(monkeypatch):
+    """A Shopify merchant must cost exactly one request, as before. Scripting the well-known
+    absent means a stray discovery would raise `unscripted GET`, not pass quietly."""
+    r = _Redirector({APEX: (200, {}, _ok({"id": "chk_1"}))}).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.methods == ["POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_a_server_error_does_not_trigger_discovery(monkeypatch, status):
+    """A merchant having a bad day is not a merchant whose door is elsewhere."""
+    r = _Redirector({APEX: (status, {}, None)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert str(status) in str(excinfo.value)
+    assert r.methods == ["POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint, why",
+    [
+        ("http://www.wixapis.com/ecom/ucp/x/mcp", "http downgrade"),
+        ("https://user:pw@www.wixapis.com/ecom/ucp/x/mcp", "carries userinfo"),
+        ("https://www.wixapis.com:8443/ecom/ucp/x/mcp", "a port of its own"),
+        ("https://localhost/ecom/ucp/x/mcp", "not a fetchable public hostname"),
+        ("https://127.0.0.1/ecom/ucp/x/mcp", "a bare IP literal"),
+        ("", "empty"),
+        (None, "absent"),
+    ],
+)
+async def test_a_discovered_endpoint_that_fails_validation_is_refused(
+    monkeypatch, endpoint, why
+):
+    """The profile is merchant-controlled input we would then FETCH. Each endpoint here serves a
+    good payload at the target, so a missing check would fetch it — and the original 403 must
+    surface instead, because a refused discovery is indistinguishable from no door."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(endpoint)),
+        "http://www.wixapis.com/ecom/ucp/x/mcp": (200, {}, _ok({"id": "pwned"})),
+        "https://user:pw@www.wixapis.com/ecom/ucp/x/mcp": (200, {}, _ok({"id": "pwned"})),
+        "https://www.wixapis.com:8443/ecom/ucp/x/mcp": (200, {}, _ok({"id": "pwned"})),
+        "https://localhost/ecom/ucp/x/mcp": (200, {}, _ok({"id": "pwned"})),
+        "https://127.0.0.1/ecom/ucp/x/mcp": (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value), why
+    assert r.methods == ["POST", "GET"], f"must not have fetched the endpoint: {why}"
+
+
+@pytest.mark.asyncio
+async def test_the_discovered_host_is_put_through_the_public_address_guard(monkeypatch):
+    """`_validated_endpoint` calls both guards; this one binds the DNS half. The endpoint is a
+    well-formed public-looking name that resolves somewhere it must not."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch, resolves=lambda d: "wixapis" not in d)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "profile, why",
+    [
+        ({"ucp": {"services": {"dev.ucp.shopping": [{"transport": "embedded",
+                                                     "endpoint": WIX}]}}}, "no mcp transport"),
+        ({"ucp": {"services": {}}}, "no shopping service"),
+        ({"not": "a profile"}, "unrecognised document"),
+        ("<html>nope</html>", "HTML, not a profile"),
+    ],
+)
+async def test_a_profile_naming_no_usable_endpoint_leaves_the_original_status(
+    monkeypatch, profile, why
+):
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (200, {}, profile),
+        WIX: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value), why
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_a_merchant_with_no_profile_reports_its_own_status_not_a_discovery_error(
+    monkeypatch,
+):
+    """Discovery is a fallback. A merchant with genuinely no door must look like itself."""
+    r = _Redirector({APEX: (404, {}, None), WK: (404, {}, None)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_does_not_re_post_the_endpoint_we_already_tried(monkeypatch):
+    """cosrx answers the apex directly though its profile names another host; the mirror case is
+    a profile naming the pinned URL we just got a 403 from. Sending it twice is pure waste."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(APEX)),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"], "the identical endpoint must not be re-POSTed"
+
+
+@pytest.mark.asyncio
+async def test_discovery_follows_the_apex_to_www_redirect_on_the_profile(monkeypatch):
+    """The same hosting quirk that hid Robinsons hides profiles too."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (301, {"location": WK_WWW}, None),
+        WK_WWW: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [APEX, WK, WK_WWW, WIX]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_at_the_discovered_endpoint_names_that_host(monkeypatch):
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(WIX)),
+        WIX: (503, {}, None),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    msg = str(excinfo.value)
+    assert "503" in msg and "www.wixapis.com" in msg
+
+
+def test_validated_endpoint_rebuilds_the_url_and_drops_the_fragment(monkeypatch):
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    assert muc._validated_endpoint(
+        "https://www.wixapis.com/ecom/ucp/x/mcp?v=1#frag"
+    ) == "https://www.wixapis.com/ecom/ucp/x/mcp?v=1"
+    assert muc._validated_endpoint("https://WWW.WIXAPIS.COM./ecom/ucp/x/mcp") == (
+        "https://www.wixapis.com/ecom/ucp/x/mcp"
     )
