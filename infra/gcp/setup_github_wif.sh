@@ -75,6 +75,20 @@ DEFAULT_REPO_ID="1075520615"
 REPO_FOLDED="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
 DEFAULT_REPO_FOLDED="$(printf '%s' "$DEFAULT_REPO" | tr '[:upper:]' '[:lower:]')"
 
+# CANONICALISE, do not merely accept. Folding decides that a mixed-case spelling
+# IS the default repo — but everything downstream still keys on $REPO by exact
+# string: STALE_PRINCIPAL, which gcloud matches character-for-character when
+# removing a member, and the provider description. GitHub's `repository` claim
+# carries canonical casing, so a stale binding is spelled canonically too; left
+# unfolded, the retirement would target a member that does not exist, report
+# "nothing to retire", confirm against the same wrong string, and exit 0 with
+# the stale member still granting impersonation. Accepting the variant and then
+# acting on it is only safe if they are the same string from here down.
+if [ "$REPO_FOLDED" = "$DEFAULT_REPO_FOLDED" ] && [ "$REPO" != "$DEFAULT_REPO" ]; then
+  echo "== normalising '$REPO' to its canonical spelling '$DEFAULT_REPO'"
+  REPO="$DEFAULT_REPO"
+fi
+
 REPO_ID="${2:-${REPO_ID:-}}"
 if [ -z "$REPO_ID" ] && [ "$REPO_FOLDED" = "$DEFAULT_REPO_FOLDED" ]; then
   REPO_ID="$DEFAULT_REPO_ID"
@@ -218,11 +232,14 @@ REMOVE_ERR="$("$GCLOUD" iam service-accounts remove-iam-policy-binding "$SA" --p
   --role="roles/iam.workloadIdentityUser" --member="$STALE_PRINCIPAL" --quiet 2>&1 >/dev/null)" \
   && echo "   removed $STALE_PRINCIPAL" \
   || {
-    # gcloud raises IamPolicyBindingNotFound("Policy binding with the specified
-    # principal and role not found!") for the idempotent case. Matching the
-    # phrase rather than a bare "not found" keeps a 404 on the SA or the project
-    # — a different failure entirely — from being waved through as "nothing to
-    # retire".
+    # This command is the conditions-aware path, so gcloud raises
+    # IamPolicyBindingNotFound("Policy binding with the specified principal,
+    # role, and condition not found!") for the idempotent case. Older SDKs said
+    # "member" where newer ones say "principal", and the --all path says
+    # "bindings"; every wording shares this 33-character prefix, which is why
+    # the match is on the prefix and not a full sentence. Matching that rather
+    # than a bare "not found" keeps a 404 on the SA or the project — a different
+    # failure entirely — from being waved through as "nothing to retire".
     if printf '%s' "$REMOVE_ERR" | grep -qiF "Policy binding with the specified"; then
       echo "   none present (nothing to retire)"
     else

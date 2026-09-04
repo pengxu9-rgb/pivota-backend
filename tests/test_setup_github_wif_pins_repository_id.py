@@ -192,8 +192,11 @@ def test_a_missing_stale_binding_is_not_an_error(tmp_path):
     deploy roles below it."""
     proc, calls, _gh = _run(tmp_path, [REPO, REPO_ID], {
         "REMOVE_RC": "1",
-        "REMOVE_ERR": "ERROR: Policy binding with the specified member "
-                      "and role not found!",
+        # The conditions-aware wording this command really raises. The older
+        # "member and role" phrasing is covered by the shared prefix; both are
+        # exercised (see the parametrised test below).
+        "REMOVE_ERR": "ERROR: Policy binding with the specified principal, "
+                      "role, and condition not found!",
     })
 
     assert proc.returncode == 0, (
@@ -362,3 +365,34 @@ def test_a_differently_cased_repo_name_still_hits_the_pin(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert gh_calls.strip() == "", f"asked GitHub for the id: {gh_calls}"
     assert f"assertion.repository_id == '{REPO_ID}'" in _condition(calls)
+
+    # AND the retirement must name the CANONICAL member. gcloud removes members
+    # by exact string and GitHub's claim carries canonical casing, so a variant
+    # spelling here targets a member that does not exist: "nothing to retire",
+    # a confirmation against the same wrong string, exit 0, and the stale
+    # binding still granting impersonation. Accepting the variant is only safe
+    # if it is canonicalised before anything acts on it.
+    remove = [l for l in calls.splitlines() if "remove-iam-policy-binding" in l]
+    assert remove, calls
+    assert f"attribute.repository/{REPO}" in remove[0], remove[0]
+    assert "PengXu9-RGB" not in remove[0], remove[0]
+
+
+@pytest.mark.parametrize("wording", [
+    # Newer SDKs say "principal", older ones "member"; this command is the
+    # conditions-aware path. All three share the prefix the script matches on,
+    # and a match that missed any of them would fail the ordinary idempotent
+    # re-run — a self-inflicted outage of the setup path.
+    "Policy binding with the specified principal, role, and condition not found!",
+    "Policy binding with the specified principal and role not found!",
+    "Policy binding with the specified member and role not found!",
+])
+def test_every_sdk_wording_of_binding_not_found_is_tolerated(tmp_path, wording):
+    proc, _calls, _gh = _run(tmp_path, [REPO, REPO_ID], {
+        "REMOVE_RC": "1", "REMOVE_ERR": f"ERROR: {wording}",
+    })
+
+    assert proc.returncode == 0, (
+        f"the idempotent re-run failed on: {wording}\n{proc.stderr}"
+    )
+    assert "nothing to retire" in proc.stdout
