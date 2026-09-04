@@ -10,6 +10,75 @@ from services import commerce_interaction_service as service
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        [("verified-agent", "verified"), ("browser-claim", "browser_observed")],
+        [("browser-claim", "browser_observed"), ("verified-agent", "verified")],
+        [("verified-agent", "verified"), (None, "platform_asserted")],
+    ],
+)
+async def test_stitched_interaction_preserves_highest_confidence_agent_identity(
+    tmp_path, monkeypatch, sequence
+):
+    from services.merchant_event_ingest_service import (
+        MerchantEventBatch,
+        ingest_merchant_event_batch,
+    )
+
+    db_path = tmp_path / "commerce-agent-identity-merge.sqlite3"
+    sync_engine = create_engine(f"sqlite:///{db_path}")
+    metadata.create_all(
+        sync_engine,
+        tables=[commerce_interactions, commerce_interaction_events],
+        checkfirst=True,
+    )
+    sync_engine.dispose()
+
+    test_database = databases.Database(f"sqlite+aiosqlite:///{db_path}")
+    await test_database.connect()
+    monkeypatch.setattr(service, "database", test_database)
+    monkeypatch.setattr(service, "IS_POSTGRES", False)
+
+    try:
+        for index, (agent_id, confidence) in enumerate(sequence):
+            batch = MerchantEventBatch.model_validate(
+                {
+                    "events": [
+                        {
+                            "event_id": f"identity-event-{index}",
+                            "event_type": (
+                                "product.viewed" if index == 0 else "checkout.started"
+                            ),
+                            "occurred_at": f"2026-08-26T12:0{index}:00Z",
+                            "platform": "custom",
+                            "store_id": "store-a",
+                            "session_id": "shared-session",
+                            "agent_id": agent_id,
+                        }
+                    ]
+                }
+            )
+            # SQLite drops timezone data; keep comparisons within this fixture naive.
+            batch.events[0].occurred_at = batch.events[0].occurred_at.replace(tzinfo=None)
+            await ingest_merchant_event_batch(
+                merchant_id="merchant-a",
+                batch=batch,
+                agent_identity_confidence=confidence,
+            )
+
+        rows = await test_database.fetch_all(select(commerce_interactions))
+        assert len(rows) == 1
+        interaction = dict(rows[0])
+        assert interaction["agent_id"] == "verified-agent"
+        assert interaction["metadata"]["agent_id"] == "verified-agent"
+        assert interaction["metadata"]["agent_identity_confidence"] == "verified"
+        assert interaction["metadata"]["traffic"]["agent_id"] == "verified-agent"
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_merge_rejects_cross_store_candidates_before_mutation():
     with pytest.raises(
         ValueError, match="cannot merge commerce interactions across stores"

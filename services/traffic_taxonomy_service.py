@@ -387,10 +387,20 @@ def taxonomy_from_row(
 ) -> Dict[str, str]:
     record = dict(row or {})
     metadata = _as_dict(record.get("metadata")) or _as_dict(record.get("context")) or _as_dict(record.get("payload"))
+    confidence = _first_text(
+        record.get("agent_identity_confidence"),
+        metadata.get("agent_identity_confidence"),
+        lower=True,
+    )
+    verified_agent_id = (
+        _first_text(record.get("agent_id"), metadata.get("agent_id"))
+        if confidence == "verified"
+        else None
+    )
     return build_traffic_taxonomy(
         record,
         metadata=metadata,
-        authenticated_agent_id=_first_text(record.get("agent_id")),
+        authenticated_agent_id=verified_agent_id,
         caller_id=_first_text(record.get("caller_id")),
         default_source_channel=_first_text(record.get("source_channel"), record.get("source")),
         default_query_source=_first_text(record.get("query_source")),

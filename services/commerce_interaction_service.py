@@ -222,11 +222,57 @@ async def _lookup_existing_interaction(refs: Dict[str, Optional[str]]) -> Option
     return matches[0] if matches else None
 
 
+_AGENT_IDENTITY_CONFIDENCE_RANK = {
+    "unknown": 0,
+    "browser_observed": 10,
+    "merchant_asserted": 20,
+    "platform_asserted": 30,
+    "verified": 40,
+}
+
+
+def _known_text(value: Any) -> Optional[str]:
+    text = _normalize_text(value)
+    return None if not text or text.lower() == "unknown" else text
+
+
+def _identity_claim(metadata: Optional[Any]) -> tuple[Optional[str], str]:
+    value = metadata if isinstance(metadata, dict) else {}
+    agent_id = _known_text(value.get("agent_id"))
+    confidence = str(value.get("agent_identity_confidence") or "unknown").strip().lower()
+    if confidence not in _AGENT_IDENTITY_CONFIDENCE_RANK:
+        confidence = "unknown"
+    return agent_id, confidence
+
+
 def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     base = dict(existing or {}) if isinstance(existing, dict) else {}
     extra = _make_json_safe(patch or {}) if patch else {}
+    existing_agent_id, existing_confidence = _identity_claim(base)
+    incoming_agent_id, incoming_confidence = _identity_claim(extra)
+    selected_agent_id = existing_agent_id
+    selected_confidence = existing_confidence
+    if incoming_agent_id and (
+        not existing_agent_id
+        or incoming_agent_id == existing_agent_id
+        or _AGENT_IDENTITY_CONFIDENCE_RANK[incoming_confidence]
+        > _AGENT_IDENTITY_CONFIDENCE_RANK[existing_confidence]
+    ):
+        selected_agent_id = incoming_agent_id
+        if (
+            incoming_agent_id != existing_agent_id
+            or _AGENT_IDENTITY_CONFIDENCE_RANK[incoming_confidence]
+            >= _AGENT_IDENTITY_CONFIDENCE_RANK[existing_confidence]
+        ):
+            selected_confidence = incoming_confidence
     if extra:
         base.update(extra)
+    if selected_agent_id:
+        base["agent_id"] = selected_agent_id
+        base["agent_identity_confidence"] = selected_confidence
+        traffic = dict(base.get("traffic") or {}) if isinstance(base.get("traffic"), dict) else {}
+        traffic["agent_id"] = selected_agent_id
+        base["traffic"] = traffic
     return base or None
 
 
@@ -388,15 +434,18 @@ def _merged_interaction_values(
                 None,
             )
 
-    metadata: Dict[str, Any] = {}
+    metadata: Optional[Dict[str, Any]] = None
     # Lower-priority rows are folded first; winner and the incoming patch retain
     # the same precedence as the legacy update path.
     for row in reversed(matches):
         if isinstance(row.get("metadata"), dict):
-            metadata.update(row["metadata"])
+            metadata = _merge_metadata(metadata, row["metadata"])
     if isinstance(values.get("metadata"), dict):
-        metadata.update(values["metadata"])
-    merged["metadata"] = metadata or None
+        metadata = _merge_metadata(metadata, values["metadata"])
+    merged["metadata"] = metadata
+    merged_agent_id, _ = _identity_claim(metadata)
+    if merged_agent_id:
+        merged["agent_id"] = merged_agent_id
 
     first_candidates = [
         value
@@ -584,13 +633,17 @@ async def ensure_interaction(
     existing_last = (existing or {}).get("last_occurred_at")
     incoming_is_latest = existing_last is None or last_seen >= existing_last
     status = _status_from_event(latest_event_type or "", (existing or {}).get("status"))
+    merged_metadata = _merge_metadata(
+        (existing or {}).get("metadata"), metadata_with_taxonomy
+    )
+    merged_agent_id, _ = _identity_claim(merged_metadata)
     values: Dict[str, Any] = {
         "interaction_id": interaction_id,
         "merchant_id": merchant_id,
         "platform": refs.get("platform") or (existing or {}).get("platform"),
         "store_id": refs.get("store_id") or (existing or {}).get("store_id"),
         "surface": refs.get("surface") or (existing or {}).get("surface"),
-        "commerce_surface": taxonomy.get("commerce_surface") or (existing or {}).get("commerce_surface"),
+        "commerce_surface": _known_text(taxonomy.get("commerce_surface")) or (existing or {}).get("commerce_surface"),
         "prompt_id": refs.get("prompt_id") or (existing or {}).get("prompt_id"),
         "result_id": refs.get("result_id") or (existing or {}).get("result_id"),
         "click_id": refs.get("click_id") or (existing or {}).get("click_id"),
@@ -608,19 +661,19 @@ async def ensure_interaction(
         "session_id": refs.get("session_id") or (existing or {}).get("session_id"),
         "visitor_id": refs.get("visitor_id") or (existing or {}).get("visitor_id"),
         "buyer_id": refs.get("buyer_id") or (existing or {}).get("buyer_id"),
-        "source_channel": taxonomy.get("source_channel") or (existing or {}).get("source_channel"),
-        "source_family": taxonomy.get("source_family") or (existing or {}).get("source_family"),
-        "query_source": taxonomy.get("query_source") or (existing or {}).get("query_source"),
-        "agent_id": taxonomy.get("agent_id") or (existing or {}).get("agent_id"),
-        "protocol_name": taxonomy.get("protocol_name") or (existing or {}).get("protocol_name"),
-        "llm_provider": taxonomy.get("llm_provider") or (existing or {}).get("llm_provider"),
-        "llm_model": taxonomy.get("llm_model") or (existing or {}).get("llm_model"),
-        "caller_id": taxonomy.get("caller_id") or (existing or {}).get("caller_id"),
+        "source_channel": _known_text(taxonomy.get("source_channel")) or (existing or {}).get("source_channel"),
+        "source_family": _known_text(taxonomy.get("source_family")) or (existing or {}).get("source_family"),
+        "query_source": _known_text(taxonomy.get("query_source")) or (existing or {}).get("query_source"),
+        "agent_id": merged_agent_id or _known_text((existing or {}).get("agent_id")),
+        "protocol_name": _known_text(taxonomy.get("protocol_name")) or (existing or {}).get("protocol_name"),
+        "llm_provider": _known_text(taxonomy.get("llm_provider")) or (existing or {}).get("llm_provider"),
+        "llm_model": _known_text(taxonomy.get("llm_model")) or (existing or {}).get("llm_model"),
+        "caller_id": _known_text(taxonomy.get("caller_id")) or (existing or {}).get("caller_id"),
         "latest_event_type": (
             latest_event_type if incoming_is_latest and latest_event_type else (existing or {}).get("latest_event_type")
         ),
         "status": status,
-        "metadata": _merge_metadata((existing or {}).get("metadata"), metadata_with_taxonomy),
+        "metadata": merged_metadata,
         "first_occurred_at": min(
             [dt for dt in [first_seen, (existing or {}).get("first_occurred_at")] if dt is not None]
         ),
