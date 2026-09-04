@@ -51,6 +51,10 @@ on:
       - 'config/**'
       - 'mvp/**'
       - 'adapters/**'
+      # The Shopify Web Pixel mapper is JavaScript and is not imported by the
+      # Python sweep. Watch integration-only changes so its Node contract test
+      # cannot be skipped when the runtime mapper changes.
+      - 'integrations/**'
       - 'jobs/**'
       - 'middleware/**'
       - 'core/**'
@@ -129,6 +133,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run Shopify Web Pixel mapper contract
+        run: node --test tests/shopify_web_pixel_mapper.node.test.mjs
 
       - name: Install dependencies
         run: |
