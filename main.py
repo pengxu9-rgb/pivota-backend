@@ -364,6 +364,7 @@ from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.agent_internal_auth import router as agent_internal_auth_router
 from routes.store_audit_probe_internal import router as store_audit_probe_internal_router
 from routes.store_audit_commerce_probe_internal import router as store_audit_commerce_probe_internal_router
+from routes.store_audit_ops import router as store_audit_ops_router
 from routes.store_audit_public_intake import router as store_audit_public_intake_router
 from routes.store_audit_public_intake import claim_router as store_audit_claim_router
 from routes.agent_internal_products import router as agent_internal_products_router
@@ -1347,6 +1348,7 @@ app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
 app.include_router(store_audit_commerce_probe_internal_router)  # Store Audit commerce receipt/capability (flag + key gated)
+app.include_router(store_audit_ops_router)  # Admin-only Store Audit lane diagnostics (no caller SQL; redacted)
 app.include_router(store_audit_public_intake_router)  # Public store-audit intake/teaser for the marketing funnel (flag gated, UCP lane only)
 app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
