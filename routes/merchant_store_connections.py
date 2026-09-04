@@ -29,7 +29,13 @@ from urllib.parse import quote, urlparse, urlencode
 
 from db.database import IS_POSTGRES, database
 from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
-from utils.auth import MERCHANT_OR_EMPLOYEE_STAFF_ROLES, get_current_user, hash_password, verify_password as verify_bcrypt_password
+from utils.auth import (
+    MERCHANT_OR_EMPLOYEE_STAFF_ROLES,
+    can_access_merchant,
+    get_current_user,
+    hash_password,
+    verify_password as verify_bcrypt_password,
+)
 from config.settings import settings
 from config.settings import resolve_public_api_base_url
 from services.merchant_web_collector_service import (
@@ -742,13 +748,13 @@ async def shopify_oauth_start(
     Start Shopify OAuth install.
     Requires a Pivota JWT (merchant/employee/admin).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
 
     shop_domain = _validate_myshopify_domain(shop)
@@ -1265,13 +1271,13 @@ async def shopify_token_diagnostic(
     """
     Diagnostic: verify Shopify token validity and required scopes without leaking secrets.
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only access your own merchant")
 
     store = await get_primary_store(target_merchant_id)
@@ -1383,7 +1389,15 @@ async def wix_oauth_start_stub(
       {"access_token": "<bearer token>", "site_id": "<wix site id>"}
     in merchant_stores.api_key.
     """
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
+    # The one site in this module that had no role gate at all -- only the
+    # merchant comparison -- so an agent or a buyer reached the body. The body
+    # is an unconditional 501, so nothing was exposed; it is gated here for the
+    # same reason the rest of the file is spelled one way: the next person to
+    # implement this stub inherits the guard instead of having to notice its
+    # absence. Non-merchant, non-staff callers now get 403 rather than 501.
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
     raise HTTPException(
         status_code=501,
@@ -1595,12 +1609,9 @@ async def merchant_connect_custom_store(
     current_user: dict = Depends(get_current_user),
 ):
     """Create a credential-free store scope for custom/headless telemetry."""
-    if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if (
-        current_user.get("role") == "merchant"
-        and str(current_user.get("merchant_id") or "") != str(request.merchant_id)
-    ):
+    if not can_access_merchant(current_user, request.merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
 
     try:
@@ -1747,14 +1758,11 @@ async def merchant_connect_shopify(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Shopify store"""
-    # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # If merchant role, verify they can only connect their own store
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         # Validate shop domain and credentials
@@ -2120,10 +2128,10 @@ async def merchant_verify_shopify_integration(
     - capability probes (Shopify Payments / Returns)
     Persists a snapshot to pcs_merchant_capabilities when available.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != request.merchant_id:
+    if not can_access_merchant(current_user, request.merchant_id):
         raise HTTPException(status_code=403, detail="Can only verify your own store")
 
     if not request.callback_base_url or not request.callback_base_url.strip():
@@ -2162,7 +2170,7 @@ async def list_shopify_webhook_events(
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only access your own merchant")
 
     safe_limit = max(1, min(int(limit or 20), 200))
@@ -2223,7 +2231,7 @@ async def merchant_sync_shopify_products(
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only sync your own store")
 
     store_row = await database.fetch_one(
@@ -2395,14 +2403,11 @@ async def merchant_connect_wix(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Wix store"""
-    # Allow merchant, employee, or admin
     if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # If merchant role, verify they can only connect their own store
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         try:
@@ -2478,9 +2483,8 @@ async def merchant_connect_woocommerce(
     if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_url or not request.consumer_key or not request.consumer_secret:
@@ -2575,7 +2579,7 @@ async def ensure_woocommerce_webhooks(
     store_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     store = await database.fetch_one(
         """
@@ -2590,10 +2594,9 @@ async def ensure_woocommerce_webhooks(
     if not store:
         raise HTTPException(status_code=404, detail="Connected WooCommerce store not found")
     store = dict(store)
-    if (
-        current_user.get("role") == "merchant"
-        and current_user.get("merchant_id") != str(store.get("merchant_id") or "")
-    ):
+    # The owning merchant is a property of the ROW here: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
         raise HTTPException(status_code=403, detail="Can only manage your own store")
 
     credentials = _woocommerce_credentials(store.get("api_key"))
@@ -2646,9 +2649,8 @@ async def merchant_connect_bigcommerce(
     if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_hash or not request.access_token:
@@ -2743,9 +2745,8 @@ async def merchant_connect_prestashop(
     if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_url or not request.api_key:
@@ -2832,7 +2833,7 @@ async def merchant_update_store_support_email(
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only update your own store")
 
     support_email = (request.support_email or "").strip() or None
@@ -2887,7 +2888,7 @@ async def merchant_get_store_support_email(
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only view your own store")
 
     # Backward compatibility: column may not exist on some deployments.
