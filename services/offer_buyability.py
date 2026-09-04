@@ -114,8 +114,15 @@ def offer_market_availability(
     return MARKET_DOMESTIC if om == sm else MARKET_CROSS_BORDER
 
 
+# The one in-stock vocabulary. Exported because a second caller (the UCP probe's
+# variant selector) needs the SAME answer this module gives: two copies of this
+# set drift, and a drift here means one lane calls a variant buyable while the
+# other calls it dead.
+IN_STOCK_AVAILABILITY = frozenset({"in_stock", "instock", "available"})
+
+
 def _in_stock(availability: Any) -> bool:
-    return str(availability or "").strip().lower() in {"in_stock", "instock", "available"}
+    return str(availability or "").strip().lower() in IN_STOCK_AVAILABILITY
 
 
 def annotate_offer_buyability(

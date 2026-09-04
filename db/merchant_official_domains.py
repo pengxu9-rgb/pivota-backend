@@ -272,6 +272,39 @@ UPDATE merchant_official_domains
    AND domain = :domain
 """
 
+# The one predicate for "this domain is provably this merchant's storefront",
+# shared by both readers below. They MUST agree: if the resolver admits a row the
+# counter does not, a merchant resolves on its domain and then counts zero
+# storefronts, and the caller silently skips forever.
+#
+#   verification_status='verified' — proven, not pending/failed/NULL.
+#   source='verified'             — brand-BOUND. record_official_domain writes
+#     SOURCE_ASSERTED when merchant_owns_domain FAILED: domain control was shown
+#     but Pivota does not associate the domain with this merchant. That gap is
+#     load-bearing here, because the caller POSTs a create_checkout built from
+#     the merchant's catalogue at whatever storefront answers on this domain.
+#     The email claim method accepts any mailbox at the exact host, so on a
+#     shared or multi-tenant domain an employee could otherwise point our probe
+#     at a stranger's store. (That method is default-off today; this does not
+#     rely on it staying that way.)
+#   liveness                      — `dead` is the module's one excluding verdict
+#     (is_excluded); counting dead rows would let a merchant who MIGRATED
+#     domains look like two storefronts forever.
+_PROVEN_STOREFRONT_WHERE = """
+       verification_status = :verified
+   AND source = :verified_source
+   AND (liveness_status IS NULL OR liveness_status <> :dead)
+"""
+
+RESOLVE_VERIFIED_MERCHANT_SQL = """
+SELECT merchant_id
+  FROM merchant_official_domains
+ WHERE lower(domain) = :domain
+   AND """ + _PROVEN_STOREFRONT_WHERE + """
+ ORDER BY merchant_id ASC
+ LIMIT 2
+"""
+
 LIST_OFFICIAL_DOMAINS_SQL = """
 SELECT merchant_id, domain, source, verification_status,
        liveness_status, last_checked_at, is_primary
@@ -363,6 +396,97 @@ async def upsert_official_domain(
             merchant_id, domain, str(exc)[:200],
         )
         return False
+
+
+async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
+    """The merchant that has PROVEN this domain is theirs, or None.
+
+    `execution_routes.merchant_id` looks like the natural answer to "whose store
+    is this route?" and is the wrong one twice over: nothing in the tree writes
+    it (`claim_execution_route` has no callers), and the association it was
+    designed to hold comes from a self-declared `store_url`. This asks the one
+    table that records a domain association someone had to prove.
+
+    FAILS CLOSED, and every branch matters to a caller that will act on the
+    answer against a live storefront:
+      * the row must satisfy _PROVEN_STOREFRONT_WHERE — proven status, a
+        brand-BOUND source, and a liveness verdict that is not `dead`. Read
+        that constant's comment before loosening any of the three; each one is
+        load-bearing for a caller that transacts against the resulting store.
+      * two merchants verified on one domain is ambiguity, not a tie to break.
+        LIMIT 2 exists to SEE the second row rather than silently take the first.
+      * a lookup failure is not an absence; it returns None either way, but the
+        caller must treat None as "we do not know", never as "not a merchant".
+    """
+    normalized = str(domain or "").strip().lower().lstrip(".")
+    if not normalized:
+        return None
+    await ensure_merchant_official_domains_table()
+    try:
+        rows = await database.fetch_all(
+            RESOLVE_VERIFIED_MERCHANT_SQL,
+            {
+                "domain": normalized,
+                "verified": VERIFICATION_VERIFIED,
+                "verified_source": SOURCE_VERIFIED,
+                "dead": LIVENESS_DEAD,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "resolve_verified_merchant_for_domain failed for %s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+    rows = list(rows or [])
+    if len(rows) != 1:
+        if len(rows) > 1:
+            logger.warning(
+                "resolve_verified_merchant_for_domain: %s is verified by %d "
+                "merchants; refusing to pick one", normalized, len(rows),
+            )
+        return None
+    return str(rows[0]["merchant_id"] or "").strip() or None
+
+
+LIST_VERIFIED_DOMAINS_SQL = """
+SELECT domain
+  FROM merchant_official_domains
+ WHERE merchant_id = :merchant_id
+   AND """ + _PROVEN_STOREFRONT_WHERE
+
+
+async def list_verified_domains(merchant_id: str) -> List[str]:
+    """Every domain this merchant has proven, so a caller can tell whether the
+    merchant is one storefront or several.
+
+    Exists because `canonical_variants` carries `merchant_id` but no store key,
+    while Shopify variant ids are per-STORE. A merchant with two proven domains
+    that are two different Shopify stores (anua.com alongside anua.us, a pairing
+    this codebase has already met) cannot have its catalogue attributed to one
+    of them, and a caller that guesses will hand storefront A a variant only
+    storefront B sells. Returns [] on failure, which callers must read as "we do
+    not know", never as "none".
+    """
+    if not merchant_id:
+        return []
+    await ensure_merchant_official_domains_table()
+    try:
+        rows = await database.fetch_all(
+            LIST_VERIFIED_DOMAINS_SQL,
+            {
+                "merchant_id": merchant_id,
+                "verified": VERIFICATION_VERIFIED,
+                "verified_source": SOURCE_VERIFIED,
+                "dead": LIVENESS_DEAD,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_verified_domains failed for %s: %s", merchant_id, str(exc)[:200]
+        )
+        return []
+    return [str(r["domain"] or "").strip().lower() for r in rows or [] if r["domain"]]
 
 
 async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
@@ -480,6 +604,8 @@ __all__: Sequence[str] = (
     "is_excluded",
     "list_domains_due_for_liveness",
     "list_official_domains",
+    "list_verified_domains",
+    "resolve_verified_merchant_for_domain",
     "merchant_official_domains",
     "record_liveness",
     "reset_ddl_ready_for_tests",
