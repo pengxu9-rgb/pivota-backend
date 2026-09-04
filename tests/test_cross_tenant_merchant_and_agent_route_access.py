@@ -219,6 +219,25 @@ def _victim_store(merchant_id: str = MERCHANT_B) -> Dict[str, Any]:
     }
 
 
+def _project(row: Dict[str, Any], query: str) -> Dict[str, Any]:
+    """Return only the columns the query actually SELECTs.
+
+    A double that hands back every column no matter what was asked for cannot
+    see a projection bug: the first cut of these tests did exactly that, and a
+    mutant deleting `merchant_id` from the sync-status SELECT survived -- the
+    very mistake this fix had to avoid, since an ownership check reading a
+    column the query never returns 403s the owner. Modelling the projection is
+    what makes test_merchant_can_still_poll_their_own_sync_status load-bearing.
+    """
+    select, _, rest = query.partition("SELECT ")
+    columns, _, _ = rest.partition(" FROM ")
+    columns = columns.strip()
+    if not columns or columns == "*":
+        return dict(row)
+    wanted = [c.strip().split(" as ")[0].strip() for c in columns.split(",")]
+    return {k: v for k, v in row.items() if k in wanted}
+
+
 class _WixDatabaseSpy:
     """Stands in for routes.wix_sync.database.
 
@@ -237,7 +256,7 @@ class _WixDatabaseSpy:
         if "merchant_onboarding" in flat:
             return {"merchant_id": (values or {}).get("merchant_id")}
         if "merchant_stores" in flat:
-            return _victim_store(self.store_owner)
+            return _project(_victim_store(self.store_owner), flat)
         return None
 
     async def execute(self, query: str, *a: Any, **kw: Any) -> None:
