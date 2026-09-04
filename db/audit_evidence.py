@@ -36,7 +36,7 @@ from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy import (
     ARRAY,
     Boolean, Column, DateTime, Index, Integer, Table, Text,
-    UniqueConstraint, func,
+    UniqueConstraint, and_, func, or_,
     select as sa_select,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -2461,3 +2461,152 @@ async def list_verifications_for_run(
         )
         return []
     return [dict(r) for r in (rows or [])]
+
+
+# =====================================================================
+# Store Audit lane diagnostics (admin-only reads)
+# =====================================================================
+
+
+async def fetch_verification_history_for_domain(
+    *,
+    normalized_domain: str,
+    verifier_id: str,
+    route_kinds: Sequence[str],
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Recent verification runs for a domain, WITH the failure reason.
+
+    fetch_latest_verification_for_domain answers the teaser's question ("is
+    there a fresh positive?") and deliberately carries none of the diagnosis.
+    This carries the diagnosis and nothing else: when a probe reports `blocked`,
+    the reason exists ONLY in verification_runs.error_message / evidence_jsonb,
+    the Cloud Run worker logs it nowhere (by design — it must never render
+    endpoints or receipt bodies), and Cloud SQL is private-IP only. Without this
+    the question "why did this store's probe fail?" is unanswerable from
+    outside the VPC, which is how four separate hypotheses got eliminated by
+    guesswork instead of by looking.
+
+    Raises nothing and returns [] on failure — but note the caller must NOT read
+    [] as "this domain has never been probed": the two are indistinguishable
+    here, and the endpoint says so in its response.
+    """
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return []
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    bounded = max(1, min(int(limit or 10), 50))
+    try:
+        joined = verification_runs.join(
+            execution_routes,
+            verification_runs.c.execution_route_id
+            == execution_routes.c.execution_route_id,
+        )
+        rows = await database.fetch_all(
+            sa_select(
+                verification_runs.c.verify_id,
+                verification_runs.c.audit_run_id,
+                verification_runs.c.status,
+                verification_runs.c.error_message,
+                verification_runs.c.evidence_jsonb,
+                verification_runs.c.retry_count,
+                verification_runs.c.max_retries,
+                verification_runs.c.product_key,
+                verification_runs.c.created_at,
+                verification_runs.c.completed_at,
+                verification_runs.c.claimed_by_worker,
+                execution_routes.c.execution_route_id,
+                execution_routes.c.route_kind,
+                execution_routes.c.endpoint_normalized,
+                execution_routes.c.is_active,
+                execution_routes.c.merchant_id.label("route_merchant_id"),
+            )
+            .select_from(joined)
+            .where(
+                and_(
+                    execution_routes.c.normalized_domain == domain,
+                    execution_routes.c.route_kind.in_(kinds),
+                    verification_runs.c.verifier_id == verifier_id,
+                )
+            )
+            .order_by(verification_runs.c.created_at.desc())
+            .limit(bounded)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_verification_history_for_domain failed for %s: %s",
+            domain, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in (rows or [])]
+
+
+async def summarize_ucp_route_merchant_coverage() -> Dict[str, int]:
+    """How many active UCP routes could ever reach the checkout-tested tier.
+
+    The tier needs a route whose domain some merchant has PROVEN is theirs
+    (merchant_official_domains, verified status + brand-bound source + not
+    dead). Nobody has been able to show that this join returns anything, and
+    the distinction matters: `variant_carried: 0` in the reprobe summary reads
+    identically whether the answer is "no merchant has claimed a probed domain"
+    or "the feature is broken". This separates them BEFORE the flag is flipped.
+    """
+    from db.merchant_official_domains import (
+        ensure_merchant_official_domains_table,
+        merchant_official_domains,
+        LIVENESS_DEAD,
+        SOURCE_VERIFIED,
+        VERIFICATION_VERIFIED,
+    )
+
+    await ensure_audit_evidence_tables()
+    await ensure_merchant_official_domains_table()
+    out = {"active_ucp_routes": 0, "routes_with_proven_merchant": 0}
+    try:
+        total = await database.fetch_one(
+            sa_select(func.count())
+            .select_from(execution_routes)
+            .where(
+                and_(
+                    execution_routes.c.route_kind == ROUTE_KIND_UCP,
+                    execution_routes.c.is_active.is_(True),
+                )
+            )
+        )
+        out["active_ucp_routes"] = int(list(total.values())[0] if total else 0)
+
+        # The same predicate the reprobe gate uses. If these two ever disagree,
+        # this number stops describing the thing it is consulted about.
+        matched = await database.fetch_one(
+            sa_select(func.count(func.distinct(execution_routes.c.execution_route_id)))
+            .select_from(
+                execution_routes.join(
+                    merchant_official_domains,
+                    func.lower(merchant_official_domains.c.domain)
+                    == execution_routes.c.normalized_domain,
+                )
+            )
+            .where(
+                and_(
+                    execution_routes.c.route_kind == ROUTE_KIND_UCP,
+                    execution_routes.c.is_active.is_(True),
+                    merchant_official_domains.c.verification_status
+                    == VERIFICATION_VERIFIED,
+                    merchant_official_domains.c.source == SOURCE_VERIFIED,
+                    or_(
+                        merchant_official_domains.c.liveness_status.is_(None),
+                        merchant_official_domains.c.liveness_status != LIVENESS_DEAD,
+                    ),
+                )
+            )
+        )
+        out["routes_with_proven_merchant"] = int(
+            list(matched.values())[0] if matched else 0
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "summarize_ucp_route_merchant_coverage failed: %s", str(exc)[:200]
+        )
+        return {"active_ucp_routes": -1, "routes_with_proven_merchant": -1}
+    return out

@@ -45,7 +45,10 @@ router = APIRouter(
     tags=["store-audit-internal"],
 )
 
-_SENSITIVE_RESULT_KEYS = frozenset({
+# Promoted from private: the diagnostics endpoint redacts with the SAME set the
+# receipt path refuses on. Two copies would drift, and a key this file learns to
+# distrust must not stay readable through the other door.
+SENSITIVE_RESULT_KEYS = frozenset({
     "authorization", "checkouturl", "continueurl", "cookie", "cookies",
     "raw", "rawresponse", "response", "secret", "session", "token",
     "toolresult",
@@ -84,7 +87,7 @@ def _contains_sensitive_data(value: Any) -> bool:
     if isinstance(value, dict):
         for key, nested in value.items():
             normalized_key = re.sub(r"[^a-z0-9]", "", str(key).strip().lower())
-            if normalized_key in _SENSITIVE_RESULT_KEYS:
+            if normalized_key in SENSITIVE_RESULT_KEYS:
                 return True
             if _contains_sensitive_data(nested):
                 return True
