@@ -3,11 +3,20 @@ Initialize API key for agent@test.com
 Temporary admin endpoint
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from utils.auth import require_admin_or_key
 import secrets
 from db.database import database
 
-router = APIRouter(prefix="/admin/init", tags=["admin-init"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# POST /admin/init/agent-test-key MINTED AN API KEY for an anonymous caller.
+router = APIRouter(prefix="/admin/init", tags=["admin-init"], dependencies=[Depends(require_admin_or_key)])
 
 @router.post("/agent-test-key")
 async def initialize_agent_test_key():
