@@ -113,6 +113,9 @@ SELECT vr.status, vr.error_message, count(*) AS n
 # different question than the one the probe is failing.
 _UA = "Pivota-UCP-BuyerAgent/1.0"
 _TIMEOUT = 4.0
+# MAX_MERCHANT_RESPONSE_BYTES in ucpBuyerAgentClient.js: past this the
+# client throws, which the probe stores as profile_unreachable.
+_MAX_MERCHANT_BYTES = 2 * 1024 * 1024
 
 
 # The client's refusal list, transcribed from isForbiddenNetworkAddress in
@@ -163,23 +166,31 @@ def _dns(host):
     }
 
 
-def _request(host, method, path, body=None, headers=None, budget=_TIMEOUT):
-    """One request under a TOTAL time budget, no redirect following, exception kept.
+def _request(host, method, path, body=None, headers=None, budget=_TIMEOUT,
+             addr=None):
+    """One request, optionally pinned to ONE resolved address, verdict-faithful.
 
-    THE BUDGET IS THE WHOLE POINT. The client wraps its fetch in one
-    AbortController for `timeoutMs`, so DNS + connect + TLS + headers + body
-    share a single 4s budget and blowing it THROWS — which the probe records as
-    `profile_unreachable`. A socket-level timeout is per-operation instead: a
-    host taking 2.5s to connect, 2.5s for TLS and 2.5s to first byte trips no
-    single 4s operation, so an earlier cut of this function printed
-    `status: 200, ms: 7500` for a host the client had already given up on. That
-    is a false all-clear on the exact failure this script exists to explain, so
-    the deadline is re-checked between every phase and the remaining budget is
-    what each socket gets.
+    PINNED PER ADDRESS ON PURPOSE. judydoll.com resolves v6-first; Python has no
+    Happy Eyeballs, while the Node client's autoSelectFamily abandons an address
+    after 250ms. So if the crawl subnet blackholes v6 rather than refusing it,
+    an unpinned attempt burns the whole budget on v6 and reports a timeout for a
+    host the client reaches over v4 — a false FAILURE on one of the very domains
+    under investigation. Attempting each address separately turns that from a
+    wrong answer into the answer.
 
-    Reads the full body under the same budget rather than a 2KB prefix, because
-    the client consumes the whole response — a profile that stalls after its
-    first packet throws for the client and must not read as fine here.
+    WHAT THE BUDGET DOES AND DOES NOT BOUND. It bounds the VERDICT, not the wall
+    clock: DNS inside getaddrinfo takes as long as it takes, and a phase already
+    in flight is not interrupted — an overrun is detected after the fact. A slow
+    host can therefore exceed `budget` in elapsed time and still be reported
+    correctly as a throw. Do not read `ms` as bounded by it.
+
+    A 2xx IS NOT A SUCCESS FOR THE CLIENT. discoverEndpoint does an unguarded
+    `res.json()` inside the same try whose catch is PROFILE_UNREACHABLE, so a
+    WAF interstitial served as 200 text/html — the canonical datacenter-egress
+    symptom, and invisible from a laptop — THROWS there while reading as a clean
+    200 here. `json_ok` is therefore part of the verdict, not decoration, and so
+    is `oversize`: the client caps a merchant response at 2 MiB and throws past
+    it.
     """
     deadline = time.monotonic() + budget
     started = time.time()
@@ -192,30 +203,55 @@ def _request(host, method, path, body=None, headers=None, budget=_TIMEOUT):
 
     conn = None
     try:
-        conn = http.client.HTTPSConnection(
-            host, 443, timeout=_left(), context=ssl.create_default_context()
-        )
-        conn.connect()                      # DNS + TCP + TLS
+        conn = http.client.HTTPSConnection(host, 443, timeout=_left())
+        if addr:
+            raw = socket.create_connection((addr, 443), timeout=_left())
+            conn.sock = ssl.create_default_context().wrap_socket(
+                raw, server_hostname=host
+            )
+        else:
+            conn.connect()
+        # Re-arm ONCE, before the exchange. Not after getresponse(): that closes
+        # the connection and sets conn.sock=None whenever the response says
+        # `Connection: close`, is HTTP/1.0, or carries neither Content-Length
+        # nor chunked encoding — so touching it there raised AttributeError and
+        # reported a REACHABLE host as a throw, on exactly the edge/WAF/proxy
+        # error responses this exists to classify. res.fp reads through the same
+        # socket this timeout is set on.
         conn.sock.settimeout(_left())
         conn.request(method, path, body=body,
                      headers=headers or {"accept": "application/json",
                                          "user-agent": _UA})
-        conn.sock.settimeout(_left())
         res = conn.getresponse()
-        conn.sock.settimeout(_left())
         payload = res.read()
-        _left()                             # reading may have exhausted it
-        return {
+        _left()                     # reading may have exhausted it
+        out = {
             "status": res.status,
             "location": scrub(res.getheader("location") or "") or None,
             "bytes": len(payload),
             "ms": int((time.time() - started) * 1000),
         }
+        if addr:
+            out["addr"] = addr
+        if 200 <= res.status < 300:
+            out["oversize"] = len(payload) > _MAX_MERCHANT_BYTES
+            try:
+                json.loads(payload)
+                out["json_ok"] = True
+            except Exception:
+                # The client would have thrown here and the probe would have
+                # stored profile_unreachable. Saying "200" alone would exonerate
+                # the network for a body that is the whole problem.
+                out["json_ok"] = False
+        return out
     except Exception as exc:
-        return {
+        out = {
             "threw": scrub(f"{type(exc).__name__}: {exc}")[:300],
             "ms": int((time.time() - started) * 1000),
         }
+        if addr:
+            out["addr"] = addr
+        return out
     finally:
         if conn is not None:
             try:
@@ -230,6 +266,13 @@ def outbound_report():
         row = {"domain": host, "dns": _dns(host)}
         # 1. What the PROBE does: the well-known profile, redirects NOT followed.
         row["profile"] = _request(host, "GET", "/.well-known/ucp")
+        # And once per resolved address, so a v6 blackhole shows up as itself
+        # rather than as "this host is unreachable".
+        addrs = [a["addr"] for a in row["dns"].get("addresses", [])]
+        if len(addrs) > 1:
+            row["profile_per_address"] = [
+                _request(host, "GET", "/.well-known/ucp", addr=a) for a in addrs
+            ]
         # 2. The PINNED MCP path, under this script's own request shape — NOT a
         #    reproduction of services/merchant_ucp_checkout.py, which uses
         #    httpx's default UA, `accept: */*`, a 12s budget and follows one
@@ -252,39 +295,59 @@ def outbound_report():
 
 
 async def main():
-    await database.connect()
     out = {}
-    cov = await database.fetch_one(COVERAGE)
-    out["coverage"] = dict(cov) if cov else None
+    try:
+        await database.connect()
+        cov = await database.fetch_one(COVERAGE)
+        out["coverage"] = dict(cov) if cov else None
 
-    rows = await database.fetch_all(HISTORY, {"domains": DOMAINS})
-    hist = []
-    for r in rows:
-        d = dict(r)
-        ev = d.get("evidence_jsonb")
-        if isinstance(ev, str):
-            try: ev = json.loads(ev)
-            except Exception: ev = {"raw": ev[:200]}
-        if isinstance(ev, dict):
-            ev = {k: scrub(v) for k, v in ev.items()
-                  if k in ("reason", "verification_status", "stage", "message",
-                           "observed_at", "verifier_id")}
-        hist.append({
-            "domain": d["domain"], "route_kind": d["route_kind"],
-            "active": d["is_active"], "status": d["status"],
-            "error": scrub(d.get("error_message") or "")[:300],
-            "evidence": ev,
-            "created": str(d.get("created_at"))[:19],
-        })
-    out["per_domain"] = hist
+        rows = await database.fetch_all(HISTORY, {"domains": DOMAINS})
+        hist = []
+        for r in rows:
+            d = dict(r)
+            ev = d.get("evidence_jsonb")
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev)
+                except Exception:
+                    ev = {"raw": ev[:200]}
+            if isinstance(ev, dict):
+                ev = {k: scrub(v) for k, v in ev.items()
+                      if k in ("reason", "verification_status", "stage",
+                               "message", "observed_at", "verifier_id")}
+            hist.append({
+                "domain": d["domain"], "route_kind": d["route_kind"],
+                "active": d["is_active"], "status": d["status"],
+                "error": scrub(d.get("error_message") or "")[:300],
+                "evidence": ev,
+                "created": str(d.get("created_at"))[:19],
+            })
+        out["per_domain"] = hist
 
-    out["reason_histogram_7d"] = [
-        {"status": r["status"], "error": scrub(r["error_message"] or "")[:160],
-         "n": r["n"]}
-        for r in await database.fetch_all(REASONS)
-    ]
-    out["outbound"] = outbound_report()
-    print("LANE_DIAG " + json.dumps(out, default=str))
-    await database.disconnect()
+        out["reason_histogram_7d"] = [
+            {"status": r["status"],
+             "error": scrub(r["error_message"] or "")[:160], "n": r["n"]}
+            for r in await database.fetch_all(REASONS)
+        ]
+    except Exception as exc:
+        # The DB half failing must not cost the outbound half. Losing both to
+        # one traceback is how a diagnostic run gets spent for nothing.
+        out["db_error"] = scrub(f"{type(exc).__name__}: {exc}")[:300]
+    finally:
+        try:
+            await database.disconnect()
+        except Exception:
+            pass
+
+    # PRINTED INCREMENTALLY, because an endless drip on one host lets the job
+    # hit its --task-timeout and be killed. A single print at the end would take
+    # the DB half down with it, so each half is emitted as soon as it exists.
+    print("LANE_DIAG_DB " + json.dumps(out, default=str), flush=True)
+
+    try:
+        outbound = outbound_report()
+    except Exception as exc:
+        outbound = {"error": scrub(f"{type(exc).__name__}: {exc}")[:300]}
+    print("LANE_DIAG_OUTBOUND " + json.dumps(outbound, default=str), flush=True)
 
 asyncio.run(main())

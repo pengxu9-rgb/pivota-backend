@@ -58,7 +58,8 @@ def test_it_writes_nothing(mod):
     tree = ast.parse(src)
 
     # No call whose name can run a statement we did not read.
-    RUNNERS = {"execute", "execute_many", "executemany"}
+    RUNNERS = {"execute", "execute_many", "executemany", "iterate",
+               "raw_connection", "executescript"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             fn = node.func
@@ -67,9 +68,15 @@ def test_it_writes_nothing(mod):
 
     # Every SQL-shaped literal is scanned for write verbs ANYWHERE in it, not
     # just at the front — a CTE hides them in the middle.
+    # `create\s+(table|index|view)` walked past CREATE TEMP TABLE, CREATE UNIQUE
+    # INDEX, CREATE MATERIALIZED VIEW, CREATE OR REPLACE VIEW and CREATE
+    # FUNCTION. A bare \bcreate\b closes all of those at once. The rest are
+    # verbs that change state without being DML.
     WRITE = re.compile(
-        r"\b(insert\s+into|update|delete\s+from|truncate|drop|alter|"
-        r"create\s+(table|index|view)|grant|revoke|copy|merge\s+into)\b",
+        r"\b(insert\s+into|update|delete\s+from|truncate|drop|alter|create|"
+        r"grant|revoke|copy|merge\s+into|refresh\s+materialized|setval|"
+        r"lock\s+table|vacuum|analyze|reindex|set\s+role|select\s+.*\binto\b|"
+        r"pg_terminate_backend|pg_cancel_backend|for\s+update|for\s+no\s+key)\b",
         re.IGNORECASE | re.DOTALL,
     )
     # Identify docstrings by NODE, not by text: ast.get_docstring() returns the
@@ -84,9 +91,15 @@ def test_it_writes_nothing(mod):
             if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
                     and isinstance(first.value.value, str)):
                 doc_nodes.add(id(first.value))
+    # A determined author can always defeat a static check (concatenation,
+    # f-strings, getattr, SQL from the environment). This ratchet is aimed at the
+    # ACCIDENT — someone adding a convenient write to a script whose whole claim
+    # is that it makes none — and every shape it cannot see is a shape a reader
+    # of the diff can. It is not a sandbox.
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            text = node.value
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            text = (node.value.decode("utf-8", "replace")
+                    if isinstance(node.value, bytes) else node.value)
             if id(node) in doc_nodes:   # prose may NAME the verbs it forbids
                 continue
             hit = WRITE.search(text)
@@ -129,10 +142,12 @@ def test_a_redirect_is_reported_as_a_status_not_followed(mod, monkeypatch):
         def read(self, *a): return b""
         def getheader(self, k): return "https://elsewhere.example/.well-known/ucp"
 
+    requests = []
+
     class _Conn:
         def __init__(self, *a, **kw): self.sock = _Sock()
         def connect(self): pass
-        def request(self, *a, **kw): pass
+        def request(self, *a, **kw): requests.append(a[1] if len(a) > 1 else a)
         def getresponse(self): return _Res()
         def close(self): pass
 
@@ -147,6 +162,9 @@ def test_a_redirect_is_reported_as_a_status_not_followed(mod, monkeypatch):
     # to five hops, because every hop answered 301 and only the last was read —
     # so it pinned the status and not the "not followed" property it named.
     assert calls == ["shop.example"]
+    # And ONE request on it. Counting only constructors let a same-connection
+    # follower — one that re-issues conn.request(location) five times — pass.
+    assert len(requests) == 1, requests
     # Location is kept as diagnosis but scrubbed of the URL itself.
     assert "elsewhere.example" not in str(out["location"])
 
@@ -192,3 +210,92 @@ def test_a_dns_failure_is_reported_not_swallowed(mod, monkeypatch):
 
     monkeypatch.setattr(mod.socket, "getaddrinfo", boom)
     assert "gaierror" in mod._dns("nope.example")["error"]
+
+
+def _conn_double(mod, monkeypatch, *, status=200, body=b"{}", closes=False,
+                 headers=None):
+    """A connection whose socket disappears after getresponse() when the response
+    says so — which is what http.client really does for `Connection: close`,
+    HTTP/1.0, and a body with neither Content-Length nor chunked encoding."""
+    class _Sock:
+        def settimeout(self, _t): pass
+
+    _status, _body, _headers = status, body, headers or {}
+
+    class _Res:
+        def __init__(self, conn):
+            self._conn = conn
+            self.status = _status
+        def read(self, *a):
+            if closes:
+                self._conn.sock = None      # http.client.close() does this
+            return _body
+        def getheader(self, k): return _headers.get(k)
+
+    class _Conn:
+        def __init__(self, *a, **kw): self.sock = _Sock()
+        def connect(self): pass
+        def request(self, *a, **kw): pass
+        def getresponse(self):
+            if closes:
+                self.sock = None            # will_close: closed before read
+            return _Res(self)
+        def close(self): pass
+
+    monkeypatch.setattr(mod.http.client, "HTTPSConnection",
+                        lambda *a, **kw: _Conn())
+
+
+def test_a_response_that_closes_the_connection_is_not_reported_as_a_throw(
+    mod, monkeypatch,
+):
+    """The regression this exists for.
+
+    getresponse() closes the connection and sets sock=None whenever the response
+    carries `Connection: close`, is HTTP/1.0, or has neither Content-Length nor
+    chunked encoding. Re-arming the socket after that raised AttributeError and
+    reported a REACHABLE host as a throw — on exactly the edge/WAF/proxy error
+    responses this script exists to classify, where it would have read as
+    corroboration of profile_unreachable.
+    """
+    _conn_double(mod, monkeypatch, status=200, body=b'{"ok":true}', closes=True)
+    out = mod._request("shop.example", "GET", "/.well-known/ucp")
+
+    assert "threw" not in out, out
+    assert out["status"] == 200
+    assert out["json_ok"] is True
+
+
+def test_a_200_that_is_not_json_is_not_reported_as_a_success(mod, monkeypatch):
+    """discoverEndpoint does an unguarded res.json() inside the same try whose
+    catch is PROFILE_UNREACHABLE. So a WAF interstitial served as 200 text/html
+    — the canonical datacenter-egress symptom, invisible from a laptop — THROWS
+    for the client while reading as a clean 200 here. Reporting the status alone
+    would exonerate the network for the body that is the whole problem."""
+    _conn_double(mod, monkeypatch, status=200,
+                 body=b"<html>Attention Required</html>")
+    out = mod._request("shop.example", "GET", "/.well-known/ucp")
+
+    assert out["status"] == 200
+    assert out["json_ok"] is False
+
+
+def test_an_oversize_body_is_flagged(mod, monkeypatch):
+    """The client caps a merchant response at 2 MiB and throws past it, which
+    the probe stores as profile_unreachable."""
+    _conn_double(mod, monkeypatch, status=200,
+                 body=b'{"x":"' + b"a" * (2 * 1024 * 1024) + b'"}')
+    out = mod._request("shop.example", "GET", "/.well-known/ucp")
+
+    assert out["oversize"] is True
+
+
+def test_a_non_2xx_carries_no_json_verdict(mod, monkeypatch):
+    """json_ok is a claim about a response the client would have PARSED. A 404
+    never reaches res.json(), so asserting anything about its body would be
+    inventing a verdict the client never forms."""
+    _conn_double(mod, monkeypatch, status=404, body=b"nope")
+    out = mod._request("shop.example", "GET", "/.well-known/ucp")
+
+    assert out["status"] == 404
+    assert "json_ok" not in out
