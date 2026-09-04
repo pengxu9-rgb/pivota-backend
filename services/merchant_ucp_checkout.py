@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -367,6 +368,45 @@ _ALLOWED_TOOLS = frozenset(
 )
 
 
+_MCP_PATH = "/api/ucp/mcp"
+
+
+def _sibling_host(domain: str, location: str) -> Optional[str]:
+    """The ONE redirect we follow: apex <-> www on the same registrable domain.
+
+    A merchant whose door lives on `www` answers the apex with a 301, and refusing every 30x
+    scored those merchants dead: robinsons.com.sg 301s to www.robinsons.com.sg and was recorded
+    as `search_failed / HTTP 301`, while the www host prices a real cart. Widening the refusal
+    to "follow redirects" would hand the merchant control of the host we fetch, which is exactly
+    the SSRF surface `validate_merchant_domain` and `resolves_only_public` close — so the only
+    accepted target is the apex/www sibling of the host we already validated, over https, on the
+    pinned path, with no port of its own. Anything else is still not a merchant door.
+
+    Returns the sibling host to retry, or None to keep refusing. The caller still runs BOTH
+    guards on whatever comes back: this function decides shape, never trust.
+    """
+    if not location:
+        return None
+    try:
+        parsed = urlsplit(location)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.path != _MCP_PATH:
+        return None
+    try:
+        if parsed.port not in (None, 443):
+            return None
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return None
+    sibling = domain[4:] if domain.startswith("www.") else f"www.{domain}"
+    if host != sibling:
+        return None
+    return host
+
+
 async def _call_tool(
     merchant_domain: str, tool: str, arguments: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -376,8 +416,10 @@ async def _call_tool(
     SSRF guards, rather than an import somewhere else that inherits none of this file's rules.
 
     Host is caller input and we fetch it, so both guards run here and the scheme and path are
-    pinned — the caller controls the host label and nothing else. Redirects are not followed:
-    a 30x to somewhere else is not a merchant door.
+    pinned — the caller controls the host label and nothing else. Redirects are not followed,
+    with ONE exception: an apex<->www 30x on the same registrable domain is retried once, and
+    the sibling host is put through both guards before we fetch it (see _sibling_host). Any
+    other 30x is still not a merchant door.
 
     NOTE ON THE ENDPOINT. We pin `https://{domain}/api/ucp/mcp` rather than reading the endpoint
     out of the merchant's `/.well-known/ucp`. Verified working on the apex 2026-08-31 (cosrx.com
@@ -410,12 +452,31 @@ async def _call_tool(
         "method": "tools/call",
         "params": {"name": tool, "arguments": arguments},
     }
-    url = f"https://{domain}/api/ucp/mcp"
     try:
         async with httpx.AsyncClient(
             timeout=_TIMEOUT_SECONDS, follow_redirects=False
         ) as client:
-            resp = await client.post(url, json=body)
+            resp = await client.post(f"https://{domain}{_MCP_PATH}", json=body)
+            # Exactly one hop, and only to the apex/www sibling — see _sibling_host. The retry
+            # re-runs BOTH guards on the new host: a redirect target is merchant-controlled
+            # input, so it is validated like any other caller-supplied host, never trusted
+            # because a 301 pointed at it.
+            if 300 <= resp.status_code < 400:
+                sibling = _sibling_host(domain, resp.headers.get("location", ""))
+                if (
+                    sibling
+                    and validate_merchant_domain(sibling) == sibling
+                    and resolves_only_public(sibling)
+                ):
+                    logger.info(
+                        "merchant-ucp %s following apex<->www redirect domain=%s -> %s",
+                        tool,
+                        domain,
+                        sibling,
+                    )
+                    resp = await client.post(
+                        f"https://{sibling}{_MCP_PATH}", json=body
+                    )
     except httpx.HTTPError as err:
         logger.warning(
             "merchant-ucp %s failed domain=%s: %s", tool, domain, type(err).__name__
