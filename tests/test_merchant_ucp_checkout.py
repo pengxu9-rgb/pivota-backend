@@ -753,6 +753,11 @@ class _Redirector:
                 self._rpc = rpc
 
             def json(self):
+                # A real httpx response RAISES json.JSONDecodeError on a non-JSON body. A stub
+                # that returns the raw string instead tests a different branch than the one it
+                # is named for — so a scripted exception here is replayed.
+                if isinstance(self._rpc, BaseException):
+                    raise self._rpc
                 return self._rpc
 
         class _Client:
@@ -1345,11 +1350,173 @@ async def test_a_failure_at_the_discovered_endpoint_names_that_host(monkeypatch)
     assert "503" in msg and "www.wixapis.com" in msg
 
 
-def test_validated_endpoint_rebuilds_the_url_and_drops_the_fragment(monkeypatch):
+def test_validated_endpoint_rebuilds_the_url_dropping_fragment_and_query(monkeypatch):
+    """The query is DROPPED, not carried. Neither Shopify's `/api/ucp/mcp` nor Wix's
+    `/ecom/ucp/<siteId>/mcp` uses one, and a merchant-chosen query was half of the
+    forced-request primitive an arbitrary path opened up."""
     monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
     assert muc._validated_endpoint(
         "https://www.wixapis.com/ecom/ucp/x/mcp?v=1#frag"
-    ) == "https://www.wixapis.com/ecom/ucp/x/mcp?v=1"
+    ) == "https://www.wixapis.com/ecom/ucp/x/mcp"
     assert muc._validated_endpoint("https://WWW.WIXAPIS.COM./ecom/ucp/x/mcp") == (
         "https://www.wixapis.com/ecom/ucp/x/mcp"
     )
+
+
+@pytest.mark.parametrize(
+    "path, why",
+    [
+        ("/ecom/ucp/x", "does not end in /mcp — an arbitrary endpoint"),
+        ("/", "bare root"),
+        ("/mcp/../../admin", "dot segments, and does not end in /mcp"),
+        ("/ecom/ucp/x\x00/mcp", "a NUL byte — httpx raises InvalidURL, which is NOT an HTTPError"),
+        ("/ecom/ucp/\u00e9/mcp", "non-ascii"),
+        ("/a" * 400 + "/mcp", "over-long"),
+    ],
+)
+def test_validated_endpoint_refuses_a_path_it_should_not_fetch(monkeypatch, path, why):
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    assert muc._validated_endpoint(f"https://www.wixapis.com{path}") is None, why
+
+
+def test_validated_endpoint_refuses_a_label_idna_cannot_encode(monkeypatch):
+    """`_DOMAIN_RE` permits a 64-character label; IDNA caps at 63, so `getaddrinfo` raises
+    UnicodeError — a ValueError, NOT the OSError `resolves_only_public` catches. Unguarded this
+    escaped `_discover_endpoint`'s "never raises" contract all the way to an unhandled 500."""
+    host = "a" * 64 + ".example.com"
+    assert muc.validate_merchant_domain(host) == host, "premise: the regex lets it through"
+    assert muc._validated_endpoint(f"https://{host}/mcp") is None
+
+
+
+# --------------------------------------------------------------------------------------
+# Discovery must NEVER add a failure mode. Two reviewers independently found it did: a
+# malformed profile and an unbuildable URL both escaped to an unhandled 500, while
+# `_discover_endpoint`'s docstring promised a merchant "still reports its OWN status".
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "profile, why",
+    [
+        ({"ucp": "2026-04-08"}, "truthy STRING at ucp — a real shape to serve"),
+        ({"ucp": ["x"]}, "list at ucp"),
+        ({"ucp": 1}, "int at ucp"),
+        ({"ucp": {"services": "x"}}, "truthy string at services"),
+        ({"ucp": {"services": ["x"]}}, "list at services"),
+        ({"ucp": {"services": {"dev.ucp.shopping": "x"}}}, "string where entries belong"),
+        ({"ucp": {"services": {"dev.ucp.shopping": ["x", 1, None]}}}, "junk entries"),
+    ],
+)
+async def test_a_malformed_profile_reports_the_merchants_own_status_not_a_500(
+    monkeypatch, profile, why
+):
+    """`(profile.get("ucp") or {}).get(...)` reads as defensive but raises AttributeError on a
+    TRUTHY non-dict. The only production caller catches MerchantUcpError, so each of these turned
+    a clean refusal into an unhandled 500 with a traceback."""
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (200, {}, profile),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value), why
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_a_profile_body_that_is_not_json_reports_the_merchants_own_status(monkeypatch):
+    """Written from the WRITER: a real httpx response raises on `.json()` for an HTML body. The
+    earlier 'HTML, not a profile' case handed the parser a str and so exercised a different
+    branch entirely."""
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (200, {}, json.JSONDecodeError("Expecting value", "<html>", 0)),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_httpx_could_not_build_is_refused_before_the_post(monkeypatch):
+    """`httpx.InvalidURL` is NOT a subclass of `httpx.HTTPError`, so it would escape the only net
+    `_call_tool` has. `_validated_endpoint` refuses the shapes that provoke it."""
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (200, {}, _profile("https://www.wixapis.com/ecom/ucp/x\x00y/mcp")),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"], "the unbuildable URL must never reach client.post"
+
+
+@pytest.mark.asyncio
+async def test_an_arbitrary_path_endpoint_is_refused(monkeypatch):
+    """The widening that mattered. A free path turned this into "POST anywhere public and read
+    the status back"; the `/mcp` suffix is what keeps it a UCP door."""
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (200, {}, _profile("https://api.pivota.cc/admin/scheduler/jobs")),
+        "https://api.pivota.cc/admin/scheduler/jobs": (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"], "must not have POSTed to the arbitrary path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["hostname", "dns"])
+async def test_the_profile_hop_sibling_is_put_through_both_guards(monkeypatch, guard):
+    """The POST-path hop had both guards bound; the PROFILE-path hop had neither. Asymmetric
+    coverage on the same mechanism is exactly where a mutant lives."""
+    script = {
+        APEX: (404, {}, None),
+        WK: (301, {"location": WK_WWW}, None),
+        WK_WWW: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "pwned"})),
+    }
+    if guard == "dns":
+        r = _Redirector(script).install(monkeypatch, resolves=lambda d: not d.startswith("www."))
+    else:
+        r = _Redirector(script).install(monkeypatch)
+        monkeypatch.setattr(
+            muc, "validate_merchant_domain", lambda d: None if d.startswith("www.") else d
+        )
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert r.urls == [APEX, WK], f"the {guard} guard must stop the profile hop"
+
+
+@pytest.mark.asyncio
+async def test_the_apex_endpoint_is_deduped_after_a_www_hop(monkeypatch):
+    """The dedup compared only against the host we last fetched. After an apex->www hop a profile
+    naming the APEX slipped through, re-POSTed the URL that had just redirected, and reported the
+    resulting 301 against the sibling — a wasted request and a misleading diagnosis."""
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (404, {}, None),
+        WK_WWW: (200, {}, _profile(APEX)),
+        WK: (200, {}, _profile(APEX)),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value), "the sibling's own 404, not a re-POSTed 301"
+    assert r.urls.count(APEX) == 1, "the apex must not be POSTed twice"

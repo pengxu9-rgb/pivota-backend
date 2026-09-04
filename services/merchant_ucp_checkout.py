@@ -443,16 +443,21 @@ def _validated_endpoint(url: str) -> Optional[str]:
     note also said what doing it properly requires — "validating the discovered host with the same
     two guards" — and that is exactly what happens here and at the call site.
 
-    The PATH is deliberately NOT pinned. Pinning it is what created the gap: `/api/ucp/mcp` is a
-    Shopify convention, and Wix serves `/ecom/ucp/<siteId>/mcp` on a different host entirely.
-    Everything that bounds SSRF is host-level, so nothing is lost by letting the platform choose
-    its own path: https only, no userinfo, no port of its own, and a hostname that clears
-    `validate_merchant_domain` and `resolves_only_public`.
+    The EXACT path is not pinned — pinning `/api/ucp/mcp` is what created the gap, since that is a
+    Shopify convention and Wix serves `/ecom/ucp/<siteId>/mcp`. But "not pinned" is not "anything":
+    the path must END IN `/mcp`, be printable ASCII, and be short, and the query is DROPPED
+    entirely (no known platform uses one; both `_MCP_PATH` and Wix's path satisfy this).
 
-    Note this admits a host OTHER than the merchant's own — `*.myshopify.com`, `www.wixapis.com`.
-    That is the point, and it is the same capability the caller already has: `merchant_domain`
-    arrives from a request body and any public host may be named there. What must never widen is
-    the guard set, and it does not.
+    WHY THAT MATTERS, stated plainly because an earlier version of this docstring got it wrong.
+    Admitting a host other than the merchant's own — `*.myshopify.com`, `www.wixapis.com` — is
+    genuinely the same capability the caller already has: `merchant_domain` arrives from a request
+    body and any public host may be named there. Admitting an arbitrary PATH is NOT. With a free
+    path this function turned "POST to a UCP door on any public host" into "POST anywhere on any
+    public host, and read the status back", which is a forced-request primitive with a response
+    oracle. The `/mcp` suffix does not reduce that to nothing, and the residual is written down
+    here rather than denied: a merchant can still aim our egress at any public URL ending `/mcp`.
+    No credential is ever attached and the body is our own JSON-RPC, so the exposure is a
+    confused deputy against unauthenticated endpoints, not credential theft.
     """
     if not url or not isinstance(url, str):
         return None
@@ -472,19 +477,40 @@ def _validated_endpoint(url: str) -> Optional[str]:
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host or validate_merchant_domain(host) != host:
         return None
-    if not resolves_only_public(host):
+    # `resolves_only_public` resolves, and its own guard catches only OSError. A 64-character DNS
+    # label passes `_DOMAIN_RE` but exceeds IDNA's 63, so getaddrinfo raises UnicodeError — a
+    # ValueError. This function's whole contract is "admit, or return None", so it absorbs that
+    # here rather than leaving a helper that can raise for any future caller to trip over.
+    try:
+        if not resolves_only_public(host):
+            return None
+    except (ValueError, UnicodeError):
         return None
     path = parsed.path or "/"
-    query = f"?{parsed.query}" if parsed.query else ""
-    # Rebuilt from validated parts — the fragment and any userinfo never reach the wire.
-    return f"https://{host}{path}{query}"
+    # httpx refuses non-printable bytes and very long URLs at request-build time by raising
+    # httpx.InvalidURL, which is NOT an httpx.HTTPError, so it would escape every net we have.
+    # Refuse those here instead: a merchant must not be able to turn a profile into a 500.
+    if len(path) > 512 or not path.isascii() or not path.isprintable():
+        return None
+    if not path.endswith("/mcp"):
+        return None
+    # Rebuilt from validated parts — fragment, userinfo and QUERY never reach the wire.
+    return f"https://{host}{path}"
 
 
 def _endpoint_from_profile(profile: Any) -> Optional[str]:
     """Pull the `dev.ucp.shopping` MCP endpoint out of a UCP profile document."""
     if not isinstance(profile, dict):
         return None
-    services = ((profile.get("ucp") or {}).get("services") or {})
+    # Every level is isinstance-checked. `(profile.get("ucp") or {}).get(...)` looks defensive but
+    # raises AttributeError on a TRUTHY non-dict — `{"ucp": "2026-04-08"}` is a real shape for a
+    # merchant to serve, and it escaped as an unhandled 500.
+    ucp = profile.get("ucp")
+    if not isinstance(ucp, dict):
+        return None
+    services = ucp.get("services")
+    if not isinstance(services, dict):
+        return None
     entries = services.get("dev.ucp.shopping")
     if not isinstance(entries, list):
         return None
@@ -518,10 +544,22 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
                 resp = await client.get(f"https://{sibling}{_WELL_KNOWN_PATH}")
         if resp.status_code != 200:
             return None
-        profile = resp.json()
-    except Exception:
+        # INSIDE the try, deliberately. `resp.json()` raises ValueError on a non-JSON body, and
+        # `_validated_endpoint` runs `resolves_only_public`, whose getaddrinfo raises UnicodeError
+        # (a ValueError, NOT the OSError its own guard catches) for a 64-character DNS label —
+        # which `_DOMAIN_RE` permits and IDNA does not. Both escaped to an unhandled 500 while
+        # this function's docstring promised it never raises.
+        endpoint = _validated_endpoint(_endpoint_from_profile(resp.json()))
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as err:
+        logger.info(
+            "merchant-ucp discovery failed domain=%s: %s", domain, type(err).__name__
+        )
         return None
-    return _validated_endpoint(_endpoint_from_profile(profile))
+    if endpoint is None:
+        # The one security-relevant event in this feature is a profile we REFUSED. Log the fact,
+        # never the URL: it is merchant-controlled text.
+        logger.info("merchant-ucp discovery yielded no usable endpoint domain=%s", domain)
+    return endpoint
 
 
 async def _call_tool(
@@ -613,7 +651,8 @@ async def _call_tool(
             # with genuinely no door still reports its own status rather than a discovery error.
             if resp.status_code in _DISCOVER_STATUSES:
                 discovered = await _discover_endpoint(client, domain)
-                if discovered and discovered != f"https://{fetched}{_MCP_PATH}":
+                already_tried = {f"https://{domain}{_MCP_PATH}", f"https://{fetched}{_MCP_PATH}"}
+                if discovered and discovered not in already_tried:
                     logger.info(
                         "merchant-ucp %s using discovered endpoint domain=%s -> %s",
                         tool,
@@ -622,7 +661,7 @@ async def _call_tool(
                     )
                     fetched = urlsplit(discovered).hostname or fetched
                     resp = await client.post(discovered, json=body)
-    except httpx.HTTPError as err:
+    except (httpx.HTTPError, httpx.InvalidURL) as err:
         logger.warning(
             "merchant-ucp %s failed domain=%s host=%s: %s",
             tool,
