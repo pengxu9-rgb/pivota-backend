@@ -211,3 +211,38 @@ def test_a_domain_that_normalizes_to_nothing_never_queries(client, no_rows):
     assert res.status_code == 200
     assert res.json()["attempts"] == []
     assert no_rows == []
+
+
+def test_urls_in_free_text_are_scrubbed_not_merely_truncated(client, monkeypatch):
+    """`reason` is the one field this endpoint exists to display, and the
+    receipt path's URL check never covered it — it applies only to
+    acceptance_signal.payload. A merchant endpoint or a signed URL arriving in
+    that free text would otherwise be rendered verbatim to the caller."""
+    from routes import store_audit_ops as mod
+
+    async def fake_history(**_kwargs):
+        return [{
+            "verify_id": "v1", "audit_run_id": "a1", "status": "blocked",
+            "error_message": "refused by https://shop.example/checkout?token=abc123",
+            "evidence_jsonb": {
+                "reason": "redirected to http://elsewhere.example/x",
+                "stage": "verifier_lookup",
+            },
+            "retry_count": 0, "max_retries": 1, "product_key": None,
+            "route_kind": "ucp", "is_active": True, "route_merchant_id": None,
+            "claimed_by_worker": None, "created_at": None, "completed_at": None,
+        }]
+
+    monkeypatch.setattr(mod, "fetch_verification_history_for_domain", fake_history)
+    res = client.get(_DIAG, params={"domain": "shop.example"},
+                     headers={"Authorization": f"Bearer {_token('admin')}"})
+    body = res.text
+    assert "https://shop.example/checkout" not in body
+    assert "token=abc123" not in body
+    assert "http://elsewhere.example" not in body
+    attempt = res.json()["attempts"][0]
+    # The diagnosis survives; only the URL is removed.
+    assert "refused by" in attempt["error_message"]
+    assert "[url]" in attempt["error_message"]
+    assert "redirected to" in attempt["evidence"]["reason"]
+    assert attempt["evidence"]["stage"] == "verifier_lookup"
