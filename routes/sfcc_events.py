@@ -163,6 +163,7 @@ async def receive_sfcc_events(
     result = await ingest_merchant_event_batch(
         merchant_id=str(store["merchant_id"]),
         batch=MerchantEventBatch(events=mapped),
+        agent_identity_confidence="platform_asserted",
     )
     return {
         "status": "recorded",
