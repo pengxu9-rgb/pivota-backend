@@ -58,6 +58,7 @@ class _Capture:
 
         class _Resp:
             status_code = capture.status
+            headers: dict = {}
 
             def json(self):
                 return capture.rpc
@@ -700,3 +701,163 @@ def test_a_real_referring_domain_is_kept_and_normalized():
     out = muc.build_attribution(None, referring_domain="Shop.Example.COM.")
     assert out["referring_domain"] == "shop.example.com"
     assert muc.build_attribution(None)["referring_domain"] == "agent.pivota.cc"
+
+
+# --------------------------------------------------------------------------------------
+# The ONE redirect we follow: apex <-> www
+#
+# A merchant whose door lives on `www` answers the apex with a 301. Refusing every 30x recorded
+# those merchants as dead: robinsons.com.sg 301s to www.robinsons.com.sg and scored
+# `search_failed / HTTP 301` in the 2026-09-04 SG sweep, while the www host prices a real cart.
+# The fix must stay narrow — a redirect target is merchant-controlled input, so every test below
+# that widens the hop also asserts the hop is REFUSED when it leaves the sibling shape.
+# --------------------------------------------------------------------------------------
+
+
+class _Redirector:
+    """Replays a per-URL script: {url: (status, headers, rpc)}. Records every URL posted, in
+    order, so a test can prove a second hop happened AND prove it went where it should."""
+
+    def __init__(self, script):
+        self.script = script
+        self.urls = []
+
+    def install(self, monkeypatch, *, resolves=lambda d: True, real_hostname_guard=True):
+        outer = self
+
+        class _Resp:
+            def __init__(self, status, headers, rpc):
+                self.status_code = status
+                self.headers = headers
+                self._rpc = rpc
+
+            def json(self):
+                return self._rpc
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None):
+                outer.urls.append(url)
+                if url not in outer.script:
+                    raise AssertionError(f"unscripted POST to {url}")
+                return _Resp(*outer.script[url])
+
+        monkeypatch.setattr(muc.httpx, "AsyncClient", _Client)
+        if not real_hostname_guard:
+            monkeypatch.setattr(muc, "validate_merchant_domain", lambda d: d)
+        monkeypatch.setattr(muc, "resolves_only_public", resolves)
+        return outer
+
+
+APEX = "https://robinsons.com.sg/api/ucp/mcp"
+WWW = "https://www.robinsons.com.sg/api/ucp/mcp"
+
+
+@pytest.mark.asyncio
+async def test_apex_to_www_redirect_is_followed_once_and_returns_the_payload(monkeypatch):
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [APEX, WWW], "must hop exactly once, to the www sibling"
+
+
+@pytest.mark.asyncio
+async def test_www_to_apex_redirect_is_followed_too(monkeypatch):
+    """The sibling relation runs both ways — a corpus may hold either host."""
+    r = _Redirector({
+        WWW: (301, {"location": APEX}, None),
+        APEX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("www.robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [WWW, APEX]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location, why",
+    [
+        ("https://evil.example.com/api/ucp/mcp", "a different registrable domain"),
+        ("https://shop.robinsons.com.sg/api/ucp/mcp", "a different subdomain, not the sibling"),
+        ("http://www.robinsons.com.sg/api/ucp/mcp", "downgraded to http"),
+        ("https://www.robinsons.com.sg/evil", "off the pinned path"),
+        ("https://www.robinsons.com.sg:8443/api/ucp/mcp", "a port of its own"),
+        ("", "no Location at all"),
+    ],
+)
+async def test_any_other_redirect_is_still_refused(monkeypatch, location, why):
+    """Each of these serves a PERFECTLY GOOD checkout payload at the redirect target. If the
+    sibling check went away, the caller would happily fetch it — that is the whole SSRF surface
+    the guards close, so every one must still surface as a failure."""
+    r = _Redirector({
+        APEX: (301, {"location": location}, None),
+        # scripted so a wrong follow reaches a real payload rather than an AssertionError
+        "https://evil.example.com/api/ucp/mcp": (200, {}, _ok({"id": "pwned"})),
+        "https://shop.robinsons.com.sg/api/ucp/mcp": (200, {}, _ok({"id": "pwned"})),
+        "http://www.robinsons.com.sg/api/ucp/mcp": (200, {}, _ok({"id": "pwned"})),
+        "https://www.robinsons.com.sg/evil": (200, {}, _ok({"id": "pwned"})),
+        "https://www.robinsons.com.sg:8443/api/ucp/mcp": (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "301" in str(excinfo.value), why
+    assert r.urls == [APEX], f"must not have fetched the redirect target: {why}"
+
+
+@pytest.mark.asyncio
+async def test_the_sibling_host_is_put_through_the_public_address_guard(monkeypatch):
+    """The sibling is merchant-controlled input like any other host. A 301 pointing at a name
+    that resolves somewhere private must be refused, not trusted because a redirect named it."""
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch, resolves=lambda d: not d.startswith("www."))
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "301" in str(excinfo.value)
+    assert r.urls == [APEX], "the guard must run BEFORE the second fetch"
+
+
+@pytest.mark.asyncio
+async def test_the_hop_is_not_a_chain(monkeypatch):
+    """One hop only. A sibling that redirects again is a loop, not a door."""
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (301, {"location": APEX}, None),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "301" in str(excinfo.value)
+    assert r.urls == [APEX, WWW], "exactly two fetches, then stop"
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_still_cannot_smuggle_a_disallowed_tool(monkeypatch):
+    """The allowlist is checked before any I/O, so the redirect path cannot be a way in."""
+    _Redirector({APEX: (301, {"location": WWW}, None)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc._call_tool("robinsons.com.sg", "complete_checkout", {})
+
+    assert "complete_checkout" in str(excinfo.value)
