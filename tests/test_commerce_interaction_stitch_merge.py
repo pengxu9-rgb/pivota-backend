@@ -76,8 +76,12 @@ async def test_stitched_interaction_preserves_highest_confidence_agent_identity(
             batch.events[0].occurred_at = batch.events[0].occurred_at.replace(tzinfo=None)
             # The identity-precedence rule under test spans tiers no single
             # production write path may assert; bypass the pairing guard.
+            # Both the batch ingest and record_commerce_event check the pairing.
             monkeypatch.setattr(
                 ingest_module, "resolve_ledger_authority", lambda _wp, _c: "merchant"
+            )
+            monkeypatch.setattr(
+                service, "resolve_ledger_authority", lambda _wp, _c: "merchant"
             )
             await ingest_merchant_event_batch(
                 merchant_id="merchant-a",

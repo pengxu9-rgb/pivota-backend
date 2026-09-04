@@ -420,3 +420,223 @@ async def test_a_batch_cannot_raise_its_own_standing(tmp_path, monkeypatch):
         MerchantEventBatch.model_validate(
             {"events": [{**_refund_event("re_x"), "authority": "psp"}]}
         )
+
+
+# ---- 4. first-party writers (PR-0.2) ---------------------------------------
+
+
+def test_first_party_write_paths_pair_only_with_their_own_confidence():
+    from services.commerce_ledger_provenance import (
+        LEDGER_AUTHORITY_BY_WRITE_PATH,
+        ledger_provenance,
+        resolve_ledger_authority,
+    )
+
+    assert ledger_provenance("agent_commerce_api", "verified") == {
+        "write_path": "agent_commerce_api",
+        "authority": "pivota",
+        "agent_identity_confidence": "verified",
+    }
+    for path in ("surface_click_attribution", "commerce_attribution_edge", "surface_listing_registry"):
+        assert LEDGER_AUTHORITY_BY_WRITE_PATH[path] == "pivota"
+        assert ledger_provenance(path, "unknown")["authority"] == "pivota"
+        # Nothing at these writers authenticates an agent; a claimed identity
+        # must not be promoted by naming a first-party path.
+        for confidence in ("browser_observed", "merchant_asserted", "platform_asserted", "verified"):
+            with pytest.raises(ValueError):
+                resolve_ledger_authority(path, confidence)
+    # And the one verified issuer cannot be used to launder a weaker claim.
+    for confidence in ("unknown", "browser_observed", "merchant_asserted", "platform_asserted"):
+        with pytest.raises(ValueError):
+            resolve_ledger_authority("agent_commerce_api", confidence)
+
+
+def test_verified_is_issued_by_exactly_one_write_path():
+    from services.commerce_ledger_provenance import _ALLOWED_CONFIDENCE_BY_WRITE_PATH
+
+    issuers = sorted(
+        path for path, allowed in _ALLOWED_CONFIDENCE_BY_WRITE_PATH.items() if "verified" in allowed
+    )
+    assert issuers == ["agent_commerce_api"]
+
+
+def _direct_ledger_calls():
+    """Every direct `record_commerce_event(...)` / `_best_effort(...)` call in
+    routes/ and services/, excluding the two forwarders (the batch ingest and
+    the best-effort wrapper) whose write_path is a validated variable."""
+    forwarders = {
+        Path("services/merchant_event_ingest_service.py"),
+        Path("services/commerce_interaction_service.py"),
+    }
+    calls = []
+    for directory in ("routes", "services"):
+        for path in sorted((REPO_ROOT / directory).rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT)
+            if rel in forwarders:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in {"record_commerce_event", "record_commerce_event_best_effort"}:
+                    calls.append((rel, node))
+    return calls
+
+
+def test_every_direct_ledger_write_splats_a_literal_provenance():
+    from services.commerce_ledger_provenance import (
+        WritePath,
+        _ALLOWED_CONFIDENCE_BY_WRITE_PATH,
+    )
+
+    calls = _direct_ledger_calls()
+    # 6 agent-commerce + 5 attribution + 2 listing-registry writers.
+    assert len(calls) >= 13, sorted({str(p) for p, _ in calls})
+    allowed_paths = set(WritePath.__args__)
+    for path, node in calls:
+        splats = [
+            kw.value
+            for kw in node.keywords
+            if kw.arg is None
+            and isinstance(kw.value, ast.Call)
+            and getattr(kw.value.func, "id", getattr(kw.value.func, "attr", None)) == "ledger_provenance"
+        ]
+        assert len(splats) == 1, f"{path}:{node.lineno} must splat exactly one ledger_provenance(...)"
+        args = splats[0].args
+        assert len(args) == 2 and all(isinstance(a, ast.Constant) for a in args), (
+            f"{path}:{node.lineno} ledger_provenance needs two string literals"
+        )
+        write_path, confidence = args[0].value, args[1].value
+        assert write_path in allowed_paths, f"{path}:{node.lineno} unknown write_path {write_path}"
+        assert confidence in _ALLOWED_CONFIDENCE_BY_WRITE_PATH[write_path], (
+            f"{path}:{node.lineno} {write_path} may not assert {confidence}"
+        )
+        # No writer may also hand-type the stamp; the splat is the only source.
+        typed = {kw.arg for kw in node.keywords if kw.arg in {"write_path", "authority", "agent_identity_confidence"}}
+        assert not typed, f"{path}:{node.lineno} types provenance by hand: {typed}"
+
+
+def test_direct_writers_are_partitioned_by_file():
+    """The literal each file may use is part of the contract: a route must not
+    borrow the attribution edge's path, nor the reverse."""
+    expected = {
+        Path("routes/agent_commerce.py"): {"agent_commerce_api"},
+        Path("services/commerce_attribution_service.py"): {
+            "surface_click_attribution",
+            "commerce_attribution_edge",
+        },
+        Path("services/surface_listing_registry_service.py"): {"surface_listing_registry"},
+    }
+    seen: dict = {}
+    for path, node in _direct_ledger_calls():
+        for kw in node.keywords:
+            if kw.arg is None and isinstance(kw.value, ast.Call):
+                seen.setdefault(path, set()).add(kw.value.args[0].value)
+    assert seen == expected, seen
+
+
+@pytest.mark.asyncio
+async def test_record_commerce_event_refuses_a_hand_typed_authority_that_disagrees(
+    tmp_path, monkeypatch
+):
+    from services.commerce_interaction_service import record_commerce_event
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "ledger-mismatch")
+    try:
+        with pytest.raises(ValueError):
+            await record_commerce_event(
+                event_type="checkout.created",
+                metadata={"merchant_id": "merchant-a", "checkout_id": "chk_1"},
+                source="agent_v2_commerce",
+                write_path="agent_commerce_api",
+                authority="psp",
+                agent_identity_confidence="verified",
+            )
+        with pytest.raises(ValueError):
+            await record_commerce_event(
+                event_type="checkout.created",
+                metadata={"merchant_id": "merchant-a", "checkout_id": "chk_1"},
+                source="agent_v2_commerce",
+                write_path="agent_commerce_api",
+                agent_identity_confidence="browser_observed",
+            )
+        rows = await test_database.fetch_all(select(commerce_interaction_events))
+        assert rows == [], "a refused stamp must not write a row"
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_agent_commerce_stamp_authenticates_the_agent_on_the_interaction(tmp_path, monkeypatch):
+    """The whole point of the verified tier: a later browser claim for a
+    different agent must not displace the identity the API-key ingress
+    authenticated, and the stitched interaction carries that agent."""
+    from services.commerce_ledger_provenance import ledger_provenance
+    from services.commerce_interaction_service import record_commerce_event
+    from services.merchant_event_ingest_service import (
+        MerchantEventBatch,
+        ingest_merchant_event_batch,
+    )
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "ledger-verified")
+    try:
+        result = await record_commerce_event(
+            event_type="checkout.created",
+            metadata={
+                "agent_id": "agent_real",
+                "agent_identity_confidence": "verified",
+                "merchant_id": "merchant-a",
+                "platform": "shopify",
+                "store_id": "store_a",
+                "checkout_id": "chk_1",
+                "order_id": "chk_1",
+            },
+            source="agent_v2_commerce",
+            upstream_idempotency_key="checkout:chk_1",
+            actor_type="agent",
+            actor_id="agent_real",
+            **ledger_provenance("agent_commerce_api", "verified"),
+        )
+        event = dict(
+            await test_database.fetch_one(
+                select(commerce_interaction_events).where(
+                    commerce_interaction_events.c.event_id == result["event_id"]
+                )
+            )
+        )
+        assert event["write_path"] == "agent_commerce_api"
+        assert event["authority"] == "pivota"
+        assert event["agent_identity_confidence"] == "verified"
+        assert event["actor_id"] == "agent_real"
+
+        # A browser collector on the same checkout claims a different agent.
+        claim = MerchantEventBatch.model_validate(
+            {
+                "events": [
+                    {
+                        "event_id": "pixel-1",
+                        "event_type": "checkout.started",
+                        "occurred_at": "2026-09-04T10:00:00Z",
+                        "platform": "shopify",
+                        "store_id": "store_a",
+                        "checkout_id": "chk_1",
+                        "agent_id": "agent_claimed",
+                    }
+                ]
+            }
+        )
+        claim.events[0].occurred_at = claim.events[0].occurred_at.replace(tzinfo=None)
+        await ingest_merchant_event_batch(
+            merchant_id="merchant-a",
+            batch=claim,
+            agent_identity_confidence="browser_observed",
+            write_path="shopify_web_pixel",
+        )
+        interactions = [dict(r) for r in await test_database.fetch_all(select(commerce_interactions))]
+        assert len(interactions) == 1
+        assert interactions[0]["agent_id"] == "agent_real"
+        assert interactions[0]["metadata"]["agent_identity_confidence"] == "verified"
+    finally:
+        await test_database.disconnect()
