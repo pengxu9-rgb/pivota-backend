@@ -69,6 +69,31 @@ done
 
 M·A·C: decide §3 first, then either the same line with `maccosmetics.com`, or the filtered variant.
 
+**Flower Beauty APPLIED 2026-09-04T23:20Z** (execution `catalog-curated-brand-onboard-xlv56`):
+`applied: merchants=1 pdps=49 skus=49 offers=49 seeds=49, offers_skipped=0, pdps_skipped_identity=0`.
+One warning: `W2 claimed-attach lookup failed for flowerbeauty.com: column "status" does not exist` —
+a code bug (the query reads `brand_claims.status`; the column is `verification_status`), harmless here
+because Flower Beauty has no brand claim, but it means no verified claim can attach through this path.
+
+Step 2b — **make them servable.** Lane A writes decision-grade rows only. Nothing writes their quality
+snapshot / index_pipeline_state / catalog_row_trust, so `search_catalog` still returns zero Flower Beauty
+rows after the apply (re-probed 2026-09-04: "Flower Beauty lipstick", "Petal Pout Lip Color", and the exact
+title all return other brands). The lane built for exactly this is `scripts/promote_brand_official_canonicals.py`
+(present in image d872c362): quality snapshot + serving-eligibility recompute + trust upsert for every
+`source_system='catalog_enrichment_agent_v1'` row. It has no brand filter — it promotes ALL unpromoted Path C
+rows, which is the intended steady state. Dry-run first, read the per-row report, then apply:
+
+```bash
+gcloud run jobs execute catalog-curated-brand-onboard --region us-west1 --project pivota-prod --wait \
+  --args="scripts/promote_brand_official_canonicals.py"
+gcloud run jobs execute catalog-curated-brand-onboard --region us-west1 --project pivota-prod --wait \
+  --args="scripts/promote_brand_official_canonicals.py,--apply"
+```
+
+Rows whose description / image / price / quality do not clear the 71.4 gate classify as blocked and stay
+out of search; the report names them. Then re-probe the three queries above. (Also: the
+`commerce-index-search-index-cron` and `commerce-index-insight-refresh-cron` schedulers are PAUSED in prod.)
+
 Step 3 — verify (any prod psql / ops shell):
 
 ```sql
