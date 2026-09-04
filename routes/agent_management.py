@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin, verify_jwt_token
+from utils.auth import AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_STAFF_ROLES, can_access_agent, get_current_employee, get_current_user, require_admin, verify_jwt_token
 from utils.logger import logger
 
 
@@ -91,6 +91,35 @@ async def create_new_agent(
         raise HTTPException(status_code=500, detail="Failed to create agent")
 
 
+def _is_own_agent_record(current_user: dict, agent_id: str, agent: dict) -> bool:
+    """Does this token identify the agent whose record was just loaded?
+
+    utils.auth.can_access_agent reads only the `agent_id` claim, but not every
+    agent token carries it -- which is why the guards in this module have
+    always accepted more. They do not agree on what: update_agent takes
+    `user_id`, while the analytics, usage, funnel, query-analytics and
+    merchants reads take `email`. A token carrying only one spelling is
+    therefore itself on some of its own sub-routes and a stranger on others.
+
+    The `email` spelling in those five is `email == agent_id`, which can only
+    ever match because agent ids happen to be shaped `agent_<hex>` and an
+    address is not -- a coincidence of format, not an ownership relation, and
+    one that stops holding the day an id is minted differently. Here the email
+    claim is matched against the RECORD's own `owner_email` instead: that is
+    the actual relation, `users.email` is UNIQUE NOT NULL so it names exactly
+    one account, and it does not care how ids are shaped.
+    """
+    target = str(agent_id)
+    if any(
+        str(current_user.get(claim) or "") == target
+        for claim in ("agent_id", "user_id")
+    ):
+        return True
+    email = str(current_user.get("email") or "").strip().lower()
+    owner_email = str((agent or {}).get("owner_email") or "").strip().lower()
+    return bool(email) and email == owner_email
+
+
 @router.get("/{agent_id}")
 async def get_agent_details(
     agent_id: str,
@@ -116,9 +145,30 @@ async def get_agent_details(
     agent = await get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    
-    # For agent role: allow access (API key already removed by get_agent)
-    # No additional restrictions needed since sensitive data is filtered
+
+    # OWNERSHIP. This used to read: "For agent role: allow access (API key
+    # already removed by get_agent) / No additional restrictions needed since
+    # sensitive data is filtered". Stripping api_key/api_key_hash is not
+    # filtering: what get_agent still returns is owner_email, webhook_url,
+    # allowed_merchants, metadata, rate_limit and daily_quota -- another
+    # tenant's contact address, their callback endpoint, the list of merchants
+    # they are cleared for, and their commercial limits. AGENT_OR_EMPLOYEE_
+    # STAFF_ROLES decides who may attempt the route; it never decided WHOSE
+    # record. Staff keep cross-agent reads; an `agent` gets their own.
+    #
+    # Ownership must be at least as wide as this route's own sub-routes, or an
+    # agent is refused the record whose /analytics, /usage and /funnel it can
+    # read -- see _is_own_agent_record for why the three claim spellings exist
+    # and why the email one is matched against owner_email rather than the id.
+    if not can_access_agent(current_user, agent_id) and not _is_own_agent_record(
+        current_user, agent_id, agent
+    ):
+        logger.error(
+            f"[GET /agents/{{id}}] {current_role} {current_email} denied: "
+            f"{current_agent_id} is not agent {agent_id}"
+        )
+        raise HTTPException(status_code=403, detail="Access denied - not your agent")
+
     logger.info(f"[Agent Access OK] {current_role} {current_email} → agent {agent_id}")
     
     return {
