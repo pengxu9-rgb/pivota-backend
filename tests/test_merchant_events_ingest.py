@@ -85,7 +85,13 @@ def patched_route(monkeypatch):
             ],
         }
 
+    async def fake_stores(merchant_id):
+        # The merchant's active connected stores, as the route binds against.
+        assert merchant_id == MERCHANT_ID
+        return {"mall_123": "cafe24"}
+
     monkeypatch.setattr("db.merchant_onboarding.get_merchant_onboarding", fake_merchant)
+    monkeypatch.setattr("routes.merchant_events.connected_store_index", fake_stores)
     monkeypatch.setattr("routes.merchant_events.ingest_merchant_event_batch", fake_ingest)
     return calls
 
