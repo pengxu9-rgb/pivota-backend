@@ -594,12 +594,40 @@ def shopify_product_to_record(
     }
 
 
+# Some storefronts (maccosmetics.com, measured 2026-09-04: 1,366 of a 1,500-product
+# sample) publish EVERY shade as its own single-variant product — "Retro Matte
+# Lipstick - Ruby Woo" beside the base "Retro Matte Lipstick". The Path-C plan keys
+# PDPs on (brand, title), so ingesting that feed as-is mints one PDP per shade:
+# ~1,900 near-duplicates for one brand. `drop_shade_listings` collapses them onto
+# the base listing when — and only when — the base listing is itself in the feed;
+# a suffixed title with no base row in the feed is a real product name and stays.
+_SHADE_SUFFIX_RE = re.compile(r"^(?P<base>.*\S)\s+-\s+(?P<shade>[^-]+?)\s*$")
+
+
+def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pure. Return `products` without single-variant rows whose title is
+    `<base> - <shade>` where `<base>` is also a title in `products`. Order is
+    preserved; nothing else is touched. Multi-variant rows are never dropped —
+    their shades already live as variants of one product."""
+    titles = {str((p or {}).get("title") or "").strip() for p in products}
+    out: List[Dict[str, Any]] = []
+    for p in products:
+        title = str((p or {}).get("title") or "").strip()
+        variants = (p or {}).get("variants") or []
+        m = _SHADE_SUFFIX_RE.match(title)
+        if m and len(variants) <= 1 and m.group("base").strip() in titles:
+            continue
+        out.append(p)
+    return out
+
+
 async def records_for_brand(
     *,
     domain: str,
     category_path: str,
     brand: Optional[str] = None,
     max_products: int = 500,
+    base_listings_only: bool = False,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
@@ -616,6 +644,8 @@ async def records_for_brand(
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
+    if base_listings_only:
+        products = drop_shade_listings(products)
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:

@@ -35,6 +35,55 @@ def test_maps_shopify_product_to_validated_record():
     assert offers[0]["price"] == 16.0  # coerced to float (numeric columns reject strings)
 
 
+def test_drop_shade_listings_collapses_onto_present_base():
+    """maccosmetics.com shape: every shade is its own single-variant product beside
+    the base listing. Only rows whose base title is IN the feed collapse."""
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick")
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo")
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="retro-matte-lipstick-bronx")
+    out = cbf.drop_shade_listings([ruby, base, bronx])
+    assert [p["title"] for p in out] == ["Retro Matte Lipstick"]
+
+
+def test_drop_shade_listings_keeps_suffixed_title_without_base_row():
+    """'Lipglass / Mini M·A·C - Nymphette' with no 'Lipglass / Mini M·A·C' row in the
+    feed is a real product name, not a shade of something else in the feed."""
+    lone = _product(title="Cream & Chrome Eyeliner Duo - Holiday", handle="ccd-holiday")
+    other = _product(title="Amplified Lipstick", handle="amplified-lipstick")
+    out = cbf.drop_shade_listings([lone, other])
+    assert [p["title"] for p in out] == ["Cream & Chrome Eyeliner Duo - Holiday", "Amplified Lipstick"]
+
+
+def test_drop_shade_listings_never_drops_multi_variant_rows():
+    """A multi-variant row already carries its shades as variants; a suffixed title
+    on such a row is a distinct line (tarte's 'X - travel size' style), so it stays."""
+    base = _product(title="Stay All Day Liquid Lipstick", handle="sad")
+    multi = _product(
+        title="Stay All Day Liquid Lipstick - Shimmer",
+        handle="sad-shimmer",
+        variants=[{"price": "25.00", "available": True}, {"price": "25.00", "available": True}],
+    )
+    out = cbf.drop_shade_listings([base, multi])
+    assert [p["title"] for p in out] == ["Stay All Day Liquid Lipstick", "Stay All Day Liquid Lipstick - Shimmer"]
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_base_listings_only_is_off_by_default_and_threads(monkeypatch):
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick")
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo")
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return [base, ruby]
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    default = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
+    assert [r["pdp"]["product_name"] for r in default] == ["Retro Matte Lipstick", "Retro Matte Lipstick - Ruby Woo"]
+    filtered = await cbf.records_for_brand(
+        domain="maccosmetics.com", category_path="beauty/makeup", base_listings_only=True
+    )
+    assert [r["pdp"]["product_name"] for r in filtered] == ["Retro Matte Lipstick"]
+
+
 def test_brand_override_and_domain_cleaning():
     rec = shopify_product_to_record(
         _product(vendor=""), domain="https://Cosrx.com/", category_path="x", brand_override="COSRX"
