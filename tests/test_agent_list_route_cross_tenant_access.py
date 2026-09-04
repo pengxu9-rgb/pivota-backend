@@ -295,6 +295,34 @@ def test_agent_identified_only_by_user_id_sees_its_own_record(client, agents_db)
     assert _agent_ids(resp.json()) == [AGENT_A]
 
 
+def test_agent_whose_email_is_not_the_records_owner_email_still_sees_it(client, agents_db):
+    """The agent_id half of the filter, on its own.
+
+    Every other agent token here happens to carry an email that also matches
+    the record's owner_email, so the email half alone would satisfy them --
+    and a fix that dropped the id half would pass. It must not: a record's
+    owner_email is a billing/contact address that need not be the address on
+    the operator's token, which is exactly why the detail route checks the id
+    claims FIRST.
+    """
+    token = _token(
+        {
+            "sub": f"u-{AGENT_A}",
+            "email": "operator.on.the.account@example.com",
+            "role": "agent",
+            "agent_id": AGENT_A,
+        }
+    )
+
+    resp = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
+
+    assert resp.status_code == 200, resp.text
+    assert _agent_ids(resp.json()) == [AGENT_A], (
+        "an agent whose token email differs from the record's owner_email was "
+        "locked out of its own record"
+    )
+
+
 def test_agent_identified_only_by_email_sees_its_own_record(client, agents_db):
     """The email fallback, matched against the record's own owner_email -- the
     relation _is_own_agent_record settled on for the detail route."""
@@ -320,12 +348,24 @@ def test_email_identity_does_not_open_another_agents_record(client, agents_db):
 
 def test_a_blank_email_claim_matches_no_record(client, agents_db, monkeypatch):
     """The empty-string trap: a token with no usable identity must select
-    nothing, not everything. Rows with a NULL owner_email must not be swept in
-    by an `owner_email = ''` comparison either."""
+    nothing, not everything.
+
+    `owner_email` is nullable and unconstrained, so both blank spellings are
+    put in the way: agent_B carries the empty STRING, which an unguarded
+    `lower(owner_email) = ''` would match and hand over, and agent_A carries
+    NULL, which would come back the day the comparison is written with a
+    COALESCE. The token has no agent_id and no user_id, so the email half is
+    the only one that could fire.
+    """
     with agents_db.engine.begin() as conn:
         conn.execute(
             agents_db.table.update()
             .where(agents_db.table.c.agent_id == AGENT_B)
+            .values(owner_email="")
+        )
+        conn.execute(
+            agents_db.table.update()
+            .where(agents_db.table.c.agent_id == AGENT_A)
             .values(owner_email=None)
         )
     token = _token({"sub": "u-x", "email": "", "role": "agent"})
