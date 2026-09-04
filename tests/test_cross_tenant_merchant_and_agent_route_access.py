@@ -476,6 +476,39 @@ def test_merchant_can_still_poll_their_own_sync_status(client, wix_spies):
     assert resp.json()["store_id"] == STORE_B
 
 
+def test_merchant_without_store_id_still_polls_via_their_own_merchant_claim(client, wix_spies):
+    """The other branch of both wix routes: no store_id, so the row is looked
+    up by the caller's OWN merchant_id claim. It was never the vulnerable path,
+    and the ownership check must not have broken it."""
+    db, _validate, _sync = wix_spies
+    db.store_owner = MERCHANT_A
+
+    resp = client.get(
+        "/merchant/integrations/sync-status",
+        headers=_auth(_merchant_token(MERCHANT_A)),
+        params={"platform": "wix"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "store_id = :store_id" not in " ".join(db.queries), (
+        "the no-store_id branch should have keyed on merchant_id"
+    )
+
+
+def test_merchant_without_store_id_still_syncs_their_own_store(client, wix_spies):
+    db, _validate, sync = wix_spies
+    db.store_owner = MERCHANT_A
+
+    resp = client.post(
+        "/merchant/integrations/wix/sync",
+        headers=_auth(_merchant_token(MERCHANT_A)),
+        params={"wait": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert sync.calls == [MERCHANT_A]
+
+
 def test_staff_keep_cross_merchant_sync_status(client, wix_spies):
     resp = client.get(
         "/merchant/integrations/sync-status",
