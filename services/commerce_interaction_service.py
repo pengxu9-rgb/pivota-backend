@@ -230,6 +230,16 @@ def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) ->
     return base or None
 
 
+def _authenticated_agent_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return an agent id only when the ingress authenticated that agent itself."""
+    if not isinstance(metadata, dict):
+        return None
+    confidence = _normalize_text(metadata.get("agent_identity_confidence"))
+    if confidence != "verified":
+        return None
+    return _normalize_text(metadata.get("agent_id"))
+
+
 _STATUS_RANK = {
     "observed": 10,
     "discovery": 20,
@@ -546,7 +556,7 @@ async def ensure_interaction(
     taxonomy = build_traffic_taxonomy(
         metadata,
         metadata=kwargs,
-        authenticated_agent_id=_normalize_text((metadata or {}).get("agent_id")) if isinstance(metadata, dict) else None,
+        authenticated_agent_id=_authenticated_agent_id(metadata),
         caller_id=_normalize_text(kwargs.get("caller_id")),
         default_source_channel=_normalize_text(kwargs.get("source_channel")),
         default_query_source=_normalize_text(kwargs.get("query_source")),
@@ -678,7 +688,7 @@ async def record_commerce_event(
     taxonomy = build_traffic_taxonomy(
         metadata,
         metadata=kwargs,
-        authenticated_agent_id=_normalize_text((metadata or {}).get("agent_id")) if isinstance(metadata, dict) else None,
+        authenticated_agent_id=_authenticated_agent_id(metadata),
         caller_id=_normalize_text(kwargs.get("caller_id")),
         default_source_channel=_normalize_text(kwargs.get("source_channel")),
         default_query_source=_normalize_text(kwargs.get("query_source")),

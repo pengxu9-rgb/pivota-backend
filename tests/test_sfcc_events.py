@@ -165,6 +165,7 @@ def test_sfcc_webhook_requires_fresh_body_signature_and_exact_site(monkeypatch):
     assert response.status_code == 200
     assert response.json()["accepted"] == 1
     assert ingested[0]["merchant_id"] == "merchant-1"
+    assert ingested[0]["agent_identity_confidence"] == "platform_asserted"
 
     tampered = client.post(
         "/webhooks/salesforce-commerce-cloud/store-sfcc",

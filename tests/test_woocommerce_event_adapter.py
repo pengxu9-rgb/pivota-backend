@@ -157,6 +157,7 @@ def test_woocommerce_webhook_route_requires_valid_hmac_and_source(monkeypatch):
     assert response.status_code == 200
     assert response.json()["accepted"] == 2
     assert ingested[0]["merchant_id"] == "merchant-1"
+    assert ingested[0]["agent_identity_confidence"] == "platform_asserted"
 
     invalid = client.post(
         "/webhooks/woocommerce/store-woo",

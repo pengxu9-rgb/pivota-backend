@@ -117,6 +117,7 @@ async def _receive(
     result = await ingest_merchant_event_batch(
         merchant_id=str(store["merchant_id"]),
         batch=batch,
+        agent_identity_confidence="platform_asserted",
     )
     return {"status": "recorded", "platform": platform, **result}
 

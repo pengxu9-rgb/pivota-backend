@@ -62,6 +62,7 @@ async def receive_cafe24_webhook(
     result = await ingest_merchant_event_batch(
         merchant_id=str(store["merchant_id"]),
         batch=batch,
+        agent_identity_confidence="platform_asserted",
     )
     return {
         "status": "recorded",

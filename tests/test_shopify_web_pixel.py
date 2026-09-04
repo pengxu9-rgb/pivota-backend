@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +59,55 @@ def test_shopify_pixel_batch_keeps_public_collector_authority_boundary():
     )
     assert batch.events[0].source == "shopify_web_pixel"
     assert batch.events[0].platform == "shopify"
+
+
+def test_shopify_pixel_route_marks_agent_identity_as_browser_observed(monkeypatch):
+    from routes import merchant_events as route
+    from services.merchant_web_collector_service import issue_shopify_pixel_token
+
+    captured = []
+
+    class FakeDatabase:
+        async def fetch_one(self, _query, values):
+            assert values["store_id"] == "store_shopify"
+            return {
+                "store_id": "store_shopify",
+                "merchant_id": "merch_1",
+                "platform": "shopify",
+                "status": "active",
+            }
+
+    async def fake_ingest(**kwargs):
+        captured.append(kwargs)
+        return {"accepted": 1, "duplicates": 0, "events": []}
+
+    monkeypatch.setattr(route, "database", FakeDatabase())
+    monkeypatch.setattr(route, "ingest_merchant_event_batch", fake_ingest)
+    token = issue_shopify_pixel_token(
+        merchant_id="merch_1",
+        store_id="store_shopify",
+    )["token"]
+    app = FastAPI()
+    app.include_router(route.router)
+
+    response = TestClient(app).post(
+        "/merchant-events/v1/shopify-pixel/batch",
+        json={
+            "collector_token": token,
+            "events": [
+                {
+                    "event_id": "shopify_pixel:evt_route",
+                    "event_type": "product.viewed",
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                    "session_id": "client_1",
+                    "agent_id": "url-supplied-agent",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured[0]["agent_identity_confidence"] == "browser_observed"
 
 
 @pytest.mark.parametrize(

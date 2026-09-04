@@ -326,6 +326,7 @@ async def ingest_web_collector_batch(request: Request):
     result = await ingest_merchant_event_batch(
         merchant_id=str(claims["merchant_id"]),
         batch=batch,
+        agent_identity_confidence="browser_observed",
     )
     return JSONResponse(
         {"status": "recorded", **result},
@@ -366,7 +367,9 @@ async def ingest_shopify_pixel_batch(request: Request):
             status_code=403, detail="Shopify pixel store is no longer active"
         )
     result = await ingest_merchant_event_batch(
-        merchant_id=str(claims["merchant_id"]), batch=batch
+        merchant_id=str(claims["merchant_id"]),
+        batch=batch,
+        agent_identity_confidence="browser_observed",
     )
     return JSONResponse(
         {"status": "recorded", **result},
@@ -428,5 +431,6 @@ async def ingest_event_batch(
     result = await ingest_merchant_event_batch(
         merchant_id=str(merchant["merchant_id"]),
         batch=batch,
+        agent_identity_confidence="merchant_asserted",
     )
     return {"status": "recorded", **result}

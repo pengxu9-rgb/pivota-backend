@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -34,6 +34,22 @@ STANDARD_COMMERCE_EVENT_TYPES = frozenset(
         "return.completed",
     }
 )
+
+AgentIdentityConfidence = Literal[
+    "browser_observed",
+    "merchant_asserted",
+    "platform_asserted",
+    "verified",
+    "unknown",
+]
+
+_AGENT_WRITER_BY_CONFIDENCE = {
+    "browser_observed": "browser_collector",
+    "merchant_asserted": "merchant_adapter",
+    "platform_asserted": "platform_adapter",
+    "verified": "external_agent",
+    "unknown": "store_adapter",
+}
 
 # The public collector is an analytics contract, not an arbitrary document
 # store. Native adapters reduce their payloads to this vocabulary before model
@@ -316,6 +332,7 @@ async def ingest_merchant_event_batch(
     *,
     merchant_id: str,
     batch: MerchantEventBatch,
+    agent_identity_confidence: AgentIdentityConfidence,
 ) -> Dict[str, Any]:
     """Normalize and append an idempotent batch to the canonical commerce ledger.
 
@@ -323,6 +340,7 @@ async def ingest_merchant_event_batch(
     transaction. A failed batch can be retried safely using the same event ids while
     already-accepted events are returned as duplicates.
     """
+    actor_type = _AGENT_WRITER_BY_CONFIDENCE[agent_identity_confidence]
     results: List[Dict[str, Any]] = []
     for event in batch.events:
         metadata = {
@@ -342,7 +360,9 @@ async def ingest_merchant_event_batch(
                     "llm_provider": event.llm_provider,
                     "llm_model": event.llm_model,
                     "agent_id": event.agent_id,
-                    "agent_identity_confidence": "merchant_asserted" if event.agent_id else "unknown",
+                    "agent_identity_confidence": (
+                        agent_identity_confidence if event.agent_id else None
+                    ),
                 }.items()
                 if value is not None
             },
@@ -352,8 +372,12 @@ async def ingest_merchant_event_batch(
             occurred_at=event.occurred_at,
             source=event.source or f"{event.platform}_adapter",
             upstream_idempotency_key=event.event_id,
-            actor_type="external_agent" if event.agent_id else "store_adapter",
-            actor_id=event.agent_id or merchant_id,
+            actor_type=actor_type,
+            actor_id=(
+                event.agent_id
+                if event.agent_id and agent_identity_confidence == "verified"
+                else merchant_id
+            ),
             metadata=metadata,
             merchant_id=merchant_id,
             platform=event.platform,
