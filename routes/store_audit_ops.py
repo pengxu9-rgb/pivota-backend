@@ -54,6 +54,22 @@ def _normalize_domain(value: str) -> str:
     return text
 
 
+_URL_RE = re.compile(r"https?://\S*", re.IGNORECASE)
+
+
+def _scrub_urls(text: str) -> str:
+    """Strip URLs out of free text on the way out.
+
+    The receipt path applies its URL check to `acceptance_signal.payload` only.
+    `receipt.reason` — free text from the crawl worker, and the single field
+    this endpoint exists to display — is stored unfiltered as both
+    error_message and evidence.reason. No writer is known to put a URL there,
+    but the guarantee this surface claims is "nothing the receipt path would
+    have refused", and that claim was true of keys and not of this value.
+    """
+    return _URL_RE.sub("[url]", text)
+
+
 def _redact(value: Any, depth: int = 0) -> Any:
     """Drop anything the receipt path would have refused to accept.
 
@@ -75,7 +91,7 @@ def _redact(value: Any, depth: int = 0) -> Any:
     if isinstance(value, list):
         return [_redact(item, depth + 1) for item in value[:25]]
     if isinstance(value, str):
-        return value[:_MAX_STRING]
+        return _scrub_urls(value)[:_MAX_STRING]
     return value
 
 
@@ -139,7 +155,7 @@ async def domain_diagnostics(
             verify_id=str(r.get("verify_id") or ""),
             audit_run_id=str(r["audit_run_id"]) if r.get("audit_run_id") else None,
             status=str(r.get("status") or ""),
-            error_message=(str(r["error_message"])[:_MAX_STRING]
+            error_message=(_scrub_urls(str(r["error_message"]))[:_MAX_STRING]
                            if r.get("error_message") else None),
             evidence=_redact(r.get("evidence_jsonb")) if r.get("evidence_jsonb") else None,
             retry_count=int(r.get("retry_count") or 0),

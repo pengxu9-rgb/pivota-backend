@@ -2551,6 +2551,13 @@ async def summarize_ucp_route_merchant_coverage() -> Dict[str, int]:
     the distinction matters: `variant_carried: 0` in the reprobe summary reads
     identically whether the answer is "no merchant has claimed a probed domain"
     or "the feature is broken". This separates them BEFORE the flag is flipped.
+
+    ONE RESIDUAL GAP, stated rather than hidden: this reproduces every
+    ASSOCIATION condition the gate applies, but not the last step — whether the
+    merchant's catalogue actually yields an in-stock Shopify variant
+    (select_probe_variant_gid). The number is therefore exact for "routes whose
+    merchant association qualifies" and an upper bound on routes that will
+    carry a variant. The endpoint's note says so.
     """
     from db.merchant_official_domains import (
         ensure_merchant_official_domains_table,
@@ -2574,23 +2581,27 @@ async def summarize_ucp_route_merchant_coverage() -> Dict[str, int]:
                 )
             )
         )
-        out["active_ucp_routes"] = int(list(total.values())[0] if total else 0)
+        # row[0], NOT row.values(): databases==0.7.0's sqlite Record is a bare
+        # Sequence with no .values(), so that spelling raised inside the try and
+        # this function answered "lookup FAILED" on every sqlite call — while
+        # asyncpg happens to carry the method (deprecated), so Postgres hid it.
+        out["active_ucp_routes"] = int(total[0] if total else 0)
 
-        # The same predicate the reprobe gate uses. If these two ever disagree,
-        # this number stops describing the thing it is consulted about.
-        matched = await database.fetch_one(
-            sa_select(func.count(func.distinct(execution_routes.c.execution_route_id)))
-            .select_from(
-                execution_routes.join(
-                    merchant_official_domains,
-                    func.lower(merchant_official_domains.c.domain)
-                    == execution_routes.c.normalized_domain,
-                )
+        # THE GATE IS NOT ONE PREDICATE, and an earlier cut counted as though it
+        # were. jobs/scheduled_ucp_reprobe_job also requires the domain resolve
+        # to exactly ONE merchant, that merchant to have exactly ONE proven
+        # domain (canonical_variants has no store key, so a two-storefront
+        # merchant is refused), and the route to carry a last_audit_run_id for
+        # list_due_ucp_routes to pick it up at all. Counting only the shared
+        # WHERE made `2` mean "the tier will fire twice" when the true answer
+        # was zero — the exact ambiguity this endpoint exists to remove.
+        proven = (
+            sa_select(
+                merchant_official_domains.c.domain.label("domain"),
+                merchant_official_domains.c.merchant_id.label("merchant_id"),
             )
             .where(
                 and_(
-                    execution_routes.c.route_kind == ROUTE_KIND_UCP,
-                    execution_routes.c.is_active.is_(True),
                     merchant_official_domains.c.verification_status
                     == VERIFICATION_VERIFIED,
                     merchant_official_domains.c.source == SOURCE_VERIFIED,
@@ -2600,10 +2611,40 @@ async def summarize_ucp_route_merchant_coverage() -> Dict[str, int]:
                     ),
                 )
             )
+            .subquery()
         )
-        out["routes_with_proven_merchant"] = int(
-            list(matched.values())[0] if matched else 0
+        sole_domain = (
+            sa_select(proven.c.domain.label("domain"))
+            .group_by(proven.c.domain)
+            .having(func.count(func.distinct(proven.c.merchant_id)) == 1)
+            .subquery()
         )
+        sole_merchant = (
+            sa_select(proven.c.merchant_id.label("merchant_id"))
+            .group_by(proven.c.merchant_id)
+            .having(func.count(func.distinct(proven.c.domain)) == 1)
+            .subquery()
+        )
+        matched = await database.fetch_one(
+            sa_select(func.count(func.distinct(execution_routes.c.execution_route_id)))
+            .select_from(
+                execution_routes
+                .join(proven, proven.c.domain == execution_routes.c.normalized_domain)
+                .join(sole_domain, sole_domain.c.domain == proven.c.domain)
+                .join(
+                    sole_merchant,
+                    sole_merchant.c.merchant_id == proven.c.merchant_id,
+                )
+            )
+            .where(
+                and_(
+                    execution_routes.c.route_kind == ROUTE_KIND_UCP,
+                    execution_routes.c.is_active.is_(True),
+                    execution_routes.c.last_audit_run_id.isnot(None),
+                )
+            )
+        )
+        out["routes_with_proven_merchant"] = int(matched[0] if matched else 0)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "summarize_ucp_route_merchant_coverage failed: %s", str(exc)[:200]
