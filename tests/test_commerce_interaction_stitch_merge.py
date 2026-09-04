@@ -42,6 +42,17 @@ async def test_stitched_interaction_preserves_highest_confidence_agent_identity(
 
     try:
         for index, (agent_id, confidence) in enumerate(sequence):
+            identity_context = (
+                {
+                    "source_channel": "chatgpt",
+                    "query_source": "agent_recommendation",
+                    "protocol_name": "mcp",
+                    "llm_provider": "openai",
+                    "llm_model": "gpt-5.4",
+                }
+                if agent_id == "verified-agent"
+                else {}
+            )
             batch = MerchantEventBatch.model_validate(
                 {
                     "events": [
@@ -55,6 +66,7 @@ async def test_stitched_interaction_preserves_highest_confidence_agent_identity(
                             "store_id": "store-a",
                             "session_id": "shared-session",
                             "agent_id": agent_id,
+                            **identity_context,
                         }
                     ]
                 }
@@ -74,6 +86,26 @@ async def test_stitched_interaction_preserves_highest_confidence_agent_identity(
         assert interaction["metadata"]["agent_id"] == "verified-agent"
         assert interaction["metadata"]["agent_identity_confidence"] == "verified"
         assert interaction["metadata"]["traffic"]["agent_id"] == "verified-agent"
+        for field, expected in {
+            "source_channel": "chatgpt",
+            "query_source": "agent_recommendation",
+            "protocol_name": "mcp",
+            "llm_provider": "openai",
+            "llm_model": "gpt-5.4",
+        }.items():
+            assert interaction[field] == expected
+            assert interaction["metadata"][field] == expected
+            assert interaction["metadata"]["traffic"][field] == expected
+
+        from services.traffic_taxonomy_service import taxonomy_from_row
+
+        derived = taxonomy_from_row(interaction)
+        assert derived["agent_id"] == "verified-agent"
+        assert derived["source_channel"] == "chatgpt"
+        assert derived["query_source"] == "agent_recommendation"
+        assert derived["protocol_name"] == "mcp"
+        assert derived["llm_provider"] == "openai"
+        assert derived["llm_model"] == "gpt-5.4"
     finally:
         await test_database.disconnect()
 

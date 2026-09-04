@@ -13,7 +13,11 @@ from sqlalchemy import and_, or_, select
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import IS_POSTGRES, database
-from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
+from services.traffic_taxonomy_service import (
+    TRAFFIC_TAXONOMY_FIELDS,
+    attach_traffic_taxonomy,
+    build_traffic_taxonomy,
+)
 
 
 logger = logging.getLogger("commerce_interaction_service")
@@ -245,9 +249,22 @@ def _identity_claim(metadata: Optional[Any]) -> tuple[Optional[str], str]:
     return agent_id, confidence
 
 
+def _known_taxonomy(metadata: Optional[Any]) -> Dict[str, str]:
+    value = metadata if isinstance(metadata, dict) else {}
+    traffic = value.get("traffic") if isinstance(value.get("traffic"), dict) else {}
+    return {
+        field: known
+        for field in TRAFFIC_TAXONOMY_FIELDS
+        if field != "agent_id"
+        and (known := _known_text(value.get(field)) or _known_text(traffic.get(field)))
+    }
+
+
 def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     base = dict(existing or {}) if isinstance(existing, dict) else {}
     extra = _make_json_safe(patch or {}) if patch else {}
+    existing_taxonomy = _known_taxonomy(base)
+    incoming_taxonomy = _known_taxonomy(extra)
     existing_agent_id, existing_confidence = _identity_claim(base)
     incoming_agent_id, incoming_confidence = _identity_claim(extra)
     selected_agent_id = existing_agent_id
@@ -267,11 +284,16 @@ def _merge_metadata(existing: Optional[Any], patch: Optional[Dict[str, Any]]) ->
             selected_confidence = incoming_confidence
     if extra:
         base.update(extra)
+    traffic = dict(base.get("traffic") or {}) if isinstance(base.get("traffic"), dict) else {}
+    for field, existing_value in existing_taxonomy.items():
+        if field not in incoming_taxonomy:
+            base[field] = existing_value
+            traffic[field] = existing_value
     if selected_agent_id:
         base["agent_id"] = selected_agent_id
         base["agent_identity_confidence"] = selected_confidence
-        traffic = dict(base.get("traffic") or {}) if isinstance(base.get("traffic"), dict) else {}
         traffic["agent_id"] = selected_agent_id
+    if traffic:
         base["traffic"] = traffic
     return base or None
 
