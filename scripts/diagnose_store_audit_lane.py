@@ -223,7 +223,10 @@ def _request(host, method, path, body=None, headers=None, budget=_TIMEOUT,
                      headers=headers or {"accept": "application/json",
                                          "user-agent": _UA})
         res = conn.getresponse()
-        payload = res.read()
+        # cap+1, not everything: the client destroys the request one byte past
+        # its cap, so this yields the identical oversize verdict without
+        # buffering hundreds of megabytes of an error page into job memory.
+        payload = res.read(_MAX_MERCHANT_BYTES + 1)
         _left()                     # reading may have exhausted it
         out = {
             "status": res.status,
@@ -233,10 +236,20 @@ def _request(host, method, path, body=None, headers=None, budget=_TIMEOUT,
         }
         if addr:
             out["addr"] = addr
+        # STATUS-BLIND, because the client's cap is: it lives in the response
+        # data handler and fires for every status, so a 3 MiB error page throws
+        # in discovery and is stored as profile_unreachable while a bare
+        # `status: 404` here would read as a clean refusal.
+        out["oversize"] = len(payload) > _MAX_MERCHANT_BYTES
         if 200 <= res.status < 300:
-            out["oversize"] = len(payload) > _MAX_MERCHANT_BYTES
             try:
-                json.loads(payload)
+                # Decoded leniently on purpose. res.json() builds a WHATWG
+                # Response over a Buffer and uses the spec's NON-FATAL decoder,
+                # so a stray Latin-1 byte in a merchant name parses there. A
+                # strict decode here would report json_ok: False for a profile
+                # the client read fine — a false FAILURE, and the reader would
+                # take it as the explanation for profile_unreachable.
+                json.loads(payload.decode("utf-8-sig", "replace"))
                 out["json_ok"] = True
             except Exception:
                 # The client would have thrown here and the probe would have

@@ -75,7 +75,15 @@ def test_it_writes_nothing(mod):
     WRITE = re.compile(
         r"\b(insert\s+into|update|delete\s+from|truncate|drop|alter|create|"
         r"grant|revoke|copy|merge\s+into|refresh\s+materialized|setval|"
-        r"lock\s+table|vacuum|analyze|reindex|set\s+role|select\s+.*\binto\b|"
+        r"lock\s+table|vacuum|analyze|reindex|set\s+role|"
+        # SELECT ... INTO newtab, bounded to one line: under DOTALL this
+        # spanned the whole literal, so a WHERE clause mentioning "folded
+        # into" or a trailing `-- rolled into ...` comment tripped it. A
+        # ratchet that fails correct code gets deleted, not obeyed.
+        # The lookahead matters: the whole alternation is wrapped in \b(...)\b,
+        # so an alternative ending in \w can never satisfy that trailing \b —
+        # it silently matched nothing at all.
+        r"select\s+[^\n]{0,200}?\binto(?=\s+\w)|"
         r"pg_terminate_backend|pg_cancel_backend|for\s+update|for\s+no\s+key)\b",
         re.IGNORECASE | re.DOTALL,
     )
@@ -298,4 +306,71 @@ def test_a_non_2xx_carries_no_json_verdict(mod, monkeypatch):
     out = mod._request("shop.example", "GET", "/.well-known/ucp")
 
     assert out["status"] == 404
+    assert "json_ok" not in out
+
+
+def test_the_pinned_address_path_builds_a_verified_connection(mod, monkeypatch):
+    """The addr= path had no test — the same gap that hid the will_close crash.
+
+    It bypasses conn.connect() and installs its own socket, so nothing else
+    exercises create_connection + wrap_socket + a pre-set conn.sock.
+    """
+    made = {}
+
+    class _Sock:
+        def settimeout(self, _t): pass
+
+    class _Res:
+        status = 200
+        def read(self, *a): return b'{"ok":true}'
+        def getheader(self, k): return None
+
+    class _Conn:
+        def __init__(self, *a, **kw): self.sock = None
+        def connect(self): raise AssertionError("must not connect() when pinned")
+        def request(self, *a, **kw): pass
+        def getresponse(self): return _Res()
+        def close(self): made["closed"] = True
+
+    class _Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            made["sni"] = server_hostname      # the DOMAIN, never the address
+            return _Sock()
+
+    monkeypatch.setattr(mod.http.client, "HTTPSConnection", lambda *a, **kw: _Conn())
+    monkeypatch.setattr(mod.socket, "create_connection",
+                        lambda addr, timeout=None: made.setdefault("dialed", addr))
+    monkeypatch.setattr(mod.ssl, "create_default_context", lambda: _Ctx())
+
+    out = mod._request("shop.example", "GET", "/.well-known/ucp",
+                       addr="2620:127:f00f:e::")
+
+    assert out["status"] == 200
+    assert out["addr"] == "2620:127:f00f:e::"
+    # Dialled the ADDRESS, verified against the DOMAIN. Passing the address as
+    # server_hostname would fail every certificate and read as a network fault.
+    assert made["dialed"] == ("2620:127:f00f:e::", 443)
+    assert made["sni"] == "shop.example"
+    assert made.get("closed") is True
+
+
+def test_a_body_with_invalid_utf8_is_still_json_ok(mod, monkeypatch):
+    """res.json() uses the WHATWG non-fatal decoder, so a stray Latin-1 byte in
+    a merchant name parses for the client. A strict decode here would report a
+    false FAILURE and the reader would take it as the cause."""
+    _conn_double(mod, monkeypatch, status=200,
+                 body=b'{"brand":"Caf\xe9 Beaut\xe9"}')
+    assert mod._request("shop.example", "GET", "/.well-known/ucp")["json_ok"] is True
+
+
+def test_an_oversize_non_2xx_is_still_flagged(mod, monkeypatch):
+    """The client's cap lives in the response data handler and fires for every
+    status, so a 3 MiB error page throws in discovery. A bare `status: 404`
+    would read as a clean refusal."""
+    _conn_double(mod, monkeypatch, status=404,
+                 body=b"x" * (2 * 1024 * 1024 + 10))
+    out = mod._request("shop.example", "GET", "/.well-known/ucp")
+
+    assert out["status"] == 404
+    assert out["oversize"] is True
     assert "json_ok" not in out
