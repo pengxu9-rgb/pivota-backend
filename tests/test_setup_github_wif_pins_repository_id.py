@@ -50,7 +50,7 @@ printf '%s\\n' "$*" >> "$CALLS"
 case "$*" in
   *"projects describe"*)            echo 371394967380 ;;
   *"remove-iam-policy-binding"*)    printf '%s\n' "${REMOVE_ERR:-}" >&2; exit "${REMOVE_RC:-0}" ;;
-  *"get-iam-policy"*)               printf '%s\n' "${POLICY_MEMBERS:-}" ;;
+  *"get-iam-policy"*)               printf '%s\n' "${POLICY_MEMBERS:-}"; exit "${POLICY_RC:-0}" ;;
   *describe*)                       exit 0 ;;
 esac
 exit 0
@@ -322,3 +322,43 @@ def test_the_repo_name_shape_guard_still_holds(tmp_path):
 
     assert proc.returncode != 0
     assert "--attribute-condition=" not in calls
+
+
+def test_a_failed_policy_reread_is_not_a_confirmed_retirement(tmp_path):
+    """The fail-open introduced by the fix for the fail-open.
+
+    Piping the confirmation read straight into grep cannot distinguish "member
+    absent" from "read failed": both produce no output and grep exits 1. So a
+    policy read that errored reported the retirement as confirmed — the same
+    cannot-fail probe the block above was written to remove."""
+    proc, _calls, _gh = _run(tmp_path, [REPO, REPO_ID], {"POLICY_RC": "1"})
+
+    assert proc.returncode != 0, (
+        "an unreadable policy was reported as a confirmed retirement\n"
+        + proc.stdout
+    )
+    assert "UNCONFIRMED" in proc.stderr
+
+
+def test_a_missing_service_account_is_not_nothing_to_retire(tmp_path):
+    """`NOT_FOUND: Requested entity was not found.` is a 404 on the SA, not a
+    missing binding. Tolerating a bare "not found" accepted it as idempotence,
+    and together with the read above it became a silent pass."""
+    proc, _calls, _gh = _run(tmp_path, [REPO, REPO_ID], {
+        "REMOVE_RC": "1",
+        "REMOVE_ERR": "ERROR: (gcloud) NOT_FOUND: Requested entity was not found.",
+    })
+
+    assert proc.returncode != 0, "a 404 on the SA was read as nothing to retire"
+    assert "FAILED to retire" in proc.stderr
+
+
+def test_a_differently_cased_repo_name_still_hits_the_pin(tmp_path):
+    """GitHub resolves owner/name case-insensitively; bash `=` does not. The
+    variant spelling is the SAME repository, so it must not slip past the
+    constant and the mismatch guard onto an unchecked lookup."""
+    proc, calls, gh_calls = _run(tmp_path, ["PengXu9-RGB/Pivota-Backend"])
+
+    assert proc.returncode == 0, proc.stderr
+    assert gh_calls.strip() == "", f"asked GitHub for the id: {gh_calls}"
+    assert f"assertion.repository_id == '{REPO_ID}'" in _condition(calls)

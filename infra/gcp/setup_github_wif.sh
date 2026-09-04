@@ -2,7 +2,9 @@
 # Let GitHub Actions deploy to Cloud Run without a service-account key.
 #   infra/gcp/setup_github_wif.sh [repo] [repo_id]   default repo: pengxu9-rgb/pivota-backend
 #
-# repo_id is the repository's IMMUTABLE numeric id. Resolved with `gh` when omitted; see
+# repo_id is the repository's IMMUTABLE numeric id. PINNED as a constant for the default repo
+# (a lookup keyed on the mutable name is the very hazard this pins against); resolved with `gh`
+# only for some other repo; see
 # "WHY THE BOUNDARY IS THE ID" below for why it, and not the name, is the boundary.
 #
 # Idempotent, like the other setup_* scripts here: re-running reconciles rather than duplicates.
@@ -66,8 +68,15 @@ GH="${GH:-gh}"
 DEFAULT_REPO="pengxu9-rgb/pivota-backend"
 DEFAULT_REPO_ID="1075520615"
 
+# Case-folded, because GitHub resolves owner/name case-insensitively while bash
+# `=` does not: `PengXu9-RGB/Pivota-Backend` is the same repository to GitHub,
+# but would miss both the constant and the mismatch guard below and fall through
+# to an unchecked lookup.
+REPO_FOLDED="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+DEFAULT_REPO_FOLDED="$(printf '%s' "$DEFAULT_REPO" | tr '[:upper:]' '[:lower:]')"
+
 REPO_ID="${2:-${REPO_ID:-}}"
-if [ -z "$REPO_ID" ] && [ "$REPO" = "$DEFAULT_REPO" ]; then
+if [ -z "$REPO_ID" ] && [ "$REPO_FOLDED" = "$DEFAULT_REPO_FOLDED" ]; then
   REPO_ID="$DEFAULT_REPO_ID"
 fi
 if [ -z "$REPO_ID" ]; then
@@ -77,10 +86,13 @@ if [ -z "$REPO_ID" ]; then
   # cannot. Shipping without the pin is not one of the options; that is the hole above.
   REPO_ID="$("$GH" api "repos/$REPO" --jq .id 2>/dev/null || true)"
 fi
-if [ "$REPO" = "$DEFAULT_REPO" ] && [ -n "$REPO_ID" ] && [ "$REPO_ID" != "$DEFAULT_REPO_ID" ]; then
+if [ "$REPO_FOLDED" = "$DEFAULT_REPO_FOLDED" ] && [ -n "$REPO_ID" ] \
+   && [ "$REPO_ID" != "$DEFAULT_REPO_ID" ]; then
   echo "refusing: '$REPO' resolved to id $REPO_ID, not the pinned $DEFAULT_REPO_ID." >&2
   echo "the name now points at a different repository than the one this deploy" >&2
-  echo "identity belongs to. Verify the transfer before overriding." >&2
+  echo "identity belongs to. Repo ids survive renames AND transfers, so this can" >&2
+  echo "only fire if the deploy repo was REPLACED. If that is intended, change" >&2
+  echo "DEFAULT_REPO_ID in this script - there is deliberately no runtime override." >&2
   exit 1
 fi
 [[ "$REPO_ID" =~ ^[0-9]+$ ]] || {
@@ -206,7 +218,12 @@ REMOVE_ERR="$("$GCLOUD" iam service-accounts remove-iam-policy-binding "$SA" --p
   --role="roles/iam.workloadIdentityUser" --member="$STALE_PRINCIPAL" --quiet 2>&1 >/dev/null)" \
   && echo "   removed $STALE_PRINCIPAL" \
   || {
-    if printf '%s' "$REMOVE_ERR" | grep -qiE "not found|does not exist|NOT_FOUND"; then
+    # gcloud raises IamPolicyBindingNotFound("Policy binding with the specified
+    # principal and role not found!") for the idempotent case. Matching the
+    # phrase rather than a bare "not found" keeps a 404 on the SA or the project
+    # — a different failure entirely — from being waved through as "nothing to
+    # retire".
+    if printf '%s' "$REMOVE_ERR" | grep -qiF "Policy binding with the specified"; then
       echo "   none present (nothing to retire)"
     else
       echo "   FAILED to retire $STALE_PRINCIPAL" >&2
@@ -218,8 +235,18 @@ REMOVE_ERR="$("$GCLOUD" iam service-accounts remove-iam-policy-binding "$SA" --p
 
 # CONFIRM it is gone. A zero exit is not an absent member: the policy is
 # read-modify-write, so a concurrent writer can restore what we just deleted.
-if "$GCLOUD" iam service-accounts get-iam-policy "$SA" --project="$SHARED" \
-     --format="value(bindings.members)" 2>/dev/null | grep -qF "$STALE_PRINCIPAL"; then
+#
+# The read is captured and its OWN failure is a failure. Piping it straight into
+# grep cannot tell "member absent" from "read failed" — both yield no output and
+# grep exits 1 — which is the same cannot-fail probe this block was written to
+# remove, reintroduced one line below it.
+if ! POLICY_MEMBERS="$("$GCLOUD" iam service-accounts get-iam-policy "$SA" \
+     --project="$SHARED" --format="value(bindings.members)" 2>&1)"; then
+  echo "   FAILED to re-read the policy on $SA; retirement is UNCONFIRMED" >&2
+  printf '   %s\n' "$POLICY_MEMBERS" >&2
+  exit 1
+fi
+if printf '%s' "$POLICY_MEMBERS" | grep -qF "$STALE_PRINCIPAL"; then
   echo "   FAILED: $STALE_PRINCIPAL is still bound after removal" >&2
   exit 1
 fi
