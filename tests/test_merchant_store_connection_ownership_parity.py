@@ -415,7 +415,7 @@ def test_staff_support_email_write_reaches_the_database_cross_merchant(client, s
 # ---------------------------------------------------------------------------
 
 
-def test_wix_oauth_stub_now_refuses_roles_that_used_to_reach_its_501():
+def test_wix_oauth_stub_now_refuses_roles_that_used_to_reach_its_501(client):
     """THE ONE DELIBERATE BEHAVIOUR CHANGE in the unification, pinned.
 
     GET /integrations/wix/oauth/start was the only site in the module with no
@@ -426,34 +426,33 @@ def test_wix_oauth_stub_now_refuses_roles_that_used_to_reach_its_501():
     pre-unification file, which is the honest signal that this one line is a
     change and not a rename.
 
-    A dedicated client: the module-scoped one is shared, and this asserts on a
-    route the table above also drives.
+    Uses the shared module client deliberately. An earlier cut opened its own
+    `with TestClient(main.app)`, which runs the app's full lifespan inside one
+    test of this file -- startup migrations against the test sqlite DB, a
+    background reconnect supervisor, and database.disconnect() on the way out.
+    It restored the connection state it found, so nothing broke, but no other
+    test here needs the lifespan and neither does this one.
     """
-    from fastapi.testclient import TestClient
+    for role in ("agent", "buyer"):
+        resp = client.get(
+            "/integrations/wix/oauth/start",
+            headers=_auth(role),
+            params={"merchant_id": MERCHANT_B},
+        )
+        assert resp.status_code == 403, f"{role}: {resp.status_code} {resp.text[:200]}"
+        assert "Not authorized" in resp.text
 
-    import main
-
-    with TestClient(main.app) as c:
-        for role in ("agent", "buyer"):
-            resp = c.get(
-                "/integrations/wix/oauth/start",
-                headers=_auth(role),
-                params={"merchant_id": MERCHANT_B},
-            )
-            assert resp.status_code == 403, f"{role}: {resp.status_code} {resp.text[:200]}"
-            assert "Not authorized" in resp.text
-
-        # Staff and the owning merchant still reach the stub itself.
-        for headers, merchant in (
-            (_auth("admin"), MERCHANT_B),
-            (_auth("merchant", MERCHANT_A), MERCHANT_A),
-        ):
-            resp = c.get(
-                "/integrations/wix/oauth/start",
-                headers=headers,
-                params={"merchant_id": merchant},
-            )
-            assert resp.status_code == 501, resp.text
+    # Staff and the owning merchant still reach the stub itself.
+    for headers, merchant in (
+        (_auth("admin"), MERCHANT_B),
+        (_auth("merchant", MERCHANT_A), MERCHANT_A),
+    ):
+        resp = client.get(
+            "/integrations/wix/oauth/start",
+            headers=headers,
+            params={"merchant_id": merchant},
+        )
+        assert resp.status_code == 501, resp.text
 
 
 @pytest.mark.parametrize("role", ("agent", "buyer", "outsourced"))
