@@ -49,7 +49,8 @@ _FAKE_GCLOUD = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$CALLS"
 case "$*" in
   *"projects describe"*)            echo 371394967380 ;;
-  *"remove-iam-policy-binding"*)    exit "${REMOVE_RC:-0}" ;;
+  *"remove-iam-policy-binding"*)    printf '%s\n' "${REMOVE_ERR:-}" >&2; exit "${REMOVE_RC:-0}" ;;
+  *"get-iam-policy"*)               printf '%s\n' "${POLICY_MEMBERS:-}" ;;
   *describe*)                       exit 0 ;;
 esac
 exit 0
@@ -189,7 +190,11 @@ def test_a_missing_stale_binding_is_not_an_error(tmp_path):
     retire, and `remove-iam-policy-binding` exits non-zero for that. Under
     `set -e` an unguarded call would abort the script before it granted the
     deploy roles below it."""
-    proc, calls, _gh = _run(tmp_path, [REPO, REPO_ID], {"REMOVE_RC": "1"})
+    proc, calls, _gh = _run(tmp_path, [REPO, REPO_ID], {
+        "REMOVE_RC": "1",
+        "REMOVE_ERR": "ERROR: Policy binding with the specified member "
+                      "and role not found!",
+    })
 
     assert proc.returncode == 0, (
         f"a missing stale binding aborted the run:\n{proc.stdout}\n{proc.stderr}"
@@ -197,17 +202,88 @@ def test_a_missing_stale_binding_is_not_an_error(tmp_path):
     assert "nothing to retire" in proc.stdout
 
 
+def test_a_removal_that_fails_for_any_other_reason_is_fatal(tmp_path):
+    """The fail-open this replaces. Every non-zero exit used to print "none
+    present" and continue, so a 409 on the policy's read-modify-write cycle, a
+    transient 5xx or a dropped connection left the name-keyed member still
+    granting impersonation while the script reported success — the exposure the
+    block exists to close."""
+    proc, _calls, _gh = _run(tmp_path, [REPO, REPO_ID], {
+        "REMOVE_RC": "1",
+        "REMOVE_ERR": "ERROR: (gcloud.iam.service-accounts."
+                      "remove-iam-policy-binding) HTTPError 409: "
+                      "There were concurrent policy changes.",
+    })
+
+    assert proc.returncode != 0, (
+        "a 409 was swallowed as 'nothing to retire'\n" + proc.stdout
+    )
+    assert "FAILED to retire" in proc.stderr
+    assert "still grants impersonation" in proc.stderr
+
+
+def test_a_member_that_survives_removal_is_fatal(tmp_path):
+    """A zero exit is not an absent member: the policy is read-modify-write, so
+    a concurrent writer can restore what was just deleted. The script re-reads
+    and refuses rather than reporting a retirement that did not stick."""
+    stale = ("principalSet://iam.googleapis.com/projects/371394967380/locations/"
+             "global/workloadIdentityPools/github-actions/attribute.repository/"
+             + REPO)
+    proc, _calls, _gh = _run(tmp_path, [REPO, REPO_ID],
+                             {"POLICY_MEMBERS": stale})
+
+    assert proc.returncode != 0, (
+        "a surviving stale member was reported as retired\n" + proc.stdout
+    )
+    assert "still bound after removal" in proc.stderr
+
+
+def test_the_id_keyed_binding_is_added_before_the_name_keyed_one_is_removed(tmp_path):
+    """Ordering is a safety property, not an accident: remove-then-add leaves an
+    instant with NO binding, and a deploy authenticating in that window fails.
+    Nothing pinned this, so swapping the two blocks passed the whole suite."""
+    proc, calls, _gh = _run(tmp_path, [REPO, REPO_ID])
+
+    assert proc.returncode == 0, proc.stderr
+    lines = calls.splitlines()
+    add = next(i for i, l in enumerate(lines)
+               if "add-iam-policy-binding" in l and "workloadIdentityUser" in l
+               and "attribute.repository_id/" in l)
+    remove = next(i for i, l in enumerate(lines)
+                  if "remove-iam-policy-binding" in l)
+    assert add < remove, (
+        "the name-keyed binding is retired before the id-keyed one exists\n"
+        + "\n".join(lines)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Resolving the id
 # ---------------------------------------------------------------------------
 
 
-def test_the_id_is_resolved_from_gh_when_omitted(tmp_path):
+def test_the_default_repo_uses_the_pinned_id_without_asking_github(tmp_path):
+    """Resolving the id from the MUTABLE name is the incident's own threat model.
+    During a squat window — the old owner name released, a stranger registering
+    it and creating `pivota-backend` — a lookup would return THEIR id and this
+    script would bind production deploy identity to it, unattended. The default
+    is therefore a constant and no lookup happens at all."""
     proc, calls, gh_calls = _run(tmp_path, [REPO])
 
     assert proc.returncode == 0, proc.stderr
-    assert f"repos/{REPO}" in gh_calls, gh_calls
+    assert gh_calls.strip() == "", f"asked GitHub for the id: {gh_calls}"
     assert f"assertion.repository_id == '{REPO_ID}'" in _condition(calls)
+
+
+def test_a_name_that_resolves_to_a_different_id_is_refused(tmp_path):
+    """The squat, made concrete: the name still reads `pengxu9-rgb/pivota-backend`
+    but now points at another repository. Preferring the lookup would move the
+    deploy boundary onto it; preferring the constant silently would hide that
+    the name is no longer ours. It refuses and says so."""
+    proc, _calls, _gh = _run(tmp_path, [REPO, "999999999"])
+
+    assert proc.returncode != 0, "a mismatched id was accepted\n" + proc.stdout
+    assert "not the pinned" in proc.stderr
 
 
 def test_it_refuses_to_configure_a_provider_when_the_id_is_unknown(tmp_path):
@@ -216,7 +292,9 @@ def test_it_refuses_to_configure_a_provider_when_the_id_is_unknown(tmp_path):
     this change exists to close -- so it must exit non-zero having sent gcloud
     nothing.
     """
-    proc, calls, _gh = _run(tmp_path, [REPO], {"GH_FAIL": "1"})
+    # A NON-default repo: the pinned constant covers only the default one, so
+    # this is the path where an id must still be resolved or refused.
+    proc, calls, _gh = _run(tmp_path, ["someone/other-repo"], {"GH_FAIL": "1"})
 
     assert proc.returncode != 0, "configured a provider with no id pin"
     assert "--attribute-condition=" not in calls, (
@@ -230,7 +308,8 @@ def test_a_non_numeric_id_is_rejected(tmp_path, bad):
     """The id is interpolated into a CEL expression inside single quotes, the
     same injection surface the repo-name shape check already guards. A digits-
     only check is what keeps `1' || true || '` out of the condition."""
-    proc, calls, _gh = _run(tmp_path, [REPO, bad], {"GH_FAIL": "1"})
+    proc, calls, _gh = _run(tmp_path, ["someone/other-repo", bad],
+                            {"GH_FAIL": "1"})
 
     assert proc.returncode != 0, f"accepted id {bad!r}"
     assert "--attribute-condition=" not in calls

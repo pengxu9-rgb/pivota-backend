@@ -56,13 +56,32 @@ REPO="${1:-pengxu9-rgb/pivota-backend}"
 # than the name. The name is therefore GONE from the condition rather than kept beside the id:
 # keeping it would re-break deploys on the next rename while adding no security.
 GH="${GH:-gh}"
+
+# The KNOWN id for the default repo. Resolving it from the MUTABLE name at run
+# time reintroduces exactly what this script argues against: during a squat
+# window — old owner name released, a stranger registers it and creates
+# `pivota-backend` — the documented default invocation would resolve THEIR id
+# and bind production deploy identity to it, unattended. So the id is a
+# constant, the name is a label, and disagreement between them is fatal.
+DEFAULT_REPO="pengxu9-rgb/pivota-backend"
+DEFAULT_REPO_ID="1075520615"
+
 REPO_ID="${2:-${REPO_ID:-}}"
+if [ -z "$REPO_ID" ] && [ "$REPO" = "$DEFAULT_REPO" ]; then
+  REPO_ID="$DEFAULT_REPO_ID"
+fi
 if [ -z "$REPO_ID" ]; then
   # Best-effort, and deliberately not fatal on its own: the original comment here was right that a
   # bootstrap script should not REQUIRE an authenticated API call. It may require the ANSWER,
   # though - so resolve it when we can and tell the operator exactly how to supply it when we
   # cannot. Shipping without the pin is not one of the options; that is the hole above.
   REPO_ID="$("$GH" api "repos/$REPO" --jq .id 2>/dev/null || true)"
+fi
+if [ "$REPO" = "$DEFAULT_REPO" ] && [ -n "$REPO_ID" ] && [ "$REPO_ID" != "$DEFAULT_REPO_ID" ]; then
+  echo "refusing: '$REPO' resolved to id $REPO_ID, not the pinned $DEFAULT_REPO_ID." >&2
+  echo "the name now points at a different repository than the one this deploy" >&2
+  echo "identity belongs to. Verify the transfer before overriding." >&2
+  exit 1
 fi
 [[ "$REPO_ID" =~ ^[0-9]+$ ]] || {
   echo "cannot resolve the immutable numeric id for '$REPO' (got '${REPO_ID:-}')" >&2
@@ -177,10 +196,33 @@ echo "== binding workloadIdentityUser for $REPO (id $REPO_ID)"
 # Tolerates "binding not found" so re-runs stay idempotent.
 STALE_PRINCIPAL="principalSet://iam.googleapis.com/projects/$SHARED_NUM/locations/global/workloadIdentityPools/$POOL/attribute.repository/$REPO"
 echo "== retiring any name-keyed binding for $REPO"
-"$GCLOUD" iam service-accounts remove-iam-policy-binding "$SA" --project="$SHARED" \
-  --role="roles/iam.workloadIdentityUser" --member="$STALE_PRINCIPAL" --quiet >/dev/null 2>&1 \
+# VERIFY THE REMOVAL, do not assume it. An earlier cut swallowed every non-zero
+# exit as "none present": a 409 on the get-modify-set etag cycle, a transient 5xx
+# or a dropped connection all printed success and left the stale member granting
+# impersonation — the very exposure the paragraph above describes. This script
+# warns about that shape itself ("a probe that cannot fail reports success for a
+# job it never did"), so it must not commit it here.
+REMOVE_ERR="$("$GCLOUD" iam service-accounts remove-iam-policy-binding "$SA" --project="$SHARED" \
+  --role="roles/iam.workloadIdentityUser" --member="$STALE_PRINCIPAL" --quiet 2>&1 >/dev/null)" \
   && echo "   removed $STALE_PRINCIPAL" \
-  || echo "   none present (nothing to retire)"
+  || {
+    if printf '%s' "$REMOVE_ERR" | grep -qiE "not found|does not exist|NOT_FOUND"; then
+      echo "   none present (nothing to retire)"
+    else
+      echo "   FAILED to retire $STALE_PRINCIPAL" >&2
+      printf '   %s\n' "$REMOVE_ERR" >&2
+      echo "   it still grants impersonation; re-run or remove it by hand" >&2
+      exit 1
+    fi
+  }
+
+# CONFIRM it is gone. A zero exit is not an absent member: the policy is
+# read-modify-write, so a concurrent writer can restore what we just deleted.
+if "$GCLOUD" iam service-accounts get-iam-policy "$SA" --project="$SHARED" \
+     --format="value(bindings.members)" 2>/dev/null | grep -qF "$STALE_PRINCIPAL"; then
+  echo "   FAILED: $STALE_PRINCIPAL is still bound after removal" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- roles
 # pivota-shared: submit the build, push the image, read build logs.
