@@ -370,6 +370,12 @@ _ALLOWED_TOOLS = frozenset(
 
 _MCP_PATH = "/api/ucp/mcp"
 
+# Which statuses may trigger the one hop. NOT `300 <= code < 400`: 303 See Other means the POST
+# WAS PROCESSED and the result should now be GET'd, so re-POSTing an identical `create_checkout`
+# on a 303 is how you build the merchant a second cart. 300 and 304 carry no usable Location for
+# a POST either. An apex<->www edge redirect is always one of these four.
+_HOP_STATUSES = frozenset({301, 302, 307, 308})
+
 
 def _sibling_host(domain: str, location: str) -> Optional[str]:
     """The ONE redirect we follow: apex <-> www on the same registrable domain.
@@ -384,6 +390,17 @@ def _sibling_host(domain: str, location: str) -> Optional[str]:
 
     Returns the sibling host to retry, or None to keep refusing. The caller still runs BOTH
     guards on whatever comes back: this function decides shape, never trust.
+
+    ON THE SCHEME/PATH/PORT CHECKS. They are not the security boundary and must not be read as
+    one — the retry URL is REBUILT from `sibling` + `_MCP_PATH`, so a Location's scheme, path,
+    port, userinfo, query and fragment can never reach the wire whatever they say. What they do
+    is bound WHEN we spend a second request: we hop only for a redirect that looks like the
+    path-preserving apex<->www move we are here to follow. A root Location (`https://www.x/`)
+    is therefore refused today. That is a deliberate call, not an oversight, and
+    `test_a_root_location_on_the_sibling_is_refused_today` pins it: every apex<->www redirect
+    observed in the 2026-09-03 and 2026-09-04 sweeps was path-preserving, so relaxing it would
+    buy coverage we have no evidence we need while making us fetch on vaguer signals. If a real
+    merchant ever redirects to root, that test names exactly what to change.
     """
     if not location:
         return None
@@ -452,6 +469,10 @@ async def _call_tool(
         "method": "tools/call",
         "params": {"name": tool, "arguments": arguments},
     }
+    # The host we actually fetched. It diverges from `domain` the moment we hop, and every
+    # failure below is reported against THIS, not the host the caller named: an operator who
+    # curls the apex and gets an instant 301 should not be told the apex timed out.
+    fetched = domain
     try:
         async with httpx.AsyncClient(
             timeout=_TIMEOUT_SECONDS, follow_redirects=False
@@ -460,8 +481,9 @@ async def _call_tool(
             # Exactly one hop, and only to the apex/www sibling — see _sibling_host. The retry
             # re-runs BOTH guards on the new host: a redirect target is merchant-controlled
             # input, so it is validated like any other caller-supplied host, never trusted
-            # because a 301 pointed at it.
-            if 300 <= resp.status_code < 400:
+            # because a 301 pointed at it. The URL is REBUILT from the sibling, so the merchant
+            # chooses whether we hop and never where.
+            if resp.status_code in _HOP_STATUSES:
                 sibling = _sibling_host(domain, resp.headers.get("location", ""))
                 if (
                     sibling
@@ -474,16 +496,23 @@ async def _call_tool(
                         domain,
                         sibling,
                     )
+                    fetched = sibling
                     resp = await client.post(
                         f"https://{sibling}{_MCP_PATH}", json=body
                     )
     except httpx.HTTPError as err:
         logger.warning(
-            "merchant-ucp %s failed domain=%s: %s", tool, domain, type(err).__name__
+            "merchant-ucp %s failed domain=%s host=%s: %s",
+            tool,
+            domain,
+            fetched,
+            type(err).__name__,
         )
         raise MerchantUcpError("merchant endpoint unreachable") from err
     if resp.status_code >= 300:
-        raise MerchantUcpError(f"merchant endpoint returned HTTP {resp.status_code}")
+        raise MerchantUcpError(
+            f"merchant endpoint returned HTTP {resp.status_code} from {fetched}"
+        )
     try:
         rpc = resp.json()
     except Exception as err:

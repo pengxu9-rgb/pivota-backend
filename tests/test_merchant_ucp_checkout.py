@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from services import merchant_ucp_checkout as muc
@@ -57,8 +58,14 @@ class _Capture:
         capture = self
 
         class _Resp:
+            # `headers` is set per instance, not as a class attribute: a shared mutable would
+            # leak between the two POSTs of a single hop. And it is a real `httpx.Headers`, not
+            # a dict — production looks the key up case-insensitively, so a plain lowercase dict
+            # would let a `"location"` -> `"Location"` mutant look killed when prod is fine.
             status_code = capture.status
-            headers: dict = {}
+
+            def __init__(self):
+                self.headers = httpx.Headers({})
 
             def json(self):
                 return capture.rpc
@@ -715,12 +722,21 @@ def test_a_real_referring_domain_is_kept_and_normalized():
 
 
 class _Redirector:
-    """Replays a per-URL script: {url: (status, headers, rpc)}. Records every URL posted, in
-    order, so a test can prove a second hop happened AND prove it went where it should."""
+    """Replays a per-URL script: {url: (status, headers, rpc)}. Records every (url, body) posted,
+    in order, so a test can prove a second hop happened, prove it went where it should, AND prove
+    it carried the same bytes as the first."""
 
     def __init__(self, script):
         self.script = script
-        self.urls = []
+        self.calls = []
+
+    @property
+    def urls(self):
+        return [u for u, _ in self.calls]
+
+    @property
+    def bodies(self):
+        return [b for _, b in self.calls]
 
     def install(self, monkeypatch, *, resolves=lambda d: True, real_hostname_guard=True):
         outer = self
@@ -728,7 +744,8 @@ class _Redirector:
         class _Resp:
             def __init__(self, status, headers, rpc):
                 self.status_code = status
-                self.headers = headers
+                # real httpx.Headers: case-insensitive, exactly like production
+                self.headers = httpx.Headers(headers)
                 self._rpc = rpc
 
             def json(self):
@@ -745,10 +762,13 @@ class _Redirector:
                 return False
 
             async def post(self, url, json=None):
-                outer.urls.append(url)
+                outer.calls.append((url, json))
                 if url not in outer.script:
                     raise AssertionError(f"unscripted POST to {url}")
-                return _Resp(*outer.script[url])
+                entry = outer.script[url]
+                if isinstance(entry, BaseException):
+                    raise entry
+                return _Resp(*entry)
 
         monkeypatch.setattr(muc.httpx, "AsyncClient", _Client)
         if not real_hostname_guard:
@@ -853,11 +873,251 @@ async def test_the_hop_is_not_a_chain(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_redirect_still_cannot_smuggle_a_disallowed_tool(monkeypatch):
-    """The allowlist is checked before any I/O, so the redirect path cannot be a way in."""
-    _Redirector({APEX: (301, {"location": WWW}, None)}).install(monkeypatch)
+async def test_a_redirect_cannot_smuggle_a_disallowed_tool_because_nothing_is_fetched(
+    monkeypatch,
+):
+    """The allowlist is checked before ANY I/O, so the redirect path cannot be a way in.
+
+    The `assert r.calls == []` is the point of this test and the reason it is not just a copy of
+    `test_only_allowlisted_tools_reach_the_wire`: without it the test passed on the exception
+    alone, which `_Redirector` would also raise for an unscripted URL — a pass that proved
+    nothing about ordering. Scripting BOTH hosts removes that accident, so the empty call list
+    is the only thing left that can fail.
+    """
+    r = _Redirector(
+        {
+            APEX: (301, {"location": WWW}, None),
+            WWW: (200, {}, _ok({"id": "pwned"})),
+        }
+    ).install(monkeypatch)
 
     with pytest.raises(MerchantUcpError) as excinfo:
         await muc._call_tool("robinsons.com.sg", "complete_checkout", {})
 
     assert "complete_checkout" in str(excinfo.value)
+    assert r.calls == [], "the allowlist must refuse before a single request is made"
+
+
+# --------------------------------------------------------------------------------------
+# Follow-ups from the review of #2044. Each test below kills a mutant that survived that
+# commit's own suite — i.e. behaviour the code had but nothing held.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_retry_url_is_rebuilt_and_never_taken_from_the_location(monkeypatch):
+    """THE property the whole SSRF argument rests on, and #2044 shipped without binding it.
+
+    Every test in that commit used a Location byte-identical to the URL we rebuild, so
+    `client.post(resp.headers["location"])` passed all 69 of them. Here the Location carries
+    userinfo and a query string: if the header were fetched verbatim the request would go to
+    the decorated URL (and `_Redirector` would raise on it as unscripted). Asserting the clean
+    rebuilt URL is what makes "the merchant chooses whether we hop, never where" a tested claim.
+    """
+    decorated = "https://user:pw@www.robinsons.com.sg/api/ucp/mcp?ref=evil#frag"
+    r = _Redirector({
+        APEX: (301, {"location": decorated}, None),
+        WWW: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [APEX, WWW], "the retry must go to the REBUILT url, not the Location"
+
+
+@pytest.mark.asyncio
+async def test_the_retry_carries_the_identical_body(monkeypatch):
+    """This file's stated purpose is to assert the bytes on the wire; the hop's bytes were not.
+    A mutant retrying with `json={}` passed #2044's whole suite."""
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    first, second = r.bodies
+    assert second == first, "the hop must replay the same request, not a fresh one"
+    assert second["params"]["arguments"]["meta"], "and it must still carry meta"
+    assert second["params"]["name"] == "get_checkout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_every_apex_to_www_redirect_status_is_followed(monkeypatch, status):
+    """Only 301 was bound, so narrowing the branch to `== 301` survived. 302/307/308 are all
+    ordinary apex<->www shapes — exactly the merchants this lane exists to stop scoring dead."""
+    r = _Redirector({
+        APEX: (status, {"location": WWW}, None),
+        WWW: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [APEX, WWW]
+
+
+@pytest.mark.asyncio
+async def test_a_303_is_refused_because_the_write_already_happened(monkeypatch):
+    """303 See Other means the POST WAS PROCESSED — re-POSTing is how you build the merchant a
+    second cart. It is a 3xx, so the old `300 <= code < 400` bound would have re-sent it."""
+    r = _Redirector({
+        APEX: (303, {"location": WWW}, None),
+        WWW: (200, {}, _ok({"id": "duplicate-cart"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "303" in str(excinfo.value)
+    assert r.urls == [APEX], "a 303 must never be re-POSTed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 403, 503])
+async def test_a_location_on_a_non_redirect_status_is_never_followed(monkeypatch, status):
+    """Widening the bound to `>= 200` or `< 500` survived #2044's suite, because every
+    non-redirect test had an empty header dict and short-circuited on the missing Location."""
+    r = _Redirector({
+        APEX: (status, {"location": WWW}, _ok({"id": "apex"})),
+        WWW: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    if status == 200:
+        got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+        assert got["id"] == "apex"
+    else:
+        with pytest.raises(MerchantUcpError) as excinfo:
+            await muc.get_checkout("robinsons.com.sg", "chk_1")
+        assert str(status) in str(excinfo.value)
+    assert r.urls == [APEX], "a Location header outside a redirect status means nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_trailing_dot_fqdn_location_is_normalised_and_followed(monkeypatch):
+    """`urlsplit` lowercases a hostname but does NOT strip the root dot, so the `.rstrip(".")`
+    is load-bearing — yet dropping it survived. A fully-qualified `www.host.` is legal."""
+    r = _Redirector({
+        APEX: (301, {"location": "https://www.robinsons.com.sg./api/ucp/mcp"}, None),
+        WWW: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [APEX, WWW], "the dot-stripped sibling is what we rebuild"
+
+
+@pytest.mark.asyncio
+async def test_the_sibling_is_refused_when_the_hostname_guard_rejects_it(monkeypatch):
+    """Deleting `validate_merchant_domain(sibling) == sibling` survived #2044's suite: every
+    test there used a sibling that guard accepts. The sibling of `www.com` is the bare TLD
+    `com`, which it rejects — a single-label intranet-shaped name is precisely what the guard
+    exists to refuse, and without it we would POST to `https://com/api/ucp/mcp`."""
+    apex_com = "https://www.com/api/ucp/mcp"
+    bare_tld = "https://com/api/ucp/mcp"
+    assert muc.validate_merchant_domain("com") is None, "premise: the guard rejects a bare TLD"
+
+    r = _Redirector({
+        apex_com: (301, {"location": bare_tld}, None),
+        bare_tld: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)  # real hostname guard by default
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("www.com", "chk_1")
+
+    assert "301" in str(excinfo.value)
+    assert r.urls == [apex_com], "the hostname guard must run BEFORE the second fetch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location, why",
+    [
+        ("https://[oops/api/ucp/mcp", "urlsplit raises Invalid IPv6 URL"),
+        ("https://www.robinsons.com.sg:abc/api/ucp/mcp", "the port cannot be cast to int"),
+    ],
+)
+async def test_a_malformed_location_is_refused_not_raised(monkeypatch, location, why):
+    """Both `except ValueError` branches were reachable but unexecuted. A merchant must not be
+    able to turn a redirect into an unhandled exception in our transport."""
+    r = _Redirector({APEX: (301, {"location": location}, None)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "301" in str(excinfo.value), why
+    assert r.urls == [APEX]
+
+
+@pytest.mark.asyncio
+async def test_a_root_location_on_the_sibling_is_refused_today(monkeypatch):
+    """A DELIBERATE call, pinned so it stays deliberate.
+
+    The retry URL is rebuilt, so the path check buys no security — it bounds when we spend a
+    second request. Every apex<->www redirect seen in the 2026-09-03 and 2026-09-04 sweeps was
+    path-preserving, so we hop only on that shape. If a real merchant ever redirects to root,
+    change `_sibling_host` and this test together, on evidence.
+    """
+    r = _Redirector({
+        APEX: (301, {"location": "https://www.robinsons.com.sg/"}, None),
+        WWW: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "301" in str(excinfo.value)
+    assert r.urls == [APEX]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_hop_names_the_host_that_actually_failed(monkeypatch):
+    """An operator reading `domain=robinsons.com.sg: ConnectTimeout` curls the apex, gets an
+    instant 301, and concludes the log is lying. The failure belongs to the host we fetched."""
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (503, {}, None),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    msg = str(excinfo.value)
+    assert "503" in msg
+    assert "www.robinsons.com.sg" in msg, "the error must name the hopped host, not the apex"
+    assert r.urls == [APEX, WWW]
+
+
+@pytest.mark.asyncio
+async def test_a_transport_error_after_the_hop_is_logged_against_the_hopped_host(
+    monkeypatch,
+):
+    """Same attribution, on the exception path rather than the status path.
+
+    The logger call is captured directly rather than through `caplog`: this repo's logger does
+    not propagate to the root, so a caplog assertion here would pass vacuously on an empty
+    record list no matter what the code logged.
+    """
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: httpx.ConnectError("boom"),
+    }).install(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        muc.logger, "warning", lambda fmt, *a: warnings.append(fmt % a)
+    )
+
+    with pytest.raises(MerchantUcpError):
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert r.urls == [APEX, WWW]
+    assert len(warnings) == 1
+    assert "host=www.robinsons.com.sg" in warnings[0], (
+        "the warning must carry the host we actually fetched"
+    )
+    assert "domain=robinsons.com.sg" in warnings[0], (
+        "and still name the host the caller asked for"
+    )
