@@ -91,6 +91,35 @@ async def create_new_agent(
         raise HTTPException(status_code=500, detail="Failed to create agent")
 
 
+def _is_own_agent_record(current_user: dict, agent_id: str, agent: dict) -> bool:
+    """Does this token identify the agent whose record was just loaded?
+
+    utils.auth.can_access_agent reads only the `agent_id` claim, but not every
+    agent token carries it -- which is why the guards in this module have
+    always accepted more. They do not agree on what: update_agent takes
+    `user_id`, while the analytics, usage, funnel, query-analytics and
+    merchants reads take `email`. A token carrying only one spelling is
+    therefore itself on some of its own sub-routes and a stranger on others.
+
+    The `email` spelling in those five is `email == agent_id`, which can only
+    ever match because agent ids happen to be shaped `agent_<hex>` and an
+    address is not -- a coincidence of format, not an ownership relation, and
+    one that stops holding the day an id is minted differently. Here the email
+    claim is matched against the RECORD's own `owner_email` instead: that is
+    the actual relation, `users.email` is UNIQUE NOT NULL so it names exactly
+    one account, and it does not care how ids are shaped.
+    """
+    target = str(agent_id)
+    if any(
+        str(current_user.get(claim) or "") == target
+        for claim in ("agent_id", "user_id")
+    ):
+        return True
+    email = str(current_user.get("email") or "").strip().lower()
+    owner_email = str((agent or {}).get("owner_email") or "").strip().lower()
+    return bool(email) and email == owner_email
+
+
 @router.get("/{agent_id}")
 async def get_agent_details(
     agent_id: str,
@@ -127,12 +156,13 @@ async def get_agent_details(
     # STAFF_ROLES decides who may attempt the route; it never decided WHOSE
     # record. Staff keep cross-agent reads; an `agent` gets their own.
     #
-    # The `current_agent_id` fallback matches the sibling guards in this module
-    # (update_agent, the analytics/usage/funnel reads): some agent tokens carry
-    # the identity as `user_id` rather than the `agent_id` claim
-    # can_access_agent looks at, and dropping the fallback would lock those
-    # agents out of their own record.
-    if not can_access_agent(current_user, agent_id) and str(current_agent_id or "") != str(agent_id):
+    # Ownership must be at least as wide as this route's own sub-routes, or an
+    # agent is refused the record whose /analytics, /usage and /funnel it can
+    # read -- see _is_own_agent_record for why the three claim spellings exist
+    # and why the email one is matched against owner_email rather than the id.
+    if not can_access_agent(current_user, agent_id) and not _is_own_agent_record(
+        current_user, agent_id, agent
+    ):
         logger.error(
             f"[GET /agents/{{id}}] {current_role} {current_email} denied: "
             f"{current_agent_id} is not agent {agent_id}"

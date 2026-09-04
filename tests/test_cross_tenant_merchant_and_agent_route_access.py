@@ -602,6 +602,66 @@ def test_agent_identified_only_by_user_id_still_reads_their_own_record(client, a
     assert resp.status_code == 200, resp.text
 
 
+def test_agent_identified_only_by_email_still_reads_their_own_record(client, agent_spy):
+    """Review finding on this PR: the first cut fell back to `agent_id` or
+    `user_id` only, while FIVE sibling guards in agent_management.py (analytics,
+    usage, funnel, query-analytics, merchants) fall back to `email`. A token
+    carrying only the email identity was therefore refused its own detail
+    record while every sub-route of that record still admitted it -- a new
+    lockout, on a route that previously admitted every agent.
+
+    Ownership here is email == the RECORD's owner_email, not the siblings'
+    email == agent_id (which only ever matches because ids are shaped
+    `agent_<hex>` and addresses are not).
+    """
+    from utils.auth import create_access_token
+
+    token = create_access_token(
+        {"sub": "u-legacy", "email": "agent_A@example.com", "role": "agent"}
+    )
+
+    resp = client.get(f"/agents/{AGENT_A}", headers=_auth(token))
+
+    assert resp.status_code == 200, (
+        f"an agent identified only by email was locked out of their own "
+        f"record: {resp.status_code} {resp.text}"
+    )
+
+
+def test_email_identity_does_not_open_another_agents_record(client, agent_spy):
+    """The positive counterpart to the fallback above: widening identity must
+    not become a way in. agent_A's token carries agent_A's email; agent_B's
+    record carries a different owner_email, so the match fails."""
+    from utils.auth import create_access_token
+
+    token = create_access_token(
+        {"sub": "u-legacy", "email": "agent_A@example.com", "role": "agent"}
+    )
+
+    resp = client.get(f"/agents/{AGENT_B}", headers=_auth(token))
+
+    assert resp.status_code == 403, resp.text
+    assert "victim@othercompany.example" not in resp.text
+
+
+def test_a_blank_email_claim_matches_no_record(client, agent_spy, monkeypatch):
+    """Kills the empty-string trap: a record with no owner_email and a token
+    with no email must not compare equal and hand over the record."""
+    from utils.auth import create_access_token
+
+    from routes import agent_management as mod
+
+    async def _no_owner(agent_id: str):
+        return {"agent_id": agent_id, "agent_name": "No Owner", "owner_email": None}
+
+    monkeypatch.setattr(mod, "get_agent", _no_owner)
+    token = create_access_token({"sub": "u-x", "email": "", "role": "agent"})
+
+    resp = client.get(f"/agents/{AGENT_B}", headers=_auth(token))
+
+    assert resp.status_code == 403, resp.text
+
+
 @pytest.mark.parametrize("role", ("super_admin", "admin", "employee"))
 def test_staff_keep_cross_agent_reads(client, agent_spy, role):
     resp = client.get(f"/agents/{AGENT_B}", headers=_auth(_staff_token(role)))
