@@ -14,6 +14,7 @@ real gid, and that a prospect one never can.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
@@ -383,11 +384,25 @@ def test_a_domain_resolution_failure_still_enqueues_the_reprobe(monkeypatch):
 # ---------------------------------------------------------------------
 
 
-async def _official(merchant, domain, verification_status, source="asserted"):
-    await database.execute(domains.merchant_official_domains.insert().values(
-        merchant_id=merchant, domain=domain, source=source,
-        verification_status=verification_status,
-    ))
+async def _official(
+    merchant, domain, verification_status, source=None, liveness=None,
+):
+    """Defaults to the shape a BOUND brand claim writes — source='verified',
+    which is what record_official_domain uses when merchant_owns_domain passes."""
+    values = {
+        "merchant_id": merchant, "domain": domain,
+        "source": source if source is not None else domains.SOURCE_VERIFIED,
+        "verification_status": verification_status,
+    }
+    if liveness is not None:
+        values["liveness_status"] = liveness
+        if liveness != domains.LIVENESS_UNCHECKED:
+            # ck_merchant_official_domains_checked_at: any verdict other than
+            # `unchecked` must carry the moment it was reached.
+            values["last_checked_at"] = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    await database.execute(
+        domains.merchant_official_domains.insert().values(**values)
+    )
 
 
 def test_resolves_a_verified_domain_to_its_merchant():
@@ -398,22 +413,24 @@ def test_resolves_a_verified_domain_to_its_merchant():
     assert asyncio.run(scenario()) == "m1"
 
 
-def test_an_asserted_source_row_still_resolves_when_its_status_is_verified():
-    """What the WRITER produces, not what the source name suggests.
+def test_refuses_an_asserted_row_even_though_its_status_is_verified():
+    """Brand-BOUND, not merely domain-controlled — and note the row is real.
 
-    services/brand_claim_service.py::record_official_domain writes
-    verification_status='verified' for a SOURCE_ASSERTED row too — that row came
-    out of a completed DNS/email brand claim, so domain control IS proven; only
-    the brand binding is missing. An earlier version of this test asserted the
-    opposite (source='asserted' => NULL) and so tested a row production never
-    writes.
+    record_official_domain writes verification_status='verified' for a
+    SOURCE_ASSERTED row too, so status alone admits it; an earlier test claimed
+    such a row sits at NULL, which no writer produces. What makes it wrong to
+    accept is the source: 'asserted' is written precisely when
+    merchant_owns_domain FAILED, so Pivota does not associate the domain with
+    this merchant. The email claim method accepts any mailbox at the exact host,
+    so on a shared domain an employee could otherwise aim our create_checkout at
+    a stranger's storefront.
     """
     async def scenario():
         await _official("m1", "shop.example", domains.VERIFICATION_VERIFIED,
                         source=domains.SOURCE_ASSERTED)
         return await domains.resolve_verified_merchant_for_domain("shop.example")
 
-    assert asyncio.run(scenario()) == "m1"
+    assert asyncio.run(scenario()) is None
 
 
 def test_refuses_an_inferred_row_which_is_the_one_written_at_null():
@@ -595,3 +612,51 @@ def test_a_catalogue_of_nothing_but_malformed_ids_still_yields_none():
         return await svc.select_probe_variant_gid("m1")
 
     assert asyncio.run(scenario()) is None
+
+
+def test_a_dead_domain_is_not_a_second_storefront():
+    """Nothing ever DELETEs from this table, so a merchant who migrated domains
+    keeps the old row forever. Counting it made them look like two storefronts
+    and disabled the tier permanently — a silent skip, which is the failure mode
+    this whole feature exists to remove."""
+    async def scenario():
+        await _official("m1", "old-brand.example", domains.VERIFICATION_VERIFIED,
+                        liveness=domains.LIVENESS_DEAD)
+        await _official("m1", "new-brand.example", domains.VERIFICATION_VERIFIED,
+                        liveness=domains.LIVENESS_LIVE)
+        return (
+            await domains.list_verified_domains("m1"),
+            await domains.resolve_verified_merchant_for_domain("old-brand.example"),
+        )
+
+    live_domains, dead_resolves = asyncio.run(scenario())
+    assert live_domains == ["new-brand.example"]
+    # And the dead domain no longer names its old owner either.
+    assert dead_resolves is None
+
+
+def test_unchecked_and_unverifiable_liveness_still_count():
+    """`dead` is the module's ONE excluding verdict (is_excluded). Treating
+    unchecked as excluded would empty the lane for every never-swept domain."""
+    async def scenario():
+        await _official("m1", "shop.example", domains.VERIFICATION_VERIFIED,
+                        liveness=domains.LIVENESS_UNCHECKED)
+        return await domains.list_verified_domains("m1")
+
+    assert asyncio.run(scenario()) == ["shop.example"]
+
+
+def test_an_unknown_storefront_count_fails_closed(monkeypatch):
+    """list_verified_domains returns [] when its query FAILS, and its docstring
+    tells callers to read that as "we do not know", never as "none". The guard
+    must therefore refuse on [] — a `> 1` spelling would let an unknown
+    storefront count through, and passes every other test in this file."""
+    observed = _enqueue_harness(monkeypatch, verified_domains=[])
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_CHECKOUT_TIER_ENABLED", "true")
+
+    summary = asyncio.run(job.run_scheduled_ucp_reprobes())
+
+    assert summary["enqueued"] == 1
+    assert summary["variant_carried"] == 0
+    assert observed["enqueue"]["product_key"] is None
+    assert observed["selector_calls"] == []

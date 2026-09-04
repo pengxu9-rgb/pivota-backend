@@ -272,11 +272,35 @@ UPDATE merchant_official_domains
    AND domain = :domain
 """
 
+# The one predicate for "this domain is provably this merchant's storefront",
+# shared by both readers below. They MUST agree: if the resolver admits a row the
+# counter does not, a merchant resolves on its domain and then counts zero
+# storefronts, and the caller silently skips forever.
+#
+#   verification_status='verified' — proven, not pending/failed/NULL.
+#   source='verified'             — brand-BOUND. record_official_domain writes
+#     SOURCE_ASSERTED when merchant_owns_domain FAILED: domain control was shown
+#     but Pivota does not associate the domain with this merchant. That gap is
+#     load-bearing here, because the caller POSTs a create_checkout built from
+#     the merchant's catalogue at whatever storefront answers on this domain.
+#     The email claim method accepts any mailbox at the exact host, so on a
+#     shared or multi-tenant domain an employee could otherwise point our probe
+#     at a stranger's store. (That method is default-off today; this does not
+#     rely on it staying that way.)
+#   liveness                      — `dead` is the module's one excluding verdict
+#     (is_excluded); counting dead rows would let a merchant who MIGRATED
+#     domains look like two storefronts forever.
+_PROVEN_STOREFRONT_WHERE = """
+       verification_status = :verified
+   AND source = :verified_source
+   AND (liveness_status IS NULL OR liveness_status <> :dead)
+"""
+
 RESOLVE_VERIFIED_MERCHANT_SQL = """
 SELECT merchant_id
   FROM merchant_official_domains
  WHERE lower(domain) = :domain
-   AND verification_status = :verified
+   AND """ + _PROVEN_STOREFRONT_WHERE + """
  ORDER BY merchant_id ASC
  LIMIT 2
 """
@@ -385,13 +409,10 @@ async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
 
     FAILS CLOSED, and every branch matters to a caller that will act on the
     answer against a live storefront:
-      * `verification_status` must be exactly 'verified' — 'pending', 'failed'
-        and NULL are all "not proven". Note this is a claim about the STATUS
-        column, not about `source`: `record_official_domain` (services/
-        brand_claim_service.py) writes 'verified' for a SOURCE_ASSERTED row too,
-        because that row still came out of a completed DNS/email brand claim —
-        it is domain control proven but brand binding not yet made. Only
-        `seed_inferred_domains` writes a row this rejects, at NULL.
+      * the row must satisfy _PROVEN_STOREFRONT_WHERE — proven status, a
+        brand-BOUND source, and a liveness verdict that is not `dead`. Read
+        that constant's comment before loosening any of the three; each one is
+        load-bearing for a caller that transacts against the resulting store.
       * two merchants verified on one domain is ambiguity, not a tie to break.
         LIMIT 2 exists to SEE the second row rather than silently take the first.
       * a lookup failure is not an absence; it returns None either way, but the
@@ -404,7 +425,12 @@ async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
     try:
         rows = await database.fetch_all(
             RESOLVE_VERIFIED_MERCHANT_SQL,
-            {"domain": normalized, "verified": VERIFICATION_VERIFIED},
+            {
+                "domain": normalized,
+                "verified": VERIFICATION_VERIFIED,
+                "verified_source": SOURCE_VERIFIED,
+                "dead": LIVENESS_DEAD,
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -427,8 +453,7 @@ LIST_VERIFIED_DOMAINS_SQL = """
 SELECT domain
   FROM merchant_official_domains
  WHERE merchant_id = :merchant_id
-   AND verification_status = :verified
-"""
+   AND """ + _PROVEN_STOREFRONT_WHERE
 
 
 async def list_verified_domains(merchant_id: str) -> List[str]:
@@ -449,7 +474,12 @@ async def list_verified_domains(merchant_id: str) -> List[str]:
     try:
         rows = await database.fetch_all(
             LIST_VERIFIED_DOMAINS_SQL,
-            {"merchant_id": merchant_id, "verified": VERIFICATION_VERIFIED},
+            {
+                "merchant_id": merchant_id,
+                "verified": VERIFICATION_VERIFIED,
+                "verified_source": SOURCE_VERIFIED,
+                "dead": LIVENESS_DEAD,
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
