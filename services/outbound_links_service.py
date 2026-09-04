@@ -151,6 +151,17 @@ SHOPIFY_CART_CLICK_ATTRIBUTE = "attributes[pivota_click_id]"
 _SHOPIFY_CART_CLICK_ATTRIBUTE = SHOPIFY_CART_CLICK_ATTRIBUTE  # back-compat alias
 REFERRAL_CLICK_PARAM = "pvt_click_id"
 
+# The recovery key rides ALONGSIDE the click id, never instead of it.
+#
+# Why both: the click id is the row identity, the recovery key is what that row
+# is ABOUT. commerce_interactions already stores both, so an order-side join
+# can go order -> click_id -> row -> recovery_key even on destinations where
+# only the click id survives. Stamping the key too means the landing collector
+# can report it directly, which is one hop shorter and works when the click id
+# is lost but the key is not.
+SHOPIFY_CART_RECOVERY_ATTRIBUTE = "attributes[pivota_recovery_key]"
+REFERRAL_RECOVERY_PARAM = "pvt_rk"
+
 
 def normalize_shop_host(value: Optional[str]) -> str:
     """Reduce a shop domain / full URL to a bare lowercase host (no scheme/path/port)."""
@@ -190,16 +201,31 @@ def _append_query_fragment(url: str, fragment: str) -> str:
     return f"{url}{sep}{fragment}"
 
 
-def append_shopify_cart_click_attribute(url: str, click_id: str) -> str:
-    """Append the order-surviving cart attribute. Brackets are kept literal per
-    Shopify's documented cart-permalink form (``attributes[key]=value``)."""
+def append_shopify_cart_click_attribute(
+    url: str, click_id: str, recovery_key: Optional[str] = None,
+) -> str:
+    """Append the order-surviving cart attribute(s). Brackets are kept literal
+    per Shopify's documented cart-permalink form (``attributes[key]=value``).
+
+    `recovery_key` rides the same mechanism and therefore survives onto the
+    order exactly as the click id does — which is what lets an order be
+    attributed to the fix that produced it rather than merely to a click.
+    """
     cid = str(click_id or "").strip()
-    if not cid:
-        return url
-    return _append_query_fragment(url, f"{_SHOPIFY_CART_CLICK_ATTRIBUTE}={quote(cid, safe='')}")
+    out = url
+    if cid:
+        out = _append_query_fragment(
+            out, f"{_SHOPIFY_CART_CLICK_ATTRIBUTE}={quote(cid, safe='')}")
+    rk = str(recovery_key or "").strip()
+    if rk:
+        out = _append_query_fragment(
+            out, f"{SHOPIFY_CART_RECOVERY_ATTRIBUTE}={quote(rk, safe='')}")
+    return out
 
 
-def append_referral_click_param(url: str, click_id: str) -> str:
+def append_referral_click_param(
+    url: str, click_id: str, recovery_key: Optional[str] = None,
+) -> str:
     """Append the click id to a non-Shopify destination.
 
     Two carriers, both appended:
@@ -212,11 +238,21 @@ def append_referral_click_param(url: str, click_id: str) -> str:
         merchant-configured utm_template wins).
     """
     cid = str(click_id or "").strip()
-    if not cid:
-        return url
-    out = _append_query_fragment(url, f"{REFERRAL_CLICK_PARAM}={quote(cid, safe='')}")
-    if "utm_content=" not in out:
-        out = _append_query_fragment(out, f"utm_content={quote(cid, safe='')}")
+    out = url
+    if cid:
+        out = _append_query_fragment(
+            out, f"{REFERRAL_CLICK_PARAM}={quote(cid, safe='')}")
+        if "utm_content=" not in out:
+            out = _append_query_fragment(
+                out, f"utm_content={quote(cid, safe='')}")
+    rk = str(recovery_key or "").strip()
+    if rk:
+        # NOT in utm_content. That carrier is the click id's order-side join on
+        # WooCommerce (core Order Attribution persists utm_* onto the order),
+        # and overwriting it would trade a working join for a new one. The key
+        # is recoverable order-side anyway via click_id -> interaction row.
+        out = _append_query_fragment(
+            out, f"{REFERRAL_RECOVERY_PARAM}={quote(rk, safe='')}")
     return out
 
 

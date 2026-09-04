@@ -69,6 +69,7 @@ from services.similarity_service import (
 )
 from services.similarity_config import get_similarity_scoring_weights
 from routes.agent_auth import AgentContext, get_agent_context
+from db.merchant_tasks import match_recovery_key
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -4328,6 +4329,46 @@ async def _handle_offers_resolve(
             used_market = str(row_dict.get("market") or market_hint or "US")
             used_tool = str(row_dict.get("tool") or tool_hint or "*")
 
+            # ONCE per seed, not once per variant. This is an agent-facing
+            # resolve path and matched_variants can be long; a lookup inside
+            # the loop is a query per variant.
+            #
+            # The identity is derived HERE, from the row, rather than reusing
+            # the loop's `redirect_identity`: that name is bound INSIDE the
+            # loop below, so reading it here raised UnboundLocalError on the
+            # first seed — swallowed by the except, so the feature silently
+            # never ran — and on later seeds held the PREVIOUS seed's value,
+            # stamping one merchant's key onto another's link. merchant_id and
+            # shop_domain come from attached_product_key, which is per-row, so
+            # deriving them without a variant is correct.
+            _seed_identity = _external_seed_redirect_identity(
+                row=row_dict, seed_data=seed_data, offer_variant_id=None,
+            )
+            _seed_merchant_id = str(_seed_identity.get("merchant_id") or "")
+            _seed_shop_domain = _seed_identity.get("shop_domain")
+
+            # Only the DB call is guarded, and only for DB failures. A blanket
+            # try around the derivation is what turned a programming error
+            # into silence last time.
+            _open_recovery_tasks: List[Dict[str, Any]] = []
+            if _seed_merchant_id:
+                try:
+                    from db.merchant_tasks import list_open_recovery_tasks
+
+                    # Same 0.5s budget every neighbouring query on this path
+                    # uses. Fail-soft catches errors, not latency — without a
+                    # timeout a slow Postgres holds offer resolution for the
+                    # full statement time, for a read that only decorates.
+                    _open_recovery_tasks = await asyncio.wait_for(
+                        list_open_recovery_tasks(merchant_id=_seed_merchant_id),
+                        timeout=0.5,
+                    )
+                except Exception:  # noqa: BLE001
+                    # Fail-soft: a link without a key is still attributable
+                    # through click_id -> commerce_interactions row, so this
+                    # costs a shortcut, never a sale.
+                    _open_recovery_tasks = []
+
             for v in matched_variants:
                 vid = _seed_offer_variant_id(v) or (sku_id or "∅")
                 offer_id = f"of:external_seed:{seed_id}:{vid}"
@@ -4398,6 +4439,17 @@ async def _handle_offers_resolve(
                 # EXECUTION SPEC v0. Composed by the SAME function the redirect itself used, with
                 # the SAME click id, so `cart_url` cannot describe a different destination from
                 # the one `affiliate_url` resolves to.
+                # Which recovery action, if any, this destination belongs
+                # to — so an order following this link is attributable to the
+                # fix that produced it, not merely to a click. Pure match over
+                # the list fetched once above.
+                _recovery_key = match_recovery_key(
+                    _open_recovery_tasks,
+                    product_key=str(row_dict.get("attached_product_key") or "")
+                    or None,
+                    target_host=_seed_shop_domain,
+                )
+
                 composed_spec = compose_attributed_destinations(
                     # The SAME value the builder above was called with (`canonical_url or
                     # destination_url`), not the raw column — _seed_domain_from_url reads the
@@ -4410,6 +4462,7 @@ async def _handle_offers_resolve(
                     platform=redirect_identity.get("platform"),
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
                     click_id=stable_click_id,
+                    recovery_key=_recovery_key,
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -8005,6 +8058,7 @@ def compose_attributed_destinations(
     platform: Optional[str],
     cart_variant_id: Optional[str],
     click_id: str,
+    recovery_key: Optional[str] = None,
     quantity: int = 1,
 ) -> Dict[str, Any]:
     """Compose every attributed URL for one external offer, ONCE.
@@ -8018,6 +8072,15 @@ def compose_attributed_destinations(
     `click_id` is REQUIRED and caller-minted on purpose. The join key has to be identical on
     the surface_click_events row, the merchant's order, and the URLs we hand the agent; a
     default here would mint a second id and silently split the join.
+
+    `recovery_key` is OPTIONAL and caller-resolved, for the same reason. It says which
+    recovery action this destination belongs to, so an order can be attributed to the fix
+    that produced it rather than only to a click. Resolving it needs a DB read
+    (db.merchant_tasks.active_recovery_key_for_destination), and this function is a pure
+    composer two consumers must agree on — putting a query inside it would make it async
+    and give the two callers a way to disagree, which is the drift this function exists to
+    prevent. Absent is fine: an order stays attributable through
+    click_id -> commerce_interactions row -> recovery_key.
 
     Returns `primary` (what the redirect signs), `cart_url` (None for an honest referral),
     `pdp_url` (always the product page, attributed), and `join_mode`.
@@ -8040,9 +8103,11 @@ def compose_attributed_destinations(
     pdp_utm = apply_utm(destination_url, template, utm_ctx)
     cart_utm = apply_utm(cart_base, template, utm_ctx) if cart_base else None
 
-    pdp_url = append_referral_click_param(pdp_utm, click_id)
+    pdp_url = append_referral_click_param(pdp_utm, click_id, recovery_key)
     cart_url = (
-        append_shopify_cart_click_attribute(cart_utm, click_id) if cart_utm else None
+        append_shopify_cart_click_attribute(cart_utm, click_id, recovery_key)
+        if cart_utm
+        else None
     )
     return {
         "primary": cart_url or pdp_url,
