@@ -134,11 +134,21 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
         enqueue_verification_run,
         has_in_flight_verification_for_route,
     )
+    from db.merchant_official_domains import (
+        resolve_verified_merchant_for_domain,
+    )
     from services.canonical_commerce_service import select_probe_variant_gid
 
     now = datetime.now(timezone.utc)
     due = await list_due_ucp_routes(now=now)
-    summary = {"enabled": True, "due": len(due), "enqueued": 0, "deduped": 0, "failed": 0}
+    summary = {
+        "enabled": True, "due": len(due), "enqueued": 0, "deduped": 0,
+        "failed": 0,
+        # Counted because the failure this change exists to fix is SILENT: a
+        # tier that never runs looks exactly like a lane with nothing to do.
+        # `enqueued` stays green in both cases; only this number separates them.
+        "variant_carried": 0,
+    }
     for route in due:
         route_id = str(route.get("execution_route_id") or "")
         audit_run_id = str(route.get("last_audit_run_id") or "")
@@ -161,26 +171,40 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
         # verification_runs.product_key. Nothing has ever set it, so the tier
         # has never run and every route sits at `detected`.
         #
-        # BOUNDED TO MERCHANTS WE ALREADY KNOW, and note it rides the
-        # merchant_id the block above already scrubbed: a `prospect_` merchant
-        # is None by then, so a domain someone typed into the public marketing
-        # form can never reach this. That matters — the tested tier's one side
-        # effect is a real create_checkout against the store, and an anonymous
-        # form that creates checkout objects on any domain a stranger names is
-        # an abuse vector, not a feature.
+        # BOUNDED TO A DOMAIN A MERCHANT HAS PROVEN IS THEIRS, and deliberately
+        # NOT to route["merchant_id"]. That column reads like the answer and is
+        # the wrong one twice: nothing in the tree writes it (claim_execution_route
+        # has no callers, so the gate would never open and this whole feature
+        # would ship dead — the #2019 failure), and what it was designed to hold
+        # comes from a self-declared store_url, which is no proof at all.
+        #
+        # It matters here more than in most gates. The tested tier's one side
+        # effect is a real create_checkout against whatever storefront sits at
+        # this route's domain, and the variant comes out of the resolved
+        # merchant's catalogue — so a wrong association does not merely leak, it
+        # POSTs one merchant's product to a different merchant's store. The
+        # anonymous marketing form lets anyone name any domain, so the pairing
+        # has to be proven on both halves: this domain, this merchant.
         probe_variant_gid: Optional[str] = None
-        if merchant_id and _checkout_tier_enabled():
+        if _checkout_tier_enabled():
+            route_domain = str(route.get("normalized_domain") or "")
             try:
-                probe_variant_gid = await select_probe_variant_gid(
-                    str(merchant_id)
+                proven_merchant = await resolve_verified_merchant_for_domain(
+                    route_domain
                 )
+                if proven_merchant:
+                    probe_variant_gid = await select_probe_variant_gid(
+                        proven_merchant
+                    )
+                    if probe_variant_gid:
+                        summary["variant_carried"] += 1
             except Exception as exc:  # noqa: BLE001
                 # Fail-soft to today's behaviour: no variant means the probe
                 # runs its detected tier, which is what it does now anyway.
                 logger.warning(
                     "scheduled_ucp_reprobe: variant lookup failed "
-                    "merchant=%s: %s",
-                    merchant_id, str(exc)[:200],
+                    "domain=%s: %s",
+                    route_domain, str(exc)[:200],
                 )
         try:
             verify_id = await enqueue_verification_run(

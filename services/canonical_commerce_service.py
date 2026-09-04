@@ -506,11 +506,20 @@ async def select_probe_variant_gid(merchant_id: str) -> Optional[str]:
     production and every route in the system sits at `detected`.
 
     DETERMINISTIC BY CONSTRUCTION. The probe's one sanctioned side effect is a
-    single create_checkout against the merchant's own store. Ordering by
-    platform_variant_id means a merchant's repeated reprobes keep landing on
-    the SAME variant instead of spraying abandoned checkouts across their
-    catalogue. Do not make this "pick a random/newest variant" — the stability
-    is the point, not an implementation detail.
+    single create_checkout against the merchant's own store, so repeated
+    reprobes must keep landing on the SAME variant rather than spraying
+    abandoned checkouts across the catalogue. Do not make this "pick a
+    random/newest variant" — the stability is the point.
+
+    ORDER BY (length, value), NOT by the raw string. platform_variant_id is a
+    String column holding Shopify's monotonically increasing integer ids, and
+    plain lexicographic order is NOT stable as a catalogue grows: a newly
+    ingested 14-digit `41...` sorts before an existing 13-digit `42...` and
+    silently steals the pick. Ordering on length first makes this numeric order
+    for digit-only ids, so the choice is "the merchant's oldest variant" — which
+    new ingests cannot displace. func.length is the portable spelling; a numeric
+    CAST would be neither portable nor safe against the non-numeric ids the
+    guard below still has to reject.
 
     Returns None whenever a purchasable Shopify variant cannot be named, which
     puts the probe back on exactly today's behaviour (detected tier).
@@ -550,7 +559,10 @@ async def select_probe_variant_gid(merchant_id: str) -> Optional[str]:
                 canonical_offers.c.orderable.isnot(False),
             )
         )
-        .order_by(canonical_variants.c.platform_variant_id.asc())
+        .order_by(
+            func.length(canonical_variants.c.platform_variant_id).asc(),
+            canonical_variants.c.platform_variant_id.asc(),
+        )
         .limit(1)
     )
     try:

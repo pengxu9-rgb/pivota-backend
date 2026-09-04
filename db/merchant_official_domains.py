@@ -272,6 +272,15 @@ UPDATE merchant_official_domains
    AND domain = :domain
 """
 
+RESOLVE_VERIFIED_MERCHANT_SQL = """
+SELECT merchant_id
+  FROM merchant_official_domains
+ WHERE lower(domain) = :domain
+   AND verification_status = :verified
+ ORDER BY merchant_id ASC
+ LIMIT 2
+"""
+
 LIST_OFFICIAL_DOMAINS_SQL = """
 SELECT merchant_id, domain, source, verification_status,
        liveness_status, last_checked_at, is_primary
@@ -363,6 +372,51 @@ async def upsert_official_domain(
             merchant_id, domain, str(exc)[:200],
         )
         return False
+
+
+async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
+    """The merchant that has PROVEN this domain is theirs, or None.
+
+    `execution_routes.merchant_id` looks like the natural answer to "whose store
+    is this route?" and is the wrong one twice over: nothing in the tree writes
+    it (`claim_execution_route` has no callers), and the association it was
+    designed to hold comes from a self-declared `store_url`. This asks the one
+    table that records a domain association someone had to prove.
+
+    FAILS CLOSED, and every branch matters to a caller that will act on the
+    answer against a live storefront:
+      * `verification_status` must be exactly 'verified' — 'pending', 'failed'
+        and NULL are all "not proven", and an `asserted` or `inferred` source
+        row sits at NULL until it is checked.
+      * two merchants verified on one domain is ambiguity, not a tie to break.
+        LIMIT 2 exists to SEE the second row rather than silently take the first.
+      * a lookup failure is not an absence; it returns None either way, but the
+        caller must treat None as "we do not know", never as "not a merchant".
+    """
+    normalized = str(domain or "").strip().lower().lstrip(".")
+    if not normalized:
+        return None
+    await ensure_merchant_official_domains_table()
+    try:
+        rows = await database.fetch_all(
+            RESOLVE_VERIFIED_MERCHANT_SQL,
+            {"domain": normalized, "verified": VERIFICATION_VERIFIED},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "resolve_verified_merchant_for_domain failed for %s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+    rows = list(rows or [])
+    if len(rows) != 1:
+        if len(rows) > 1:
+            logger.warning(
+                "resolve_verified_merchant_for_domain: %s is verified by %d "
+                "merchants; refusing to pick one", normalized, len(rows),
+            )
+        return None
+    return str(rows[0]["merchant_id"] or "").strip() or None
 
 
 async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
@@ -480,6 +534,7 @@ __all__: Sequence[str] = (
     "is_excluded",
     "list_domains_due_for_liveness",
     "list_official_domains",
+    "resolve_verified_merchant_for_domain",
     "merchant_official_domains",
     "record_liveness",
     "reset_ddl_ready_for_tests",
