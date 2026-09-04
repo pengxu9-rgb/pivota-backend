@@ -228,10 +228,13 @@ def test_stale_timestamp_is_rejected_even_with_a_valid_mac(rig):
     )
     assert r.status_code == 401
     assert state["events"] == []
-    # ...and the same delivery signed 299 s ago is still inside the window
+    # Keep the positive boundary comfortably inside the window. Using 299 here
+    # is flaky because _sign() truncates to integer seconds while verification
+    # reads a later floating-point clock value, so crossing a second boundary
+    # can make the effective age slightly greater than 300 seconds.
     fresh = client.post(
         "/webhooks/reap", content=raw,
-        headers={"content-type": "application/json", SIG_HEADER: _sign(raw, age=299)},
+        headers={"content-type": "application/json", SIG_HEADER: _sign(raw, age=290)},
     )
     assert fresh.status_code == 200
 
