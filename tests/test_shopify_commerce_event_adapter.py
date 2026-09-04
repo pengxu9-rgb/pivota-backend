@@ -168,11 +168,13 @@ async def test_shopify_pixel_and_order_webhook_with_same_checkout_token_stitch(
             merchant_id="merchant-shopify",
             batch=pixel_batch,
             agent_identity_confidence="browser_observed",
+            write_path="shopify_web_pixel",
         )
         webhook_result = await ingest_merchant_event_batch(
             merchant_id="merchant-shopify",
             batch=webhook_batch,
             agent_identity_confidence="platform_asserted",
+            write_path="shopify_webhook",
         )
 
         interactions = await test_database.fetch_all(select(commerce_interactions))
@@ -355,6 +357,7 @@ async def test_shopify_best_effort_ingest_resolves_store_and_writes_batch(monkey
     assert result["store_id"] == "store-1"
     assert captured[0]["merchant_id"] == "merchant-1"
     assert captured[0]["agent_identity_confidence"] == "platform_asserted"
+    assert captured[0]["write_path"] == "shopify_webhook"
     assert captured[0]["batch"].events[0].event_type == "order.paid"
 
 

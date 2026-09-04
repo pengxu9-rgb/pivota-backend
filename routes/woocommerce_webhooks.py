@@ -108,5 +108,6 @@ async def receive_woocommerce_webhook(
         merchant_id=str(store["merchant_id"]),
         batch=batch,
         agent_identity_confidence="platform_asserted",
+        write_path="woocommerce_webhook",
     )
     return {"status": "recorded", "platform": "woocommerce", **result}

@@ -74,6 +74,7 @@ async def ingest_stripe_commerce_event_best_effort(
             merchant_id=merchant_id,
             batch=batch,
             agent_identity_confidence="platform_asserted",
+            write_path="stripe_webhook",
         )
         return {
             "status": "accepted",

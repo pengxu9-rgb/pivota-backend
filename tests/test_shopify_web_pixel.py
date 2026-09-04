@@ -108,6 +108,7 @@ def test_shopify_pixel_route_marks_agent_identity_as_browser_observed(monkeypatc
 
     assert response.status_code == 200, response.text
     assert captured[0]["agent_identity_confidence"] == "browser_observed"
+    assert captured[0]["write_path"] == "shopify_web_pixel"
 
 
 @pytest.mark.parametrize(

@@ -266,6 +266,7 @@ def test_web_collector_route_accepts_origin_bound_batch(monkeypatch):
     assert response.headers["access-control-allow-origin"] == ORIGIN
     assert len(calls) == 1
     assert calls[0]["agent_identity_confidence"] == "browser_observed"
+    assert calls[0]["write_path"] == "universal_web_collector"
     event = calls[0]["batch"].events[0]
     assert calls[0]["merchant_id"] == MERCHANT_ID
     assert event.store_id == STORE_ID

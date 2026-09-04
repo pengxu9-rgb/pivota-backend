@@ -277,10 +277,16 @@ def _build_canary_events(args: argparse.Namespace) -> List[Dict[str, Any]]:
     ]
 
 
-def _signed_batch(events: Iterable[Dict[str, Any]], api_key: str) -> tuple[bytes, str]:
-    body = json.dumps(
-        {"events": list(events)}, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+def _signed_batch(
+    events: Iterable[Dict[str, Any]], api_key: str, *, synthetic: bool = False
+) -> tuple[bytes, str]:
+    payload: Dict[str, Any] = {"events": list(events)}
+    if synthetic:
+        # The ledger stamps `synthetic` from this batch-level flag, so the
+        # probe is excluded from the merchant's default funnel by a column
+        # rather than by the caller-supplied surface string.
+        payload["synthetic"] = True
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     signature = hmac.new(str(api_key).encode("utf-8"), body, hashlib.sha256).hexdigest()
     return body, signature
 
@@ -534,7 +540,9 @@ def run(
         and baseline_available
     ):
         events = _build_canary_events(args)
-        body_bytes, signature = _signed_batch(events, args.merchant_api_key)
+        body_bytes, signature = _signed_batch(
+            events, args.merchant_api_key, synthetic=True
+        )
         ingest_headers = {
             "Content-Type": "application/json",
             "X-Pivota-Merchant-Id": args.merchant_id,

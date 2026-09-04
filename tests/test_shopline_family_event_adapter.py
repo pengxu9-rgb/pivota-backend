@@ -270,6 +270,7 @@ def test_shopline_family_webhook_routes_verify_signature_and_source(
     assert response.json()["platform"] == platform
     assert ingested[0]["merchant_id"] == "merchant-1"
     assert ingested[0]["agent_identity_confidence"] == "platform_asserted"
+    assert ingested[0]["write_path"] in {"shopline_webhook", "shoplazza_webhook"}
 
     invalid = client.post(path, content=raw, headers={**headers, signature_header: "invalid"})
     assert invalid.status_code == 401

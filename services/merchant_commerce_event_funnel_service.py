@@ -101,7 +101,16 @@ def _event_scope(row: Dict[str, Any]) -> tuple[str, str]:
 
 
 def _refund_authority(row: Dict[str, Any]) -> str:
-    """Separate PSP and store observations of the same underlying refund."""
+    """Separate PSP and store observations of the same underlying refund.
+
+    The ingress-stamped ``authority`` column is the answer whenever it exists.
+    The string inference below survives only for rows written before
+    migration 213; ``source`` and ``surface`` are caller-supplied and a
+    merchant collector can set them to anything.
+    """
+    stamped = _text(row.get("authority")).lower()
+    if stamped:
+        return stamped
     surface = _text(row.get("surface")).lower()
     source = _text(row.get("source")).lower()
     if surface == "psp" or source in {
@@ -372,11 +381,18 @@ async def _fetch_event_rows(
         # Synthetic production probes remain queryable through an explicit
         # surface=ops_canary request, but must never contribute to a merchant's
         # default funnel stages, order counts, paid GMV, or refund totals.
+        # The ingress-stamped `synthetic` column is authoritative; the surface
+        # match covers rows written before that column existed. A NULL
+        # `synthetic` (pre-migration row) is not evidence of a probe.
         query = query.where(
+            or_(
+                commerce_interaction_events.c.synthetic.is_(None),
+                commerce_interaction_events.c.synthetic == False,  # noqa: E712
+            ),
             or_(
                 commerce_interaction_events.c.surface.is_(None),
                 commerce_interaction_events.c.surface != OPS_CANARY_SURFACE,
-            )
+            ),
         )
     if platform:
         query = query.where(commerce_interaction_events.c.platform == platform)

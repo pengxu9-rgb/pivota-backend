@@ -393,6 +393,29 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
+            # mig 213: trust provenance on the commerce ledger. Early and
+            # wrapped like mig 212: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until these columns exist. Four columns in
+            # the migration, four here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS write_path VARCHAR(48) NULL,
+                          ADD COLUMN IF NOT EXISTS authority VARCHAR(16) NULL,
+                          ADD COLUMN IF NOT EXISTS agent_identity_confidence VARCHAR(24) NULL,
+                          ADD COLUMN IF NOT EXISTS synthetic BOOLEAN NOT NULL DEFAULT FALSE;
+                        """
+                    )
+                )
+                # The mig-214 partial index is deliberately absent here: it
+                # rolls out CONCURRENTLY, which this guard's transaction
+                # cannot do, and nothing on the write path needs it.
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
             # mig 210: anonymous audit runs. Position and wrapping are BOTH
             # load-bearing, and neither alone is enough — measured, not assumed.
             #
