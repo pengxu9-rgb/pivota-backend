@@ -15,7 +15,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin, verify_jwt_token
+from utils.auth import AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_STAFF_ROLES, can_access_agent, get_current_employee, get_current_user, require_admin, verify_jwt_token
 from utils.logger import logger
 
 
@@ -116,9 +116,29 @@ async def get_agent_details(
     agent = await get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    
-    # For agent role: allow access (API key already removed by get_agent)
-    # No additional restrictions needed since sensitive data is filtered
+
+    # OWNERSHIP. This used to read: "For agent role: allow access (API key
+    # already removed by get_agent) / No additional restrictions needed since
+    # sensitive data is filtered". Stripping api_key/api_key_hash is not
+    # filtering: what get_agent still returns is owner_email, webhook_url,
+    # allowed_merchants, metadata, rate_limit and daily_quota -- another
+    # tenant's contact address, their callback endpoint, the list of merchants
+    # they are cleared for, and their commercial limits. AGENT_OR_EMPLOYEE_
+    # STAFF_ROLES decides who may attempt the route; it never decided WHOSE
+    # record. Staff keep cross-agent reads; an `agent` gets their own.
+    #
+    # The `current_agent_id` fallback matches the sibling guards in this module
+    # (update_agent, the analytics/usage/funnel reads): some agent tokens carry
+    # the identity as `user_id` rather than the `agent_id` claim
+    # can_access_agent looks at, and dropping the fallback would lock those
+    # agents out of their own record.
+    if not can_access_agent(current_user, agent_id) and str(current_agent_id or "") != str(agent_id):
+        logger.error(
+            f"[GET /agents/{{id}}] {current_role} {current_email} denied: "
+            f"{current_agent_id} is not agent {agent_id}"
+        )
+        raise HTTPException(status_code=403, detail="Access denied - not your agent")
+
     logger.info(f"[Agent Access OK] {current_role} {current_email} → agent {agent_id}")
     
     return {

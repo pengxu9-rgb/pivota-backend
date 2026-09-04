@@ -7,7 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from datetime import datetime
-from utils.auth import EMPLOYEE_STAFF_ROLES, MERCHANT_OR_EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.auth import (
+    EMPLOYEE_STAFF_ROLES,
+    MERCHANT_OR_EMPLOYEE_STAFF_ROLES,
+    can_access_merchant,
+    get_current_user,
+)
 from db.database import database
 from services.merchant_psp_config_service import persist_canonical_merchant_psp
 from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
@@ -188,9 +193,21 @@ async def setup_merchant_psp(
     was the outlier, and it had no callers anywhere in the repo. Merchant
     self-service is still supported - `merchant` remains in the allowed roles -
     it just has to be a merchant who is signed in.
+
+    AND IT HAS TO BE THEIR OWN MERCHANT. The role gate above says who may
+    ATTEMPT the route; it says nothing about whose row they may write. The only
+    check on request.merchant_id used to be "does this merchant exist", so any
+    signed-in merchant could POST {merchant_id: <someone else's>, psp_type:
+    "stripe", api_key: ...} and overwrite another merchant's payment-provider
+    credentials - a cross-tenant write of exactly the secret that moves their
+    money. can_access_merchant binds the caller to the target: staff keep
+    cross-merchant access (that is the point of the employee portal), a
+    `merchant` is confined to their own merchant_id.
     """
     if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only set up PSPs for your own merchant")
     
     try:
         api_key = (request.api_key or "").strip()

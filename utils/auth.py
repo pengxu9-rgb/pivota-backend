@@ -351,11 +351,26 @@ EMPLOYEE_STAFF_ROLES = ["super_admin", "admin", "employee"]
 # Same set, plus merchants -- for surfaces a merchant reaches for their own data
 # and staff reach for anyone's. Was spelled ["merchant", "employee", "admin"],
 # and carried the identical super_admin omission.
+#
+# "for their own data" is a description of the SURFACE, not a guarantee this
+# constant provides. Membership here says only who may ATTEMPT the route; it
+# admits every merchant, not the owning one. Any handler that then reads a
+# merchant_id/store_id OUT OF THE REQUEST must pair this with
+# can_access_merchant() -- otherwise merchant_A reaches merchant_B's row with a
+# perfectly valid token. That pairing was missing on five routes shipped to
+# prod (setup-psp overwrote another merchant's PSP credentials; the Wix
+# connect/test/sync/sync-status routes hijacked and read another merchant's
+# store), which is why this note exists. See
+# routes/merchant_onboarding_shopify_verify_routes.py for the shape.
 MERCHANT_OR_EMPLOYEE_STAFF_ROLES = ["merchant"] + EMPLOYEE_STAFF_ROLES
 
 # Same set, plus agents -- for surfaces an agent reaches for their OWN record
 # and staff reach for anyone's. The caller still has to prove ownership
-# separately; this only decides who may attempt the route at all.
+# separately with can_access_agent(); this only decides who may attempt the
+# route at all. "Separately" is load-bearing and was not happening on
+# GET /agents/{agent_id}, which let any agent read any other agent's
+# owner_email, webhook_url, allowed_merchants and quotas. Redacting a secret
+# from the response is not an ownership check.
 AGENT_OR_EMPLOYEE_STAFF_ROLES = ["agent"] + EMPLOYEE_STAFF_ROLES
 
 # Permission guarding /api/operations/* (merchant & agent onboarding, approval,
