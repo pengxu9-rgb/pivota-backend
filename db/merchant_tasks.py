@@ -22,9 +22,10 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 
 from sqlalchemy import (
+    select as sa_select,
     Column,
     DateTime,
     Index,
@@ -765,6 +766,106 @@ def recovery_key_for(
     )
     material = "\x1f".join([str(merchant_id or "").strip().lower(), *identity])
     return "rk_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+async def list_open_recovery_tasks(*, merchant_id: str) -> List[Dict[str, Any]]:
+    """This merchant's OPEN tasks that carry a recovery key. ONE query.
+
+    Split from the matcher so a caller resolving many destinations — the offer
+    resolve path walks every matched variant — fetches once and matches in
+    memory, instead of issuing a query per variant on an agent-facing path.
+
+    ONLY OPEN TASKS. A verified or dismissed task is finished, and stamping its
+    key onto a fresh link would keep crediting a closed fix for orders it had
+    nothing to do with: attribution that is wrong is worse than absent.
+    """
+    if not merchant_id:
+        return []
+    try:
+        # ensure_merchant_tasks_table runs 9 DDL statements under a module
+        # lock, and INSIDE the try on purpose: outside it, a persistently
+        # failing DDL (permissions, lock wait) would re-run all nine behind
+        # one lock on EVERY offers.resolve — a wedge on the agent path, from
+        # a read that is only ever a nice-to-have.
+        await ensure_merchant_tasks_table()
+        rows = await database.fetch_all(
+            sa_select(
+                merchant_tasks.c.recovery_key,
+                merchant_tasks.c.evidence_jsonb,
+            )
+            .where(
+                merchant_tasks.c.merchant_id == merchant_id,
+                merchant_tasks.c.recovery_key.isnot(None),
+                merchant_tasks.c.status.notin_(sorted(TERMINAL_STATUSES)),
+                merchant_tasks.c.status != "superseded",
+            )
+            .order_by(merchant_tasks.c.updated_at.desc())
+            .limit(50)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_open_recovery_tasks failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in rows or []]
+
+
+def match_recovery_key(
+    open_tasks: Optional[List[Dict[str, Any]]],
+    *,
+    product_key: Optional[str] = None,
+    target_host: Optional[str] = None,
+) -> Optional[str]:
+    """Which open task, if any, describes this destination. PURE.
+
+    A product match is the stronger claim and wins; a host-only match is
+    accepted only when the caller had no product to offer, so a brand-level
+    task never steals attribution from a per-product one.
+    """
+    want_product = str(product_key or "").strip().lower()
+    want_host = str(target_host or "").strip().lower()
+    if not want_product and not want_host:
+        return None
+    host_match: Optional[str] = None
+    for row in open_tasks or []:
+        ev = (row or {}).get("evidence_jsonb") or {}
+        if not isinstance(ev, Mapping):
+            continue
+        key = str((row or {}).get("recovery_key") or "") or None
+        if not key:
+            continue
+        if want_product and str(ev.get("product_key") or "").strip().lower() == want_product:
+            return key
+        if (
+            not want_product
+            and want_host
+            and str(ev.get("target_host") or "").strip().lower() == want_host
+            and host_match is None
+        ):
+            host_match = key
+    return host_match
+
+
+async def active_recovery_key_for_destination(
+    *,
+    merchant_id: str,
+    product_key: Optional[str] = None,
+    target_host: Optional[str] = None,
+) -> Optional[str]:
+    """One-shot convenience: fetch + match for a SINGLE destination.
+
+    Callers resolving many destinations should use list_open_recovery_tasks
+    once and match_recovery_key per destination instead — this issues a query
+    every call, which is a query per variant inside a loop.
+    """
+    if not merchant_id or (not product_key and not target_host):
+        return None
+    return match_recovery_key(
+        await list_open_recovery_tasks(merchant_id=merchant_id),
+        product_key=product_key,
+        target_host=target_host,
+    )
 
 
 async def dedupe_pending_tasks(*, merchant_id: str) -> int:
