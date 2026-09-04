@@ -37,6 +37,20 @@ def _enabled() -> bool:
     return scheduler_enabled and receipt_enabled and bool(receipt_key)
 
 
+def _checkout_tier_enabled() -> bool:
+    """Whether a reprobe may carry a variant, i.e. may test checkout for real.
+
+    Defaults OFF, and the default is the safe direction on purpose: this is the
+    switch that turns a two-GET protocol read into a create_checkout against a
+    merchant's live store. An env wipe (which this project has had) therefore
+    lands on "observe only", never on "start transacting".
+    """
+    return (
+        os.getenv("STORE_AUDIT_UCP_PROBE_CHECKOUT_TIER_ENABLED", "false")
+        .strip().lower() == "true"
+    )
+
+
 def _bounded_int(value: Optional[str], default: int, maximum: int) -> int:
     try:
         parsed = int(str(value or default))
@@ -120,6 +134,7 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
         enqueue_verification_run,
         has_in_flight_verification_for_route,
     )
+    from services.canonical_commerce_service import select_probe_variant_gid
 
     now = datetime.now(timezone.utc)
     due = await list_due_ucp_routes(now=now)
@@ -139,11 +154,40 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
         merchant_id = route.get("merchant_id")
         if merchant_id and str(merchant_id).startswith("prospect_"):
             merchant_id = None
+        # The checkout-tested tier, and the ONLY thing that unlocks it. The
+        # gateway probe records priced_facts.checkout_status — the one signal
+        # that separates "an agent can buy here" from "this store advertises
+        # UCP" — only when the claim hands it a variant_gid, which it reads off
+        # verification_runs.product_key. Nothing has ever set it, so the tier
+        # has never run and every route sits at `detected`.
+        #
+        # BOUNDED TO MERCHANTS WE ALREADY KNOW, and note it rides the
+        # merchant_id the block above already scrubbed: a `prospect_` merchant
+        # is None by then, so a domain someone typed into the public marketing
+        # form can never reach this. That matters — the tested tier's one side
+        # effect is a real create_checkout against the store, and an anonymous
+        # form that creates checkout objects on any domain a stranger names is
+        # an abuse vector, not a feature.
+        probe_variant_gid: Optional[str] = None
+        if merchant_id and _checkout_tier_enabled():
+            try:
+                probe_variant_gid = await select_probe_variant_gid(
+                    str(merchant_id)
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Fail-soft to today's behaviour: no variant means the probe
+                # runs its detected tier, which is what it does now anyway.
+                logger.warning(
+                    "scheduled_ucp_reprobe: variant lookup failed "
+                    "merchant=%s: %s",
+                    merchant_id, str(exc)[:200],
+                )
         try:
             verify_id = await enqueue_verification_run(
                 audit_run_id=audit_run_id,
                 verifier_id=VERIFIER_UCP_PROBE,
                 merchant_id=merchant_id,
+                product_key=probe_variant_gid,
                 execution_route_id=route_id,
                 # A one-attempt UCP discovery is intentionally cheap and
                 # terminal state handles WAF/rate limit as blocked.
