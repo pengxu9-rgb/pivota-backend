@@ -217,11 +217,15 @@ def test_every_spelling_the_shared_vocabulary_accepts_reaches_the_selector():
 def _enqueue_harness(
     monkeypatch, *, merchant_id="merchant_real", domain="shop.example",
     resolves_to="merchant_real", gid="gid://shopify/ProductVariant/7",
+    verified_domains=None,
 ):
+    """Default shape is the one the tier is FOR: a merchant with exactly one
+    proven domain, which is this route's. Tests that care about the multi-
+    storefront guard override `verified_domains` explicitly."""
     monkeypatch.setenv("STORE_AUDIT_UCP_REPROBE_SCHEDULER_ENABLED", "true")
     monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED", "true")
     monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_INTERNAL_KEY", "test-key")
-    observed = {"selector_calls": [], "resolver_calls": []}
+    observed = {"selector_calls": [], "resolver_calls": [], "domains_calls": []}
 
     async def fake_due(**_kwargs):
         return [{
@@ -242,6 +246,10 @@ def _enqueue_harness(
         observed["resolver_calls"].append(d)
         return resolves_to
 
+    async def fake_verified_domains(merchant):
+        observed["domains_calls"].append(merchant)
+        return [domain] if verified_domains is None else verified_domains
+
     async def fake_selector(merchant):
         observed["selector_calls"].append(merchant)
         return gid
@@ -255,6 +263,9 @@ def _enqueue_harness(
     monkeypatch.setattr(evidence_module, "enqueue_verification_run", fake_enqueue)
     monkeypatch.setattr(
         domains_module, "resolve_verified_merchant_for_domain", fake_resolver,
+    )
+    monkeypatch.setattr(
+        domains_module, "list_verified_domains", fake_verified_domains,
     )
     monkeypatch.setattr(svc, "select_probe_variant_gid", fake_selector)
     return observed
@@ -387,11 +398,30 @@ def test_resolves_a_verified_domain_to_its_merchant():
     assert asyncio.run(scenario()) == "m1"
 
 
-def test_refuses_a_domain_that_is_only_asserted():
-    """`asserted` and `inferred` rows sit at NULL until something checks them.
-    A self-declared store_url is not proof that the storefront is theirs."""
+def test_an_asserted_source_row_still_resolves_when_its_status_is_verified():
+    """What the WRITER produces, not what the source name suggests.
+
+    services/brand_claim_service.py::record_official_domain writes
+    verification_status='verified' for a SOURCE_ASSERTED row too — that row came
+    out of a completed DNS/email brand claim, so domain control IS proven; only
+    the brand binding is missing. An earlier version of this test asserted the
+    opposite (source='asserted' => NULL) and so tested a row production never
+    writes.
+    """
     async def scenario():
-        await _official("m1", "shop.example", None, source="asserted")
+        await _official("m1", "shop.example", domains.VERIFICATION_VERIFIED,
+                        source=domains.SOURCE_ASSERTED)
+        return await domains.resolve_verified_merchant_for_domain("shop.example")
+
+    assert asyncio.run(scenario()) == "m1"
+
+
+def test_refuses_an_inferred_row_which_is_the_one_written_at_null():
+    """seed_inferred_domains is the writer that leaves the status NULL — the
+    only unproven population, and the one this fence exists to exclude."""
+    async def scenario():
+        await _official("m1", "shop.example", None,
+                        source=domains.SOURCE_INFERRED)
         return await domains.resolve_verified_merchant_for_domain("shop.example")
 
     assert asyncio.run(scenario()) is None
@@ -444,3 +474,124 @@ def test_a_blank_domain_never_queries():
     assert asyncio.run(
         domains.resolve_verified_merchant_for_domain("   ")
     ) is None
+
+
+# ---------------------------------------------------------------------
+# One storefront, or nothing (MEDIUM 1)
+# ---------------------------------------------------------------------
+
+
+def test_lists_every_verified_domain_for_a_merchant():
+    async def scenario():
+        await _official("m1", "anua.com", domains.VERIFICATION_VERIFIED)
+        await _official("m1", "anua.us", domains.VERIFICATION_VERIFIED)
+        await _official("m1", "later.example", domains.VERIFICATION_PENDING)
+        await _official("m2", "other.example", domains.VERIFICATION_VERIFIED)
+        return sorted(await domains.list_verified_domains("m1"))
+
+    assert asyncio.run(scenario()) == ["anua.com", "anua.us"]
+
+
+def test_a_merchant_with_two_storefronts_never_carries_a_variant(monkeypatch):
+    """The false-negative guard.
+
+    canonical_variants has merchant_id but no store key, and Shopify variant ids
+    are per-store. Handing storefront A a variant only storefront B sells makes
+    create_checkout fail, and the tier would record that failure as evidence
+    that an agent cannot buy from a store that is perfectly fine.
+    """
+    observed = _enqueue_harness(
+        monkeypatch, domain="anua.com", resolves_to="merchant_real",
+        verified_domains=["anua.com", "anua.us"],
+    )
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_CHECKOUT_TIER_ENABLED", "true")
+
+    summary = asyncio.run(job.run_scheduled_ucp_reprobes())
+
+    assert summary["enqueued"] == 1
+    assert summary["variant_carried"] == 0
+    assert observed["enqueue"]["product_key"] is None
+    # No catalogue was consulted at all — we never had a storefront to attribute.
+    assert observed["selector_calls"] == []
+
+
+def test_a_merchant_with_exactly_one_storefront_does_carry_a_variant(monkeypatch):
+    """The positive counterpart: the guard above must not be a blanket refusal."""
+    observed = _enqueue_harness(
+        monkeypatch, domain="shop.example", resolves_to="merchant_real",
+        verified_domains=["shop.example"],
+    )
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_CHECKOUT_TIER_ENABLED", "true")
+
+    summary = asyncio.run(job.run_scheduled_ucp_reprobes())
+
+    assert summary["variant_carried"] == 1
+    assert observed["enqueue"]["product_key"] == "gid://shopify/ProductVariant/7"
+
+
+# ---------------------------------------------------------------------
+# The counter says what it means (LOW 4)
+# ---------------------------------------------------------------------
+
+
+def test_a_failed_enqueue_does_not_report_a_variant_carried(monkeypatch):
+    observed = _enqueue_harness(monkeypatch)
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_CHECKOUT_TIER_ENABLED", "true")
+
+    async def failing_enqueue(**kwargs):
+        observed["enqueue"] = kwargs
+        return None
+
+    import db.audit_evidence as evidence_module
+    monkeypatch.setattr(
+        evidence_module, "enqueue_verification_run", failing_enqueue,
+    )
+
+    summary = asyncio.run(job.run_scheduled_ucp_reprobes())
+
+    assert summary["failed"] == 1
+    assert summary["enqueued"] == 0
+    # A gid chosen for a run that does not exist was carried by nothing.
+    assert summary["variant_carried"] == 0
+
+
+def test_a_resolved_merchant_with_no_usable_variant_counts_nothing(monkeypatch):
+    observed = _enqueue_harness(monkeypatch, gid=None)
+    monkeypatch.setenv("STORE_AUDIT_UCP_PROBE_CHECKOUT_TIER_ENABLED", "true")
+
+    summary = asyncio.run(job.run_scheduled_ucp_reprobes())
+
+    assert summary["enqueued"] == 1
+    assert summary["variant_carried"] == 0
+    assert observed["enqueue"]["product_key"] is None
+    assert observed["selector_calls"] == ["merchant_real"]
+
+
+# ---------------------------------------------------------------------
+# One malformed id must not hide a catalogue (LOW 3)
+# ---------------------------------------------------------------------
+
+
+def test_one_malformed_id_does_not_blank_the_whole_merchant():
+    """Ordering by length puts a 3-char "abc" first. Under LIMIT 1 that single
+    junk row silenced the tier for everything the merchant sells."""
+    async def scenario():
+        await _variant(cvid="bad", merchant="m1", platform_product_id="zzz",
+                       platform_variant_id="abc", availability="in_stock")
+        await _variant(cvid="ok", merchant="m1", platform_product_id="aaa",
+                       platform_variant_id="51086327775448",
+                       availability="in_stock")
+        return await svc.select_probe_variant_gid("m1")
+
+    assert asyncio.run(scenario()) == (
+        "gid://shopify/ProductVariant/51086327775448"
+    )
+
+
+def test_a_catalogue_of_nothing_but_malformed_ids_still_yields_none():
+    async def scenario():
+        await _variant(cvid="bad", merchant="m1",
+                       platform_variant_id="abc", availability="in_stock")
+        return await svc.select_probe_variant_gid("m1")
+
+    assert asyncio.run(scenario()) is None

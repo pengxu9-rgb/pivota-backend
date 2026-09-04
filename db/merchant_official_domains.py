@@ -386,8 +386,12 @@ async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
     FAILS CLOSED, and every branch matters to a caller that will act on the
     answer against a live storefront:
       * `verification_status` must be exactly 'verified' — 'pending', 'failed'
-        and NULL are all "not proven", and an `asserted` or `inferred` source
-        row sits at NULL until it is checked.
+        and NULL are all "not proven". Note this is a claim about the STATUS
+        column, not about `source`: `record_official_domain` (services/
+        brand_claim_service.py) writes 'verified' for a SOURCE_ASSERTED row too,
+        because that row still came out of a completed DNS/email brand claim —
+        it is domain control proven but brand binding not yet made. Only
+        `seed_inferred_domains` writes a row this rejects, at NULL.
       * two merchants verified on one domain is ambiguity, not a tie to break.
         LIMIT 2 exists to SEE the second row rather than silently take the first.
       * a lookup failure is not an absence; it returns None either way, but the
@@ -417,6 +421,42 @@ async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
             )
         return None
     return str(rows[0]["merchant_id"] or "").strip() or None
+
+
+LIST_VERIFIED_DOMAINS_SQL = """
+SELECT domain
+  FROM merchant_official_domains
+ WHERE merchant_id = :merchant_id
+   AND verification_status = :verified
+"""
+
+
+async def list_verified_domains(merchant_id: str) -> List[str]:
+    """Every domain this merchant has proven, so a caller can tell whether the
+    merchant is one storefront or several.
+
+    Exists because `canonical_variants` carries `merchant_id` but no store key,
+    while Shopify variant ids are per-STORE. A merchant with two proven domains
+    that are two different Shopify stores (anua.com alongside anua.us, a pairing
+    this codebase has already met) cannot have its catalogue attributed to one
+    of them, and a caller that guesses will hand storefront A a variant only
+    storefront B sells. Returns [] on failure, which callers must read as "we do
+    not know", never as "none".
+    """
+    if not merchant_id:
+        return []
+    await ensure_merchant_official_domains_table()
+    try:
+        rows = await database.fetch_all(
+            LIST_VERIFIED_DOMAINS_SQL,
+            {"merchant_id": merchant_id, "verified": VERIFICATION_VERIFIED},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_verified_domains failed for %s: %s", merchant_id, str(exc)[:200]
+        )
+        return []
+    return [str(r["domain"] or "").strip().lower() for r in rows or [] if r["domain"]]
 
 
 async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
@@ -534,6 +574,7 @@ __all__: Sequence[str] = (
     "is_excluded",
     "list_domains_due_for_liveness",
     "list_official_domains",
+    "list_verified_domains",
     "resolve_verified_merchant_for_domain",
     "merchant_official_domains",
     "record_liveness",

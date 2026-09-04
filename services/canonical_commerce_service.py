@@ -493,6 +493,11 @@ async def canonical_cache_parity(
 
 _PROBE_VARIANT_GID_PREFIX = "gid://shopify/ProductVariant/"
 
+# How many ordered rows to look at before giving up. Only exists so one
+# malformed id cannot hide an entire merchant's catalogue; the pick is still
+# the first USABLE row in the same deterministic order.
+_PROBE_VARIANT_SCAN_LIMIT = 25
+
 
 async def select_probe_variant_gid(merchant_id: str) -> Optional[str]:
     """One Shopify variant GID for a merchant, for the Store Audit UCP probe.
@@ -563,10 +568,16 @@ async def select_probe_variant_gid(merchant_id: str) -> Optional[str]:
             func.length(canonical_variants.c.platform_variant_id).asc(),
             canonical_variants.c.platform_variant_id.asc(),
         )
-        .limit(1)
+        # A SMALL WINDOW, NOT LIMIT 1. The numeric guard below runs in Python
+        # because neither engine spells "digits only" portably, so LIMIT 1 let a
+        # single malformed id at the front of the order blank the merchant
+        # entirely — the tier would go silent for their whole catalogue on one
+        # bad row. Scanning a few lets the ordering keep its meaning (still the
+        # oldest USABLE variant, deterministically) while tolerating junk.
+        .limit(_PROBE_VARIANT_SCAN_LIMIT)
     )
     try:
-        row = await database.fetch_one(query)
+        rows = await database.fetch_all(query)
     except Exception:
         # Never let a catalogue lookup fail an enqueue: no variant is a
         # supported outcome (the probe stays on its detected tier), an
@@ -576,14 +587,13 @@ async def select_probe_variant_gid(merchant_id: str) -> Optional[str]:
             merchant, exc_info=True,
         )
         return None
-    if not row:
-        return None
 
     # The claim endpoint only forwards a value that already starts with the GID
     # prefix, and merchant_ucp_checkout rejects a non-numeric id upstream. A
     # non-numeric platform_variant_id here would therefore travel as far as the
     # merchant's door before being refused — reject it at the source instead.
-    variant_id = str(row["platform_variant_id"] or "").strip()
-    if not variant_id.isdigit():
-        return None
-    return f"{_PROBE_VARIANT_GID_PREFIX}{variant_id}"
+    for row in rows or []:
+        variant_id = str(row["platform_variant_id"] or "").strip()
+        if variant_id.isdigit():
+            return f"{_PROBE_VARIANT_GID_PREFIX}{variant_id}"
+    return None

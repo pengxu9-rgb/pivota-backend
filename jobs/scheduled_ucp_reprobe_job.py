@@ -135,6 +135,7 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
         has_in_flight_verification_for_route,
     )
     from db.merchant_official_domains import (
+        list_verified_domains,
         resolve_verified_merchant_for_domain,
     )
     from services.canonical_commerce_service import select_probe_variant_gid
@@ -192,12 +193,33 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
                 proven_merchant = await resolve_verified_merchant_for_domain(
                     route_domain
                 )
+                # ONE PROVEN DOMAIN, OR NONE OF THIS RUNS. canonical_variants
+                # carries merchant_id but no store key, while Shopify variant
+                # ids are per-STORE. A merchant with two proven domains may be
+                # two different Shopify stores (anua.com alongside anua.us —
+                # a pairing this codebase has already met), and nothing in the
+                # catalogue says which store the oldest variant belongs to.
+                # Guess wrong and we hand storefront A a variant only B sells:
+                # create_checkout fails, the tier records that failure as fact,
+                # and we tell a merchant whose store is fine that an agent
+                # cannot buy from them — weekly, deterministically. A false
+                # negative on the exact signal this feature exists to produce
+                # is worse than no signal, so this stays closed until the
+                # catalogue can name a store.
+                if proven_merchant:
+                    proven_domains = await list_verified_domains(proven_merchant)
+                    if len(proven_domains) != 1:
+                        logger.info(
+                            "scheduled_ucp_reprobe: merchant=%s has %d proven "
+                            "domains; cannot attribute its catalogue to one "
+                            "storefront, skipping checkout tier",
+                            proven_merchant, len(proven_domains),
+                        )
+                        proven_merchant = None
                 if proven_merchant:
                     probe_variant_gid = await select_probe_variant_gid(
                         proven_merchant
                     )
-                    if probe_variant_gid:
-                        summary["variant_carried"] += 1
             except Exception as exc:  # noqa: BLE001
                 # Fail-soft to today's behaviour: no variant means the probe
                 # runs its detected tier, which is what it does now anyway.
@@ -229,6 +251,10 @@ async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:
             verify_id = None
         if verify_id:
             summary["enqueued"] += 1
+            # Counted HERE, not where the gid was chosen: a gid selected for an
+            # enqueue that then failed was carried by nothing.
+            if probe_variant_gid:
+                summary["variant_carried"] += 1
         else:
             summary["failed"] += 1
     logger.info("scheduled_ucp_reprobe: %s", summary)
