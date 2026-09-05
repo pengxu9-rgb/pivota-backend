@@ -47,6 +47,52 @@ async def resolve_shopify_store_id(
     return None
 
 
+async def resolve_pivota_order_id(
+    *, merchant_id: str, shopify_order_id: Optional[str]
+) -> Optional[str]:
+    """The Pivota order this Shopify order was written back from, if any.
+
+    The fallback half of the canonical order identity: orders written back
+    before the ``pivota_order_id`` note attribute existed carry no marker in
+    the webhook body, but Pivota recorded the Shopify id on its own row at
+    writeback time. ``orders.shopify_order_id`` is UNIQUE, so this is a single
+    indexed lookup. Best-effort: a failure means "no marker", never a dropped
+    event.
+    """
+    native_id = str(shopify_order_id or "").strip()
+    if not native_id or not str(merchant_id or "").strip():
+        return None
+    try:
+        row = await database.fetch_one(
+            """
+            SELECT order_id
+            FROM orders
+            WHERE merchant_id = :merchant_id
+              AND shopify_order_id = :shopify_order_id
+            LIMIT 1
+            """,
+            {"merchant_id": merchant_id, "shopify_order_id": native_id},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Shopify canonical order_ref lookup failed "
+            f"merchant={merchant_id} shopify_order_id={native_id}: {exc}"
+        )
+        return None
+    if not row:
+        return None
+    return str(dict(row).get("order_id") or "").strip() or None
+
+
+def _native_order_id(topic: str, payload: Dict[str, Any]) -> Optional[str]:
+    """The Shopify order id this webhook is about, whatever the topic."""
+    if str(topic or "").strip().lower() == "refunds/create":
+        raw = payload.get("order_id")
+    else:
+        raw = payload.get("id") or payload.get("order_number") or payload.get("name")
+    return str(raw or "").strip() or None
+
+
 async def ingest_shopify_commerce_event_best_effort(
     *,
     merchant_id: str,
@@ -74,6 +120,10 @@ async def ingest_shopify_commerce_event_best_effort(
             delivery_id=webhook_id,
             store_id=store_id,
             occurred_at=occurred_at,
+            pivota_order_id=await resolve_pivota_order_id(
+                merchant_id=merchant_id,
+                shopify_order_id=_native_order_id(topic, payload),
+            ),
         )
         result = await ingest_merchant_event_batch(
             merchant_id=merchant_id,

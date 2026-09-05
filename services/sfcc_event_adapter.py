@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -168,6 +169,7 @@ def map_sfcc_integration_event(
         checkout_id=checkout_id,
         payment_id=payment_id,
         order_id=order_id,
+        order_ref=build_order_ref("salesforce_commerce_cloud", order_id),
         refund_id=refund_id,
         trace_id=_text(payload.get("trace_id") or delivery_id or native_event_id),
         amount_cents=_amount_cents(payload.get("amount"), currency),

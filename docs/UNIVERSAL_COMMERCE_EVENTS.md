@@ -138,6 +138,87 @@ rule as much as a trust rule.
 Agent identity received through this merchant-signed endpoint is stored as
 `merchant_asserted`; it is not equivalent to a cryptographically verified agent.
 
+## Order identity across authorities
+
+One purchase reaches the ledger from several writers, and each of them knows
+the order by a different id: the Stripe PSP bridge holds the Pivota `orders`
+row and says `ord_1`; the Shopify `orders/paid` webhook says `6600123`; the
+agent checkout says `ord_1` again; WooCommerce, Cafe24, SHOPLINE, Adobe and
+SFCC each say their own native id. `order_id` is therefore several unrelated
+namespaces at once, and the funnel keyed paid amounts and order counts on
+`(platform, store_id, order_id)` — which de-duplicates only when the two ids
+already match. A Pivota-originated Shopify order paid through Stripe counted
+its GMV twice, once under each namespace.
+
+`order_ref` is the canonical answer: **the id of the order in its system of
+record, namespaced so two systems can never collide.**
+
+| Namespace | Meaning | Example |
+| --- | --- | --- |
+| `pivota:` | The order originated in Pivota: agent checkout → `orders` row → Stripe → optional writeback to the store platform. | `pivota:ord_1` |
+| `<platform>:` | The order was placed on the storefront; the platform is its system of record. | `shopify:6600123`, `woocommerce:44`, `cafe24:20260904-0000011` |
+
+Format: `^[a-z0-9_]+:[^\s]+$`, at most 160 characters
+(`services/commerce_order_ref.py`).
+
+### Who sets it
+
+| Writer | Ref | How it knows |
+| --- | --- | --- |
+| Stripe PSP bridge (`services/stripe_commerce_event_adapter.py`) | `pivota:<orders.order_id>` | It was resolved against the Pivota order row. |
+| Agent checkout (`routes/agent_commerce.py`) | `pivota:<checkout_id>` | `checkout_id` **is** the Pivota order id. |
+| Attribution edge (`services/commerce_attribution_service.py`) | `pivota:<order_id>` | Every caller passes a Pivota order id. |
+| Shopify adapter | `pivota:<id>` if recognised, else `shopify:<native id>` | The `pivota_order_id` note attribute, else the ingest's `orders.shopify_order_id` lookup. |
+| WooCommerce adapter | `pivota:<id>` if recognised, else `woocommerce:<native id>` | The `pivota_order_id` entry in the order's `meta_data`. |
+| Cafe24 / SHOPLINE / Shoplazza / Adobe / SFCC adapters | `<platform>:<native id>` | Their webhooks are platform-originated. |
+
+### The marker, and the fallback
+
+Pivota's Shopify order writeback stamps a `pivota_order_id` note attribute on
+every order it creates (it previously did so only when the order also carried
+discount annotations, so a plain order had no marker at all). The WooCommerce
+writeback stamps the same key into the order's `meta_data`. A later webhook for
+that order therefore recognises it as Pivota-originated from its own body, with
+no lookup.
+
+For Shopify orders written back *before* the marker existed,
+`services/shopify_commerce_event_ingest.py` falls back to a single indexed
+lookup on the unique `orders.shopify_order_id` column and passes the Pivota
+order id into the adapter. WooCommerce has no equivalent indexed column — the
+writeback records the native id inside `orders.metadata` — so pre-marker
+WooCommerce orders keep their `woocommerce:` identity.
+
+### What it changes, and what it does not
+
+- **Stitching.** `order_ref` is a strong, store-scoped lookup key in
+  `services/commerce_interaction_service.py`, with a unique index
+  `(merchant_id, COALESCE(store_id, ''), order_ref)` mirroring the `order_id`
+  one. A Stripe `payment.succeeded` and a Shopify `orders/paid` for the same
+  purchase converge on ONE interaction even when no click id ties them
+  together. It is store-scoped because `_merge_interactions` refuses a
+  cross-store merge; the two authorities that share a canonical order also
+  share a store scope, because both resolve the merchant's connected store.
+- **Funnel.** `order_ref` rows are keyed in one global scope rather than
+  `(platform, store_id)`; the existing `max` across `payment.succeeded` and
+  `order.paid` per key is then what removes the double count. Refunds and
+  payments that carry only a `payment_id` inherit the order's ref through the
+  same resolution maps.
+- **Legacy rows.** `order_ref IS NULL` on every row written before migration
+  216, and those rows keep aggregating on `(platform, store_id, order_id)`
+  exactly as before. `order_id` itself is untouched and remains the diagnostic
+  record of what each authority called the order.
+
+### Who may claim one
+
+`order_ref` is server-set. A merchant HMAC collector *is* its own platform's
+server for its own orders, so it may send one — but only in its bound store's
+platform namespace (`services/merchant_event_store_binding.py`). A `pivota:`
+ref from a merchant collector is refused with 422: `order_ref` is a strong
+stitch key, so a forged one would merge the collector's events into a
+Pivota-originated interaction it does not own. Browser collectors may not send
+`order_ref` at all — it joins `order_id` in
+`FORBIDDEN_WEB_EVENT_FIELDS`.
+
 ## Rate limits, metrics, and logging
 
 Every ledger-writing ingress (the three collector routes and the six native

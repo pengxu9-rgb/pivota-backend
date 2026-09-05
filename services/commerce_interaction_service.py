@@ -70,6 +70,10 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
         "checkout_id": _normalize_text(raw.get("checkout_id")),
         "payment_id": _normalize_text(raw.get("payment_id")),
         "order_id": _normalize_text(raw.get("order_id")),
+        # The canonical cross-authority order identity. `order_id` is what
+        # ONE writer calls the order; `order_ref` is what every writer that
+        # recognises the same purchase calls it.
+        "order_ref": _normalize_text(raw.get("order_ref")),
         "refund_id": _normalize_text(raw.get("refund_id")),
         "return_id": _normalize_text(raw.get("return_id")),
         "canonical_product_id": _normalize_text(raw.get("canonical_product_id")),
@@ -86,6 +90,7 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
 def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
     for key in (
         "click_id",
+        "order_ref",
         "cart_id",
         "order_id",
         "checkout_id",
@@ -112,6 +117,10 @@ def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
 _INTERACTION_LOOKUP_KEYS = (
     "interaction_id",
     "click_id",
+    # Strong, and deliberately ahead of order_id: two authorities agree on
+    # order_ref and disagree on order_id, so this is the key that converges
+    # a Stripe payment.succeeded with a Shopify orders/paid.
+    "order_ref",
     "order_id",
     "checkout_id",
     "payment_id",
@@ -124,6 +133,12 @@ _INTERACTION_LOOKUP_KEYS = (
 
 _STORE_SCOPED_LOOKUP_KEYS = {
     "interaction_id",
+    # Store-scoped like order_id, and for the same reason: _merge_interactions
+    # REFUSES a cross-store merge, so a lookup key that can reach across stores
+    # would turn a stitch into a raised ValueError. The authorities that share
+    # a canonical order also share a store scope (the Stripe bridge and the
+    # Shopify ingest both resolve the merchant's connected store).
+    "order_ref",
     "click_id",
     "session_id",
     "cart_id",
@@ -424,6 +439,7 @@ _MERGEABLE_INTERACTION_FIELDS = (
     "checkout_id",
     "payment_id",
     "order_id",
+    "order_ref",
     "refund_id",
     "return_id",
     "canonical_product_id",
@@ -675,6 +691,7 @@ async def ensure_interaction(
         "checkout_id": refs.get("checkout_id") or (existing or {}).get("checkout_id"),
         "payment_id": refs.get("payment_id") or (existing or {}).get("payment_id"),
         "order_id": refs.get("order_id") or (existing or {}).get("order_id"),
+        "order_ref": refs.get("order_ref") or (existing or {}).get("order_ref"),
         "refund_id": refs.get("refund_id") or (existing or {}).get("refund_id"),
         "return_id": refs.get("return_id") or (existing or {}).get("return_id"),
         "canonical_product_id": refs.get("canonical_product_id") or (existing or {}).get("canonical_product_id"),
@@ -893,6 +910,7 @@ async def _record_commerce_event_unlocked(
                 visitor_id=refs.get("visitor_id") or interaction.get("visitor_id"),
                 cart_id=refs.get("cart_id") or interaction.get("cart_id"),
                 payment_id=refs.get("payment_id") or interaction.get("payment_id"),
+                order_ref=refs.get("order_ref") or interaction.get("order_ref"),
                 source=source,
                 upstream_idempotency_key=upstream_idempotency_key,
                 actor_type=actor_type,

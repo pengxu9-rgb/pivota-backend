@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from services.commerce_order_ref import order_ref_namespace
 from services.merchant_event_ingest_service import MerchantEventBatch
 from services.merchant_store_service import get_merchant_active_stores
 
@@ -103,6 +104,20 @@ def bind_batch_to_stores(
                 422,
                 f"events[{index}].platform {event_platform!r} does not match the "
                 f"connected store's platform",
+            )
+        # A merchant collector IS the platform's server for its own orders, so
+        # it may name them `<its platform>:<native id>`. It may not name them
+        # anything else. In particular it may not claim the `pivota:` namespace:
+        # order_ref is a strong stitch key, so a forged `pivota:` ref would
+        # merge the collector's events into a Pivota-originated interaction it
+        # does not own — and the funnel would then read its amounts as that
+        # purchase's.
+        namespace = order_ref_namespace(event.order_ref)
+        if event.order_ref and namespace != store_platform:
+            raise MerchantEventBindingError(
+                422,
+                f"events[{index}].order_ref must be namespaced "
+                f"{store_platform!r}, not {namespace or 'malformed'!r}",
             )
         event.store_id = store_id
         event.platform = store_platform

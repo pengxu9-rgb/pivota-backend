@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -263,6 +264,7 @@ def map_shopline_webhook(
                     store_id=store_id,
                     payment_id=transaction_id,
                     order_id=order_id,
+                    order_ref=build_order_ref("shopline", order_id),
                     refund_id=refund_id,
                     trace_id=trace_id,
                     amount_cents=_amount_cents(transaction.get("amount"), currency),
@@ -311,6 +313,7 @@ def map_shopline_webhook(
                 checkout_id=_text(order.get("checkout_id") or order.get("checkout_token")),
                 payment_id=_first_payment_id(order),
                 order_id=order_id,
+                order_ref=build_order_ref("shopline", order_id),
                 trace_id=trace_id,
                 amount_cents=_amount_cents(amount, currency),
                 currency=currency.upper() if currency else None,
@@ -385,6 +388,7 @@ def map_shoplazza_webhook(
                 ),
                 payment_id=_first_payment_id(order),
                 order_id=order_id,
+                order_ref=build_order_ref("shoplazza", order_id),
                 trace_id=trace_id,
                 amount_cents=_amount_cents(amount, currency),
                 currency=currency.upper() if currency else None,
