@@ -170,7 +170,7 @@ class _FakeResp:
     def _body(self):
         return {"jsonrpc": "2.0", "id": "1", "result": {"structuredContent": self._payload}}
 
-    async def aiter_bytes(self):
+    async def aiter_raw(self):
         # `_read_bounded` rebuilds the body from streamed bytes, so this must be the real
         # payload rather than a placeholder.
         yield _json.dumps(self._body()).encode()

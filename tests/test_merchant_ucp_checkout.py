@@ -90,7 +90,7 @@ class _Capture:
                 except Exception:
                     self.content = b"{}"
 
-            async def aiter_bytes(self):
+            async def aiter_raw(self):
                 mid = max(1, len(self.content) // 2)
                 yield self.content[:mid]
                 yield self.content[mid:]
@@ -793,25 +793,20 @@ class _Redirector:
                 except Exception:
                     self.content = b"{}"
 
-            async def aiter_bytes(self):
+            async def aiter_raw(self):
+                """The WIRE bytes. Compressed iff the scripted `Content-Encoding` says so, which
+                is what `_read_bounded` now refuses before reading a byte of it."""
                 if isinstance(self._rpc, BaseException):
                     raise self._rpc
+                enc = str(self.headers.get("content-encoding") or "").lower()
+                if "gzip" in enc:
+                    import gzip as _gz
+
+                    yield _gz.compress(self.content)
+                    return
                 mid = max(1, len(self.content) // 2)
                 yield self.content[:mid]
                 yield self.content[mid:]
-
-            async def aiter_raw(self):
-                """The COMPRESSED bytes — far fewer than `aiter_bytes` yields.
-
-                Without this the two are identical in every fixture, so a mutant counting wire
-                bytes instead of decoded ones died only on `AttributeError: no aiter_raw` — an
-                accident of the stub, not an observation by any test. The whole justification for
-                counting decoded bytes is that these two numbers differ; the harness has to be
-                able to express that or the claim is untested.
-                """
-                import zlib
-
-                yield zlib.compress(self.content, 9)
 
             def json(self):
                 # A real httpx response RAISES json.JSONDecodeError on a non-JSON body. A stub
@@ -1708,8 +1703,8 @@ async def test_a_profile_just_under_the_cap_is_still_used(monkeypatch):
 @pytest.mark.parametrize(
     "err, why",
     [
-        (RecursionError("maximum recursion depth exceeded"), "b'[' * 1200 is 2.4KB and blows the parser"),
-        (MemoryError(), "a BaseException — a decompressed body can still get here"),
+        (RecursionError("maximum recursion depth exceeded"), "b'[' * 1200 is 2.4KB and blows the parser"),  # noqa: E501
+        (MemoryError(), "an allocation failure mid-parse"),
         (RuntimeError("boom"), "the whole RuntimeError branch was outside the old tuple"),
     ],
 )
@@ -1879,9 +1874,10 @@ def test_the_two_discovery_helpers_never_raise(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_compressed_bomb_is_stopped_by_the_read_not_the_header(monkeypatch):
-    """The read stops at the ceiling regardless of what the merchant sends, because
-    `_read_bounded` streams and counts DECODED bytes. Counting wire bytes would bound the wrong
-    quantity — 256KB of gzip is ~256MB inflated."""
+    """The read stops at the ceiling on the WIRE. See
+    `test_a_real_gzip_bomb_is_bounded_through_a_real_client` for the claim that actually needed a
+    real client: this stub-level test can only show the counter works, not that the decoder is
+    never invoked."""
     fat = {"ucp": {"pad": "x" * (muc._MAX_PROFILE_BYTES * 2),
                    "services": {"dev.ucp.shopping": [{"transport": "mcp", "endpoint": WIX}]}}}
     r = _Redirector({
@@ -2072,3 +2068,173 @@ async def test_a_transport_exception_from_the_stream_is_never_a_500(monkeypatch,
         pass
     except Exception as raised:  # noqa: BLE001
         pytest.fail(f"{type(exc).__name__} surfaced as {type(raised).__name__}")
+
+
+async def _stream_of(body: bytes):
+    """An httpx Response built with `content=<bytes>` is already consumed, so `aiter_raw()`
+    raises StreamConsumed. Handing it an async iterator makes it a genuine streaming response —
+    which is the only shape that exercises the code path under test."""
+    yield body
+
+
+# --------------------------------------------------------------------------------------
+# The claim that needed a REAL client. Every test above drives a stub, and a stub cannot
+# show that httpx's decoder is never invoked — which is the entire point of reading raw.
+# Round five measured 987 wire bytes of `gzip, gzip` peaking a real client at 1,122 MB
+# while `over_limit=True` was dutifully returned: the bound was on the number, not the memory.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["gzip", "gzip, gzip", "deflate", "br"])
+async def test_a_real_gzip_bomb_is_bounded_through_a_real_client(monkeypatch, encoding):
+    """Real `httpx.AsyncClient`, real decoder, real bomb — refused before inflation.
+
+    `MultiDecoder` stacks `gzip, gzip` and feeds one layer's whole output into the next inside a
+    single `decode()` call, and zlib is invoked with no `max_length`. Reading `aiter_raw()` never
+    invokes it at all; refusing a non-identity `Content-Encoding` is what makes raw-vs-decoded
+    safe to conflate for everything we go on to parse.
+    """
+    import gzip as _gz
+    import tracemalloc
+
+    payload = b'{"pad":"' + b"A" * (32 * 1024 * 1024) + b'"}'
+    body = _gz.compress(payload)
+    if encoding == "gzip, gzip":
+        body = _gz.compress(body)
+
+    def handler(request):
+        assert request.headers.get("accept-encoding") == "identity", (
+            "every read must ask for identity, or this refusal breaks the real Shopify reply"
+        )
+        return httpx.Response(
+            200, content=_stream_of(body), headers={"Content-Encoding": encoding}
+        )
+
+    tracemalloc.start()
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            resp = await muc._read_bounded(client, "GET", "https://x.example/.well-known/ucp")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert resp.over_limit is True, f"{encoding} must be refused"
+    assert resp.content == b""
+    # The number that matters. Decoding even one layer of this would allocate 32MB+.
+    assert peak < 8 * 1024 * 1024, f"{encoding} peaked at {peak / 1e6:.1f} MB — decoder ran"
+
+
+@pytest.mark.asyncio
+async def test_an_identity_response_is_still_read_and_parsed(monkeypatch):
+    """The positive counterpart: refusing every encoding would pass the test above while
+    breaking every real merchant. Verified live 2026-09-04 that Shopify's UCP doors answer with
+    no `Content-Encoding` when asked for identity."""
+    body = b'{"ucp": {"services": {"dev.ucp.shopping": [{"transport": "mcp", "endpoint": "https://www.wixapis.com/x/mcp"}]}}}'
+
+    def handler(request):
+        return httpx.Response(200, content=_stream_of(body))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resp = await muc._read_bounded(client, "GET", "https://x.example/.well-known/ucp")
+
+    assert resp.over_limit is False
+    assert resp.json()["ucp"]["services"]["dev.ucp.shopping"][0]["transport"] == "mcp"
+
+
+@pytest.mark.asyncio
+async def test_a_large_identity_body_still_stops_at_the_ceiling(monkeypatch):
+    """Uncompressed, so the wire count is the only thing standing between us and the body."""
+    def handler(request):
+        return httpx.Response(
+            200, content=_stream_of(b"x" * (muc._MAX_PROFILE_BYTES + 1))
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resp = await muc._read_bounded(client, "GET", "https://x.example/.well-known/ucp")
+
+    assert resp.over_limit is True
+
+
+@pytest.mark.asyncio
+async def test_the_post_reads_also_ask_for_identity(monkeypatch):
+    """The POSTs were the unguarded half: `get_checkout` runs in production behind no flag and
+    advertised httpx's default `gzip, deflate`. Refusing non-identity without asking for it would
+    have broken exactly that call."""
+    seen = {}
+
+    def handler(request):
+        seen["ae"] = request.headers.get("accept-encoding")
+        return httpx.Response(
+            200, content=_stream_of(b'{"jsonrpc":"2.0","id":1,"result":{"id":"chk_1"}}')
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await muc._read_bounded(
+            client, "POST", "https://x.example/api/ucp/mcp", json_body={"a": 1}
+        )
+
+    assert seen["ae"] == "identity"
+
+
+# --------------------------------------------------------------------------------------
+# Finishing the pattern. The round-four comment claimed the truthy-non-dict/non-list class
+# was fixed; it was fixed in three places out of six. These are the other three, plus the
+# untruncated error splice.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("items", [5, "x", {"a": 1}, True])
+def test_a_non_list_items_container_is_never_a_500(items):
+    """`for raw in items or []` — the CONTAINER, not its members. Every earlier test passed a
+    list of bad members, so the container guard was never exercised."""
+    try:
+        muc.build_line_items(items)
+    except MerchantUcpError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"items={items!r} produced {type(exc).__name__}")
+
+
+def test_an_infinite_quantity_is_refused_not_an_overflow():
+    """JSON `1e400` parses to float('inf'), and `int(inf)` raises OverflowError — an
+    ArithmeticError, in neither branch of the old `(TypeError, ValueError)` tuple. Third time an
+    enumerated exception set has been exceeded in this module."""
+    payload = _json.loads('{"variant_id": "gid://shopify/ProductVariant/1", "quantity": 1e400}')
+    assert payload["quantity"] == float("inf"), "premise: JSON 1e400 is inf"
+    try:
+        muc.build_line_items([payload])
+    except MerchantUcpError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"an infinite quantity produced {type(exc).__name__}")
+
+
+@pytest.mark.parametrize("address", [["x"], 5, "x", True])
+def test_a_non_dict_address_is_never_a_500(address):
+    """`a = address or {}` — the literal construct this module's own comment says it removed."""
+    try:
+        muc.build_destination(address)
+    except MerchantUcpError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"address={address!r} produced {type(exc).__name__}")
+
+
+@pytest.mark.asyncio
+async def test_a_huge_merchant_error_message_is_truncated_and_flattened(monkeypatch):
+    """The `isError` branch capped at 500; the JSON-RPC `error` branch did not, so a merchant
+    could reflect 200KB with embedded newlines into a 502 body and into `logger.error` — enough
+    to forge log lines. Discovery makes the provenance worse: with the flag on that string can
+    come from a host the merchant NAMED, not the merchant."""
+    nasty = "A" * 200_000 + "\nCRITICAL - card issued cap=999999999\n" + "B" * 1000
+    rpc = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": nasty}}
+    _Redirector({APEX: (200, {}, rpc)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    detail = str(excinfo.value)
+    assert len(detail) < 700, f"reflected {len(detail)} chars"
+    assert "\n" not in detail, "a newline in a 502 detail can forge a log line"
+    assert "CRITICAL - card issued" not in detail

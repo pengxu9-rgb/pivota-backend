@@ -220,7 +220,9 @@ def build_line_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     exactly those, and they belong on the referral rail.
     """
     out: List[Dict[str, Any]] = []
-    for raw in items or []:
+    # `items` itself, not just its members: `build_line_items(5)` is `for raw in 5`. Fixing the
+    # members and not the container is the same half-fix this comment used to describe.
+    for raw in items if isinstance(items, list) else []:
         # isinstance, not `(raw or {})`. That construct raises AttributeError on a TRUTHY
         # non-dict — `["x"]` — which is the identical bug `_endpoint_from_profile` was fixed for
         # and whose comment names it. Fixing one instance and not the pattern is how a ratchet
@@ -238,8 +240,11 @@ def build_line_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if raw_qty is None:
             raw_qty = 1
         try:
+            # OverflowError, not just TypeError/ValueError: JSON `1e400` parses to float('inf'),
+            # and `int(inf)` is an ArithmeticError that neither branch of the old tuple caught.
+            # Enumerating exception classes has been wrong three times in this module.
             quantity = int(raw_qty)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise MerchantUcpError("line item quantity must be an integer", caller_fault=True)
         if quantity < 1:
             raise MerchantUcpError("line item quantity must be at least 1", caller_fault=True)
@@ -255,7 +260,8 @@ def build_destination(address: Dict[str, Any]) -> Dict[str, Any]:
     Only keys the merchant declares are emitted — an invented field is how a double starts
     describing a shape the real endpoint never had.
     """
-    a = address or {}
+    # isinstance, not `or {}` — the literal construct whose sibling this module already fixed.
+    a = address if isinstance(address, dict) else {}
     mapping = (
         ("first_name", "first_name"),
         ("last_name", "last_name"),
@@ -293,6 +299,12 @@ def message_codes(payload: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _safe_detail(text: Any, limit: int = 500) -> str:
+    """Merchant prose, made safe to splice into an error body and a log line."""
+    flat = " ".join(str(text or "").split())
+    return flat[:limit]
+
+
 def _unwrap(rpc: Any) -> Dict[str, Any]:
     """Pull the checkout payload out of an MCP tools/call response.
 
@@ -315,7 +327,13 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
         # to 422: our own broken profile presented to the agent as ITS bad request.
         our_fault = str(data.get("code") or "") in ("invalid_profile_url", "profile_unreachable")
         raise MerchantUcpError(
-            f"merchant refused the call: {detail}", our_fault=our_fault, rpc_code=code
+            # Truncated and flattened. The sibling `isError` branch already capped at 500; this
+            # one did not, so a merchant could reflect 200KB with embedded newlines into a 502
+            # body and into `logger.error` — enough to forge a log line. Discovery worsens the
+            # provenance: with the flag on, that string can come from a host the merchant NAMED.
+            f"merchant refused the call: {_safe_detail(detail)}",
+            our_fault=our_fault,
+            rpc_code=code,
         )
 
     result = rpc.get("result")
@@ -417,6 +435,11 @@ _WELL_KNOWN_PATH = "/.well-known/ucp"
 # to merchant POST responses: nothing legitimate on this rail is larger.
 _MAX_PROFILE_BYTES = 256 * 1024
 
+# Asked on EVERY merchant read, POSTs included. Not a courtesy any more: the read
+# refuses a non-identity `Content-Encoding`, so without asking we would refuse the real
+# Shopify reply, which is gzipped by default.
+_IDENTITY_ONLY = {"Accept-Encoding": "identity"}
+
 
 class _BoundedBody:
     """A merchant response read under a byte ceiling. Same surface `_call_tool` used before."""
@@ -442,32 +465,38 @@ async def _read_bounded(
     headers: Optional[Dict[str, str]] = None,
     limit: int = _MAX_PROFILE_BYTES,
 ) -> _BoundedBody:
-    """Read a merchant response, stopping at `limit` DECODED bytes.
+    """Read a merchant response, stopping at `limit` bytes ON THE WIRE.
 
-    WHY STREAMING, and why the previous attempt did not work. `client.get`/`client.post` read AND
-    DECODE the entire body inside the call, so a cap applied to `resp.content` runs after the
-    damage is done. Asking for `Accept-Encoding: identity` does not help either: httpx decodes on
-    the RESPONSE's `Content-Encoding`, so the request header is advisory and a hostile merchant is
-    precisely the one who ignores it. Measured: a 20,420-byte gzip body answered a request that
-    sent `identity` and produced 20,971,530 bytes in `.content` — which is what the cap then
-    inspected. The only real bound is to stop consuming.
+    RAW BYTES, and the encoding refused — because counting DECODED bytes does not bound memory.
+    `Response.aiter_bytes()` runs `decoder.decode()` on every ~64KB read from httpcore, and
+    zlib's `decompress()` is called with no `max_length`, so a counter placed after it sees the
+    chunk only once it has already been allocated. `MultiDecoder` stacks `Content-Encoding:
+    gzip, gzip` and feeds one layer's whole output into the next inside a single call. Measured
+    against a real client and a hostile server: 987 wire bytes of `gzip, gzip` peaked the client
+    at 1,122 MB while dutifully reporting `over_limit=True`. The bound was on the number, not on
+    the memory.
 
-    DECODED bytes, not raw, is the number that matters: 256KB of raw gzip is ~256MB inflated, so
-    counting wire bytes would bound the wrong quantity.
+    `aiter_raw()` never invokes the decoder — the same 987-byte bomb peaks at 0.30 MB. That
+    leaves raw and decoded differing, which is only safe because a response encoded as anything
+    but identity is REFUSED outright, so for everything we actually parse the two are equal.
 
-    (The earlier comment here also claimed MemoryError is a BaseException that escapes
-    `except Exception`. It is not — `issubclass(MemoryError, Exception)` is True. Both claims were
-    wrong; this docstring states what was measured.)
+    Refusing is safe in production, not just in theory: every read asks for `identity`, and the
+    live Shopify doors honour it — verified 2026-09-04 against jungsaemmool and cocomo65, which
+    answer with no `Content-Encoding` when asked for identity and `gzip` when asked for gzip.
+    Without asking, this refusal WOULD break the production `get_checkout`, whose reply Shopify
+    gzips by default.
     """
     kwargs: Dict[str, Any] = {}
     if json_body is not None:
         kwargs["json"] = json_body
-    if headers is not None:
-        kwargs["headers"] = headers
+    kwargs["headers"] = dict(headers or {}, **_IDENTITY_ONLY)
     async with client.stream(method, url, **kwargs) as resp:
+        encoding = str(resp.headers.get("content-encoding") or "").strip().lower()
+        if encoding not in ("", "identity"):
+            return _BoundedBody(resp.status_code, resp.headers, b"", over_limit=True)
         chunks: List[bytes] = []
         total = 0
-        async for chunk in resp.aiter_bytes():
+        async for chunk in resp.aiter_raw():
             total += len(chunk)
             if total > limit:
                 return _BoundedBody(resp.status_code, resp.headers, b"", over_limit=True)
@@ -641,11 +670,8 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
     error from the tool the caller asked for.
     """
     url = f"https://{domain}{_WELL_KNOWN_PATH}"
-    # `identity` is a courtesy only — httpx decodes on the RESPONSE header, so this does not
-    # bound anything. `_read_bounded` is what bounds it.
-    _no_compression = {"Accept-Encoding": "identity"}
     try:
-        resp = await _read_bounded(client, "GET", url, headers=_no_compression)
+        resp = await _read_bounded(client, "GET", url)
         if resp.status_code in _HOP_STATUSES:
             sibling = _sibling_host(
                 domain, resp.headers.get("location", ""), _WELL_KNOWN_PATH
@@ -656,10 +682,7 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
                 and resolves_only_public(sibling)
             ):
                 resp = await _read_bounded(
-                    client,
-                    "GET",
-                    f"https://{sibling}{_WELL_KNOWN_PATH}",
-                    headers=_no_compression,
+                    client, "GET", f"https://{sibling}{_WELL_KNOWN_PATH}"
                 )
         if resp.status_code != 200:
             return None
