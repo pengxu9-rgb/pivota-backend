@@ -85,8 +85,9 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     502, NOT 422. The handler below spells out the house rule: a bad request is 422 (which the
     error middleware rewrites to 400 INVALID_REQUEST), and a merchant that refused or answered
     unreadably is 502. An earlier draft raised 422 here, so a merchant nesting its own reply
-    made the agent read "Request validation failed" about a request that was fine -- and the
-    middleware discarded this detail string entirely. Deep merchant JSON is the merchant's
+    made the agent read "Request validation failed" about a request that was fine. The
+    middleware does copy this string through to `body["detail"]`, but it replaces the STATUS and
+    the MESSAGE, which are what an agent switches on. Deep merchant JSON is the merchant's
     fault, so it gets the merchant's status.
 
     DEFENCE IN DEPTH, not a reachable path. `json.dumps` and `json.loads` are the same C encoder
@@ -102,6 +103,16 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     except RecursionError:
         raise HTTPException(
             status_code=502, detail="merchant quote nested beyond the readable depth"
+        )
+    except (ValueError, TypeError):
+        # The clause this docstring calls "the BELT" -- `allow_nan=False` raises ValueError, and
+        # an unserialisable value raises TypeError. Catching only RecursionError left the belt
+        # itself uncaught: a 500 one exception type over from the one just guarded. Unreachable
+        # today (`resolve_merchant_quote` dumps the same totals first and `to_minor_units`
+        # refuses non-finite `picked`), and kept for the reason above -- one clause against a
+        # 500 if that ordering changes.
+        raise HTTPException(
+            status_code=502, detail="merchant quote carried an unserialisable amount"
         )
 
 

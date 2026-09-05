@@ -260,11 +260,13 @@ def _is_quoted_amount(value: Any, _depth: int = 0) -> bool:
         # C and Python recursion share one budget there, and `resp.json()` is called STRICTLY
         # DEEPER than this walk -- `resolve_merchant_quote` -> `get_checkout` -> `_call_tool` ->
         # `resp.json()` -- so the parser always runs out first. Measured end to end through the
-        # real transport with this bound REVERTED: through the route the cliff is 963/964 --
-        # 963 returns, 964 is a clean 502 ("merchant response was not JSON"), and NO depth produces a 500. An earlier
-        # version of this comment claimed a measured 500 here; that was an artifact of a probe
-        # that added a frame PER LEVEL. A deeper stack adds a CONSTANT, which shifts the parser
-        # and this walk equally and preserves the ordering.
+        # real transport with this bound REVERTED: a return below the cliff and a clean 502
+        # above it, near depth 965 through the app. The exact integer is a harness constant --
+        # driving the service directly puts it a few frames higher -- so nothing asserts it. The
+        # 502 is the transport's own "merchant response was not JSON", and NO depth yields a
+        # 500 on either path. An earlier version of this comment claimed a measured 500 here;
+        # that was an artifact of a probe that added a frame PER LEVEL. A deeper stack adds a
+        # CONSTANT, which shifts the parser and this walk equally and preserves the ordering.
         #
         # It is load-bearing on 3.12+, where the two budgets are separate: measured on 3.12.8,
         # `json.loads` accepts 9997 levels while this pure-Python walk still stops at 996. The

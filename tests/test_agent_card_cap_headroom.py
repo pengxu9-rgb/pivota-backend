@@ -499,13 +499,15 @@ def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
 
     On the PINNED runtime (runtime.txt: python-3.11) this is NOT a live 500. C and Python
     recursion share one budget there and `resp.json()` runs STRICTLY DEEPER than this walk, so
-    the parser always exhausts first: measured end to end through the real transport with the
-    bound reverted, depth 970 returns and depth 980 is a clean 502, with no depth producing a
-    500. The claim that it did came from a probe that added a frame PER LEVEL; a deeper stack
-    adds a CONSTANT, which shifts parser and walk equally and preserves their order.
+    the parser always exhausts first: measured end to end with the bound reverted, the cliff is
+    a return below it and a clean 502 above, with no depth producing a 500. The exact integer is
+    a property of the measuring harness, not of the route -- it lands near 965 through the app
+    and a few frames higher when the service is driven directly -- so it is deliberately not
+    asserted here. The earlier claim of a 500 came from a probe that added a frame PER LEVEL; a
+    deeper stack adds a CONSTANT, which shifts parser and walk equally and preserves their order.
 
     It is load-bearing on 3.12+, where the budgets are separate -- measured on 3.12.8,
-    `json.loads` accepts 4000+ levels while this walk still stops at 996, so the parser stops
+    `json.loads` accepts 9997 levels while this walk still stops at ~996, so the parser stops
     gating. RecursionError is a RuntimeError, which no `except (TypeError, ValueError)` on this
     path catches. This test pins the bound so that upgrade is not a 500.
 
@@ -530,6 +532,12 @@ def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
     assert covers["shipping"] is True
 
 
+# Deeper than the C encoder's limit on EVERY runtime we may run on. 2000 was enough on 3.11
+# (limit 993) but `json.dumps` SUCCEEDS at 2000 on 3.12.8 (limit 9997), so both guard tests
+# below would have started failing on exactly the upgrade their guards are justified against.
+_DEEPER_THAN_ANY_ENCODER = 12_000
+
+
 def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
     """Bounding the walk alone would have MOVED this 500, not removed it.
 
@@ -540,15 +548,22 @@ def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
     surfaced from `json.dumps` a few lines later instead. Measured before this guard: an
     uncaught RecursionError at agent_card_issuance.py, in our own source.
 
-    Both sites are gated by the parser on the pinned 3.11 and reachable on 3.12+, exactly like
-    the walk. This drives the route helper directly, which is reachable on either.
+    NEITHER site is reachable in production, on either runtime: `json.dumps` and `json.loads`
+    are the same C encoder on one shared limit (993/993 on 3.11, 9997/9997 on 3.12.8) and
+    `resp.json()` parses strictly deeper, so the parser always refuses first. An earlier version
+    of this docstring said these guards were "reachable on 3.12+, exactly like the walk" -- that
+    was the claim measurement withdrew, and it survived here after being deleted from both
+    sources. The 3.12 argument holds only for the pure-Python walk (~996 vs 9997).
+
+    That is precisely why this drives the helper directly: an unreachable guard is invisible to
+    every end-to-end fixture, so nothing else notices if it is deleted.
     """
     from fastapi import HTTPException
 
     from routes.agent_cards import _dump_snapshot
 
     deep = 1
-    for _ in range(2000):
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
         deep = {"amount": deep}
     quote = {"quote_snapshot": {"totals": deep}}
 
@@ -556,8 +571,9 @@ def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
         _dump_snapshot(quote, {"max_minor": 7500})
 
     # 502, not 422: the error middleware rewrites every 422 leaving the app into a 400
-    # INVALID_REQUEST with a generic "Request validation failed" and DISCARDS this detail, so a
-    # 422 here told the agent its own request was bad because the MERCHANT nested its reply.
+    # INVALID_REQUEST whose `message` is a generic "Request validation failed". It does copy the
+    # detail through to `body["detail"]`, but the STATUS and the MESSAGE an agent reads both say
+    # the caller's request was invalid -- because the MERCHANT nested its reply.
     assert excinfo.value.status_code == 502
     assert "nested beyond the readable depth" in str(excinfo.value.detail)
 
@@ -608,7 +624,7 @@ async def test_resolve_merchant_quote_refuses_a_dump_that_recurses(monkeypatch):
     from services.agent_card_issuance import MerchantQuoteError, resolve_merchant_quote
 
     deep = 5
-    for _ in range(2000):
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
         deep = {"amount": deep}
 
     async def fake_get_checkout(domain, checkout_id):
@@ -621,3 +637,25 @@ async def test_resolve_merchant_quote_refuses_a_dump_that_recurses(monkeypatch):
         await resolve_merchant_quote("example.com", "chk_1")
 
     assert "nested beyond the readable depth" in str(excinfo.value)
+
+
+def test_the_snapshot_dump_refuses_a_non_finite_amount_it_calls_itself_a_belt_for():
+    """`_dump_snapshot` calls `allow_nan=False` "the BELT", then caught only RecursionError.
+
+    So the belt itself was uncaught: `allow_nan=False` raises ValueError, which is a 500 one
+    exception type over from the one that had just been guarded. Unreachable through the route
+    today -- `resolve_merchant_quote` dumps the same `totals` first and `to_minor_units` refuses
+    a non-finite `picked` -- which is exactly why it needs a direct test: dropping the clause
+    leaves every end-to-end fixture green.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    quote = {"quote_snapshot": {"totals": [{"type": "tax", "amount": float("nan")}]}}
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot(quote, {"max_minor": 7500})
+
+    assert excinfo.value.status_code == 502
+    assert "unserialisable" in str(excinfo.value.detail)
