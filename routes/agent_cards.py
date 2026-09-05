@@ -69,6 +69,27 @@ def _snapshot_with_headroom(quote: Dict[str, Any], cap: Dict[str, Any]) -> Dict[
     """
     base = quote.get("quote_snapshot")
     if not isinstance(base, dict):
+        # LOG IT, because nothing else will and the mint SUCCEEDS. `resolve_merchant_quote`
+        # always builds a dict, so reaching here means one of the causes this docstring names --
+        # all of them OURS. And measured: a non-dict snapshot does NOT fail the request. It
+        # renders to `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the card
+        # issues 200. (Only a DEEP non-dict reaches a 502, via `repr()` recursing below.)
+        #
+        # SCOPED, because an earlier draft of this comment called it "a live card with no
+        # provenance" and that overstates it. The audited NUMBERS survive: `quote_total_minor`,
+        # `amount_cap_minor` and `currency` are their own columns on the row, `headroom` survives
+        # inside the degraded snapshot, and `cap_for_quote` never reads `quote_snapshot` at all --
+        # so the cap is not corrupted and nothing declines or overspends. What is lost is the
+        # merchant's raw payload -- `totals`, `picked`, `covers` -- the EVIDENCE BEHIND those
+        # numbers. Forensic only: nothing in the codebase reads this column back.
+        #
+        # The TYPE, never the value. `base` is unbounded and partly merchant-derived, and this
+        # goes to a log sink; the shape is the whole diagnostic anyway.
+        logger.warning(
+            "agent-card quote_snapshot was not a dict (type=%s); the card still mints and its "
+            "audited amounts are intact, but the merchant payload behind them is not recorded",
+            type(base).__name__,
+        )
         base = {"unexpected_snapshot_shape": repr(base)[:200]}
     return {**base, "headroom": cap}
 
@@ -109,6 +130,10 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     try:
         snapshot = _snapshot_with_headroom(quote, cap)
     except RecursionError:
+        # Logged separately from the encoder's identical-detail raise below: the two are
+        # indistinguishable in the response, and they mean different things -- this one is the
+        # SNAPSHOT BUILDER's own `repr()` recursing, that one is the encoder walking `totals`.
+        logger.warning("agent-card snapshot builder recursed while rendering an unexpected shape")
         # RecursionError ONLY, which is the asymmetry the hoist above exists to create. The
         # builder's non-dict fallback does `repr(base)[:200]`, and `repr()` RECURSES -- so
         # hoisting it out of the encoder's guard moved that recursion out of cover: a 12,000-deep
@@ -126,6 +151,7 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     try:
         return json.dumps(snapshot, allow_nan=False)
     except RecursionError:
+        logger.warning("agent-card quote_snapshot nested beyond the encoder's depth")
         raise HTTPException(
             status_code=502, detail="merchant quote nested beyond the readable depth"
         )
