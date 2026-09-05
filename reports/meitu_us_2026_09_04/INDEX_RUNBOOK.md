@@ -113,6 +113,16 @@ flowerbeauty.com/products/petal-pout-delicate-dew-lip-color. Three caveats a rea
    confidence null / status unknown on external-seed content). Shadow rows reach the agent search surface;
    whether the public web surface reads them is a separate check.
 
+**Stila + Tarte APPLIED 2026-09-05T00:2xZ** (executions 7pqcc / hczgn, after dry-runs skj6s / bksmb matched the
+local plans): Stila `pdps=124 skus=124 offers=125 seeds=125`, Tarte `pdps=249 … merchants=2` (the Tarte feed
+carries two vendor spellings, "Tarte" and "Tarte Cosmetics", so two observed merchants were minted — a
+brand-alias question for the identity graph, not an ingest error). Same W2 `status` warning on both.
+Promotion apply (67m4m): population 1,100 → `serving_eligible=354` (was 48), trust 746 blocked / 354 shadow;
+healed 366 stale PDP views. Re-probe: "Tarte lipstick" now returns maracuja juicy lip sculptor lipstick & lip
+gloss $29 (the #19 successor); "Stila Cosmetics Stay All Day® Liquid Lipstick" returns 10 Stila rows
+(merchant `merch_obs_e65708e6dc609674`). Hygiene: a "Free Travel … (TikTok Shop)" promo row at **$0.01**
+ingested and serves — the feed's unpriced-gift filter stops at $0, not at token prices.
+
 Step 3 — verify (any prod psql / ops shell):
 
 ```sql
