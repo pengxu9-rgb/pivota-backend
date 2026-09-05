@@ -9,6 +9,7 @@ from services.shopify_access_token_service import (
 )
 from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
 from services.store_lifecycle_service import sync_catalog_merchant_status
+from services.bigcommerce_event_adapter import SUPPORTED_BIGCOMMERCE_SCOPES
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError
@@ -1475,6 +1476,48 @@ def _woocommerce_webhook_callback_url(store_id: str) -> str:
     return callback_url
 
 
+def _bigcommerce_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("BIGCOMMERCE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure BIGCOMMERCE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/bigcommerce/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
+def _bigcommerce_credentials(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value or not value.startswith("{"):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
 def _woocommerce_credentials(raw: object) -> dict:
     if isinstance(raw, dict):
         return dict(raw)
@@ -1575,6 +1618,7 @@ async def _woocommerce_webhook_install_lock(store_id: str):
 
 
 _WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+_BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
 
 
 class ConnectBigCommerceRequest(BaseModel):
@@ -2732,9 +2776,14 @@ async def merchant_connect_bigcommerce(
         return {
             "status": "success",
             "message": "BigCommerce store connected successfully",
-            "store_id": store_id
+            "store_id": store_id,
+            "webhook_path": f"/webhooks/bigcommerce/{store_id}",
+            "webhook_subscription_path": (
+                f"/integrations/bigcommerce/{store_id}/webhooks/ensure"
+            ),
+            "required_webhook_scopes": list(SUPPORTED_BIGCOMMERCE_SCOPES),
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -2742,6 +2791,118 @@ async def merchant_connect_bigcommerce(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to connect BigCommerce: {str(e)}")
+
+
+@router.post("/bigcommerce/{store_id}/webhooks/ensure")
+async def ensure_bigcommerce_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Register (or re-sync) the BigCommerce hooks that feed the ledger.
+
+    BigCommerce does not sign deliveries, so the receiver's credential is a
+    per-store random secret carried in a header the hook itself declares. It is
+    minted here on first use, persisted into the store's credential JSON, and
+    NEVER returned: the response says which scopes and callback were installed,
+    nothing more.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'bigcommerce'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected BigCommerce store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    credentials = _bigcommerce_credentials(store.get("api_key"))
+    store_hash = str(credentials.get("store_hash") or "").strip()
+    access_token = str(credentials.get("access_token") or "").strip()
+    if not store_hash or not access_token:
+        raise HTTPException(status_code=409, detail="BigCommerce API credentials are incomplete")
+
+    webhook_secret = str(credentials.get("webhook_secret") or "").strip()
+    minted_secret = not webhook_secret
+    if minted_secret:
+        webhook_secret = secrets.token_urlsafe(32)
+
+    from services.bigcommerce_webhook_subscriptions import (
+        BigCommerceWebhookSubscriptionError,
+        ensure_bigcommerce_subscriptions,
+    )
+
+    callback_url = _bigcommerce_webhook_callback_url(store_id)
+    if minted_secret:
+        # Persist BEFORE registering: a hook that carries a secret the
+        # receiver does not know would 401 every delivery.
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET api_key = :api_key
+            WHERE store_id = :store_id
+            """,
+            {
+                "store_id": store_id,
+                "api_key": json.dumps(
+                    {**credentials, "webhook_secret": webhook_secret},
+                    separators=(",", ":"),
+                ),
+            },
+        )
+
+        # Two first-time calls can race: each mints its own secret and the
+        # last UPDATE wins. Hooks must carry the secret the RECEIVER holds, so
+        # re-read the row and register with whatever actually persisted; the
+        # loser's minted value is discarded, never registered.
+        persisted = await database.fetch_one(
+            "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+            {"store_id": store_id},
+        )
+        persisted_secret = str(
+            _bigcommerce_credentials(dict(persisted).get("api_key") if persisted else None)
+            .get("webhook_secret")
+            or ""
+        ).strip()
+        if not persisted_secret:
+            raise HTTPException(
+                status_code=503, detail="BigCommerce webhook secret could not be persisted"
+            )
+        webhook_secret = persisted_secret
+    try:
+        async with asyncio.timeout(90.0):
+            async with _BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY:
+                result = await ensure_bigcommerce_subscriptions(
+                    store_hash=store_hash,
+                    access_token=access_token,
+                    client_id=credentials.get("client_id"),
+                    callback_url=callback_url,
+                    secret=webhook_secret,
+                    scopes=SUPPORTED_BIGCOMMERCE_SCOPES,
+                )
+    except BigCommerceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="BigCommerce webhook management request failed",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="BigCommerce webhook installation timed out",
+        ) from exc
+    return {"status": "success", "store_id": store_id, **result}
 
 
 @router.post("/prestashop/connect")
