@@ -355,6 +355,71 @@ def extract_citation_observations(
 # =====================================================================
 
 
+# Bands the rollup uses. `blocked` and `partial` are the report's own words for
+# "an agent cannot resolve this" and "it resolves sometimes" — they are findings
+# by the report's own reckoning, so a projection that showed nothing for them
+# would be contradicting the same run's headline.
+_ROLLUP_FINDING_BANDS = {"blocked": "high", "partial": "medium"}
+
+# What each dimension means to the merchant, in the report's own language, so a
+# finding does not invent a claim the rollup did not make.
+_ROLLUP_DIMENSION_FINDING = {
+    "identity": "product_identity_unresolvable",
+    "citation": "category_citation_weak",
+    "routability": "destination_unroutable",
+    "content_richness": "content_too_thin_to_cite",
+}
+
+
+def _findings_from_brand_rollup(
+    brand_report: Dict[str, Any], rollup: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Findings from the shape production writes.
+
+    Deliberately conservative: it reports ONLY what the rollup already asserts —
+    a dimension's own band and median — and derives nothing. Mapping these onto
+    the legacy avg_visibility/avg_attribution numbers would be inventing a
+    comparison the report never made, which is how the /100-score-rendered-as-a-
+    percentage defect got in next door.
+    """
+    out: List[Dict[str, Any]] = []
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict):
+        return out
+    for key, dim in dims.items():
+        if not isinstance(dim, dict):
+            continue
+        severity = _ROLLUP_FINDING_BANDS.get(str(dim.get("band") or "").lower())
+        if not severity:
+            continue
+        label = dim.get("dimension_label") or key
+        meaning = dim.get("meaning") or ""
+        out.append({
+            "finding_type": _ROLLUP_DIMENSION_FINDING.get(
+                str(key), f"dimension_{key}_below_band",
+            ),
+            "severity": severity,
+            "payload": {
+                "dimension": key,
+                "band": dim.get("band"),
+                "median": dim.get("median"),
+                "p25": dim.get("p25"),
+                "p75": dim.get("p75"),
+                # n, because a band from 3 SKUs is not a band from 300 and the
+                # reader is entitled to know which one this is.
+                "above_count": dim.get("above_count"),
+                "total_count": dim.get("total_count"),
+                "verdict_label": brand_report.get("brand_verdict_label"),
+            },
+            "confidence": CONFIDENCE_FINDING_HIGH,
+            "short_summary": (
+                f"{label}: {dim.get('band')}"
+                + (f" — {meaning}" if meaning else "")
+            ),
+        })
+    return out
+
+
 def extract_findings(
     brand_report: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -365,7 +430,58 @@ def extract_findings(
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(brand_report, dict):
+        # A MISSING report is not an all-clear either. Returning [] put it on
+        # exactly the same footing as "read the report, found nothing", which
+        # is the ambiguity this function was silently trading on.
+        return [{
+            "finding_type": "report_shape_unreadable",
+            "severity": "high",
+            "payload": {"received_type": type(brand_report).__name__},
+            "confidence": CONFIDENCE_FINDING_HIGH,
+            "short_summary": (
+                "No brand report was available to extract findings from. "
+                "This is NOT an all-clear."
+            ),
+        }]
+
+    # WHICH REPORT SHAPE IS THIS?
+    #
+    # Everything below reads the LEGACY shape: `aggregate` + `per_product`. The
+    # per-SKU report that production actually writes has neither — its top level
+    # is `brand_rollup` / `brand_verdict_label`, with the per-product detail in
+    # `per_sku_reports` on the RESPONSE, not the report
+    # (agent_center_bd_report_service). So on every real run this function fell
+    # through every branch and returned [], and
+    # build_revenue_recovery_projection turned that empty list into
+    # `NO_FINDINGS` — "we checked and found nothing" — for audits that had found
+    # blocked dimensions. Verified against a live run on 2026-09-05:
+    # get_selected and get_cited both rendered NO_FINDINGS while the same run
+    # scored the brand 1.6/10 with identity and routability BLOCKED.
+    #
+    # The empty list was never the bug on its own; the AMBIGUITY was. "[] because
+    # nothing is wrong" and "[] because I could not read this" are different
+    # facts and only one of them is an all-clear. `unreadable_shape` is appended
+    # as a finding so the caller cannot mistake the second for the first, and so
+    # the projection has a row to cite instead of inventing a pass.
+    _legacy = ("aggregate" in brand_report) or ("per_product" in brand_report)
+    _rollup = brand_report.get("brand_rollup")
+    _modern = isinstance(_rollup, dict) and bool(_rollup)
+    if not _legacy and not _modern:
+        out.append({
+            "finding_type": "report_shape_unreadable",
+            "severity": "high",
+            "payload": {"top_level_keys": sorted(brand_report.keys())[:20]},
+            "confidence": CONFIDENCE_FINDING_HIGH,
+            "short_summary": (
+                "The findings extractor did not recognise this report's shape, "
+                "so no finding could be derived from it. This is NOT an "
+                "all-clear."
+            ),
+        })
         return out
+
+    if _modern:
+        out.extend(_findings_from_brand_rollup(brand_report, _rollup))
 
     aggregate = brand_report.get("aggregate") or {}
     avg_vis = aggregate.get("avg_visibility")

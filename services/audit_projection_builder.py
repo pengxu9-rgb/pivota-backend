@@ -386,11 +386,28 @@ _STAGES = (_STAGE_GET_SELECTED, _STAGE_GET_CITED, _STAGE_CONVERT_SALES)
 # these four are everything it can produce. Keeping the list explicit is what
 # lets a stage say "nothing can be measured here yet" instead of "all clear".
 _PRODUCIBLE_FINDING_TYPES = frozenset({
+    # Legacy `aggregate`/`per_product` shape.
     "merchant_visible_via_retailers_only",
     "category_visibility_low",
     "first_party_pdp_indexing_gap",
     "integration_state_incomplete",
+    # The shape production actually writes (`brand_rollup.dimensions`). Absent
+    # from this set, a stage whose only producer is the rollup would report
+    # NO_FINDINGS — "checked, fine" — because _stage_is_measurable would say
+    # nothing can produce for it. That is the same false all-clear from the
+    # other direction.
+    "product_identity_unresolvable",
+    "category_citation_weak",
+    "destination_unroutable",
+    "content_too_thin_to_cite",
+    # Meta: the extractor did not recognise the report. Producible, and handled
+    # specially below — it must never let ANY stage claim an all-clear.
+    "report_shape_unreadable",
 })
+
+# The finding that says we could not read the report at all. It is not evidence
+# about the merchant; it is evidence about us.
+_UNREADABLE_FINDING = "report_shape_unreadable"
 
 _STAGE_FOR_FINDING_TYPE = {
     # Not chosen for the category's queries at all.
@@ -401,6 +418,22 @@ _STAGE_FOR_FINDING_TYPE = {
     "merchant_visible_via_retailers_only": _STAGE_GET_CITED,
     # The merchant's own page cannot be cited because it is not indexable.
     "first_party_pdp_indexing_gap": _STAGE_GET_CITED,
+
+    # Rollup dimensions, mapped by what the dimension MEANS, not by where the
+    # default would drop them. Unmapped types fall to GET SELECTED, so leaving
+    # these out silently filed every citation problem under selection.
+    #   identity — an agent cannot tell which product this is, so it is never
+    #   the one chosen.
+    "product_identity_unresolvable": _STAGE_GET_SELECTED,
+    #   content richness — too thin to be picked out of a category.
+    "content_too_thin_to_cite": _STAGE_GET_SELECTED,
+    #   citation — mentioned, but rarely as the answer.
+    "category_citation_weak": _STAGE_GET_CITED,
+    #   routability — cited, but the answer has no buyable offer to send anyone
+    #   to. NOT convert_sales: that stage means a real purchase path was
+    #   exercised, and only the browser commerce lane can say that. Filing it
+    #   there would make a stage that has never run look measured.
+    "destination_unroutable": _STAGE_GET_CITED,
 }
 
 
@@ -479,6 +512,11 @@ def build_revenue_recovery_projection(
         )
         stages[stage]["actions"].append(_action_for_merchant(a))
 
+    unreadable = any(
+        str((f or {}).get("finding_type") or "").strip().lower()
+        == _UNREADABLE_FINDING
+        for f in (findings or [])
+    )
     for name in _STAGES:
         if not _stage_is_measurable(name):
             stages[name]["status"] = "UNVERIFIED"
@@ -486,6 +524,16 @@ def build_revenue_recovery_projection(
                 name,
                 "Nothing that runs today can produce a finding for this "
                 "stage, so its absence is not an all-clear.",
+            )
+        elif unreadable:
+            # We could not read the report. NOTHING about this merchant was
+            # established, so no stage may claim an all-clear — including the
+            # stages this particular finding did not land in.
+            stages[name]["status"] = "UNVERIFIED"
+            stages[name]["unverified_reason"] = (
+                "The findings extractor did not recognise this audit's report "
+                "shape, so nothing was read for this stage. Absence here is "
+                "not an all-clear."
             )
         else:
             stages[name]["status"] = (

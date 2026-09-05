@@ -1,0 +1,59 @@
+{
+    "audit_run_id": "REDACTED-RUN-ID",
+    "brand_verdict_label": "PARTIAL",
+    "brand_state": "scored",
+    "coverage_profile": "explicit",
+    "brand_rollup": {
+        "dimensions": {
+            "citation": {
+                "p25": 42,
+                "p75": 50,
+                "band": "partial",
+                "median": 48,
+                "meaning": "AI mentions this product occasionally, but rarely as the answer.",
+                "question": "Does AI actually recommend you?",
+                "band_label": "Needs work",
+                "above_count": 2,
+                "total_count": 3,
+                "dimension_label": "Citation"
+            },
+            "identity": {
+                "p25": 16,
+                "p75": 16,
+                "band": "blocked",
+                "median": 16,
+                "meaning": "AI can't reliably tell which product this is.",
+                "question": "Can AI tell exactly which product this is?",
+                "band_label": "Not yet visible",
+                "above_count": 3,
+                "total_count": 3,
+                "dimension_label": "Identity"
+            },
+            "routability": {
+                "p25": 6,
+                "p75": 6,
+                "band": "blocked",
+                "median": 6,
+                "meaning": "AI has no buyable offer to route a shopper to.",
+                "question": "Can AI hand a shopper a buyable offer?",
+                "band_label": "Not yet visible",
+                "above_count": 3,
+                "total_count": 3,
+                "dimension_label": "Routability"
+            },
+            "content_richness": {
+                "p25": 20,
+                "p75": 23,
+                "band": "blocked",
+                "median": 23,
+                "meaning": "The listing is too thin for AI to describe this product.",
+                "question": "Does the listing answer what shoppers ask?",
+                "band_label": "Not yet visible",
+                "above_count": 2,
+                "total_count": 3,
+                "dimension_label": "Content"
+            }
+        },
+        "merchant_type": "brand"
+    }
+}
