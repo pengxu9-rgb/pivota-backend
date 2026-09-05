@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+from services.commerce_attribution_service import PIVOTA_ORDER_ID_NOTE_ATTR
+from services.commerce_order_ref import build_order_ref, pivota_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 from services.woocommerce_conversion_poller import extract_click_id_from_wc_order
 
@@ -16,6 +18,32 @@ _PAID_STATUSES = frozenset({"processing", "completed"})
 
 class UnsupportedWooCommerceEvent(ValueError):
     pass
+
+
+def _wc_order_ref(order: Dict[str, Any], order_id: str) -> Optional[str]:
+    """The canonical ref: Pivota's when the writeback marker is on the order.
+
+    Pivota's WooCommerce order writeback stamps ``pivota_order_id`` into the
+    order's ``meta_data``. Its presence means this purchase originated in
+    Pivota and is already in the ledger under ``pivota:<order id>`` from the
+    Stripe bridge; without it the order was placed on the storefront and
+    WooCommerce is its system of record.
+
+    Unlike Shopify there is no indexed column holding the WooCommerce order id
+    on the Pivota row (the writeback records it inside `orders.metadata`), so
+    orders written back before the marker existed have no fallback and keep
+    their `woocommerce:` identity. Honest, and no worse than today.
+    """
+    meta = order.get("meta_data")
+    if isinstance(meta, list):
+        for entry in meta:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("key") or "").strip() == PIVOTA_ORDER_ID_NOTE_ATTR:
+                pivota_id = str(entry.get("value") or "").strip()
+                if pivota_id:
+                    return pivota_order_ref(pivota_id)
+    return build_order_ref("woocommerce", order_id)
 
 
 def _text(value: Any) -> Optional[str]:
@@ -153,6 +181,7 @@ def map_woocommerce_webhook(
     if customer_id == "0":
         customer_id = None
     click_id = extract_click_id_from_wc_order(order)
+    order_ref = _wc_order_ref(order, order_id)
     currency = str(order.get("currency") or "").strip().upper() or None
     decimals = order.get("currency_minor_unit", 2)
     trace_id = _text(delivery_id) or hashlib.sha256(
@@ -277,6 +306,7 @@ def map_woocommerce_webhook(
                 click_id=click_id,
                 payment_id=transaction_id,
                 order_id=order_id,
+                order_ref=order_ref,
                 trace_id=trace_id,
                 amount_cents=_amount_cents(amount_value, decimals),
                 currency=currency,

@@ -15,6 +15,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from routes.refund_api import RefundRequest, process_refund as process_refund_route
 from services.commerce_ledger_provenance import ledger_provenance
+from services.commerce_order_ref import pivota_order_ref
 from services.commerce_interaction_service import (
     find_interaction_by_order_id,
     record_commerce_event,
@@ -277,6 +278,7 @@ async def create_commerce_checkout(
             "surface": _surface_from_source(body.source),
             "checkout_id": checkout_id,
             "order_id": checkout_id,
+            "order_ref": pivota_order_ref(checkout_id),
             "buyer_id": body.buyer_ref,
             "brief_id": body.brief_id,
             "canonical_product_id": first_item.get("canonical_product_id"),
@@ -302,6 +304,7 @@ async def create_commerce_checkout(
             "surface": _surface_from_source(body.source),
             "checkout_id": checkout_id,
             "order_id": checkout_id,
+            "order_ref": pivota_order_ref(checkout_id),
             "buyer_id": body.buyer_ref,
             "canonical_product_id": first_item.get("canonical_product_id"),
             "canonical_variant_id": first_item.get("canonical_variant_id"),
@@ -359,6 +362,7 @@ async def get_checkout_payment_intent(
             "surface": (interaction or {}).get("surface") or "agent_v2_commerce",
             "checkout_id": checkout_id,
             "order_id": checkout_id,
+            "order_ref": pivota_order_ref(checkout_id),
             "payment_action": payment_action,
             "preferred_psps": body.preferred_psps or [],
         },
@@ -438,6 +442,7 @@ async def create_checkout_refund(
             "surface": (interaction or {}).get("surface") or "agent_v2_commerce",
             "checkout_id": checkout_id,
             "order_id": checkout_id,
+            "order_ref": pivota_order_ref(checkout_id),
             "refund_id": response.get("refund_id"),
             "amount": response.get("refund_amount"),
             "reason": body.reason,
@@ -482,6 +487,7 @@ async def sync_checkout_returns(
                 "surface": (interaction or {}).get("surface") or "agent_v2_commerce",
                 "checkout_id": checkout_id,
                 "order_id": checkout_id,
+                "order_ref": pivota_order_ref(checkout_id),
             },
             source="agent_v2_commerce",
             upstream_idempotency_key=f"return-sync-pending:{checkout_id}:{platform or 'unknown'}",
@@ -532,6 +538,7 @@ async def sync_checkout_returns(
             "surface": (interaction or {}).get("surface") or "agent_v2_commerce",
             "checkout_id": checkout_id,
             "order_id": checkout_id,
+            "order_ref": pivota_order_ref(checkout_id),
             "return_sync": sync_result,
             "return_eligibility": eligibility,
         },

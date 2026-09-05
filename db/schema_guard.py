@@ -470,6 +470,56 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
+            # mig 216: the canonical order_ref. Early and wrapped like mig 213
+            # for the same reason: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until BOTH columns exist. Two columns in
+            # the migration, two here; and unlike mig 214's index this one is
+            # built normally (order_ref is new and all-NULL, so there is
+            # nothing to scan), so the guard carries it too.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interactions_order_ref "
+                        "ON commerce_interactions (order_ref);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interaction_events_order_ref "
+                        "ON commerce_interaction_events (order_ref);"
+                    )
+                )
+                # The stitch rests on this one: without it two authorities can
+                # both insert an interaction for the same canonical order and
+                # neither insert raises.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_commerce_interactions_order_ref_unique "
+                        "ON commerce_interactions (merchant_id, COALESCE(store_id, ''), order_ref) "
+                        "WHERE order_ref IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
             # mig 210: anonymous audit runs. Position and wrapping are BOTH
             # load-bearing, and neither alone is enough — measured, not assumed.
             #

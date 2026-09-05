@@ -61,6 +61,11 @@ FORBIDDEN_WEB_EVENT_FIELDS = frozenset(
     {
         "buyer_id",
         "order_id",
+        # order_ref is a STRONG store-scoped stitch key and the funnel's
+        # de-duplication key. A page script is not an order authority: letting
+        # it name one would let any visitor's browser attach itself to — and
+        # re-key — a real purchase.
+        "order_ref",
         "refund_id",
         "return_id",
     }

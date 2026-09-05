@@ -19,6 +19,7 @@ from observability.reliability_metrics import (
 )
 from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.commerce_ledger_provenance import ledger_provenance
+from services.commerce_order_ref import pivota_order_ref
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -38,6 +39,10 @@ PVT_PROMPT_CLUSTER = "pvt_prompt_cluster"
 # the join key on the way back in (orders/paid webhook). Keep in lockstep with
 # services/outbound_links_service.build_shopify_cart_permalink.
 EXTERNAL_CLICK_NOTE_ATTR = "pivota_click_id"
+# The marker Pivota's Shopify/WooCommerce order writeback stamps on the
+# platform order, so a later webhook for that order can be recognised as
+# Pivota-originated without a database lookup. See services/commerce_order_ref.py.
+PIVOTA_ORDER_ID_NOTE_ATTR = "pivota_order_id"
 EDGE_STATE_REFERRED = "referred"
 EDGE_STATE_CONVERTED = "converted"
 EDGE_SOURCE_EXTERNAL_REDIRECT = "external_redirect"
@@ -459,6 +464,12 @@ async def upsert_order_attribution_edge(
             "merchant_id": merchant_id,
             "interaction_id": _first_nonempty(payload, "interaction_id"),
             "order_id": order_id,
+            # Always a Pivota `orders.order_id` (every caller passes one), so
+            # this edge names the same purchase the Stripe bridge and the
+            # Shopify adapter do. Without it this row counted a second
+            # `order.created` against the platform adapter's, under a scope
+            # with no store_id at all.
+            "order_ref": pivota_order_ref(order_id),
             "platform": _first_nonempty(payload, "platform"),
             "trace_id": _first_nonempty(payload, "trace_id"),
             "brief_id": _first_nonempty(payload, "brief_id"),
@@ -661,27 +672,43 @@ async def trace_click_id(click_id: str) -> Dict[str, Any]:
 # recovers it here and materializes a self-contained `converted` edge (gap #4).
 
 
-def extract_click_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
-    """Pull `pivota_click_id` out of a Shopify order's ``note_attributes``.
+def extract_note_attribute(note_attributes: Any, name: str) -> Optional[str]:
+    """Pull one named attribute out of a Shopify order's ``note_attributes``.
 
     Shopify sends note_attributes as ``[{"name": ..., "value": ...}, ...]``.
     Tolerate a dict shape too (some connectors flatten it). Returns None when
-    the attribute is absent/blank — a normal, non-attributed order.
+    the attribute is absent/blank.
     """
     if isinstance(note_attributes, dict):
-        value = note_attributes.get(EXTERNAL_CLICK_NOTE_ATTR)
+        value = note_attributes.get(name)
         text = str(value).strip() if value is not None else ""
         return text or None
     if isinstance(note_attributes, (list, tuple)):
         for attr in note_attributes:
             if not isinstance(attr, dict):
                 continue
-            if str(attr.get("name") or "").strip() == EXTERNAL_CLICK_NOTE_ATTR:
+            if str(attr.get("name") or "").strip() == name:
                 value = attr.get("value")
                 text = str(value).strip() if value is not None else ""
                 if text:
                     return text
     return None
+
+
+def extract_click_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
+    """The `pivota_click_id` an attributed order carries, else None."""
+    return extract_note_attribute(note_attributes, EXTERNAL_CLICK_NOTE_ATTR)
+
+
+def extract_pivota_order_id_from_note_attributes(note_attributes: Any) -> Optional[str]:
+    """The Pivota order id the writeback stamped, else None.
+
+    Its presence is what makes a platform order recognisable as
+    Pivota-originated from the webhook payload alone. Absent (an order written
+    back before the marker existed, or one the buyer placed on the storefront)
+    the Shopify ingest falls back to the `orders.shopify_order_id` lookup.
+    """
+    return extract_note_attribute(note_attributes, PIVOTA_ORDER_ID_NOTE_ATTR)
 
 
 def shopify_order_total_to_cents(data: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:

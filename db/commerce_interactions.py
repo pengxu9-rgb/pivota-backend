@@ -28,6 +28,11 @@ commerce_interactions = Table(
     Column("checkout_id", String(128), nullable=True, index=True),
     Column("payment_id", String(128), nullable=True, index=True),
     Column("order_id", String(128), nullable=True, index=True),
+    # The canonical identity of the purchase across authorities (migration
+    # 216). `order_id` above is what ONE authority calls the order; two
+    # authorities reporting the same purchase disagree on it. `order_ref`
+    # is `<namespace>:<id in that namespace>` and they agree on it.
+    Column("order_ref", String(160), nullable=True, index=True),
     Column("refund_id", String(128), nullable=True, index=True),
     Column("return_id", String(128), nullable=True, index=True),
     Column("canonical_product_id", String(64), nullable=True, index=True),
@@ -82,6 +87,21 @@ Index(
     commerce_interactions.c.order_id,
     unique=True,
 )
+# Mirrors idx_commerce_interactions_order_id_unique: one interaction per
+# (merchant, store, canonical order). This is what makes a Stripe
+# payment.succeeded and a Shopify orders/paid for the same purchase converge
+# on one row instead of fragmenting under their two native order ids. Unlike
+# its order_id sibling the predicate is spelled out, so the model and
+# migration 216 build byte-identical index definitions.
+Index(
+    "idx_commerce_interactions_order_ref_unique",
+    commerce_interactions.c.merchant_id,
+    func.coalesce(commerce_interactions.c.store_id, ""),
+    commerce_interactions.c.order_ref,
+    unique=True,
+    postgresql_where=commerce_interactions.c.order_ref.isnot(None),
+    sqlite_where=commerce_interactions.c.order_ref.isnot(None),
+)
 Index(
     "idx_commerce_interactions_refund_id_unique",
     commerce_interactions.c.merchant_id,
@@ -117,6 +137,9 @@ commerce_interaction_events = Table(
     Column("visitor_id", String(128), nullable=True, index=True),
     Column("cart_id", String(128), nullable=True, index=True),
     Column("payment_id", String(128), nullable=True, index=True),
+    # Migration 216. Written by the adapter/bridge that recognised the
+    # order, so the funnel can key one purchase across authorities.
+    Column("order_ref", String(160), nullable=True, index=True),
     Column("source", String(128), nullable=True),
     Column("upstream_idempotency_key", Text, nullable=True),
     Column("actor_type", String(32), nullable=True),

@@ -11,6 +11,7 @@ from sqlalchemy import or_, select
 from db.commerce_interactions import commerce_interaction_events
 from db.database import database
 from services.traffic_taxonomy_service import taxonomy_from_row
+from services.commerce_order_ref import PIVOTA_ORDER_REF_NAMESPACE
 
 
 logger = logging.getLogger("merchant_commerce_event_funnel_service")
@@ -93,11 +94,34 @@ def _matches_filters(row: Dict[str, Any], filters: Dict[str, Optional[str]]) -> 
     return True
 
 
+# The scope a canonical order_ref lives in. A ref already carries its own
+# namespace (`pivota:`, `shopify:`, ...) and is the SAME string from every
+# authority that recognised the purchase, so putting it under (platform,
+# store) would re-introduce exactly the fragmentation it exists to remove:
+# the Stripe bridge and the Shopify webhook report the same purchase under
+# platform="shopify" but the attribution edge reports it with no store at all.
+_CANONICAL_ORDER_SCOPE = "order_ref"
+
+
 def _event_scope(row: Dict[str, Any]) -> tuple[str, str]:
+    """The namespace this row's native ids live in: (platform, store)."""
     return (
         _text(row.get("platform")).lower() or "unknown",
         _text(row.get("store_id")) or "unknown",
     )
+
+
+def _order_scope(row: Dict[str, Any]) -> tuple[str, str]:
+    """The scope this row's resolved order reference is counted in.
+
+    A row whose reference is a canonical ``order_ref`` — its own, or one
+    inherited through the payment/refund/interaction maps — shares one global
+    scope with every other authority reporting that purchase. Everything else
+    keeps the (platform, store) scope that made native ids comparable.
+    """
+    if row.get("_resolved_order_is_ref"):
+        return (_CANONICAL_ORDER_SCOPE, _CANONICAL_ORDER_SCOPE)
+    return _event_scope(row)
 
 
 def _refund_authority(row: Dict[str, Any]) -> str:
@@ -126,42 +150,65 @@ def _refund_authority(row: Dict[str, Any]) -> str:
 
 
 def _attach_resolved_order_ids(rows: List[Dict[str, Any]]) -> None:
-    interaction_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
-    payment_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
-    refund_orders: Dict[tuple[str, str, str], Set[str]] = defaultdict(set)
-    for row in rows:
+    """Give every row the order identity it should be counted under.
+
+    A row's own identity is its canonical ``order_ref`` when it has one, else
+    its native ``order_id``. Rows that carry neither — a refund that names only
+    a payment — inherit one through the payment/refund/interaction maps.
+
+    The map KEYS are native identifiers, which mean something only inside one
+    (platform, store). The map VALUES carry the identity AND whether it is
+    canonical, so canonical-ness travels with the row that actually declared an
+    ``order_ref``; it is never re-derived from the shape of a string, and a
+    native order id that happens to read like a ref cannot borrow that scope.
+    """
+    Reference = tuple[str, bool]
+    interaction_orders: Dict[tuple[str, str, str], Set[Reference]] = defaultdict(set)
+    payment_orders: Dict[tuple[str, str, str], Set[Reference]] = defaultdict(set)
+    refund_orders: Dict[tuple[str, str, str], Set[Reference]] = defaultdict(set)
+
+    def _own_reference(row: Dict[str, Any]) -> Optional[Reference]:
+        order_ref = _text(row.get("order_ref"))
+        if order_ref:
+            return (order_ref, True)
         order_id = _text(row.get("order_id"))
-        if not order_id:
+        if order_id:
+            return (order_id, False)
+        return None
+
+    for row in rows:
+        reference = _own_reference(row)
+        if reference is None:
             continue
         platform, store_id = _event_scope(row)
         interaction_id = _text(row.get("interaction_id"))
         payment_id = _text(row.get("payment_id"))
         refund_id = _text(row.get("refund_id"))
         if interaction_id:
-            interaction_orders[(platform, store_id, interaction_id)].add(order_id)
+            interaction_orders[(platform, store_id, interaction_id)].add(reference)
         if payment_id:
-            payment_orders[(platform, store_id, payment_id)].add(order_id)
+            payment_orders[(platform, store_id, payment_id)].add(reference)
         if refund_id:
-            refund_orders[(platform, store_id, refund_id)].add(order_id)
+            refund_orders[(platform, store_id, refund_id)].add(reference)
 
     for row in rows:
         platform, store_id = _event_scope(row)
-        order_id = _text(row.get("order_id"))
+        own = _own_reference(row)
         interaction_id = _text(row.get("interaction_id"))
-        candidates: Set[str] = set()
-        if order_id:
-            candidates.add(order_id)
-        for reference, mapping in (
+        candidates: Set[Reference] = set()
+        if own is not None:
+            candidates.add(own)
+        for native_id, mapping in (
             (_text(row.get("payment_id")), payment_orders),
             (_text(row.get("refund_id")), refund_orders),
             (interaction_id, interaction_orders),
         ):
-            scoped_reference = (platform, store_id, reference)
-            if reference and len(mapping.get(scoped_reference, set())) == 1:
+            scoped_reference = (platform, store_id, native_id)
+            if native_id and len(mapping.get(scoped_reference, set())) == 1:
                 candidates.update(mapping[scoped_reference])
-        row["_resolved_order_id"] = order_id or (
-            next(iter(candidates)) if len(candidates) == 1 else ""
-        )
+        resolved = own or (next(iter(candidates)) if len(candidates) == 1 else None)
+        row["_resolved_order_id"] = resolved[0] if resolved else ""
+        row["_resolved_order_is_ref"] = bool(resolved) and resolved[1]
 
 
 _CART_EVENTS = {
@@ -250,21 +297,28 @@ class _Accumulator:
         if event_type == "return.completed":
             self.stage_interactions["return_completed"].add(interaction_id)
 
-        platform, store_id = _event_scope(row)
+        platform, store_id = _order_scope(row)
         resolved_order_id = _text(row.get("_resolved_order_id"))
         order_key = (platform, store_id, resolved_order_id or f"interaction:{interaction_id}")
+        # The *_order_ids sets exist for one reader: merchant_commerce_funnel_service
+        # subtracts them from the legacy attribution/orders rows, which are keyed
+        # on the BARE Pivota order id. A canonical `pivota:<id>` ref must therefore
+        # also expose `<id>`, or a Pivota-originated purchase stops cancelling its
+        # legacy twin and observed_* counts it twice.
+        overlap_ids = {resolved_order_id} if resolved_order_id else set()
+        if row.get("_resolved_order_is_ref"):
+            namespace, _, native = resolved_order_id.partition(":")
+            if namespace == PIVOTA_ORDER_REF_NAMESPACE and native:
+                overlap_ids.add(native)
         if event_type in _ORDER_EVENTS:
             self.order_keys.add(order_key)
-            if resolved_order_id:
-                self.order_ids.add(resolved_order_id)
+            self.order_ids.update(overlap_ids)
         if event_type in _PAID_EVENTS:
             self.paid_keys.add(order_key)
-            if resolved_order_id:
-                self.paid_order_ids.add(resolved_order_id)
+            self.paid_order_ids.update(overlap_ids)
         if event_type == "refund.succeeded":
             self.refund_keys.add(order_key)
-            if resolved_order_id:
-                self.refund_order_ids.add(resolved_order_id)
+            self.refund_order_ids.update(overlap_ids)
 
         currency = _text(row.get("currency")).upper()
         amount_cents = _int(row.get("amount_cents"))
