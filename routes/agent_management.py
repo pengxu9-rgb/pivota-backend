@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional, List, Dict, Any, Set, Tuple
 from datetime import datetime, timedelta
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import func, or_, select
+from sqlalchemy import column, func, or_, select, text
 
 from db.agents import (
     create_agent,
@@ -395,7 +395,60 @@ async def deactivate_agent(
 # Agent 列表和搜索
 # ============================================================================
 
-def _own_agent_rows_filter(current_user: dict):
+# Which email-bearing column the DEPLOYED agents table actually has, resolved
+# once. None until probed.
+_AGENT_EMAIL_COLUMNS: Optional[Tuple[str, ...]] = None
+
+# `owner_email` is NOT probed: it is proven present. agents.select() -- the
+# query this route has always run -- selects every column of the model,
+# owner_email among them, and that query works in production today (it is the
+# leak being fixed). A deployed table without the column would already be
+# raising, not leaking.
+#
+# `email` is the open question. routes/employee_agent_mgmt.py:433 creates
+# agents with `INSERT INTO agents (agent_id, name, email, ...)` and never
+# writes owner_email, and five read paths in that module coalesce
+# `agent.get("email") or agent.get("owner_email")` -- so rows whose address
+# lives only in `email` either exist or that creation path has been failing.
+# Which one is true depends on how the deployed table was built (the SQLAlchemy
+# model in db/agents.py, or the raw CREATE TABLE at main.py:1588, which have
+# different column sets), and prod Postgres is private-IP only, so it cannot be
+# settled from a checkout. scripts/backfill_auth_identities.py:85 settles it
+# the same way at runtime, with a try/except around the same question.
+#
+# Probing keeps the answer out of the guess: if `email` is absent the filter is
+# exactly what it would have been anyway, and if it is present an agent whose
+# address lives there is no longer locked out of its own record.
+_CANDIDATE_EMAIL_COLUMNS = ("owner_email", "email")
+
+
+async def _agent_email_columns() -> Tuple[str, ...]:
+    """The subset of _CANDIDATE_EMAIL_COLUMNS the live agents table has.
+
+    `LIMIT 0` reads no rows and works on every dialect the suite and production
+    use. The column names are module constants, never request input. Cached
+    for the process: a table does not grow a column mid-request, and this must
+    not become a second query on every list call.
+    """
+    global _AGENT_EMAIL_COLUMNS
+    if _AGENT_EMAIL_COLUMNS is not None:
+        return _AGENT_EMAIL_COLUMNS
+
+    present = []
+    for name in _CANDIDATE_EMAIL_COLUMNS:
+        try:
+            await database.fetch_one(text(f"SELECT {name} FROM agents LIMIT 0"))
+            present.append(name)
+        except Exception:
+            # Absent, or the table is unreadable. Either way this column cannot
+            # carry an ownership match; the id claims still can.
+            logger.info(f"[GET /agents/] agents.{name} not usable for ownership matching")
+
+    _AGENT_EMAIL_COLUMNS = tuple(present)
+    return _AGENT_EMAIL_COLUMNS
+
+
+def _own_agent_rows_filter(current_user: dict, email_columns: Tuple[str, ...] = ("owner_email",)):
     """The WHERE clause that is this route's version of an ownership check.
 
     On GET /agents/{agent_id} ownership is a 403; on a list there is no
@@ -415,7 +468,17 @@ def _own_agent_rows_filter(current_user: dict):
     if ids:
         conditions.append(agents.c.agent_id.in_(sorted(ids)))
     if email:
-        conditions.append(func.lower(agents.c.owner_email) == email)
+        for name in email_columns:
+            # agents.c.<name> for a column the model declares, an unbound
+            # column() for one it does not -- the latter renders as a bare
+            # identifier against the FROM already in the query, and cannot
+            # pollute the FROM list.
+            col = agents.c[name] if name in agents.c else column(name)
+            # trim as well as lower: _is_own_agent_record normalizes the stored
+            # value with .strip().lower(), and a SQL half that only lowercased
+            # would disagree with it on a padded address -- the exact drift
+            # _own_agent_identity exists to prevent.
+            conditions.append(func.lower(func.trim(col)) == email)
 
     if not conditions:
         return None
@@ -468,7 +531,7 @@ async def list_agents(
 
     scope = None
     if current_role not in EMPLOYEE_ROLES:
-        scope = _own_agent_rows_filter(current_user)
+        scope = _own_agent_rows_filter(current_user, await _agent_email_columns())
         if scope is None:
             # An agent token with no id and no email names no record. Returning
             # the unfiltered roster here is exactly the bug being fixed.

@@ -91,7 +91,11 @@ def _auth(token: str) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _sqlite_agents_table(metadata: sqlalchemy.MetaData) -> sqlalchemy.Table:
+def _sqlite_agents_table(
+    metadata: sqlalchemy.MetaData,
+    drop: Tuple[str, ...] = (),
+    add: Tuple[str, ...] = (),
+) -> sqlalchemy.Table:
     """Mirror db.agents.agents column-for-column, minus the server defaults.
 
     Derived from the real table rather than hand-written: the handler selects
@@ -102,19 +106,23 @@ def _sqlite_agents_table(metadata: sqlalchemy.MetaData) -> sqlalchemy.Table:
     """
     from db.agents import agents as real_agents
 
-    return sqlalchemy.Table(
-        "agents",
-        metadata,
-        *[
-            sqlalchemy.Column(
-                col.name,
-                col.type,
-                primary_key=col.primary_key,
-                nullable=col.nullable,
-            )
-            for col in real_agents.columns
-        ],
-    )
+    columns = [
+        sqlalchemy.Column(
+            col.name,
+            col.type,
+            primary_key=col.primary_key,
+            nullable=col.nullable,
+        )
+        for col in real_agents.columns
+        if col.name not in drop
+    ]
+    # `add` carries columns the MODEL does not declare but the deployed table
+    # may -- `email`, written by routes/employee_agent_mgmt.py:433. A fixture
+    # derived from the model alone cannot represent those rows, which is how
+    # the first cut of this file was green against the lockout it should have
+    # caught.
+    columns += [sqlalchemy.Column(name, sqlalchemy.String(255)) for name in add]
+    return sqlalchemy.Table("agents", metadata, *columns)
 
 
 def _rows() -> List[Dict[str, Any]]:
@@ -163,7 +171,15 @@ def _rows() -> List[Dict[str, Any]]:
 class _AgentsDbSpy:
     """Stands in for routes.agent_management.database, backed by real sqlite."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        drop: Tuple[str, ...] = (),
+        add: Tuple[str, ...] = (),
+        overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        self._drop = drop
+        self._add = add
+        self._overrides = overrides or {}
         # StaticPool + check_same_thread: TestClient runs the app on its own
         # thread, and the default in-memory pool would hand that thread a
         # second, empty database.
@@ -173,10 +189,15 @@ class _AgentsDbSpy:
             poolclass=sqlalchemy.pool.StaticPool,
         )
         metadata = sqlalchemy.MetaData()
-        self.table = _sqlite_agents_table(metadata)
+        self.table = _sqlite_agents_table(metadata, drop=drop, add=add)
         metadata.create_all(self.engine)
+        rows = []
+        for row in _rows():
+            row = {k: v for k, v in row.items() if k not in drop}
+            row.update(self._overrides.get(row["agent_id"], {}))
+            rows.append(row)
         with self.engine.begin() as conn:
-            conn.execute(self.table.insert(), _rows())
+            conn.execute(self.table.insert(), rows)
         self.queries: List[Any] = []
 
     def _run(self, query: Any, values: Optional[Dict[str, Any]] = None):
@@ -198,8 +219,50 @@ class _AgentsDbSpy:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _reset_email_column_cache():
+    """_agent_email_columns() caches for the life of the process. Each fixture
+    below builds a DIFFERENT table, so a cached answer from an earlier test
+    would silently describe the wrong schema. Reset around every test, not just
+    the ones that vary the shape -- a stale cache is exactly the kind of
+    cross-test coupling that makes one of these pass for the wrong reason."""
+    from routes import agent_management as mod
+
+    mod._AGENT_EMAIL_COLUMNS = None
+    yield
+    mod._AGENT_EMAIL_COLUMNS = None
+
+
 @pytest.fixture
 def agents_db(monkeypatch) -> _AgentsDbSpy:
+    from routes import agent_management as mod
+
+    spy = _AgentsDbSpy()
+    monkeypatch.setattr(mod, "database", spy)
+    return spy
+
+
+@pytest.fixture
+def legacy_agents_db(monkeypatch) -> _AgentsDbSpy:
+    """The shape routes/employee_agent_mgmt.py:433 writes: the address lives in
+    `email`, and owner_email is NULL."""
+    from routes import agent_management as mod
+
+    spy = _AgentsDbSpy(
+        add=("email",),
+        overrides={
+            AGENT_A: {"owner_email": None, "email": AGENT_A_EMAIL},
+            AGENT_B: {"owner_email": None, "email": VICTIM_EMAIL},
+        },
+    )
+    monkeypatch.setattr(mod, "database", spy)
+    return spy
+
+
+@pytest.fixture
+def no_email_column_agents_db(monkeypatch) -> _AgentsDbSpy:
+    """A deployed table with no `email` column at all -- the other possible
+    shape. The probe must find nothing and the route must still work."""
     from routes import agent_management as mod
 
     spy = _AgentsDbSpy()
@@ -424,4 +487,102 @@ def test_the_refusal_happens_before_the_query(client, agents_db):
     assert resp.status_code == 403, resp.text
     assert agents_db.queries == [], (
         f"handler queried the agents table before refusing: {agents_db.queries}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The deployed table's shape is not knowable from a checkout, so the filter
+# probes for it. Both shapes are exercised here.
+# ---------------------------------------------------------------------------
+
+
+def test_agent_whose_address_lives_in_email_sees_its_own_record(client, legacy_agents_db):
+    """The lockout this file could not previously see.
+
+    routes/employee_agent_mgmt.py:433 creates agents with
+    `INSERT INTO agents (agent_id, name, email, ...)` and never writes
+    owner_email. An agent created that way, holding a token with only the email
+    identity, matched nothing when the filter looked only at owner_email -- and
+    got 200 with an EMPTY list, a silent lockout rather than the detail route's
+    explicit 403. The earlier fixture was built from the SQLAlchemy model,
+    which has no `email` column, so it could not represent such a row at all.
+    """
+    token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
+
+    resp = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
+
+    assert resp.status_code == 200, resp.text
+    assert _agent_ids(resp.json()) == [AGENT_A], (
+        "an agent whose address is stored in `email` was locked out of its own "
+        f"record: {resp.text}"
+    )
+
+
+def test_the_email_column_does_not_widen_access(client, legacy_agents_db):
+    """Positive counterpart: probing for a second column must not turn into a
+    second way in. agent_A's token must still not reach agent_B's row through
+    it."""
+    token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
+
+    resp = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
+
+    assert resp.status_code == 200, resp.text
+    assert AGENT_B not in _agent_ids(resp.json())
+    for leaked in _VICTIM_SECRETS:
+        assert leaked not in resp.text
+
+
+def test_a_table_without_an_email_column_still_works(client, no_email_column_agents_db):
+    """The other shape. The probe finds no `email` column; the route must
+    behave exactly as it would have without the probe, not 500.
+
+    Kills a fix that references a column unconditionally: a SELECT naming a
+    column the deployed table lacks raises, and list_agents' blanket
+    `except Exception` would turn that into 'Failed to list agents' for staff
+    as well as agents -- an outage on a route that works today.
+    """
+    resp = client.get(
+        "/agents/", params={"limit": 100}, headers=_auth(_agent_token(AGENT_A, AGENT_A_EMAIL))
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert _agent_ids(resp.json()) == [AGENT_A]
+
+    staff = client.get("/agents/", params={"limit": 100}, headers=_auth(_staff_token("admin")))
+    assert staff.status_code == 200, staff.text
+    assert sorted(_agent_ids(staff.json())) == sorted([AGENT_A, AGENT_B])
+
+
+def test_the_column_probe_runs_once_not_per_request(client, agents_db):
+    """The probe is a query. Two of them on every list call would be a
+    regression in its own right."""
+    from routes import agent_management as mod
+
+    for _ in range(3):
+        client.get("/agents/", headers=_auth(_agent_token(AGENT_A, AGENT_A_EMAIL)))
+
+    probes = [
+        q for q in agents_db.queries if "LIMIT 0" in str(q).upper()
+    ]
+    assert len(probes) <= len(mod._CANDIDATE_EMAIL_COLUMNS), (
+        f"the column probe ran {len(probes)} times across 3 requests"
+    )
+
+
+def test_a_padded_owner_email_matches(client, monkeypatch):
+    """The trim half. _is_own_agent_record normalizes the stored value with
+    .strip().lower(); a SQL comparison that only lowercased would disagree with
+    it, so an agent could read its record through GET /agents/{id} and get an
+    empty list from GET /agents/."""
+    from routes import agent_management as mod
+
+    spy = _AgentsDbSpy(overrides={AGENT_A: {"owner_email": f"  {AGENT_A_EMAIL.upper()}  "}})
+    monkeypatch.setattr(mod, "database", spy)
+    token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
+
+    resp = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
+
+    assert resp.status_code == 200, resp.text
+    assert _agent_ids(resp.json()) == [AGENT_A], (
+        f"a padded owner_email did not match its own token: {resp.text}"
     )
