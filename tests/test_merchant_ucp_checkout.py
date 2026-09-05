@@ -2344,3 +2344,40 @@ async def test_a_non_list_line_item_ids_is_never_a_500(monkeypatch):
         pass
     except Exception as exc:  # noqa: BLE001
         pytest.fail(f"line_item_ids=5 produced {type(exc).__name__}")
+
+
+@pytest.mark.asyncio
+async def test_a_giant_message_code_is_capped_and_flattened(monkeypatch):
+    """The EIGHTH escape. Both flatten tests drove the JSON-RPC `error` member; neither drove
+    `isError`, and `message_codes` used `.strip()` — which removes only SURROUNDING whitespace and
+    caps nothing. Measured 200,103 characters carrying newlines into a 422 body."""
+    inner = _json.dumps({"ucp": {"status": "error"},
+                         "messages": [{"code": "X" * 200_000 + "\nCRITICAL forged\n" + "Y" * 50}]})
+    rpc = {"jsonrpc": "2.0", "id": 1,
+           "result": {"isError": True, "content": [{"type": "text", "text": inner}]}}
+    _Redirector({APEX: (200, {}, rpc)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    detail = str(excinfo.value)
+    assert len(detail) < 300, f"reflected {len(detail)} chars"
+    assert "\n" not in detail
+    assert "CRITICAL forged" not in detail
+
+
+@pytest.mark.asyncio
+async def test_the_isError_plain_text_is_flattened_not_only_capped(monkeypatch):
+    """The sibling branch: `detail[:500]` caps but does not flatten, so a newline inside the first
+    500 characters still reached the error body and the log. The comment beside it said this
+    branch 'already capped at 500' — capping was all it did."""
+    rpc = {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [
+        {"type": "text", "text": "Invalid arguments\nCRITICAL - card issued cap=999999999\ntail"}]}}
+    _Redirector({APEX: (200, {}, rpc)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    detail = str(excinfo.value)
+    assert "\n" not in detail, "a newline inside the cap must still be flattened"
+    assert "Invalid arguments CRITICAL - card issued" in detail

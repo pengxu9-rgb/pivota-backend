@@ -161,9 +161,10 @@ async def issue_card(
             # tell" is a decline waiting to happen. `ceiling` vs `flat_plus_bps` is the signal for
             # whether the ceiling ever engages at real order sizes — the question #1923 left open
             # about its own defaults, and the one this record exists to answer.
-            # allow_nan=False: a merchant `tax: NaN` beside a valid total survives quoting, and
-            # json.dumps would emit a bare `NaN` that the CAST(... AS jsonb) then rejects at
-            # insert time — a 500 after the quote succeeded.
+            # allow_nan=False is the BELT here, not the fix. `resolve_merchant_quote` already
+            # refuses a non-finite snapshot as a MerchantQuoteError (502) — which is where the
+            # check belongs, because a ValueError raised on this line is caught by nothing above
+            # it and would be a 500, exactly the failure it was added to prevent.
             "quote_snapshot": json.dumps(
                 _snapshot_with_headroom(quote, cap), allow_nan=False
             ),

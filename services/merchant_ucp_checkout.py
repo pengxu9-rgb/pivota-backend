@@ -295,7 +295,10 @@ def message_codes(payload: Dict[str, Any]) -> List[str]:
     messages = payload.get("messages")
     for entry in messages if isinstance(messages, list) else []:
         if isinstance(entry, dict) and isinstance(entry.get("code"), str) and entry["code"].strip():
-            out.append(entry["code"].strip())
+            # `_safe_detail`, not `.strip()`. A code is a short machine token, but it is merchant
+            # text and it reaches a 422 body: measured 200,103 characters carrying newlines,
+            # because `.strip()` removes only SURROUNDING whitespace and there was no cap at all.
+            out.append(_safe_detail(entry["code"], 80))
     return out
 
 
@@ -385,7 +388,11 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
             )
         detail = " | ".join(t for t in texts if t) or "unspecified"
         raise MerchantUcpError(
-            f"merchant rejected the call: {detail[:500]}", caller_fault=True
+            # `_safe_detail`, not `detail[:500]`: the slice caps but does not FLATTEN, so a
+            # newline inside the first 500 characters still reached the error body and the
+            # log. The neighbouring comment said this branch "already capped at 500" —
+            # capping was all it ever did.
+            f"merchant rejected the call: {_safe_detail(detail)}", caller_fault=True
         )
 
     if isinstance(result.get("structuredContent"), dict):
@@ -589,8 +596,10 @@ def _validated_endpoint(url: str) -> Optional[str]:
 
     And it is a CONTENT oracle, not a status one — the earlier wording said "read the status
     back" and that understated it. What reaches the API caller is the target's status and
-    hostname, its entire JSON-RPC `result` on a 2xx, and its `error.message` — flattened and
-    capped at 500 by `_safe_detail`, not verbatim as an earlier draft of this note said. No credential is attached and the body is our own JSON-RPC — but that
+    hostname, its entire JSON-RPC `result` on a 2xx, and merchant-authored refusal text from
+    three branches — `error.message`, the `isError` plain text, and `messages[].code` — each
+    flattened and capped by `_safe_detail`. An earlier draft said "verbatim", then a later one
+    corrected only the first branch while the other two were the worse offenders. No credential is attached and the body is our own JSON-RPC — but that
     second half is true because of what is WIRED today, not by construction: `create_checkout`
     and `update_checkout` put caller-supplied buyer and address in that same body, so routing
     either of them makes this sentence false and nothing here re-checks it.
@@ -691,6 +700,15 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
                 resp = await _read_bounded(
                     client, "GET", f"https://{sibling}{_WELL_KNOWN_PATH}"
                 )
+        if resp.refused_encoding:
+            # Ordered like `_call_tool`: a refused encoding is the more specific fact, and
+            # returning on status first meant `403 + Content-Encoding: gzip` logged nothing.
+            logger.info(
+                "merchant-ucp discovery profile refused domain=%s reason=content-encoding=%s",
+                domain,
+                _safe_detail(resp.refused_encoding, 40),
+            )
+            return None
         if resp.status_code != 200:
             return None
         # `_read_bounded` already stopped at the ceiling; this reports it. Size is not the parser

@@ -24,7 +24,12 @@ import json as _json
 
 import pytest
 
-from services.agent_card_issuance import cap_for_quote, headroom_policy, quote_covers
+from services.agent_card_issuance import (
+    MerchantQuoteError,
+    cap_for_quote,
+    headroom_policy,
+    quote_covers,
+)
 
 
 def _quote(total_minor: int, **kw):
@@ -413,3 +418,76 @@ def test_a_finite_amount_still_converts():
 
     assert to_minor_units("12.34", "USD") == 1234
     assert to_minor_units("0.005", "USD") == 1, "ROUND_CEILING, because this is a cap"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+async def test_a_non_finite_amount_anywhere_in_the_quote_is_a_502_not_a_500(monkeypatch, bad):
+    """`json.loads` accepts bare `NaN`/`Infinity`, so a merchant `tax: NaN` beside a VALID total
+    survives quoting. Adding `allow_nan=False` at the route turned the DB-insert 500 into a
+    json-dumps 500 one line earlier — the raise is caught by nothing there. The refusal has to
+    happen where MerchantQuoteError is the contract."""
+    payload = _json.loads(
+        '{"currency":"USD","status":"ready_for_complete","totals":['
+        '{"type":"total","amount":2317},{"type":"fulfillment","amount":500},'
+        f'{{"type":"tax","amount":{bad}}}]}}'
+    )
+    with pytest.raises(MerchantQuoteError) as excinfo:
+        await _quote_from(monkeypatch, payload)
+    assert "non-finite" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_of_a_finite_quote_still_serialises(monkeypatch):
+    """The positive counterpart — refusing every snapshot would pass the test above."""
+    quote = await _quote_from(
+        monkeypatch,
+        _json.loads('{"currency":"USD","status":"ready_for_complete","totals":['
+                    '{"type":"total","amount":2317},{"type":"tax","amount":217}]}'),
+    )
+    assert _json.dumps(quote["quote_snapshot"], allow_nan=False)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "NaN", "inf", "-inf"])
+def test_a_non_finite_tax_does_not_read_as_a_quoted_amount(bad):
+    """The eighth escape, and it mints a bad card rather than raising: NaN/inf read as "the
+    merchant DID quote tax", which strips headroom and caps at the quote — so the card declines
+    the moment real tax lands. That is the decline direction this function exists to prevent."""
+    from services.agent_card_issuance import _is_quoted_amount
+
+    assert _is_quoted_amount(bad) is False, f"{bad!r} is not a quoted amount"
+    assert _is_quoted_amount({"amount": bad}) is False
+
+
+def test_a_finite_tax_still_reads_as_quoted():
+    from services.agent_card_issuance import _is_quoted_amount
+
+    assert _is_quoted_amount(217) is True
+    assert _is_quoted_amount("217") is True
+    assert _is_quoted_amount({"amount": "217"}) is True
+
+
+def test_a_huge_exponent_is_refused_in_constant_time():
+    """The hazard on `int(minor)` is COST, not exception class. `Decimal("9e999997")` is finite,
+    and `d * 100` lands at exponent 999999 — still inside Emax — so `decimal.Overflow` never
+    fires and `int()` materialises a million-digit integer. Measured 19.1 SECONDS, from 8 bytes
+    of merchant input, blocking the event loop because this function is sync on an async path.
+    The `is_finite` and `ArithmeticError` guards both pass it straight through."""
+    import time
+
+    from services.agent_card_issuance import to_minor_units
+
+    for probe in ("9e999997", "1e999998", "9" * 300000):
+        started = time.monotonic()
+        assert to_minor_units(probe, "USD") is None, probe
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, f"{probe[:12]!r} took {elapsed:.2f}s — the big int was built"
+
+
+def test_an_ordinary_large_amount_still_converts():
+    """The positive counterpart: an 18-digit bound must not refuse real money. _MAX_CAP_MINOR is
+    10**15, so the largest legitimate cap is three orders of magnitude inside it."""
+    from services.agent_card_issuance import to_minor_units
+
+    assert to_minor_units("10000000000000.00", "USD") == 1000000000000000
+    assert to_minor_units("12.34", "USD") == 1234

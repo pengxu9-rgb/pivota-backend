@@ -18,6 +18,8 @@ top-level, with total_amount/grand_total as scalar fallbacks.
 from __future__ import annotations
 
 import ipaddress
+import json
+import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -153,10 +155,23 @@ def to_minor_units(amount: Any, currency: str) -> Optional[int]:
             return None
         exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
         # ROUND_CEILING, not the Decimal default (banker's): this number becomes a spending CAP.
+        # Caveat: the multiply runs under the default context (prec=28), which rounds BEFORE
+        # to_integral_value sees it, so above 28 significant digits the cap can land one minor
+        # unit LOW — fail-safe (a low cap declines, it cannot overspend) but not "always up".
         # Rounding a half-cent DOWN mints a card the merchant's real charge then declines;
         # rounding up mints at most one extra minor unit of headroom. For a cap, up is safe.
         from decimal import ROUND_CEILING
 
+        # MAGNITUDE, before the arithmetic — because the hazard on the next lines is COST, not
+        # exception class. `Decimal("9e999997")` is finite, and `d * 100` lands at exponent
+        # 999999, still inside Emax, so decimal.Overflow never fires; `int()` then materialises a
+        # million-digit integer. Measured: 19.1 SECONDS, from 8 bytes of merchant input, blocking
+        # the whole event loop because this function is sync on an async request path. The
+        # ArithmeticError guard below was necessary and did not cover this at all.
+        # `adjusted()` is O(1) (measured 1 microsecond) and 18 digits is already three orders
+        # above _MAX_CAP_MINOR, so nothing legitimate is refused.
+        if d.adjusted() > 18:
+            return None
         # `is_finite` is not enough on its own: Decimal("1e999999999") IS finite, and only the
         # multiply below raises decimal.Overflow. Guard the arithmetic too.
         try:
@@ -223,13 +238,17 @@ def _is_quoted_amount(value: Any) -> bool:
     if value is None or isinstance(value, bool):
         return False
     if isinstance(value, (int, float)):
-        return True
+        # NaN and inf are floats, and `float("NaN")`/`float("inf")` parse from strings too. Read
+        # as a quoted amount they say "the merchant DID quote tax", which strips headroom and
+        # mints a cap that declines the moment real tax lands — the decline direction this
+        # function's docstring exists to prevent for `{}` and `"n/a"`.
+        return math.isfinite(value)
     if isinstance(value, str):
         try:
-            float(value.strip())
+            parsed = float(value.strip())
         except ValueError:
             return False
-        return True
+        return math.isfinite(parsed)
     if isinstance(value, dict):
         for key in ("amount", "value"):
             if key in value:
@@ -319,6 +338,21 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
     if total_minor is None:
         raise MerchantQuoteError("merchant quote total was not a positive amount")
     covers = quote_covers(payload)
+    # The snapshot must be JSON-safe HERE, not at the route. `json.loads` accepts bare `NaN` and
+    # `Infinity`, so a merchant `tax: NaN` beside a valid total survives quoting — and then
+    # `json.dumps(..., allow_nan=False)` in the route raises ValueError, which no handler there
+    # translates. That turned a DB-insert 500 into a json-dumps 500 one line earlier rather than
+    # fixing it. This function's whole contract is that a bad merchant answer becomes a
+    # MerchantQuoteError the route maps to 502, so the check belongs where that contract holds.
+    snapshot = {
+        "totals": payload.get("totals"),
+        "currency": currency,
+        "checkout_status": payload.get("status"),
+    }
+    try:
+        json.dumps(snapshot, allow_nan=False)
+    except (ValueError, TypeError):
+        raise MerchantQuoteError("merchant quote carried a non-finite or unserialisable amount")
     return {
         "total_minor": total_minor,
         "currency": currency,
