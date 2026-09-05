@@ -733,6 +733,7 @@ class _Redirector:
     def __init__(self, script):
         self.script = script
         self.calls = []  # (method, url, body)
+        self.get_headers = []
 
     @property
     def urls(self):
@@ -789,7 +790,11 @@ class _Redirector:
                     raise entry
                 return _Resp(*entry)
 
-            async def get(self, url):
+            async def get(self, url, headers=None):
+                # `headers` is captured, not ignored: the discovery GET must send
+                # `Accept-Encoding: identity`, and a stub that silently dropped it would let a
+                # mutant removing that header pass.
+                outer.get_headers.append(headers)
                 outer.calls.append(("GET", url, None))
                 if url not in outer.script:
                     raise AssertionError(f"unscripted GET to {url}")
@@ -1629,3 +1634,175 @@ async def test_a_profile_just_under_the_cap_is_still_used(monkeypatch):
 
     assert got["id"] == "chk_1"
     assert r.urls == [APEX, WK, WIX]
+
+
+# --------------------------------------------------------------------------------------
+# Round-three review. Two reviewers independently found a THIRD escape of "discovery must
+# not add a failure mode", plus the same defect one line above the code that fixed it.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "err, why",
+    [
+        (RecursionError("maximum recursion depth exceeded"), "b'[' * 1200 is 2.4KB and blows the parser"),
+        (MemoryError(), "a BaseException — a decompressed body can still get here"),
+        (RuntimeError("boom"), "the whole RuntimeError branch was outside the old tuple"),
+    ],
+)
+async def test_a_profile_that_breaks_the_parser_is_not_a_500(monkeypatch, err, why):
+    """DEPTH, not size, is the parser hazard, and the size cap cannot bound it. The old
+    enumerated tuple `(HTTPError, InvalidURL, ValueError, TypeError)` contained no RuntimeError,
+    so a 2.4KB body three orders of magnitude under the cap reached the caller as a 500."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, err),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value), why
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_the_discovery_get_refuses_compression(monkeypatch):
+    """`resp.content` is the DECOMPRESSED body, so a byte cap applied after the fact bounds
+    nothing: a ~1KB gzip bomb materialises a gigabyte first, and the MemoryError is a
+    BaseException. Refusing the encoding is what bounds the read."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert r.get_headers, "the discovery GET must be made"
+    assert all(h and h.get("Accept-Encoding") == "identity" for h in r.get_headers)
+
+
+@pytest.mark.asyncio
+async def test_a_64_character_label_in_the_callers_own_domain_is_not_a_500(monkeypatch):
+    """The SAME UnicodeError the diff absorbed in `_validated_endpoint`, one function above and
+    left unwrapped. `_DOMAIN_RE` admits a 64-char label, IDNA caps at 63, getaddrinfo raises
+    UnicodeError — a ValueError, not the OSError the guard catches. Reachable from a request
+    body with NO flag armed, so this test deliberately does not arm discovery."""
+    monkeypatch.delenv("MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED", raising=False)
+    _Redirector({}).install(monkeypatch, resolves=_raise_unicode)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("a" * 64 + ".com", "chk_1")
+
+    assert "does not resolve to a public address" in str(excinfo.value)
+
+
+def _raise_unicode(domain):
+    raise UnicodeError("encoding with 'idna' codec failed (label empty or too long)")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint, why",
+    [
+        ({"url": WIX}, "a dict where a string belongs"),
+        (5, "an int"),
+        ([WIX], "a list"),
+        (True, "a bool"),
+    ],
+)
+async def test_a_non_string_endpoint_is_refused_not_raised(monkeypatch, endpoint, why):
+    """`ucp`, `services` and `entry` were each isinstance-pinned; `endpoint` was not, and the two
+    guards that cover it are in different functions — so dropping BOTH survived every test.
+    `urlsplit(x.strip())` on a non-string is an AttributeError, i.e. the same 500 class again."""
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (200, {}, {"ucp": {"services": {"dev.ucp.shopping": [
+            {"transport": "mcp", "endpoint": endpoint}]}}}),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value), why
+    assert r.methods == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [301, 404, 500])
+async def test_a_profile_served_on_a_non_200_is_not_used(monkeypatch, status):
+    """The no-profile test scripts a 404 with a `None` body, which yields None whether or not the
+    status is checked — so it could never see this. Here the body is a VALID profile."""
+    r = _Redirector({
+        APEX: (404, {}, None),
+        WK: (status, {}, _profile(WIX)),
+        WK_WWW: (status, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert WIX not in r.urls, "a profile the merchant did not serve with 200 must not be used"
+
+
+def test_validated_endpoint_refuses_paths_a_target_could_renormalise(monkeypatch):
+    """The `/mcp` suffix is not a path bound: httpx forwards the path verbatim, so a target that
+    collapses `%2e%2e` or strips `;` parameters AFTER routing receives our POST somewhere that
+    does not end `/mcp`. `/xmcp` is the plain suffix-vs-segment case."""
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    for path in (
+        "/admin/jobs/%2e%2e/%2e%2e/mcp",
+        "/admin/jobs/../mcp",
+        "/admin/jobs;/mcp",
+        "/admin//mcp",
+        "/xmcp",
+        "/API/UCP/%2E%2E/mcp",
+    ):
+        assert muc._validated_endpoint(f"https://www.wixapis.com{path}") is None, path
+    # the positive counterpart — both real platform paths must still be admitted
+    for good in ("/api/ucp/mcp", "/ecom/ucp/53b84487-eb3f-4f9d-a68b-583b9677dc65/mcp"):
+        assert muc._validated_endpoint(f"https://www.wixapis.com{good}") == (
+            f"https://www.wixapis.com{good}"
+        ), good
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 429])
+async def test_an_auth_or_ratelimit_status_does_not_trigger_discovery(monkeypatch, status):
+    """The trigger set's upper bound was unbound — adding 401 to `_DISCOVER_STATUSES` survived.
+    A merchant refusing us is not a merchant whose door is elsewhere."""
+    r = _Redirector({APEX: (status, {}, None)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert str(status) in str(excinfo.value)
+    assert r.methods == ["POST"]
+
+
+def test_the_two_discovery_helpers_never_raise(monkeypatch):
+    """Turns the equivalence claim into a test. Two mutants survive by being harmless ONLY while
+    both helpers are total; nothing pinned that, so a regression would quietly make the `try`
+    placement load-bearing again and turn a merchant profile back into a 500."""
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    for profile in (
+        None, 3, [], "x", {"ucp": "x"}, {"ucp": ["x"]}, {"ucp": {"services": "x"}},
+        {"ucp": {"services": {"dev.ucp.shopping": "x"}}},
+        {"ucp": {"services": {"dev.ucp.shopping": [None, 1, {"transport": "mcp"}]}}},
+        {"ucp": {"services": {"dev.ucp.shopping": [{"transport": "mcp", "endpoint": {"a": 1}}]}}},
+    ):
+        assert muc._endpoint_from_profile(profile) is None or isinstance(
+            muc._endpoint_from_profile(profile), str
+        )
+    for url in (
+        None, 5, [], b"https://x.com/mcp", "", "   ", "https://[oops/mcp",
+        "https://x.com:abc/mcp", "https://" + "a" * 64 + ".com/mcp",
+        "https://x.com/" + "a" * 900 + "/mcp", "https://x.com/\x00/mcp",
+    ):
+        assert muc._validated_endpoint(url) is None or isinstance(
+            muc._validated_endpoint(url), str
+        )

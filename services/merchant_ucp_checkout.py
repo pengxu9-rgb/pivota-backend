@@ -481,9 +481,17 @@ def _validated_endpoint(url: str) -> Optional[str]:
     path this function turned "POST to a UCP door on any public host" into "POST anywhere on any
     public host, and read the status back", which is a forced-request primitive with a response
     oracle. The `/mcp` suffix does not reduce that to nothing, and the residual is written down
-    here rather than denied: a merchant can still aim our egress at any public URL ending `/mcp`.
-    No credential is ever attached and the body is our own JSON-RPC, so the exposure is a
-    confused deputy against unauthenticated endpoints, not credential theft.
+    here rather than denied: a merchant can still aim our egress at a public URL ending `/mcp`,
+    and `/mcp` is the MCP convention, so the bound SELECTS FOR public MCP servers rather than
+    shrinking the set much.
+
+    And it is a CONTENT oracle, not a status one — the earlier wording said "read the status
+    back" and that understated it. What reaches the API caller is the target's status and
+    hostname, its entire JSON-RPC `result` on a 2xx, and its `error.message` spliced verbatim
+    into our error string. No credential is attached and the body is our own JSON-RPC — but that
+    second half is true because of what is WIRED today, not by construction: `create_checkout`
+    and `update_checkout` put caller-supplied buyer and address in that same body, so routing
+    either of them makes this sentence false and nothing here re-checks it.
     """
     if not url or not isinstance(url, str):
         return None
@@ -519,6 +527,13 @@ def _validated_endpoint(url: str) -> Optional[str]:
     if len(path) > 512 or not path.isascii() or not path.isprintable():
         return None
     if not path.endswith("/mcp"):
+        return None
+    # A suffix is not a path bound. httpx forwards the path verbatim, so the TARGET decides what
+    # `/admin/jobs/%2e%2e/mcp` or `/admin/jobs;/mcp` resolves to — a server that collapses dot
+    # segments or strips `;` parameters after routing receives our POST somewhere that does not
+    # end `/mcp` at all. Refuse the shapes that let a target's normaliser disagree with ours.
+    lowered = path.lower()
+    if ".." in path or "%2e" in lowered or ";" in path or "//" in path:
         return None
     # Rebuilt from validated parts — fragment, userinfo and QUERY never reach the wire.
     return f"https://{host}{path}"
@@ -556,8 +571,15 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
     error from the tool the caller asked for.
     """
     url = f"https://{domain}{_WELL_KNOWN_PATH}"
+    # `identity`: httpx auto-decompresses gzip/deflate/br with no size limit, and `resp.content`
+    # is the DECOMPRESSED body — so a ~1KB gzip bomb materialises a gigabyte before the byte cap
+    # below is ever evaluated, and the resulting MemoryError is a BaseException that escapes
+    # every handler in this file. Refusing the encoding is what actually bounds the read; the cap
+    # below then bounds the parse. A streaming read with a running byte counter is the fuller fix
+    # and remains a follow-up.
+    _no_compression = {"Accept-Encoding": "identity"}
     try:
-        resp = await client.get(url)
+        resp = await client.get(url, headers=_no_compression)
         if resp.status_code in _HOP_STATUSES:
             sibling = _sibling_host(
                 domain, resp.headers.get("location", ""), _WELL_KNOWN_PATH
@@ -567,13 +589,14 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
                 and validate_merchant_domain(sibling) == sibling
                 and resolves_only_public(sibling)
             ):
-                resp = await client.get(f"https://{sibling}{_WELL_KNOWN_PATH}")
+                resp = await client.get(
+                    f"https://{sibling}{_WELL_KNOWN_PATH}", headers=_no_compression
+                )
         if resp.status_code != 200:
             return None
-        # Cap the body BEFORE parsing. A UCP profile is a few KB; the 12 s timeout is otherwise
-        # the only bound on how much a hostile host can make us buffer and then hand to a JSON
-        # parser. `content` is already in memory here, so this bounds the parse, not the read —
-        # the honest fix for the read itself is a streaming cap, noted rather than claimed.
+        # Bounds the PARSE only, and only by size. `content` is already buffered by now, so the
+        # read is bounded by the `identity` encoding above plus the timeout, not by this. And
+        # size is not the parser hazard — see the RecursionError note on the except below.
         body = resp.content
         if len(body) > _MAX_PROFILE_BYTES:
             logger.info(
@@ -588,7 +611,13 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
         # which `_DOMAIN_RE` permits and IDNA does not. Both escaped to an unhandled 500 while
         # this function's docstring promised it never raises.
         endpoint = _validated_endpoint(_endpoint_from_profile(resp.json()))
-    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as err:
+    # `except Exception`, NOT an enumerated tuple. Enumerating was the bug: `b"[" * 1200` is a
+    # 2.4KB body — three orders of magnitude under the size cap — and `json.loads` answers it
+    # with RecursionError, a RuntimeError, which no tuple of (HTTPError, InvalidURL, ValueError,
+    # TypeError) contains. DEPTH is the parser hazard and a byte cap cannot bound it. The main
+    # read in `_call_tool` already used `except Exception` for exactly this reason; narrowing it
+    # here lost that. The type is logged so a bug of OURS is still visible rather than silent.
+    except Exception as err:
         logger.info(
             "merchant-ucp discovery failed domain=%s: %s", domain, type(err).__name__
         )
@@ -608,8 +637,9 @@ async def _call_tool(
     Underscored so that adding a send site is an edit HERE, next to the allowlist and the two
     SSRF guards, rather than an import somewhere else that inherits none of this file's rules.
 
-    Host is caller input and we fetch it, so both guards run here and the scheme and path are
-    pinned — the caller controls the host label and nothing else. Redirects are not followed,
+    Host is caller input and we fetch it, so both guards run here. The scheme is pinned and the
+    path is pinned ON THE FIRST ATTEMPT; once discovery runs, the path is BOUNDED rather than
+    pinned and the host may be one the merchant named (see `_validated_endpoint`). Redirects are not followed,
     with ONE exception: an apex<->www 30x on the same registrable domain is retried once, and
     the sibling host is put through both guards before we fetch it (see _sibling_host). Any
     other 30x is still not a merchant door.
@@ -640,7 +670,16 @@ async def _call_tool(
         raise MerchantUcpError(
             "merchant_domain is not a fetchable public hostname", caller_fault=True
         )
-    if not resolves_only_public(domain):
+    # Wrapped for the same reason `_validated_endpoint` is: `_DOMAIN_RE` admits a 64-character
+    # label, IDNA caps at 63, and getaddrinfo answers that with UnicodeError — a ValueError, not
+    # the OSError this guard catches. `merchant_domain` is request-body input, so unwrapped this
+    # was an unhandled 500 reachable with no flag armed at all. Assigned first and raised after:
+    # MerchantUcpError IS a ValueError, so raising inside the try would catch our own refusal.
+    try:
+        domain_is_public = resolves_only_public(domain)
+    except (ValueError, UnicodeError):
+        domain_is_public = False
+    if not domain_is_public:
         raise MerchantUcpError(
             "merchant_domain does not resolve to a public address", caller_fault=True
         )
