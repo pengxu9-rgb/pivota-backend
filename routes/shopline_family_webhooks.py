@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from db.database import database
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.shopline_family_event_adapter import (
     UnsupportedShoplineFamilyEvent,
     map_shopline_webhook,
@@ -89,6 +90,9 @@ async def _receive(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid {platform} webhook credentials",
         )
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=store["merchant_id"], store_id=store_id)
+    await ingress.enforce_rate_limit("platform", store_id)
     supplied_host = _host(source_domain)
     expected_host = _host(store.get("domain"))
     # The app secret can be shared by every installation of a public app. The
@@ -124,6 +128,7 @@ async def _receive(
 
 
 @router.post("/shopline/{store_id}")
+@telemetry_ingress_route("shopline_webhook")
 async def receive_shopline_webhook(
     store_id: str,
     request: Request,
@@ -144,6 +149,7 @@ async def receive_shopline_webhook(
 
 
 @router.post("/shoplazza/{store_id}")
+@telemetry_ingress_route("shoplazza_webhook")
 async def receive_shoplazza_webhook(
     store_id: str,
     request: Request,
