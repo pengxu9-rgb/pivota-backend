@@ -209,6 +209,10 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 VARIANT_SKU_INFIX = "::v:"
+# The serving lane renders at most 30 variants (routes/agent_api.py); this bounds
+# what a pathological feed can put in one seed_data row. MAC's widest line carries
+# 82 shades — catalog_skus keeps every one of them, which is the authority.
+MAX_SEED_VARIANTS = 100
 
 
 # catalog_skus.sku_key is VARCHAR(255) and product_key alone can reach 214 chars
@@ -546,6 +550,44 @@ def _build_seed_inserts(
             "availability": availability,
             "in_stock": in_stock,
         }
+        # REAL variants when the record carries them. The external-seed serving
+        # lane builds its variant list from seed_data['variants']
+        # (routes/agent_api.py::_seed_variants -> _build_external_seed_product),
+        # NOT from catalog_skus — so a folded shade line whose shades exist as
+        # SKUs still served a single synthetic "canonical" variant and the shade
+        # identity was invisible on the PDP (measured on MAC 2026-09-05: 1,869
+        # shade SKUs in the catalog, one variant on the page).
+        #
+        # Keys are the ones that builder reads: variant_id / title / price_amount
+        # / price_currency / availability / image_url, plus sku for display.
+        # Cart prefill is unaffected: `sole_stamped_variant_id` reads
+        # seed_data['snapshot']['variants'], which this lane never writes, so it
+        # declines here exactly as it did before.
+        seed_variants = [synthetic_variant]
+        real_variants = pdp_payload.get("variants") or []
+        if len(real_variants) >= 2:
+            built: List[Dict[str, Any]] = []
+            for v in real_variants[:MAX_SEED_VARIANTS]:
+                vid = str(v.get("variant_id") or "").strip()
+                if not vid:
+                    continue
+                v_in_stock = bool(v.get("in_stock"))
+                built.append({
+                    "variant_id": vid,
+                    "id": vid,
+                    "sku": str(v.get("sku") or "").strip() or None,
+                    "barcode": str(v.get("barcode") or "").strip() or None,
+                    "title": str(v.get("title") or "").strip() or pdp_payload["product_name"],
+                    "currency": "USD",
+                    "price_currency": "USD",
+                    "price_amount": v.get("price"),
+                    "price": v.get("price"),
+                    "availability": "in_stock" if v_in_stock else "out_of_stock",
+                    "in_stock": v_in_stock,
+                    "image_url": str(v.get("image_url") or "").strip() or None,
+                })
+            if built:
+                seed_variants = built
         rows.append({
             "id": seed_id,
             "external_product_id": external_product_id,
@@ -571,7 +613,7 @@ def _build_seed_inserts(
                 "availability": availability,
                 "validated_at": offer.get("validated_at"),
                 "agent_version": AGENT_VERSION,
-                "variants": [synthetic_variant],
+                "variants": seed_variants,
                 "image_urls": [offer.get("image_url")] if offer.get("image_url") else [],
             }),
         })
