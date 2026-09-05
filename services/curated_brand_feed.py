@@ -32,6 +32,11 @@ logger = logging.getLogger("curated_brand_feed")
 
 _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
+# Lowest variant price (in the store's currency) that counts as a real offer. Across
+# the four Meitu-US feeds measured 2026-09-05 (2,108 products) exactly one variant sat
+# in (0, 1.00): the $0.01 stila promo described at the variant pick below. Nothing legitimate in a beauty D2C feed is
+# priced under a dollar; a floor this low cannot drop a real product.
+MIN_SELLABLE_PRICE = 1.0
 
 
 def _clean_domain(domain: str) -> str:
@@ -531,15 +536,19 @@ def shopify_product_to_record(
         return None
     variants = product.get("variants")
     variants = variants if isinstance(variants, list) else []
-    # Pick the first sellable (positive-price) variant. Gift-with-purchase and other
-    # $0/unpriced items have no purchasable offer — drop the product entirely so it
-    # never enters the commerce index (these were landing as junk PDPs/seeds, the
-    # offers_skipped noise seen onboarding kosas).
+    # Pick the first sellable variant — priced at or above MIN_SELLABLE_PRICE.
+    # Gift-with-purchase and other $0/unpriced items have no purchasable offer —
+    # drop the product entirely so it never enters the commerce index (these were
+    # landing as junk PDPs/seeds, the offers_skipped noise seen onboarding kosas).
+    # The floor exists because "positive" was not enough: stilacosmetics.com lists a
+    # "Free Travel … (TikTok Shop)" promo at $0.01, which cleared `p > 0`, ingested
+    # as a canonical anchor and served (measured 2026-09-05). A token price is a
+    # promo mechanic, not an offer.
     variant = None
     price = None
     for v in variants:
         p = _to_float((v or {}).get("price"))
-        if p is not None and p > 0:
+        if p is not None and p >= MIN_SELLABLE_PRICE:
             variant, price = v, p
             break
     if variant is None:
@@ -594,12 +603,70 @@ def shopify_product_to_record(
     }
 
 
+# Some storefronts (maccosmetics.com, measured 2026-09-04: 1,366 of a 1,500-product
+# sample) publish EVERY shade as its own single-variant product — "Retro Matte
+# Lipstick - Ruby Woo" beside the base "Retro Matte Lipstick". The Path-C plan keys
+# PDPs on (brand, title), so ingesting that feed as-is mints one PDP per shade:
+# ~1,900 near-duplicates for one brand. `drop_shade_listings` collapses them onto
+# the base listing when — and only when — the base listing is itself in the feed;
+# a suffixed title with no base row in the feed is a real product name and stays.
+#
+# Titles are compared through `normalize_title` (the same normaliser
+# `make_content_key` uses downstream), because the feed is not case- or
+# punctuation-stable across a line: stila lists "HUGE™ Extreme Lash Mascara" beside
+# "Huge™ Extreme Lash Mascara - Intense Black", and "Heaven's" beside "Heaven’s".
+# A raw compare let 2 of stila's 12 shade rows through to mint their own PDP.
+# Shade names may themselves contain hyphens ("Lady-Be-Good", "Brick-O-La",
+# "Tete-A-Tint" — 21 of MAC's 1,381 collapsible rows), so every " - " split point
+# is tried, longest base first, rather than a single regex capture.
+#
+# KNOWN LIMIT, measured on the MAC feed: the surviving base row is itself a
+# single-variant parent stub (variants[0].option1 == title, sku P2000_*) — the
+# shade rows ARE the purchasable SKUs, and this collapse discards them rather
+# than folding them in as variants. It trades shade identity for one PDP per
+# line; it does not produce a base row that carries its shades. Folding shade
+# rows into the base's variants is the deeper fix and is not done here.
+_SHADE_SEP = " - "
+
+
+def _shade_bases(title: str) -> List[str]:
+    """Every '<base>' a '<base> - <shade>' title could be split into, longest
+    base first, so 'Lip Pencil - Brick-O-La' yields ['Lip Pencil - Brick-O',
+    'Lip Pencil']. Only ' - ' (space-hyphen-space) is a separator."""
+    parts = title.split(_SHADE_SEP)
+    return [_SHADE_SEP.join(parts[:i]).strip() for i in range(len(parts) - 1, 0, -1)]
+
+
+def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pure. Return `products` without single-variant rows whose title is
+    `<base> - <shade>` where `<base>` is also a title in `products` (compared
+    through normalize_title). Order is preserved; nothing else is touched.
+    Multi-variant rows are never dropped — a suffixed multi-variant title is a
+    distinct line, not a shade."""
+    from services.catalog_identity import normalize_title
+
+    titles = {normalize_title(str((p or {}).get("title") or "")) for p in products}
+    titles.discard("")
+    out: List[Dict[str, Any]] = []
+    for p in products:
+        title = str((p or {}).get("title") or "").strip()
+        variants = (p or {}).get("variants") or []
+        is_shade = len(variants) <= 1 and any(
+            normalize_title(base) in titles for base in _shade_bases(title) if base
+        )
+        if is_shade:
+            continue
+        out.append(p)
+    return out
+
+
 async def records_for_brand(
     *,
     domain: str,
     category_path: str,
     brand: Optional[str] = None,
     max_products: int = 500,
+    base_listings_only: bool = False,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
@@ -616,6 +683,8 @@ async def records_for_brand(
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
+    if base_listings_only:
+        products = drop_shade_listings(products)
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:

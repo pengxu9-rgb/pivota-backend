@@ -64,6 +64,7 @@ async def _run(args: argparse.Namespace) -> int:
             category_path=b.get("category_path") or args.category or "",
             brand=b.get("brand"),
             max_products=args.max_products,
+            base_listings_only=args.base_listings_only,
         )
         print(f"  {b['domain']}: {len(recs)} products")
         all_records.extend(recs)
@@ -105,6 +106,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--category", help="category_path (default/override for rows without one)")
     p.add_argument("--brand", help="brand name override (single --domain mode)")
     p.add_argument("--max-products", type=int, default=500, help="cap products per brand")
+    p.add_argument(
+        "--base-listings-only",
+        action="store_true",
+        help=(
+            "drop single-variant '<base> - <shade>' listings whose base listing is also in the "
+            "feed (maccosmetics.com publishes one product per shade; as-is that mints one PDP per shade)"
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     return asyncio.run(_run(args))

@@ -35,6 +35,77 @@ def test_maps_shopify_product_to_validated_record():
     assert offers[0]["price"] == 16.0  # coerced to float (numeric columns reject strings)
 
 
+def test_drop_shade_listings_collapses_onto_present_base():
+    """maccosmetics.com shape: every shade is its own single-variant product beside
+    the base listing. Only rows whose base title is IN the feed collapse."""
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick")
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo")
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="retro-matte-lipstick-bronx")
+    out = cbf.drop_shade_listings([ruby, base, bronx])
+    assert [p["title"] for p in out] == ["Retro Matte Lipstick"]
+
+
+def test_drop_shade_listings_keeps_suffixed_title_without_base_row():
+    """'Lipglass / Mini M·A·C - Nymphette' with no 'Lipglass / Mini M·A·C' row in the
+    feed is a real product name, not a shade of something else in the feed."""
+    lone = _product(title="Cream & Chrome Eyeliner Duo - Holiday", handle="ccd-holiday")
+    other = _product(title="Amplified Lipstick", handle="amplified-lipstick")
+    out = cbf.drop_shade_listings([lone, other])
+    assert [p["title"] for p in out] == ["Cream & Chrome Eyeliner Duo - Holiday", "Amplified Lipstick"]
+
+
+def test_drop_shade_listings_handles_hyphenated_shade_names():
+    """21 of MAC's collapsible rows carry a hyphen INSIDE the shade name; a
+    single `[^-]+` capture kept every one of them as a duplicate PDP."""
+    base = _product(title="Retro Matte Liquid Lipcolour", handle="rmll")
+    lady = _product(title="Retro Matte Liquid Lipcolour - Lady-Be-Good", handle="rmll-lady-be-good")
+    pencil = _product(title="Lip Pencil", handle="lip-pencil")
+    brick = _product(title="Lip Pencil - Brick-O-La", handle="lip-pencil-brick-o-la")
+    out = cbf.drop_shade_listings([base, lady, pencil, brick])
+    assert [p["title"] for p in out] == ["Retro Matte Liquid Lipcolour", "Lip Pencil"]
+
+
+def test_drop_shade_listings_compares_normalised_titles():
+    """stila: 'HUGE™ …' base vs 'Huge™ … - Intense Black' shade, and a curly vs
+    straight apostrophe — the same normaliser make_content_key uses decides."""
+    base = _product(title="HUGE\u2122 Extreme Lash Mascara", handle="huge")
+    shade = _product(title="Huge\u2122 Extreme Lash Mascara - Intense Black", handle="huge-black")
+    balm = _product(title="Heaven's Dew\u2122 Honey Glow Balm", handle="balm")
+    balm_shade = _product(title="Heaven\u2019s Dew\u2122 Honey Glow Balm - Golden Sun", handle="balm-golden")
+    out = cbf.drop_shade_listings([base, shade, balm, balm_shade])
+    assert [p["handle"] for p in out] == ["huge", "balm"]
+
+
+def test_drop_shade_listings_never_drops_multi_variant_rows():
+    """A multi-variant row already carries its shades as variants; a suffixed title
+    on such a row is a distinct line (tarte's 'X - travel size' style), so it stays."""
+    base = _product(title="Stay All Day Liquid Lipstick", handle="sad")
+    multi = _product(
+        title="Stay All Day Liquid Lipstick - Shimmer",
+        handle="sad-shimmer",
+        variants=[{"price": "25.00", "available": True}, {"price": "25.00", "available": True}],
+    )
+    out = cbf.drop_shade_listings([base, multi])
+    assert [p["title"] for p in out] == ["Stay All Day Liquid Lipstick", "Stay All Day Liquid Lipstick - Shimmer"]
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_base_listings_only_is_off_by_default_and_threads(monkeypatch):
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick")
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo")
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return [base, ruby]
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    default = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
+    assert [r["pdp"]["product_name"] for r in default] == ["Retro Matte Lipstick", "Retro Matte Lipstick - Ruby Woo"]
+    filtered = await cbf.records_for_brand(
+        domain="maccosmetics.com", category_path="beauty/makeup", base_listings_only=True
+    )
+    assert [r["pdp"]["product_name"] for r in filtered] == ["Retro Matte Lipstick"]
+
+
 def test_brand_override_and_domain_cleaning():
     rec = shopify_product_to_record(
         _product(vendor=""), domain="https://Cosrx.com/", category_path="x", brand_override="COSRX"
@@ -61,6 +132,26 @@ def test_drops_unpriced_gift_items():
     assert shopify_product_to_record(_product(variants=[{"price": None}]), domain="x.com", category_path="x") is None
     assert shopify_product_to_record(_product(variants=[{"price": "0.00"}]), domain="x.com", category_path="x") is None
     assert shopify_product_to_record(_product(variants=[]), domain="x.com", category_path="x") is None
+
+
+def test_drops_token_priced_promo_items():
+    # stilacosmetics.com "Free Travel … (TikTok Shop)" at $0.01 cleared the old `> 0`
+    # test and served as a canonical anchor. A token price is a promo, not an offer.
+    assert shopify_product_to_record(_product(variants=[{"price": "0.01"}]), domain="x.com", category_path="x") is None
+    assert shopify_product_to_record(_product(variants=[{"price": "0.99"}]), domain="x.com", category_path="x") is None
+    # Exactly the floor is sellable.
+    rec = shopify_product_to_record(_product(variants=[{"price": "1.00"}]), domain="x.com", category_path="x")
+    assert rec is not None and rec["offers"][0]["price"] == 1.0
+
+
+def test_price_floor_skips_to_the_first_real_variant():
+    rec = shopify_product_to_record(
+        _product(variants=[{"price": "0.01", "barcode": "PROMO"}, {"price": "15.00", "barcode": "8809416470016"}]),
+        domain="x.com",
+        category_path="x",
+    )
+    assert rec["offers"][0]["price"] == 15.0
+    assert rec["pdp"]["barcode"] == "8809416470016"
 
 
 def test_picks_first_positive_priced_variant():
