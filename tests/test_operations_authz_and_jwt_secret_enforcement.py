@@ -790,23 +790,30 @@ def test_no_operations_route_depends_on_the_query_string_verifier():
 
     utils.auth.verify_jwt_token takes a bare `token: str`. Anything using it as
     a dependency puts the credential back in the URL, and the failure is silent
-    — the route keeps working, it just leaks. routes/auth_routes.py defines its
-    OWN bearer-based function of the same name, which is easy to confuse at an
-    import site.
+    — the route keeps working, it just leaks. routes/auth_routes.py defines a
+    bearer-based function of the SAME NAME (now a thin adapter over
+    utils.auth.get_current_user), which is easy to confuse at an import site.
     """
+    # routes/auth_routes.py DEFINES the bearer-based verify_jwt_token, so
+    # depending on the name there is correct by construction. It is exempted by
+    # filename, not by inspecting its imports: it legitimately imports other
+    # names from utils.auth, and the previous heuristic -- "is the substring
+    # 'verify_jwt_token' within 300 characters after 'from utils.auth import'"
+    # -- only kept clearing that file because the names it imports happened to
+    # be short enough. Adding an import there would have made this guard report
+    # a leak that does not exist.
+    _DEFINES_ITS_OWN = {"auth_routes.py"}
+
     offenders = []
     for route_file in sorted((REPO_ROOT / "routes").glob("*.py")):
+        if route_file.name in _DEFINES_ITS_OWN:
+            continue
         src = route_file.read_text(encoding="utf-8")
         if "Depends(verify_jwt_token)" not in src:
             continue
-        # routes/auth_routes.py defines its OWN header-based verify_jwt_token,
-        # so depending on it there is correct. Only utils.auth's version binds a
-        # query parameter, and importing THAT is what makes the difference.
-        imported_from_utils = "from utils.auth import" in src and "verify_jwt_token" in (
-            src.split("from utils.auth import")[1][:300]
-        )
-        if imported_from_utils:
-            offenders.append(route_file.name)
+        # Every other file can only have gotten the name by importing it, and
+        # utils.auth's is the query-parameter one.
+        offenders.append(route_file.name)
     assert not offenders, (
         "these bind the credential as a query parameter by depending on "
         f"utils.auth.verify_jwt_token: {offenders}"
