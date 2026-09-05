@@ -279,8 +279,7 @@ async def test_brand_category_anchor_outranks_generic_category_rows(knight_categ
     await _merchant(f"{_PREFIX}_owner")
     await _merchant(f"{_PREFIX}_seller")
     for suffix, title, brand in (
-        ("generic1", "Soft Pinch Liquid Blush", "Generic One"),
-        ("generic2", "Cloud Paint Blush", "Generic Two"),
+        *((f"generic{i}", "Soft Pinch Liquid Blush", "Generic One") for i in range(30)),
         ("knight", "Knight Unicorn Satin Blush", "Knight Unicorn"),
     ):
         await _product_with_offer(
@@ -291,6 +290,11 @@ async def test_brand_category_anchor_outranks_generic_category_rows(knight_categ
             brand=brand,
             category_path=knight_category if suffix == "knight" else "beauty/makeup/face/blush",
         )
+        if suffix.startswith("generic"):
+            await database.execute(
+                "UPDATE catalog_products SET pdp_scope = 'multi_merchant_canonical' WHERE product_key = :key",
+                {"key": f"{_PREFIX}_{suffix}"},
+            )
 
     # Missing taxonomy must not turn the brand admit branch into an all-brand
     # fallback; nor may title evidence override an explicit, different category.
@@ -308,7 +312,7 @@ async def test_brand_category_anchor_outranks_generic_category_rows(knight_categ
     rows = await svc._fetch_canonical_search_rows(
         query=query,
         merchant_id=None,
-        limit=20,
+        limit=1,
     )
     recalled = [
         str(row.get("product_key"))

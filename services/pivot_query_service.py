@@ -1115,6 +1115,7 @@ async def _fetch_canonical_search_rows(
     # caller of this function.
     brand_anchor_score = ""
     brand_anchor_where = ""
+    brand_priority_score = "0"
     brand_anchor_terms = (
         brand_anchor_terms
         if brand_anchor_terms is not None
@@ -1259,6 +1260,10 @@ async def _fetch_canonical_search_rows(
         brand_anchor_where = (
             "\n                OR (" + admit_predicate + ")\n"
         )
+        # Preserve explicit brand/category evidence BEFORE both SQL limits.
+        # A published canonical's +260 structural score otherwise outweighs
+        # the +180 brand boost and can evict every newly synced brand row.
+        brand_priority_score = f"CASE WHEN ({admit_predicate}) THEN 1 ELSE 0 END"
 
     # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
     # clause above only matches the verbatim phrase, so multi-word queries whose
@@ -1361,6 +1366,7 @@ async def _fetch_canonical_search_rows(
                     {vertical_score}
                     {token_score}
                 ) AS rank_score,
+                {brand_priority_score} AS brand_priority,
                 -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
                 -- + vertical term hits), with NO structural/scope boost. Used to
                 -- order results when v2 is on so the +200 canonical boost can't
@@ -1416,7 +1422,7 @@ async def _fetch_canonical_search_rows(
             {signature_clause}
             {indexable_clause}
             {sku_suppression_clause}
-            ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
+            ORDER BY brand_priority DESC, rank_score DESC, p.updated_at DESC, s.updated_at DESC
             LIMIT :candidate_limit
         )
         SELECT
@@ -1493,7 +1499,7 @@ async def _fetch_canonical_search_rows(
         LEFT JOIN catalog_merchants bm
           ON bm.merchant_id = o.merchant_id
         {offer_seller_where}
-        ORDER BY rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
+        ORDER BY c.brand_priority DESC, rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
         params,
