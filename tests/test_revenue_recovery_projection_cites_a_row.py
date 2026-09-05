@@ -161,3 +161,22 @@ def test_every_producible_type_has_a_stage_and_vice_versa():
         b._UNREADABLE_FINDING,
     }
     assert not unmapped, f"producible but unmapped to a stage: {sorted(unmapped)}"
+
+
+def test_a_stage_is_never_unverified_while_carrying_findings(real_report):
+    """The contradiction the producible-set gate can create.
+
+    `_stage_is_measurable` is checked BEFORE the findings list, so a stage whose
+    producers are all missing from _PRODUCIBLE_FINDING_TYPES renders UNVERIFIED
+    — "nothing can be measured here" — while displaying the findings it just
+    collected. Dropping a rollup type from that set is a one-line edit and left
+    the whole suite green.
+    """
+    proj = _project(extract_findings(real_report))
+
+    for stage in proj["stages"]:
+        if stage["status"] == "UNVERIFIED":
+            assert not stage["findings"], (
+                f"{stage['stage']} says nothing can be measured while citing "
+                f"{len(stage['findings'])} finding(s)"
+            )
