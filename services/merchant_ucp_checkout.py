@@ -221,7 +221,12 @@ def build_line_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     for raw in items or []:
-        variant_id = _variant_gid(str((raw or {}).get("variant_id") or "").strip())
+        # isinstance, not `(raw or {})`. That construct raises AttributeError on a TRUTHY
+        # non-dict — `["x"]` — which is the identical bug `_endpoint_from_profile` was fixed for
+        # and whose comment names it. Fixing one instance and not the pattern is how a ratchet
+        # that matches one syntactic form permits the rest.
+        raw = raw if isinstance(raw, dict) else {}
+        variant_id = _variant_gid(str(raw.get("variant_id") or "").strip())
         if not variant_id:
             raise MerchantUcpError(
                 "each line item needs a storefront variant_id", caller_fault=True
@@ -229,7 +234,7 @@ def build_line_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # ABSENT defaults to 1; PRESENT-BUT-ZERO is refused. `or 1` collapsed those two, turning
         # an explicit quantity of 0 into a line the buyer never asked for — and quantity is one
         # of the two numbers a cap is derived from.
-        raw_qty = (raw or {}).get("quantity")
+        raw_qty = raw.get("quantity")
         if raw_qty is None:
             raw_qty = 1
         try:
@@ -278,7 +283,11 @@ def message_codes(payload: Dict[str, Any]) -> List[str]:
     error surface. Missing/oddly-shaped entries are skipped rather than guessed at.
     """
     out: List[str] = []
-    for entry in payload.get("messages") or []:
+    # isinstance, not `or []`. A TRUTHY non-list — `{"messages": 5}` — survives `or []` and then
+    # `for entry in 5` is a TypeError, which nothing between here and the route translates. Same
+    # truthy-non-dict class as `_endpoint_from_profile`; this is the sibling instance.
+    messages = payload.get("messages")
+    for entry in messages if isinstance(messages, list) else []:
         if isinstance(entry, dict) and isinstance(entry.get("code"), str) and entry["code"].strip():
             out.append(entry["code"].strip())
     return out
@@ -321,9 +330,12 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
     # threw the message away. Probed live 2026-09-02. These are OUR malformed requests, hence
     # caller_fault.
     if result.get("isError"):
+        # Same reason as `message_codes`: a truthy non-list `content` passes `or []` and then
+        # raises TypeError on iteration.
+        raw_content = result.get("content")
         texts = [
             str(chunk.get("text") or "").strip()
-            for chunk in (result.get("content") or [])
+            for chunk in (raw_content if isinstance(raw_content, list) else [])
             if isinstance(chunk, dict) and chunk.get("type") == "text"
         ]
         # TWO isError shapes, probed live 2026-09-02. cosrx.com: plain text ("Invalid
@@ -401,14 +413,68 @@ _HOP_STATUSES = frozenset({301, 302, 307, 308})
 
 _WELL_KNOWN_PATH = "/.well-known/ucp"
 
-# A real UCP profile is a few KB. Shopify's is ~1.5KB, Wix's ~1KB.
+# A real UCP profile is a few KB. Shopify's is ~1.5KB, Wix's ~1KB. The same ceiling is applied
+# to merchant POST responses: nothing legitimate on this rail is larger.
 _MAX_PROFILE_BYTES = 256 * 1024
 
-# The pinned path is a SHOPIFY convention, and platforms do not agree on one. When it answers
-# with one of these — "there is no door at this path" — we fall back to reading the endpoint out
-# of the merchant's own profile. Wix serves a real UCP door at
-# `https://www.wixapis.com/ecom/ucp/<siteId>/mcp` and answers the pinned path 403, so before this
-# fallback every Wix merchant was recorded as having no door at all.
+
+class _BoundedBody:
+    """A merchant response read under a byte ceiling. Same surface `_call_tool` used before."""
+
+    __slots__ = ("status_code", "headers", "content", "over_limit")
+
+    def __init__(self, status_code, headers, content, over_limit=False):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content
+        self.over_limit = over_limit
+
+    def json(self) -> Any:
+        return json.loads(self.content)
+
+
+async def _read_bounded(
+    client: Any,
+    method: str,
+    url: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    limit: int = _MAX_PROFILE_BYTES,
+) -> _BoundedBody:
+    """Read a merchant response, stopping at `limit` DECODED bytes.
+
+    WHY STREAMING, and why the previous attempt did not work. `client.get`/`client.post` read AND
+    DECODE the entire body inside the call, so a cap applied to `resp.content` runs after the
+    damage is done. Asking for `Accept-Encoding: identity` does not help either: httpx decodes on
+    the RESPONSE's `Content-Encoding`, so the request header is advisory and a hostile merchant is
+    precisely the one who ignores it. Measured: a 20,420-byte gzip body answered a request that
+    sent `identity` and produced 20,971,530 bytes in `.content` — which is what the cap then
+    inspected. The only real bound is to stop consuming.
+
+    DECODED bytes, not raw, is the number that matters: 256KB of raw gzip is ~256MB inflated, so
+    counting wire bytes would bound the wrong quantity.
+
+    (The earlier comment here also claimed MemoryError is a BaseException that escapes
+    `except Exception`. It is not — `issubclass(MemoryError, Exception)` is True. Both claims were
+    wrong; this docstring states what was measured.)
+    """
+    kwargs: Dict[str, Any] = {}
+    if json_body is not None:
+        kwargs["json"] = json_body
+    if headers is not None:
+        kwargs["headers"] = headers
+    async with client.stream(method, url, **kwargs) as resp:
+        chunks: List[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > limit:
+                return _BoundedBody(resp.status_code, resp.headers, b"", over_limit=True)
+            chunks.append(chunk)
+        return _BoundedBody(resp.status_code, resp.headers, b"".join(chunks))
+
+
 _DISCOVER_STATUSES = frozenset({403, 404, 405})
 
 
@@ -533,7 +599,11 @@ def _validated_endpoint(url: str) -> Optional[str]:
     # segments or strips `;` parameters after routing receives our POST somewhere that does not
     # end `/mcp` at all. Refuse the shapes that let a target's normaliser disagree with ours.
     lowered = path.lower()
-    if ".." in path or "%2e" in lowered or ";" in path or "//" in path:
+    if ".." in path or ";" in path or "//" in path:
+        return None
+    # Percent-encoded delimiters too: a target that decodes BEFORE routing sees `.` `?` `#` NUL
+    # and `\` where we saw an opaque path, and `%25` lets it double-decode its way to any of them.
+    if any(tok in lowered for tok in ("%2e", "%2f", "%3f", "%23", "%00", "%5c", "%25")):
         return None
     # Rebuilt from validated parts — fragment, userinfo and QUERY never reach the wire.
     return f"https://{host}{path}"
@@ -571,15 +641,11 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
     error from the tool the caller asked for.
     """
     url = f"https://{domain}{_WELL_KNOWN_PATH}"
-    # `identity`: httpx auto-decompresses gzip/deflate/br with no size limit, and `resp.content`
-    # is the DECOMPRESSED body — so a ~1KB gzip bomb materialises a gigabyte before the byte cap
-    # below is ever evaluated, and the resulting MemoryError is a BaseException that escapes
-    # every handler in this file. Refusing the encoding is what actually bounds the read; the cap
-    # below then bounds the parse. A streaming read with a running byte counter is the fuller fix
-    # and remains a follow-up.
+    # `identity` is a courtesy only — httpx decodes on the RESPONSE header, so this does not
+    # bound anything. `_read_bounded` is what bounds it.
     _no_compression = {"Accept-Encoding": "identity"}
     try:
-        resp = await client.get(url, headers=_no_compression)
+        resp = await _read_bounded(client, "GET", url, headers=_no_compression)
         if resp.status_code in _HOP_STATUSES:
             sibling = _sibling_host(
                 domain, resp.headers.get("location", ""), _WELL_KNOWN_PATH
@@ -589,20 +655,21 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
                 and validate_merchant_domain(sibling) == sibling
                 and resolves_only_public(sibling)
             ):
-                resp = await client.get(
-                    f"https://{sibling}{_WELL_KNOWN_PATH}", headers=_no_compression
+                resp = await _read_bounded(
+                    client,
+                    "GET",
+                    f"https://{sibling}{_WELL_KNOWN_PATH}",
+                    headers=_no_compression,
                 )
         if resp.status_code != 200:
             return None
-        # Bounds the PARSE only, and only by size. `content` is already buffered by now, so the
-        # read is bounded by the `identity` encoding above plus the timeout, not by this. And
-        # size is not the parser hazard — see the RecursionError note on the except below.
-        body = resp.content
-        if len(body) > _MAX_PROFILE_BYTES:
+        # `_read_bounded` already stopped at the ceiling; this reports it. Size is not the parser
+        # hazard anyway — see the RecursionError note on the except below.
+        if resp.over_limit:
             logger.info(
-                "merchant-ucp discovery profile too large domain=%s bytes=%d",
+                "merchant-ucp discovery profile exceeded %d bytes domain=%s",
+                _MAX_PROFILE_BYTES,
                 domain,
-                len(body),
             )
             return None
         # INSIDE the try, deliberately. `resp.json()` raises ValueError on a non-JSON body, and
@@ -624,7 +691,9 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
         return None
     if endpoint is None:
         # The one security-relevant event in this feature is a profile we REFUSED. Log the fact,
-        # never the URL: it is merchant-controlled text.
+        # not the URL. (`_call_tool` DOES log the accepted endpoint — that one has already passed
+        # `_validated_endpoint`, so it is bounded printable ASCII on a guarded host. A refused one
+        # has passed nothing.)
         logger.info("merchant-ucp discovery yielded no usable endpoint domain=%s", domain)
     return endpoint
 
@@ -698,7 +767,9 @@ async def _call_tool(
         async with httpx.AsyncClient(
             timeout=_TIMEOUT_SECONDS, follow_redirects=False
         ) as client:
-            resp = await client.post(f"https://{domain}{_MCP_PATH}", json=body)
+            resp = await _read_bounded(
+                client, "POST", f"https://{domain}{_MCP_PATH}", json_body=body
+            )
             # Exactly one hop, and only to the apex/www sibling — see _sibling_host. The retry
             # re-runs BOTH guards on the new host: a redirect target is merchant-controlled
             # input, so it is validated like any other caller-supplied host, never trusted
@@ -718,11 +789,11 @@ async def _call_tool(
                         sibling,
                     )
                     fetched = sibling
-                    resp = await client.post(
-                        f"https://{sibling}{_MCP_PATH}", json=body
+                    resp = await _read_bounded(
+                        client, "POST", f"https://{sibling}{_MCP_PATH}", json_body=body
                     )
             # The pinned path is Shopify's. When it says "no door here", ask the merchant's own
-            # profile where the door is — the hop the note below called more correct. The
+            # profile where the door is — the hop the note above called more correct. The
             # discovered endpoint is re-validated host-first by `_validated_endpoint`, and a
             # discovery that yields nothing leaves the original response untouched, so a merchant
             # with genuinely no door still reports its own status rather than a discovery error.
@@ -742,7 +813,7 @@ async def _call_tool(
                         discovered,
                     )
                     fetched = urlsplit(discovered).hostname or fetched
-                    resp = await client.post(discovered, json=body)
+                    resp = await _read_bounded(client, "POST", discovered, json_body=body)
     except (httpx.HTTPError, httpx.InvalidURL) as err:
         logger.warning(
             "merchant-ucp %s failed domain=%s host=%s: %s",
@@ -752,6 +823,10 @@ async def _call_tool(
             type(err).__name__,
         )
         raise MerchantUcpError("merchant endpoint unreachable") from err
+    if resp.over_limit:
+        raise MerchantUcpError(
+            f"merchant response exceeded {_MAX_PROFILE_BYTES} bytes from {fetched}"
+        )
     if resp.status_code >= 300:
         raise MerchantUcpError(
             f"merchant endpoint returned HTTP {resp.status_code} from {fetched}"

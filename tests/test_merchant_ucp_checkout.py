@@ -31,6 +31,20 @@ from services.merchant_ucp_checkout import MerchantUcpError
 PROFILE = "https://ucp.pivota.cc/.well-known/ucp-agent"
 
 
+class _Streamed:
+    """Async context manager standing in for `httpx.AsyncClient.stream`, yielding the scripted
+    body through `aiter_bytes()` in two chunks so a byte counter has something to count."""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
+
+
 @pytest.fixture(autouse=True)
 def _configured(monkeypatch):
     monkeypatch.setenv("UCP_AGENT_PROFILE_URL", PROFILE)
@@ -69,7 +83,17 @@ class _Capture:
 
             def __init__(self):
                 self.headers = httpx.Headers({})
-                self.content = b"{}"
+                # The real RPC, serialised: `_read_bounded` rebuilds the body from the streamed
+                # bytes, so a stub streaming a placeholder would lose the scripted response.
+                try:
+                    self.content = _json.dumps(capture.rpc).encode()
+                except Exception:
+                    self.content = b"{}"
+
+            async def aiter_bytes(self):
+                mid = max(1, len(self.content) // 2)
+                yield self.content[:mid]
+                yield self.content[mid:]
 
             def json(self):
                 return capture.rpc
@@ -88,6 +112,12 @@ class _Capture:
                 capture.url = url
                 capture.body = json
                 return _Resp()
+
+            def stream(self, method, url, *, json=None, headers=None):
+                capture.url = url
+                if json is not None:
+                    capture.body = json
+                return _Streamed(_Resp())
 
         monkeypatch.setattr(muc.httpx, "AsyncClient", _Client)
         if not real_hostname_guard:
@@ -763,6 +793,13 @@ class _Redirector:
                 except Exception:
                     self.content = b"{}"
 
+            async def aiter_bytes(self):
+                if isinstance(self._rpc, BaseException):
+                    raise self._rpc
+                mid = max(1, len(self.content) // 2)
+                yield self.content[:mid]
+                yield self.content[mid:]
+
             def json(self):
                 # A real httpx response RAISES json.JSONDecodeError on a non-JSON body. A stub
                 # that returns the raw string instead tests a different branch than the one it
@@ -789,6 +826,18 @@ class _Redirector:
                 if isinstance(entry, BaseException):
                     raise entry
                 return _Resp(*entry)
+
+            def stream(self, method, url, *, json=None, headers=None):
+                """`_read_bounded` streams; the stub must too, or every read is unexercised."""
+                if method == "GET":
+                    outer.get_headers.append(headers)
+                outer.calls.append((method, url, json))
+                if url not in outer.script:
+                    raise AssertionError(f"unscripted {method} to {url}")
+                entry = outer.script[url]
+                if isinstance(entry, BaseException):
+                    raise entry
+                return _Streamed(_Resp(*entry))
 
             async def get(self, url, headers=None):
                 # `headers` is captured, not ignored: the discovery GET must send
@@ -1806,3 +1855,150 @@ def test_the_two_discovery_helpers_never_raise(monkeypatch):
         assert muc._validated_endpoint(url) is None or isinstance(
             muc._validated_endpoint(url), str
         )
+
+
+# --------------------------------------------------------------------------------------
+# Round four. The gzip "bound" from round three did not bound anything: httpx decodes on the
+# RESPONSE header, so `Accept-Encoding: identity` is advisory and the cap ran after inflation.
+# Measured: 20,420 bytes on the wire -> 20,971,530 bytes in `.content`.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_compressed_bomb_is_stopped_by_the_read_not_the_header(monkeypatch):
+    """The read stops at the ceiling regardless of what the merchant sends, because
+    `_read_bounded` streams and counts DECODED bytes. Counting wire bytes would bound the wrong
+    quantity — 256KB of gzip is ~256MB inflated."""
+    fat = {"ucp": {"pad": "x" * (muc._MAX_PROFILE_BYTES * 2),
+                   "services": {"dev.ucp.shopping": [{"transport": "mcp", "endpoint": WIX}]}}}
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, fat),
+        WIX: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    infos = []
+    monkeypatch.setattr(muc.logger, "info", lambda fmt, *a: infos.append(fmt % a))
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value)
+    assert WIX not in r.urls, "an over-limit profile must not yield an endpoint"
+    # Bind the DIAGNOSTIC, not just the outcome. An over-limit body is empty, so `resp.json()`
+    # would fail and discovery would refuse anyway — dropping the `over_limit` check changes no
+    # behaviour and survived as an equivalent mutant. What it buys is an operator being told the
+    # profile was too large rather than that it was unparseable, and that is what this pins.
+    assert any("exceeded" in m and "262144" in m for m in infos), infos
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_merchant_POST_response_is_refused(monkeypatch):
+    """The ceiling applies to the POSTs too, not just the profile GET. The discovered POST is on a
+    host the MERCHANT named, so leaving that read unbounded would be new exposure from discovery."""
+    r = _Redirector({
+        APEX: (200, {}, {"jsonrpc": "2.0", "id": 1,
+                         "result": {"structuredContent": {"pad": "x" * (muc._MAX_PROFILE_BYTES * 2)}}}),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "exceeded" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_both_discovery_gets_refuse_compression(monkeypatch):
+    """The header is only a courtesy now, but pin it on BOTH GETs. The sibling GET was the half
+    left unbound, and it is the worse half: the merchant controls the 301, so 'apex redirects you
+    to its own www, www serves the bomb' is the path an attacker would actually take."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (301, {"location": WK_WWW}, None),
+        WK_WWW: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert len(r.get_headers) == 2, "both the apex and the sibling profile GET"
+    assert all(h and h.get("Accept-Encoding") == "identity" for h in r.get_headers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result, why",
+    [
+        ({"isError": True, "content": [{"type": "text", "text": '{"messages": 5}'}]}, "int messages"),
+        ({"isError": True, "content": [{"type": "text", "text": '{"messages": true}'}]}, "bool messages"),
+        ({"isError": True, "content": [{"type": "text", "text": '{"messages": 1.5}'}]}, "float messages"),
+        ({"isError": True, "content": [{"type": "text", "text": '{"messages": "x"}'}]}, "string messages"),
+        ({"isError": True, "content": 5}, "int content"),
+        ({"isError": True, "content": "x"}, "string content"),
+        ({"isError": True, "content": {"a": 1}}, "dict content"),
+    ],
+)
+async def test_a_non_list_member_in_the_rpc_result_is_never_a_500(monkeypatch, result, why):
+    """The FOURTH escape of the invariant, in `_unwrap`/`message_codes` rather than discovery:
+    `for entry in 5` is a TypeError and nothing on the route translates it.
+
+    The assertion is the invariant itself, not a specific outcome — returning normally and
+    refusing with MerchantUcpError are both fine; ANY other exception is the bug. Writing it as
+    `pytest.raises(MerchantUcpError)` would have been wrong in the other direction, since after
+    the fix several of these no longer raise at all.
+
+    Pre-existing on the pinned POST — but discovery makes any public MCP server a merchant names
+    into a second source of the same response, so it is fixed here rather than filed.
+    """
+    rpc = {"jsonrpc": "2.0", "id": 1, "result": result}
+    _Redirector({APEX: (200, {}, rpc)}).install(monkeypatch)
+
+    try:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+    except MerchantUcpError:
+        pass
+    except Exception as exc:  # noqa: BLE001 — the whole point is to catch the wrong class
+        pytest.fail(f"{why}: merchant input produced {type(exc).__name__}, not MerchantUcpError")
+
+
+@pytest.mark.asyncio
+async def test_a_non_dict_line_item_is_never_a_500(monkeypatch):
+    """The same truthy-non-dict construct the round-one fix named, 250 lines above it and left
+    alone: `(raw or {}).get(...)` raises AttributeError on `["x"]`. Not HTTP-reachable today —
+    create_checkout has no production caller — which is exactly why it is worth pinning before
+    one appears."""
+    _Capture(_ok({"id": "chk_1"})).install(monkeypatch)
+
+    try:
+        await muc.create_checkout("cosrx.com", line_items=[["x"]])
+    except MerchantUcpError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"a non-dict line item produced {type(exc).__name__}")
+
+
+def test_percent_encoded_delimiters_are_refused(monkeypatch):
+    """A target that decodes BEFORE routing sees `?` `#` NUL `\\` and `.` where we saw an opaque
+    path; `%25` lets it double-decode its way to any of them."""
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    for tok in ("%2e", "%2f", "%3f", "%23", "%00", "%5c", "%25", "%2E", "%3F"):
+        assert muc._validated_endpoint(f"https://www.wixapis.com/a{tok}b/mcp") is None, tok
+
+
+@pytest.mark.asyncio
+async def test_the_hopped_pinned_url_is_also_deduped(monkeypatch):
+    """The dedup has two halves; only the apex half was bound. This is the www half — a profile
+    naming the pinned URL on the host we hopped TO, which is the case the fix's own comment
+    describes."""
+    r = _Redirector({
+        APEX: (301, {"location": WWW}, None),
+        WWW: (404, {}, None),
+        WK: (200, {}, _profile(WWW)),
+        WK_WWW: (200, {}, _profile(WWW)),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "404" in str(excinfo.value)
+    assert r.urls.count(WWW) == 1, "the hopped pinned url must not be POSTed twice"
