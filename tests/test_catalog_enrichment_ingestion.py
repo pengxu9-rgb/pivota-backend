@@ -851,3 +851,51 @@ def test_variant_sku_key_fits_the_column_for_a_long_product_key():
     assert len(key) <= 255
     # stable across calls — re-runs must UPSERT, not mint a second row
     assert key == ing.derive_variant_sku_key(long_pk, "5405734574509012345678901234567890")
+
+
+# --- the seed carries the real variants the PDP renders from --------------------
+
+
+def test_seed_data_carries_every_real_variant_for_the_pdp():
+    """The external-seed serving lane builds its variant list from
+    seed_data['variants'], NOT from catalog_skus, so a folded shade line whose
+    shades exist as SKUs still rendered ONE synthetic variant and the shade
+    identity was invisible on the page."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_variant_record(3))
+    seed = result["seeds"][0]
+    variants = json.loads(seed["seed_data"])["variants"]
+    assert [v["title"] for v in variants] == ["Ruby Woo", "Bronx", "Dangerous"]
+    # the keys routes/agent_api.py::_build_external_seed_product actually reads
+    assert [v["variant_id"] for v in variants] == ["54057345745090", "54057345745091", "54057345745092"]
+    assert [v["price_amount"] for v in variants] == [24.0, 25.0, 26.0]
+    assert {v["price_currency"] for v in variants} == {"USD"}
+    assert [v["availability"] for v in variants] == ["in_stock", "out_of_stock", "in_stock"]
+    assert variants[0]["image_url"] == "https://cdn.x/0.jpg"
+    assert variants[0]["sku"] == "M0N900"
+
+
+def test_a_single_variant_record_still_writes_the_synthetic_canonical_variant():
+    """Byte-identical for every lane that does not fold: one synthetic variant,
+    named for the product, keyed on the canonical id."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_variant_record(1))
+    variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    assert len(variants) == 1
+    assert variants[0]["variant_id"].endswith("::canonical")
+    assert variants[0]["title"] == "Retro Matte Lipstick"
+
+
+def test_seed_variants_are_bounded():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    rec["pdp"]["variants"] = [
+        {"variant_id": f"v{i}", "sku": f"S{i}", "title": f"Shade {i}", "price": 24.0,
+         "in_stock": True, "image_url": None}
+        for i in range(ing.MAX_SEED_VARIANTS + 25)
+    ]
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert len(variants) == ing.MAX_SEED_VARIANTS
