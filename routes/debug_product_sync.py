@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from db.database import database
 from adapters.product_adapters import WixProductAdapter
+from services.wix_connection import extract_wix_site_id, normalize_wix_api_key
 import logging
 
 router = APIRouter(prefix="/debug", tags=["debug"])
@@ -22,8 +23,16 @@ async def debug_wix_sync(merchant_id: str):
         if not store:
             return {"error": "No Wix store found", "merchant_id": merchant_id}
         
-        site_id = store["domain"]
-        api_key = store["api_key"]
+        # The stored credential may be a JSON blob (`api_key`/`site_id`/
+        # `instance_id`), and sending that verbatim as the Authorization header
+        # leaks the whole blob to Wix and fails the call. One reader, the same
+        # one every other Wix caller uses.
+        raw_credential = store["api_key"]
+        api_key = normalize_wix_api_key(raw_credential)
+        try:
+            site_id = extract_wix_site_id(store["domain"], raw_credential)
+        except Exception:
+            site_id = store["domain"]
         
         # Test Wix adapter
         products, next_token, error = await WixProductAdapter.fetch_products(
