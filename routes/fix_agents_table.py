@@ -2,10 +2,20 @@
 Fix agents table schema - add missing columns
 This endpoint can be called once to update the agents table structure
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from utils.auth import require_admin_or_key
 from db.database import database
 
-router = APIRouter(prefix="/admin/fix", tags=["admin-fix"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# POST /admin/fix/agents-table ran `DROP TABLE IF EXISTS agents CASCADE`
+# (line 18 below) for an anonymous caller.
+router = APIRouter(prefix="/admin/fix", tags=["admin-fix"], dependencies=[Depends(require_admin_or_key)])
 
 @router.post("/agents-table")
 async def fix_agents_table():
