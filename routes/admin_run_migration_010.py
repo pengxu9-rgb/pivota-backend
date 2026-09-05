@@ -232,7 +232,12 @@ from typing import Dict, Any
 import os
 
 from db.database import database
-from utils.auth import get_current_employee
+# NOTE: this module's whole body appears TWICE; `router` is rebound here, so
+# main.py mounts THIS copy's routes and the ones above are dead. ADMIN_ROLES
+# is therefore imported on both sides -- the live guards below use it, and
+# relying on the dead copy's import to bind it would turn the obvious
+# de-duplication cleanup into a NameError on every admin route here.
+from utils.auth import ADMIN_ROLES, get_current_employee
 
 router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"])
 

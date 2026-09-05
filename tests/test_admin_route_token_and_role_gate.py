@@ -577,3 +577,114 @@ def test_require_employee_still_refuses_non_staff(client, psp_db_spy, role):
 
     assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
     assert not psp_db_spy.calls
+
+
+# ---------------------------------------------------------------------------
+# The ownership-OR-admin guards.
+#
+# `routes/payment_routing_routes.py` (5 sites) and `routes/agent_protocol_test.py`
+# (1) spell their guard `caller is the agent OR caller is an admin`. This
+# change edits only the second conjunct, and a review found the first one is
+# pinned by nothing: replacing all five conditions with `if False:` -- deleting
+# authorization from execute-payment, read-routes, create/update/delete-route
+# -- left `pytest -k "routing or payment or agent"` at 1662 passed, 0 failed.
+#
+# So the conjunct this PR did NOT touch gets its coverage here, next to the one
+# it did. Editing an admin allowlist beside an unpinned ownership test is how a
+# later "cleanup" quietly turns an agent-scoped route into an open one.
+# ---------------------------------------------------------------------------
+
+_AGENT_ROUTES = "/agents/{agent_id}/routes"
+_OWNER_AGENT = "agent-owner-1"
+_OTHER_AGENT = "agent-other-2"
+
+
+def _agent_token(user_id: str) -> str:
+    """An agent-portal token whose `user_id` is what the guard compares."""
+    return _sign(
+        {
+            "sub": user_id,
+            "user_id": user_id,
+            "email": f"{user_id}@example.com",
+            "role": "agent",
+            "membership_type": "agent",
+            "agent_id": user_id,
+            "aud": "agent-portal",
+            "scope": "agent",
+        }
+    )
+
+
+@pytest.fixture
+def routing_db_spy(monkeypatch) -> _DatabaseSpy:
+    from routes import payment_routing_routes as mod
+
+    spy = _DatabaseSpy()
+    monkeypatch.setattr(mod, "database", spy)
+    return spy
+
+
+def test_an_agent_reaches_its_own_routing_config(client, routing_db_spy):
+    """The ownership conjunct, admit side.
+
+    Kills a "fix" that drops `user_id != agent_id` and leaves admin-only --
+    which would lock every agent out of its own configuration.
+    """
+    resp = client.get(
+        _AGENT_ROUTES.format(agent_id=_OWNER_AGENT),
+        headers={"Authorization": f"Bearer {_agent_token(_OWNER_AGENT)}"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert routing_db_spy.calls, "the owning agent never reached the handler"
+
+
+def test_an_agent_cannot_read_another_agents_routing_config(
+    client, routing_db_spy
+):
+    """The ownership conjunct, refuse side -- the one nothing pinned.
+
+    Kills deleting the guard, and kills any rewrite that admits every
+    authenticated agent. `psp_priority` and `routing_strategy` are another
+    tenant's payment configuration.
+    """
+    resp = client.get(
+        _AGENT_ROUTES.format(agent_id=_OWNER_AGENT),
+        headers={"Authorization": f"Bearer {_agent_token(_OTHER_AGENT)}"},
+    )
+
+    assert resp.status_code == 403, (
+        f"agent {_OTHER_AGENT} read {_OWNER_AGENT}'s routes: {resp.text}"
+    )
+    assert not routing_db_spy.calls, "a refused agent reached the handler body"
+
+
+@pytest.mark.parametrize("role", _ADMITTED)
+def test_admin_roles_override_agent_ownership(client, routing_db_spy, role):
+    """The admin conjunct this PR fixed: `super_admin` was refused here too.
+
+    Its user_id is not the agent_id, so it clears the guard only on the second
+    conjunct -- which is exactly the one that read `!= "admin"`.
+    """
+    resp = client.get(
+        _AGENT_ROUTES.format(agent_id=_OWNER_AGENT),
+        headers={"Authorization": f"Bearer {_portal_token(role)}"},
+    )
+
+    assert resp.status_code == 200, f"{role} was refused: {resp.text}"
+    assert routing_db_spy.calls, f"{role} never reached the handler body"
+
+
+@pytest.mark.parametrize("role", ("employee", "outsourced", "merchant"))
+def test_non_admin_non_owner_is_refused_agent_routing(
+    client, routing_db_spy, role
+):
+    """Staff are not owners and not admins here, and stay refused."""
+    membership = "merchant" if role == "merchant" else "employee"
+    resp = client.get(
+        _AGENT_ROUTES.format(agent_id=_OWNER_AGENT),
+        headers={"Authorization": f"Bearer {_portal_token(role, membership)}"},
+    )
+
+    assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
+    assert not routing_db_spy.calls
