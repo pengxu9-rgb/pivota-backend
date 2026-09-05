@@ -94,6 +94,25 @@ Rows whose description / image / price / quality do not clear the 71.4 gate clas
 out of search; the report names them. Then re-probe the three queries above. (Also: the
 `commerce-index-search-index-cron` and `commerce-index-insight-refresh-cron` schedulers are PAUSED in prod.)
 
+**Promotion APPLIED 2026-09-05T00:04Z** (execution `catalog-curated-brand-onboard-g9nnq`, ~1 min):
+`quality=775/775 ips_recomputed=775/775 serving_eligible=48 trust_writes=775`. Blockers across the 775:
+suppressed 373, low_quality 246, no_price 27, no_image 22, short_description 21, no_seed 20,
+non_core_product 18. Trust: 727 blocked, **48 shadow** (none public). It also healed 60 stale agent_pdp_view rows.
+
+Re-probe result: Flower Beauty now SERVES. "FLOWER Beauty Petal Pout Lip Color" returns 10 FLOWER Beauty
+rows (Petal Pout Lip Color $8 first, merchant `merch_obs_6dc50e07fefbaecd`), and `get_product` on
+`sig_88aac9afbce66c31d77d1de8f5d3db30` reports `serving_eligible: true`, $8, destination
+flowerbeauty.com/products/petal-pout-delicate-dew-lip-color. Three caveats a reader must know:
+1. Brand-level phrasings still miss: "Flower Beauty lipstick" returns other brands (no brand hard-filter);
+   "Flower Beauty lip" / "FLOWER Beauty Bitten Lip Stain" / "…Plump Up Gloss Stick" are classed
+   `ambiguous_or_non_shopping` → clarify → 0. Exact product titles retrieve.
+2. The served rows are `readiness_tier: referral_only`, `buyable: false`, `offers_count: 0` on get_product, and
+   the variant carries `source_quality_status: blocked` / `hidden_from_selector: true` — link-out PDPs, not
+   yet a checkout path, even though the door completes (Phase 2 / merchant onboarding is what flips that).
+3. `serving_decision = shadow`, not public, for all 48 eligible rows (catalog_trust_policy: identity
+   confidence null / status unknown on external-seed content). Shadow rows reach the agent search surface;
+   whether the public web surface reads them is a separate check.
+
 Step 3 — verify (any prod psql / ops shell):
 
 ```sql
