@@ -89,9 +89,14 @@ def resolves_only_public(domain: str) -> bool:
     names whose A record points inside (localtest.me, *.nip.io, an attacker's own zone). ANY
     non-public answer disqualifies — a name that round-robins one public and one private
     address is exactly the rebinding shape this exists to refuse. TOCTOU residual (re-resolve
-    between check and connect) is accepted for now: scheme and path are pinned and the request
-    carries no credentials, so the remaining exposure is a blind probe; pinning the checked IP
-    for the actual connection is the follow-up if this rail's threat model hardens.
+    between check and connect) is accepted for now, but re-derive the reason before relying on
+    it: this used to read "scheme and path are pinned", and that is NO LONGER TRUE of every
+    caller. `services/merchant_ucp_checkout._validated_endpoint` admits a merchant-declared
+    endpoint whose path it bounds (https, ends `/mcp`, no query) rather than pins. What still
+    holds is the part that carries the argument — https with certificate verification, and no
+    credential on the request — so a rebound internal target must present a valid cert for the
+    attacker's name, leaving a connect-time probe rather than a read. Pinning the checked IP for
+    the actual connection remains the follow-up if this rail's threat model hardens.
     """
     import socket
 
