@@ -94,6 +94,24 @@ session_id + cart_id
 `merchant_id` is taken only from the authenticated API key. `store_id` scopes
 store-local session, cart, quote, checkout, payment, order, refund, and return
 identifiers for merchants with multiple stores.
+
+The key proves the merchant, not the store. Every event is bound to one of the
+merchant's active connected stores before it is written, using the same store
+set the Stripe PSP bridge resolves against so both authorities land in the
+same scope:
+
+- `store_id` must name an active connected store; an unknown or disconnected
+  store is refused with 422 and the batch is not written.
+- `store_id` may be omitted only when the merchant has exactly one connected
+  store, which is then filled in. A merchant with several must say which.
+- `platform` is taken from the connected store. An omitted platform (or the
+  default `custom`) is filled in; an explicit platform that disagrees with the
+  store is refused.
+- `surface` may not be `psp`; no merchant is a settlement authority.
+
+An event written under a store id the native webhook never uses would sit in
+an interaction scope nothing else reaches, so this binding is a correctness
+rule as much as a trust rule.
 `visitor_id` is retained for analysis but is not used by itself to merge sessions.
 
 Agent identity received through this merchant-signed endpoint is stored as

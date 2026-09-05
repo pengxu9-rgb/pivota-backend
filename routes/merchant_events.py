@@ -15,6 +15,11 @@ from services.merchant_event_ingest_service import (
     MerchantEventBatch,
     ingest_merchant_event_batch,
 )
+from services.merchant_event_store_binding import (
+    MerchantEventBindingError,
+    bind_batch_to_stores,
+    connected_store_index,
+)
 from services.merchant_hmac_auth import (
     MerchantHMACAuthError,
     authenticate_hmac_merchant,
@@ -393,7 +398,8 @@ async def ingest_event_batch(
 
     The signature is HMAC-SHA256 over the exact raw body using the merchant API
     key. Each event_id is the upstream idempotency key, making whole-batch retries
-    safe after a partial transport or database failure.
+    safe after a partial transport or database failure. Every event is bound to
+    one of the merchant's active connected stores before it is written.
     """
     raw_body = await request.body()
     if len(raw_body) > MAX_REQUEST_BYTES:
@@ -430,8 +436,19 @@ async def ingest_event_batch(
             detail=exc.errors(include_context=False),
         ) from exc
 
+    # The key proves the merchant, not the store. Every event must land in a
+    # store this merchant actually has connected, or its interaction would sit
+    # in a scope no native webhook or PSP event ever reaches.
+    merchant_id = str(merchant["merchant_id"])
+    try:
+        batch = bind_batch_to_stores(
+            batch, stores=await connected_store_index(merchant_id)
+        )
+    except MerchantEventBindingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
     result = await ingest_merchant_event_batch(
-        merchant_id=str(merchant["merchant_id"]),
+        merchant_id=merchant_id,
         batch=batch,
         agent_identity_confidence="merchant_asserted",
         write_path="merchant_hmac_batch",
