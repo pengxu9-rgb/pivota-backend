@@ -524,3 +524,56 @@ def test_no_guard_compares_a_role_against_the_bare_string_admin():
         "refuses super_admin. Use `not in ADMIN_ROLES` (utils.auth):\n  "
         + "\n  ".join(sorted(offenders))
     )
+
+
+# ---------------------------------------------------------------------------
+# The other dependency in routes.auth_routes. `require_employee` already
+# spelled its role check with EMPLOYEE_STAFF_ROLES, so it never carried defect
+# 1 -- and was still unreachable with a portal token, because it chains the
+# same validator. It is here to show the validator fix unblocks the whole
+# module, not just the route the prod report named, and that widening the
+# TOKEN did not widen the ROLE scope of a staff surface.
+# ---------------------------------------------------------------------------
+
+_PSP_OVERVIEW_ROUTE = "/api/psp/overview"
+
+
+@pytest.fixture
+def psp_db_spy(monkeypatch) -> _DatabaseSpy:
+    from routes import psp_overview_routes as mod
+
+    spy = _DatabaseSpy()
+    monkeypatch.setattr(mod, "database", spy)
+    return spy
+
+
+@pytest.mark.parametrize("role", ("super_admin", "admin", "employee"))
+def test_require_employee_admits_staff_with_a_portal_token(
+    client, psp_db_spy, role
+):
+    """EMPLOYEE_STAFF_ROLES, reached at last.
+
+    Kills a validator "fix" narrow enough to unblock only require_admin.
+    """
+    resp = client.get(
+        _PSP_OVERVIEW_ROUTE,
+        headers={"Authorization": f"Bearer {_portal_token(role)}"},
+    )
+
+    assert resp.status_code == 200, f"{role} was refused: {resp.text}"
+    assert psp_db_spy.calls, f"{role} never reached the handler body"
+
+
+@pytest.mark.parametrize("role", ("outsourced", "merchant", "agent"))
+def test_require_employee_still_refuses_non_staff(client, psp_db_spy, role):
+    """`outsourced` is the load-bearing one: it is an employee-portal login
+    role that EMPLOYEE_STAFF_ROLES deliberately excludes, and accepting its
+    token as VALID must not turn into accepting it as STAFF."""
+    membership = {"merchant": "merchant", "agent": "agent"}.get(role, "employee")
+    resp = client.get(
+        _PSP_OVERVIEW_ROUTE,
+        headers={"Authorization": f"Bearer {_portal_token(role, membership)}"},
+    )
+
+    assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
+    assert not psp_db_spy.calls
