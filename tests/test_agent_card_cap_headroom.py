@@ -495,16 +495,19 @@ def test_an_ordinary_large_amount_still_converts():
 
 def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
     """`_is_quoted_amount` follows `amount`/`value` into merchant-authored JSON, one Python frame
-    per level, against a 1000-frame limit a live request has already eaten into.
+    per level. Whether that is reachable depends entirely on the runtime.
 
-    A depth-900 probe returned normally, which read as a refutation and was not one: it undershot.
-    Adding a single frame per level -- less than any real ASGI stack adds -- made the same walk
-    raise RecursionError at depth 498 on a 994-deep reply. RecursionError is a RuntimeError, so
-    nothing on the quote path catches it and it surfaces as a 500 on merchant-controlled input.
+    On the PINNED runtime (runtime.txt: python-3.11) this is NOT a live 500. C and Python
+    recursion share one budget there and `resp.json()` runs STRICTLY DEEPER than this walk, so
+    the parser always exhausts first: measured end to end through the real transport with the
+    bound reverted, depth 970 returns and depth 980 is a clean 502, with no depth producing a
+    500. The claim that it did came from a probe that added a frame PER LEVEL; a deeper stack
+    adds a CONSTANT, which shifts parser and walk equally and preserves their order.
 
-    `json.loads` is not the guard. It refuses that body at depth 995, but costs about the same
-    frame per level, so which of the two trips first turns on a handful of frames of residual
-    stack rather than on anything built here.
+    It is load-bearing on 3.12+, where the budgets are separate -- measured on 3.12.8,
+    `json.loads` accepts 4000+ levels while this walk still stops at 996, so the parser stops
+    gating. RecursionError is a RuntimeError, which no `except (TypeError, ValueError)` on this
+    path catches. This test pins the bound so that upgrade is not a 500.
 
     The bound answers False, which reads as "the merchant did NOT quote tax" and ADDS headroom.
     That is the direction `_is_quoted_amount`'s docstring exists to protect: reading an unquoted
@@ -515,7 +518,54 @@ def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
     for _ in range(depth):
         nested = {"amount": nested}
 
-    covers = quote_covers({"currency": "USD", "total_amount": 2317, "tax": nested})
+    covers = quote_covers({"currency": "USD", "total_amount": 2317, "tax": nested,
+                           "total_shipping": 400})
 
     assert covers["tax"] is False
-    assert covers["shipping"] is False
+    # POSITIVE counterpart. The first draft asserted `shipping is False` against a fixture with
+    # no shipping key at all -- true with the bound and without it, and true of an empty dict.
+    # A real shipping amount alongside the hostile tax proves the walk still WORKS after the
+    # bound, instead of only proving it stopped.
+    assert covers["shipping"] is True
+
+
+def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
+    """Bounding the walk alone would have MOVED this 500, not removed it.
+
+    `_is_quoted_amount` is not the only thing that recurses over merchant `totals`: the audit
+    snapshot is `json.dumps`ed twice on the same request, once in `resolve_merchant_quote` and
+    once in the route. Both sites carried `except (ValueError, TypeError)` for `allow_nan`, and
+    RecursionError is a RuntimeError -- so with the walk bounded, the identical input simply
+    surfaced from `json.dumps` a few lines later instead. Measured before this guard: an
+    uncaught RecursionError at agent_card_issuance.py, in our own source.
+
+    Both sites are gated by the parser on the pinned 3.11 and reachable on 3.12+, exactly like
+    the walk. This drives the route helper directly, which is reachable on either.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep = 1
+    for _ in range(2000):
+        deep = {"amount": deep}
+    quote = {"quote_snapshot": {"totals": deep}}
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot(quote, {"max_minor": 7500})
+
+    assert excinfo.value.status_code == 422
+    assert "nested beyond the readable depth" in str(excinfo.value.detail)
+
+
+def test_the_snapshot_dump_still_serialises_a_normal_quote():
+    """The positive counterpart: the guard must not swallow ordinary snapshots."""
+    from routes.agent_cards import _dump_snapshot
+
+    out = _dump_snapshot(
+        {"quote_snapshot": {"totals": [{"type": "tax", "amount": 500}], "currency": "USD"}},
+        {"max_minor": 7500},
+    )
+
+    assert _json.loads(out)["totals"] == [{"type": "tax", "amount": 500}]
+    assert _json.loads(out)["headroom"] == {"max_minor": 7500}

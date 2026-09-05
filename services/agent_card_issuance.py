@@ -253,16 +253,28 @@ def _is_quoted_amount(value: Any, _depth: int = 0) -> bool:
             return False
         return math.isfinite(parsed)
     if isinstance(value, dict):
-        # BOUNDED. This walks merchant-authored JSON, and `{"amount": {"amount": {...}}}` nests as
-        # deep as the merchant likes: one Python frame per level against a 1000-frame limit that a
-        # live request has already eaten into. Measured -- with a single extra frame per level, a
-        # 994-deep reply raised RecursionError at depth 498. RecursionError is a RuntimeError, so
-        # no `except (TypeError, ValueError)` on this path catches it and it surfaces as a 500.
+        # BOUNDED. This walks merchant-authored JSON, and `{"amount": {"amount": {...}}}` nests
+        # as deep as the merchant likes, one Python frame per level.
         #
-        # The parser is NOT the guard. `json.loads` refuses that same 994-deep body at 995 -- but
-        # it costs about the same one frame per level, so which of the two trips first is decided
-        # by a handful of frames of residual stack, not by construction. A real quote nests
-        # `{"amount": {"amount": 5}}` once or twice; 8 is far past anything a merchant means.
+        # On the PINNED runtime (runtime.txt: python-3.11) this bound is NOT what stops a 500.
+        # C and Python recursion share one budget there, and `resp.json()` is called STRICTLY
+        # DEEPER than this walk -- `resolve_merchant_quote` -> `get_checkout` -> `_call_tool` ->
+        # `resp.json()` -- so the parser always runs out first. Measured end to end through the
+        # real transport with this bound REVERTED: depth 970 returns normally, depth 980 is a
+        # clean 502 ("merchant response was not JSON"), and NO depth produces a 500. An earlier
+        # version of this comment claimed a measured 500 here; that was an artifact of a probe
+        # that added a frame PER LEVEL. A deeper stack adds a CONSTANT, which shifts the parser
+        # and this walk equally and preserves the ordering.
+        #
+        # It is load-bearing on 3.12+, where the two budgets are separate: measured on 3.12.8,
+        # `json.loads` accepts 4000+ levels while this pure-Python walk still stops at 996. The
+        # parser stops gating and the walk trips first -- and RecursionError is a RuntimeError,
+        # so no `except (TypeError, ValueError)` on this path catches it. This is forward cover
+        # for that upgrade, not a fix for a live 3.11 defect.
+        #
+        # A real quote nests `{"amount": {"amount": 5}}` once or twice; 8 is far past that.
+        # `False` means "the merchant did not quote tax", which ADDS headroom -- and grants
+        # nothing the merchant could not get by simply OMITTING the key.
         if _depth >= _MAX_AMOUNT_NESTING:
             return False
         for key in ("amount", "value"):
@@ -368,6 +380,12 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
         json.dumps(snapshot, allow_nan=False)
     except (ValueError, TypeError):
         raise MerchantQuoteError("merchant quote carried a non-finite or unserialisable amount")
+    except RecursionError:
+        # `json.dumps` recurses over merchant `totals` too, and RecursionError is a RuntimeError
+        # that the clause above does not catch -- so bounding `_is_quoted_amount` alone would
+        # just move the same 500 four lines down. Gated by the parser on 3.11 like the walk is;
+        # reachable on 3.12+, where `json.loads` accepts 4000+ levels and this does not.
+        raise MerchantQuoteError("merchant quote nested beyond the readable depth")
     return {
         "total_minor": total_minor,
         "currency": currency,

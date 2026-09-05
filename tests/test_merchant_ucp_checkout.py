@@ -2396,6 +2396,10 @@ async def test_many_short_codes_are_capped_as_an_AGGREGATE_not_only_per_code(mon
         await muc.get_checkout("robinsons.com.sg", "chk_1")
 
     detail = str(excinfo.value)
+    # Pin the BRANCH as well as the length: without this the test stays green if a refactor
+    # routes this payload to a different (already-capped) refusal branch, and would no longer
+    # be testing the join at all.
+    assert detail.startswith("merchant refused the checkout:")
     assert len(detail) < 600, f"reflected {len(detail)} chars from {len(codes)} short codes"
 
 
