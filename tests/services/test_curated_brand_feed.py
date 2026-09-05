@@ -52,7 +52,9 @@ def test_fold_replaces_a_parent_stub_with_its_shades():
     assert [(v["title"], v["sku"]) for v in vs] == [("Ruby Woo", "M0N904"), ("Bronx", "M0N901")]
     assert vs[0]["image_src"] == "https://cdn.x/ruby.jpg"
     assert vs[0][cbf.FOLDED_FROM_KEY] == "retro-matte-lipstick-ruby-woo"
-    assert report == {"bases": 1, "shades": 2, "stubs_replaced": 1, "refused": [],
+    # images_adopted 0: this base carries its own image, so the fold leaves it alone
+    # (the adoption path has its own test below).
+    assert report == {"bases": 1, "shades": 2, "stubs_replaced": 1, "refused": [], "images_adopted": 0,
                       "folded": {"retro-matte-lipstick": ["retro-matte-lipstick-ruby-woo", "retro-matte-lipstick-bronx"]}}
     assert out[0][cbf.FOLDED_INTO_KEY] == 2  # marks the row the mapper may emit variants for
 
@@ -93,6 +95,48 @@ def test_mapper_emits_variants_only_for_a_folded_row_that_asked_for_them():
     # a real Shopify variant carries its swatch in featured_image; the product image is the fallback
     assert vs[0]["image_url"] == "https://cdn.x/a.jpg" and vs[1]["image_url"] == "https://cdn.x/img.jpg"
     assert rec["offers"][0]["price"] == 24.0  # primary offer unchanged: first sellable variant
+
+
+def test_fold_adopts_shade_images_when_the_base_stub_has_none():
+    """maccosmetics.com: 106 of 109 folded bases have an EMPTY images list while the
+    shade rows carry the swatches. The product row is what the quality scorer reads,
+    so an imageless base forfeits the whole images component — MAC scored 66.7
+    against the 71.4 gate and every row was blocked low_quality."""
+    base = _product(title="Retro Matte Lipstick", handle="rml", images=[],
+                    variants=[{"id": 1, "sku": "P2000_1", "price": "24.00", "option1": "Retro Matte Lipstick", "available": True}])
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="rml-ruby",
+                    images=[{"src": "https://cdn.x/ruby.jpg"}],
+                    variants=[{"id": 2, "sku": "M0N904", "price": "24.00", "available": True}])
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="rml-bronx",
+                     images=[{"src": "https://cdn.x/bronx.jpg"}],
+                     variants=[{"id": 3, "sku": "M0N901", "price": "24.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, ruby, bronx])
+    assert [i["src"] for i in out[0]["images"]] == ["https://cdn.x/ruby.jpg", "https://cdn.x/bronx.jpg"]
+    assert report["images_adopted"] == 1
+    # ...and the record the mapper builds now names a real product image
+    rec = shopify_product_to_record(out[0], domain="x.com", category_path="x", emit_variants=True)
+    assert rec["offers"][0]["image_url"] == "https://cdn.x/ruby.jpg"
+
+
+def test_fold_never_overwrites_a_base_that_has_its_own_images():
+    base = _product(title="Lip Pencil", handle="lp", images=[{"src": "https://cdn.x/own.jpg"}],
+                    variants=[{"id": 1, "sku": "LP01", "price": "20.00", "option1": "Whirl", "available": True}])
+    shade = _product(title="Lip Pencil - Brick-O-La", handle="lp-b", images=[{"src": "https://cdn.x/shade.jpg"}],
+                     variants=[{"id": 2, "sku": "LP02", "price": "20.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, shade])
+    assert [i["src"] for i in out[0]["images"]] == ["https://cdn.x/own.jpg"]
+    assert report["images_adopted"] == 0
+
+
+def test_mapper_falls_back_to_a_variant_image_when_the_product_has_none():
+    """Safety net for any imageless product row, folded or not: a variant's own
+    swatch is a real image of the product and beats publishing an imageless row."""
+    rec = shopify_product_to_record(
+        _product(images=[], variants=[{"id": 9, "sku": "A", "price": "24.00",
+                                        "featured_image": {"src": "https://cdn.x/v.jpg"}, "available": True}]),
+        domain="x.com", category_path="x",
+    )
+    assert rec["offers"][0]["image_url"] == "https://cdn.x/v.jpg"
 
 
 def test_fold_keeps_the_shade_rows_own_option1_over_the_title_suffix():

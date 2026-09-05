@@ -555,6 +555,19 @@ def shopify_product_to_record(
     if variant is None:
         return None
     image = _first(product.get("images")) or {}
+    if not str(image.get("src") or "").strip():
+        # No product-level image: a variant's own swatch is a real image of this
+        # product and is better than publishing a row the scorer counts as
+        # imageless. Only a fallback — a product image always wins.
+        for _v in variants:
+            _fi = _v.get("featured_image") if isinstance(_v, dict) else None
+            _src = (
+                str((_fi or {}).get("src") or "").strip() if isinstance(_fi, dict)
+                else str((_v or {}).get("image_src") or "").strip()
+            )
+            if _src:
+                image = {"src": _src}
+                break
     # A FOLDED row is a product LINE, not one physical item: its variants are the
     # shades, each with its own GTIN. Taking the first shade's barcode as the line's
     # would publish (say) Ruby Woo's GTIN on "Retro Matte Lipstick", and GTIN is
@@ -698,6 +711,16 @@ def _shade_bases(title: str) -> List[str]:
     return [_SHADE_SEP.join(parts[:i]).strip() for i in range(len(parts) - 1, 0, -1)]
 
 
+def _image_srcs(product: Dict[str, Any]) -> List[str]:
+    """Every usable image URL on a Shopify product row, in feed order."""
+    out: List[str] = []
+    for img in (product or {}).get("images") or []:
+        src = str((img or {}).get("src") or "").strip() if isinstance(img, dict) else str(img or "").strip()
+        if src:
+            out.append(src)
+    return out
+
+
 def _first_price(product: Dict[str, Any]) -> Optional[float]:
     for v in (product or {}).get("variants") or []:
         p = _to_float((v or {}).get("price")) if isinstance(v, dict) else None
@@ -765,7 +788,8 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
             folded_into.setdefault(id(base), []).append(p)
             shade_of[id(p)] = base
             break
-    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "folded": {}, "refused": refusals}
+    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
+                             "folded": {}, "refused": refusals}
     out: List[Dict[str, Any]] = []
     for p in products:
         if id(p) in shade_of:
@@ -811,6 +835,24 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
             handles.append(str(s.get("handle") or ""))
         base["variants"] = new_variants
         base[FOLDED_INTO_KEY] = len(shades)
+        # A parent stub carries no images of its own — measured on maccosmetics.com
+        # 2026-09-05, 106 of 109 folded bases have an EMPTY `images` list while the
+        # shade rows carry the swatches. The product row is what the quality scorer
+        # reads (`_extract_main_image`), so a base left imageless forfeits the whole
+        # images component: MAC scored 66.7 against a 71.4 gate and every row was
+        # blocked `low_quality`. Adopt the folded shades' images when the base has
+        # none; a base with its own images keeps them untouched.
+        if not _image_srcs(p):
+            adopted: List[Dict[str, Any]] = []
+            seen_src: set = set()
+            for s in shades:
+                for src in _image_srcs(s):
+                    if src not in seen_src:
+                        seen_src.add(src)
+                        adopted.append({"src": src})
+            if adopted:
+                base["images"] = adopted
+                report["images_adopted"] += 1
         report["bases"] += 1
         report["shades"] += len(shades)
         report["folded"][str(p.get("handle") or base_title)] = handles
