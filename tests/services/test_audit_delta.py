@@ -143,26 +143,98 @@ def test_band_crossing_score_improvement_is_material():
     assert "improved: First-party citation" in delta["headline"]
 
 
-def test_same_basis_tightens_material_threshold():
-    """W2: when both runs were measured on the SAME pinned prompt set, an 8-point
-    move (below the loose 15 but at/above the tight 5) IS material — the prompt
-    noise that justified 15 is gone."""
-    pinned = {"selected_set_id": "sel_abc"}
-    prior = _report(attribution=45, prompt_basis=pinned)
-    current = _report(attribution=53, prompt_basis=pinned)
+def test_same_basis_does_not_buy_a_threshold_below_the_measured_floor():
+    """The regression. This test used to assert the opposite — that an 8-point
+    move on a pinned basis IS material, because MATERIAL_SCORE_DELTA_SAME_BASIS
+    was 5.
 
+    8 points is inside the measured noise floor. Three replicate runs at
+    temperature 0 over the SAME queries spread 63.6 / 52.3 / 53.5 — 11.3 points
+    from noise alone, 95% CI ±8.5, smallest resolvable change ~11.9
+    (docs/revenue-recovery-joy-spike-2026-08-31.md §4). That study WAS the
+    pinned-basis condition: identical queries, temperature 0. Pinning removes
+    the variance from which questions got asked; it does not touch the response
+    variance that produced the spread.
+
+    So the tightening claimed detection at under half our smallest detectable
+    change, and claimed it specifically on the runs we tell the merchant are
+    the most comparable.
+    """
+    from services.audit_delta import (
+        MATERIAL_SCORE_DELTA, MATERIAL_SCORE_DELTA_SAME_BASIS,
+    )
+
+    assert MATERIAL_SCORE_DELTA_SAME_BASIS >= 12, (
+        "the same-basis threshold is back inside the ±8.5-14.6 measured floor"
+    )
+    assert MATERIAL_SCORE_DELTA_SAME_BASIS == MATERIAL_SCORE_DELTA
+
+    pinned = {"selected_set_id": "sel_abc"}
     delta = build_reaudit_delta(
-        current_report=current,
-        prior_report=prior,
+        current_report=_report(attribution=53, prompt_basis=pinned),
+        prior_report=_report(attribution=45, prompt_basis=pinned),
         prior_row={"run_id": "prior"},
         days_since=14,
     )
 
+    # Same basis is still stamped — it licenses "the questions did not change",
+    # which is a real and useful thing to say. It just does not license calling
+    # an 8-point move.
     assert delta["measurement_basis"]["same"] is True
     movement = _movement(delta, "attribution")
     assert movement["from"] == 45 and movement["to"] == 53
-    assert movement["direction"] == "improved"
+    assert movement["is_material"] is False
+
+
+def test_a_sub_threshold_move_is_reported_as_undetectable_not_as_stable():
+    """`direction: "stable"` is a positive claim — "this did not move". For a
+    12-point drop that is false; what is true is that the move is smaller than
+    this basis can resolve. The distinction is the whole point of the floor."""
+    pinned = {"selected_set_id": "sel_abc"}
+    delta = build_reaudit_delta(
+        current_report=_report(attribution=40, prompt_basis=pinned),
+        prior_report=_report(attribution=52, prompt_basis=pinned),
+        prior_row={"run_id": "prior"},
+        days_since=14,
+    )
+
+    detection = _movement(delta, "attribution")["detection"]
+    assert detection["observed_delta"] == 12
+    assert detection["threshold"] == 15
+    assert detection["verdict"] == "below_detection_floor"
+    assert "not evidence of stability" in detection["basis_note"]
+
+
+def test_a_move_clear_of_the_floor_is_reported_as_resolved():
+    """The positive counterpart: the floor must not swallow everything."""
+    pinned = {"selected_set_id": "sel_abc"}
+    delta = build_reaudit_delta(
+        current_report=_report(attribution=70, prompt_basis=pinned),
+        prior_report=_report(attribution=45, prompt_basis=pinned),
+        prior_row={"run_id": "prior"},
+        days_since=14,
+    )
+
+    movement = _movement(delta, "attribution")
     assert movement["is_material"] is True
+    assert movement["direction"] == "improved"
+    assert movement["detection"]["verdict"] == "resolved"
+    assert movement["detection"]["observed_delta"] == 25
+
+
+def test_a_signal_missing_on_one_side_is_not_called_stable():
+    """No prior value is not a zero move."""
+    pinned = {"selected_set_id": "sel_abc"}
+    delta = build_reaudit_delta(
+        current_report=_report(attribution=45, prompt_basis=pinned),
+        prior_report=_report(attribution=None, prompt_basis=pinned),
+        prior_row={"run_id": "prior"},
+        days_since=14,
+    )
+
+    detection = _movement(delta, "attribution")["detection"]
+    assert detection["observed_delta"] is None
+    assert detection["verdict"] == "not_comparable"
 
 
 def test_different_basis_keeps_loose_threshold():
