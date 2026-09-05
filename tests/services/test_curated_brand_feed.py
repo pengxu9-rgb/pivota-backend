@@ -54,6 +54,28 @@ def test_drop_shade_listings_keeps_suffixed_title_without_base_row():
     assert [p["title"] for p in out] == ["Cream & Chrome Eyeliner Duo - Holiday", "Amplified Lipstick"]
 
 
+def test_drop_shade_listings_handles_hyphenated_shade_names():
+    """21 of MAC's collapsible rows carry a hyphen INSIDE the shade name; a
+    single `[^-]+` capture kept every one of them as a duplicate PDP."""
+    base = _product(title="Retro Matte Liquid Lipcolour", handle="rmll")
+    lady = _product(title="Retro Matte Liquid Lipcolour - Lady-Be-Good", handle="rmll-lady-be-good")
+    pencil = _product(title="Lip Pencil", handle="lip-pencil")
+    brick = _product(title="Lip Pencil - Brick-O-La", handle="lip-pencil-brick-o-la")
+    out = cbf.drop_shade_listings([base, lady, pencil, brick])
+    assert [p["title"] for p in out] == ["Retro Matte Liquid Lipcolour", "Lip Pencil"]
+
+
+def test_drop_shade_listings_compares_normalised_titles():
+    """stila: 'HUGE™ …' base vs 'Huge™ … - Intense Black' shade, and a curly vs
+    straight apostrophe — the same normaliser make_content_key uses decides."""
+    base = _product(title="HUGE\u2122 Extreme Lash Mascara", handle="huge")
+    shade = _product(title="Huge\u2122 Extreme Lash Mascara - Intense Black", handle="huge-black")
+    balm = _product(title="Heaven's Dew\u2122 Honey Glow Balm", handle="balm")
+    balm_shade = _product(title="Heaven\u2019s Dew\u2122 Honey Glow Balm - Golden Sun", handle="balm-golden")
+    out = cbf.drop_shade_listings([base, shade, balm, balm_shade])
+    assert [p["handle"] for p in out] == ["huge", "balm"]
+
+
 def test_drop_shade_listings_never_drops_multi_variant_rows():
     """A multi-variant row already carries its shades as variants; a suffixed title
     on such a row is a distinct line (tarte's 'X - travel size' style), so it stays."""

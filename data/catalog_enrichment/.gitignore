@@ -1,2 +1,8 @@
 # Validated output is regenerated per category — don't commit.
 *_validated.jsonl
+
+# Hand-validated Lane C input for the Meitu-US non-Shopify brands (no Gemini key
+# exists in prod, so it is authored, not generated). run_catalog_enrichment.py
+# derives this same path from --category: `validate --category meitu_us_nonshopify`
+# would overwrite it — do not create a candidates file under that category.
+!meitu_us_nonshopify_validated.jsonl

@@ -465,8 +465,9 @@ def _collect_remediate() -> List[Tuple[str, str]]:
 
 
 def _collect_withdraw_catalog_rows() -> List[Tuple[str, str]]:
-    """Named takedown: the jsonb_build_object UPDATE with an integer bind, the
-    CASE-on-bind reverts, and the ANY(:pks) loader — every statement it sends."""
+    """Named takedown: the per-table jsonb_build_object UPDATE with a jsonb bind,
+    the CASE-on-bind + metadata-subtraction reverts, the ANY(:ids) seed writes
+    and the ANY(:pks) loader — every statement it sends (13)."""
     import scripts.withdraw_catalog_rows as module
 
     row = {
@@ -478,7 +479,7 @@ def _collect_withdraw_catalog_rows() -> List[Tuple[str, str]]:
     }
     ours = dict(row, suppressed_at="2026-01-01",
                 suppression_metadata={"script": module.SCRIPT_NAME, "reason": "probe",
-                                      "prior_active_seeds": 1})
+                                      "deactivated_seed_ids": ["seed_probe"]})
 
     async def _trust(*, db, product_keys, **kw):
         return len(product_keys)
@@ -749,7 +750,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
 # losing them needs a deliberate edit here, with the reason.
 _MIN_STATEMENTS = {
     "scripts/remediate_unpublished_crawl_rows.py": 11,
-    "scripts/withdraw_catalog_rows.py": 12,
+    "scripts/withdraw_catalog_rows.py": 13,
     "scripts/run_seed_content_audit.py": 4,
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,

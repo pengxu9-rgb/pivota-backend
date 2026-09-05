@@ -34,7 +34,7 @@ _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
 # Lowest variant price (in the store's currency) that counts as a real offer. Across
 # the four Meitu-US feeds measured 2026-09-05 (2,108 products) exactly one variant sat
-# in (0, 1.00): the $0.01 promo above. Nothing legitimate in a beauty D2C feed is
+# in (0, 1.00): the $0.01 stila promo described at the variant pick below. Nothing legitimate in a beauty D2C feed is
 # priced under a dollar; a floor this low cannot drop a real product.
 MIN_SELLABLE_PRICE = 1.0
 
@@ -519,7 +519,6 @@ def shopify_product_to_record(
     domain: str,
     category_path: str,
     brand_override: Optional[str] = None,
-    min_price: float = MIN_SELLABLE_PRICE,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -549,7 +548,7 @@ def shopify_product_to_record(
     price = None
     for v in variants:
         p = _to_float((v or {}).get("price"))
-        if p is not None and p >= min_price:
+        if p is not None and p >= MIN_SELLABLE_PRICE:
             variant, price = v, p
             break
     if variant is None:
@@ -611,21 +610,51 @@ def shopify_product_to_record(
 # ~1,900 near-duplicates for one brand. `drop_shade_listings` collapses them onto
 # the base listing when — and only when — the base listing is itself in the feed;
 # a suffixed title with no base row in the feed is a real product name and stays.
-_SHADE_SUFFIX_RE = re.compile(r"^(?P<base>.*\S)\s+-\s+(?P<shade>[^-]+?)\s*$")
+#
+# Titles are compared through `normalize_title` (the same normaliser
+# `make_content_key` uses downstream), because the feed is not case- or
+# punctuation-stable across a line: stila lists "HUGE™ Extreme Lash Mascara" beside
+# "Huge™ Extreme Lash Mascara - Intense Black", and "Heaven's" beside "Heaven’s".
+# A raw compare let 2 of stila's 12 shade rows through to mint their own PDP.
+# Shade names may themselves contain hyphens ("Lady-Be-Good", "Brick-O-La",
+# "Tete-A-Tint" — 21 of MAC's 1,381 collapsible rows), so every " - " split point
+# is tried, longest base first, rather than a single regex capture.
+#
+# KNOWN LIMIT, measured on the MAC feed: the surviving base row is itself a
+# single-variant parent stub (variants[0].option1 == title, sku P2000_*) — the
+# shade rows ARE the purchasable SKUs, and this collapse discards them rather
+# than folding them in as variants. It trades shade identity for one PDP per
+# line; it does not produce a base row that carries its shades. Folding shade
+# rows into the base's variants is the deeper fix and is not done here.
+_SHADE_SEP = " - "
+
+
+def _shade_bases(title: str) -> List[str]:
+    """Every '<base>' a '<base> - <shade>' title could be split into, longest
+    base first, so 'Lip Pencil - Brick-O-La' yields ['Lip Pencil - Brick-O',
+    'Lip Pencil']. Only ' - ' (space-hyphen-space) is a separator."""
+    parts = title.split(_SHADE_SEP)
+    return [_SHADE_SEP.join(parts[:i]).strip() for i in range(len(parts) - 1, 0, -1)]
 
 
 def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Pure. Return `products` without single-variant rows whose title is
-    `<base> - <shade>` where `<base>` is also a title in `products`. Order is
-    preserved; nothing else is touched. Multi-variant rows are never dropped —
-    their shades already live as variants of one product."""
-    titles = {str((p or {}).get("title") or "").strip() for p in products}
+    `<base> - <shade>` where `<base>` is also a title in `products` (compared
+    through normalize_title). Order is preserved; nothing else is touched.
+    Multi-variant rows are never dropped — a suffixed multi-variant title is a
+    distinct line, not a shade."""
+    from services.catalog_identity import normalize_title
+
+    titles = {normalize_title(str((p or {}).get("title") or "")) for p in products}
+    titles.discard("")
     out: List[Dict[str, Any]] = []
     for p in products:
         title = str((p or {}).get("title") or "").strip()
         variants = (p or {}).get("variants") or []
-        m = _SHADE_SUFFIX_RE.match(title)
-        if m and len(variants) <= 1 and m.group("base").strip() in titles:
+        is_shade = len(variants) <= 1 and any(
+            normalize_title(base) in titles for base in _shade_bases(title) if base
+        )
+        if is_shade:
             continue
         out.append(p)
     return out

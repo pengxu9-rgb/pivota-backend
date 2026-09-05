@@ -10,37 +10,35 @@ selects its own cohort (crawl rows absent from the merchant sitemap); nothing
 takes down a row by NAME. This does.
 
 WHAT IT WRITES, per product_key, in this order:
-  1. catalog_products  — suppression_reason + suppressed_at + suppression_metadata
-                          in ONE statement. The serving classifier reads
-                          `suppressed_at` (blocker_code 'suppressed'); the label
-                          alone leaves the row serving, and writing the two as
-                          separate autocommitted statements is how reason-only
-                          rows were minted before (see the module docstring of
-                          tests/test_canonical_feed_tombstoned_flag_postgres.py).
-  2. catalog_skus      — same pair, so no child SKU keeps the product priceable.
-  3. catalog_offers    — same pair, so no live offer feeds a price to the PDP.
-  4. external_product_seeds — status 'inactive' for seeds attached to the key;
-                          the seed's PRIOR status is recorded in the product's
-                          suppression_metadata so --revert restores it rather than
-                          blanket-activating.
-  5. index_pipeline_state — recompute_serving_eligibility per content_key, then
-                          the state is READ BACK from the table (never inferred:
-                          the recompute swallows exceptions and returns False for
-                          "went dark" and "blew up" alike).
-  6. catalog_row_trust — upsert for the touched product_keys, the column public
-                          readers gate on (the promotion lane writes it for the
-                          same reason).
+  1. catalog_products, catalog_skus, catalog_offers — suppression_reason +
+     suppressed_at + suppression_metadata{script, reason} in ONE statement per
+     table. The serving classifier reads `suppressed_at` (blocker_code
+     'suppressed'); the label alone leaves the row serving, and writing the two
+     as separate autocommitted statements is how reason-only rows were minted
+     before (see tests/test_canonical_feed_tombstoned_flag_postgres.py). The
+     metadata is what makes the withdrawal OWNED: --revert touches only rows
+     whose metadata names this script, on all three tables, so a SKU or offer
+     another lane tombstoned earlier (catalog_sync_service's stale sweep,
+     merge_duplicate_canonicals) is neither re-gated here nor un-gated later.
+  2. external_product_seeds — status 'inactive' for the seeds attached to the
+     key that were ACTIVE at withdrawal time; their ids are recorded in the
+     product's metadata (`deactivated_seed_ids`) so --revert re-activates
+     exactly those and never a seed another lane retired (the destination
+     sweep's 404 retirements, identity-resolution losers).
+  3. index_pipeline_state — recompute_serving_eligibility per content_key, then
+     the state is READ BACK from the table (never inferred: the recompute
+     swallows exceptions and returns False for "went dark" and "blew up" alike).
+  4. catalog_row_trust — upsert for the touched product_keys, the column public
+     readers gate on (the promotion lane writes it for the same reason).
 
 CONTENT_KEY GRAIN, stated because it is the obvious trap: index_pipeline_state
 is keyed on content_key and takes the MAX across the key's rows. Withdrawing one
 row on a key that has live siblings leaves the KEY serving-eligible — the
 withdrawn row itself is no longer advertised, but the read-back will say
-'serving'. The report prints rows_on_key so that reading is not a surprise.
+'serving'. The report prints "live rows on key" so that reading is not a surprise.
 
-Every write is guarded on the column it changes (… IS NULL / status='active'),
-so a re-run is a no-op. --revert undoes only rows this script suppressed
-(suppression_metadata.script == SCRIPT_NAME) and only clears a reason that is
-ours — a row carrying another lane's provenance keeps it.
+Every write is guarded on the column it changes (suppressed_at IS NULL /
+status = 'active' / ownership), so a re-run is a no-op.
 
 Usage:
   python3 scripts/withdraw_catalog_rows.py --product-key <pk> [--product-key ...] \
@@ -69,7 +67,11 @@ from services.index_pipeline_state_service import recompute_serving_eligibility 
 SCRIPT_NAME = "withdraw_catalog_rows"
 DEFAULT_REASON = "manual_withdrawal"
 
-_LOAD_SQL = """
+# The three tables a withdrawal gates. One statement shape each way, applied per
+# table, so the reason+timestamp+ownership invariant cannot drift between them.
+_SUPPRESSIBLE_TABLES = ("catalog_products", "catalog_skus", "catalog_offers")
+
+_ROW_COLUMNS_SQL = """
 SELECT cp.product_key, cp.content_key, cp.title, cp.brand, cp.source_system, cp.source_domain,
        cp.suppression_reason, cp.suppressed_at, cp.suppression_metadata,
        (SELECT count(*) FROM catalog_skus s WHERE s.product_key = cp.product_key) AS skus,
@@ -81,17 +83,12 @@ SELECT cp.product_key, cp.content_key, cp.title, cp.brand, cp.source_system, cp.
        (SELECT count(*) FROM catalog_products c2
          WHERE c2.content_key = cp.content_key AND c2.suppressed_at IS NULL) AS rows_on_key
 FROM catalog_products cp
-WHERE cp.product_key = ANY(:pks)
 """
-
-_LOAD_OURS_SQL = """
-SELECT cp.product_key, cp.content_key, cp.title, cp.brand, cp.source_system, cp.source_domain,
-       cp.suppression_reason, cp.suppressed_at, cp.suppression_metadata,
-       0 AS skus, 0 AS offers, 0 AS seeds, 0 AS active_seeds, 0 AS rows_on_key
-FROM catalog_products cp
-WHERE cp.suppressed_at IS NOT NULL
-  AND cp.suppression_metadata->>'script' = CAST(:script AS text)
-"""
+_LOAD_SQL = _ROW_COLUMNS_SQL + "WHERE cp.product_key = ANY(:pks)"
+_LOAD_OURS_SQL = _ROW_COLUMNS_SQL + (
+    "WHERE cp.suppressed_at IS NOT NULL "
+    "  AND cp.suppression_metadata->>'script' = CAST(:script AS text)"
+)
 
 
 async def _load_rows(product_keys: List[str]) -> List[Dict[str, Any]]:
@@ -107,6 +104,9 @@ async def _load_ours(product_keys: Optional[List[str]]) -> List[Dict[str, Any]]:
     rows = [dict(r) for r in await database.fetch_all(_LOAD_OURS_SQL, {"script": SCRIPT_NAME})]
     if product_keys:
         keep = set(product_keys)
+        ours = {r["product_key"] for r in rows}
+        for pk in sorted(keep - ours):
+            print(f"  ! {pk}: not withdrawn by this script (or not suppressed) — skipped")
         rows = [r for r in rows if r["product_key"] in keep]
     return rows
 
@@ -128,44 +128,41 @@ async def _recompute_and_verify(content_keys: List[str], reason: str) -> Dict[st
 
 
 async def _withdraw(rows: List[Dict[str, Any]], reason: str) -> Dict[str, str]:
-    """Suppress product + skus + offers, deactivate attached seeds, recompute."""
+    """Suppress product + skus + offers under our name, deactivate the seeds that
+    were active (recording which), recompute, refresh trust."""
     for row in rows:
         pk = row["product_key"]
-        prior_active = int(row.get("active_seeds") or 0)
-        # Reason, timestamp and provenance in ONE statement — never a reason
-        # without its gate column. Guarded on suppressed_at so a re-run and a
-        # row another lane already withdrew are both left alone.
-        await database.execute(
-            "UPDATE catalog_products "
-            "   SET suppression_reason = COALESCE(suppression_reason, CAST(:reason AS text)), "
-            "       suppressed_at = NOW(), "
-            "       suppression_metadata = COALESCE(suppression_metadata, '{}'::jsonb) "
-            "         || jsonb_build_object("
-            "              'script', CAST(:script AS text), "
-            "              'reason', CAST(:reason AS text), "
-            "              'prior_active_seeds', CAST(:prior AS integer)), "
-            "       updated_at = NOW() "
-            " WHERE product_key = :pk AND suppressed_at IS NULL",
-            {"pk": pk, "reason": reason, "script": SCRIPT_NAME, "prior": prior_active},
-        )
-        await database.execute(
-            "UPDATE catalog_skus "
-            "   SET suppression_reason = COALESCE(suppression_reason, CAST(:reason AS text)), "
-            "       suppressed_at = NOW(), updated_at = NOW() "
-            " WHERE product_key = :pk AND suppressed_at IS NULL",
-            {"pk": pk, "reason": reason},
-        )
-        await database.execute(
-            "UPDATE catalog_offers "
-            "   SET suppression_reason = COALESCE(suppression_reason, CAST(:reason AS text)), "
-            "       suppressed_at = NOW(), updated_at = NOW() "
-            " WHERE product_key = :pk AND suppressed_at IS NULL",
-            {"pk": pk, "reason": reason},
-        )
-        await database.execute(
-            "UPDATE external_product_seeds SET status = 'inactive', updated_at = NOW() "
+        # Which seeds are we about to deactivate? Recorded BEFORE the write so
+        # --revert can restore exactly these and nothing another lane retired.
+        seed_rows = await database.fetch_all(
+            "SELECT id FROM external_product_seeds "
             " WHERE attached_product_key = :pk AND status = 'active'",
             {"pk": pk},
+        )
+        seed_ids = [str(dict(r)["id"]) for r in seed_rows]
+        for table in _SUPPRESSIBLE_TABLES:
+            # Reason, timestamp and provenance in ONE statement — never a reason
+            # without its gate column. Guarded on suppressed_at so a re-run and a
+            # row another lane already withdrew are both left alone. CASTs are
+            # load-bearing: jsonb_build_object is variadic "any" and Postgres
+            # cannot infer a bind's type from position (fails at PREPARE).
+            await database.execute(
+                f"UPDATE {table} "
+                "   SET suppression_reason = COALESCE(suppression_reason, CAST(:reason AS text)), "
+                "       suppressed_at = NOW(), "
+                "       suppression_metadata = COALESCE(suppression_metadata, '{}'::jsonb) "
+                "         || jsonb_build_object("
+                "              'script', CAST(:script AS text), "
+                "              'reason', CAST(:reason AS text), "
+                "              'deactivated_seed_ids', CAST(:seed_ids AS jsonb)), "
+                "       updated_at = NOW() "
+                " WHERE product_key = :pk AND suppressed_at IS NULL",
+                {"pk": pk, "reason": reason, "script": SCRIPT_NAME, "seed_ids": json.dumps(seed_ids)},
+            )
+        await database.execute(
+            "UPDATE external_product_seeds SET status = 'inactive', updated_at = NOW() "
+            " WHERE id = ANY(:ids) AND status = 'active'",
+            {"ids": seed_ids},
         )
     keys = sorted({r["content_key"] for r in rows if r.get("content_key")})
     states = await _recompute_and_verify(keys, f"{SCRIPT_NAME}:{reason}")
@@ -184,8 +181,10 @@ def _meta(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Undo OUR withdrawals only: clear the gate column and our reason on all
-    three tables, re-activate seeds only if some were active when we withdrew."""
+    """Undo OUR withdrawals only. Every table is guarded on the ownership stamp
+    in its own metadata, so a SKU/offer another lane tombstoned before we came
+    along keeps its gate column and its reason. Seeds come back only if we were
+    the ones that put them to sleep."""
     for row in rows:
         pk = row["product_key"]
         meta = _meta(row)
@@ -193,39 +192,25 @@ async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
             print(f"  ! {pk}: suppressed by {meta.get('script') or 'another lane'}, not reverting")
             continue
         reason = str(meta.get("reason") or DEFAULT_REASON)
-        await database.execute(
-            "UPDATE catalog_products "
-            "   SET suppressed_at = NULL, "
-            "       suppression_reason = CASE WHEN suppression_reason = CAST(:reason AS text) "
-            "                                 THEN NULL ELSE suppression_reason END, "
-            "       updated_at = NOW() "
-            " WHERE product_key = :pk AND suppressed_at IS NOT NULL",
-            {"pk": pk, "reason": reason},
-        )
-        await database.execute(
-            "UPDATE catalog_skus "
-            "   SET suppressed_at = NULL, "
-            "       suppression_reason = CASE WHEN suppression_reason = CAST(:reason AS text) "
-            "                                 THEN NULL ELSE suppression_reason END, "
-            "       updated_at = NOW() "
-            " WHERE product_key = :pk AND suppressed_at IS NOT NULL",
-            {"pk": pk, "reason": reason},
-        )
-        await database.execute(
-            "UPDATE catalog_offers "
-            "   SET suppressed_at = NULL, "
-            "       suppression_reason = CASE WHEN suppression_reason = CAST(:reason AS text) "
-            "                                 THEN NULL ELSE suppression_reason END, "
-            "       updated_at = NOW() "
-            " WHERE product_key = :pk AND suppressed_at IS NOT NULL",
-            {"pk": pk, "reason": reason},
-        )
-        if int(meta.get("prior_active_seeds") or 0) > 0:
+        seed_ids = [str(s) for s in (meta.get("deactivated_seed_ids") or [])]
+        for table in _SUPPRESSIBLE_TABLES:
             await database.execute(
-                "UPDATE external_product_seeds SET status = 'active', updated_at = NOW() "
-                " WHERE attached_product_key = :pk AND status = 'inactive'",
-                {"pk": pk},
+                f"UPDATE {table} "
+                "   SET suppressed_at = NULL, "
+                "       suppression_reason = CASE WHEN suppression_reason = CAST(:reason AS text) "
+                "                                 THEN NULL ELSE suppression_reason END, "
+                "       suppression_metadata = suppression_metadata "
+                "                              - 'script' - 'reason' - 'deactivated_seed_ids', "
+                "       updated_at = NOW() "
+                " WHERE product_key = :pk AND suppressed_at IS NOT NULL "
+                "   AND suppression_metadata->>'script' = CAST(:script AS text)",
+                {"pk": pk, "reason": reason, "script": SCRIPT_NAME},
             )
+        await database.execute(
+            "UPDATE external_product_seeds SET status = 'active', updated_at = NOW() "
+            " WHERE id = ANY(:ids) AND status = 'inactive'",
+            {"ids": seed_ids},
+        )
     keys = sorted({r["content_key"] for r in rows if r.get("content_key")})
     states = await _recompute_and_verify(keys, f"{SCRIPT_NAME}:revert")
     await upsert_catalog_row_trust_many(db=database, product_keys=[r["product_key"] for r in rows])
@@ -284,8 +269,8 @@ async def _run(args: argparse.Namespace) -> int:
             states = await _withdraw(actionable, args.reason)
         for ck, state in sorted(states.items()):
             print(f"  {ck}: {state}")
-        dark = sum(1 for s in states.values() if s == "dark")
-        print(f"done: {len(states)} content_key(s) recomputed, {dark} dark, "
+        print(f"done: {len(states)} content_key(s) recomputed, "
+              f"{sum(1 for s in states.values() if s == 'dark')} dark, "
               f"{sum(1 for s in states.values() if s == 'serving')} still serving, "
               f"{sum(1 for s in states.values() if s == 'unknown')} unknown")
         return 0
