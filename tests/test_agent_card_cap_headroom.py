@@ -538,6 +538,28 @@ def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
 _DEEPER_THAN_ANY_ENCODER = 12_000
 
 
+def test_the_guard_depth_constant_actually_exceeds_the_encoder():
+    """A RATCHET for the constant above, which otherwise has none.
+
+    Setting it back to 2_000 -- the exact regression that made both dump-guard tests
+    green-but-dead on 3.12 -- leaves the whole suite passing on the pinned 3.11, because 2_000
+    trips the encoder THERE. So the numeric floor has to be asserted against the highest limit
+    any runtime we may move to imposes (9997 on 3.12.8), not merely against this one.
+
+    The second assertion is the property the constant actually needs, checked against whatever
+    interpreter is running: at this depth the encoder must genuinely refuse. Together they catch
+    both a value lowered below a future runtime's limit and a runtime whose limit outgrows it.
+    """
+    assert _DEEPER_THAN_ANY_ENCODER > 9997, "must exceed the 3.12.8 encoder limit, not just 3.11's"
+
+    deep = 1
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = {"amount": deep}
+
+    with pytest.raises(RecursionError):
+        _json.dumps(deep)
+
+
 def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
     """Bounding the walk alone would have MOVED this 500, not removed it.
 
@@ -659,3 +681,58 @@ def test_the_snapshot_dump_refuses_a_non_finite_amount_it_calls_itself_a_belt_fo
 
     assert excinfo.value.status_code == 502
     assert "unserialisable" in str(excinfo.value.detail)
+
+
+def test_the_dump_guard_does_not_swallow_our_own_errors_from_the_snapshot_builder(monkeypatch):
+    """Pins that the catch covers the ENCODER only, not the snapshot builder.
+
+    `MerchantQuoteError` and `MerchantUcpError` are both ValueError SUBCLASSES, so
+    `except (ValueError, TypeError)` around `_snapshot_with_headroom(...)` would report any of
+    OUR failures there to the agent as "the merchant sent an unserialisable amount" -- a 502
+    blaming a third party for our bug. Demonstrated before the builder was hoisted out of the
+    try: dropping `_snapshot_with_headroom`'s non-dict guard turned `{**None}` into
+    `502 merchant quote carried an unserialisable amount`; hoisted, the same TypeError surfaces
+    as a loud 500 that reads as ours. merchant_ucp_checkout.py already carries this exact
+    warning about the same subclass overlap.
+
+    This pins it without needing that second mutation: an error raised by the builder must
+    travel, not be relabelled.
+    """
+    import routes.agent_cards as mod
+    from services.agent_card_issuance import MerchantQuoteError
+
+    def boom(quote, cap):
+        raise MerchantQuoteError("our own failure, not the merchant's")
+
+    monkeypatch.setattr(mod, "_snapshot_with_headroom", boom)
+
+    with pytest.raises(MerchantQuoteError):
+        mod._dump_snapshot({"quote_snapshot": {}}, {"max_minor": 7500})
+
+
+def test_a_deep_non_dict_snapshot_is_a_502_not_an_uncaught_recursion():
+    """The regression the hoist itself introduced, caught by review and pinned here.
+
+    `_snapshot_with_headroom`'s non-dict fallback does `repr(base)[:200]`, and `repr()` recurses.
+    Hoisting the builder out of the encoder's `try` -- which is what stops our own ValueErrors
+    being relabelled as the merchant's -- took that recursion out of cover with it. Measured: a
+    12,000-deep non-dict `quote_snapshot` answered 502 before the hoist and an uncaught 500
+    after, i.e. the hardening opened the hole it was hardening.
+
+    Dead today (`resolve_merchant_quote` only ever emits a dict), which is exactly why it needs a
+    direct test: it is the "older cached shape, hand-built dict, future refactor" the builder's
+    own docstring anticipates, and nothing end-to-end would notice.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep = []
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = [deep]
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot({"quote_snapshot": deep}, {"max_minor": 7500})
+
+    assert excinfo.value.status_code == 502
+    assert "nested beyond the readable depth" in str(excinfo.value.detail)
