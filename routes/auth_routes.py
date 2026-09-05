@@ -143,9 +143,14 @@ async def verify_jwt_token(
     """
     payload = await shared_get_current_user(credentials)
 
-    # `get_current_user` requires sub/email/role. The legacy contract here is
-    # user_id/role, and `sub` is what the canonical issuer fills for identity,
-    # so fall back to it rather than 401-ing a token the rest of the app takes.
+    # `get_current_user` requires sub/email/role; the legacy contract here is
+    # user_id/role. The `sub` fallback and the 401 below are DEFENSIVE, not
+    # load-bearing: an audit checked all four live issuers (routes/auth.py:607
+    # and :1094, accounts_orders_api.py:797, agent_account.py:666) and every
+    # one stamps `user_id`, so no token in circulation reaches either branch.
+    # They stay because this function's contract is "user_id is always
+    # present", and a future issuer that fills only `sub` should be adapted
+    # here rather than 401'd on a route that never reads the claim.
     user_id = payload.get("user_id") or payload.get("sub")
     role = payload.get("role")
     if not user_id or not role:

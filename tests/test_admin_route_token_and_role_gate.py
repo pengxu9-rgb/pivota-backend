@@ -828,3 +828,152 @@ def test_auth_me_answers_a_portal_token_with_its_real_email(client):
     user = resp.json()["user"]
     assert user["email"] == "super_admin@example.com", user
     assert user["role"] == "super_admin"
+
+
+# ---------------------------------------------------------------------------
+# The adapter's RETURN SHAPE.
+#
+# A mutation audit found that reverting the adapter to the old narrow
+# `{"user_id", "role"}` dict killed nothing in the entire 14k-test suite, even
+# though routes/direct_db_check.py reads `merchant_id` off it. The widened
+# shape is a deliberate part of "one validator" -- the shared validator returns
+# the claim set, so this must too -- and it was unpinned.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_adapter_returns_the_whole_claim_set():
+    """Kills reverting `verify_jwt_token` to `{"user_id", "role"}`.
+
+    Every claim the shared validator hands back must survive the adapter;
+    narrowing it here would silently re-introduce the divergence this PR
+    exists to remove, just on the response side instead of the accept side.
+    """
+    import inspect
+
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    from routes.auth_routes import verify_jwt_token
+
+    token = _portal_token("super_admin")
+    creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    result = verify_jwt_token(creds)
+    if inspect.isawaitable(result):
+        result = await result
+
+    for claim in ("sub", "email", "role", "user_id", "identity_id",
+                  "membership_type", "membership_id", "employee_id",
+                  "aud", "scope"):
+        assert claim in result, f"the adapter dropped the {claim!r} claim: {result}"
+    assert result["email"] == "super_admin@example.com"
+    assert result["aud"] == "employee-portal"
+
+
+# ---------------------------------------------------------------------------
+# The three highest-risk guards this PR edits.
+#
+# The same audit measured line coverage across all 67 changed guard sites: 5
+# were executed by any test, and deleting authorization outright from 18 of the
+# rest was invisible to the whole suite. The mechanical equivalence of those
+# edits is provable (base + the rewrite == the shipped AST for 75 of 76), but
+# "provably unchanged" is not "guarded", and these three are the ones whose
+# blast radius justifies a behavioural test rather than a proof.
+# ---------------------------------------------------------------------------
+
+_EXECUTE_PAYMENT = "/agents/{agent_id}/payments/route"
+_DELETE_EMPLOYEE = "/employees/emp-42"
+_OVERRIDE_PERMISSION = "/employee/routing/agents/{agent_id}/override-permission"
+
+# A VALID body matters here. FastAPI validates the request model before the
+# handler runs, so an incomplete body answers 422 and the in-handler guard is
+# never reached -- the refusal would be the validator's, not the role check's,
+# and the test would prove nothing. (It caught exactly that on the first cut:
+# a missing `order_id` produced 422 instead of 403.)
+_PAYMENT_BODY = {
+    "order_id": "ord-1",
+    "amount": 10.0,
+    "currency": "USD",
+    "merchant_id": "m-1",
+}
+
+
+@pytest.mark.parametrize("role", ("employee", "outsourced", "merchant", "agent"))
+def test_execute_payment_refuses_non_admin_non_owner(client, routing_db_spy, role):
+    """`POST /agents/{id}/payments/route` executes a real payment with failover
+    on another tenant's behalf. Highest blast radius of the 67 sites."""
+    membership = {"merchant": "merchant", "agent": "agent"}.get(role, "employee")
+    resp = client.post(
+        _EXECUTE_PAYMENT.format(agent_id=_OWNER_AGENT),
+        json=_PAYMENT_BODY,
+        headers={"Authorization": f"Bearer {_portal_token(role, membership)}"},
+    )
+
+    assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
+    assert not routing_db_spy.calls, f"refused {role} reached the handler body"
+
+
+@pytest.mark.parametrize("role", ("employee", "outsourced", "merchant"))
+def test_employee_deactivation_refuses_non_admins(client, audit_db_spy, role):
+    """`DELETE /employees/{id}` sets an employee inactive -- a privilege write.
+    `employee` is staff and must still be refused."""
+    membership = "merchant" if role == "merchant" else "employee"
+    resp = client.delete(
+        _DELETE_EMPLOYEE,
+        headers={"Authorization": f"Bearer {_portal_token(role, membership)}"},
+    )
+
+    assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
+    assert not audit_db_spy.calls, f"refused {role} reached the handler body"
+
+
+@pytest.mark.parametrize("role", _ADMITTED)
+def test_admin_roles_can_deactivate_an_employee(client, audit_db_spy, role):
+    """The admit side, so the refusals above cannot pass by the route being
+    broken for everyone."""
+    resp = client.delete(
+        _DELETE_EMPLOYEE,
+        headers={"Authorization": f"Bearer {_portal_token(role)}"},
+    )
+
+    assert resp.status_code != 403, f"{role} was refused: {resp.text}"
+    assert audit_db_spy.calls, f"{role} never reached the handler body"
+
+
+@pytest.fixture
+def governance_db_spy(monkeypatch) -> _DatabaseSpy:
+    from routes import routing_governance as mod
+
+    spy = _DatabaseSpy()
+    monkeypatch.setattr(mod, "database", spy)
+    return spy
+
+
+@pytest.mark.parametrize("role", ("employee", "outsourced"))
+def test_routing_override_grant_refuses_non_admin_staff(
+    client, governance_db_spy, role
+):
+    """Grants an agent the right to OVERRIDE merchant routing rules. The route
+    sits behind get_current_employee, so `employee` and `outsourced` clear the
+    router-level dependency and are stopped only by this guard."""
+    resp = client.put(
+        _OVERRIDE_PERMISSION.format(agent_id=_OWNER_AGENT),
+        params={"enabled": True},
+        headers={"Authorization": f"Bearer {_portal_token(role)}"},
+    )
+
+    assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
+    assert not governance_db_spy.calls, f"refused {role} reached the handler"
+
+
+@pytest.mark.parametrize("role", _ADMITTED)
+def test_admin_roles_can_grant_routing_override(client, governance_db_spy, role):
+    """The admit side -- and the super_admin half of this PR's fix, on a route
+    whose guard was `!= "admin"` behind an employee-only router."""
+    resp = client.put(
+        _OVERRIDE_PERMISSION.format(agent_id=_OWNER_AGENT),
+        params={"enabled": True},
+        headers={"Authorization": f"Bearer {_portal_token(role)}"},
+    )
+
+    assert resp.status_code != 403, f"{role} was refused: {resp.text}"
+    assert governance_db_spy.calls, f"{role} never reached the handler body"
