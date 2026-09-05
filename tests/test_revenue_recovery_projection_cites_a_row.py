@@ -55,7 +55,7 @@ def test_the_production_report_shape_yields_findings(real_report):
     types = {f["finding_type"] for f in findings}
     # The rollup called these blocked; the projection must not be silent on them.
     assert "product_identity_unresolvable" in types
-    assert "destination_unroutable" in types
+    assert "content_too_thin_to_cite" in types
 
 
 def test_no_stage_claims_an_all_clear_on_the_real_report(real_report):
@@ -71,16 +71,36 @@ def test_no_stage_claims_an_all_clear_on_the_real_report(real_report):
             )
 
 
-def test_every_stage_that_claims_MEASURED_cites_at_least_one_finding(real_report):
-    """'Every stage claim must cite a row.' MEASURED with an empty list is a
-    claim with no evidence behind it."""
-    proj = _project(extract_findings(real_report))
+def test_every_stage_claim_cites_a_row_that_exists_in_the_report(real_report):
+    """'Every stage claim must cite a row.'
 
+    The earlier version of this test asserted MEASURED implies non-empty
+    findings — which is VACUOUS: MEASURED is assigned by `"MEASURED" if
+    stages[name]["findings"] else "NO_FINDINGS"`, so no input can fail it. It
+    passed against the broken build too. What actually needed pinning is that
+    the cited rows trace back to the report: a stage citing a finding the
+    rollup never produced is a fabricated claim, which is the same defect
+    class as the false all-clear.
+    """
+    report_dims = set(real_report["brand_rollup"]["dimensions"])
+    findings = extract_findings(real_report)
+    proj = _project(findings)
+
+    emitted = {f["finding_type"]: f for f in findings}
+    cited = 0
     for stage in proj["stages"]:
-        if stage["status"] == "MEASURED":
-            assert stage["findings"], (
-                f"{stage['stage']} is MEASURED but cites no finding"
+        assert (stage["status"] == "MEASURED") == bool(stage["findings"])
+        for f in stage["findings"]:
+            assert f["type"] in emitted, (
+                f"{stage['stage']} cites {f['type']}, which the extractor "
+                f"never emitted for this report"
             )
+            payload = emitted[f["type"]].get("payload") or {}
+            assert payload.get("dimension") in report_dims, (
+                f"{f['type']} cites a dimension absent from the rollup"
+            )
+            cited += 1
+    assert cited, "no stage cited anything on a report with blocked dimensions"
 
 
 def test_findings_reach_the_stage_their_meaning_belongs_to(real_report):
@@ -92,8 +112,8 @@ def test_findings_reach_the_stage_their_meaning_belongs_to(real_report):
     }
 
     assert "product_identity_unresolvable" in by_stage["get_selected"]
+    assert "content_too_thin_to_cite" in by_stage["get_selected"]
     assert "category_citation_weak" in by_stage["get_cited"]
-    assert "destination_unroutable" in by_stage["get_cited"]
     # routability is NOT convert_sales: that stage means a real purchase path
     # was exercised, and only the browser lane can say that.
     assert not by_stage["convert_sales"]
@@ -123,7 +143,7 @@ def test_an_unrecognised_report_leaves_every_stage_unverified():
     by_stage = {s["stage"]: s for s in proj["stages"]}
     # The two stages that WOULD have been readable say why they were not read.
     for name in ("get_selected", "get_cited"):
-        assert "did not recognise" in by_stage[name]["unverified_reason"]
+        assert "established nothing" in by_stage[name]["unverified_reason"]
         assert "not an all-clear" in by_stage[name]["unverified_reason"]
     # convert_sales keeps its own, more specific reason — it has never run at
     # all, which is a stronger statement than "we could not read the report",
@@ -157,10 +177,30 @@ def test_every_producible_type_has_a_stage_and_vice_versa():
     selection one. Keep the two tables in step."""
     from services import audit_projection_builder as b
 
-    unmapped = b._PRODUCIBLE_FINDING_TYPES - set(b._STAGE_FOR_FINDING_TYPE) - {
-        b._UNREADABLE_FINDING,
-    }
+    from services import audit_evidence_builder as e
+
+    unmapped = (
+        b._PRODUCIBLE_FINDING_TYPES
+        - set(b._STAGE_FOR_FINDING_TYPE)
+        - b._META_FINDING_TYPES
+    )
     assert not unmapped, f"producible but unmapped to a stage: {sorted(unmapped)}"
+
+    # The "vice versa" the name promised and the body never checked: a stage
+    # mapping for a type nothing emits makes _stage_is_measurable say a stage
+    # has a producer when it has none — which is how a stage claims
+    # NO_FINDINGS for something that can never produce one.
+    unproducible = set(b._STAGE_FOR_FINDING_TYPE) - b._PRODUCIBLE_FINDING_TYPES
+    assert not unproducible, (
+        f"mapped to a stage but no producer emits it: {sorted(unproducible)}"
+    )
+
+    # And the third table: every dimension the evidence builder maps must be a
+    # type the projection knows. A rename on one side alone is the whole
+    # failure mode here.
+    assert set(e._ROLLUP_DIMENSION_FINDING.values()) <= (
+        b._PRODUCIBLE_FINDING_TYPES
+    )
 
 
 def test_a_stage_is_never_unverified_while_carrying_findings(real_report):
@@ -378,3 +418,174 @@ def test_a_side_with_no_answered_prompts_has_no_rate(real_report):
     assert split["branded"]["rate"] is None, "0/0 rendered as a rate"
     # The other side still reports normally — this is not a global blank.
     assert split["unbranded"]["rate"] is not None
+
+
+# ---------------------------------------------------------------------
+# Review findings, 2026-09-05. Each of these pins a defect the first cut of
+# this fix shipped.
+# ---------------------------------------------------------------------
+
+
+def test_routability_is_never_a_merchant_facing_visibility_claim(real_report):
+    """It measures OUR readiness, not the brand's.
+
+    Every routability bucket reads Pivota data and only Pivota data:
+    serving_eligibility (30) is our index pipeline state, offer_orderability
+    (25) and price_currency_confidence (15) read our `catalog_offers`, the last
+    10 read our merchant record. Not one reads a model's answer. The writer
+    already demoted it for exactly this reason (_INTERNAL_STATE_GAPS, #1504) —
+    "conflating 'Pivota hasn't served this' with 'brand isn't AI-visible'".
+
+    The first cut emitted it as a HIGH finding, `destination_unroutable`, in
+    the CITATION stage, with the summary "AI has no buyable offer to route a
+    shopper to". On this run routability banded `blocked` at median 6 — the
+    merchant would have read our own un-ingested catalog as their AI-visibility
+    failure, with nothing they could do about it.
+    """
+    findings = extract_findings(real_report)
+    routability = [
+        f for f in findings
+        if (f.get("payload") or {}).get("dimension") == "routability"
+    ]
+
+    assert routability, "routability stopped being measured entirely"
+    for f in routability:
+        assert f["severity"] == "low", (
+            "routability is high-severity again; it will reach the merchant"
+        )
+    assert not any(
+        f["finding_type"] == "destination_unroutable" for f in findings
+    )
+
+    # And it reaches no merchant stage list.
+    for stage in _project(findings)["stages"]:
+        for shown in stage["findings"]:
+            assert shown["type"] != "pivota_serving_not_ready"
+
+    # It is still measured and still visible in the headline, labelled for
+    # what it is.
+    head = _project(findings)["headline"]
+    row = {d["dimension"]: d for d in head["dimensions"]}["routability"]
+    assert row["measures"] == "pivota_readiness"
+    assert row["band"] == "blocked"
+
+
+def test_no_raw_band_enum_reaches_merchant_copy(real_report):
+    """The writer's contract: the band enum is "INTERNAL vocabulary that must
+    never reach a merchant as a raw token"; `band_label` exists for this. The
+    first cut interpolated `dim["band"]`, so `findings_summary[].summary` on
+    the merchant projection read "Identity: blocked"."""
+    import services.audit_projection_builder as apb
+    import db.audit_evidence as ae
+
+    findings = extract_findings(real_report)
+    merchant = apb.build_projection(
+        audience=ae.AUDIENCE_MERCHANT, evidence=[], findings=findings,
+        actions=[], audit_run_row={"run_id": "r"},
+    )
+    shown = " ".join(
+        str(f["summary"]) for f in merchant["findings_summary"]
+    ) + " ".join(str(f["short_summary"]) for f in findings)
+
+    for token in ("blocked", "partial", "agent_ready", "unscored"):
+        assert token not in shown.lower(), (
+            f"the raw band token {token!r} reached merchant copy"
+        )
+    # The merchant-safe rendering is what shipped instead.
+    assert "Needs work" in shown or "Not yet visible" in shown
+
+
+def test_a_rollup_that_scored_nothing_is_unmeasured_not_empty(real_report):
+    """The residual false all-clear. `_dimension_band(None)` is "unscored",
+    which is what every dimension gets when each SKU hit missing_inputs. That
+    rollup is still the modern shape, so it passed the shape check, produced no
+    band finding, and rendered NO_FINDINGS — "checked, found nothing" — for a
+    run that measured nothing at all."""
+    report = json.loads(json.dumps(real_report))
+    for dim in report["brand_rollup"]["dimensions"].values():
+        dim["band"] = "unscored"
+
+    findings = extract_findings(report)
+    proj = _project(findings)
+
+    assert any(f["finding_type"] == "no_dimension_was_scored" for f in findings)
+    assert [s["status"] for s in proj["stages"]] == ["UNVERIFIED"] * 3
+    by_stage = {s["stage"]: s for s in proj["stages"]}
+    for name in ("get_selected", "get_cited"):
+        assert "not an all-clear" in by_stage[name]["unverified_reason"]
+    # convert_sales keeps its own, stronger reason — it has never run at all.
+    assert "never run against a live store" in (
+        by_stage["convert_sales"]["unverified_reason"]
+    )
+
+
+def test_a_rollup_with_no_dimensions_key_is_unmeasured_too(real_report):
+    report = json.loads(json.dumps(real_report))
+    report["brand_rollup"].pop("dimensions")
+
+    proj = _project(extract_findings(report))
+
+    assert [s["status"] for s in proj["stages"]] == ["UNVERIFIED"] * 3
+
+
+def test_a_meta_finding_never_lands_in_a_stages_findings():
+    """Commit 2's own invariant, violated by commit 1 and invisible to its
+    test because that test only ran on the real report.
+    `_stage_for("report_shape_unreadable")` falls to the get_selected default,
+    severity high, so the stage rendered UNVERIFIED *while citing it*."""
+    proj = _project(extract_findings({"unknown": "shape"}))
+
+    for stage in proj["stages"]:
+        assert stage["status"] == "UNVERIFIED"
+        assert not stage["findings"], (
+            f"{stage['stage']} is UNVERIFIED and cites {stage['findings']}"
+        )
+
+
+def test_a_meta_finding_is_not_sold_as_a_locked_finding():
+    """public_anonymous counted it, so the paywall teaser advertised
+    "1 finding waiting" for a run in which nothing was read."""
+    import services.audit_projection_builder as apb
+    import db.audit_evidence as ae
+
+    findings = extract_findings({"unknown": "shape"})
+    assert findings, "the meta-finding stopped being emitted"
+
+    public = apb.build_projection(
+        audience=ae.AUDIENCE_PUBLIC_ANONYMOUS, evidence=[], findings=findings,
+        actions=[], audit_run_row={"run_id": "r"},
+    )
+    assert public["locked"]["findings"] == 0
+
+
+def test_a_meta_finding_is_not_told_to_the_merchant_or_to_agents():
+    """It is evidence about US. The merchant projection rendered "The findings
+    extractor did not recognise this report's shape" to the store owner as a
+    high-severity finding about their store, and the agent feed published it as
+    a claim at confidence 85 for external agents to ingest as fact."""
+    import services.audit_projection_builder as apb
+    import db.audit_evidence as ae
+
+    findings = extract_findings({"unknown": "shape"})
+
+    merchant = apb.build_projection(
+        audience=ae.AUDIENCE_MERCHANT, evidence=[], findings=findings,
+        actions=[], audit_run_row={"run_id": "r"},
+    )
+    assert merchant["findings_summary"] == []
+
+    feed = apb.build_projection(
+        audience=ae.AUDIENCE_FRONTEND_AGENT_FEED, evidence=[],
+        findings=findings, actions=[], audit_run_row={"run_id": "r"},
+    )
+    assert feed["claims"] == []
+
+
+def test_the_builder_version_moved_so_cached_projections_are_re_rendered():
+    """Every run that completed before this fix has a cached revenue_recovery
+    projection holding the NO_FINDINGS all-clear and the bare headline_score —
+    including the live run this whole branch was opened for. Serving those
+    unchanged is the defect still shipping."""
+    from services import audit_projection_builder as b
+
+    assert b._BUILDER_VERSION != "1.0.0"

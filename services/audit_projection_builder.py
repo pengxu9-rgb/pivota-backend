@@ -46,7 +46,12 @@ logger = logging.getLogger(__name__)
 
 # Bump when the projection shape changes in a way that callers
 # would notice. Semantic versioning style: major.minor.
-_BUILDER_VERSION = "1.0.0"
+# 1.1.0: the revenue_recovery headline stopped being a bare score, the
+# rollup shape became readable, and meta-findings stopped reaching merchant
+# surfaces. Cached `report_projections` rows built at 1.0.0 still hold the
+# NO_FINDINGS all-clear and the bare headline_score, so they must be
+# re-rendered rather than served — the version is what lets a reader tell.
+_BUILDER_VERSION = "1.1.0"
 
 
 # Audience constants (mirror db.audit_evidence values; kept as
@@ -136,7 +141,7 @@ def build_merchant_projection(
       - Re-order actions by severity (critical first) then phase
     """
     visible_findings = [
-        f for f in findings if f.get("severity") in (
+        f for f in _without_meta_findings(findings) if f.get("severity") in (
             "critical", "high", "medium",
         )
     ]
@@ -321,7 +326,9 @@ def build_frontend_agent_feed_projection(
                 "claim_payload": f.get("payload_jsonb"),
                 "confidence": f.get("confidence"),
             }
-            for f in findings
+            # Meta-findings are not claims about the brand, and this feed is
+            # built for external agents to ingest as fact.
+            for f in _without_meta_findings(findings)
         ],
         "supporting_evidence": [
             {
@@ -398,16 +405,55 @@ _PRODUCIBLE_FINDING_TYPES = frozenset({
     # other direction.
     "product_identity_unresolvable",
     "category_citation_weak",
-    "destination_unroutable",
     "content_too_thin_to_cite",
-    # Meta: the extractor did not recognise the report. Producible, and handled
-    # specially below — it must never let ANY stage claim an all-clear.
+    # routability. Producible, but it is emitted at `low` severity because
+    # every one of its buckets reads PIVOTA'S catalog and serving state, not a
+    # model's answer — see _PIVOTA_INTERNAL_DIMENSIONS in the evidence builder.
+    # It is listed here so `_stage_is_measurable` still sees a producer behind
+    # the stage it belongs to; it just never appears in a merchant stage list.
+    "pivota_serving_not_ready",
+    # Meta: about the RUN, not the merchant. Producible, and handled specially
+    # below — they must never let ANY stage claim an all-clear, and they must
+    # never appear in a stage's findings either.
     "report_shape_unreadable",
+    "no_dimension_was_scored",
 })
 
 # The finding that says we could not read the report at all. It is not evidence
 # about the merchant; it is evidence about us.
 _UNREADABLE_FINDING = "report_shape_unreadable"
+_NO_DIMENSION_SCORED_FINDING = "no_dimension_was_scored"
+
+# Findings that describe THIS RUN, not this merchant. They exist so a projection
+# cannot mistake "I could not read this" for "nothing is wrong" — that is their
+# whole job — but they are not defects the merchant has, and every surface that
+# lists or COUNTS findings was treating them as if they were:
+#
+#   - merchant `findings_summary` rendered "The findings extractor did not
+#     recognise this report's shape" to the store owner as a high-severity
+#     finding about their store;
+#   - public_anonymous `locked.findings` counted it, so the paywall teaser
+#     advertised "1 finding waiting" for a run in which nothing was read;
+#   - frontend_agent_feed published it as a claim at confidence 85, for
+#     external agents to ingest as a fact about the brand.
+#
+# They stay in the revenue_recovery stage logic, which is the one place whose
+# job is to act on them.
+_META_FINDING_TYPES = frozenset({
+    _UNREADABLE_FINDING, _NO_DIMENSION_SCORED_FINDING,
+})
+
+
+def _is_meta_finding(finding: Optional[Dict[str, Any]]) -> bool:
+    return str(
+        (finding or {}).get("finding_type") or "",
+    ).strip().lower() in _META_FINDING_TYPES
+
+
+def _without_meta_findings(
+    findings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [f for f in (findings or []) if not _is_meta_finding(f)]
 
 _STAGE_FOR_FINDING_TYPE = {
     # Not chosen for the category's queries at all.
@@ -429,11 +475,16 @@ _STAGE_FOR_FINDING_TYPE = {
     "content_too_thin_to_cite": _STAGE_GET_SELECTED,
     #   citation — mentioned, but rarely as the answer.
     "category_citation_weak": _STAGE_GET_CITED,
-    #   routability — cited, but the answer has no buyable offer to send anyone
-    #   to. NOT convert_sales: that stage means a real purchase path was
-    #   exercised, and only the browser commerce lane can say that. Filing it
-    #   there would make a stage that has never run look measured.
-    "destination_unroutable": _STAGE_GET_CITED,
+    #   routability — kept in get_cited for stage-measurability accounting
+    #   only. It is emitted at `low`, so it never reaches a merchant stage
+    #   list. It was previously emitted at high as "destination_unroutable —
+    #   AI has no buyable offer to route a shopper to", which told the merchant
+    #   their AI visibility had failed when what was measured was our own
+    #   un-ingested catalog. NOT convert_sales either: that stage means a real
+    #   purchase path was exercised, and only the browser commerce lane can say
+    #   that. Filing it there would make a stage that has never run look
+    #   measured.
+    "pivota_serving_not_ready": _STAGE_GET_CITED,
 }
 
 
@@ -562,6 +613,12 @@ def build_revenue_recovery_projection(
             stage_by_finding_id[str(fid)] = stage
         if f.get("severity") not in ("critical", "high", "medium"):
             continue
+        if _is_meta_finding(f):
+            # It is evidence about US, not about the merchant. Appending it
+            # produced a stage that was UNVERIFIED *and* carried a finding —
+            # the exact contradiction the invariant test forbids. Its effect on
+            # this projection is the UNVERIFIED status below, nothing more.
+            continue
         stages[stage]["findings"].append({
             "type": f.get("finding_type"),
             "severity": f.get("severity"),
@@ -575,11 +632,7 @@ def build_revenue_recovery_projection(
         )
         stages[stage]["actions"].append(_action_for_merchant(a))
 
-    unreadable = any(
-        str((f or {}).get("finding_type") or "").strip().lower()
-        == _UNREADABLE_FINDING
-        for f in (findings or [])
-    )
+    unreadable = any(_is_meta_finding(f) for f in (findings or []))
     for name in _STAGES:
         if not _stage_is_measurable(name):
             stages[name]["status"] = "UNVERIFIED"
@@ -594,9 +647,9 @@ def build_revenue_recovery_projection(
             # stages this particular finding did not land in.
             stages[name]["status"] = "UNVERIFIED"
             stages[name]["unverified_reason"] = (
-                "The findings extractor did not recognise this audit's report "
-                "shape, so nothing was read for this stage. Absence here is "
-                "not an all-clear."
+                "This audit established nothing for this stage — its report "
+                "was either unreadable or scored no dimension at all. Absence "
+                "here is not an all-clear."
             )
         else:
             stages[name]["status"] = (
@@ -682,7 +735,10 @@ def build_public_anonymous_projection(
         "observed_signals": signals,
         # How much is waiting, never what it says, and never how severe.
         "locked": {
-            "findings": len(findings),
+            # Meta-findings excluded: a teaser saying "1 finding waiting" for a
+            # run whose only finding is "I could not read this report" sells
+            # something that does not exist.
+            "findings": len(_without_meta_findings(findings)),
             "actions": len(actions),
         },
         # An unclaimed run is claimable; a claimed one is not, and saying so

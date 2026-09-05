@@ -366,9 +366,30 @@ _ROLLUP_FINDING_BANDS = {"blocked": "high", "partial": "medium"}
 _ROLLUP_DIMENSION_FINDING = {
     "identity": "product_identity_unresolvable",
     "citation": "category_citation_weak",
-    "routability": "destination_unroutable",
+    "routability": "pivota_serving_not_ready",
     "content_richness": "content_too_thin_to_cite",
 }
+
+# Dimensions that measure PIVOTA'S OWN readiness, not the brand's AI
+# visibility. Every one of routability's buckets reads our data and only our
+# data — serving_eligibility (30) is our index pipeline state,
+# offer_orderability (25) and price_currency_confidence (15) read our
+# `catalog_offers` rows, and the last 10 read our merchant/verification record.
+# Not one of them reads a model's answer.
+#
+# The writer already knows this and says so: _INTERNAL_STATE_GAPS (#1504) — a
+# product deliberately held out of serving scores 0 here, and the gap was
+# annotated and STOPPED FROM HEADLINING precisely so it could not be read as
+# "brand isn't AI-visible". Emitting it to the merchant as high-severity
+# "destination unroutable, AI has no buyable offer to send anyone to" undid
+# that demotion in a new place, and filed it under GET CITED, where it reads as
+# a citation failure. On the live Anuko run this dimension banded `blocked`
+# with median 6 — the merchant would have read our own un-ingested catalog as
+# their AI-visibility failure, and had nothing they could do about it.
+#
+# It is still measured, still carried in the headline distribution, and still
+# visible to internal_ops. It is just not a defect the merchant is told to fix.
+_PIVOTA_INTERNAL_DIMENSIONS = frozenset({"routability"})
 
 
 # The headline finding's type. `low` severity on purpose: the projection's
@@ -376,6 +397,37 @@ _ROLLUP_DIMENSION_FINDING = {
 # distribution to the headline WITHOUT appearing to the merchant as a problem
 # of its own. It is a measurement, not a defect.
 FINDING_HEADLINE_DISTRIBUTION = "brand_headline_distribution"
+
+
+# Emitted when the rollup is readable but scored nothing. Distinct from
+# report_shape_unreadable ("I could not read this") — this one means "I read it
+# and it measured nothing". Both are meta-findings about the RUN, not claims
+# about the merchant; see _META_FINDING_TYPES in audit_projection_builder.
+FINDING_NO_DIMENSION_SCORED = "no_dimension_was_scored"
+
+
+def _rollup_bands_seen(rollup: Dict[str, Any]) -> List[str]:
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict):
+        return []
+    return sorted({
+        str(d.get("band") or "missing")
+        for d in dims.values() if isinstance(d, dict)
+    })
+
+
+def _rollup_scored_any_dimension(rollup: Dict[str, Any]) -> bool:
+    """True when at least one dimension carries a band the writer scored."""
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict) or not dims:
+        return False
+    for dim in dims.values():
+        if not isinstance(dim, dict):
+            continue
+        band = str(dim.get("band") or "").strip().lower()
+        if band and band not in ("unscored", "unknown"):
+            return True
+    return False
 
 
 def _prompt_split_from_rollup(rollup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -473,6 +525,15 @@ def _headline_finding_from_rollup(
             "dimension": str(key),
             "label": dim.get("dimension_label") or str(key),
             "band": dim.get("band"),
+            # The raw enum above is internal vocabulary; anything rendering
+            # this row to a merchant must use band_label. Both travel so the
+            # renderer never has to re-derive one from the other.
+            "band_label": dim.get("band_label"),
+            "measures": (
+                "pivota_readiness"
+                if str(key) in _PIVOTA_INTERNAL_DIMENSIONS
+                else "brand_ai_visibility"
+            ),
             "median": dim.get("median"),
             "p25": dim.get("p25"),
             "p75": dim.get("p75"),
@@ -521,11 +582,22 @@ def _findings_from_brand_rollup(
     for key, dim in dims.items():
         if not isinstance(dim, dict):
             continue
-        severity = _ROLLUP_FINDING_BANDS.get(str(dim.get("band") or "").lower())
+        band = str(dim.get("band") or "").lower()
+        severity = _ROLLUP_FINDING_BANDS.get(band)
         if not severity:
             continue
+        if str(key) in _PIVOTA_INTERNAL_DIMENSIONS:
+            # `low` keeps it out of the projection's merchant stage lists
+            # (critical/high/medium) without discarding the measurement.
+            severity = "low"
         label = dim.get("dimension_label") or key
         meaning = dim.get("meaning") or ""
+        # The band enum is INTERNAL vocabulary the writer forbids reaching a
+        # merchant as a raw token; `band_label` ("Needs work" / "Not yet
+        # visible") is the merchant-safe rendering it publishes for exactly
+        # this. "Identity: blocked" was shipping the raw enum into
+        # findings_summary[].summary on the merchant projection.
+        band_text = dim.get("band_label") or band or "unscored"
         out.append({
             "finding_type": _ROLLUP_DIMENSION_FINDING.get(
                 str(key), f"dimension_{key}_below_band",
@@ -545,7 +617,17 @@ def _findings_from_brand_rollup(
             },
             "confidence": CONFIDENCE_FINDING_HIGH,
             "short_summary": (
-                f"{label}: {dim.get('band')}"
+                # For an internal-state dimension the report's own `meaning`
+                # ("AI has no buyable offer to route a shopper to") describes
+                # the merchant's AI visibility, which is not what the buckets
+                # measured. It does not reach the merchant at `low` severity,
+                # but it does reach internal_ops and the findings table, and
+                # the same sentence misleads whoever reads it there.
+                f"{label}: {band_text} — Pivota has not finished ingesting "
+                f"and serving this store's offers. This measures our own "
+                f"readiness, not the brand's AI visibility."
+                if str(key) in _PIVOTA_INTERNAL_DIMENSIONS
+                else f"{label}: {band_text}"
                 + (f" — {meaning}" if meaning else "")
             ),
         })
@@ -581,8 +663,12 @@ def extract_findings(
     # Everything below reads the LEGACY shape: `aggregate` + `per_product`. The
     # per-SKU report that production actually writes has neither — its top level
     # is `brand_rollup` / `brand_verdict_label`, with the per-product detail in
-    # `per_sku_reports` on the RESPONSE, not the report
-    # (agent_center_bd_report_service). So on every real run this function fell
+    # `per_sku_reports` — which IS on the brand report
+    # (agent_center_bd_report_service.py writes it there), not only on the
+    # response as an earlier revision of this comment claimed. That matters:
+    # the per-SKU breakdowns are readable from here, which is where a finding
+    # that needs bucket-level detail would get it. So on every real run this
+    # function fell
     # through every branch and returned [], and
     # build_revenue_recovery_projection turned that empty list into
     # `NO_FINDINGS` — "we checked and found nothing" — for audits that had found
@@ -617,6 +703,29 @@ def extract_findings(
         _headline = _headline_finding_from_rollup(_rollup)
         if _headline is not None:
             out.append(_headline)
+        # A rollup whose dimensions all came back `unscored` — or that carries
+        # no `dimensions` at all — passes the _modern shape check, produces no
+        # band finding, and used to leave `out` empty for the rollup lane. The
+        # projection renders empty as NO_FINDINGS: "we checked and found
+        # nothing". It is the SAME false all-clear this function was rewritten
+        # to close, one level in. `_dimension_band(None)` returns "unscored",
+        # which happens when every SKU hit missing_inputs — nothing was
+        # measured, so nothing may be passed.
+        if not _rollup_scored_any_dimension(_rollup):
+            out.append({
+                "finding_type": FINDING_NO_DIMENSION_SCORED,
+                "severity": "high",
+                "payload": {
+                    "bands_seen": _rollup_bands_seen(_rollup),
+                    "skus_audited": _rollup.get("skus_audited"),
+                },
+                "confidence": CONFIDENCE_FINDING_HIGH,
+                "short_summary": (
+                    "This audit scored none of the four dimensions, so nothing "
+                    "was established about this store. This is NOT an "
+                    "all-clear."
+                ),
+            })
 
     aggregate = brand_report.get("aggregate") or {}
     avg_vis = aggregate.get("avg_visibility")
