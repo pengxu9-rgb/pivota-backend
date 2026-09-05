@@ -246,10 +246,20 @@ def test_extract_integration_incomplete_finding():
     assert integration[0]["severity"] == "critical"
 
 
-def test_extract_findings_handles_empty_input():
+def test_extract_findings_reports_unreadable_instead_of_silence():
+    """Updated deliberately: the previous assertion (`== []`) PINNED the defect.
+
+    An empty or missing report returning [] put it on the same footing as
+    "read the report and found nothing" — and build_revenue_recovery_projection
+    turns the second into NO_FINDINGS, an all-clear. Neither an empty dict nor
+    None is evidence that anything is fine.
+    """
     from services.audit_evidence_builder import extract_findings
-    assert extract_findings({}) == []
-    assert extract_findings(None) == []
+
+    for empty in ({}, None):
+        findings = extract_findings(empty)
+        assert [f["finding_type"] for f in findings] == ["report_shape_unreadable"]
+        assert findings[0]["severity"] == "high"
 
 
 # =====================================================================
