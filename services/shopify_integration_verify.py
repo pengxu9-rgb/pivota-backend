@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from db.database import database
+from services.shopify_domain import normalize_myshopify_domain
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.shopify_graphql_client import ShopifyGraphQLError, shopify_admin_graphql
@@ -328,7 +329,18 @@ async def verify_shopify_integration(
     if not store_info or (store_info.get("platform") or "").lower() != "shopify":
         raise ValueError("Primary store is not Shopify")
 
-    shop_domain = store_info.get("domain") or ""
+    # The stored column, re-checked before it becomes four Admin API URLs below.
+    #
+    # This is a READ-path guard and it is not made redundant by the write-path guard added in the
+    # same change: rows predating that guard are still in the table, every writer lives elsewhere,
+    # and a guard on one path does not cover the other. Refusing here costs no packet; the
+    # alternative is sending a live Admin token to whatever host the row happens to name.
+    shop_domain = normalize_myshopify_domain(store_info.get("domain")) or ""
+    if not shop_domain:
+        # Raised BEFORE the first use, not after. Deliberately does not echo the domain: it is
+        # untrusted text that would land in logs and API surfaces, and the merchant id already
+        # identifies the offending row.
+        raise ValueError("Primary Shopify store domain is not a *.myshopify.com host")
     access_token, _ = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
@@ -337,7 +349,7 @@ async def verify_shopify_integration(
     access_token = (access_token or "").strip()
     store_id = store_info.get("store_id")
 
-    if not shop_domain or not access_token:
+    if not access_token:
         raise ValueError("Missing Shopify credentials")
 
     checked_at = datetime.now(timezone.utc).isoformat()
@@ -347,7 +359,10 @@ async def verify_shopify_integration(
     shop_json = await _shopify_get_json(url=shop_url, access_token=access_token)
     shop = (shop_json or {}).get("shop") or {}
 
-    canonical_myshopify = shop.get("myshopify_domain") or ""
+    # Re-checked for the same reason as the OAuth path: this upstream-supplied value is what gets
+    # PERSISTED into merchant_stores.domain, and it is read back as a URL host by this repo and by
+    # the PIVOTA-Agent gateway. An unusable value means "do not canonicalise", not "store it".
+    canonical_myshopify = normalize_myshopify_domain(shop.get("myshopify_domain")) or ""
     domain_updated: Optional[Tuple[str, str]] = None
     if canonical_myshopify and canonical_myshopify.strip().lower() != shop_domain.strip().lower():
         # Update stored domain to myshopify_domain to match webhook header X-Shopify-Shop-Domain.

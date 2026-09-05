@@ -9,6 +9,7 @@ from services.shopify_access_token_service import (
 )
 from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
 from services.store_lifecycle_service import sync_catalog_merchant_status
+from services.shopify_domain import canonicalize_shop_domain, normalize_myshopify_domain
 from services.bigcommerce_event_adapter import SUPPORTED_BIGCOMMERCE_SCOPES
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
@@ -131,27 +132,14 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
         return None
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    candidate = raw if "://" in raw else f"https://{raw}"
-    try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").strip().lower()
-        return host or None
-    except Exception:
-        return raw.lower()
-
-
 def _validate_myshopify_domain(value: str) -> str:
-    shop = (_canonicalize_shop_domain(value) or "").strip().lower()
-    if not shop:
+    # The one place a 400 is the right answer: the caller's own input. Everywhere else the value is
+    # re-checked with normalize_myshopify_domain and FALLS BACK, because failing a merchant's
+    # install over an unexpected upstream response would be worse than the thing being prevented.
+    if not (canonicalize_shop_domain(value) or "").strip():
         raise HTTPException(status_code=400, detail="shop is required")
-    # Basic guard: allow only the canonical myshopify domain during OAuth.
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", shop):
+    shop = normalize_myshopify_domain(value)
+    if not shop:
         raise HTTPException(status_code=400, detail="shop must be a *.myshopify.com domain")
     return shop
 
@@ -1010,7 +998,13 @@ async def _shopify_oauth_callback_impl(request: Request):
     if not isinstance(shop_info, dict):
         raise HTTPException(status_code=400, detail="Invalid Shopify shop response")
 
-    canonical_myshopify_domain = (shop_info.get("myshopify_domain") or shop_domain).strip().lower()
+    # `shop_domain` is already validated; `myshopify_domain` is whatever the upstream response
+    # carried, and it — not the validated input — is what gets PERSISTED and later turned back into
+    # an Admin API URL by this repo and by the gateway. Re-check it, and fall back to the validated
+    # input rather than failing the install.
+    canonical_myshopify_domain = (
+        normalize_myshopify_domain(shop_info.get("myshopify_domain")) or shop_domain
+    )
     shop_name = (shop_info.get("name") or canonical_myshopify_domain).strip()
     if stored_shop_domain and stored_shop_domain not in {canonical_myshopify_domain, shop_domain}:
         raise HTTPException(status_code=400, detail="OAuth shop mismatch (reason=shop_domain_mismatch)")
@@ -1293,7 +1287,16 @@ async def shopify_token_diagnostic(
     if not store or (store.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-    shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
+    # Same stored column, same Admin API URLs, same guard as verify_shopify_integration. This route
+    # is the sharper of the two: it returns the upstream status codes in a 200 body, so an unpinned
+    # host here is a read-back SSRF oracle rather than a blind one.
+    raw_domain = (store.get("domain") or store.get("shop_domain") or "")
+    shop_domain = normalize_myshopify_domain(raw_domain) or ""
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
     access_token, token_meta = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store.get("api_key_raw") or store.get("api_key"),
@@ -1817,9 +1820,16 @@ async def merchant_connect_shopify(
         raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
-        # Validate shop domain and credentials
-        if not request.shop_domain or not request.shop_domain.strip():
-            raise HTTPException(status_code=400, detail="Shop domain is required")
+        # Validate shop domain and credentials.
+        #
+        # This used to check only that the string was non-empty, while the comment claimed to
+        # validate it. Everything below builds a URL from it and sends CREDENTIALS there: the
+        # client-credentials token exchange, and `GET https://<host>/admin/api/.../shop.json` with
+        # an Admin token. An authenticated merchant could therefore point this repo's egress at any
+        # host or port and read the outcome from the status echoed back in the 400 detail. The
+        # shape check is also a PRECONDITION for the myshopify_domain re-check further down, whose
+        # fallback is this value — falling back to an unvalidated host would defeat it.
+        shop_domain = _validate_myshopify_domain(request.shop_domain)
 
         provided_access_token = (request.access_token or "").strip()
         provided_client_id = (request.client_id or "").strip()
@@ -1840,7 +1850,7 @@ async def merchant_connect_shopify(
         exchanged_expires_in: Optional[int] = None
         if not effective_access_token:
             exchanged_token, exchanged_expires_in, exchange_error = await exchange_shopify_client_credentials_token(
-                shop_domain=request.shop_domain,
+                shop_domain=shop_domain,
                 client_id=provided_client_id,
                 client_secret=provided_client_secret,
             )
@@ -1852,7 +1862,7 @@ async def merchant_connect_shopify(
             effective_access_token = exchanged_token
 
         # Test Shopify API connection
-        test_url = f"https://{request.shop_domain}/admin/api/2025-10/shop.json"
+        test_url = f"https://{shop_domain}/admin/api/2025-10/shop.json"
         headers = {"X-Shopify-Access-Token": effective_access_token}
         
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1870,7 +1880,9 @@ async def merchant_connect_shopify(
             raise HTTPException(status_code=400, detail="Invalid Shopify response")
         
         shop_info = shop_data["shop"]
-        canonical_myshopify_domain = (shop_info.get("myshopify_domain") or request.shop_domain or "").strip().lower()
+        canonical_myshopify_domain = (
+            normalize_myshopify_domain(shop_info.get("myshopify_domain")) or shop_domain
+        )
         logger.info(f"✅ Shopify credentials verified for {canonical_myshopify_domain}")
 
         # Storefront token strategy:
@@ -1889,7 +1901,7 @@ async def merchant_connect_shopify(
                AND (domain = :domain_input OR domain = :domain_canonical)""",
             {
                 "merchant_id": request.merchant_id,
-                "domain_input": request.shop_domain,
+                "domain_input": shop_domain,
                 "domain_canonical": canonical_myshopify_domain,
             },
         )
@@ -2310,6 +2322,17 @@ async def merchant_sync_shopify_products(
             detail=f"Store is {store.get('status')}. Please reconnect your store."
         )
 
+    # Pinned here -- before the credential lookup and outside the try below, so the refusal costs no
+    # further work and is not reshaped by that block's broad handler. Both uses downstream build a
+    # URL from this: the token refresh POSTs client credentials to {domain}/admin/oauth/access_token,
+    # and fetch_products reads from the same host.
+    sync_shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
+    if not sync_shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
+
     # Call Shopify adapter directly
     try:
         import json
@@ -2323,7 +2346,7 @@ async def merchant_sync_shopify_products(
         )
         api_key_raw = cred_row["api_key"] if cred_row else None
         access_token, token_meta = await resolve_shopify_admin_access_token(
-            shop_domain=store.get("domain"),
+            shop_domain=sync_shop_domain,
             api_key_raw=api_key_raw,
             store_id=str(store.get("store_id") or "").strip() or None,
         )
@@ -2348,7 +2371,7 @@ async def merchant_sync_shopify_products(
 
         while pages_fetched < max_pages:
             products, next_page, error = await ShopifyProductAdapter.fetch_products(
-                shop_domain=store["domain"],
+                shop_domain=sync_shop_domain,
                 access_token=access_token,
                 merchant_id=target_merchant_id,
                 limit=250,
