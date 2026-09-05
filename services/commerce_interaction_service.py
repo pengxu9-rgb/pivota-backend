@@ -13,6 +13,7 @@ from sqlalchemy import and_, or_, select
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import IS_POSTGRES, database
+from services.commerce_ledger_provenance import resolve_ledger_authority
 from services.traffic_taxonomy_service import (
     TRAFFIC_TAXONOMY_FIELDS,
     attach_traffic_taxonomy,
@@ -770,7 +771,18 @@ async def record_commerce_event(
     are trust provenance stamped by the authenticated ingress. They are stored
     as first-class columns and are deliberately NOT read from ``metadata``, so
     a caller-supplied payload cannot claim a standing its route did not grant.
+    When ``write_path`` is given the authority is derived from it here; a
+    caller may name the same authority but never a different one.
     """
+    if write_path is not None:
+        derived_authority = resolve_ledger_authority(
+            write_path, str(agent_identity_confidence or "")
+        )
+        if authority is not None and authority != derived_authority:
+            raise ValueError(
+                f"write_path {write_path} carries authority {derived_authority}, not {authority}"
+            )
+        authority = derived_authority
     taxonomy = build_traffic_taxonomy(
         metadata,
         metadata=kwargs,

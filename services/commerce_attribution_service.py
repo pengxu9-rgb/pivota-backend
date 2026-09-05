@@ -18,6 +18,7 @@ from observability.reliability_metrics import (
     record_traffic_taxonomy,
 )
 from services.commerce_interaction_service import record_commerce_event_best_effort
+from services.commerce_ledger_provenance import ledger_provenance
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -258,6 +259,7 @@ async def record_surface_event(
             },
             source="surface_click_events",
             upstream_idempotency_key=f"{click_id}:{event_type}",
+            **ledger_provenance("surface_click_attribution", "unknown"),
         )
         if event_type == "click":
             record_traffic_taxonomy(
@@ -287,6 +289,7 @@ async def record_surface_event(
         },
         source="surface_click_events",
         upstream_idempotency_key=f"{click_id}:{event_type}",
+        **ledger_provenance("surface_click_attribution", "unknown"),
     )
     if event_type == "click":
         record_traffic_taxonomy(
@@ -464,6 +467,7 @@ async def upsert_order_attribution_edge(
         },
         source="commerce_attribution_edges",
         upstream_idempotency_key=f"order:{order_id}",
+        **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
     record_traffic_taxonomy(stage="order", taxonomy=attribution)
     values["interaction_id"] = interaction_event["interaction_id"]
@@ -627,6 +631,7 @@ async def attach_refund_to_attribution_edge(
         },
         source="commerce_attribution_edges",
         upstream_idempotency_key=f"refund:{refund_id}",
+        **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
     # Backwards-compatible return shape: callers expect a single dict.
     # When fan-out exists, surface the first edge with an added edge_count
@@ -1134,6 +1139,7 @@ async def close_external_order_conversion(
         # Idempotency keyed on the SUBJECT (matches the edge guard): self/legacy
         # subject == merchant_id (unchanged); cross subject == seller_ref.
         upstream_idempotency_key=f"external_order:{subject_merchant_id}:{external_order_id}",
+        **ledger_provenance("commerce_attribution_edge", "unknown"),
     )
     if not click_matched:
         logger.info(

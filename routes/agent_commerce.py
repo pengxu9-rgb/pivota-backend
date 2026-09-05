@@ -14,6 +14,7 @@ from routes.agent_api import agent_create_order
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from routes.refund_api import RefundRequest, process_refund as process_refund_route
+from services.commerce_ledger_provenance import ledger_provenance
 from services.commerce_interaction_service import (
     find_interaction_by_order_id,
     record_commerce_event,
@@ -266,6 +267,10 @@ async def create_commerce_checkout(
     await record_commerce_event(
         event_type="checkout.created",
         metadata={
+            # The identity the ingress authenticated, carried in metadata so the
+            # interaction-level merge treats it as verified (see _authenticated_agent_id).
+            "agent_id": context.agent_id,
+            "agent_identity_confidence": "verified",
             "merchant_id": body.merchant_id,
             "interaction_id": body.interaction_id,
             "platform": platform,
@@ -282,10 +287,15 @@ async def create_commerce_checkout(
         upstream_idempotency_key=body.idempotency_key or f"checkout:{checkout_id}",
         actor_type="agent",
         actor_id=context.agent_id,
+        **ledger_provenance("agent_commerce_api", "verified"),
     )
     await record_commerce_event(
         event_type="payment.intent.created",
         metadata={
+            # The identity the ingress authenticated, carried in metadata so the
+            # interaction-level merge treats it as verified (see _authenticated_agent_id).
+            "agent_id": context.agent_id,
+            "agent_identity_confidence": "verified",
             "merchant_id": body.merchant_id,
             "interaction_id": body.interaction_id,
             "platform": platform,
@@ -301,6 +311,7 @@ async def create_commerce_checkout(
         upstream_idempotency_key=f"payment-intent:{checkout_id}",
         actor_type="agent",
         actor_id=context.agent_id,
+        **ledger_provenance("agent_commerce_api", "verified"),
     )
 
     return {
@@ -338,6 +349,10 @@ async def get_checkout_payment_intent(
     await record_commerce_event(
         event_type="payment.intent.viewed",
         metadata={
+            # The identity the ingress authenticated, carried in metadata so the
+            # interaction-level merge treats it as verified (see _authenticated_agent_id).
+            "agent_id": context.agent_id,
+            "agent_identity_confidence": "verified",
             "merchant_id": order.get("merchant_id"),
             "interaction_id": (interaction or {}).get("interaction_id"),
             "platform": (await get_primary_store(str(order.get("merchant_id") or "")) or {}).get("platform"),
@@ -351,6 +366,7 @@ async def get_checkout_payment_intent(
         upstream_idempotency_key=f"payment-intent-view:{checkout_id}",
         actor_type="agent",
         actor_id=context.agent_id,
+        **ledger_provenance("agent_commerce_api", "verified"),
     )
     return {
         "status": "success",
@@ -412,6 +428,10 @@ async def create_checkout_refund(
     await record_commerce_event(
         event_type="refund.requested",
         metadata={
+            # The identity the ingress authenticated, carried in metadata so the
+            # interaction-level merge treats it as verified (see _authenticated_agent_id).
+            "agent_id": context.agent_id,
+            "agent_identity_confidence": "verified",
             "merchant_id": order.get("merchant_id"),
             "interaction_id": (interaction or {}).get("interaction_id"),
             "platform": (await get_primary_store(str(order.get("merchant_id") or "")) or {}).get("platform"),
@@ -426,6 +446,7 @@ async def create_checkout_refund(
         upstream_idempotency_key=body.idempotency_key or f"refund:{checkout_id}:{response.get('refund_id')}",
         actor_type="agent",
         actor_id=context.agent_id,
+        **ledger_provenance("agent_commerce_api", "verified"),
     )
     return {
         "status": "success",
@@ -451,6 +472,10 @@ async def sync_checkout_returns(
         await record_commerce_event(
             event_type="return.sync.pending",
             metadata={
+                # The identity the ingress authenticated, carried in metadata so the
+                # interaction-level merge treats it as verified (see _authenticated_agent_id).
+                "agent_id": context.agent_id,
+                "agent_identity_confidence": "verified",
                 "merchant_id": merchant_id,
                 "interaction_id": (interaction or {}).get("interaction_id"),
                 "platform": platform,
@@ -462,6 +487,7 @@ async def sync_checkout_returns(
             upstream_idempotency_key=f"return-sync-pending:{checkout_id}:{platform or 'unknown'}",
             actor_type="agent",
             actor_id=context.agent_id,
+            **ledger_provenance("agent_commerce_api", "verified"),
         )
         return {
             "status": "pending_external_platform",
@@ -496,6 +522,10 @@ async def sync_checkout_returns(
     await record_commerce_event(
         event_type="return.sync.completed",
         metadata={
+            # The identity the ingress authenticated, carried in metadata so the
+            # interaction-level merge treats it as verified (see _authenticated_agent_id).
+            "agent_id": context.agent_id,
+            "agent_identity_confidence": "verified",
             "merchant_id": merchant_id,
             "interaction_id": (interaction or {}).get("interaction_id"),
             "platform": platform,
@@ -509,6 +539,7 @@ async def sync_checkout_returns(
         upstream_idempotency_key=f"return-sync:{checkout_id}:{body.api_version}:{body.limit}",
         actor_type="agent",
         actor_id=context.agent_id,
+        **ledger_provenance("agent_commerce_api", "verified"),
     )
     return {
         "status": "success",

@@ -126,16 +126,29 @@ or whether a row is a probe.
 
 | Column | Values | Set by |
 | --- | --- | --- |
-| `write_path` | `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `shopline_webhook`, `shoplazza_webhook`, `sfcc_cartridge`, `adobe_io_events`, `stripe_webhook` | the route that verified the request |
-| `authority` | `observational` (browser), `merchant` (HMAC collector), `platform` (native signed webhook, reconciliation replay), `psp` (Stripe bridge) | derived from `write_path` on the server |
-| `agent_identity_confidence` | `browser_observed` < `merchant_asserted` < `platform_asserted` < `verified` | fixed per `write_path`; a mismatched pair is refused |
+| `write_path` | batch ingress: `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `shopline_webhook`, `shoplazza_webhook`, `sfcc_cartridge`, `adobe_io_events`, `stripe_webhook`; first-party writers: `agent_commerce_api`, `surface_click_attribution`, `commerce_attribution_edge`, `surface_listing_registry` | the route or service that verified the request |
+| `authority` | `observational` (browser), `merchant` (HMAC collector), `platform` (native signed webhook, reconciliation replay), `psp` (Stripe bridge), `pivota` (first-party checkout, attribution, and listing facts) | derived from `write_path` on the server |
+| `agent_identity_confidence` | `unknown` < `browser_observed` < `merchant_asserted` < `platform_asserted` < `verified` | fixed per `write_path`; a mismatched pair is refused |
 | `synthetic` | boolean, default false | `true` when the batch says `"synthetic": true` or the event surface is `ops_canary` |
 
 `synthetic` is the only provenance a caller may influence, and only downward:
 a synthetic batch is excluded from the caller's own default funnel and nothing
-else. No production ingress issues `verified` today; the tier exists in the
-core and the pairing table keeps it unissued until an ingress actually
-authenticates the agent.
+else.
+
+`verified` is issued by exactly one write path, `agent_commerce_api`
+(`routes/agent_commerce.py`). Every branch of its `get_agent_context`
+dependency authenticates the agent's own Pivota credential before yielding an
+agent id: an API key looked up in the agents table, a Pivota-signed checkout
+token whose agent id is then looked up, or an internal trusted key. `verified`
+therefore means "the writing ingress authenticated the credential Pivota issued
+to this agent". It is not a statement about the agent vendor beyond that
+credential. The click, attribution-edge, and listing writers carry whatever
+agent id their attribution context held and may only assert `unknown`.
+
+The vocabulary and pairing table live in
+`services/commerce_ledger_provenance.py`; direct writers splat
+`ledger_provenance(write_path, confidence)` so the authority is never typed by
+hand, and `record_commerce_event` refuses a caller that names a different one.
 
 Refund de-duplication in the funnel groups by `authority`: a PSP report and a
 store-platform report of the same refund are kept as two authorities and the
