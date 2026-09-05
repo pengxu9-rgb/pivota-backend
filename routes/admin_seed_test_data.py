@@ -1,6 +1,6 @@
 """Admin endpoint to seed test data for Phase 3 demo"""
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 import logging
 from datetime import datetime, timedelta
@@ -16,7 +16,7 @@ async def seed_test_metrics_and_alerts(
     current_user: dict = Depends(get_current_user)
 ):
     """Seed test metrics and alerts data for demo purposes"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -150,7 +150,7 @@ async def clear_test_data(
     current_user: dict = Depends(get_current_user)
 ):
     """Clear test data"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -184,7 +184,7 @@ async def seed_test_metrics_and_alerts(
     current_user: dict = Depends(get_current_user)
 ):
     """Seed test metrics and alerts data for demo purposes"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -318,7 +318,7 @@ async def clear_test_data(
     current_user: dict = Depends(get_current_user)
 ):
     """Clear test data"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:

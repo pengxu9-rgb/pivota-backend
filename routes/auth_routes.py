@@ -27,7 +27,12 @@ import os
 # Database import for employee authentication
 from config.platform import is_production
 from db.database import database
-from utils.auth import EMPLOYEE_STAFF_ROLES, verify_password as verify_bcrypt_password
+from utils.auth import (
+    ADMIN_ROLES,
+    EMPLOYEE_STAFF_ROLES,
+    get_current_user as shared_get_current_user,
+    verify_password as verify_bcrypt_password,
+)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
@@ -90,35 +95,84 @@ def create_jwt_token(
         payload.update(extra_claims)
     return jwt.encode(payload, require_jwt_secret(), algorithm=JWT_ALGORITHM)
 
-def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token and return user info"""
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, require_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        user_id = payload.get("user_id")
-        role = payload.get("role")
-        
-        if not user_id or not role:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token"
-            )
-        
-        return {"user_id": user_id, "role": role}
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired"
-        )
-    except jwt.InvalidTokenError:
+async def verify_jwt_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    """Verify a bearer JWT and return the caller's claims.
+
+    THIS IS A THIN ADAPTER OVER THE SHARED VALIDATOR, NOT A SECOND ONE, and
+    that is the entire point of its existence.
+
+    It used to call `jwt.decode()` itself, with no `audience=` and no
+    `verify_aud` option. That is not the same as "does not check the
+    audience": PyJWT's `_validate_aud` raises
+    `InvalidAudienceError("Invalid audience")` -- an `InvalidTokenError`
+    subclass, so it landed in the generic handler below -- whenever the token
+    CARRIES an `aud` claim and the caller named none. Every token
+    `/api/auth/login` mints carries one; `routes.auth._claims_for_membership`
+    stamps `db.auth_identity.PORTAL_TO_AUDIENCE[membership_type]`
+    (employee-portal / merchant-portal / agent-portal) onto all of them. So
+    this function rejected, as malformed, every canonical portal token that
+    `utils.auth.get_current_user` accepts -- and `utils.auth.decode_token`
+    passes `options={"verify_aud": False}` precisely so it does not.
+
+    Live consequence, observed 2026-09-05 on api.pivota.cc: a valid
+    `super_admin` employee-portal token got
+    `401 {"code":"UNAUTHORIZED","message":"Invalid token"}` from
+    `GET /admin/cleanup/list-merchants`, while the same token answered 200 on
+    routes wired to the shared validator. Nine route modules depend on this
+    function (`admin_cleanup`, `admin_cleanup_rebuild`,
+    `admin_cleanup_duplicates`, `admin_simple_fix`, `admin_migrations`,
+    `admin_fix_merchant`, `init_orders_table`, `direct_db_check`,
+    `psp_overview_routes`) plus `/auth/me` and `/auth/signout` here; all of
+    them were reachable only with a legacy `/auth/signin` token, which is the
+    one issuer that stamps no `aud`.
+
+    Two validators that disagree about what a valid token is will always drift
+    apart again, so this one no longer decides. `utils.auth.get_current_user`
+    is the single answer; the only thing left here is the legacy RETURN SHAPE
+    (`user_id` guaranteed, alongside the full claim set) that `/auth/me` and
+    the nine modules above read.
+
+    Audience is deliberately still not enforced, exactly as the shared
+    validator does not enforce it. Binding a route to one portal is a
+    different, useful control, but it belongs in one place for the whole app
+    rather than being reintroduced here as a side effect -- which is how this
+    defect happened. Until then, a merchant-portal token reaching an admin
+    route is refused by the ROLE check (403), not mistaken for a forgery.
+    """
+    payload = await shared_get_current_user(credentials)
+
+    # `get_current_user` requires sub/email/role. The legacy contract here is
+    # user_id/role, and `sub` is what the canonical issuer fills for identity,
+    # so fall back to it rather than 401-ing a token the rest of the app takes.
+    user_id = payload.get("user_id") or payload.get("sub")
+    role = payload.get("role")
+    if not user_id or not role:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token"
         )
 
+    return {**payload, "user_id": user_id, "role": role}
+
 def require_admin(current_user: dict = Depends(verify_jwt_token)):
-    """Require admin role for access"""
-    if current_user["role"] != "admin":
+    """Require an admin role for access.
+
+    `ADMIN_ROLES`, not the literal "admin", and that is a fix rather than a
+    tidy-up: this was `current_user["role"] != "admin"`, which refused
+    `super_admin` -- the MOST privileged role in the system, and one the
+    employee portal issues (`routes.auth.EMPLOYEE_AUTH_ROLES`). Same defect
+    #2031 fixed across 88 list-literal guards, in a spelling (`!= "admin"`)
+    that the list-literal ratchet cannot match. `utils.auth.require_admin`,
+    the shared equivalent, has always admitted both.
+
+    Deliberately NOT widened to `EMPLOYEE_STAFF_ROLES`: the routes behind this
+    dependency delete merchants, run migrations and reset system state.
+    Admitting `super_admin` corrects an omission; admitting every staff role
+    would be a new grant.
+    """
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"

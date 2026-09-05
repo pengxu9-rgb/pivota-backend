@@ -1,7 +1,7 @@
 """Admin endpoint to fix agent metrics calculation - use orders table instead of usage logs"""
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 import logging
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
@@ -16,7 +16,7 @@ async def fix_agent_metrics_v2(current_user: dict = Depends(get_current_user)):
     instead of agent_usage_logs table
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can execute this fix"
@@ -156,7 +156,7 @@ async def check_agent_orders(
     Check agent's actual orders from orders table
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can check orders"
@@ -247,7 +247,7 @@ async def fix_agent_metrics_v2(current_user: dict = Depends(get_current_user)):
     instead of agent_usage_logs table
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can execute this fix"
@@ -387,7 +387,7 @@ async def check_agent_orders(
     Check agent's actual orders from orders table
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can check orders"

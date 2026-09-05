@@ -1,7 +1,7 @@
 """Admin endpoint to fix agent data (name/email)"""
 from fastapi import APIRouter, Depends, HTTPException, status
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 import logging
 from typing import Dict, Any
 
@@ -14,7 +14,7 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
     Fix agents with null name/email by populating from company/use_case/agent_id
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can execute this fix"
@@ -102,7 +102,7 @@ async def check_agents_status(current_user: dict = Depends(get_current_user)):
     Check how many agents need fixing
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can check agent status"
@@ -172,7 +172,7 @@ async def fix_agents_data(current_user: dict = Depends(get_current_user)):
     Fix agents with null name/email by populating from company/use_case/agent_id
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can execute this fix"
@@ -260,7 +260,7 @@ async def check_agents_status(current_user: dict = Depends(get_current_user)):
     Check how many agents need fixing
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can check agent status"

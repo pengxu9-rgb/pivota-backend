@@ -10,7 +10,11 @@ import json
 
 from db.database import database
 from services.protocol_adapter_service import ProtocolAdapterService
-from utils.auth import get_current_user, get_current_employee
+from utils.auth import ADMIN_ROLES, get_current_user, get_current_employee
+
+# Enabling/disabling a protocol for an agent changes what that agent can
+# transact with, so this stays admin-only; ADMIN_ROLES only adds the
+# super_admin that `!= "admin"` had excluded.
 
 
 router = APIRouter(prefix="/protocols", tags=["Protocol Management"])
@@ -279,7 +283,7 @@ async def enable_protocol_for_agent(
     Enable a protocol for an agent
     """
     # Verify agent access (admin only for enabling protocols)
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     # Get protocol version if not specified
@@ -340,7 +344,7 @@ async def disable_protocol_for_agent(
     Disable a protocol for an agent
     """
     # Verify agent access (admin only for disabling protocols)
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     result = await database.execute(

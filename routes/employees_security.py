@@ -8,7 +8,18 @@ from datetime import datetime, timedelta
 from textwrap import dedent
 import logging
 from db.auth_identity import upsert_membership
-from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user, hash_password as hash_user_password
+from utils.auth import ADMIN_ROLES, EMPLOYEE_STAFF_ROLES, get_current_user, hash_password as hash_user_password
+
+# All seven guards below were `current_user["role"] != "admin"`, which locked
+# `super_admin` -- the portal's most privileged role -- out of employee
+# management entirely. ADMIN_ROLES corrects that omission and NOTHING ELSE.
+#
+# Deliberately NOT EMPLOYEE_STAFF_ROLES: these endpoints create, update and
+# deactivate employees and read the security audit log, the API-key list and
+# the security settings. A plain `employee` reaching them could grant itself a
+# colleague's access or delete one; `outsourced` is a contractor. Both stay
+# refused. Widening this family is a scope decision for whoever needs it, with
+# its own review -- not a side effect of fixing a role-name omission.
 from db.database import database
 from config.settings import settings
 import uuid
@@ -170,7 +181,7 @@ async def create_employee(
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new employee"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can create employees")
     
     try:
@@ -299,7 +310,7 @@ async def update_employee(
     current_user: dict = Depends(get_current_user)
 ):
     """Update employee information"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can update employees")
     
     try:
@@ -400,7 +411,7 @@ async def delete_employee(
     current_user: dict = Depends(get_current_user)
 ):
     """Deactivate an employee"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can delete employees")
     
     try:
@@ -461,7 +472,7 @@ async def get_audit_logs(
     current_user: dict = Depends(get_current_user)
 ):
     """Get security audit logs"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can view audit logs")
     
     try:
@@ -530,7 +541,7 @@ async def get_api_keys(
     current_user: dict = Depends(get_current_user)
 ):
     """Get API keys"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can view API keys")
     
     try:
@@ -565,7 +576,7 @@ async def get_security_settings(
     current_user: dict = Depends(get_current_user)
 ):
     """Get security settings"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can view security settings")
     
     return {
@@ -593,7 +604,7 @@ async def update_security_settings(
     current_user: dict = Depends(get_current_user)
 ):
     """Update security settings"""
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only admins can update security settings")
     
     # In production, this would update settings in database
