@@ -38,6 +38,7 @@ from services.merchant_web_collector_service import (
     verify_web_collector_token,
 )
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.shopify_web_pixel_provisioning import (
     ShopifyWebPixelProvisioningError,
     ensure_shopify_web_pixel,
@@ -290,6 +291,7 @@ async def shopify_pixel_status(
 
 
 @router.post("/web/batch")
+@telemetry_ingress_route("universal_web_collector", failure_budget=True)
 async def ingest_web_collector_batch(request: Request):
     """Accept non-authoritative browser funnel events from an origin-bound token."""
     raw_body = await request.body()
@@ -314,6 +316,8 @@ async def ingest_web_collector_batch(request: Request):
     except WebCollectorError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=claims["merchant_id"], store_id=claims["store_id"])
     store = await _connected_store(str(claims["store_id"]))
     if (
         not store
@@ -323,6 +327,7 @@ async def ingest_web_collector_batch(request: Request):
         raise HTTPException(
             status_code=403, detail="Web collector store is no longer active"
         )
+    await ingress.enforce_rate_limit("browser", claims["store_id"])
     try:
         batch = build_web_collector_batch(payload, claims=claims)
     except WebCollectorError as exc:
@@ -334,6 +339,7 @@ async def ingest_web_collector_batch(request: Request):
         agent_identity_confidence="browser_observed",
         write_path="universal_web_collector",
     )
+    ingress.record_result(result)
     return JSONResponse(
         {"status": "recorded", **result},
         headers={
@@ -345,6 +351,7 @@ async def ingest_web_collector_batch(request: Request):
 
 
 @router.post("/shopify-pixel/batch")
+@telemetry_ingress_route("shopify_web_pixel", failure_budget=True)
 async def ingest_shopify_pixel_batch(request: Request):
     """Accept consent-gated Shopify standard events from its strict pixel sandbox."""
     raw_body = await request.body()
@@ -363,6 +370,8 @@ async def ingest_shopify_pixel_batch(request: Request):
         )
     except WebCollectorError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=claims["merchant_id"], store_id=claims["store_id"])
     store = await _connected_store(str(claims["store_id"]))
     if (
         not store
@@ -372,12 +381,14 @@ async def ingest_shopify_pixel_batch(request: Request):
         raise HTTPException(
             status_code=403, detail="Shopify pixel store is no longer active"
         )
+    await ingress.enforce_rate_limit("browser", claims["store_id"])
     result = await ingest_merchant_event_batch(
         merchant_id=str(claims["merchant_id"]),
         batch=batch,
         agent_identity_confidence="browser_observed",
         write_path="shopify_web_pixel",
     )
+    ingress.record_result(result)
     return JSONResponse(
         {"status": "recorded", **result},
         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"},
@@ -385,6 +396,7 @@ async def ingest_shopify_pixel_batch(request: Request):
 
 
 @router.post("/batch")
+@telemetry_ingress_route("merchant_hmac_batch", failure_budget=True)
 async def ingest_event_batch(
     request: Request,
     x_pivota_merchant_id: Optional[str] = Header(
@@ -416,6 +428,9 @@ async def ingest_event_batch(
         )
     except MerchantHMACAuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=merchant["merchant_id"])
+    await ingress.enforce_rate_limit("merchant", merchant["merchant_id"])
 
     try:
         payload = json.loads(raw_body or b"{}")

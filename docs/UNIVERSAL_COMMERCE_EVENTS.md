@@ -117,6 +117,37 @@ rule as much as a trust rule.
 Agent identity received through this merchant-signed endpoint is stored as
 `merchant_asserted`; it is not equivalent to a cryptographically verified agent.
 
+## Rate limits, metrics, and logging
+
+Every ledger-writing ingress (the three collector routes and the six native
+webhook routes) runs inside one envelope, `services/telemetry_ingress.py`:
+
+| Tier | Key | Default | Env |
+| --- | --- | --- | --- |
+| browser | connected store (from the verified token) | 600 / min | `TELEMETRY_RATE_LIMIT_BROWSER_RPM` |
+| merchant | merchant (after the HMAC is proven) | 1200 / min | `TELEMETRY_RATE_LIMIT_MERCHANT_RPM` |
+| platform | connected store (after the platform signature is proven) | 3000 / min | `TELEMETRY_RATE_LIMIT_PLATFORM_RPM` |
+| auth failures | client hash, public collector routes only | 60 / min | `TELEMETRY_AUTH_FAILURES_PER_IP_RPM` |
+
+The limit is charged against the authenticated principal, never an unverified
+header, so a caller cannot dodge it by rotating store ids. A 429 carries
+`Retry-After`. Setting a tier to `0` disables it. The window is Redis-backed
+when `REDIS_URL` is set and otherwise a bounded in-process store with the same
+fixed-window algorithm; Redis errors fail open on the verdict.
+
+The failure budget applies only to `/merchant-events/*`: repeated 401/403 from
+one client trip a 429 before the next signature check. Native platform webhooks
+arrive from shared egress addresses, so a single misconfigured store must not
+throttle its neighbours; those routes get the per-store limit only.
+
+Prometheus: `commerce_telemetry_requests_total{write_path,result,reason}`
+(`result` in accepted, rejected, unauthenticated, rate_limited, error;
+`reason` is the status code), `commerce_telemetry_events_total{write_path,outcome}`
+(accepted, duplicate, ignored, rejected), and
+`commerce_telemetry_request_duration_seconds{write_path}`. Every non-2xx is
+logged at warning with the write path, principal, status, and a bounded reason.
+Request bodies, signatures, and validation inputs are never logged.
+
 ## Trust provenance
 
 Every ledger row carries four columns stamped by the ingress that authenticated
