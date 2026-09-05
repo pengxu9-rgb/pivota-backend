@@ -424,24 +424,27 @@ def test_employee_security_stays_closed_to_non_admin_staff(
 
 
 # ---------------------------------------------------------------------------
-# Ratchet: the `!= "admin"` spelling must not come back.
+# Ratchet: a role allowlist that admits `admin` must admit `super_admin`.
 #
-# The #2031 ratchet (tests/test_super_admin_employee_route_access.py) is a
-# line-scoped REGEX for `not in <container of quoted strings>`. Every one of
-# the 67 sites this change fixed is invisible to it -- which is why they were
-# still live on main after that fix landed. This is the companion for the
-# comparison spellings, and it walks the AST rather than lines, so it sees a
-# condition however it is wrapped and never reads a docstring as code.
+# The #2031 ratchet is a line-scoped REGEX that flags `not in <container>` only
+# when the container holds BOTH "employee" and "admin". Two whole spellings
+# walked through it and were still live on main months later:
+#
+#   * the comparisons -- `current_user["role"] != "admin"`, 67 sites/25 files;
+#   * two-element containers -- `["merchant", "admin"]` (7 sites) and
+#     `("agent", "admin")` (2 sites, routes/protocol_routes.py), which have no
+#     "employee" member for that regex to key on. The protocol_routes pair
+#     refused `super_admin` the protocol LIST for an agent whose protocols it
+#     could enable and disable two routes further down the same file.
+#
+# This one walks the AST, so it sees a condition however it is wrapped, never
+# reads a docstring as code, and covers both shapes.
 #
 # WHAT IT STILL DOES NOT SEE, stated plainly rather than implied:
-#   * a POSITIVE allowlist -- `if role in ["employee", "admin"]`. Both live
-#     instances (routes/agent_metrics.py, utils.auth.validate_entity_access)
-#     already list super_admin, so this is a coverage gap, not a hidden defect
-#     today; the sibling ratchet covers only the `not in` direction of it.
-#   * any check routed through a helper, or a role compared against a name
-#     built at runtime.
-# Neither ratchet is a proof of absence. Together they pin the two spellings
-# that have actually shipped this bug, twice.
+#   * a container built at runtime, or membership routed through a helper;
+#   * a role compared against a name that is not a literal.
+# It is not a proof of absence. It pins the shapes that have now shipped this
+# bug three times.
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -466,11 +469,60 @@ def _reads_a_role(node: ast.AST) -> bool:
     return False
 
 
-def _mentions_super_admin(node: ast.AST) -> bool:
-    return any(
-        isinstance(sub, ast.Constant) and sub.value == "super_admin"
-        for sub in ast.walk(node)
-    )
+def _string_container(node: ast.AST):
+    """The members of a list/tuple/set literal of plain strings, else None."""
+    if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return None
+    values = []
+    for element in node.elts:
+        if not (isinstance(element, ast.Constant)
+                and isinstance(element.value, str)):
+            return None
+        values.append(element.value)
+    return values or None
+
+
+def _accounts_for_super_admin(fn: ast.AST) -> bool:
+    """True if this function actually TESTS for super_admin somewhere.
+
+    Deliberately not "mentions the string": a review pointed out that the first
+    cut exempted any function whose body merely contained "super_admin", so a
+    stray `logger.info("super_admin only")` would have licensed `!= "admin"`
+    underneath it. Only a comparison or a membership container counts.
+    """
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            for operand in operands:
+                if (isinstance(operand, ast.Constant)
+                        and operand.value == "super_admin"):
+                    return True
+                members = _string_container(operand)
+                if members and "super_admin" in members:
+                    return True
+    return False
+
+
+def _iter_reviewable_files():
+    for path in sorted(_REPO_ROOT.glob("**/*.py")):
+        rel = path.relative_to(_REPO_ROOT).as_posix()
+        if rel.startswith((".claude/", "tests/")) or "/.venv" in f"/{rel}":
+            continue
+        try:
+            yield rel, ast.parse(path.read_text())
+        except SyntaxError:  # not ours to police
+            continue
+
+
+def _exempt_node_ids(tree: ast.AST) -> set:
+    """Nodes inside a function that already answers for super_admin."""
+    return {
+        id(node)
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _accounts_for_super_admin(fn)
+        for node in ast.walk(fn)
+    }
 
 
 def test_no_guard_compares_a_role_against_the_bare_string_admin():
@@ -482,32 +534,16 @@ def test_no_guard_compares_a_role_against_the_bare_string_admin():
     super_admin every permission unconditionally), so a guard that admits one
     and refuses the other is wrong however the comparison is spelled.
 
-    A function that ALSO handles "super_admin" is not flagged: that is the
-    shape of utils.auth.check_permission, whose `role == "admin"` branch sits
-    below an unconditional `role == "super_admin": return True`. The rule is
-    "super_admin must be accounted for", not "the string must not appear".
+    A function that actually TESTS for "super_admin" is not flagged: that is
+    the shape of utils.auth.check_permission, whose `role == "admin"` branch
+    sits below an unconditional `role == "super_admin": return True`. The rule
+    is "super_admin must be accounted for", not "the string must not appear".
     """
     offenders = []
-    for path in sorted(_REPO_ROOT.glob("**/*.py")):
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        if rel.startswith((".claude/", "tests/")) or "/.venv" in f"/{rel}":
-            continue
-        try:
-            tree = ast.parse(path.read_text())
-        except SyntaxError:  # not ours to police
-            continue
-
-        # Scopes that already answer for super_admin somewhere in their body.
-        exempt: List[ast.AST] = [
-            fn
-            for fn in ast.walk(tree)
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and _mentions_super_admin(fn)
-        ]
-        exempt_nodes = {id(n) for fn in exempt for n in ast.walk(fn)}
-
+    for rel, tree in _iter_reviewable_files():
+        exempt = _exempt_node_ids(tree)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Compare) or id(node) in exempt_nodes:
+            if not isinstance(node, ast.Compare) or id(node) in exempt:
                 continue
             if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
                 continue
@@ -525,6 +561,41 @@ def test_no_guard_compares_a_role_against_the_bare_string_admin():
         + "\n  ".join(sorted(offenders))
     )
 
+
+def test_no_role_allowlist_admits_admin_while_refusing_super_admin():
+    """Kills the container spelling that survived #2031 entirely.
+
+    `["merchant", "admin"]` and `("agent", "admin")` are role allowlists with
+    no "employee" member, so #2031's regex had nothing to key on and left 9
+    sites live: 7 merchant-or-admin guards over another tenant's orders and PSP
+    telemetry, and 2 in routes/protocol_routes.py that refused `super_admin`
+    an agent's protocol list while the sibling enable/disable routes in the
+    same file admitted it.
+
+    Shared constants exist for exactly this and are what the fix uses --
+    utils.auth.MERCHANT_OR_ADMIN_ROLES and AGENT_OR_ADMIN_ROLES. Note they are
+    NOT the ...EMPLOYEE_STAFF_ROLES variants: swapping in those would newly
+    admit every `employee`, which is a grant rather than a correction.
+    """
+    offenders = []
+    for rel, tree in _iter_reviewable_files():
+        exempt = _exempt_node_ids(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare) or id(node) in exempt:
+                continue
+            if not any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+                continue
+            for comparator in node.comparators:
+                members = _string_container(comparator)
+                if members and "admin" in members and "super_admin" not in members:
+                    offenders.append(f"{rel}:{node.lineno} {members}")
+
+    assert not offenders, (
+        "Role allowlist admits `admin` but not `super_admin`. Use a shared "
+        "constant from utils.auth (ADMIN_ROLES / MERCHANT_OR_ADMIN_ROLES / "
+        "AGENT_OR_ADMIN_ROLES / the ...EMPLOYEE_STAFF_ROLES variants where "
+        "staff really are intended):\n  " + "\n  ".join(sorted(offenders))
+    )
 
 # ---------------------------------------------------------------------------
 # The other dependency in routes.auth_routes. `require_employee` already
@@ -599,8 +670,16 @@ _OWNER_AGENT = "agent-owner-1"
 _OTHER_AGENT = "agent-other-2"
 
 
-def _agent_token(user_id: str) -> str:
-    """An agent-portal token whose `user_id` is what the guard compares."""
+def _agent_token(user_id: str, agent_id: str = None) -> str:
+    """An agent-portal token.
+
+    `user_id` is the claim the payment-routing guard actually compares. By
+    default `agent_id` mirrors it, which is the shape the guard's ownership
+    branch is written for -- and, as a review established, a shape NO issuer
+    mints: routes/agent_account.py stamps `user_id` from the `users` PK and
+    `agent_id` as `agent_<hex>` (db/agents.py). Pass both to build the real
+    thing; see test_a_real_agent_token_is_refused_its_own_routing_config.
+    """
     return _sign(
         {
             "sub": user_id,
@@ -608,7 +687,7 @@ def _agent_token(user_id: str) -> str:
             "email": f"{user_id}@example.com",
             "role": "agent",
             "membership_type": "agent",
-            "agent_id": user_id,
+            "agent_id": agent_id or user_id,
             "aud": "agent-portal",
             "scope": "agent",
         }
@@ -625,10 +704,14 @@ def routing_db_spy(monkeypatch) -> _DatabaseSpy:
 
 
 def test_an_agent_reaches_its_own_routing_config(client, routing_db_spy):
-    """The ownership conjunct, admit side.
+    """The ownership conjunct, admit side -- as the guard is WRITTEN.
 
-    Kills a "fix" that drops `user_id != agent_id` and leaves admin-only --
-    which would lock every agent out of its own configuration.
+    Kills a "fix" that drops `user_id != agent_id` and leaves admin-only.
+
+    Read this together with the test below: the token here is SYNTHETIC. It
+    sets `user_id == agent_id` because that is what the shipped guard compares,
+    and no live issuer produces it. This test therefore pins the branch, not a
+    reachable behaviour -- keeping the two apart is the point.
     """
     resp = client.get(
         _AGENT_ROUTES.format(agent_id=_OWNER_AGENT),
@@ -657,6 +740,39 @@ def test_an_agent_cannot_read_another_agents_routing_config(
         f"agent {_OTHER_AGENT} read {_OWNER_AGENT}'s routes: {resp.text}"
     )
     assert not routing_db_spy.calls, "a refused agent reached the handler body"
+
+
+def test_a_real_agent_token_is_refused_its_own_routing_config(
+    client, routing_db_spy
+):
+    """The reachable behaviour, pinned as it actually is: a fail-closed lockout.
+
+    A real agent-portal token carries `user_id` = the `users` PK and
+    `agent_id` = `agent_<hex>` (routes/agent_account.py, db/agents.py) -- two
+    different values. The guard compares `user_id` against the path's agent_id,
+    so the ownership branch can never fire for a real agent and every agent is
+    403'd on its own payment-routing configuration.
+
+    PRE-EXISTING and NOT changed by this PR, which touches only the admin
+    conjunct beside it. Recorded rather than fixed because the fix GRANTS
+    access that is denied today -- comparing the `agent_id` claim as well is a
+    scope decision that deserves its own review, not a side effect of a
+    super_admin correction. This test fails the moment someone makes it, which
+    is exactly when it should be revisited.
+    """
+    resp = client.get(
+        _AGENT_ROUTES.format(agent_id=_OWNER_AGENT),
+        headers={
+            "Authorization": f"Bearer {_agent_token('42', _OWNER_AGENT)}"
+        },
+    )
+
+    assert resp.status_code == 403, (
+        "an agent now reaches its own routing config -- if that is deliberate, "
+        "this lockout has been fixed and the test should assert 200: "
+        + resp.text
+    )
+    assert not routing_db_spy.calls
 
 
 @pytest.mark.parametrize("role", _ADMITTED)
@@ -688,3 +804,27 @@ def test_non_admin_non_owner_is_refused_agent_routing(
 
     assert resp.status_code == 403, f"{role} was admitted: {resp.status_code}"
     assert not routing_db_spy.calls
+
+
+# ---------------------------------------------------------------------------
+# /auth/me, the other endpoint the validator unblocked.
+# ---------------------------------------------------------------------------
+
+
+def test_auth_me_answers_a_portal_token_with_its_real_email(client):
+    """Kills the reverted `"email": current_user["user_id"]`.
+
+    /auth/me chains the same validator, so it rejected every canonical portal
+    token too. Unblocking it exposed a field that had been wrong all along and
+    unreachable: `email` was filled from `user_id`, which for a portal session
+    is an `identity_...` string, not an address.
+    """
+    resp = client.get(
+        "/auth/me",
+        headers={"Authorization": f"Bearer {_portal_token('super_admin')}"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    user = resp.json()["user"]
+    assert user["email"] == "super_admin@example.com", user
+    assert user["role"] == "super_admin"

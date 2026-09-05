@@ -10,11 +10,19 @@ import json
 
 from db.database import database
 from services.protocol_adapter_service import ProtocolAdapterService
-from utils.auth import ADMIN_ROLES, get_current_user, get_current_employee
+from utils.auth import ADMIN_ROLES, AGENT_OR_ADMIN_ROLES, get_current_user, get_current_employee
 
 # Enabling/disabling a protocol for an agent changes what that agent can
 # transact with, so this stays admin-only; ADMIN_ROLES only adds the
 # super_admin that `!= "admin"` had excluded.
+
+# The two READ routes below (`/events` and the protocol list) spelled their
+# guard as the TUPLE ("agent", "admin"), which locked `super_admin` out of the
+# very agent whose protocols it may enable and disable two routes down. That
+# tuple escapes BOTH ratchets: #2031's regex only flags a container holding
+# `employee`+`admin`, and the AST one added here only walks ==/!= comparisons.# Narrow on purpose -- utils.auth.AGENT_OR_ADMIN_ROLES, not
+# AGENT_OR_EMPLOYEE_STAFF_ROLES, which would newly admit `employee` to another
+# tenant's protocol config.
 
 
 router = APIRouter(prefix="/protocols", tags=["Protocol Management"])
@@ -122,7 +130,7 @@ async def get_protocol_events(
     current_role = current_user.get("role")
     current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
 
-    if current_role not in ("agent", "admin"):
+    if current_role not in AGENT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
 
     if current_role == "agent" and current_agent_id != agent_id:
@@ -236,7 +244,7 @@ async def get_agent_protocols(
     current_role = current_user.get("role")
     current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
 
-    if current_role not in ("agent", "admin"):
+    if current_role not in AGENT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
 
     if current_role == "agent" and current_agent_id != agent_id:

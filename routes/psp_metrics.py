@@ -5,7 +5,7 @@ from services.merchant_psp_telemetry_service import (
     get_merchant_psp_telemetry,
     unavailable_payment_telemetry,
 )
-from utils.auth import get_current_user
+from utils.auth import MERCHANT_OR_ADMIN_ROLES, get_current_user
 
 router = APIRouter()
 
@@ -15,7 +15,7 @@ async def get_psp_metrics(
     current_user: dict = Depends(get_current_user)
 ):
     """Get measured telemetry for a specific PSP when available."""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -47,7 +47,7 @@ async def get_psp_metrics(
 @router.get("/merchant/psps/metrics/all")
 async def get_all_psp_metrics(current_user: dict = Depends(get_current_user)):
     """Get measured telemetry for all PSPs of this merchant when available."""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_id = current_user.get("merchant_id")

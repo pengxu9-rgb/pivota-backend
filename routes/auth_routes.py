@@ -425,13 +425,23 @@ async def signin(login_data: UserLogin):
 
 @router.get("/me")
 async def get_current_user(current_user: dict = Depends(verify_jwt_token)):
-    """Get current user information, derived from the verified JWT."""
+    """Get current user information, derived from the verified JWT.
+
+    `email` reads the `email` CLAIM, falling back to `user_id` only when the
+    token carries none. It used to be `user_id` unconditionally, which was
+    merely wrong-and-unreachable while this route rejected every canonical
+    portal token: now that the shared validator admits them, /auth/me would
+    answer a real employee-portal session with its numeric user id, or an
+    `identity_...` string, in the `email` field. Every live issuer stamps
+    `email` (routes/auth.py, and create_jwt_token above), so the fallback is
+    for legacy tokens only.
+    """
     try:
         return {
             "status": "success",
             "user": {
                 "id": current_user["user_id"],
-                "email": current_user["user_id"],
+                "email": current_user.get("email") or current_user["user_id"],
                 "full_name": current_user["user_id"],
                 "role": current_user["role"],
                 "created_at": datetime.utcnow().isoformat()

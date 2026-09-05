@@ -1,7 +1,7 @@
 """Extended Merchant API Routes for Dashboard Features"""
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Query, Response
 from typing import Dict, Any, Optional, List
-from utils.auth import get_current_user
+from utils.auth import MERCHANT_OR_ADMIN_ROLES, get_current_user
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from db.database import database
@@ -2391,7 +2391,7 @@ async def get_order_detail(
     current_user: dict = Depends(get_current_user)
 ):
     """Get order details"""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_id = await get_merchant_id_from_user(current_user)

@@ -389,6 +389,23 @@ AGENT_OR_EMPLOYEE_STAFF_ROLES = ["agent"] + EMPLOYEE_STAFF_ROLES
 # request away on the sibling route.
 AGENT_OR_EMPLOYEE_ROLES = ["agent"] + EMPLOYEE_ROLES
 
+# The same two "own data OR staff" shapes, but WITHOUT `employee` -- for guards
+# that were spelled ["merchant", "admin"] / ("agent", "admin") and so never
+# admitted staff in the first place. They exist because the STAFF variants
+# above are the wrong repair for those: swapping ["merchant", "admin"] for
+# MERCHANT_OR_EMPLOYEE_STAFF_ROLES would newly hand every `employee` another
+# tenant's orders and PSP telemetry. Adding `super_admin` corrects an
+# omission; adding `employee` is a grant, and a grant needs its own review.
+#
+# These spellings are why a second sweep was needed after #2031: that ratchet
+# only flags a container holding BOTH `employee` and `admin`, so a two-element
+# ["merchant", "admin"] slipped through it in 7 places, and ("agent", "admin")
+# in 2 more -- including routes/protocol_routes.py, which refused `super_admin`
+# the protocol list for an agent whose protocols it could enable two routes
+# down.
+MERCHANT_OR_ADMIN_ROLES = ["merchant"] + ADMIN_ROLES
+AGENT_OR_ADMIN_ROLES = ["agent"] + ADMIN_ROLES
+
 # Permission guarding /api/operations/* (merchant & agent onboarding, approval,
 # verification, API-key issuance, audit log). A named permission, not a role
 # name — see the note in check_permission's permission_map.
