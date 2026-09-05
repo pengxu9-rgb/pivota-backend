@@ -73,6 +73,74 @@ def _snapshot_with_headroom(quote: Dict[str, Any], cap: Dict[str, Any]) -> Dict[
     return {**base, "headroom": cap}
 
 
+def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
+    """Serialise the audit snapshot without letting merchant JSON pick the status code.
+
+    `allow_nan=False` is the BELT here, not the fix: `resolve_merchant_quote` already refuses a
+    non-finite snapshot as a 502, which is where that check belongs. But `json.dumps` RECURSES
+    over merchant-controlled `totals`, and a RecursionError on this line is caught by nothing
+    above it -- a 500, the exact failure the belt was added to prevent, arriving by a different
+    exception type.
+
+    502, NOT 422. The handler below spells out the house rule: a bad request is 422 (which the
+    error middleware rewrites to 400 INVALID_REQUEST), and a merchant that refused or answered
+    unreadably is 502. An earlier draft raised 422 here, so a merchant nesting its own reply
+    made the agent read "Request validation failed" about a request that was fine. The
+    middleware does copy this string through to `body["detail"]`, but it replaces the STATUS and
+    the MESSAGE, which are what an agent switches on. Deep merchant JSON is the merchant's
+    fault, so it gets the merchant's status.
+
+    DEFENCE IN DEPTH, not a reachable path. `json.dumps` and `json.loads` are the same C encoder
+    sharing one limit -- measured identical on both runtimes (993/993 on 3.11, 9997/9997 on
+    3.12.8) -- and `resp.json()` parses strictly deeper in the chain, so the parser always
+    refuses first and this never fires in production. An earlier comment claimed it was "forward
+    cover for 3.12+"; that is true of the pure-Python walk in `_is_quoted_amount` (996 vs 9997),
+    not of this dump. Kept because the cost is one clause and the alternative is a 500 if that
+    ordering ever changes.
+    """
+    # BUILT OUTSIDE THE TRY, deliberately. `MerchantQuoteError` and `MerchantUcpError` are both
+    # ValueError SUBCLASSES, so the `except (ValueError, TypeError)` below catches far more than
+    # the encoder it was written for -- with this call inside the try, any ValueError or
+    # TypeError from the snapshot builder would be reported to the agent as the MERCHANT sending
+    # an unserialisable amount. Nothing in `_snapshot_with_headroom` raises either today (it
+    # self-guards a non-dict `base`, and `cap` carries only ints and strs), so this masked
+    # nothing; it is hoisted so that stays true if that guard is ever removed. The same
+    # ValueError-subclass overlap is already called out at merchant_ucp_checkout.py:800.
+    try:
+        snapshot = _snapshot_with_headroom(quote, cap)
+    except RecursionError:
+        # RecursionError ONLY, which is the asymmetry the hoist above exists to create. The
+        # builder's non-dict fallback does `repr(base)[:200]`, and `repr()` RECURSES -- so
+        # hoisting it out of the encoder's guard moved that recursion out of cover: a 12,000-deep
+        # non-dict `quote_snapshot` answered 502 before the hoist and an UNCAUGHT 500 after it.
+        # Hardening one hypothetical while opening the equal and opposite one.
+        #
+        # So the two exception families are split deliberately. A ValueError/TypeError from the
+        # builder is OURS and must stay loud (MerchantQuoteError and MerchantUcpError are both
+        # ValueError subclasses, so catching those here would relabel our bug as the merchant's).
+        # A RecursionError is a depth property of the DATA, which is the merchant's, and gets the
+        # merchant's status either way.
+        raise HTTPException(
+            status_code=502, detail="merchant quote nested beyond the readable depth"
+        )
+    try:
+        return json.dumps(snapshot, allow_nan=False)
+    except RecursionError:
+        raise HTTPException(
+            status_code=502, detail="merchant quote nested beyond the readable depth"
+        )
+    except (ValueError, TypeError):
+        # The clause this docstring calls "the BELT" -- `allow_nan=False` raises ValueError, and
+        # an unserialisable value raises TypeError. Catching only RecursionError left the belt
+        # itself uncaught: a 500 one exception type over from the one just guarded. Unreachable
+        # today (`resolve_merchant_quote` dumps the same totals first and `to_minor_units`
+        # refuses non-finite `picked`), and kept for the reason above -- one clause against a
+        # 500 if that ordering changes.
+        raise HTTPException(
+            status_code=502, detail="merchant quote carried an unserialisable amount"
+        )
+
+
 def _card_view(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "card_id": row["card_id"],
@@ -161,7 +229,9 @@ async def issue_card(
             # tell" is a decline waiting to happen. `ceiling` vs `flat_plus_bps` is the signal for
             # whether the ceiling ever engages at real order sizes — the question #1923 left open
             # about its own defaults, and the one this record exists to answer.
-            "quote_snapshot": json.dumps(_snapshot_with_headroom(quote, cap)),
+            # `_dump_snapshot` carries the reasoning: allow_nan is a belt behind
+            # `resolve_merchant_quote`'s 502, and the dump's own recursion is guarded there too.
+            "quote_snapshot": _dump_snapshot(quote, cap),
             "issuer": issuer.name,
             "single_use": True,
             "expires_at": expires_at,
