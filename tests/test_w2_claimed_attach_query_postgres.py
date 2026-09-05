@@ -147,10 +147,12 @@ async def test_a_verified_claim_attaches_the_rows_to_the_tenant(_db, caplog):
 
 async def test_a_subdomain_claim_attaches_by_registrable(_db):
     """The LIKE branch: the claim is on shop.flowerbeauty.com, the plan's
-    registrable is flowerbeauty.com."""
+    registrable is flowerbeauty.com. Mixed case on purpose: the claim route
+    stores brand_domain as submitted (strip, never lower), so the query's
+    lower() is load-bearing and a mutant dropping it must fail here."""
     from services.catalog_enrichment_agent.apply import _prepare_seller_of_record
 
-    await _claim(_db, merchant_id=TENANT, brand_domain="shop.flowerbeauty.com", status="verified")
+    await _claim(_db, merchant_id=TENANT, brand_domain="Shop.FlowerBeauty.com", status="verified")
     await _tenant_merchant(_db, TENANT)
     plan = _plan(observed_id=OBSERVED, registrable="flowerbeauty.com")
 
