@@ -708,3 +708,31 @@ def test_the_dump_guard_does_not_swallow_our_own_errors_from_the_snapshot_builde
 
     with pytest.raises(MerchantQuoteError):
         mod._dump_snapshot({"quote_snapshot": {}}, {"max_minor": 7500})
+
+
+def test_a_deep_non_dict_snapshot_is_a_502_not_an_uncaught_recursion():
+    """The regression the hoist itself introduced, caught by review and pinned here.
+
+    `_snapshot_with_headroom`'s non-dict fallback does `repr(base)[:200]`, and `repr()` recurses.
+    Hoisting the builder out of the encoder's `try` -- which is what stops our own ValueErrors
+    being relabelled as the merchant's -- took that recursion out of cover with it. Measured: a
+    12,000-deep non-dict `quote_snapshot` answered 502 before the hoist and an uncaught 500
+    after, i.e. the hardening opened the hole it was hardening.
+
+    Dead today (`resolve_merchant_quote` only ever emits a dict), which is exactly why it needs a
+    direct test: it is the "older cached shape, hand-built dict, future refactor" the builder's
+    own docstring anticipates, and nothing end-to-end would notice.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep = []
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = [deep]
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot({"quote_snapshot": deep}, {"max_minor": 7500})
+
+    assert excinfo.value.status_code == 502
+    assert "nested beyond the readable depth" in str(excinfo.value.detail)

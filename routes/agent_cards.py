@@ -106,7 +106,23 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     # self-guards a non-dict `base`, and `cap` carries only ints and strs), so this masked
     # nothing; it is hoisted so that stays true if that guard is ever removed. The same
     # ValueError-subclass overlap is already called out at merchant_ucp_checkout.py:800.
-    snapshot = _snapshot_with_headroom(quote, cap)
+    try:
+        snapshot = _snapshot_with_headroom(quote, cap)
+    except RecursionError:
+        # RecursionError ONLY, which is the asymmetry the hoist above exists to create. The
+        # builder's non-dict fallback does `repr(base)[:200]`, and `repr()` RECURSES -- so
+        # hoisting it out of the encoder's guard moved that recursion out of cover: a 12,000-deep
+        # non-dict `quote_snapshot` answered 502 before the hoist and an UNCAUGHT 500 after it.
+        # Hardening one hypothetical while opening the equal and opposite one.
+        #
+        # So the two exception families are split deliberately. A ValueError/TypeError from the
+        # builder is OURS and must stay loud (MerchantQuoteError and MerchantUcpError are both
+        # ValueError subclasses, so catching those here would relabel our bug as the merchant's).
+        # A RecursionError is a depth property of the DATA, which is the merchant's, and gets the
+        # merchant's status either way.
+        raise HTTPException(
+            status_code=502, detail="merchant quote nested beyond the readable depth"
+        )
     try:
         return json.dumps(snapshot, allow_nan=False)
     except RecursionError:
