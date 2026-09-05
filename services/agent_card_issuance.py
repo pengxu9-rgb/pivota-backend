@@ -260,14 +260,14 @@ def _is_quoted_amount(value: Any, _depth: int = 0) -> bool:
         # C and Python recursion share one budget there, and `resp.json()` is called STRICTLY
         # DEEPER than this walk -- `resolve_merchant_quote` -> `get_checkout` -> `_call_tool` ->
         # `resp.json()` -- so the parser always runs out first. Measured end to end through the
-        # real transport with this bound REVERTED: depth 970 returns normally, depth 980 is a
-        # clean 502 ("merchant response was not JSON"), and NO depth produces a 500. An earlier
+        # real transport with this bound REVERTED: through the route the cliff is 963/964 --
+        # 963 returns, 964 is a clean 502 ("merchant response was not JSON"), and NO depth produces a 500. An earlier
         # version of this comment claimed a measured 500 here; that was an artifact of a probe
         # that added a frame PER LEVEL. A deeper stack adds a CONSTANT, which shifts the parser
         # and this walk equally and preserves the ordering.
         #
         # It is load-bearing on 3.12+, where the two budgets are separate: measured on 3.12.8,
-        # `json.loads` accepts 4000+ levels while this pure-Python walk still stops at 996. The
+        # `json.loads` accepts 9997 levels while this pure-Python walk still stops at 996. The
         # parser stops gating and the walk trips first -- and RecursionError is a RuntimeError,
         # so no `except (TypeError, ValueError)` on this path catches it. This is forward cover
         # for that upgrade, not a fix for a live 3.11 defect.
@@ -383,8 +383,13 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
     except RecursionError:
         # `json.dumps` recurses over merchant `totals` too, and RecursionError is a RuntimeError
         # that the clause above does not catch -- so bounding `_is_quoted_amount` alone would
-        # just move the same 500 four lines down. Gated by the parser on 3.11 like the walk is;
-        # reachable on 3.12+, where `json.loads` accepts 4000+ levels and this does not.
+        # just move the same 500 four lines down.
+        #
+        # DEFENCE IN DEPTH, not a reachable path, and NOT "forward cover for 3.12" as an earlier
+        # comment claimed: `dumps` and `loads` are the same C encoder on one shared limit,
+        # measured identical on both runtimes (993/993 on 3.11, 9997/9997 on 3.12.8), and
+        # `resp.json()` parses strictly deeper, so the parser always refuses first. The 3.12
+        # argument is real for the pure-Python walk above (996 vs 9997) and only for that.
         raise MerchantQuoteError("merchant quote nested beyond the readable depth")
     return {
         "total_minor": total_minor,

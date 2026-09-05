@@ -80,16 +80,28 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     non-finite snapshot as a 502, which is where that check belongs. But `json.dumps` RECURSES
     over merchant-controlled `totals`, and a RecursionError on this line is caught by nothing
     above it -- a 500, the exact failure the belt was added to prevent, arriving by a different
-    exception type. Gated by the parser on the pinned 3.11 (`resp.json()` runs deeper and
-    refuses first); reachable on 3.12+, where `json.loads` accepts 4000+ levels and this does
-    not. Refused as a 422 because it is the merchant's reply that is unreadable, matching the
-    `MerchantQuoteError` the sibling guard raises in `resolve_merchant_quote`.
+    exception type.
+
+    502, NOT 422. The handler below spells out the house rule: a bad request is 422 (which the
+    error middleware rewrites to 400 INVALID_REQUEST), and a merchant that refused or answered
+    unreadably is 502. An earlier draft raised 422 here, so a merchant nesting its own reply
+    made the agent read "Request validation failed" about a request that was fine -- and the
+    middleware discarded this detail string entirely. Deep merchant JSON is the merchant's
+    fault, so it gets the merchant's status.
+
+    DEFENCE IN DEPTH, not a reachable path. `json.dumps` and `json.loads` are the same C encoder
+    sharing one limit -- measured identical on both runtimes (993/993 on 3.11, 9997/9997 on
+    3.12.8) -- and `resp.json()` parses strictly deeper in the chain, so the parser always
+    refuses first and this never fires in production. An earlier comment claimed it was "forward
+    cover for 3.12+"; that is true of the pure-Python walk in `_is_quoted_amount` (996 vs 9997),
+    not of this dump. Kept because the cost is one clause and the alternative is a 500 if that
+    ordering ever changes.
     """
     try:
         return json.dumps(_snapshot_with_headroom(quote, cap), allow_nan=False)
     except RecursionError:
         raise HTTPException(
-            status_code=422, detail="merchant quote nested beyond the readable depth"
+            status_code=502, detail="merchant quote nested beyond the readable depth"
         )
 
 

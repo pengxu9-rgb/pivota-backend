@@ -519,13 +519,14 @@ def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
         nested = {"amount": nested}
 
     covers = quote_covers({"currency": "USD", "total_amount": 2317, "tax": nested,
-                           "total_shipping": 400})
+                           "total_shipping": {"amount": {"value": 400}}})
 
     assert covers["tax"] is False
-    # POSITIVE counterpart. The first draft asserted `shipping is False` against a fixture with
-    # no shipping key at all -- true with the bound and without it, and true of an empty dict.
-    # A real shipping amount alongside the hostile tax proves the walk still WORKS after the
-    # bound, instead of only proving it stopped.
+    # POSITIVE counterpart, and it must enter the RECURSIVE branch. The first draft asserted
+    # `shipping is False` against a fixture with no shipping key -- true with the bound, without
+    # it, and for an empty dict. The second used a bare int, which never recurses at all. A
+    # legitimately NESTED shipping amount alongside the hostile tax is what proves the bounded
+    # walk still RESOLVES real nesting instead of only proving it stops.
     assert covers["shipping"] is True
 
 
@@ -554,7 +555,10 @@ def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
     with pytest.raises(HTTPException) as excinfo:
         _dump_snapshot(quote, {"max_minor": 7500})
 
-    assert excinfo.value.status_code == 422
+    # 502, not 422: the error middleware rewrites every 422 leaving the app into a 400
+    # INVALID_REQUEST with a generic "Request validation failed" and DISCARDS this detail, so a
+    # 422 here told the agent its own request was bad because the MERCHANT nested its reply.
+    assert excinfo.value.status_code == 502
     assert "nested beyond the readable depth" in str(excinfo.value.detail)
 
 
@@ -569,3 +573,51 @@ def test_the_snapshot_dump_still_serialises_a_normal_quote():
 
     assert _json.loads(out)["totals"] == [{"type": "tax", "amount": 500}]
     assert _json.loads(out)["headroom"] == {"max_minor": 7500}
+
+
+@pytest.mark.parametrize("depth,expected", [(1, True), (2, True), (8, True), (9, False)])
+def test_the_amount_nesting_bound_is_pinned_at_its_actual_value(depth, expected):
+    """`_MAX_AMOUNT_NESTING = 1` passed the entire agent-card suite; only 0 failed, and via a
+    pre-existing test. So the constant's value was unpinned and its comment ("a real quote nests
+    once or twice; 8 is far past that") was an unverified claim -- a mutant lowering 8 to 1 or 2
+    survived. This pins both ends: legitimate nesting up to the bound still reads as a quoted
+    amount, and one level past it does not."""
+    from services.agent_card_issuance import _MAX_AMOUNT_NESTING, _is_quoted_amount
+
+    assert _MAX_AMOUNT_NESTING == 8
+
+    nested = 500
+    for _ in range(depth):
+        nested = {"amount": nested}
+
+    assert _is_quoted_amount(nested) is expected
+
+
+@pytest.mark.asyncio
+async def test_resolve_merchant_quote_refuses_a_dump_that_recurses(monkeypatch):
+    """The SIBLING half of the dump guard, which no test covered: deleting
+    `resolve_merchant_quote`'s `except RecursionError` left the whole suite green (14,580
+    passed). Only the route helper was pinned, while the commit claimed both were.
+
+    Driven by patching `get_checkout`, because the guard is unreachable over the wire on both
+    runtimes -- `resp.json()` parses strictly deeper than this dump and refuses first. That is
+    exactly why it needs a direct test: an unreachable guard is invisible to every end-to-end
+    fixture, so nothing else would notice if it were deleted.
+    """
+    import services.merchant_ucp_checkout as muc
+    from services.agent_card_issuance import MerchantQuoteError, resolve_merchant_quote
+
+    deep = 5
+    for _ in range(2000):
+        deep = {"amount": deep}
+
+    async def fake_get_checkout(domain, checkout_id):
+        return {"currency": "USD", "total_amount": 2317, "status": "ready_for_complete",
+                "totals": deep}
+
+    monkeypatch.setattr(muc, "get_checkout", fake_get_checkout)
+
+    with pytest.raises(MerchantQuoteError) as excinfo:
+        await resolve_merchant_quote("example.com", "chk_1")
+
+    assert "nested beyond the readable depth" in str(excinfo.value)
