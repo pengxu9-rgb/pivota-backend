@@ -348,6 +348,9 @@ _TELEMETRY_ROUTE_FILES = {
         "receive_shoplazza_webhook": ("shoplazza_webhook", "platform"),
     },
     Path("routes/sfcc_events.py"): {"receive_sfcc_events": ("sfcc_cartridge", "platform")},
+    Path("routes/prestashop_webhooks.py"): {
+        "receive_prestashop_events": ("prestashop_module", "platform")
+    },
     Path("routes/adobe_commerce_events.py"): {"receive_adobe_commerce_event": ("adobe_io_events", "platform")},
 }
 

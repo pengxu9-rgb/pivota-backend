@@ -175,6 +175,57 @@ order through the API, so a Pivota-written-back order maps to
 `pivota:<order id>`. The `buyerNote` the same writeback sets is buyer free text
 and is never read. See `docs/WIX_TELEMETRY.md`.
 
+## PrestaShop native module bridge
+
+`POST /webhooks/prestashop/{store_id}` is the second bridge — after the SFCC
+cartridge — whose **sender Pivota ships**, and for the same reason: PrestaShop
+has no outbound webhooks. There is no subscription API, no signed delivery and
+no callback registry; the platform's extension point is a hook that runs inside
+the shop's own PHP process. The module lives at
+`integrations/prestashop-module/pivotatelemetry/` and is unlinted PHP (there is
+no `php` binary in this repo's CI).
+
+**The hooks never touch the network.** Three hooks —
+`actionValidateOrder`, `actionOrderStatusPostUpdate` and `actionOrderSlipAdd` —
+each write ONE row into a local outbox table (`ps_pivota_telemetry_outbox`) and
+return, so a Pivota outage can never slow a checkout. A cron-driven front
+controller (`controllers/front/drain.php`, token-guarded) is the only code that
+opens a socket: at most 100 events per POST, 10 POSTs per run, exponential
+backoff on a non-2xx, and a row dropped after 20 failed attempts.
+
+`actionOrderStatusPostUpdate` is registered rather than
+`actionOrderStatusUpdate` because `OrderHistory` fires the `Update` variant
+*before* the new state is written, where the order still carries the old
+`current_state` and the old `total_paid_real`.
+
+**The receiver never keys money on a shop-specific state id.** Order-state ids
+are rows in each shop's own table, so the module resolves them against
+`Configuration::get('PS_OS_PAYMENT' | 'PS_OS_CANCELED' | 'PS_OS_REFUND' |
+'PS_OS_ERROR' | 'PS_OS_SHIPPING' | 'PS_OS_DELIVERED')` and sends a fixed
+`state_key`. There is deliberately no payment-error key: PrestaShop has none,
+and asking `Configuration` for a key it does not have returns `false`, which
+compares equal to state 0 — every unmatched state would have become a payment
+failure.
+
+`services/prestashop_event_adapter.py` maps `order.created` on every
+`actionValidateOrder` (plus `order.paid` when the validated state is paid),
+`order.paid` / `order.cancelled` / `payment.failed` on a status transition, and
+one `refund.succeeded` per **credit slip**, keyed on the slip id. A `refund`
+STATE alone emits nothing: it carries no amount and no per-refund identity, and
+counting both it and the slip would double-count every refund.
+
+The refund total is `total_products_tax_incl + total_shipping_tax_incl`, never
+the legacy `amount` column — `OrderSlipCreator` writes `amount` as
+products-only and tax-EXCLUDED on the default path, with nothing on the row
+saying which basis was used. See `docs/PRESTASHOP_TELEMETRY.md`.
+
+Auth is a per-store secret the **merchant pastes** into the module (there is no
+handshake to mint it through), so
+`POST /integrations/prestashop/{store_id}/telemetry/ensure` returns it exactly
+once, on the call that mints it. The delivery is bound to the shop by URL: the
+`X-Pivota-PrestaShop-Shop-Url` header and the signed body's `shop_url` must both
+resolve to the host the store was connected with.
+
 ## PSP terminal-event bridge
 
 After the existing Stripe handler has verified the webhook signature, resolved
@@ -280,6 +331,7 @@ Format: `^[a-z0-9_]+:[^\s]+$`, at most 160 characters
 | Shopify adapter | `pivota:<id>` if recognised, else `shopify:<native id>` | The `pivota_order_id` note attribute, else the ingest's `orders.shopify_order_id` lookup. |
 | WooCommerce adapter | `pivota:<id>` if recognised, else `woocommerce:<native id>` | The `pivota_order_id` entry in the order's `meta_data`. |
 | Cafe24 / SHOPLINE / Shoplazza / Adobe / SFCC adapters | `<platform>:<native id>` | Their webhooks are platform-originated. |
+| PrestaShop module adapter | `prestashop:<id_order>` | There is no PrestaShop order writeback, so every order originated in the shop. |
 
 ### The marker, and the fallback
 
