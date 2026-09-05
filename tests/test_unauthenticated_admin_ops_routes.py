@@ -59,6 +59,53 @@ def client() -> TestClient:
     return TestClient(main.app)
 
 
+class _HandlerReached(Exception):
+    """Raised by the tripwire in place of running the statement."""
+
+
+@pytest.fixture
+def db_tripwire(monkeypatch):
+    """Replace every database accessor with a raise, and record the calls.
+
+    Two jobs, and the second is why this is not optional.
+
+    It makes the refusals below say what they mean. `assert status in (401,
+    403)` is satisfied by a handler that RAN and then failed a later check;
+    what this file actually claims is that the guard sits in FRONT of the
+    handler. Recording the calls turns that into an assertion.
+
+    And it bounds the blast radius of its own failure. UNAUTHENTICATED_ROUTES
+    contains `POST /admin/fix/agents-table`, whose first statement is
+    `DROP TABLE IF EXISTS agents CASCADE`, plus ~12 ALTER TABLEs on `orders`
+    and a DELETE from products_cache. Those routes are listed here precisely
+    because they were once unguarded -- so the day the guard regresses is the
+    day this suite sends them an anonymous request and the handler runs. That
+    was measured, not assumed: with the guard removed from
+    routes/fix_agents_table.py, the anonymous request these tests send executed
+    `DROP TABLE IF EXISTS agents CASCADE` against the test database. sqlite
+    happens to reject CASCADE, but the statement was issued, and anyone running
+    the suite with DATABASE_URL pointed at Postgres would lose the table.
+
+    A regression should fail this file, not drop a table to do it.
+    """
+    from db import database as db_module
+
+    calls: List[str] = []
+
+    def _trap(kind):
+        async def _call(*args, **kwargs):
+            calls.append(f"{kind}: {str(args[0])[:120] if args else ''}")
+            raise _HandlerReached(kind)
+
+        return _call
+
+    for accessor in ("execute", "execute_many", "fetch_all", "fetch_one", "fetch_val"):
+        if hasattr(db_module.database, accessor):
+            monkeypatch.setattr(db_module.database, accessor, _trap(accessor))
+
+    return calls
+
+
 # (method, path, json body or None). Paths are the real ones; the bodies are
 # only enough to get past request validation, because a 422 would mean the
 # refusal was never reached.
@@ -94,7 +141,7 @@ def _call(client: TestClient, method: str, path: str, body: Any, headers=None):
 
 
 @pytest.mark.parametrize("method,path,body", UNAUTHENTICATED_ROUTES)
-def test_admin_ops_routes_refuse_an_anonymous_caller(client, method, path, body):
+def test_admin_ops_routes_refuse_an_anonymous_caller(client, db_tripwire, method, path, body):
     """No Authorization header, no X-ADMIN-KEY. Must be refused."""
     resp = _call(client, method, path, body)
 
@@ -102,10 +149,14 @@ def test_admin_ops_routes_refuse_an_anonymous_caller(client, method, path, body)
         f"{method} {path} answered {resp.status_code} to an unauthenticated "
         f"caller: {resp.text[:400]}"
     )
+    assert not db_tripwire, (
+        f"{method} {path} answered {resp.status_code} but the handler still "
+        f"reached the database -- the guard is not in FRONT of it: {db_tripwire}"
+    )
 
 
 @pytest.mark.parametrize("method,path,body", UNAUTHENTICATED_ROUTES)
-def test_admin_ops_routes_refuse_a_non_admin_token(client, method, path, body):
+def test_admin_ops_routes_refuse_a_non_admin_token(client, db_tripwire, method, path, body):
     """A real signed token for a non-admin role is not a way in either.
 
     Real JWTs throughout -- never the `test-token` placeholder, whose pytest
@@ -124,10 +175,13 @@ def test_admin_ops_routes_refuse_a_non_admin_token(client, method, path, body):
         f"{method} {path} admitted a merchant token: {resp.status_code} "
         f"{resp.text[:400]}"
     )
+    assert not db_tripwire, (
+        f"{method} {path} reached the database with a merchant token: {db_tripwire}"
+    )
 
 
 @pytest.mark.parametrize("method,path,body", UNAUTHENTICATED_ROUTES)
-def test_admin_ops_routes_refuse_a_bogus_admin_key(client, method, path, body):
+def test_admin_ops_routes_refuse_a_bogus_admin_key(client, db_tripwire, method, path, body):
     """An X-ADMIN-KEY that is not the configured one must not pass.
 
     Kills a guard that merely checks the header is PRESENT.
@@ -138,6 +192,51 @@ def test_admin_ops_routes_refuse_a_bogus_admin_key(client, method, path, body):
         f"{method} {path} accepted a bogus admin key: {resp.status_code} "
         f"{resp.text[:400]}"
     )
+    assert not db_tripwire, (
+        f"{method} {path} reached the database with a bogus admin key: {db_tripwire}"
+    )
+
+
+async def test_the_tripwire_lands_on_the_object_the_routes_use(db_tripwire):
+    """The mechanism the three refusal tests now rest on, pinned separately.
+
+    Those tests read "the handler never ran" off `db_tripwire` being EMPTY --
+    and an empty list is also what a tripwire that patched nothing produces. So
+    a broken tripwire (a renamed accessor, a second Database instance, a module
+    that rebound the name) reads exactly like a perfectly guarded route, which
+    is the failure mode that matters: it would restore the silent
+    DROP-on-regression this fixture exists to prevent, while every test stayed
+    green.
+
+    Asserting it needs no request. The route modules all do `from db.database
+    import database`, so they hold the singleton by reference and a patch on
+    its attributes is visible through every alias -- that identity is the whole
+    mechanism, and it is checked directly here. Deliberately independent of the
+    guard, so a failure here means the tripwire is broken rather than the
+    authentication.
+    """
+    import importlib
+
+    from db import database as db_module
+
+    checked = 0
+    for module_name in _GUARDED_MODULES:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, "database"):
+            continue  # not every guarded module talks to the DB
+        assert module.database is db_module.database, (
+            f"{module_name} holds a different Database object than the one the "
+            f"tripwire patches -- the `assert not db_tripwire` in every refusal "
+            f"test above is vacuous for this module"
+        )
+        checked += 1
+
+    assert checked, "no guarded module exposes `database` -- identity check was vacuous"
+
+    with pytest.raises(_HandlerReached):
+        await db_module.database.fetch_all("SELECT 1")
+
+    assert db_tripwire, "the patched accessor ran but recorded nothing"
 
 
 def test_the_refusal_is_the_guard_not_a_missing_table(client):
