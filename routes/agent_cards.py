@@ -98,8 +98,17 @@ def _dump_snapshot(quote: Dict[str, Any], cap: Dict[str, Any]) -> str:
     not of this dump. Kept because the cost is one clause and the alternative is a 500 if that
     ordering ever changes.
     """
+    # BUILT OUTSIDE THE TRY, deliberately. `MerchantQuoteError` and `MerchantUcpError` are both
+    # ValueError SUBCLASSES, so the `except (ValueError, TypeError)` below catches far more than
+    # the encoder it was written for -- with this call inside the try, any ValueError or
+    # TypeError from the snapshot builder would be reported to the agent as the MERCHANT sending
+    # an unserialisable amount. Nothing in `_snapshot_with_headroom` raises either today (it
+    # self-guards a non-dict `base`, and `cap` carries only ints and strs), so this masked
+    # nothing; it is hoisted so that stays true if that guard is ever removed. The same
+    # ValueError-subclass overlap is already called out at merchant_ucp_checkout.py:800.
+    snapshot = _snapshot_with_headroom(quote, cap)
     try:
-        return json.dumps(_snapshot_with_headroom(quote, cap), allow_nan=False)
+        return json.dumps(snapshot, allow_nan=False)
     except RecursionError:
         raise HTTPException(
             status_code=502, detail="merchant quote nested beyond the readable depth"
