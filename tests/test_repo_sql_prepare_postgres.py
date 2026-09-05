@@ -345,14 +345,12 @@ _KNOWN_UNPLANNABLE = {
     # 6.   `mcp_connected_at` is declared by no migration, model or schema_guard
     #      ALTER anywhere in the repo.
     ("services/merchant_store_service.py", 'column "mcp_connected_at"', "ec6d28aa1ef9"),
-    # 7-8. Surfaced only once the column parser above stopped emitting junk tokens
-    #      (they hid behind unfaithful tables). Both real: `external_product_seeds`
-    #      has no `category` column; `brand_claims` has `verification_status`, not
-    #      `status`, so that VERIFIED-claim lookup can never match and `claimed` is
-    #      always None — under a comment advertising itself as the fix for an
-    #      earlier silent-miss bug.
+    # 7.   Surfaced only once the column parser above stopped emitting junk tokens
+    #      (it hid behind an unfaithful table). Real: `external_product_seeds`
+    #      has no `category` column. (Its sibling pin — apply.py's VERIFIED-claim
+    #      lookup reading `status`/`updated_at` on brand_claims — was FIXED
+    #      2026-09-04 and is now executed by test_w2_claimed_attach_query_postgres.py.)
     ("services/attached_seed_runtime_evidence.py", 'column "category" does not exist', "7a110251d5f0"),
-    ("services/catalog_enrichment_agent/apply.py", 'column "status" does not exist', "a34e0f691cd4"),
     #
     # ---- added when the collector learned to follow function-local literals ----
     # Seven statements that were always there and are only now visible. None is

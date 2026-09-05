@@ -384,6 +384,7 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
          failure is logged and skipped (the plan contract is per-row
          fail-soft); the merchant heals on the next run.
     """
+    from db.brand_claims import STATUS_VERIFIED
     from services.seller_identity import BANNED_BUCKET_MERCHANT_ID, etld1
 
     pdps = plan.get("pdps") or []
@@ -442,19 +443,26 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
                 # database handle THIS plan runs on (never the module-global,
                 # which diverges under db overrides), and no Python-side scan
                 # cap (the old LIMIT-200 scan silently missed claim #201).
+                # Column names are brand_claims' REAL ones (`verification_status`,
+                # `verified_at`; db/brand_claims.py). Until 2026-09-04 this read
+                # `status`/`updated_at`, neither of which exists, so the
+                # best-effort except below swallowed a `column does not exist`
+                # on EVERY apply and no verified claim ever attached
+                # (prod: catalog-curated-brand-onboard-xlv56, flowerbeauty.com).
+                # tests/test_w2_claimed_attach_query_postgres.py pins it.
                 try:
                     row = await database.fetch_one(
                         """
                         SELECT merchant_id FROM brand_claims
-                        WHERE lower(coalesce(status, '')) = 'verified'
+                        WHERE verification_status = :verified
                           AND (
                             lower(coalesce(brand_domain, '')) = :reg
                             OR lower(coalesce(brand_domain, '')) LIKE '%.' || :reg
                           )
-                        ORDER BY updated_at DESC NULLS LAST
+                        ORDER BY verified_at DESC NULLS LAST, created_at DESC
                         LIMIT 1
                         """,
-                        {"reg": registrable},
+                        {"reg": registrable, "verified": STATUS_VERIFIED},
                     )
                     claimed = str(dict(row).get("merchant_id") or "").strip() or None if row else None
                 except Exception as exc:  # noqa: BLE001 — attach is best-effort; mint is the honest state
