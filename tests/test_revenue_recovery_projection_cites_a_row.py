@@ -358,3 +358,23 @@ def test_a_run_with_no_distribution_says_so_rather_than_showing_a_clean_sheet():
     assert head["dimensions"] == []
     reason = head["unavailable_reason"].lower()
     assert "not a score of zero" in reason and "not a pass" in reason
+
+
+def test_a_side_with_no_answered_prompts_has_no_rate(real_report):
+    """0/0 is not 0%. A branded rate of 0.0 says the brand was asked for and
+    never cited; `None` says it was never asked. Rendering the second as the
+    first is the false zero this whole file exists to stop, moved into the
+    split — and it survived a mutant until this test existed.
+    """
+    report = json.loads(json.dumps(real_report))
+    by_intent = report["brand_rollup"]["citation_by_intent"]
+    for axis in report["brand_rollup"]["prompt_mix"]["branded_axes"]:
+        by_intent[axis]["cited"] = 0
+        by_intent[axis]["total"] = 0
+
+    split = _project(extract_findings(report))["headline"]["prompt_split"]
+
+    assert split["branded"]["answered"] == 0
+    assert split["branded"]["rate"] is None, "0/0 rendered as a rate"
+    # The other side still reports normally — this is not a global blank.
+    assert split["unbranded"]["rate"] is not None
