@@ -2861,6 +2861,24 @@ async def ensure_bigcommerce_webhooks(
             },
         )
 
+        # Two first-time calls can race: each mints its own secret and the
+        # last UPDATE wins. Hooks must carry the secret the RECEIVER holds, so
+        # re-read the row and register with whatever actually persisted; the
+        # loser's minted value is discarded, never registered.
+        persisted = await database.fetch_one(
+            "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+            {"store_id": store_id},
+        )
+        persisted_secret = str(
+            _bigcommerce_credentials(dict(persisted).get("api_key") if persisted else None)
+            .get("webhook_secret")
+            or ""
+        ).strip()
+        if not persisted_secret:
+            raise HTTPException(
+                status_code=503, detail="BigCommerce webhook secret could not be persisted"
+            )
+        webhook_secret = persisted_secret
     try:
         async with asyncio.timeout(90.0):
             async with _BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY:

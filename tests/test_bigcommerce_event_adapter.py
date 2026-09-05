@@ -607,3 +607,112 @@ async def test_fetcher_raises_when_the_refund_read_fails(monkeypatch):
             order_id="250",
             scope="store/order/updated",
         )
+
+
+# ---- the ensure route: the secret the hooks carry is the secret the receiver holds ----
+
+
+def _ensure_app(current_user):
+    from fastapi import FastAPI
+
+    from routes.merchant_store_connections import router
+    from utils.auth import get_current_user
+
+    app = FastAPI()
+    app.include_router(router)
+
+    async def fake_user():
+        return current_user
+
+    app.dependency_overrides[get_current_user] = fake_user
+    return TestClient(app)
+
+
+class _EnsureStoreDB:
+    """One BigCommerce store row; records the credential UPDATE; can simulate a
+    concurrent writer by answering the re-read with a different secret."""
+
+    def __init__(self, credentials, *, reread_secret=None):
+        self.credentials = dict(credentials)
+        self.reread_secret = reread_secret
+        self.updates = []
+
+    async def fetch_one(self, query, values):
+        if "SELECT api_key FROM merchant_stores" in str(query):
+            creds = dict(self.credentials)
+            if self.updates:
+                creds = json.loads(self.updates[-1]["api_key"])
+            if self.reread_secret is not None:
+                creds["webhook_secret"] = self.reread_secret
+            return {"api_key": json.dumps(creds)}
+        return {
+            "store_id": values["store_id"],
+            "merchant_id": "merch_bc",
+            "domain": "store-abc12.mybigcommerce.com",
+            "api_key": json.dumps(self.credentials),
+        }
+
+    async def execute(self, query, values):
+        self.updates.append(dict(values))
+        return None
+
+
+def _install_ensure_stubs(monkeypatch, db, installed):
+    import routes.merchant_store_connections as route
+    import services.bigcommerce_webhook_subscriptions as subs
+
+    monkeypatch.setenv("BIGCOMMERCE_WEBHOOK_BASE_URL", "https://api.example.test")
+    monkeypatch.setattr(route, "database", db)
+
+    async def fake_ensure(**kwargs):
+        installed.append(kwargs)
+        return {"created_scopes": list(kwargs["scopes"]), "synchronized_scopes": [], "disabled_duplicates": []}
+
+    monkeypatch.setattr(subs, "ensure_bigcommerce_subscriptions", fake_ensure)
+
+
+def test_ensure_route_registers_hooks_with_the_secret_that_actually_persisted(monkeypatch):
+    """A concurrent first-time call may win the UPDATE with a different secret;
+    the hooks must carry THAT one, or every delivery is a 401 until re-ensured."""
+    installed = []
+    db = _EnsureStoreDB(
+        {"store_hash": "abc12", "access_token": "tok", "client_id": "cid"},
+        reread_secret="secret-from-the-other-writer",
+    )
+    _install_ensure_stubs(monkeypatch, db, installed)
+
+    response = _ensure_app({"role": "merchant", "merchant_id": "merch_bc"}).post(
+        "/integrations/bigcommerce/store_bc/webhooks/ensure"
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(db.updates) == 1, "a missing secret is minted and persisted exactly once"
+    minted = json.loads(db.updates[0]["api_key"])["webhook_secret"]
+    assert minted and minted != "secret-from-the-other-writer"
+    assert installed[0]["secret"] == "secret-from-the-other-writer"
+    assert installed[0]["callback_url"] == "https://api.example.test/webhooks/bigcommerce/store_bc"
+    # Neither secret is ever returned to the caller.
+    assert minted not in response.text
+    assert "secret-from-the-other-writer" not in response.text
+
+
+def test_ensure_route_reuses_an_existing_secret_without_rewriting_credentials(monkeypatch):
+    installed = []
+    db = _EnsureStoreDB(
+        {"store_hash": "abc12", "access_token": "tok", "webhook_secret": "existing-secret"}
+    )
+    _install_ensure_stubs(monkeypatch, db, installed)
+
+    response = _ensure_app({"role": "merchant", "merchant_id": "merch_bc"}).post(
+        "/integrations/bigcommerce/store_bc/webhooks/ensure"
+    )
+
+    assert response.status_code == 200, response.text
+    assert db.updates == []
+    assert installed[0]["secret"] == "existing-secret"
+    assert "existing-secret" not in response.text
+    # A foreign merchant cannot trigger installation for this store.
+    denied = _ensure_app({"role": "merchant", "merchant_id": "merch_other"}).post(
+        "/integrations/bigcommerce/store_bc/webhooks/ensure"
+    )
+    assert denied.status_code == 403
