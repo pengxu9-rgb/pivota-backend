@@ -136,10 +136,23 @@ gcloud run jobs execute catalog-curated-brand-onboard --region us-west1 --projec
   --args="-m,scripts.onboard_curated_brands,--domain,stilacosmetics.com,--category,beauty/makeup,--max-products,2500,--apply"
 ```
 
-A rerun does NOT remove the row already ingested: the lane upserts and never prunes. The $0.01 row
-(`ext:stila-cosmetics-free-travel-stay-all-day-liquid-eye-liner-in-intense-black-tiktok-shop::841db8be`,
-sig in search_raw) has to be withdrawn explicitly — offers → skus → products → seeds for that product_key, then
-`recompute_index_serving_eligibility.py` for its content_key — or it keeps serving at one cent.
+A rerun does NOT remove the row already ingested: the lane upserts and never prunes. The $0.01 row is
+withdrawn by name with `scripts/withdraw_catalog_rows.py` (this branch; reversible suppression on
+products + skus + offers, seeds deactivated, serving recomputed and read back, trust re-upserted — never a
+DELETE). It is in the same image as the floor, so it runs from the same job once the tag is bumped:
+
+```bash
+PK=ext:stila-cosmetics-free-travel-stay-all-day-liquid-eye-liner-in-intense-black-tiktok-shop::841db8be
+gcloud run jobs execute catalog-curated-brand-onboard --region us-west1 --project pivota-prod --wait \
+  --args="scripts/withdraw_catalog_rows.py,--product-key,$PK,--reason,token_price_promo"          # dry-run
+gcloud run jobs execute catalog-curated-brand-onboard --region us-west1 --project pivota-prod --wait \
+  --args="scripts/withdraw_catalog_rows.py,--product-key,$PK,--reason,token_price_promo,--apply"
+```
+
+The report reads the content_key state back from `index_pipeline_state` (dark / serving / unknown) and
+prints "live rows on key": a withdrawn row whose content_key has live siblings leaves the KEY eligible
+(content_key grain, MAX across rows) while the row itself stops being advertised. `--revert --apply` undoes
+only this script's withdrawals.
 
 Step 3 — verify (any prod psql / ops shell):
 

@@ -464,6 +464,38 @@ def _collect_remediate() -> List[Tuple[str, str]]:
     )
 
 
+def _collect_withdraw_catalog_rows() -> List[Tuple[str, str]]:
+    """Named takedown: the jsonb_build_object UPDATE with an integer bind, the
+    CASE-on-bind reverts, and the ANY(:pks) loader — every statement it sends."""
+    import scripts.withdraw_catalog_rows as module
+
+    row = {
+        "product_key": "prod::probe", "content_key": "ck_probe", "title": "probe",
+        "brand": "Probe", "source_system": "catalog_enrichment_agent_v1",
+        "source_domain": "example.com", "suppression_reason": None, "suppressed_at": None,
+        "suppression_metadata": None, "skus": 1, "offers": 1, "seeds": 1,
+        "active_seeds": 1, "rows_on_key": 1,
+    }
+    ours = dict(row, suppressed_at="2026-01-01",
+                suppression_metadata={"script": module.SCRIPT_NAME, "reason": "probe",
+                                      "prior_active_seeds": 1})
+
+    async def _trust(*, db, product_keys, **kw):
+        return len(product_keys)
+
+    async def _go() -> None:
+        await module._load_rows(["prod::probe"])
+        await module._load_ours(None)
+        await module._withdraw([dict(row)], "probe")
+        await module._revert([ours])
+
+    return _drive(
+        module, _go, "withdraw_catalog_rows",
+        recompute_serving_eligibility=_noop_recompute,
+        upsert_catalog_row_trust_many=_trust,
+    )
+
+
 def _collect_seed_content_audit() -> List[Tuple[str, str]]:
     import scripts.run_seed_content_audit as module
 
@@ -693,6 +725,7 @@ def _collect_enrichment_baseline() -> List[Tuple[str, str]]:
 # so a script cannot be registered here and left half-covered in silence.
 _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/remediate_unpublished_crawl_rows.py": _collect_remediate,
+    "scripts/withdraw_catalog_rows.py": _collect_withdraw_catalog_rows,
     "scripts/run_seed_content_audit.py": _collect_seed_content_audit,
     "scripts/source_pdp_content_repair.py": _collect_source_pdp_content_repair,
     "scripts/source_pdp_offer_image_repair.py": _collect_source_pdp_offer_image_repair,
@@ -716,6 +749,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
 # losing them needs a deliberate edit here, with the reason.
 _MIN_STATEMENTS = {
     "scripts/remediate_unpublished_crawl_rows.py": 11,
+    "scripts/withdraw_catalog_rows.py": 12,
     "scripts/run_seed_content_audit.py": 4,
     "scripts/source_pdp_content_repair.py": 3,
     "scripts/source_pdp_offer_image_repair.py": 6,
