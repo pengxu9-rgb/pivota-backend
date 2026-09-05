@@ -1,8 +1,17 @@
 """Admin endpoint to debug agent_usage_logs"""
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from utils.auth import require_admin_or_key
 from db.database import database
 
-router = APIRouter(prefix="/admin/usage", tags=["admin-debug"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# Anyone could read any agent's usage logs and stats by id.
+router = APIRouter(prefix="/admin/usage", tags=["admin-debug"], dependencies=[Depends(require_admin_or_key)])
 
 @router.get("/logs/{agent_id}")
 async def get_agent_usage_logs(agent_id: str, limit: int = 20):
