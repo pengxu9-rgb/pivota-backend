@@ -2367,6 +2367,39 @@ async def test_a_giant_message_code_is_capped_and_flattened(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_many_short_codes_are_capped_as_an_AGGREGATE_not_only_per_code(monkeypatch):
+    """The NINTH escape, and the fix for the eighth is what caused it. That fix capped each
+    `code` at 80 characters; nothing capped HOW MANY codes the join concatenated. Measured on
+    the shipped code: a 251,304-byte reply -- inside the 256KB read cap, so `_read_bounded`
+    never refuses it -- reflected 219,215 characters, WORSE than the 200,103 of the bug the
+    per-element cap was written to remove. The per-element cap read as protection and stopped
+    anyone counting the elements.
+
+    So the payload here is deliberately the shape the previous test is NOT: every individual
+    code is short and well under 80, and only the aggregate is abusive.
+    """
+    codes = [{"code": f"err_{i:05d}_declined"} for i in range(7_000)]
+    inner = _json.dumps({"ucp": {"status": "error"}, "messages": codes})
+    rpc = {"jsonrpc": "2.0", "id": 1,
+           "result": {"isError": True, "content": [{"type": "text", "text": inner}]}}
+
+    # Both preconditions are ASSERTED, because the first draft of this test met neither and
+    # passed against the unfixed build. It sized the reply at 432KB, so `_read_bounded` refused
+    # the read and the short message it asserted on came from the size branch -- the aggregate
+    # join was never reached. A cap test whose fixture the cap rejects proves nothing.
+    assert all(len(c["code"]) < 80 for c in codes), "each code must pass the per-element cap"
+    assert len(_json.dumps(rpc)) < muc._MAX_PROFILE_BYTES, "must be READ, not size-refused"
+
+    _Redirector({APEX: (200, {}, rpc)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    detail = str(excinfo.value)
+    assert len(detail) < 600, f"reflected {len(detail)} chars from {len(codes)} short codes"
+
+
+@pytest.mark.asyncio
 async def test_the_isError_plain_text_is_flattened_not_only_capped(monkeypatch):
     """The sibling branch: `detail[:500]` caps but does not flatten, so a newline inside the first
     500 characters still reached the error body and the log. The comment beside it said this

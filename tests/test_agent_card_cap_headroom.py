@@ -491,3 +491,31 @@ def test_an_ordinary_large_amount_still_converts():
 
     assert to_minor_units("10000000000000.00", "USD") == 1000000000000000
     assert to_minor_units("12.34", "USD") == 1234
+
+
+def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
+    """`_is_quoted_amount` follows `amount`/`value` into merchant-authored JSON, one Python frame
+    per level, against a 1000-frame limit a live request has already eaten into.
+
+    A depth-900 probe returned normally, which read as a refutation and was not one: it undershot.
+    Adding a single frame per level -- less than any real ASGI stack adds -- made the same walk
+    raise RecursionError at depth 498 on a 994-deep reply. RecursionError is a RuntimeError, so
+    nothing on the quote path catches it and it surfaces as a 500 on merchant-controlled input.
+
+    `json.loads` is not the guard. It refuses that body at depth 995, but costs about the same
+    frame per level, so which of the two trips first turns on a handful of frames of residual
+    stack rather than on anything built here.
+
+    The bound answers False, which reads as "the merchant did NOT quote tax" and ADDS headroom.
+    That is the direction `_is_quoted_amount`'s docstring exists to protect: reading an unquoted
+    tax as quoted strips headroom and mints a card that declines when real tax lands.
+    """
+    depth = 994
+    nested = 1
+    for _ in range(depth):
+        nested = {"amount": nested}
+
+    covers = quote_covers({"currency": "USD", "total_amount": 2317, "tax": nested})
+
+    assert covers["tax"] is False
+    assert covers["shipping"] is False

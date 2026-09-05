@@ -227,7 +227,10 @@ _SHIPPING_KEYS = ("fulfillment", "total_shipping", "shipping", "delivery")
 _TAX_KEYS = ("tax", "total_tax", "taxes")
 
 
-def _is_quoted_amount(value: Any) -> bool:
+_MAX_AMOUNT_NESTING = 8
+
+
+def _is_quoted_amount(value: Any, _depth: int = 0) -> bool:
     """Did the merchant name an AMOUNT here, or merely a key?
 
     Mirrors the gateway's `pickMoney`, which this backend copy was looser than: a number, a
@@ -250,9 +253,21 @@ def _is_quoted_amount(value: Any) -> bool:
             return False
         return math.isfinite(parsed)
     if isinstance(value, dict):
+        # BOUNDED. This walks merchant-authored JSON, and `{"amount": {"amount": {...}}}` nests as
+        # deep as the merchant likes: one Python frame per level against a 1000-frame limit that a
+        # live request has already eaten into. Measured -- with a single extra frame per level, a
+        # 994-deep reply raised RecursionError at depth 498. RecursionError is a RuntimeError, so
+        # no `except (TypeError, ValueError)` on this path catches it and it surfaces as a 500.
+        #
+        # The parser is NOT the guard. `json.loads` refuses that same 994-deep body at 995 -- but
+        # it costs about the same one frame per level, so which of the two trips first is decided
+        # by a handful of frames of residual stack, not by construction. A real quote nests
+        # `{"amount": {"amount": 5}}` once or twice; 8 is far past anything a merchant means.
+        if _depth >= _MAX_AMOUNT_NESTING:
+            return False
         for key in ("amount", "value"):
             if key in value:
-                return _is_quoted_amount(value[key])
+                return _is_quoted_amount(value[key], _depth + 1)
     return False
 
 

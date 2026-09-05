@@ -382,7 +382,12 @@ def _unwrap(rpc: Any) -> Dict[str, Any]:
             ucp = parsed.get("ucp")
             if isinstance(ucp, dict) and ucp.get("status") == "success":
                 return parsed
-            codes = ", ".join(message_codes(parsed)) or "unspecified"
+            # `_safe_detail` on the JOIN, not just on each element. Capping per-element at 80
+            # bounds one code; nothing bounded HOW MANY. A 251KB reply (inside the 256KB read
+            # cap) carrying thousands of short codes measured 219,215 characters through this
+            # join -- WORSE than the 200,103 of the uncapped-element bug this replaced, because
+            # the per-element cap read as protection and stopped anyone looking at the count.
+            codes = _safe_detail(", ".join(message_codes(parsed))) or "unspecified"
             raise MerchantUcpError(
                 f"merchant refused the checkout: {codes}", caller_fault=True
             )
@@ -598,8 +603,9 @@ def _validated_endpoint(url: str) -> Optional[str]:
     back" and that understated it. What reaches the API caller is the target's status and
     hostname, its entire JSON-RPC `result` on a 2xx, and merchant-authored refusal text from
     three branches — `error.message`, the `isError` plain text, and `messages[].code` — each
-    flattened and capped by `_safe_detail`. An earlier draft said "verbatim", then a later one
-    corrected only the first branch while the other two were the worse offenders. No credential is attached and the body is our own JSON-RPC — but that
+    flattened and capped by `_safe_detail` at the point it becomes the message. An earlier draft
+    said "verbatim"; a later one corrected only the first branch; a third capped each `code` at 80
+    and left the JOIN unbounded, which this sentence then wrongly described as capped. No credential is attached and the body is our own JSON-RPC — but that
     second half is true because of what is WIRED today, not by construction: `create_checkout`
     and `update_checkout` put caller-supplied buyer and address in that same body, so routing
     either of them makes this sentence false and nothing here re-checks it.
