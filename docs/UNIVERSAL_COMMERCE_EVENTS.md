@@ -45,6 +45,27 @@ still retries the idempotent canonical write for safe rollout backfill.
 embedded Shopify transaction whose kind is `refund` and status is `success`.
 The adapter never treats refund-object creation alone as proof that funds moved.
 
+Delivery is only as good as the subscription. Two install paths exist and both
+must register every topic the adapter maps:
+
+- **OAuth / custom-app installs** register per-merchant webhooks from
+  `_SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS` in `routes/merchant_store_connections.py`
+  (the ops sweep in `routes/ops_shopify_integration_routes.py` mirrors the same
+  list). `refunds/create` joined that list on 2026-09-04; before that only the
+  verify flow registered it, so refunds reached the ledger for some merchants
+  and not others.
+- **App Store installs (App A)** hold no `write_webhooks` scope and receive only
+  the app-owned subscriptions declared in `shopify.app.toml`, delivered to the
+  static `/webhooks/shopify/orders` endpoint. That list now carries
+  `orders/create`, `orders/paid`, `orders/cancelled`, `refunds/create`, and
+  `app/uninstalled`. Editing the file registers nothing by itself: a new app
+  version must be published with `shopify app deploy` before Shopify delivers
+  the added topics.
+
+`tests/test_shopify_refund_webhook_subscription.py` pins both lists and the
+toml against `SUPPORTED_SHOPIFY_TOPICS` in the adapter, so a topic added to the
+adapter without a subscription fails the build.
+
 ## WooCommerce native refund bridge
 
 WooCommerce publishes no refund webhook topic. A refund — partial or full —
