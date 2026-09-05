@@ -10,7 +10,7 @@ import os
 import logging
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ async def run_migration_011(current_user: dict = Depends(get_current_user)):
     - detect_routing_conflicts function
     - routing_conflict_summary view
     """
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     steps = []

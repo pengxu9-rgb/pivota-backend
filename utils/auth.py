@@ -203,7 +203,7 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
     Raises:
         HTTPException: If user is not an admin
     """
-    if current_user.get("role") not in ["admin", "super_admin"]:
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -286,7 +286,7 @@ async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_u
     Alias for require_admin (backward compatibility)
     Require admin or super_admin role
     """
-    if current_user.get("role") not in ["admin", "super_admin"]:
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -314,7 +314,7 @@ async def get_current_employee(current_user: Dict[str, Any] = Depends(get_curren
             detail="Employee access required"
         )
 
-    if current_user.get("role") not in ["super_admin", "admin", "employee", "outsourced"]:
+    if current_user.get("role") not in EMPLOYEE_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Employee access required"
@@ -388,6 +388,23 @@ AGENT_OR_EMPLOYEE_STAFF_ROLES = ["agent"] + EMPLOYEE_STAFF_ROLES
 # owner_email, webhook_url, allowed_merchants, metadata and quotas were one
 # request away on the sibling route.
 AGENT_OR_EMPLOYEE_ROLES = ["agent"] + EMPLOYEE_ROLES
+
+# The same two "own data OR staff" shapes, but WITHOUT `employee` -- for guards
+# that were spelled ["merchant", "admin"] / ("agent", "admin") and so never
+# admitted staff in the first place. They exist because the STAFF variants
+# above are the wrong repair for those: swapping ["merchant", "admin"] for
+# MERCHANT_OR_EMPLOYEE_STAFF_ROLES would newly hand every `employee` another
+# tenant's orders and PSP telemetry. Adding `super_admin` corrects an
+# omission; adding `employee` is a grant, and a grant needs its own review.
+#
+# These spellings are why a second sweep was needed after #2031: that ratchet
+# only flags a container holding BOTH `employee` and `admin`, so a two-element
+# ["merchant", "admin"] slipped through it in 7 places, and ("agent", "admin")
+# in 2 more -- including routes/protocol_routes.py, which refused `super_admin`
+# the protocol list for an agent whose protocols it could enable two routes
+# down.
+MERCHANT_OR_ADMIN_ROLES = ["merchant"] + ADMIN_ROLES
+AGENT_OR_ADMIN_ROLES = ["agent"] + ADMIN_ROLES
 
 # Permission guarding /api/operations/* (merchant & agent onboarding, approval,
 # verification, API-key issuance, audit log). A named permission, not a role
