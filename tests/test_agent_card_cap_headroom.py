@@ -379,3 +379,37 @@ def test_the_totals_type_key_is_normalised(raw):
     a landed `"Fulfillment"` quote into an unlanded one earning full headroom."""
     covers = quote_covers({"totals": [{"type": raw, "amount": 500}]})
     assert covers["shipping"] is True or covers["tax"] is True
+
+
+@pytest.mark.parametrize(
+    "amount, why",
+    [
+        (1e400, "JSON 1e400 parses to inf; int(inf) is OverflowError"),
+        (float("nan"), "comparing a NaN raises InvalidOperation"),
+        ("NaN", "the string form parses to a Decimal NaN"),
+        ("sNaN", "signalling NaN"),
+        ("1e999999999", "finite, so is_finite passes — only the multiply overflows"),
+        ("Infinity", "spelled out"),
+    ],
+)
+def test_a_non_finite_merchant_amount_is_refused_not_an_arithmetic_error(amount, why):
+    """A merchant controls this number. Every one of these raised an ArithmeticError that neither
+    `to_minor_units` nor the route (which catches only MerchantQuoteError) translates — an
+    unhandled 500 at card issuance. Same class as the `int(inf)` fixed for CALLER input in
+    merchant_ucp_checkout.build_line_items; this is the MERCHANT-input half."""
+    from services.agent_card_issuance import to_minor_units
+
+    try:
+        assert to_minor_units(amount, "USD") is None, why
+    except Exception as exc:  # noqa: BLE001
+        import pytest as _pt
+
+        _pt.fail(f"{why}: raised {type(exc).__name__}")
+
+
+def test_a_finite_amount_still_converts():
+    """The positive counterpart — refusing everything would pass the test above."""
+    from services.agent_card_issuance import to_minor_units
+
+    assert to_minor_units("12.34", "USD") == 1234
+    assert to_minor_units("0.005", "USD") == 1, "ROUND_CEILING, because this is a cap"

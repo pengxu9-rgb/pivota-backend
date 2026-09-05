@@ -200,7 +200,7 @@ def _variant_gid(variant_id: str) -> str:
     `gid://shopify/ProductVariant/51086327775448` opens the checkout. Every variant id we hold
     (the offers-lane token ctx, `attached_variant_id`, the storefront .js stamp) is the bare
     number, so the wrap happens HERE, once, rather than at every call site. A value that is
-    already a GID passes through; anything else is left as given — this module pins Shopify's
+    already a GID passes through; anything else is left as given — this module TRIES Shopify's
     `/api/ucp/mcp` path, so a non-numeric, non-GID id is an upstream data problem the merchant
     will name, not something to guess at.
     """
@@ -444,13 +444,17 @@ _IDENTITY_ONLY = {"Accept-Encoding": "identity"}
 class _BoundedBody:
     """A merchant response read under a byte ceiling. Same surface `_call_tool` used before."""
 
-    __slots__ = ("status_code", "headers", "content", "over_limit")
+    __slots__ = ("status_code", "headers", "content", "over_limit", "refused_encoding")
 
-    def __init__(self, status_code, headers, content, over_limit=False):
+    def __init__(self, status_code, headers, content, over_limit=False, refused_encoding=None):
         self.status_code = status_code
         self.headers = headers
         self.content = content
         self.over_limit = over_limit
+        # Distinct from `over_limit`: both refuse the body, but reporting a refused
+        # `Content-Encoding` as "exceeded 262144 bytes" sends an operator hunting a size problem
+        # that does not exist.
+        self.refused_encoding = refused_encoding
 
     def json(self) -> Any:
         return json.loads(self.content)
@@ -493,7 +497,10 @@ async def _read_bounded(
     async with client.stream(method, url, **kwargs) as resp:
         encoding = str(resp.headers.get("content-encoding") or "").strip().lower()
         if encoding not in ("", "identity"):
-            return _BoundedBody(resp.status_code, resp.headers, b"", over_limit=True)
+            return _BoundedBody(
+                resp.status_code, resp.headers, b"", over_limit=True,
+                refused_encoding=encoding,
+            )
         chunks: List[bytes] = []
         total = 0
         async for chunk in resp.aiter_raw():
@@ -582,8 +589,8 @@ def _validated_endpoint(url: str) -> Optional[str]:
 
     And it is a CONTENT oracle, not a status one — the earlier wording said "read the status
     back" and that understated it. What reaches the API caller is the target's status and
-    hostname, its entire JSON-RPC `result` on a 2xx, and its `error.message` spliced verbatim
-    into our error string. No credential is attached and the body is our own JSON-RPC — but that
+    hostname, its entire JSON-RPC `result` on a 2xx, and its `error.message` — flattened and
+    capped at 500 by `_safe_detail`, not verbatim as an earlier draft of this note said. No credential is attached and the body is our own JSON-RPC — but that
     second half is true because of what is WIRED today, not by construction: `create_checkout`
     and `update_checkout` put caller-supplied buyer and address in that same body, so routing
     either of them makes this sentence false and nothing here re-checks it.
@@ -690,9 +697,11 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
         # hazard anyway — see the RecursionError note on the except below.
         if resp.over_limit:
             logger.info(
-                "merchant-ucp discovery profile exceeded %d bytes domain=%s",
-                _MAX_PROFILE_BYTES,
+                "merchant-ucp discovery profile refused domain=%s reason=%s",
                 domain,
+                f"content-encoding={resp.refused_encoding}"
+                if resp.refused_encoding
+                else f"exceeded {_MAX_PROFILE_BYTES} bytes",
             )
             return None
         # INSIDE the try, deliberately. `resp.json()` raises ValueError on a non-JSON body, and
@@ -854,6 +863,11 @@ async def _call_tool(
             type(err).__name__,
         )
         raise MerchantUcpError("merchant endpoint unreachable") from err
+    if resp.refused_encoding:
+        raise MerchantUcpError(
+            f"merchant response used Content-Encoding "
+            f"{_safe_detail(resp.refused_encoding, 40)!r} from {fetched}; only identity is read"
+        )
     if resp.over_limit:
         raise MerchantUcpError(
             f"merchant response exceeded {_MAX_PROFILE_BYTES} bytes from {fetched}"
@@ -932,7 +946,11 @@ async def update_checkout(
         # so the caller has to carry them over from the checkout it created. Probed live
         # 2026-09-02: a method without them is rejected ("missing required properties:
         # line_item_ids"), and before the isError fix above that read as "no checkout payload".
-        ids = [str(i).strip() for i in (line_item_ids or []) if str(i or "").strip()]
+        # The last `or []` of the pattern. `update_checkout(..., line_item_ids=5)` is
+        # `for i in 5`. Caller input with no production caller, but the round-five commit
+        # said the pattern was finished and this one outlived the claim.
+        raw_ids = line_item_ids if isinstance(line_item_ids, list) else []
+        ids = [str(i).strip() for i in raw_ids if str(i or "").strip()]
         if not ids:
             raise MerchantUcpError(
                 "pricing a destination needs the checkout's line_item_ids "

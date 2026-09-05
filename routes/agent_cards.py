@@ -161,7 +161,12 @@ async def issue_card(
             # tell" is a decline waiting to happen. `ceiling` vs `flat_plus_bps` is the signal for
             # whether the ceiling ever engages at real order sizes — the question #1923 left open
             # about its own defaults, and the one this record exists to answer.
-            "quote_snapshot": json.dumps(_snapshot_with_headroom(quote, cap)),
+            # allow_nan=False: a merchant `tax: NaN` beside a valid total survives quoting, and
+            # json.dumps would emit a bare `NaN` that the CAST(... AS jsonb) then rejects at
+            # insert time — a 500 after the quote succeeded.
+            "quote_snapshot": json.dumps(
+                _snapshot_with_headroom(quote, cap), allow_nan=False
+            ),
             "issuer": issuer.name,
             "single_use": True,
             "expires_at": expires_at,

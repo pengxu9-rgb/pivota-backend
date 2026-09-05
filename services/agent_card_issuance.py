@@ -141,6 +141,14 @@ def to_minor_units(amount: Any, currency: str) -> Optional[int]:
             d = Decimal(s)
         except Exception:
             return None
+        # BEFORE `d <= 0`, because comparing a NaN raises InvalidOperation rather than answering.
+        # A merchant `amount` of 1e400 / NaN / "sNaN" / "1e999999999" reaches here as request data
+        # via resolve_merchant_quote, and each raises an ArithmeticError that neither this
+        # function nor routes/agent_cards.py (which catches only MerchantQuoteError) translates —
+        # an unhandled 500. Same class as the `int(inf)` fixed for CALLER input in
+        # merchant_ucp_checkout.build_line_items; this is the MERCHANT-input half, one hop down.
+        if not d.is_finite():
+            return None
         if d <= 0:
             return None
         exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
@@ -149,8 +157,13 @@ def to_minor_units(amount: Any, currency: str) -> Optional[int]:
         # rounding up mints at most one extra minor unit of headroom. For a cap, up is safe.
         from decimal import ROUND_CEILING
 
-        minor = (d * (10 ** exponent)).to_integral_value(rounding=ROUND_CEILING)
-        value = int(minor)
+        # `is_finite` is not enough on its own: Decimal("1e999999999") IS finite, and only the
+        # multiply below raises decimal.Overflow. Guard the arithmetic too.
+        try:
+            minor = (d * (10 ** exponent)).to_integral_value(rounding=ROUND_CEILING)
+            value = int(minor)
+        except ArithmeticError:
+            return None
         return value if 0 < value <= _MAX_CAP_MINOR else None
     return None
 
