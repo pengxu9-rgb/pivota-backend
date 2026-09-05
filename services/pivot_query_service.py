@@ -1223,9 +1223,38 @@ async def _fetch_canonical_search_rows(
         # query ("show me Murad products") has no category prefix and still admits the whole brand,
         # which is exactly what that query asked for.
         if category_where:
+            # A newly synced SIG can have an offer before taxonomy enrichment.
+            # Missing taxonomy is not evidence of a category mismatch. Admit
+            # such rows only with BOTH the brand identity above and a literal,
+            # whole-word category phrase in product evidence. Do not override
+            # an existing category path or admit the brand's entire inventory.
+            category_evidence = []
+            query_words = re.findall(r"[a-z0-9]+", lowered)[:40]
+            category_phrases = []
+            for width in range(1, 5):
+                for start in range(len(query_words) - width + 1):
+                    phrase = " ".join(query_words[start:start + width])
+                    if any(f" {known} " in f" {phrase} " for known in category_phrases):
+                        continue
+                    if category_path_prefix_for_query(phrase) == category_prefix:
+                        category_phrases.append(phrase)
+            for index, phrase in enumerate(category_phrases[:8]):
+                param_name = f"brand_category_evidence_{index}"
+                params[param_name] = f"% {phrase} %"
+                category_evidence.extend(
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                    for field in ("p.title", "p.product_type", "s.title")
+                )
+            missing_taxonomy = ""
+            if category_evidence:
+                missing_taxonomy = (
+                    " OR (NULLIF(TRIM(p.category_path), '') IS NULL AND ("
+                    + " OR ".join(category_evidence) + "))"
+                )
             admit_predicate = (
                 "(" + admit_predicate + ")"
-                + " AND (p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix)"
+                + " AND (p.category_path LIKE :category_path_prefix"
+                + missing_taxonomy + ")"
             )
         brand_anchor_where = (
             "\n                OR (" + admit_predicate + ")\n"
