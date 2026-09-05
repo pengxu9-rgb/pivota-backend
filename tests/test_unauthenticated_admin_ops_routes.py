@@ -1,4 +1,4 @@
-"""Eight /admin/* routers shipped with NO authentication of any kind.
+"""Twelve /admin/* routers shipped with NO authentication of any kind.
 
 THE DEFECT, live on prod through ad02087c5. Found while reviewing the fix for
 the GET /agents/ roster leak (PR #2048): that PR closes an AUTHENTICATED read
@@ -63,8 +63,15 @@ class _HandlerReached(Exception):
     """Raised by the tripwire in place of running the statement."""
 
 
+# Every accessor a handler in these routers could reach the database through.
+# Named once so the fixture and the self-test that proves it works cannot drift:
+# a self-test that probed only one of these let the tuple be narrowed back to
+# nothing while staying green.
+_TRAPPED_ACCESSORS = ("execute", "execute_many", "fetch_all", "fetch_one", "fetch_val")
+
+
 @pytest.fixture
-def db_tripwire(monkeypatch):
+def db_tripwire():
     """Replace every database accessor with a raise, and record the calls.
 
     Two jobs, and the second is why this is not optional.
@@ -72,7 +79,12 @@ def db_tripwire(monkeypatch):
     It makes the refusals below say what they mean. `assert status in (401,
     403)` is satisfied by a handler that RAN and then failed a later check;
     what this file actually claims is that the guard sits in FRONT of the
-    handler. Recording the calls turns that into an assertion.
+    handler. Recording the calls turns that into an assertion. Note what that
+    is worth TODAY: no handler in these twelve modules returns 401/403 itself,
+    so with the guards stripped every failure comes from the status assertion
+    and `assert not db_tripwire` never fires. It is there for the handler that
+    later does return a 403 of its own -- the interception below is the part
+    carrying weight now.
 
     And it bounds the blast radius of its own failure. UNAUTHENTICATED_ROUTES
     contains `POST /admin/fix/agents-table`, whose first statement is
@@ -99,11 +111,23 @@ def db_tripwire(monkeypatch):
 
         return _call
 
-    for accessor in ("execute", "execute_many", "fetch_all", "fetch_one", "fetch_val"):
-        if hasattr(db_module.database, accessor):
-            monkeypatch.setattr(db_module.database, accessor, _trap(accessor))
+    # --- Finding 2 from review: monkeypatch.setattr on an INSTANCE undoes with
+    # setattr, not delattr, so every accessor would be left as a permanent
+    # instance attribute shadowing the class. Harmless for direct calls, but it
+    # would silently defeat a future test that patches
+    # databases.Database.<accessor> at the CLASS level. Restore by hand.
+    had = {a: (a in vars(db_module.database)) for a in _TRAPPED_ACCESSORS}
+    originals = {a: getattr(db_module.database, a) for a in _TRAPPED_ACCESSORS}
+    for accessor in _TRAPPED_ACCESSORS:
+        setattr(db_module.database, accessor, _trap(accessor))
 
-    return calls
+    yield calls
+
+    for accessor in _TRAPPED_ACCESSORS:
+        if had[accessor]:
+            setattr(db_module.database, accessor, originals[accessor])
+        else:
+            db_module.database.__dict__.pop(accessor, None)
 
 
 # (method, path, json body or None). Paths are the real ones; the bodies are
@@ -251,10 +275,28 @@ async def test_the_tripwire_lands_on_the_object_the_routes_use(db_tripwire):
     )
     assert checked, "no guarded module exposes `database` -- identity check was vacuous"
 
-    with pytest.raises(_HandlerReached):
-        await db_module.database.fetch_all("SELECT 1")
+    # The requirement is stated HERE as a literal, deliberately duplicating
+    # _TRAPPED_ACCESSORS rather than iterating it. Iterating the fixture's own
+    # tuple made this test narrow in lockstep with the thing it polices:
+    # dropping `execute` from the tuple left it green, and `execute` carries
+    # every DROP/ALTER/DELETE in this route set. A test whose expectation is
+    # read out of the code under test can only ever agree with it.
+    must_trap = {"execute", "execute_many", "fetch_all", "fetch_one", "fetch_val"}
+    assert must_trap <= set(_TRAPPED_ACCESSORS), (
+        f"the tripwire stopped trapping {sorted(must_trap - set(_TRAPPED_ACCESSORS))} "
+        f"-- a handler reaching the database through those would leave "
+        f"db_tripwire empty, which every refusal test reads as 'never ran'"
+    )
 
-    assert db_tripwire, "the patched accessor ran but recorded nothing"
+    for accessor in sorted(must_trap):
+        before = len(db_tripwire)
+        with pytest.raises(_HandlerReached):
+            await getattr(db_module.database, accessor)("SELECT 1")
+        assert len(db_tripwire) == before + 1, (
+            f"database.{accessor} is not trapped -- a handler reaching the DB "
+            f"through it would leave db_tripwire empty, which every refusal "
+            f"test above reads as 'the handler never ran'"
+        )
 
 
 def test_the_identity_check_can_actually_fail():
@@ -363,7 +405,7 @@ def test_every_route_on_these_routers_carries_the_guard(module_name):
 # ---------------------------------------------------------------------------
 
 
-def test_an_admin_credential_still_reaches_these_routes(client):
+def test_an_admin_credential_still_reaches_these_routes(client, db_tripwire):
     """The counterpart the three negative tests above need.
 
     Without it, every assertion in this file stays green if these routes later
@@ -384,14 +426,22 @@ def test_an_admin_credential_still_reaches_these_routes(client):
         token = create_access_token(
             {"sub": f"u-{role}", "email": f"{role}@example.com", "role": role}
         )
+        db_tripwire.clear()
         resp = client.get(path, headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code not in (401, 403), (
             f"{role} was refused its own admin route: {resp.status_code} "
             f"{resp.text[:300]}"
         )
+        # `not in (401, 403)` on its own is satisfied by a 500, so it proves
+        # only that the guard did not refuse -- not that it let anything
+        # through. The tripwire settles it: the handler ran far enough to query.
+        assert db_tripwire, (
+            f"{role} was not refused, but the handler never reached the "
+            f"database either -- this does not show the guard admitted anyone"
+        )
 
 
-def test_a_configured_admin_key_is_admitted_without_a_bearer_header(client, monkeypatch):
+def test_a_configured_admin_key_is_admitted_without_a_bearer_header(client, monkeypatch, db_tripwire):
     """The header-only path, pinned because it is the one a guard built on a
     non-optional HTTPBearer would silently break."""
     monkeypatch.setenv("ADMIN_API_KEY", "the-configured-key")
@@ -404,6 +454,10 @@ def test_a_configured_admin_key_is_admitted_without_a_bearer_header(client, monk
     assert resp.status_code not in (401, 403), (
         f"a correct X-ADMIN-KEY with no Authorization header was refused: "
         f"{resp.status_code} {resp.text[:300]}"
+    )
+    assert db_tripwire, (
+        "the key was not refused, but the handler never reached the database "
+        "-- this does not show the header-only path admits anyone"
     )
 
 
