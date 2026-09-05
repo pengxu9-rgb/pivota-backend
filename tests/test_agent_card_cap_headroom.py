@@ -736,3 +736,89 @@ def test_a_deep_non_dict_snapshot_is_a_502_not_an_uncaught_recursion():
 
     assert excinfo.value.status_code == 502
     assert "nested beyond the readable depth" in str(excinfo.value.detail)
+
+
+@pytest.fixture
+def pivota_log(caplog):
+    """Capture the `pivota` logger, which does NOT propagate.
+
+    `utils.logger` sets `propagate = False` and attaches its own stdout handler, so caplog --
+    which installs a handler on the ROOT logger -- sees none of these records. A test written the
+    usual way collects an empty list and every `assert not any(...)` in it passes for free. The
+    first draft of these tests did exactly that and failed loudly only because they also assert a
+    POSITIVE line; attach the handler to the real logger instead.
+    """
+    import logging
+
+    lg = logging.getLogger("pivota")
+    lg.addHandler(caplog.handler)
+    prev = lg.level
+    lg.setLevel(logging.WARNING)
+    try:
+        yield caplog
+    finally:
+        lg.removeHandler(caplog.handler)
+        lg.setLevel(prev)
+
+
+def _pivota_warnings(log):
+    return [r.getMessage() for r in log.records if r.levelname == "WARNING"]
+
+
+def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(pivota_log):
+    """The quiet failure here is NOT a status code -- it is a live card with no provenance.
+
+    A non-dict `quote_snapshot` does not fail the request. Measured: it renders to
+    `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the mint returns 200 with a
+    real spending cap whose audit row no longer records which quote justified it. Every cause of
+    that branch is ours -- a stale cached shape, a hand-built dict, a refactor -- so nothing
+    external will ever report it, and without this line it reaches production silently.
+
+    The review that asked for this framed it as a 502 going out under EXTERNAL_SERVICE_ERROR;
+    that is true only of the DEEP non-dict case, which is the rarer one.
+    """
+    from routes.agent_cards import _dump_snapshot
+
+    out = _dump_snapshot({"quote_snapshot": None}, {"max_minor": 7500})
+
+    assert _json.loads(out)["unexpected_snapshot_shape"] == "None", "the mint SUCCEEDS"
+    assert any("was not a dict" in m and "NoneType" in m for m in _pivota_warnings(pivota_log))
+    # The VALUE must never reach the sink -- `base` is unbounded and partly merchant-derived.
+    assert not any("unexpected_snapshot_shape\": \"" in m for m in _pivota_warnings(pivota_log))
+
+
+def test_a_normal_snapshot_logs_nothing(pivota_log):
+    """The negative counterpart: a warning on every healthy mint is a warning nobody reads."""
+    from routes.agent_cards import _dump_snapshot
+
+    _dump_snapshot({"quote_snapshot": {"totals": [], "currency": "USD"}}, {"max_minor": 7500})
+
+    assert _pivota_warnings(pivota_log) == []
+
+
+def test_the_two_identical_502s_are_distinguishable_in_the_LOG(pivota_log):
+    """Both depth guards raise byte-identical detail, so the response cannot say which fired --
+    but they mean different things: the snapshot builder's own `repr()` recursing, versus the
+    encoder walking merchant `totals`. The log is the only place that distinction survives."""
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep_list = []
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep_list = [deep_list]
+    deep_dict = 1
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep_dict = {"amount": deep_dict}
+
+    with pytest.raises(HTTPException):
+        _dump_snapshot({"quote_snapshot": deep_list}, {"max_minor": 7500})
+    builder = _pivota_warnings(pivota_log)
+    pivota_log.clear()
+    with pytest.raises(HTTPException):
+        _dump_snapshot({"quote_snapshot": {"totals": deep_dict}}, {"max_minor": 7500})
+    encoder = _pivota_warnings(pivota_log)
+
+    assert any("snapshot builder recursed" in m for m in builder)
+    assert any("nested beyond the encoder" in m for m in encoder)
+    assert not any("snapshot builder recursed" in m for m in encoder), "must not be the same line"
