@@ -123,6 +123,24 @@ gloss $29 (the #19 successor); "Stila Cosmetics Stay All Day® Liquid Lipstick" 
 (merchant `merch_obs_e65708e6dc609674`). Hygiene: a "Free Travel … (TikTok Shop)" promo row at **$0.01**
 ingested and serves — the feed's unpriced-gift filter stops at $0, not at token prices.
 
+**Price floor added (this branch):** `curated_brand_feed.MIN_SELLABLE_PRICE = 1.0` — a variant under $1.00 is
+not an offer. Measured across the four Meitu feeds (2,108 products) it touches exactly the one $0.01 promo row.
+Local Stila dry-run with the floor: 125 products → 123 PDPs (was 124). Rerun sequence for Stila once merged:
+
+```bash
+# 1. after merge, point the job at the backend tag that carries the floor + base-listings flag
+gcloud run jobs update catalog-curated-brand-onboard --region us-west1 --project pivota-prod \
+  --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:<new-tag> --quiet
+# 2. re-ingest (upsert; re-runs are idempotent on product_key)
+gcloud run jobs execute catalog-curated-brand-onboard --region us-west1 --project pivota-prod --wait \
+  --args="-m,scripts.onboard_curated_brands,--domain,stilacosmetics.com,--category,beauty/makeup,--max-products,2500,--apply"
+```
+
+A rerun does NOT remove the row already ingested: the lane upserts and never prunes. The $0.01 row
+(`ext:stila-cosmetics-free-travel-stay-all-day-liquid-eye-liner-in-intense-black-tiktok-shop::841db8be`,
+sig in search_raw) has to be withdrawn explicitly — offers → skus → products → seeds for that product_key, then
+`recompute_index_serving_eligibility.py` for its content_key — or it keeps serving at one cent.
+
 Step 3 — verify (any prod psql / ops shell):
 
 ```sql

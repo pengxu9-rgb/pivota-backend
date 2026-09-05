@@ -112,6 +112,26 @@ def test_drops_unpriced_gift_items():
     assert shopify_product_to_record(_product(variants=[]), domain="x.com", category_path="x") is None
 
 
+def test_drops_token_priced_promo_items():
+    # stilacosmetics.com "Free Travel … (TikTok Shop)" at $0.01 cleared the old `> 0`
+    # test and served as a canonical anchor. A token price is a promo, not an offer.
+    assert shopify_product_to_record(_product(variants=[{"price": "0.01"}]), domain="x.com", category_path="x") is None
+    assert shopify_product_to_record(_product(variants=[{"price": "0.99"}]), domain="x.com", category_path="x") is None
+    # Exactly the floor is sellable.
+    rec = shopify_product_to_record(_product(variants=[{"price": "1.00"}]), domain="x.com", category_path="x")
+    assert rec is not None and rec["offers"][0]["price"] == 1.0
+
+
+def test_price_floor_skips_to_the_first_real_variant():
+    rec = shopify_product_to_record(
+        _product(variants=[{"price": "0.01", "barcode": "PROMO"}, {"price": "15.00", "barcode": "8809416470016"}]),
+        domain="x.com",
+        category_path="x",
+    )
+    assert rec["offers"][0]["price"] == 15.0
+    assert rec["pdp"]["barcode"] == "8809416470016"
+
+
 def test_picks_first_positive_priced_variant():
     # First variant unpriced, second priced → keep the product, use the priced variant.
     rec = shopify_product_to_record(

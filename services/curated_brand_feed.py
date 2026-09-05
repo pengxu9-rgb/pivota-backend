@@ -32,6 +32,11 @@ logger = logging.getLogger("curated_brand_feed")
 
 _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
+# Lowest variant price (in the store's currency) that counts as a real offer. Across
+# the four Meitu-US feeds measured 2026-09-05 (2,108 products) exactly one variant sat
+# in (0, 1.00): the $0.01 promo above. Nothing legitimate in a beauty D2C feed is
+# priced under a dollar; a floor this low cannot drop a real product.
+MIN_SELLABLE_PRICE = 1.0
 
 
 def _clean_domain(domain: str) -> str:
@@ -514,6 +519,7 @@ def shopify_product_to_record(
     domain: str,
     category_path: str,
     brand_override: Optional[str] = None,
+    min_price: float = MIN_SELLABLE_PRICE,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -531,15 +537,19 @@ def shopify_product_to_record(
         return None
     variants = product.get("variants")
     variants = variants if isinstance(variants, list) else []
-    # Pick the first sellable (positive-price) variant. Gift-with-purchase and other
-    # $0/unpriced items have no purchasable offer — drop the product entirely so it
-    # never enters the commerce index (these were landing as junk PDPs/seeds, the
-    # offers_skipped noise seen onboarding kosas).
+    # Pick the first sellable variant — priced at or above MIN_SELLABLE_PRICE.
+    # Gift-with-purchase and other $0/unpriced items have no purchasable offer —
+    # drop the product entirely so it never enters the commerce index (these were
+    # landing as junk PDPs/seeds, the offers_skipped noise seen onboarding kosas).
+    # The floor exists because "positive" was not enough: stilacosmetics.com lists a
+    # "Free Travel … (TikTok Shop)" promo at $0.01, which cleared `p > 0`, ingested
+    # as a canonical anchor and served (measured 2026-09-05). A token price is a
+    # promo mechanic, not an offer.
     variant = None
     price = None
     for v in variants:
         p = _to_float((v or {}).get("price"))
-        if p is not None and p > 0:
+        if p is not None and p >= min_price:
             variant, price = v, p
             break
     if variant is None:
