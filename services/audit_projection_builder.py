@@ -468,6 +468,69 @@ def _stage_is_measurable(stage: str) -> bool:
     )
 
 
+_HEADLINE_FINDING = "brand_headline_distribution"
+
+
+def _headline_distribution(
+    findings: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The headline, as a distribution the report actually measured.
+
+    Reads the `brand_headline_distribution` finding the evidence builder copies
+    verbatim out of the rollup, so the headline and the stage detail cannot
+    disagree — they were read from the same rows in the same pass.
+
+    WHAT IT DELIBERATELY DOES NOT DO. It computes no average across dimensions
+    and emits no single number: collapsing bands into one figure is the stage
+    score Rule 1 removes, and the run that prompted this showed why — identity
+    16 and citation 48 average to something that describes neither.
+
+    A run with no such finding gets `unavailable_reason`, NOT an empty
+    distribution that reads like a clean sheet. That confusion is the whole
+    reason this file was touched.
+    """
+    payload: Dict[str, Any] = {}
+    for finding in findings or []:
+        if str((finding or {}).get("finding_type") or "").strip().lower() == (
+            _HEADLINE_FINDING
+        ):
+            payload = (finding.get("payload") or {})
+            break
+
+    dims = payload.get("dimensions")
+    if not isinstance(dims, list) or not dims:
+        return {
+            "kind": "distribution",
+            "dimensions": [],
+            "prompt_split": None,
+            "unavailable_reason": (
+                "This run produced no per-dimension distribution. That is a "
+                "missing measurement, not a score of zero and not a pass."
+            ),
+        }
+
+    split = payload.get("prompt_split")
+    out: Dict[str, Any] = {
+        "kind": "distribution",
+        "dimensions": dims,
+        "dimensions_considered": payload.get("dimensions_considered"),
+        "skus_audited": payload.get("skus_audited"),
+        "prompt_split": split,
+        "note": (
+            "Per-dimension distribution with n. Not a composite score: "
+            "averaging these describes no dimension."
+        ),
+    }
+    if split is None:
+        # Absent must read as absent. Without this the caller sees a null and
+        # is free to assume branded and unbranded performed alike.
+        out["prompt_split_unavailable_reason"] = (
+            "This report did not carry the intent-axis citation counts the "
+            "branded/unbranded split is computed from. Not parity — unknown."
+        )
+    return out
+
+
 def build_revenue_recovery_projection(
     *,
     evidence: List[Dict[str, Any]],
@@ -544,7 +607,13 @@ def build_revenue_recovery_projection(
         "audience": AUDIENCE_REVENUE_RECOVERY,
         "builder_version": _BUILDER_VERSION,
         "audit_run_id": row.get("run_id"),
-        "headline_score": row.get("visibility_score_avg"),
+        # NOT a headline score. `visibility_score_avg` sat here as a bare
+        # integer with no n and no interval, which Rule 1 forbids outright — "no
+        # stage scores. Distributions only. A 'CAPTURE INTENT 41%' implies a
+        # formula. Ours moves 5.6x on denominator choice." The §6 definition of
+        # done asks this surface for a split "with `n` beside it", so a
+        # distribution carrying its own counts is what belongs here.
+        "headline": _headline_distribution(findings),
         "stages": [stages[name] for name in _STAGES],
     }
 

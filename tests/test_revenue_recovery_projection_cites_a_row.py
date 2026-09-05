@@ -180,3 +180,181 @@ def test_a_stage_is_never_unverified_while_carrying_findings(real_report):
                 f"{stage['stage']} says nothing can be measured while citing "
                 f"{len(stage['findings'])} finding(s)"
             )
+
+
+# ---------------------------------------------------------------------
+# The headline. `headline_score` was `visibility_score_avg` — a bare integer
+# with no n and no interval. Rule 1 forbids exactly that: "no stage scores.
+# Distributions only. A 'CAPTURE INTENT 41%' implies a formula. Ours moves
+# 5.6x on denominator choice."
+# ---------------------------------------------------------------------
+
+
+def test_the_revenue_recovery_surface_reports_no_bare_score(real_report):
+    """The regression. A single integer here is the defect, whatever it is
+    named — so this asserts the ABSENCE of the shape, not of one key."""
+    out = _project(extract_findings(real_report))
+
+    assert "headline_score" not in out
+    for key, value in out.items():
+        if key in ("headline", "stages", "audit_run_id", "audience",
+                   "builder_version"):
+            continue
+        assert not isinstance(value, (int, float)) or isinstance(value, bool), (
+            f"{key} is a bare number on the merchant headline surface"
+        )
+    assert out["headline"]["kind"] == "distribution"
+
+
+def test_every_headline_number_travels_with_its_n(real_report):
+    """A band over 3 SKUs is not a band over 300. Rule 2."""
+    dims = _project(extract_findings(real_report))["headline"]["dimensions"]
+
+    assert dims, "the real report banded four dimensions; the headline shows none"
+    for dim in dims:
+        assert dim["n"] is not None, f"{dim['dimension']} carries a band with no n"
+        assert dim["median"] is not None
+        # The interval, not just the point. A median with no spread is the
+        # single number Rule 1 removes wearing a different name.
+        assert dim["p25"] is not None and dim["p75"] is not None
+
+
+def test_every_number_in_the_headline_is_traceable_to_one_row(real_report):
+    """No composite. identity 16 and citation 48 average to something that
+    describes neither, so no key here may hold a cross-dimension figure.
+
+    Asserted structurally rather than by value: `round(23.25)` collides with
+    content_richness's own median, so "the mean does not appear" is not a test
+    a composite would fail. "Every number sits inside a dimension row or a
+    split bucket" is — a new `headline_score` breaks it whatever it holds.
+    """
+    head = _project(extract_findings(real_report))["headline"]
+
+    # Counts of what was measured, not measurements. Named so that adding a
+    # third scalar is a decision someone has to make here.
+    allowed_scalars = {"dimensions_considered", "skus_audited"}
+    stray: list[str] = []
+
+    def walk(node, path):
+        if isinstance(node, bool):
+            return
+        if isinstance(node, (int, float)):
+            head_key = path[0] if path else ""
+            if head_key in ("dimensions", "prompt_split"):
+                return
+            if head_key in allowed_scalars and len(path) == 1:
+                return
+            stray.append(".".join(str(p) for p in path) + f" = {node}")
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, path + [k])
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, path + [i])
+
+    walk(head, [])
+    assert not stray, f"headline carries untraceable number(s): {stray}"
+
+
+def test_the_headline_shows_dimensions_that_passed_too(real_report):
+    """The denominator. Findings are emitted only for blocked/partial, so a
+    headline built from findings alone could not tell four-of-four from
+    four-of-nine — it would show the failures and imply they were all of it."""
+    report = json.loads(json.dumps(real_report))
+    dims = report["brand_rollup"]["dimensions"]
+    passing_key = "content_richness"
+    dims[passing_key]["band"] = "strong"
+
+    findings = extract_findings(report)
+    out = build_revenue_recovery_projection(
+        evidence=[], findings=findings, actions=[],
+        audit_run_row={"run_id": "run-1"},
+    )
+
+    # It emits no problem finding — the merchant is not told to fix it.
+    assert not any(
+        f["finding_type"] == "content_too_thin_to_cite" for f in findings
+    )
+    for stage in out["stages"]:
+        assert all(
+            f["type"] != "content_too_thin_to_cite" for f in stage["findings"]
+        )
+    # But it still counts, and it still shows.
+    head = out["headline"]
+    shown = {d["dimension"]: d for d in head["dimensions"]}
+    assert passing_key in shown, "a passing dimension vanished from the headline"
+    assert shown[passing_key]["band"] == "strong"
+    assert head["dimensions_considered"] == len(dims)
+
+
+# ---------------------------------------------------------------------
+# The branded/unbranded split — §6's definition of done for this surface.
+# ---------------------------------------------------------------------
+
+
+def test_the_branded_unbranded_split_is_present_with_n(real_report):
+    split = _project(extract_findings(real_report))["headline"]["prompt_split"]
+
+    assert split is not None, "the §6 split is missing from a report that has it"
+    for side in ("branded", "unbranded"):
+        bucket = split[side]
+        assert bucket["answered"], f"{side} rate carries no denominator"
+        assert bucket["cited"] <= bucket["answered"]
+        assert bucket["rate"] == round(
+            bucket["cited"] / bucket["answered"], 3,
+        )
+    # Comparing across a mix version change is invalid; the version must be
+    # legible to whoever renders or diffs this.
+    assert split["prompt_mix_version"] is not None
+
+
+def test_the_split_classifies_by_the_reports_own_branded_axes(real_report):
+    """Not by a list of our own. The report says which axes are branded; a
+    hard-coded copy here would drift the first time #1521 is revised."""
+    mix = real_report["brand_rollup"]["prompt_mix"]
+    split = _project(extract_findings(real_report))["headline"]["prompt_split"]
+
+    assert set(split["branded"]["axes"]) == set(mix["branded_axes"])
+    assert set(split["unbranded"]["axes"]) == (
+        set(real_report["brand_rollup"]["citation_by_intent"])
+        - set(mix["branded_axes"])
+    )
+    assert split["unclassified_axes"] == []
+    assert split["branded_axes_without_citation_data"] == []
+
+
+def test_an_axis_the_report_never_scored_is_named_not_dropped(real_report):
+    """A branded axis with no citation row would silently shrink the branded
+    denominator and make the split look better than it is."""
+    report = json.loads(json.dumps(real_report))
+    branded = report["brand_rollup"]["prompt_mix"]["branded_axes"]
+    report["brand_rollup"]["citation_by_intent"].pop(branded[0])
+
+    split = _project(extract_findings(report))["headline"]["prompt_split"]
+
+    assert branded[0] in split["branded_axes_without_citation_data"]
+
+
+def test_a_missing_split_reads_as_unknown_not_as_parity(real_report):
+    report = json.loads(json.dumps(real_report))
+    report["brand_rollup"].pop("citation_by_intent")
+
+    head = _project(extract_findings(report))["headline"]
+
+    assert head["prompt_split"] is None
+    assert "unknown" in head["prompt_split_unavailable_reason"].lower()
+    # It must still show the dimensions it DID measure.
+    assert head["dimensions"]
+
+
+def test_a_run_with_no_distribution_says_so_rather_than_showing_a_clean_sheet():
+    """An empty dimension list rendered as a headline reads as a clean sheet.
+    That is the same false all-clear this file exists for, moved one level up."""
+    head = build_revenue_recovery_projection(
+        evidence=[], findings=[], actions=[], audit_run_row={"run_id": "r"},
+    )["headline"]
+
+    assert head["dimensions"] == []
+    reason = head["unavailable_reason"].lower()
+    assert "not a score of zero" in reason and "not a pass" in reason

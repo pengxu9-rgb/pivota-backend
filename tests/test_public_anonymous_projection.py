@@ -401,16 +401,23 @@ def test_the_locked_counts_count_the_right_collections():
     assert out["locked"] == {"findings": 4, "actions": 7}
 
 
-def test_revenue_recovery_reports_the_visibility_score_not_another_one():
-    """headline_score was asserted by nothing, so pointing it at
-    attribution_score_avg survived."""
+def test_revenue_recovery_reports_no_score_from_the_run_row_at_all():
+    """This used to assert `headline_score == visibility_score_avg`, guarding
+    a swap with attribution_score_avg. The field itself was the defect: a bare
+    integer with no n and no interval is the stage score Rule 1 removes. Now
+    NEITHER run-row score may reach this surface — the headline is built from
+    the distribution the findings carry."""
     out = apb.build_projection(
         audience=ae.AUDIENCE_REVENUE_RECOVERY, evidence=[], findings=[],
         actions=[],
         audit_run_row={"run_id": "r-1", "visibility_score_avg": 40,
                        "attribution_score_avg": 91},
     )
-    assert out["headline_score"] == 40
+    assert "headline_score" not in out
+    assert 40 not in out.values() and 91 not in out.values()
+    # And with nothing measured it must say so, not show an empty clean sheet.
+    assert out["headline"]["dimensions"] == []
+    assert out["headline"]["unavailable_reason"]
 
 
 # ---- what gets PERSISTED ----------------------------------------------------

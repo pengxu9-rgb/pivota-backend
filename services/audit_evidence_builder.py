@@ -371,6 +371,138 @@ _ROLLUP_DIMENSION_FINDING = {
 }
 
 
+# The headline finding's type. `low` severity on purpose: the projection's
+# stage lists take critical/high/medium only, so this row carries the
+# distribution to the headline WITHOUT appearing to the merchant as a problem
+# of its own. It is a measurement, not a defect.
+FINDING_HEADLINE_DISTRIBUTION = "brand_headline_distribution"
+
+
+def _prompt_split_from_rollup(rollup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The branded-vs-unbranded citation split, with n, or None.
+
+    The §6 definition of done asks the merchant surface for this split. It is
+    NOT a new measurement: `prompt_mix.branded_axes` already says which intent
+    axes are branded, and `citation_by_intent` already reports cited/total per
+    axis. This classifies the second by the first and sums. Nothing is
+    estimated, and an axis the report did not classify is named in
+    `unclassified_axes` rather than being quietly counted as unbranded.
+
+    Returns None when either input is missing — an absent split must read as
+    absent, never as parity.
+    """
+    mix = rollup.get("prompt_mix")
+    by_intent = rollup.get("citation_by_intent")
+    if not isinstance(mix, dict) or not isinstance(by_intent, dict):
+        return None
+    branded_axes = mix.get("branded_axes")
+    if not isinstance(branded_axes, list) or not branded_axes:
+        return None
+    branded_set = {str(a) for a in branded_axes}
+
+    buckets = {
+        "branded": {"cited": 0, "answered": 0, "axes": []},
+        "unbranded": {"cited": 0, "answered": 0, "axes": []},
+    }
+    unclassified: List[str] = []
+    for axis, stats in by_intent.items():
+        if not isinstance(stats, dict):
+            unclassified.append(str(axis))
+            continue
+        cited = stats.get("cited")
+        total = stats.get("total")
+        if not isinstance(cited, int) or not isinstance(total, int):
+            unclassified.append(str(axis))
+            continue
+        side = "branded" if str(axis) in branded_set else "unbranded"
+        buckets[side]["cited"] += cited
+        buckets[side]["answered"] += total
+        buckets[side]["axes"].append(str(axis))
+
+    # An axis the mix calls branded but the report never scored would silently
+    # shrink the branded denominator. Say it instead.
+    axes_without_data = sorted(branded_set - set(buckets["branded"]["axes"]))
+
+    for side in buckets.values():
+        side["axes"] = sorted(side["axes"])
+        answered = side["answered"]
+        # No answered prompts means no rate. 0/0 is not 0%.
+        side["rate"] = (
+            round(side["cited"] / answered, 3) if answered else None
+        )
+
+    if not buckets["branded"]["axes"] and not buckets["unbranded"]["axes"]:
+        return None
+
+    return {
+        "basis": (
+            "citation_by_intent axes classified by prompt_mix.branded_axes; "
+            "cited and answered are prompt counts, not SKU counts"
+        ),
+        "branded": buckets["branded"],
+        "unbranded": buckets["unbranded"],
+        "unclassified_axes": sorted(unclassified),
+        "branded_axes_without_citation_data": axes_without_data,
+        "branded_prompt_count": mix.get("branded"),
+        "unbranded_prompt_count": mix.get("unbranded"),
+        # Rule: scores are not comparable across a prompt_mix_version change.
+        # Whoever renders or diffs this must be able to see which version it is.
+        "prompt_mix_version": rollup.get("prompt_mix_version"),
+    }
+
+
+def _headline_finding_from_rollup(
+    rollup: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Every dimension the rollup banded, plus the split, as ONE finding.
+
+    Deliberately carries dimensions the merchant PASSED as well as the ones
+    that blocked. _findings_from_brand_rollup emits a finding only for
+    blocked/partial, so a headline built from those alone would show the bad
+    dimensions with no denominator — the reader could not tell four-of-four
+    from four-of-nine. `dimensions_considered` is that denominator.
+    """
+    dims = rollup.get("dimensions")
+    if not isinstance(dims, dict):
+        return None
+    rows: List[Dict[str, Any]] = []
+    for key, dim in sorted(dims.items(), key=lambda kv: str(kv[0])):
+        if not isinstance(dim, dict):
+            continue
+        rows.append({
+            "dimension": str(key),
+            "label": dim.get("dimension_label") or str(key),
+            "band": dim.get("band"),
+            "median": dim.get("median"),
+            "p25": dim.get("p25"),
+            "p75": dim.get("p75"),
+            # n travels WITH the number. A band over 3 SKUs is not a band over
+            # 300 and the reader is entitled to know which one this is.
+            "n": dim.get("total_count"),
+            "above_count": dim.get("above_count"),
+        })
+    split = _prompt_split_from_rollup(rollup)
+    if not rows and split is None:
+        return None
+    return {
+        "finding_type": FINDING_HEADLINE_DISTRIBUTION,
+        # "low" so the projection's stage lists (critical/high/medium) skip it.
+        "severity": "low",
+        "payload": {
+            "dimensions": rows,
+            "dimensions_considered": len(rows),
+            "prompt_split": split,
+            "skus_audited": rollup.get("skus_audited"),
+            "verdict_label": rollup.get("brand_verdict_label"),
+        },
+        "confidence": CONFIDENCE_FINDING_HIGH,
+        "short_summary": (
+            f"Per-dimension distribution over {len(rows)} dimension(s)"
+            + ("" if split else "; no branded/unbranded split available")
+        ),
+    }
+
+
 def _findings_from_brand_rollup(
     brand_report: Dict[str, Any], rollup: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -482,6 +614,9 @@ def extract_findings(
 
     if _modern:
         out.extend(_findings_from_brand_rollup(brand_report, _rollup))
+        _headline = _headline_finding_from_rollup(_rollup)
+        if _headline is not None:
+            out.append(_headline)
 
     aggregate = brand_report.get("aggregate") or {}
     avg_vis = aggregate.get("avg_visibility")
