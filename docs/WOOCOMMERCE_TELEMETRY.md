@@ -44,6 +44,16 @@ WooCommerce store IDs. It maps order status into `order.created`, `order.paid`,
 on the store, canonical lifecycle fact, and order/payment entity, so duplicate
 `order.created` and `order.updated` deliveries are idempotent.
 
+WooCommerce has no refund webhook topic, so refunds are read from the order's
+`refunds[]` array rather than from its status. Every entry with a native refund
+id becomes its own `refund.succeeded` — keyed on that id, amounted from the
+entry's `total` as a positive magnitude in `currency_minor_unit` — emitted in
+addition to the order lifecycle events of the same delivery. That is what makes a
+partial refund visible at all: it arrives as an `order.updated` on a still
+`processing`/`completed` order. The cumulative `total_refunded` is used only as a
+legacy fallback, when a `refunded` order carries no usable `refunds[]` entry.
+`refunds[].reason` is merchant free text and is never stored.
+
 Only allowlisted order facts and line-item identifiers are copied to canonical
 metadata. Billing/shipping addresses, email, phone, and customer names are not
 stored. WooCommerce 8.5+ Order Attribution `utm_content` metadata is reused as a

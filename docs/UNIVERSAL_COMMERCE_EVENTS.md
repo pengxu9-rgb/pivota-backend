@@ -45,6 +45,27 @@ still retries the idempotent canonical write for safe rollout backfill.
 embedded Shopify transaction whose kind is `refund` and status is `success`.
 The adapter never treats refund-object creation alone as proof that funds moved.
 
+## WooCommerce native refund bridge
+
+WooCommerce publishes no refund webhook topic. A refund — partial or full —
+arrives as an `order.updated` delivery whose `refunds[]` array has grown by one
+entry, and for a partial refund the order status stays `processing`/`completed`.
+`services/woocommerce_event_adapter.py` therefore reads `refunds[]` off the order
+payload on every delivery and emits one `refund.succeeded` per native refund id,
+in addition to whatever order lifecycle events that same webhook produces. The
+event id is keyed on the native refund id, so the entries that reappear on every
+later `order.updated` dedupe individually while a new one is accepted. Amounts
+are `abs()` of the entry's `total` (WooCommerce writes it negative) in the
+order's `currency_minor_unit`; `native_amount_semantics=native_refund_total`
+marks them per-refund rather than cumulative. The cumulative `total_refunded` is
+never written alongside them. Only when `refunds[]` is absent or carries no
+usable id — older wc/v3 payloads — does a `refunded` status fall back to the
+legacy single event keyed on `<order_id>:refund` with the cumulative amount and
+`native_amount_semantics=cumulative_refund_total`. Refund entries carry no
+timestamp in the order payload, so `occurred_at` is the order's modification
+time, and `refunds[].reason` is merchant free text that is never copied into
+canonical metadata.
+
 ## PSP terminal-event bridge
 
 After the existing Stripe handler has verified the webhook signature, resolved
