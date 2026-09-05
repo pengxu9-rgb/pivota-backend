@@ -178,10 +178,13 @@ def test_connect_refuses_a_hostile_shop_domain_before_any_connection(
     }
     resp = client.post("/integrations/shopify/connect", json=body, headers=_auth())
 
+    # THE SOCKET FIRST, deliberately. pytest reports the first failing assertion, and this is the
+    # one signal that survives a client no spy watches. Ordered after the status assertions, it was
+    # never reached against the unfixed build: those failed on `500 != 400` and the connection this
+    # exists to catch went unreported.
+    assert listener.count == 0, "a packet reached the listener before the host was validated"
     assert resp.status_code == 400
     assert "myshopify.com" in resp.json().get("detail", "")
-    # The load-bearing assertion: the refusal happened before a packet existed.
-    assert listener.count == 0
 
 
 def test_connect_still_accepts_a_real_shop_domain(client, listener, monkeypatch):
@@ -241,15 +244,22 @@ async def test_verify_refuses_a_hostile_stored_domain_before_any_connection(
     monkeypatch.setattr(svc, "get_primary_store", _fake_primary_store, raising=True)
     monkeypatch.setattr(svc, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
 
-    with pytest.raises(ValueError) as excinfo:
+    # Catching BROADLY on purpose. Against the unfixed build this raises httpx.ConnectError from
+    # deep inside the client, which would escape `pytest.raises(ValueError)` and end the test before
+    # the socket assertion below ever ran -- reporting a connection error instead of the connection.
+    raised: Optional[BaseException] = None
+    try:
         await svc.verify_shopify_integration(
             merchant_id=MERCHANT, callback_base_url="https://api.example"
         )
+    except BaseException as exc:  # noqa: BLE001
+        raised = exc
 
-    assert "myshopify.com" in str(excinfo.value)
+    assert listener.count == 0, "a packet reached the listener before the stored host was validated"
+    assert isinstance(raised, ValueError), f"expected a local refusal, got {raised!r}"
+    assert "myshopify.com" in str(raised)
     # The untrusted value must not be echoed into the error, which reaches logs and API surfaces.
-    assert stored not in str(excinfo.value)
-    assert listener.count == 0
+    assert stored not in str(raised)
 
 
 async def test_verify_does_not_persist_a_hostile_upstream_myshopify_domain(monkeypatch):
