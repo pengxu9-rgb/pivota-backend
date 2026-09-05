@@ -21,7 +21,7 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -555,6 +555,32 @@ def shopify_product_to_record(
         return None
     image = _first(product.get("images")) or {}
     barcode = str(variant.get("barcode") or "").strip() or None
+    # Every sellable variant, when the product has more than one: the ingest
+    # writes one SKU + offer per entry beside the canonical SKU, so a folded
+    # shade line (see fold_shade_listings) keeps its purchasable SKUs. Single-
+    # variant products emit nothing here — the canonical SKU already is the row.
+    sellable = [
+        v for v in variants
+        if isinstance(v, dict) and (_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE
+    ]
+    pdp_variants: List[Dict[str, Any]] = []
+    if len(sellable) >= 2:
+        seen_ids: set = set()
+        for i, v in enumerate(sellable):
+            vid = str(v.get("id") or v.get("variant_id") or f"{handle}:{i}").strip()
+            if vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+            pdp_variants.append({
+                "variant_id": vid,
+                "sku": str(v.get("sku") or "").strip() or None,
+                "barcode": str(v.get("barcode") or "").strip() or None,
+                "title": str(v.get("title") or v.get("option1") or "").strip() or None,
+                "price": _to_float(v.get("price")),
+                "in_stock": bool(v.get("available")),
+                "image_url": str(v.get("image_src") or "").strip() or str(image.get("src") or "").strip() or None,
+                "source_handle": str(v.get(FOLDED_FROM_KEY) or "").strip() or None,
+            })
     raw_tags = product.get("tags")
     tags = (
         raw_tags
@@ -588,6 +614,7 @@ def shopify_product_to_record(
             # on this lane (captured on the retailer-PDP lane instead).
             "rating_value": None,
             "rating_count": None,
+            "variants": pdp_variants,
         },
         "offers": [
             {
@@ -607,26 +634,24 @@ def shopify_product_to_record(
 # sample) publish EVERY shade as its own single-variant product — "Retro Matte
 # Lipstick - Ruby Woo" beside the base "Retro Matte Lipstick". The Path-C plan keys
 # PDPs on (brand, title), so ingesting that feed as-is mints one PDP per shade:
-# ~1,900 near-duplicates for one brand. `drop_shade_listings` collapses them onto
-# the base listing when — and only when — the base listing is itself in the feed;
-# a suffixed title with no base row in the feed is a real product name and stays.
+# ~1,900 near-duplicates for one brand.
+#
+# `fold_shade_listings` FOLDS those shade rows into the base listing's variants
+# instead of dropping them: the base keeps one PDP, and every shade becomes a
+# variant of it (title = shade name, its own sku / barcode / price / image), so
+# the purchasable SKUs survive. Measured on the MAC feed, every base row is
+# itself a single-variant PARENT STUB (variants[0].option1 == title, sku P2000_*):
+# that stub variant is replaced by the shades, never kept beside them. A base
+# that already carries real variants keeps them and gains the folded shades.
 #
 # Titles are compared through `normalize_title` (the same normaliser
 # `make_content_key` uses downstream), because the feed is not case- or
 # punctuation-stable across a line: stila lists "HUGE™ Extreme Lash Mascara" beside
 # "Huge™ Extreme Lash Mascara - Intense Black", and "Heaven's" beside "Heaven’s".
-# A raw compare let 2 of stila's 12 shade rows through to mint their own PDP.
-# Shade names may themselves contain hyphens ("Lady-Be-Good", "Brick-O-La",
-# "Tete-A-Tint" — 21 of MAC's 1,381 collapsible rows), so every " - " split point
-# is tried, longest base first, rather than a single regex capture.
-#
-# KNOWN LIMIT, measured on the MAC feed: the surviving base row is itself a
-# single-variant parent stub (variants[0].option1 == title, sku P2000_*) — the
-# shade rows ARE the purchasable SKUs, and this collapse discards them rather
-# than folding them in as variants. It trades shade identity for one PDP per
-# line; it does not produce a base row that carries its shades. Folding shade
-# rows into the base's variants is the deeper fix and is not done here.
+# Shade names may themselves contain hyphens ("Lady-Be-Good", "Brick-O-La"), so
+# every " - " split point is tried, longest base first.
 _SHADE_SEP = " - "
+FOLDED_FROM_KEY = "_folded_from_handle"
 
 
 def _shade_bases(title: str) -> List[str]:
@@ -637,27 +662,96 @@ def _shade_bases(title: str) -> List[str]:
     return [_SHADE_SEP.join(parts[:i]).strip() for i in range(len(parts) - 1, 0, -1)]
 
 
-def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pure. Return `products` without single-variant rows whose title is
-    `<base> - <shade>` where `<base>` is also a title in `products` (compared
-    through normalize_title). Order is preserved; nothing else is touched.
-    Multi-variant rows are never dropped — a suffixed multi-variant title is a
-    distinct line, not a shade."""
+def _is_stub_variant(product: Dict[str, Any]) -> bool:
+    """A single placeholder variant that names no shade: its option/title is the
+    product's own title or Shopify's 'Default Title'. MAC's P2000_ parents are
+    this shape; a real single-shade product ('Ruby Woo' as option1) is not."""
+    variants = (product or {}).get("variants") or []
+    if len(variants) != 1:
+        return False
+    v = variants[0] or {}
+    title = str((product or {}).get("title") or "").strip()
+    label = str(v.get("option1") or v.get("title") or "").strip()
+    return label in ("", "Default Title", title)
+
+
+def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str, Any]], Dict[str, Any]]":
+    """Pure. Fold single-variant `<base> - <shade>` rows into the variants of
+    the base row (matched through normalize_title). Returns (products, report):
+    the base rows now carry the shades as variants (a stub placeholder variant
+    is replaced; real variants are kept and extended), the shade rows are
+    removed, order is otherwise preserved, and multi-variant rows are never
+    folded — a suffixed multi-variant title is a distinct line, not a shade.
+    `report` names what happened so the caller can print it: bases folded,
+    shade rows folded, stub variants replaced, and every folded handle by base."""
     from services.catalog_identity import normalize_title
 
-    titles = {normalize_title(str((p or {}).get("title") or "")) for p in products}
-    titles.discard("")
-    out: List[Dict[str, Any]] = []
+    by_norm: Dict[str, Dict[str, Any]] = {}
+    for p in products:
+        key = normalize_title(str((p or {}).get("title") or ""))
+        if key and key not in by_norm:
+            by_norm[key] = p
+    folded_into: Dict[int, List[Dict[str, Any]]] = {}  # id(base) -> shade rows
+    shade_of: Dict[int, Dict[str, Any]] = {}            # id(shade row) -> base
     for p in products:
         title = str((p or {}).get("title") or "").strip()
         variants = (p or {}).get("variants") or []
-        is_shade = len(variants) <= 1 and any(
-            normalize_title(base) in titles for base in _shade_bases(title) if base
-        )
-        if is_shade:
+        if len(variants) > 1:
             continue
-        out.append(p)
-    return out
+        for base_title in _shade_bases(title):
+            base = by_norm.get(normalize_title(base_title)) if base_title else None
+            if base is not None and base is not p:
+                folded_into.setdefault(id(base), []).append(p)
+                shade_of[id(p)] = base
+                break
+    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "folded": {}}
+    out: List[Dict[str, Any]] = []
+    for p in products:
+        if id(p) in shade_of:
+            continue
+        shades = folded_into.get(id(p))
+        if not shades:
+            out.append(p)
+            continue
+        base_title = str(p.get("title") or "").strip()
+        base = dict(p)
+        own = [] if _is_stub_variant(p) else [
+            dict(v, title=str(v.get("title") or v.get("option1") or "").strip())
+            for v in (p.get("variants") or []) if isinstance(v, dict)
+        ]
+        if not own and (p.get("variants") or []):
+            report["stubs_replaced"] += 1
+        new_variants: List[Dict[str, Any]] = list(own)
+        handles: List[str] = []
+        for s in shades:
+            shade_title = str(s.get("title") or "").strip()
+            for bt in _shade_bases(shade_title):
+                if normalize_title(bt) == normalize_title(base_title):
+                    shade_name = shade_title[len(bt):].lstrip(" -").strip() or shade_title
+                    break
+            else:
+                shade_name = shade_title
+            sv = dict((s.get("variants") or [{}])[0] or {})
+            sv["title"] = shade_name
+            sv["option1"] = shade_name
+            sv.setdefault("id", s.get("id"))
+            img = _first(s.get("images")) or {}
+            if img.get("src"):
+                sv["image_src"] = str(img.get("src"))
+            sv[FOLDED_FROM_KEY] = str(s.get("handle") or "")
+            new_variants.append(sv)
+            handles.append(str(s.get("handle") or ""))
+        base["variants"] = new_variants
+        report["bases"] += 1
+        report["shades"] += len(shades)
+        report["folded"][str(p.get("handle") or base_title)] = handles
+        out.append(base)
+    return out, report
+
+
+def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compatibility name for `fold_shade_listings`: same collapse, report dropped."""
+    return fold_shade_listings(products)[0]
 
 
 async def records_for_brand(
@@ -684,7 +778,8 @@ async def records_for_brand(
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
     if base_listings_only:
-        products = drop_shade_listings(products)
+        products, fold_report = fold_shade_listings(products)
+        records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:

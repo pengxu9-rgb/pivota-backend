@@ -35,6 +35,57 @@ def test_maps_shopify_product_to_validated_record():
     assert offers[0]["price"] == 16.0  # coerced to float (numeric columns reject strings)
 
 
+def test_fold_replaces_a_parent_stub_with_its_shades():
+    """MAC shape: the base row is a single P2000_ placeholder whose option1 is its
+    own title; the shade rows are the purchasable SKUs. The base keeps one PDP and
+    the shades become its variants — the stub variant is gone, not kept beside them."""
+    base = _product(title="Retro Matte Lipstick", handle="retro-matte-lipstick",
+                    variants=[{"id": 1, "sku": "P2000_1", "price": "24.00", "option1": "Retro Matte Lipstick", "available": True}])
+    ruby = _product(title="Retro Matte Lipstick - Ruby Woo", handle="retro-matte-lipstick-ruby-woo",
+                    images=[{"src": "https://cdn.x/ruby.jpg"}],
+                    variants=[{"id": 2, "sku": "M0N904", "barcode": "773602049363", "price": "24.00", "available": True}])
+    bronx = _product(title="Retro Matte Lipstick - Bronx", handle="retro-matte-lipstick-bronx",
+                     variants=[{"id": 3, "sku": "M0N901", "price": "24.00", "available": False}])
+    out, report = cbf.fold_shade_listings([ruby, base, bronx])
+    assert [p["title"] for p in out] == ["Retro Matte Lipstick"]
+    vs = out[0]["variants"]
+    assert [(v["title"], v["sku"]) for v in vs] == [("Ruby Woo", "M0N904"), ("Bronx", "M0N901")]
+    assert vs[0]["image_src"] == "https://cdn.x/ruby.jpg"
+    assert vs[0][cbf.FOLDED_FROM_KEY] == "retro-matte-lipstick-ruby-woo"
+    assert report == {"bases": 1, "shades": 2, "stubs_replaced": 1,
+                      "folded": {"retro-matte-lipstick": ["retro-matte-lipstick-ruby-woo", "retro-matte-lipstick-bronx"]}}
+
+
+def test_fold_keeps_a_real_base_variant_and_appends_shades():
+    """A base whose single variant names a real shade is not a stub: it stays and
+    the folded shades join it."""
+    base = _product(title="Lip Pencil", handle="lip-pencil",
+                    variants=[{"id": 1, "sku": "LP01", "price": "20.00", "option1": "Whirl", "available": True}])
+    shade = _product(title="Lip Pencil - Brick-O-La", handle="lip-pencil-brick-o-la",
+                     variants=[{"id": 2, "sku": "LP02", "price": "20.00", "available": True}])
+    out, report = cbf.fold_shade_listings([base, shade])
+    assert [v["title"] for v in out[0]["variants"]] == ["Whirl", "Brick-O-La"]
+    assert report["stubs_replaced"] == 0
+
+
+def test_mapper_emits_variants_only_for_multi_variant_products():
+    single = shopify_product_to_record(_product(), domain="x.com", category_path="x")
+    assert single["pdp"]["variants"] == []
+    multi = shopify_product_to_record(
+        _product(variants=[
+            {"id": 11, "sku": "A", "price": "24.00", "title": "Ruby Woo", "available": True, "image_src": "https://cdn.x/a.jpg"},
+            {"id": 12, "sku": "B", "price": "0.01", "title": "Promo", "available": True},   # under the floor: not a variant
+            {"id": 13, "sku": "C", "price": "24.00", "title": "Bronx", "available": False},
+        ]),
+        domain="x.com", category_path="x",
+    )
+    vs = multi["pdp"]["variants"]
+    assert [(v["variant_id"], v["title"], v["price"], v["in_stock"]) for v in vs] == [
+        ("11", "Ruby Woo", 24.0, True), ("13", "Bronx", 24.0, False)]
+    assert vs[0]["image_url"] == "https://cdn.x/a.jpg" and vs[1]["image_url"] == "https://cdn.x/img.jpg"
+    assert multi["offers"][0]["price"] == 24.0  # primary offer unchanged: first sellable variant
+
+
 def test_drop_shade_listings_collapses_onto_present_base():
     """maccosmetics.com shape: every shade is its own single-variant product beside
     the base listing. Only rows whose base title is IN the feed collapse."""

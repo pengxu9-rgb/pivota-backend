@@ -775,3 +775,68 @@ def test_pdp_insert_writes_o4_lifecycle_stage():
     assert pdp_row["pdp_lifecycle_stage"] in {"draft", "candidate"}
     # Specifically: 'brief' is 5 chars, well below CANDIDATE_DESCRIPTION_MIN_LEN
     assert pdp_row["pdp_lifecycle_stage"] == "draft"
+
+
+# --- real variants ride beside the canonical SKU (folded shade lines) ---------
+
+
+def _variant_record(n_variants=2):
+    variants = [
+        {"variant_id": f"5405734574509{i}", "sku": f"M0N90{i}", "barcode": f"77360204936{i}",
+         "title": ["Ruby Woo", "Bronx", "Dangerous"][i], "price": 24.0 + i, "in_stock": i != 1,
+         "image_url": f"https://cdn.x/{i}.jpg", "source_handle": f"retro-matte-lipstick-{i}"}
+        for i in range(n_variants)
+    ]
+    return {
+        "pdp": {"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick",
+                "category_path": "beauty/makeup", "attribute_summary": "matte lipstick",
+                "source_domain": "maccosmetics.com", "variants": variants},
+        "offers": [{"merchant_inferred": "MAC Cosmetics",
+                    "canonical_url": "https://maccosmetics.com/products/retro-matte-lipstick",
+                    "destination_url": "https://maccosmetics.com/products/retro-matte-lipstick",
+                    "image_url": "https://cdn.x/base.jpg", "price": 24.0, "in_stock": True,
+                    "validated_at": "shopify_products_json"}],
+    }
+
+
+def test_variants_become_shade_skus_and_offers_beside_the_canonical():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_variant_record(3))
+    assert result and not result.get("skipped_reason")
+    pk = result["pdp"]["product_key"]
+    assert result["sku"]["sku_key"] == pk + ing.SKU_SUFFIX
+    vskus = result["variant_skus"]
+    assert [s["title"] for s in vskus] == ["Ruby Woo", "Bronx", "Dangerous"]
+    assert all(s["sku_key"].startswith(pk + ing.VARIANT_SKU_INFIX) for s in vskus)
+    assert [s["source_variant_id"] for s in vskus] == ["54057345745090", "54057345745091", "54057345745092"]
+    assert vskus[0]["sku"] == "M0N900" and vskus[0]["barcode"] == "773602049360"
+    # the label shape catalog_sync_service's shade extractor keys on
+    assert json.loads(vskus[0]["visible_option_labels"]) == ["shade_ruby_woo"]
+    assert vskus[0]["image_url"] == "https://cdn.x/0.jpg"
+    # one offer per variant SKU, priced and stocked per variant, plus the canonical one
+    offers = result["offers"]
+    assert len(offers) == 4
+    by_sku = {o["sku_key"]: o for o in offers}
+    assert by_sku[vskus[1]["sku_key"]]["list_price"] == 25.0
+    assert by_sku[vskus[1]["sku_key"]]["availability"] == "unknown"   # in_stock False
+    assert by_sku[vskus[0]["sku_key"]]["availability"] == "in_stock"
+    assert len({o["offer_id"] for o in offers}) == 4
+
+
+def test_single_variant_records_write_only_the_canonical_sku():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_variant_record(1))
+    assert result["variant_skus"] == []
+    assert len(result["offers"]) == 1
+
+
+def test_plan_counts_variant_skus():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    plan = ing.ingest_validated_jsonl([_variant_record(3)])
+    assert len(plan["pdps"]) == 1
+    assert len(plan["skus"]) == 4
+    assert len(plan["offers"]) == 4
+    assert plan["skipped"] == 0

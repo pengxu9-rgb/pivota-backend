@@ -197,10 +197,79 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         # catalog_products columns on purpose — INCI lives in the beauty tables.
         "raw_inci": (str(pdp.get("raw_inci")).strip() or None) if pdp.get("raw_inci") else None,
         "inci_source": str(pdp.get("inci_source") or "").strip() or None,
+        # Real variants when the record carries them (the curated Shopify feed
+        # emits one entry per sellable variant on multi-variant products, and a
+        # folded shade line arrives this way). Each becomes a SKU + offer beside
+        # the canonical SKU — see _build_variant_sku_inserts.
+        "variants": [v for v in (pdp.get("variants") or []) if isinstance(v, dict)],
     }
     if not payload["brand"] or not payload["product_name"]:
         return {}
     return payload
+
+
+VARIANT_SKU_INFIX = "::v:"
+
+
+def derive_variant_sku_key(product_key: str, variant_id: str) -> str:
+    """One SKU per real variant, keyed on the merchant's own variant id so
+    re-runs UPSERT; distinct from the canonical '::canonical' SKU."""
+    token = _normalize_token(str(variant_id)).replace(" ", "-")[:60] or "v"
+    return f"{product_key}{VARIANT_SKU_INFIX}{token}"
+
+
+def _build_variant_sku_inserts(
+    *,
+    product_key: str,
+    pdp_payload: Dict[str, Any],
+    seller: Dict[str, str],
+    canonical_url: Optional[str],
+) -> List[Dict[str, Any]]:
+    """One catalog_skus row per real variant, in the shape merchant sync writes
+    for a shade: title = shade name, visible_option_labels = ['shade_<name>']
+    (the label prefix catalog_sync_service's shade extractor keys on), the
+    variant's own sku / barcode / image. Nothing when the record has fewer
+    than two variants — the canonical SKU already represents the product."""
+    variants = pdp_payload.get("variants") or []
+    if len(variants) < 2:
+        return []
+    rows: List[Dict[str, Any]] = []
+    seen: set = set()
+    for v in variants:
+        vid = str(v.get("variant_id") or "").strip()
+        if not vid:
+            continue
+        sku_key = derive_variant_sku_key(product_key, vid)
+        if sku_key in seen:
+            continue
+        seen.add(sku_key)
+        shade = str(v.get("title") or "").strip()
+        labels = [f"shade_{_normalize_token(shade).replace(' ', '_')}"] if shade else []
+        rows.append({
+            "sku_key": sku_key,
+            "product_key": product_key,
+            "merchant_id": seller["merchant_id"],
+            "platform": SYNTHETIC_PLATFORM,
+            "source_product_id": canonical_product_name(pdp_payload["brand"], pdp_payload["product_name"]),
+            "source_variant_id": vid,
+            "source_domain": pdp_payload.get("source_domain") or None,
+            "sku": str(v.get("sku") or "").strip() or None,
+            "barcode": str(v.get("barcode") or "").strip() or None,
+            "title": shade or pdp_payload["product_name"],
+            "currency": "USD",
+            "image_url": str(v.get("image_url") or "").strip() or None,
+            "visible_attributes": json.dumps({"shade": shade} if shade else {}),
+            "visible_option_labels": json.dumps(labels),
+            "ingredient_ids": json.dumps([]),
+            "sku_payload": json.dumps({
+                "agent_version": AGENT_VERSION,
+                "variant_id": vid,
+                "source_handle": v.get("source_handle"),
+                "canonical_url": canonical_url,
+            }),
+            "readiness_tier": OFFER_READINESS_TIER,
+        })
+    return rows
 
 
 def _coerce_rating_value(value: Any) -> Optional[float]:
@@ -782,6 +851,26 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         offers=offers,
         source_domain=pdp_row.get("source_domain"),
     )
+    # Real variants ride beside the canonical SKU: one SKU + one offer each,
+    # priced and stocked per variant, at the brand-direct destination.
+    variant_sku_rows = _build_variant_sku_inserts(
+        product_key=pdp_row["product_key"],
+        pdp_payload=pdp_payload,
+        seller=seller,
+        canonical_url=pdp_row.get("canonical_url"),
+    )
+    variant_offer_rows: List[Dict[str, Any]] = []
+    if variant_sku_rows and offers:
+        primary = offers[0]
+        by_vid = {str(v.get("variant_id") or ""): v for v in (pdp_payload.get("variants") or [])}
+        for vsku in variant_sku_rows:
+            v = by_vid.get(str(vsku["source_variant_id"])) or {}
+            variant_offer_rows.extend(_build_offer_inserts(
+                product_key=pdp_row["product_key"],
+                sku_key=vsku["sku_key"],
+                offers=[dict(primary, price=v.get("price"), in_stock=bool(v.get("in_stock")))],
+                source_domain=pdp_row.get("source_domain"),
+            ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],
         pdp_payload=pdp_payload,
@@ -795,8 +884,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
     return {
         "pdp": pdp_row,
         "sku": sku_row,
+        "variant_skus": variant_sku_rows,
         "merchants": merchant_rows,
-        "offers": offer_rows,
+        "offers": offer_rows + variant_offer_rows,
         "seeds": seed_rows,
         "inci": inci_row,
         "audit_reasons": _identifier_audit_reasons(
@@ -861,6 +951,7 @@ def ingest_validated_jsonl(
             continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
+        sku_rows.extend(result.get("variant_skus") or [])
         merchant_rows.extend(result["merchants"])
         offer_rows.extend(result["offers"])
         seed_rows.extend(result["seeds"])
