@@ -128,6 +128,53 @@ Subscriptions are installed idempotently through
 `store/order/created`, `store/order/updated`, `store/order/statusUpdated`, and
 `store/order/refund/created`.
 
+## Wix native webhook bridge
+
+`POST /webhooks/wix` is the first **static** native bridge with no store id in
+its path, and the first with no signature header, because of three Wix facts
+(all verified against the vendor docs on 2026-09-04).
+
+**Webhooks are an app extension, not a per-store subscription.** They are
+configured once per app in the Wix app dashboard against ONE callback URL, and
+every site that installed the app delivers there. There is no per-site
+registration call, so this bridge has no subscription manager at all, and the
+store is resolved from the delivery's `instanceId` — the id of the app instance
+on that site, and the only site-scoping key a REST delivery carries. That id is
+new to `merchant_stores`: `POST /merchant-stores/wix/connect` now accepts an
+optional `instance_id` and stores the credential as a JSON blob when one is
+given. A store connected in API-key mode without the app installed has no
+instance and can never receive telemetry.
+
+**The body IS a JWT.** The whole request body is a token signed by Wix and
+verified with the app's public key (`WIX_APP_PUBLIC_KEY`, RS256 pinned, `alg`
+never read from the token, `exp` enforced when present). The decoded `data`
+claim is a JSON *string* carrying `eventType`/`instanceId`/`identity`/`data`,
+and that inner `data` is a JSON string **again** — two parses, per Wix's own
+reference handler. `instanceId` is read only from the verified claim.
+
+**Orders arrive whole; transactions do not.** The five `wix.ecom.v1.order`
+events (`created`, `updated`, `approved`, `canceled`, `payment_status_updated`)
+embed the full Order, so their mapper is pure. The two Order Transactions
+events (`refund_completed`, `details_updated`) carry `orderId` and amounts but
+**no currency** — a Wix `Price` is `{amount, formattedAmount}` — and the funnel
+drops a money row without one, so `services/wix_order_fetch.py` reads the order
+back for those two only; a failure is 503, because Wix retries a non-2xx up to
+12 times over ~48 hours.
+
+`services/wix_event_adapter.py` maps `order.created` (always, keyed on the
+order id), `order.paid` for `PAID`/`PARTIALLY_REFUNDED`/`FULLY_REFUNDED` but
+never `PARTIALLY_PAID`, `order.cancelled` for `status = CANCELED`,
+`payment.failed` for a `DECLINED` order or a `DECLINED` payment in the
+transactions payload, and one `refund.succeeded` per native refund id with that
+refund's own settled amount (`summary.refunded`, else its `SUCCEEDED`
+transactions) and date.
+
+Unlike BigCommerce, Wix orders **can** recover their Pivota identity:
+`channelInfo.externalOrderId` is a structured field set by whoever records the
+order through the API, so a Pivota-written-back order maps to
+`pivota:<order id>`. The `buyerNote` the same writeback sets is buyer free text
+and is never read. See `docs/WIX_TELEMETRY.md`.
+
 ## PSP terminal-event bridge
 
 After the existing Stripe handler has verified the webhook signature, resolved

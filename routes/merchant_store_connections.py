@@ -1383,6 +1383,15 @@ class ConnectWixRequest(BaseModel):
     site_id: str
     api_key: str
     store_name: Optional[str] = None
+    # The id of the Pivota app INSTANCE on this Wix site. Wix webhooks are an
+    # app-level extension delivered to one static URL for every site that
+    # installed the app, and the delivery names its site only by `instanceId`
+    # (https://dev.wix.com/docs/build-apps/develop-your-app/api-integrations/events-and-webhooks/about-webhooks.md),
+    # so routes/wix_webhooks.py cannot resolve a store without it. Nothing
+    # persisted it before this: the API-key connect below never knew it, and
+    # the OAuth path is still a 501 stub. Optional, because catalog sync works
+    # without it — a store that omits it simply receives no telemetry.
+    instance_id: Optional[str] = None
 
 
 @router.get("/wix/oauth/start")
@@ -2473,6 +2482,19 @@ async def merchant_connect_wix(
         site_id = validation["site_id"]
         api_key = validation["api_key"]
 
+        # An instance id turns the credential into the JSON blob every Wix
+        # reader in this repo already understands (`normalize_wix_api_key`,
+        # `extract_wix_site_id`, `adapters/wix_adapter.py::_wix_credentials`
+        # all read `api_key`/`site_id`/`instance_id` out of one). Without an
+        # instance id the bare key is written exactly as before, so a connect
+        # that does not opt into telemetry is byte-identical to today's.
+        instance_id = str(request.instance_id or "").strip()
+        stored_credential = api_key
+        if instance_id:
+            stored_credential = json.dumps(
+                {"api_key": api_key, "site_id": site_id, "instance_id": instance_id}
+            )
+
         logger.info("Wix credentials verified for merchant=%s", request.merchant_id)
         
         # Check if store already exists
@@ -2488,7 +2510,7 @@ async def merchant_connect_wix(
                 """UPDATE merchant_stores 
                    SET api_key = :token, status = 'active', connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "token": api_key}
+                {"store_id": existing_store["store_id"], "token": stored_credential}
             )
             store_id = existing_store["store_id"]
         else:
@@ -2503,7 +2525,7 @@ async def merchant_connect_wix(
                     "merchant_id": request.merchant_id,
                     "site_id": site_id,
                     "name": request.store_name or f"Wix Store {site_id[:8]}",
-                    "token": api_key
+                    "token": stored_credential
                 }
             )
         

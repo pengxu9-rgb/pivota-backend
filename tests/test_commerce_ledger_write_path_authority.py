@@ -100,6 +100,12 @@ def test_every_production_write_path_has_exactly_one_authority():
     assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["bigcommerce_webhook"] == frozenset(
         {"platform_asserted"}
     )
+    # Wix is the same shape: the row is what Wix's own signed event said, not
+    # what a merchant claimed, so it is `platform` and may assert nothing else.
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["wix_webhook"] == "platform"
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["wix_webhook"] == frozenset(
+        {"platform_asserted"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -110,6 +116,7 @@ def test_every_production_write_path_has_exactly_one_authority():
         ("merchant_hmac_batch", "merchant_asserted"),
         ("cafe24_webhook", "platform_asserted"),
         ("bigcommerce_webhook", "platform_asserted"),
+        ("wix_webhook", "platform_asserted"),
         ("stripe_webhook", "platform_asserted"),
     ],
 )
@@ -134,6 +141,9 @@ def test_each_ingress_may_assert_only_its_own_confidence(write_path, confidence)
         ("cafe24_webhook", "unknown"),
         ("bigcommerce_webhook", "merchant_asserted"),
         ("bigcommerce_webhook", "browser_observed"),
+        ("wix_webhook", "merchant_asserted"),
+        ("wix_webhook", "browser_observed"),
+        ("wix_webhook", "verified"),
     ],
 )
 def test_a_mismatched_write_path_and_confidence_is_refused(write_path, confidence):
