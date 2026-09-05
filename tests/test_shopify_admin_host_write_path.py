@@ -312,3 +312,278 @@ async def test_verify_does_not_persist_a_hostile_upstream_myshopify_domain(monke
         pass
 
     assert "evil.example" not in writes, "a hostile upstream domain reached merchant_stores.domain"
+
+# --------------------------------------------------------------------------------------
+# 4. The two derivation sites in routes/merchant_store_connections.py.
+#
+# Added after review: the original file asserted these holes "fail independently" and they did not.
+# Reverting BOTH re-checks -- the two lines that close the reported write path -- left all 43 tests
+# green, because the connect route's own input guard refused the hostile value first and the
+# derivation never ran on anything bad. To reach the derivation the INPUT must be valid and only the
+# UPSTREAM response hostile, which is exactly the real-world shape: Shopify is reached correctly and
+# answers with a myshopify_domain we then store.
+# --------------------------------------------------------------------------------------
+
+def _shop_json(myshopify_domain):
+    return {"shop": {"myshopify_domain": myshopify_domain, "name": "A Shop"}}
+
+
+def test_connect_does_not_store_a_hostile_upstream_myshopify_domain(client, monkeypatch):
+    """Mutant that survived review: `shop_info.get("myshopify_domain") or shop_domain` unchecked."""
+    stored: List[Dict[str, Any]] = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return _shop_json("evil.example")
+
+    async def _fake_get(self, url, *a, **k):  # noqa: ANN001
+        return _Resp()
+
+    # POST must be stubbed too. The handler best-effort creates a storefront token and registers
+    # webhooks; leaving those unstubbed sent REAL requests to the live shop from a unit test and the
+    # insert under assertion was never reached.
+    async def _fake_post(self, url, *a, **k):  # noqa: ANN001
+        return _Resp()
+
+    async def _fake_execute(query, values=None):
+        if values and isinstance(values, dict) and "domain" in values:
+            stored.append(values["domain"])
+        return None
+
+    async def _fake_fetch_one(*a, **k):
+        return None
+
+    async def _fake_fetch_all(*a, **k):
+        return []
+
+    import routes.merchant_store_connections as msc
+
+    monkeypatch.setattr("httpx.AsyncClient.get", _fake_get, raising=True)
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post, raising=True)
+    monkeypatch.setattr(msc.database, "execute", _fake_execute, raising=False)
+    monkeypatch.setattr(msc.database, "fetch_one", _fake_fetch_one, raising=False)
+    monkeypatch.setattr(msc.database, "fetch_all", _fake_fetch_all, raising=False)
+
+    body = {
+        "merchant_id": MERCHANT,
+        # VALID input -- the guard at the top of the handler must not be what refuses here.
+        "shop_domain": "cosrx-renewal.myshopify.com",
+        "access_token": "shpat_TEST_TOKEN_SENTINEL",
+        # Required alongside a static token since the token-refresh change; without them the handler
+        # 400s on "requires client_id+client_secret" and the derivation under test never runs.
+        "client_id": "test_client_id",
+        "client_secret": "test_client_secret",
+    }
+    client.post("/integrations/shopify/connect", json=body, headers=_auth())
+
+    assert "evil.example" not in stored, (
+        "the upstream myshopify_domain reached merchant_stores.domain unchecked"
+    )
+    # Positive counterpart: something WAS written, and it was the validated fallback. Without this
+    # the assertion above is satisfied by a handler that stores nothing at all.
+    assert stored, "no domain was written; the assertion above would be vacuous"
+    assert set(stored) == {"cosrx-renewal.myshopify.com"}
+
+
+async def test_verify_persists_a_valid_but_different_upstream_domain(monkeypatch):
+    """Positive counterpart for the persist test. Setting `canonical_myshopify = ""` deletes the
+    whole canonicalisation write -- which keeps merchant_stores.domain matching the
+    X-Shopify-Shop-Domain webhook header -- and survived every test before this one existed."""
+    import services.shopify_integration_verify as svc
+
+    writes: List[str] = []
+
+    async def _fake_primary_store(_merchant_id):
+        return {
+            "store_id": "store_x",
+            "platform": "shopify",
+            "domain": "old-handle.myshopify.com",
+            "api_key": "shpat_TEST_TOKEN_SENTINEL",
+            "api_key_raw": "shpat_TEST_TOKEN_SENTINEL",
+        }
+
+    async def _fake_resolve(**_kwargs):
+        return "shpat_TEST_TOKEN_SENTINEL", {}
+
+    async def _fake_get_json(*, url, access_token, timeout_s=12.0):  # noqa: ANN001
+        return _shop_json("new-handle.myshopify.com")
+
+    class _DB:
+        async def execute(self, query, values=None):
+            if values and "domain" in (values or {}):
+                writes.append(values["domain"])
+            return None
+
+        async def fetch_one(self, *a, **k):
+            return None
+
+        async def fetch_all(self, *a, **k):
+            return []
+
+    monkeypatch.setattr(svc, "get_primary_store", _fake_primary_store, raising=True)
+    monkeypatch.setattr(svc, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
+    monkeypatch.setattr(svc, "_shopify_get_json", _fake_get_json, raising=True)
+    monkeypatch.setattr(svc, "database", _DB(), raising=True)
+
+    try:
+        await svc.verify_shopify_integration(
+            merchant_id=MERCHANT, callback_base_url="https://api.example"
+        )
+    except Exception:
+        pass
+
+    assert writes == ["new-handle.myshopify.com"], (
+        "a valid canonical domain must still be persisted; this is the write the "
+        "X-Shopify-Shop-Domain webhook match depends on"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# 5. The two sibling read paths in the same file, found by review.
+#
+# Both read merchant_stores.domain and build Admin API URLs from it, exactly as
+# verify_shopify_integration did. Proven to reach a listener before the guard was added.
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stored_tpl", ["127.0.0.1:{port}", "[::1]:{port}", "evil.example"])
+def test_token_diagnostic_refuses_a_hostile_stored_domain(client, listener, monkeypatch, stored_tpl):
+    import routes.merchant_store_connections as msc
+
+    stored = stored_tpl.format(port=listener.port)
+
+    async def _fake_primary_store(_merchant_id):
+        return {
+            "store_id": "store_x",
+            "platform": "shopify",
+            "domain": stored,
+            "api_key": "shpat_TEST_TOKEN_SENTINEL",
+            "api_key_raw": "shpat_TEST_TOKEN_SENTINEL",
+        }
+
+    monkeypatch.setattr(msc, "get_primary_store", _fake_primary_store, raising=True)
+
+    resp = client.get(
+        "/integrations/shopify/token/diagnostic",
+        params={"merchant_id": MERCHANT},
+        headers=_auth(),
+    )
+
+    assert listener.count == 0, "the token diagnostic dialled the stored host"
+    assert resp.status_code == 400
+    assert "myshopify.com" in resp.json().get("detail", "")
+
+
+@pytest.mark.parametrize("stored_tpl", ["127.0.0.1:{port}", "[::1]:{port}", "evil.example"])
+def test_products_sync_refuses_a_hostile_stored_domain(client, listener, monkeypatch, stored_tpl):
+    import routes.merchant_store_connections as msc
+
+    stored = stored_tpl.format(port=listener.port)
+
+    # This route reads merchant_stores with database.fetch_one directly -- NOT get_primary_store.
+    # Mocking the wrong seam made the first version of this test 500 on "no such table" while
+    # asserting nothing about the guard.
+    async def _fake_fetch_one(query, values=None):
+        if "api_key" in str(query):
+            return {"api_key": "shpat_TEST_TOKEN_SENTINEL"}
+        return {
+            "store_id": "store_x",
+            "platform": "shopify",
+            "domain": stored,
+            "status": "active",
+        }
+
+    monkeypatch.setattr(msc.database, "fetch_one", _fake_fetch_one, raising=False)
+
+    resp = client.post(
+        "/integrations/shopify/products/sync",
+        json={"merchant_id": MERCHANT},
+        headers=_auth(),
+    )
+
+    assert listener.count == 0, "the product sync dialled the stored host"
+    assert resp.status_code == 400
+
+def test_oauth_callback_does_not_store_a_hostile_upstream_myshopify_domain(client, monkeypatch):
+    """The OAuth callback is the PRIMARY install path and the one the reported hole named, yet its
+    re-check survived every test until this one: the connect route's own input guard refused hostile
+    values before any derivation ran, so reverting BOTH derivations left the suite green.
+
+    HMAC is stubbed deliberately -- the property under test is what happens to the domain the
+    upstream returns, not signature verification, which has its own coverage."""
+    import routes.merchant_store_connections as msc
+
+    stored: List[str] = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return _shop_json("evil.example")
+
+    class _TokenResp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"access_token": "shpat_TEST_TOKEN_SENTINEL", "scope": "read_orders"}
+
+    async def _fake_post(self, url, *a, **k):  # noqa: ANN001
+        return _TokenResp() if "access_token" in str(url) else _Resp()
+
+    async def _fake_get(self, url, *a, **k):  # noqa: ANN001
+        return _Resp()
+
+    async def _fake_fetch_one(query, values=None):
+        q = " ".join(str(query).split())
+        if "shopify_oauth_states" in q and q.upper().startswith("UPDATE"):
+            return {"merchant_id": MERCHANT}          # the anti-replay consumption
+        if "shopify_oauth_states" in q:
+            return {                                   # the state lookup
+                "merchant_id": MERCHANT,
+                "shop_domain": "cosrx-renewal.myshopify.com",
+                "used_at": None,
+                "expires_at": None,
+                "install_source": "test",
+                "return_to": "",
+            }
+        return None
+
+    async def _fake_execute(query, values=None):
+        if values and isinstance(values, dict) and "domain" in values:
+            stored.append(values["domain"])
+        return None
+
+    async def _fake_fetch_all(*a, **k):
+        return []
+
+    # The token exchange refuses with 500 "not configured" unless a client id/secret resolve.
+    monkeypatch.setattr(msc.settings, "shopify_client_id", "test_client_id", raising=False)
+    monkeypatch.setattr(msc.settings, "shopify_client_secret", "test_client_secret", raising=False)
+    monkeypatch.setattr(msc, "_shopify_oauth_verify_hmac", lambda **k: True, raising=True)
+    monkeypatch.setattr("httpx.AsyncClient.get", _fake_get, raising=True)
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post, raising=True)
+    monkeypatch.setattr(msc.database, "fetch_one", _fake_fetch_one, raising=False)
+    monkeypatch.setattr(msc.database, "execute", _fake_execute, raising=False)
+    monkeypatch.setattr(msc.database, "fetch_all", _fake_fetch_all, raising=False)
+
+    client.get(
+        "/integrations/shopify/oauth/callback",
+        params={
+            "shop": "cosrx-renewal.myshopify.com",
+            "code": "abc123",
+            "state": "s" * 24,
+            "hmac": "deadbeef",
+        },
+        follow_redirects=False,
+    )
+
+    assert "evil.example" not in stored, (
+        "the OAuth callback stored the upstream myshopify_domain unchecked"
+    )
+    assert stored, "no domain was written; the assertion above would be vacuous"
+    assert set(stored) == {"cosrx-renewal.myshopify.com"}
+

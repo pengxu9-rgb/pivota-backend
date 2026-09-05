@@ -82,11 +82,17 @@ async def merchant_onboarding_verify_shopify(
     if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Can only verify your own merchant")
 
-    report = await verify_shopify_integration(
-        merchant_id=merchant_id,
-        callback_base_url=request.callback_base_url,
-        api_version=request.api_version or "2025-10",
-    )
+    try:
+        report = await verify_shopify_integration(
+            merchant_id=merchant_id,
+            callback_base_url=request.callback_base_url,
+            api_version=request.api_version or "2025-10",
+        )
+    except ValueError as exc:
+        # Without this the deliberately-worded refusal below reaches the generic handler as a bare
+        # 500 with no detail — on exactly the misconfigured merchant an operator is here to debug.
+        # Matches how /integrations/shopify/verify already maps it.
+        raise HTTPException(status_code=400, detail=str(exc))
 
     redacted = {
         "run_id": report.get("run_id"),

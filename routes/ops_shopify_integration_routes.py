@@ -83,11 +83,17 @@ async def ops_verify_shopify(
     """
     if not request.callback_base_url or not request.callback_base_url.strip():
         raise HTTPException(status_code=400, detail="callback_base_url is required")
-    report = await verify_shopify_integration(
-        merchant_id=merchant_id,
-        callback_base_url=request.callback_base_url,
-        api_version=request.api_version or "2025-10",
-    )
+    try:
+        report = await verify_shopify_integration(
+            merchant_id=merchant_id,
+            callback_base_url=request.callback_base_url,
+            api_version=request.api_version or "2025-10",
+        )
+    except ValueError as exc:
+        # Without this the deliberately-worded refusal below reaches the generic handler as a bare
+        # 500 with no detail — on exactly the misconfigured merchant an operator is here to debug.
+        # Matches how /integrations/shopify/verify already maps it.
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "success", "report": report, "requested_by": current_user.get("sub")}
 
 

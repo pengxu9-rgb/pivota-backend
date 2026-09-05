@@ -17,6 +17,13 @@ packet and leaks no credential.
 The regex is deliberately identical to the gateway's `normalizeShopifyAdminHost`
 (PIVOTA-Agent `src/services/shopifyAdminHost.js`, #2145) so the two repos agree on one shop-handle
 contract rather than drifting into two.
+
+NOT YET THE ONLY DEFINITION IN THIS REPO. `routes/webhook_routes.py:846` still holds a
+byte-identical private copy of the old `_canonicalize_shop_domain`, feeding six call sites including
+an Admin API webhook URL. It is used for webhook-header comparison rather than for choosing a host
+to send a credential to, so it is not the same exposure and is deliberately out of scope here — but
+it is a second definition, free to drift. Said plainly rather than left implied by this module's
+existence.
 """
 
 from __future__ import annotations

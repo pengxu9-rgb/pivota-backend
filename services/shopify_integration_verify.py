@@ -336,6 +336,11 @@ async def verify_shopify_integration(
     # and a guard on one path does not cover the other. Refusing here costs no packet; the
     # alternative is sending a live Admin token to whatever host the row happens to name.
     shop_domain = normalize_myshopify_domain(store_info.get("domain")) or ""
+    if not shop_domain:
+        # Raised BEFORE the first use, not after. Deliberately does not echo the domain: it is
+        # untrusted text that would land in logs and API surfaces, and the merchant id already
+        # identifies the offending row.
+        raise ValueError("Primary Shopify store domain is not a *.myshopify.com host")
     access_token, _ = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
@@ -344,10 +349,6 @@ async def verify_shopify_integration(
     access_token = (access_token or "").strip()
     store_id = store_info.get("store_id")
 
-    if not shop_domain:
-        # Deliberately does NOT echo the domain: it is untrusted text that would land in logs and
-        # error surfaces, and the merchant id already identifies the offending row.
-        raise ValueError("Primary Shopify store domain is not a *.myshopify.com host")
     if not access_token:
         raise ValueError("Missing Shopify credentials")
 

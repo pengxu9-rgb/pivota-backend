@@ -132,13 +132,6 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
         return None
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    # Kept as a module-local name because this file and webhook_routes.py both use it, but the
-    # implementation now lives in services/shopify_domain.py so the host CONTRACT has exactly one
-    # definition — shared with the PIVOTA-Agent gateway, which reads what this file writes.
-    return canonicalize_shop_domain(value)
-
-
 def _validate_myshopify_domain(value: str) -> str:
     # The one place a 400 is the right answer: the caller's own input. Everywhere else the value is
     # re-checked with normalize_myshopify_domain and FALLS BACK, because failing a merchant's
@@ -1294,7 +1287,16 @@ async def shopify_token_diagnostic(
     if not store or (store.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-    shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
+    # Same stored column, same Admin API URLs, same guard as verify_shopify_integration. This route
+    # is the sharper of the two: it returns the upstream status codes in a 200 body, so an unpinned
+    # host here is a read-back SSRF oracle rather than a blind one.
+    raw_domain = (store.get("domain") or store.get("shop_domain") or "")
+    shop_domain = normalize_myshopify_domain(raw_domain) or ""
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
     access_token, token_meta = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store.get("api_key_raw") or store.get("api_key"),
@@ -1899,7 +1901,7 @@ async def merchant_connect_shopify(
                AND (domain = :domain_input OR domain = :domain_canonical)""",
             {
                 "merchant_id": request.merchant_id,
-                "domain_input": request.shop_domain,
+                "domain_input": shop_domain,
                 "domain_canonical": canonical_myshopify_domain,
             },
         )
@@ -2320,6 +2322,17 @@ async def merchant_sync_shopify_products(
             detail=f"Store is {store.get('status')}. Please reconnect your store."
         )
 
+    # Pinned here -- before the credential lookup and outside the try below, so the refusal costs no
+    # further work and is not reshaped by that block's broad handler. Both uses downstream build a
+    # URL from this: the token refresh POSTs client credentials to {domain}/admin/oauth/access_token,
+    # and fetch_products reads from the same host.
+    sync_shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
+    if not sync_shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
+
     # Call Shopify adapter directly
     try:
         import json
@@ -2333,7 +2346,7 @@ async def merchant_sync_shopify_products(
         )
         api_key_raw = cred_row["api_key"] if cred_row else None
         access_token, token_meta = await resolve_shopify_admin_access_token(
-            shop_domain=store.get("domain"),
+            shop_domain=sync_shop_domain,
             api_key_raw=api_key_raw,
             store_id=str(store.get("store_id") or "").strip() or None,
         )
@@ -2358,7 +2371,7 @@ async def merchant_sync_shopify_products(
 
         while pages_fetched < max_pages:
             products, next_page, error = await ShopifyProductAdapter.fetch_products(
-                shop_domain=store["domain"],
+                shop_domain=sync_shop_domain,
                 access_token=access_token,
                 merchant_id=target_merchant_id,
                 limit=250,
