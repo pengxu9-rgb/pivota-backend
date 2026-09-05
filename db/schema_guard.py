@@ -393,6 +393,60 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
+            # mig 215: collector token registry. Early and wrapped like its
+            # siblings: the issue routes INSERT into these tables, so a deploy
+            # that skips db/migrations/ would fail every token provisioning
+            # until they exist. Both tables here, both in the migration.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_tokens (
+                            jti VARCHAR(64) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            store_id VARCHAR(128) NOT NULL,
+                            token_type VARCHAR(32) NOT NULL,
+                            token_version INTEGER NOT NULL,
+                            store_token_version INTEGER NOT NULL,
+                            allowed_origins JSONB NULL,
+                            issued_at TIMESTAMPTZ NOT NULL,
+                            expires_at TIMESTAMPTZ NOT NULL,
+                            revoked_at TIMESTAMPTZ NULL,
+                            revoked_reason VARCHAR(64) NULL,
+                            superseded_by VARCHAR(64) NULL,
+                            issued_by VARCHAR(128) NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_store "
+                        "ON merchant_collector_tokens (merchant_id, store_id);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_expiring "
+                        "ON merchant_collector_tokens (expires_at) WHERE revoked_at IS NULL;"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_token_policy (
+                            store_id VARCHAR(128) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            min_token_version INTEGER NOT NULL DEFAULT 1,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
             # mig 213: trust provenance on the commerce ledger. Early and
             # wrapped like mig 212: the SQLAlchemy INSERT names every modeled
             # column, so a deploy that skips db/migrations/ would fail every

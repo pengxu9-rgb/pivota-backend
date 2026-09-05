@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
@@ -17,7 +18,13 @@ from services.merchant_event_ingest_service import MerchantEventBatch
 WEB_COLLECTOR_ISSUER = "pivota-merchant-events"
 WEB_COLLECTOR_AUDIENCE = "pivota-web-collector"
 WEB_COLLECTOR_TOKEN_TYPE = "merchant_web_collector"
-WEB_COLLECTOR_TOKEN_VERSION = 1
+# Format version 2 adds `jti` (the registry row) and `sv` (the store's token
+# generation at issuance). Version 1 tokens were issued before the registry
+# existed and carry neither; they stay valid until they expire or the store's
+# generation is bumped, whichever comes first.
+WEB_COLLECTOR_TOKEN_VERSION = 2
+LEGACY_TOKEN_VERSION = 1
+ACCEPTED_TOKEN_VERSIONS = frozenset({LEGACY_TOKEN_VERSION, WEB_COLLECTOR_TOKEN_VERSION})
 SHOPIFY_PIXEL_AUDIENCE = "pivota-shopify-web-pixel"
 SHOPIFY_PIXEL_TOKEN_TYPE = "shopify_web_pixel"
 
@@ -42,7 +49,14 @@ WEB_COLLECTOR_EVENT_TYPES = frozenset(
 MAX_WEB_EVENT_AGE = timedelta(days=7)
 MAX_WEB_EVENT_FUTURE_SKEW = timedelta(minutes=5)
 MAX_ALLOWED_ORIGINS = 10
-MAX_TOKEN_TTL_DAYS = 400
+# A public browser credential that cannot be recalled from the pages it was
+# pasted into. 90 days bounds the exposure of a leaked snippet; renewal is a
+# route, not a re-install, so the cap costs the merchant one snippet swap a
+# quarter.
+MAX_TOKEN_TTL_DAYS = 90
+DEFAULT_TOKEN_TTL_DAYS = 90
+# Listings flag a token as due for renewal this far before it expires.
+RENEWAL_WINDOW_DAYS = 30
 FORBIDDEN_WEB_EVENT_FIELDS = frozenset(
     {
         "buyer_id",
@@ -140,24 +154,42 @@ def normalize_allowed_origins(values: Iterable[Any]) -> List[str]:
     return normalized
 
 
+def _new_jti() -> str:
+    return f"ct_{uuid.uuid4().hex}"
+
+
+def _store_token_version(value: Any) -> int:
+    try:
+        version = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return version if version >= 1 else 1
+
+
 def issue_web_collector_token(
     *,
     merchant_id: str,
     store_id: str,
     platform: str,
     allowed_origins: Iterable[Any],
-    ttl_days: int = 90,
+    ttl_days: int = DEFAULT_TOKEN_TTL_DAYS,
+    store_token_version: int = 1,
+    jti: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     issued_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     ttl = max(1, min(int(ttl_days), MAX_TOKEN_TTL_DAYS))
     origins = normalize_allowed_origins(allowed_origins)
     expires_at = issued_at + timedelta(days=ttl)
+    token_id = str(jti or _new_jti()).strip()
+    generation = _store_token_version(store_token_version)
     claims = {
         "iss": WEB_COLLECTOR_ISSUER,
         "aud": WEB_COLLECTOR_AUDIENCE,
         "typ": WEB_COLLECTOR_TOKEN_TYPE,
         "v": WEB_COLLECTOR_TOKEN_VERSION,
+        "jti": token_id,
+        "sv": generation,
         "merchant_id": str(merchant_id).strip(),
         "store_id": str(store_id).strip(),
         "platform": str(platform).strip().lower(),
@@ -170,7 +202,13 @@ def issue_web_collector_token(
     token = jwt.encode(claims, _collector_signing_key(), algorithm="HS256")
     return {
         "token": token,
+        "jti": token_id,
+        "token_type": WEB_COLLECTOR_TOKEN_TYPE,
+        "token_version": WEB_COLLECTOR_TOKEN_VERSION,
+        "store_token_version": generation,
+        "issued_at": issued_at.isoformat(),
         "expires_at": expires_at.isoformat(),
+        "renewal_due_at": (expires_at - timedelta(days=RENEWAL_WINDOW_DAYS)).isoformat(),
         "allowed_origins": origins,
     }
 
@@ -201,13 +239,15 @@ def verify_web_collector_token(
 
     if (
         claims.get("typ") != WEB_COLLECTOR_TOKEN_TYPE
-        or claims.get("v") != WEB_COLLECTOR_TOKEN_VERSION
+        or claims.get("v") not in ACCEPTED_TOKEN_VERSIONS
     ):
         raise WebCollectorError(401, "Invalid web collector token")
     merchant_id = str(claims.get("merchant_id") or "").strip()
     store_id = str(claims.get("store_id") or "").strip()
     platform = str(claims.get("platform") or "").strip().lower()
     if not merchant_id or not store_id or not platform:
+        raise WebCollectorError(401, "Invalid web collector token")
+    if claims.get("v") == WEB_COLLECTOR_TOKEN_VERSION and not str(claims.get("jti") or "").strip():
         raise WebCollectorError(401, "Invalid web collector token")
     try:
         allowed = normalize_allowed_origins(claims.get("allowed_origins") or [])
@@ -225,6 +265,8 @@ def verify_web_collector_token(
         "platform": platform,
         "allowed_origins": allowed,
         "request_origin": normalized_request_origin,
+        "jti": str(claims.get("jti") or "").strip() or None,
+        "sv": _store_token_version(claims.get("sv")),
     }
 
 
@@ -232,18 +274,24 @@ def issue_shopify_pixel_token(
     *,
     merchant_id: str,
     store_id: str,
-    ttl_days: int = 90,
+    ttl_days: int = DEFAULT_TOKEN_TTL_DAYS,
+    store_token_version: int = 1,
+    jti: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     issued_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     expires_at = issued_at + timedelta(
         days=max(1, min(int(ttl_days), MAX_TOKEN_TTL_DAYS))
     )
+    token_id = str(jti or _new_jti()).strip()
+    generation = _store_token_version(store_token_version)
     claims = {
         "iss": WEB_COLLECTOR_ISSUER,
         "aud": SHOPIFY_PIXEL_AUDIENCE,
         "typ": SHOPIFY_PIXEL_TOKEN_TYPE,
         "v": WEB_COLLECTOR_TOKEN_VERSION,
+        "jti": token_id,
+        "sv": generation,
         "merchant_id": str(merchant_id).strip(),
         "store_id": str(store_id).strip(),
         "platform": "shopify",
@@ -254,7 +302,14 @@ def issue_shopify_pixel_token(
         raise ValueError("merchant_id and store_id are required")
     return {
         "token": jwt.encode(claims, _collector_signing_key(), algorithm="HS256"),
+        "jti": token_id,
+        "token_type": SHOPIFY_PIXEL_TOKEN_TYPE,
+        "token_version": WEB_COLLECTOR_TOKEN_VERSION,
+        "store_token_version": generation,
+        "issued_at": issued_at.isoformat(),
         "expires_at": expires_at.isoformat(),
+        "renewal_due_at": (expires_at - timedelta(days=RENEWAL_WINDOW_DAYS)).isoformat(),
+        "allowed_origins": None,
     }
 
 
@@ -277,18 +332,22 @@ def verify_shopify_pixel_token(token: Any) -> Dict[str, Any]:
         raise WebCollectorError(401, "Invalid Shopify pixel token") from exc
     if (
         claims.get("typ") != SHOPIFY_PIXEL_TOKEN_TYPE
-        or claims.get("v") != WEB_COLLECTOR_TOKEN_VERSION
+        or claims.get("v") not in ACCEPTED_TOKEN_VERSIONS
     ):
         raise WebCollectorError(401, "Invalid Shopify pixel token")
     merchant_id = str(claims.get("merchant_id") or "").strip()
     store_id = str(claims.get("store_id") or "").strip()
     if not merchant_id or not store_id or claims.get("platform") != "shopify":
         raise WebCollectorError(401, "Invalid Shopify pixel token")
+    if claims.get("v") == WEB_COLLECTOR_TOKEN_VERSION and not str(claims.get("jti") or "").strip():
+        raise WebCollectorError(401, "Invalid Shopify pixel token")
     return {
         **claims,
         "merchant_id": merchant_id,
         "store_id": store_id,
         "platform": "shopify",
+        "jti": str(claims.get("jti") or "").strip() or None,
+        "sv": _store_token_version(claims.get("sv")),
     }
 
 

@@ -252,6 +252,10 @@ def test_web_collector_route_accepts_origin_bound_batch(monkeypatch):
 
     monkeypatch.setattr(route, "database", FakeDatabase())
     monkeypatch.setattr(route, "ingest_merchant_event_batch", fake_ingest)
+    async def _registry_ok(_claims):
+        return None
+
+    monkeypatch.setattr(route, "enforce_token_registry", _registry_ok)
     response = TestClient(_app()).post(
         "/merchant-events/v1/web/batch",
         content=json.dumps(
@@ -305,6 +309,17 @@ def test_install_token_is_tenant_scoped_and_returns_pending_consent_snippet(monk
             }
 
     monkeypatch.setattr(route, "database", FakeDatabase())
+    registered = []
+
+    async def fake_version(_store_id):
+        return 1
+
+    async def fake_register(**kwargs):
+        registered.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(route, "current_store_token_version", fake_version)
+    monkeypatch.setattr(route, "register_issued_token", fake_register)
     current_user = {"role": "merchant", "merchant_id": MERCHANT_ID}
     response = TestClient(_app(current_user)).post(
         "/merchant-events/v1/web/install-token",
@@ -316,6 +331,11 @@ def test_install_token_is_tenant_scoped_and_returns_pending_consent_snippet(monk
     assert payload["allowed_origins"] == [ORIGIN]
     assert payload["collector_token"] not in payload["script_src"]
     assert 'data-pivota-consent="pending"' in payload["install_snippet"]
+    # Issuing is recorded: the row is what makes the token listable and revocable.
+    assert len(registered) == 1
+    assert registered[0]["issued"]["jti"] == payload["jti"]
+    assert registered[0]["store_id"] == STORE_ID
+    assert payload["renewal_due_at"] < payload["expires_at"]
 
     denied = TestClient(_app({"role": "merchant", "merchant_id": "other"})).post(
         "/merchant-events/v1/web/install-token",
