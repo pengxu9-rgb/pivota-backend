@@ -48,6 +48,7 @@ _SWEEP_WEBHOOK_TOPICS: List[str] = [
     "orders/updated",
     "orders/paid",
     "orders/cancelled",
+    "refunds/create",
     "fulfillments/create",
     "fulfillments/update",
     "orders/fulfilled",

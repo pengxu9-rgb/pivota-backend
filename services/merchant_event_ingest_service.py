@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from services.commerce_interaction_service import record_commerce_event
+from services.commerce_order_ref import ORDER_REF_MAX_LENGTH, is_valid_order_ref
 
 
 STANDARD_COMMERCE_EVENT_TYPES = frozenset(
@@ -50,6 +51,18 @@ _AGENT_WRITER_BY_CONFIDENCE = {
     "verified": "external_agent",
     "unknown": "store_adapter",
 }
+
+# The write-path / authority / confidence contract lives in
+# services.commerce_ledger_provenance so the direct ledger writers can share
+# it without importing this module. Re-exported here for the batch callers.
+from services.commerce_ledger_provenance import (  # noqa: E402
+    LEDGER_AUTHORITY_BY_WRITE_PATH,
+    OPS_CANARY_SURFACE,
+    LedgerAuthority,
+    WritePath,
+    _ALLOWED_CONFIDENCE_BY_WRITE_PATH,
+    resolve_ledger_authority,
+)
 
 # The public collector is an analytics contract, not an arbitrary document
 # store. Native adapters reduce their payloads to this vocabulary before model
@@ -237,6 +250,12 @@ class MerchantCommerceEvent(BaseModel):
     checkout_id: Optional[str] = Field(default=None, max_length=128)
     payment_id: Optional[str] = Field(default=None, max_length=128)
     order_id: Optional[str] = Field(default=None, max_length=128)
+    # The canonical cross-authority order identity, `<namespace>:<native id>`.
+    # Server writers (adapters and bridges) set it; a merchant collector may
+    # only claim its OWN platform's namespace, which
+    # services/merchant_event_store_binding.py enforces against the store the
+    # batch is bound to.
+    order_ref: Optional[str] = Field(default=None, max_length=ORDER_REF_MAX_LENGTH)
     refund_id: Optional[str] = Field(default=None, max_length=128)
     return_id: Optional[str] = Field(default=None, max_length=128)
     canonical_product_id: Optional[str] = Field(default=None, max_length=64)
@@ -266,6 +285,21 @@ class MerchantCommerceEvent(BaseModel):
     @classmethod
     def normalize_platform(cls, value: str) -> str:
         return value.strip().lower().replace(" ", "_")
+
+    @field_validator("order_ref")
+    @classmethod
+    def validate_order_ref(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if not is_valid_order_ref(normalized):
+            raise ValueError(
+                "order_ref must be '<namespace>:<native order id>' with a "
+                "lowercase namespace and no whitespace"
+            )
+        return normalized
 
     @field_validator("currency")
     @classmethod
@@ -313,6 +347,7 @@ class MerchantCommerceEvent(BaseModel):
             self.checkout_id,
             self.payment_id,
             self.order_id,
+            self.order_ref,
             self.refund_id,
             self.return_id,
             self.trace_id,
@@ -326,6 +361,9 @@ class MerchantEventBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     events: List[MerchantCommerceEvent] = Field(min_length=1, max_length=100)
+    # A caller may only lower its own standing: marking a batch synthetic
+    # removes it from the caller's default funnel and nothing else.
+    synthetic: bool = False
 
 
 async def ingest_merchant_event_batch(
@@ -333,14 +371,22 @@ async def ingest_merchant_event_batch(
     merchant_id: str,
     batch: MerchantEventBatch,
     agent_identity_confidence: AgentIdentityConfidence,
+    write_path: WritePath,
+    synthetic: bool = False,
 ) -> Dict[str, Any]:
     """Normalize and append an idempotent batch to the canonical commerce ledger.
 
     Writes are intentionally individually idempotent rather than wrapped in one long
     transaction. A failed batch can be retried safely using the same event ids while
     already-accepted events are returned as duplicates.
+
+    ``write_path`` names the ingress that authenticated this batch. The ledger
+    authority is derived from it here, on the server, so no event body can
+    promote itself to a PSP or platform fact.
     """
     actor_type = _AGENT_WRITER_BY_CONFIDENCE[agent_identity_confidence]
+    authority = resolve_ledger_authority(write_path, agent_identity_confidence)
+    batch_synthetic = bool(synthetic or batch.synthetic)
     results: List[Dict[str, Any]] = []
     for event in batch.events:
         metadata = {
@@ -379,6 +425,10 @@ async def ingest_merchant_event_batch(
                 else merchant_id
             ),
             metadata=metadata,
+            write_path=write_path,
+            authority=authority,
+            agent_identity_confidence=agent_identity_confidence,
+            synthetic=batch_synthetic or event.surface == OPS_CANARY_SURFACE,
             merchant_id=merchant_id,
             platform=event.platform,
             store_id=event.store_id,
@@ -397,6 +447,7 @@ async def ingest_merchant_event_batch(
             checkout_id=event.checkout_id,
             payment_id=event.payment_id,
             order_id=event.order_id,
+            order_ref=event.order_ref,
             refund_id=event.refund_id,
             return_id=event.return_id,
             canonical_product_id=event.canonical_product_id,

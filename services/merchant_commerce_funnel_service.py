@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -188,6 +189,8 @@ async def get_merchant_commerce_funnel(
     commerce_surface: Optional[str] = None,
     platform: Optional[str] = None,
     store_id: Optional[str] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     platform = _normalize_text(platform).lower() or None
     store_id = _normalize_text(store_id) or None
@@ -205,6 +208,16 @@ async def get_merchant_commerce_funnel(
         click_rows: List[Dict[str, Any]] = []
         edge_rows: List[Dict[str, Any]] = []
     else:
+        # DELIBERATELY UNWINDOWED. `since`/`until` bound the canonical event
+        # ledger only. Both legacy tables do have a `created_at`, but neither
+        # is the time of the activity they report: surface_click_events rows
+        # are mutable accumulators (commerce_attribution_service increments
+        # impression_count/click_count on an existing row) and attribution
+        # edges accumulate refund_count/refunded_amount the same way, so
+        # `created_at` is the row's birth. Bounding on it would drop a click
+        # that happened today on a row first created a year ago. Listing rows
+        # carry no event time at all. Inventing a window for them would be
+        # less honest than leaving them all-time and saying so.
         listing_rows = await _fetch_listing_rows(merchant_id, resolved_surface)
         click_rows = await _fetch_click_rows(merchant_id, resolved_surface)
         edge_rows = await _fetch_edge_rows(merchant_id, resolved_surface)
@@ -235,6 +248,8 @@ async def get_merchant_commerce_funnel(
         commerce_surface=commerce_surface,
         platform=platform,
         store_id=store_id,
+        since=since,
+        until=until,
     )
 
     def _row_dimension(row: Dict[str, Any], field: str) -> str:
@@ -580,6 +595,10 @@ async def get_merchant_commerce_funnel(
                     if unsupported_legacy_filters
                     else None
                 ),
+                # `since`/`until` bound the canonical ledger only. See the
+                # comment on the legacy fetches above: these rows' `created_at`
+                # is the row's birth, not the time of the activity they count.
+                "time_windowed": False,
             },
             "canonical_events": {
                 "included": bool(event_funnel.payload.get("available", True)),
@@ -588,6 +607,8 @@ async def get_merchant_commerce_funnel(
                     for field in ("platform", "store_id")
                     if filters.get(field) is not None
                 ],
+                # The window itself is reported once, at event_funnel.window.
+                "time_windowed": True,
             },
         },
         "slices": list(slices.values()),

@@ -683,6 +683,7 @@ def test_verified_cafe24_webhook_reaches_canonical_ingest(patched_webhook):
     assert len(patched_webhook) == 1
     assert patched_webhook[0]["merchant_id"] == "merchant-1"
     assert patched_webhook[0]["agent_identity_confidence"] == "platform_asserted"
+    assert patched_webhook[0]["write_path"] == "cafe24_webhook"
 
 
 def test_bad_cafe24_webhook_key_is_rejected_before_ingest(patched_webhook):

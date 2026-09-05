@@ -13,6 +13,7 @@ from services.cafe24_event_adapter import (
 )
 from services.cafe24_integration_service import find_cafe24_store
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 
 
 router = APIRouter(prefix="/webhooks/cafe24", tags=["Cafe24 Webhooks"])
@@ -20,6 +21,7 @@ MAX_CAFE24_WEBHOOK_BYTES = 1_000_000
 
 
 @router.post("")
+@telemetry_ingress_route("cafe24_webhook")
 async def receive_cafe24_webhook(
     request: Request,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
@@ -41,6 +43,9 @@ async def receive_cafe24_webhook(
     if not store or not x_api_key or not expected_key or not hmac.compare_digest(x_api_key, expected_key):
         # Unknown store and invalid key deliberately share one response.
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Cafe24 webhook credentials")
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=store["merchant_id"], store_id=store["store_id"])
+    await ingress.enforce_rate_limit("platform", store["store_id"])
 
     try:
         batch = map_cafe24_webhook(
@@ -63,6 +68,7 @@ async def receive_cafe24_webhook(
         merchant_id=str(store["merchant_id"]),
         batch=batch,
         agent_identity_confidence="platform_asserted",
+        write_path="cafe24_webhook",
     )
     return {
         "status": "recorded",

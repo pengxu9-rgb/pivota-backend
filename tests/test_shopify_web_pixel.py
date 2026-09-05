@@ -83,6 +83,10 @@ def test_shopify_pixel_route_marks_agent_identity_as_browser_observed(monkeypatc
 
     monkeypatch.setattr(route, "database", FakeDatabase())
     monkeypatch.setattr(route, "ingest_merchant_event_batch", fake_ingest)
+    async def _registry_ok(_claims):
+        return None
+
+    monkeypatch.setattr(route, "enforce_token_registry", _registry_ok)
     token = issue_shopify_pixel_token(
         merchant_id="merch_1",
         store_id="store_shopify",
@@ -108,6 +112,7 @@ def test_shopify_pixel_route_marks_agent_identity_as_browser_observed(monkeypatc
 
     assert response.status_code == 200, response.text
     assert captured[0]["agent_identity_confidence"] == "browser_observed"
+    assert captured[0]["write_path"] == "shopify_web_pixel"
 
 
 @pytest.mark.parametrize(

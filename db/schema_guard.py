@@ -393,6 +393,133 @@ async def ensure_required_schema_light() -> None:
             except Exception:  # noqa: BLE001
                 # Best-effort like every sibling; must not starve what follows.
                 pass
+            # mig 215: collector token registry. Early and wrapped like its
+            # siblings: the issue routes INSERT into these tables, so a deploy
+            # that skips db/migrations/ would fail every token provisioning
+            # until they exist. Both tables here, both in the migration.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_tokens (
+                            jti VARCHAR(64) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            store_id VARCHAR(128) NOT NULL,
+                            token_type VARCHAR(32) NOT NULL,
+                            token_version INTEGER NOT NULL,
+                            store_token_version INTEGER NOT NULL,
+                            allowed_origins JSONB NULL,
+                            issued_at TIMESTAMPTZ NOT NULL,
+                            expires_at TIMESTAMPTZ NOT NULL,
+                            revoked_at TIMESTAMPTZ NULL,
+                            revoked_reason VARCHAR(64) NULL,
+                            superseded_by VARCHAR(64) NULL,
+                            issued_by VARCHAR(128) NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_store "
+                        "ON merchant_collector_tokens (merchant_id, store_id);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_expiring "
+                        "ON merchant_collector_tokens (expires_at) WHERE revoked_at IS NULL;"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_token_policy (
+                            store_id VARCHAR(128) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            min_token_version INTEGER NOT NULL DEFAULT 1,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 213: trust provenance on the commerce ledger. Early and
+            # wrapped like mig 212: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until these columns exist. Four columns in
+            # the migration, four here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS write_path VARCHAR(48) NULL,
+                          ADD COLUMN IF NOT EXISTS authority VARCHAR(16) NULL,
+                          ADD COLUMN IF NOT EXISTS agent_identity_confidence VARCHAR(24) NULL,
+                          ADD COLUMN IF NOT EXISTS synthetic BOOLEAN NOT NULL DEFAULT FALSE;
+                        """
+                    )
+                )
+                # The mig-214 partial index is deliberately absent here: it
+                # rolls out CONCURRENTLY, which this guard's transaction
+                # cannot do, and nothing on the write path needs it.
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 216: the canonical order_ref. Early and wrapped like mig 213
+            # for the same reason: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until BOTH columns exist. Two columns in
+            # the migration, two here; and unlike mig 214's index this one is
+            # built normally (order_ref is new and all-NULL, so there is
+            # nothing to scan), so the guard carries it too.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interactions_order_ref "
+                        "ON commerce_interactions (order_ref);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interaction_events_order_ref "
+                        "ON commerce_interaction_events (order_ref);"
+                    )
+                )
+                # The stitch rests on this one: without it two authorities can
+                # both insert an interaction for the same canonical order and
+                # neither insert raises.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_commerce_interactions_order_ref_unique "
+                        "ON commerce_interactions (merchant_id, COALESCE(store_id, ''), order_ref) "
+                        "WHERE order_ref IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
             # mig 210: anonymous audit runs. Position and wrapping are BOTH
             # load-bearing, and neither alone is enough — measured, not assumed.
             #

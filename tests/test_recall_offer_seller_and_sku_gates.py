@@ -267,7 +267,9 @@ async def test_canonical_sig_candidate_with_a_live_offer_serves():
 
 
 @pytest.mark.asyncio
-async def test_brand_category_anchor_outranks_generic_category_rows():
+@pytest.mark.parametrize("knight_category", ["beauty/makeup/face/blush", None, ""])
+@pytest.mark.parametrize("query", ["knight unicorn blush", "knight unicorn only blush"])
+async def test_brand_category_anchor_outranks_generic_category_rows(knight_category, query):
     """A category OR-clause must not truncate the explicit brand result.
 
     The query phrase is deliberately non-contiguous in the product title; this
@@ -277,8 +279,7 @@ async def test_brand_category_anchor_outranks_generic_category_rows():
     await _merchant(f"{_PREFIX}_owner")
     await _merchant(f"{_PREFIX}_seller")
     for suffix, title, brand in (
-        ("generic1", "Soft Pinch Liquid Blush", "Generic One"),
-        ("generic2", "Cloud Paint Blush", "Generic Two"),
+        *((f"generic{i}", "Soft Pinch Liquid Blush", "Generic One") for i in range(30)),
         ("knight", "Knight Unicorn Satin Blush", "Knight Unicorn"),
     ):
         await _product_with_offer(
@@ -287,13 +288,31 @@ async def test_brand_category_anchor_outranks_generic_category_rows():
             seller=f"{_PREFIX}_seller",
             title=title,
             brand=brand,
-            category_path="beauty/makeup/face/blush",
+            category_path=knight_category if suffix == "knight" else "beauty/makeup/face/blush",
+        )
+        if suffix.startswith("generic"):
+            await database.execute(
+                "UPDATE catalog_products SET pdp_scope = 'multi_merchant_canonical' WHERE product_key = :key",
+                {"key": f"{_PREFIX}_{suffix}"},
+            )
+
+    # Missing taxonomy must not turn the brand admit branch into an all-brand
+    # fallback; nor may title evidence override an explicit, different category.
+    for suffix, title, category in (
+        ("off_category", "Knight Unicorn Satin Eye Palette", None),
+        ("known_mismatch", "Knight Unicorn Satin Blush Brush", "beauty/tools/brush"),
+        ("substring", "Knight Unicorn Satin Blusherino Case", None),
+    ):
+        await _product_with_offer(
+            f"{_PREFIX}_{suffix}", owner=f"{_PREFIX}_owner",
+            seller=f"{_PREFIX}_seller", title=title, brand="Knight Unicorn",
+            category_path=category,
         )
 
     rows = await svc._fetch_canonical_search_rows(
-        query="knight unicorn blush",
+        query=query,
         merchant_id=None,
-        limit=20,
+        limit=1,
     )
     recalled = [
         str(row.get("product_key"))
@@ -310,6 +329,9 @@ async def test_brand_category_anchor_outranks_generic_category_rows():
         "unicorn",
     ]
     assert recalled[0] == f"{_PREFIX}_knight"
+    assert not set(recalled) & {
+        f"{_PREFIX}_off_category", f"{_PREFIX}_known_mismatch", f"{_PREFIX}_substring",
+    }
 
 
 def test_category_brand_anchor_is_not_created_from_a_single_descriptor():

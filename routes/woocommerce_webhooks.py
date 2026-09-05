@@ -12,6 +12,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
 from db.database import database
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.woocommerce_event_adapter import (
     UnsupportedWooCommerceEvent,
     map_woocommerce_webhook,
@@ -46,6 +47,7 @@ def _source_host(value: Optional[str]) -> str:
 
 
 @router.post("/{store_id}")
+@telemetry_ingress_route("woocommerce_webhook")
 async def receive_woocommerce_webhook(
     store_id: str,
     request: Request,
@@ -85,6 +87,9 @@ async def receive_woocommerce_webhook(
             detail="Invalid WooCommerce webhook credentials",
         )
     store = dict(store)
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=store["merchant_id"], store_id=store_id)
+    await ingress.enforce_rate_limit("platform", store_id)
     supplied_host = _source_host(x_wc_webhook_source)
     expected_host = _source_host(store.get("domain"))
     if supplied_host and expected_host and supplied_host != expected_host:
@@ -108,5 +113,6 @@ async def receive_woocommerce_webhook(
         merchant_id=str(store["merchant_id"]),
         batch=batch,
         agent_identity_confidence="platform_asserted",
+        write_path="woocommerce_webhook",
     )
     return {"status": "recorded", "platform": "woocommerce", **result}

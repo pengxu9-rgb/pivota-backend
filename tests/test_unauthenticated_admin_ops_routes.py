@@ -1,4 +1,4 @@
-"""Eight /admin/* routers shipped with NO authentication of any kind.
+"""Twelve /admin/* routers shipped with NO authentication of any kind.
 
 THE DEFECT, live on prod through ad02087c5. Found while reviewing the fix for
 the GET /agents/ roster leak (PR #2048): that PR closes an AUTHENTICATED read
@@ -59,6 +59,77 @@ def client() -> TestClient:
     return TestClient(main.app)
 
 
+class _HandlerReached(Exception):
+    """Raised by the tripwire in place of running the statement."""
+
+
+# Every accessor a handler in these routers could reach the database through.
+# Named once so the fixture and the self-test that proves it works cannot drift:
+# a self-test that probed only one of these let the tuple be narrowed back to
+# nothing while staying green.
+_TRAPPED_ACCESSORS = ("execute", "execute_many", "fetch_all", "fetch_one", "fetch_val")
+
+
+@pytest.fixture
+def db_tripwire():
+    """Replace every database accessor with a raise, and record the calls.
+
+    Two jobs, and the second is why this is not optional.
+
+    It makes the refusals below say what they mean. `assert status in (401,
+    403)` is satisfied by a handler that RAN and then failed a later check;
+    what this file actually claims is that the guard sits in FRONT of the
+    handler. Recording the calls turns that into an assertion. Note what that
+    is worth TODAY: no handler in these twelve modules returns 401/403 itself,
+    so with the guards stripped every failure comes from the status assertion
+    and `assert not db_tripwire` never fires. It is there for the handler that
+    later does return a 403 of its own -- the interception below is the part
+    carrying weight now.
+
+    And it bounds the blast radius of its own failure. UNAUTHENTICATED_ROUTES
+    contains `POST /admin/fix/agents-table`, whose first statement is
+    `DROP TABLE IF EXISTS agents CASCADE`, plus ~12 ALTER TABLEs on `orders`
+    and a DELETE from products_cache. Those routes are listed here precisely
+    because they were once unguarded -- so the day the guard regresses is the
+    day this suite sends them an anonymous request and the handler runs. That
+    was measured, not assumed: with the guard removed from
+    routes/fix_agents_table.py, the anonymous request these tests send executed
+    `DROP TABLE IF EXISTS agents CASCADE` against the test database. sqlite
+    happens to reject CASCADE, but the statement was issued, and anyone running
+    the suite with DATABASE_URL pointed at Postgres would lose the table.
+
+    A regression should fail this file, not drop a table to do it.
+    """
+    from db import database as db_module
+
+    calls: List[str] = []
+
+    def _trap(kind):
+        async def _call(*args, **kwargs):
+            calls.append(f"{kind}: {str(args[0])[:120] if args else ''}")
+            raise _HandlerReached(kind)
+
+        return _call
+
+    # --- Finding 2 from review: monkeypatch.setattr on an INSTANCE undoes with
+    # setattr, not delattr, so every accessor would be left as a permanent
+    # instance attribute shadowing the class. Harmless for direct calls, but it
+    # would silently defeat a future test that patches
+    # databases.Database.<accessor> at the CLASS level. Restore by hand.
+    had = {a: (a in vars(db_module.database)) for a in _TRAPPED_ACCESSORS}
+    originals = {a: getattr(db_module.database, a) for a in _TRAPPED_ACCESSORS}
+    for accessor in _TRAPPED_ACCESSORS:
+        setattr(db_module.database, accessor, _trap(accessor))
+
+    yield calls
+
+    for accessor in _TRAPPED_ACCESSORS:
+        if had[accessor]:
+            setattr(db_module.database, accessor, originals[accessor])
+        else:
+            db_module.database.__dict__.pop(accessor, None)
+
+
 # (method, path, json body or None). Paths are the real ones; the bodies are
 # only enough to get past request validation, because a 422 would mean the
 # refusal was never reached.
@@ -94,7 +165,7 @@ def _call(client: TestClient, method: str, path: str, body: Any, headers=None):
 
 
 @pytest.mark.parametrize("method,path,body", UNAUTHENTICATED_ROUTES)
-def test_admin_ops_routes_refuse_an_anonymous_caller(client, method, path, body):
+def test_admin_ops_routes_refuse_an_anonymous_caller(client, db_tripwire, method, path, body):
     """No Authorization header, no X-ADMIN-KEY. Must be refused."""
     resp = _call(client, method, path, body)
 
@@ -102,10 +173,14 @@ def test_admin_ops_routes_refuse_an_anonymous_caller(client, method, path, body)
         f"{method} {path} answered {resp.status_code} to an unauthenticated "
         f"caller: {resp.text[:400]}"
     )
+    assert not db_tripwire, (
+        f"{method} {path} answered {resp.status_code} but the handler still "
+        f"reached the database -- the guard is not in FRONT of it: {db_tripwire}"
+    )
 
 
 @pytest.mark.parametrize("method,path,body", UNAUTHENTICATED_ROUTES)
-def test_admin_ops_routes_refuse_a_non_admin_token(client, method, path, body):
+def test_admin_ops_routes_refuse_a_non_admin_token(client, db_tripwire, method, path, body):
     """A real signed token for a non-admin role is not a way in either.
 
     Real JWTs throughout -- never the `test-token` placeholder, whose pytest
@@ -124,10 +199,13 @@ def test_admin_ops_routes_refuse_a_non_admin_token(client, method, path, body):
         f"{method} {path} admitted a merchant token: {resp.status_code} "
         f"{resp.text[:400]}"
     )
+    assert not db_tripwire, (
+        f"{method} {path} reached the database with a merchant token: {db_tripwire}"
+    )
 
 
 @pytest.mark.parametrize("method,path,body", UNAUTHENTICATED_ROUTES)
-def test_admin_ops_routes_refuse_a_bogus_admin_key(client, method, path, body):
+def test_admin_ops_routes_refuse_a_bogus_admin_key(client, db_tripwire, method, path, body):
     """An X-ADMIN-KEY that is not the configured one must not pass.
 
     Kills a guard that merely checks the header is PRESENT.
@@ -137,6 +215,130 @@ def test_admin_ops_routes_refuse_a_bogus_admin_key(client, method, path, body):
     assert resp.status_code in (401, 403), (
         f"{method} {path} accepted a bogus admin key: {resp.status_code} "
         f"{resp.text[:400]}"
+    )
+    assert not db_tripwire, (
+        f"{method} {path} reached the database with a bogus admin key: {db_tripwire}"
+    )
+
+
+def _database_identity(module_names):
+    """(how many of these modules expose `database`, which hold a DIFFERENT one).
+
+    The tripwire patches attributes on the db.database singleton. Route modules
+    do `from db.database import database`, so they hold that same object by
+    reference and see the patch. A module that somehow held its own Database
+    would not -- and the refusal tests would read "handler never ran" off an
+    empty list that only means "the tripwire was never in the way".
+    """
+    import importlib
+
+    from db import database as db_module
+
+    checked = 0
+    strangers = set()
+    for module_name in module_names:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, "database"):
+            continue  # not every guarded module talks to the DB
+        checked += 1
+        if module.database is not db_module.database:
+            strangers.add(module_name)
+    return checked, strangers
+
+
+async def test_the_tripwire_lands_on_the_object_the_routes_use(db_tripwire):
+    """The mechanism the three refusal tests now rest on, pinned separately.
+
+    Those tests read "the handler never ran" off `db_tripwire` being EMPTY --
+    and an empty list is also what a tripwire that patched nothing produces. So
+    a broken tripwire (a renamed accessor, a second Database instance, a module
+    that rebound the name) reads exactly like a perfectly guarded route, which
+    is the failure mode that matters: it would restore the silent
+    DROP-on-regression this fixture exists to prevent, while every test stayed
+    green.
+
+    Asserting it needs no request. The route modules all do `from db.database
+    import database`, so they hold the singleton by reference and a patch on
+    its attributes is visible through every alias -- that identity is the whole
+    mechanism, and it is checked directly here. Deliberately independent of the
+    guard, so a failure here means the tripwire is broken rather than the
+    authentication.
+    """
+    from db import database as db_module
+
+    checked, strangers = _database_identity(_GUARDED_MODULES)
+
+    assert not strangers, (
+        f"these modules hold a different Database object than the one the "
+        f"tripwire patches -- the `assert not db_tripwire` in every refusal "
+        f"test above is vacuous for them: {sorted(strangers)}"
+    )
+    assert checked, "no guarded module exposes `database` -- identity check was vacuous"
+
+    # The requirement is stated HERE as a literal, deliberately duplicating
+    # _TRAPPED_ACCESSORS rather than iterating it. Iterating the fixture's own
+    # tuple made this test narrow in lockstep with the thing it polices:
+    # dropping `execute` from the tuple left it green, and `execute` carries
+    # every DROP/ALTER/DELETE in this route set. A test whose expectation is
+    # read out of the code under test can only ever agree with it.
+    must_trap = {"execute", "execute_many", "fetch_all", "fetch_one", "fetch_val"}
+    assert must_trap <= set(_TRAPPED_ACCESSORS), (
+        f"the tripwire stopped trapping {sorted(must_trap - set(_TRAPPED_ACCESSORS))} "
+        f"-- a handler reaching the database through those would leave "
+        f"db_tripwire empty, which every refusal test reads as 'never ran'"
+    )
+
+    for accessor in sorted(must_trap):
+        before = len(db_tripwire)
+        with pytest.raises(_HandlerReached):
+            await getattr(db_module.database, accessor)("SELECT 1")
+        assert len(db_tripwire) == before + 1, (
+            f"database.{accessor} is not trapped -- a handler reaching the DB "
+            f"through it would leave db_tripwire empty, which every refusal "
+            f"test above reads as 'the handler never ran'"
+        )
+
+
+def test_the_identity_check_can_actually_fail():
+    """Proves the check above detects what it claims to.
+
+    Every guarded module really does share the singleton, so the assertion in
+    `test_the_tripwire_lands_on_the_object_the_routes_use` is true whether or
+    not it is computed correctly -- replacing it with `assert True` changes
+    nothing observable, and the tripwire's silent failure mode comes back. A
+    synthetic module holding a DIFFERENT object must be reported, and one
+    holding the real singleton must not.
+    """
+    import sys
+    import types
+
+    from db import database as db_module
+
+    stranger = types.ModuleType("_probe_stranger_database")
+    stranger.database = object()  # a second Database instance, in effect
+    native = types.ModuleType("_probe_native_database")
+    native.database = db_module.database
+    silent = types.ModuleType("_probe_no_database")  # talks to no DB at all
+
+    for module in (stranger, native, silent):
+        sys.modules[module.__name__] = module
+    try:
+        checked, strangers = _database_identity(
+            (stranger.__name__, native.__name__, silent.__name__)
+        )
+    finally:
+        for module in (stranger, native, silent):
+            sys.modules.pop(module.__name__, None)
+
+    assert stranger.__name__ in strangers, (
+        "the identity check did not flag a module holding a different Database "
+        "object -- it cannot fail, so the assertion it guards proves nothing"
+    )
+    assert native.__name__ not in strangers, (
+        "the identity check flags a module that DOES share the singleton"
+    )
+    assert checked == 2, (
+        f"expected the two modules exposing `database` to be counted, got {checked}"
     )
 
 
@@ -203,7 +405,7 @@ def test_every_route_on_these_routers_carries_the_guard(module_name):
 # ---------------------------------------------------------------------------
 
 
-def test_an_admin_credential_still_reaches_these_routes(client):
+def test_an_admin_credential_still_reaches_these_routes(client, db_tripwire):
     """The counterpart the three negative tests above need.
 
     Without it, every assertion in this file stays green if these routes later
@@ -224,14 +426,22 @@ def test_an_admin_credential_still_reaches_these_routes(client):
         token = create_access_token(
             {"sub": f"u-{role}", "email": f"{role}@example.com", "role": role}
         )
+        db_tripwire.clear()
         resp = client.get(path, headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code not in (401, 403), (
             f"{role} was refused its own admin route: {resp.status_code} "
             f"{resp.text[:300]}"
         )
+        # `not in (401, 403)` on its own is satisfied by a 500, so it proves
+        # only that the guard did not refuse -- not that it let anything
+        # through. The tripwire settles it: the handler ran far enough to query.
+        assert db_tripwire, (
+            f"{role} was not refused, but the handler never reached the "
+            f"database either -- this does not show the guard admitted anyone"
+        )
 
 
-def test_a_configured_admin_key_is_admitted_without_a_bearer_header(client, monkeypatch):
+def test_a_configured_admin_key_is_admitted_without_a_bearer_header(client, monkeypatch, db_tripwire):
     """The header-only path, pinned because it is the one a guard built on a
     non-optional HTTPBearer would silently break."""
     monkeypatch.setenv("ADMIN_API_KEY", "the-configured-key")
@@ -244,6 +454,10 @@ def test_a_configured_admin_key_is_admitted_without_a_bearer_header(client, monk
     assert resp.status_code not in (401, 403), (
         f"a correct X-ADMIN-KEY with no Authorization header was refused: "
         f"{resp.status_code} {resp.text[:300]}"
+    )
+    assert db_tripwire, (
+        "the key was not refused, but the handler never reached the database "
+        "-- this does not show the header-only path admits anyone"
     )
 
 

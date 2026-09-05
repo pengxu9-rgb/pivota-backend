@@ -13,6 +13,7 @@ from sqlalchemy import and_, or_, select
 
 from db.commerce_interactions import commerce_interaction_events, commerce_interactions
 from db.database import IS_POSTGRES, database
+from services.commerce_ledger_provenance import resolve_ledger_authority
 from services.traffic_taxonomy_service import (
     TRAFFIC_TAXONOMY_FIELDS,
     attach_traffic_taxonomy,
@@ -69,6 +70,10 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
         "checkout_id": _normalize_text(raw.get("checkout_id")),
         "payment_id": _normalize_text(raw.get("payment_id")),
         "order_id": _normalize_text(raw.get("order_id")),
+        # The canonical cross-authority order identity. `order_id` is what
+        # ONE writer calls the order; `order_ref` is what every writer that
+        # recognises the same purchase calls it.
+        "order_ref": _normalize_text(raw.get("order_ref")),
         "refund_id": _normalize_text(raw.get("refund_id")),
         "return_id": _normalize_text(raw.get("return_id")),
         "canonical_product_id": _normalize_text(raw.get("canonical_product_id")),
@@ -85,6 +90,7 @@ def _coerce_refs(payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dic
 def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
     for key in (
         "click_id",
+        "order_ref",
         "cart_id",
         "order_id",
         "checkout_id",
@@ -111,6 +117,10 @@ def _fallback_interaction_id(refs: Dict[str, Optional[str]]) -> str:
 _INTERACTION_LOOKUP_KEYS = (
     "interaction_id",
     "click_id",
+    # Strong, and deliberately ahead of order_id: two authorities agree on
+    # order_ref and disagree on order_id, so this is the key that converges
+    # a Stripe payment.succeeded with a Shopify orders/paid.
+    "order_ref",
     "order_id",
     "checkout_id",
     "payment_id",
@@ -123,6 +133,12 @@ _INTERACTION_LOOKUP_KEYS = (
 
 _STORE_SCOPED_LOOKUP_KEYS = {
     "interaction_id",
+    # Store-scoped like order_id, and for the same reason: _merge_interactions
+    # REFUSES a cross-store merge, so a lookup key that can reach across stores
+    # would turn a stitch into a raised ValueError. The authorities that share
+    # a canonical order also share a store scope (the Stripe bridge and the
+    # Shopify ingest both resolve the merchant's connected store).
+    "order_ref",
     "click_id",
     "session_id",
     "cart_id",
@@ -423,6 +439,7 @@ _MERGEABLE_INTERACTION_FIELDS = (
     "checkout_id",
     "payment_id",
     "order_id",
+    "order_ref",
     "refund_id",
     "return_id",
     "canonical_product_id",
@@ -674,6 +691,7 @@ async def ensure_interaction(
         "checkout_id": refs.get("checkout_id") or (existing or {}).get("checkout_id"),
         "payment_id": refs.get("payment_id") or (existing or {}).get("payment_id"),
         "order_id": refs.get("order_id") or (existing or {}).get("order_id"),
+        "order_ref": refs.get("order_ref") or (existing or {}).get("order_ref"),
         "refund_id": refs.get("refund_id") or (existing or {}).get("refund_id"),
         "return_id": refs.get("return_id") or (existing or {}).get("return_id"),
         "canonical_product_id": refs.get("canonical_product_id") or (existing or {}).get("canonical_product_id"),
@@ -758,8 +776,30 @@ async def record_commerce_event(
     upstream_idempotency_key: Optional[str] = None,
     actor_type: Optional[str] = None,
     actor_id: Optional[str] = None,
+    write_path: Optional[str] = None,
+    authority: Optional[str] = None,
+    agent_identity_confidence: Optional[str] = None,
+    synthetic: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
+    """Append one event to the ledger.
+
+    ``write_path`` / ``authority`` / ``agent_identity_confidence`` / ``synthetic``
+    are trust provenance stamped by the authenticated ingress. They are stored
+    as first-class columns and are deliberately NOT read from ``metadata``, so
+    a caller-supplied payload cannot claim a standing its route did not grant.
+    When ``write_path`` is given the authority is derived from it here; a
+    caller may name the same authority but never a different one.
+    """
+    if write_path is not None:
+        derived_authority = resolve_ledger_authority(
+            write_path, str(agent_identity_confidence or "")
+        )
+        if authority is not None and authority != derived_authority:
+            raise ValueError(
+                f"write_path {write_path} carries authority {derived_authority}, not {authority}"
+            )
+        authority = derived_authority
     taxonomy = build_traffic_taxonomy(
         metadata,
         metadata=kwargs,
@@ -789,6 +829,10 @@ async def record_commerce_event(
             actor_type=actor_type,
             actor_id=actor_id,
             refs=refs,
+            write_path=write_path,
+            authority=authority,
+            agent_identity_confidence=agent_identity_confidence,
+            synthetic=synthetic,
         )
 
 
@@ -802,6 +846,10 @@ async def _record_commerce_event_unlocked(
     actor_type: Optional[str],
     actor_id: Optional[str],
     refs: Dict[str, Optional[str]],
+    write_path: Optional[str] = None,
+    authority: Optional[str] = None,
+    agent_identity_confidence: Optional[str] = None,
+    synthetic: bool = False,
 ) -> Dict[str, Any]:
     merchant_id = refs.get("merchant_id")
     if not merchant_id:
@@ -862,10 +910,15 @@ async def _record_commerce_event_unlocked(
                 visitor_id=refs.get("visitor_id") or interaction.get("visitor_id"),
                 cart_id=refs.get("cart_id") or interaction.get("cart_id"),
                 payment_id=refs.get("payment_id") or interaction.get("payment_id"),
+                order_ref=refs.get("order_ref") or interaction.get("order_ref"),
                 source=source,
                 upstream_idempotency_key=upstream_idempotency_key,
                 actor_type=actor_type,
                 actor_id=actor_id,
+                write_path=_normalize_text(write_path),
+                authority=_normalize_text(authority),
+                agent_identity_confidence=_normalize_text(agent_identity_confidence),
+                synthetic=bool(synthetic),
                 payload=payload,
             )
         )
@@ -903,6 +956,10 @@ async def record_commerce_event_best_effort(
     upstream_idempotency_key: Optional[str] = None,
     actor_type: Optional[str] = None,
     actor_id: Optional[str] = None,
+    write_path: Optional[str] = None,
+    authority: Optional[str] = None,
+    agent_identity_confidence: Optional[str] = None,
+    synthetic: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     refs = _coerce_refs(metadata, **kwargs)
@@ -921,6 +978,10 @@ async def record_commerce_event_best_effort(
             upstream_idempotency_key=upstream_idempotency_key,
             actor_type=actor_type,
             actor_id=actor_id,
+            write_path=write_path,
+            authority=authority,
+            agent_identity_confidence=agent_identity_confidence,
+            synthetic=synthetic,
             **kwargs,
         )
     except Exception as exc:

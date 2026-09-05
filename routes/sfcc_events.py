@@ -10,6 +10,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from db.database import database
 from services.merchant_event_ingest_service import MerchantEventBatch, ingest_merchant_event_batch
+from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.sfcc_event_adapter import (
     UnsupportedSFCCEvent,
     map_sfcc_integration_event,
@@ -98,6 +99,7 @@ def _verify_signature(
 
 
 @router.post("/{store_id}")
+@telemetry_ingress_route("sfcc_cartridge")
 async def receive_sfcc_events(
     store_id: str,
     request: Request,
@@ -128,6 +130,9 @@ async def receive_sfcc_events(
     if not site_id or not hmac.compare_digest(expected_site_id, str(site_id).strip()):
         raise HTTPException(status_code=401, detail="Invalid SFCC event site")
     _verify_signature(raw, secret=secret, signature=signature, timestamp=timestamp)
+    ingress = current_ingress(request)
+    ingress.identify(merchant_id=dict(store)["merchant_id"], store_id=store_id)
+    await ingress.enforce_rate_limit("platform", store_id)
     try:
         payload = json.loads(raw or b"{}")
     except Exception as exc:
@@ -164,6 +169,7 @@ async def receive_sfcc_events(
         merchant_id=str(store["merchant_id"]),
         batch=MerchantEventBatch(events=mapped),
         agent_identity_confidence="platform_asserted",
+        write_path="sfcc_cartridge",
     )
     return {
         "status": "recorded",

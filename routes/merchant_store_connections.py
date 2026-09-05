@@ -57,6 +57,14 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "orders/updated",
     "orders/paid",
     "orders/cancelled",
+    # Refunds. services/shopify_commerce_event_adapter.py maps refunds/create
+    # into the canonical ledger (refund.created, and refund.succeeded per
+    # successful refund transaction), and routes/webhook_routes.py reconciles
+    # it operationally. Until 2026-09-04 no install path registered it, so
+    # Shopify refunds reached the ledger only for merchants who had run the
+    # verify flow. Every topic the adapter maps must be registered here;
+    # tests/test_shopify_refund_webhook_subscription.py pins that.
+    "refunds/create",
     "fulfillments/create",
     "fulfillments/update",
     "orders/fulfilled",

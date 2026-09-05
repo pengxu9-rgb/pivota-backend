@@ -14,6 +14,7 @@ from db.surface_listing_registry import (
 )
 from readiness.models import ChannelReadinessReport, MerchantReadinessSnapshot
 from services.commerce_interaction_service import record_commerce_event_best_effort
+from services.commerce_ledger_provenance import ledger_provenance
 from services.canonical_commerce_service import (
     make_canonical_product_id,
     make_canonical_variant_id,
@@ -210,6 +211,7 @@ async def persist_channel_export(
                     },
                     source="surface_listing_registry",
                     upstream_idempotency_key=f"listing:{listing_id}:exported:{report.generated_at}",
+                    **ledger_provenance("surface_listing_registry", "unknown"),
                 )
                 receipt_id = _receipt_id(listing_id, "exported")
                 await database.execute(
@@ -258,6 +260,7 @@ async def persist_channel_export(
                 },
                 source="surface_listing_registry",
                 upstream_idempotency_key=f"listing:{listing_id}:{error_code}:{report.generated_at}",
+                **ledger_provenance("surface_listing_registry", "unknown"),
             )
             await database.execute(
                 surface_listing_errors.insert().values(

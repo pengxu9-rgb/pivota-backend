@@ -916,8 +916,8 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
 # (`<product_key>::canonical`) when that budget was chosen, so 40 rows meant 40
 # products. It stops meaning that the moment a lane writes one SKU per real
 # variant: a 60-shade lipstick's rows all share the same p.title / p.brand terms,
-# so they cluster together under `ORDER BY rank_score DESC` and can occupy every
-# slot, returning ONE product where the query should return ~40.
+# so they cluster together under the same ORDER BY and can occupy every slot,
+# returning ONE product where the query should return ~40.
 #
 # The fix is a per-product cap, NOT a dedupe: `_build_canonical_items` groups on
 # sku_key, so one result item IS one SKU, and collapsing to a single row per
@@ -1133,6 +1133,7 @@ async def _fetch_canonical_search_rows(
     # caller of this function.
     brand_anchor_score = ""
     brand_anchor_where = ""
+    brand_priority_score = "0"
     brand_anchor_terms = (
         brand_anchor_terms
         if brand_anchor_terms is not None
@@ -1241,13 +1242,46 @@ async def _fetch_canonical_search_rows(
         # query ("show me Murad products") has no category prefix and still admits the whole brand,
         # which is exactly what that query asked for.
         if category_where:
+            # A newly synced SIG can have an offer before taxonomy enrichment.
+            # Missing taxonomy is not evidence of a category mismatch. Admit
+            # such rows only with BOTH the brand identity above and a literal,
+            # whole-word category phrase in product evidence. Do not override
+            # an existing category path or admit the brand's entire inventory.
+            category_evidence = []
+            query_words = re.findall(r"[a-z0-9]+", lowered)[:40]
+            category_phrases = []
+            for width in range(1, 5):
+                for start in range(len(query_words) - width + 1):
+                    phrase = " ".join(query_words[start:start + width])
+                    if any(f" {known} " in f" {phrase} " for known in category_phrases):
+                        continue
+                    if category_path_prefix_for_query(phrase) == category_prefix:
+                        category_phrases.append(phrase)
+            for index, phrase in enumerate(category_phrases[:8]):
+                param_name = f"brand_category_evidence_{index}"
+                params[param_name] = f"% {phrase} %"
+                category_evidence.extend(
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                    for field in ("p.title", "p.product_type", "s.title")
+                )
+            missing_taxonomy = ""
+            if category_evidence:
+                missing_taxonomy = (
+                    " OR (NULLIF(TRIM(p.category_path), '') IS NULL AND ("
+                    + " OR ".join(category_evidence) + "))"
+                )
             admit_predicate = (
                 "(" + admit_predicate + ")"
-                + " AND (p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix)"
+                + " AND (p.category_path LIKE :category_path_prefix"
+                + missing_taxonomy + ")"
             )
         brand_anchor_where = (
             "\n                OR (" + admit_predicate + ")\n"
         )
+        # Preserve explicit brand/category evidence BEFORE both SQL limits.
+        # A published canonical's +260 structural score otherwise outweighs
+        # the +180 brand boost and can evict every newly synced brand row.
+        brand_priority_score = f"CASE WHEN ({admit_predicate}) THEN 1 ELSE 0 END"
 
     # Token-overlap recall (Part A). ADDITIVE: the whole-phrase `LIKE :query_like`
     # clause above only matches the verbatim phrase, so multi-word queries whose
@@ -1351,6 +1385,7 @@ async def _fetch_canonical_search_rows(
                     {vertical_score}
                     {token_score}
                 ) AS rank_score,
+                {brand_priority_score} AS brand_priority,
                 -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
                 -- + vertical term hits), with NO structural/scope boost. Used to
                 -- order results when v2 is on so the +200 canonical boost can't
@@ -1408,11 +1443,12 @@ async def _fetch_canonical_search_rows(
             {sku_suppression_clause}
         ),
         -- Cap each product's contribution BEFORE the budget is spent, then take
-        -- the top `candidate_limit` rows exactly as before. Ordering inside the
-        -- window mirrors the outer one, so the rows a product keeps are the ones
-        -- it would have won anyway (an exact-SKU match scores +120 and stays
-        -- rank 1, so a SKU-code lookup is unaffected). See
-        -- RECALL_MAX_SKUS_PER_PRODUCT for why this is a cap and not a DISTINCT.
+        -- the top `candidate_limit` rows exactly as before. The window ordering
+        -- mirrors the budget ordering below — brand_priority first (#2063), then
+        -- rank — so the rows a product keeps are the ones it would have won
+        -- anyway: an exact-SKU match scores +120 and stays rank 1, so a SKU-code
+        -- lookup is unaffected. See RECALL_MAX_SKUS_PER_PRODUCT for why this is a
+        -- cap and not a DISTINCT ON (product_key).
         candidate_skus AS (
             SELECT *
             FROM (
@@ -1420,12 +1456,14 @@ async def _fetch_canonical_search_rows(
                     ms.*,
                     ROW_NUMBER() OVER (
                         PARTITION BY ms.product_key
-                        ORDER BY ms.rank_score DESC, ms.sku_updated_at DESC, ms.sku_key
+                        ORDER BY ms.brand_priority DESC, ms.rank_score DESC,
+                                 ms.sku_updated_at DESC, ms.sku_key
                     ) AS product_sku_rank
                 FROM matched_skus ms
             ) ranked
             WHERE ranked.product_sku_rank <= :per_product_sku_cap
-            ORDER BY rank_score DESC, product_updated_at DESC, sku_updated_at DESC
+            ORDER BY brand_priority DESC, rank_score DESC,
+                     product_updated_at DESC, sku_updated_at DESC
             LIMIT :candidate_limit
         )
         SELECT
@@ -1502,7 +1540,7 @@ async def _fetch_canonical_search_rows(
         LEFT JOIN catalog_merchants bm
           ON bm.merchant_id = o.merchant_id
         {offer_seller_where}
-        ORDER BY rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
+        ORDER BY c.brand_priority DESC, rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
         params,

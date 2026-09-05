@@ -20,6 +20,8 @@ that delta beside a `card_rail_outcomes` decline is how they become measurable.
 
 from __future__ import annotations
 
+import json as _json
+
 import pytest
 
 from services.agent_card_issuance import cap_for_quote, headroom_policy, quote_covers
@@ -160,12 +162,21 @@ def test_a_malformed_policy_value_falls_back_to_the_default(monkeypatch, bad):
 
 class _FakeResp:
     status_code = 200
+    headers: "dict[str, str]" = {}
 
     def __init__(self, payload):
         self._payload = payload
 
-    def json(self):
+    def _body(self):
         return {"jsonrpc": "2.0", "id": "1", "result": {"structuredContent": self._payload}}
+
+    async def aiter_raw(self):
+        # `_read_bounded` rebuilds the body from streamed bytes, so this must be the real
+        # payload rather than a placeholder.
+        yield _json.dumps(self._body()).encode()
+
+    def json(self):
+        return self._body()
 
 
 class _FakeClient:
@@ -180,6 +191,26 @@ class _FakeClient:
 
     async def post(self, url, json=None):
         return _FakeResp(self._payload)
+
+    def stream(self, method, url, *, json=None, headers=None):
+        """The transport reads through `client.stream` now, so this double must model it.
+
+        It did not, and only the full sweep caught that: this file was outside the subset run
+        while iterating on merchant_ucp_checkout, so `AttributeError: no attribute 'stream'`
+        reached CI rather than the local run.
+        """
+        return _FakeStream(_FakeResp(self._payload))
+
+
+class _FakeStream:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
 
 
 async def _quote_from(monkeypatch, payload):
