@@ -22,7 +22,7 @@ file, and the schema-guard self-heal for a deploy that skips db/migrations/.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +41,12 @@ PIVOTA_ORDER_ID = "ord_1"
 SHOPIFY_ORDER_ID = "6600123"
 PIVOTA_REF = "pivota:ord_1"
 STORE_ID = "store_a"
+# The two authorities describe ONE purchase, so they must report the same era.
+# Relative to now, not a pinned date: canonical funnel reads are bounded by
+# COMMERCE_FUNNEL_DEFAULT_WINDOW_DAYS, and a fixture stamped a fixed day would
+# quietly fall out of that window as time passed, silently reading back fewer
+# rows than the test believes it wrote.
+FIXTURE_OCCURRED_AT = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
 MERCHANT_ID = "merchant-a"
 ORDER_TOTAL_CENTS = 4999
 
@@ -199,8 +205,8 @@ def _shopify_paid_payload(*, marker: bool) -> Dict[str, Any]:
         "financial_status": "paid",
         "currency": "USD",
         "total_price": "49.99",
-        "processed_at": "2026-09-04T10:00:00Z",
-        "updated_at": "2026-09-04T10:00:00Z",
+        "processed_at": FIXTURE_OCCURRED_AT.isoformat(),
+        "updated_at": FIXTURE_OCCURRED_AT.isoformat(),
     }
     if marker:
         # What Pivota's Shopify order writeback stamps.
@@ -226,7 +232,7 @@ async def _drive_stripe(monkeypatch) -> Dict[str, Any]:
     return await bridge.ingest_stripe_commerce_event_best_effort(
         event_type="payment_intent.succeeded",
         stripe_event_id="evt_stripe_1",
-        event_created=1757000000,
+        event_created=int(FIXTURE_OCCURRED_AT.timestamp()),
         data={
             "id": "pi_1",
             "amount_received": ORDER_TOTAL_CENTS,
@@ -263,7 +269,7 @@ async def _drive_shopify(
         topic=topic,
         payload=_shopify_paid_payload(marker=marker),
         webhook_id="wh_1",
-        occurred_at=datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc),
+        occurred_at=FIXTURE_OCCURRED_AT,
         signature_verified=True,
     )
 

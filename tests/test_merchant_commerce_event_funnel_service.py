@@ -572,10 +572,15 @@ async def test_existing_funnel_exposes_event_only_platform_slices(
                 "Legacy click and attribution rows do not carry a reliable platform/store identity; "
                 "legacy metrics are excluded instead of being assigned to the wrong store."
             ),
+            # since/until bound the canonical ledger only: the legacy click and
+            # attribution rows are mutable accumulators, so their created_at is
+            # the row's birth rather than the time of the activity they count.
+            "time_windowed": False,
         },
         "canonical_events": {
             "included": True,
             "scoped_filters": ["platform"],
+            "time_windowed": True,
         },
     }
     assert funnel["slices"] == [

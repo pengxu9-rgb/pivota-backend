@@ -340,10 +340,49 @@ adds `event_funnel`, `ledger_events_total`, `ledger_interactions_total`, and
 a Pivota click; `observed_order_conversion` additionally includes native store
 events that do not have a click attribution edge.
 
-Reads are newest-first and bounded by `COMMERCE_FUNNEL_LEDGER_EVENT_LIMIT`
+Every canonical read is bounded by a TIME WINDOW as well as by a row limit.
+
+```text
+GET /merchant/analytics/commerce-funnel?since=2026-06-01T00:00:00Z&until=2026-06-30T23:59:59Z
+```
+
+`since` and `until` are ISO-8601 and inclusive; a naive value is read as UTC,
+never as process-local. Omitting both reads the last
+`COMMERCE_FUNNEL_DEFAULT_WINDOW_DAYS` days (default 90); omitting only `until`
+ends the window at now. A caller may widen up to
+`COMMERCE_FUNNEL_MAX_WINDOW_DAYS` (default 400); a wider span is clamped to it.
+`since` after `until` is a 422, as is an unparseable bound. The response
+carries the slice it actually aggregated:
+
+```json
+"window": {"since": "2026-06-01T00:00:00+00:00", "until": "2026-06-30T23:59:59+00:00", "days": 30, "clamped": false}
+```
+
+WHY. Without a window the row limit alone decided the population, and it cuts
+on recency, not on purchases: a `refund.succeeded` inside the newest N can
+belong to an `order.paid` that fell outside it, so `paid_amount_cents_by_currency`
+and `refunded_amount_cents_by_currency` stopped describing the same set of
+purchases with nothing in the response saying so. The bounds are applied in
+SQL, on `occurred_at`, served by migration 206's
+`idx_commerce_interaction_events_merchant_occurred` — verified by `EXPLAIN` on
+real Postgres in `tests/test_commerce_ledger_retention_postgres.py`, so no new
+index was added.
+
+The window bounds the CANONICAL ledger only. The legacy listing, click and
+attribution rows stay all-time and report
+`metric_scopes.legacy_attribution.time_windowed=false`: `surface_click_events`
+and `commerce_attribution_edges` rows are mutable accumulators (impressions,
+clicks, refund counts and amounts are incremented on an existing row), so their
+`created_at` is the row's birth rather than the time of the activity they
+count, and bounding on it would drop today's click on a year-old row. Listing
+rows carry no event time at all.
+
+Reads are also newest-first and bounded by `COMMERCE_FUNNEL_LEDGER_EVENT_LIMIT`
 (default 50,000, minimum 100, maximum 200,000). The response sets
 `event_funnel.truncated=true` when the bound was reached, so callers never
-mistake a partial aggregate for a complete all-time count.
+mistake a partial aggregate for a complete all-time count. `truncated=true`
+inside a wide window is the signal to narrow the window rather than to widen
+the limit.
 If the canonical event store is temporarily unavailable during rollout,
 `event_funnel.available=false` distinguishes that state from a valid empty
 funnel while the legacy analytics response remains available.
@@ -386,3 +425,48 @@ the legacy metrics.
   ]
 }
 ```
+
+## Retention
+
+The ops telemetry canary writes an eight-event chain per run and, until now,
+nothing ever deleted one: neither `commerce_interaction_events` nor
+`commerce_interactions` had any cleanup at all. `scripts/sweep_commerce_ledger_synthetic.py`
+deletes aged PROBE rows only — `synthetic IS TRUE` (migration 213's column,
+served by migration 214's partial index) plus the pre-column shape
+`surface = 'ops_canary'`, which this sweep deliberately treats as synthetic so
+that probe rows written before 213 are not permanently undeletable. It is a
+DRY RUN by default and prints its JSON result; `--apply` performs the deletes,
+in batches of `--batch-size` with one transaction per batch, bounded by
+`--max-batches`. An interaction is deleted only when no `commerce_interaction_events`
+row of any kind still points at it, so an interaction carrying one real event
+and one synthetic event keeps both its row and its real event. As a Cloud Run
+job, following the convention in `docs/runbooks/derive_offer_market_currency.md`
+(`gcloud run jobs execute --args` overrides the Job's baked args, so the full
+argument list is given each time):
+
+```bash
+gcloud run jobs execute sweep-commerce-ledger-synthetic --region us-west1 --project pivota-prod --wait \
+  --args='-m,scripts.sweep_commerce_ledger_synthetic,--older-than-days,7,--apply'
+```
+
+Recommended cadence is daily at a low-traffic hour with `--older-than-days 7`,
+which keeps a week of canary chains available for debugging a failed run.
+**Scheduling is ops config, not code** — this PR ships the script and no
+schedule; creating the Job and its Cloud Scheduler trigger is a separate,
+deliberate ops step, and CI never updates Cloud Run Jobs.
+
+### Real commerce history
+
+No real row is deleted anywhere in this lane, and there is no retention policy
+for real history yet. `--report-horizon-days N` measures what such a policy
+would cost: events and interactions older than N days, per merchant, with the
+oldest `occurred_at` on file. Two options once the numbers are in:
+
+* **Native range partitioning on `occurred_at`.** Dropping a partition is
+  instant and never bloats the table. Cost: `commerce_interaction_events` is an
+  established table, so this is a full rewrite — a new partitioned table, a
+  backfill, a cutover of every writer, and re-creating six indexes.
+* **Periodic archive to GCS, then delete.** No schema change and history stays
+  readable offline. Cost: batched `DELETE`s leave dead tuples for autovacuum,
+  the archive becomes a second source of truth that no query joins, and each
+  run must be idempotent against a partly-finished previous one.

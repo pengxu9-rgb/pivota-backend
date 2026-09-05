@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy import or_, select
@@ -18,6 +20,10 @@ logger = logging.getLogger("merchant_commerce_event_funnel_service")
 OPS_CANARY_SURFACE = "ops_canary"
 
 
+DEFAULT_WINDOW_DAYS = 90
+MAX_WINDOW_DAYS = 400
+
+
 def _event_limit() -> int:
     raw = str(os.getenv("COMMERCE_FUNNEL_LEDGER_EVENT_LIMIT") or "50000").strip()
     try:
@@ -25,6 +31,94 @@ def _event_limit() -> int:
     except ValueError:
         value = 50000
     return max(100, min(value, 200000))
+
+
+def _days_env(name: str, default: int) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, value)
+
+
+def _max_window_days() -> int:
+    return _days_env("COMMERCE_FUNNEL_MAX_WINDOW_DAYS", MAX_WINDOW_DAYS)
+
+
+def _default_window_days() -> int:
+    # A misconfigured default wider than the hard maximum must not become a
+    # way to read all-time history without asking for it.
+    return min(_days_env("COMMERCE_FUNNEL_DEFAULT_WINDOW_DAYS", DEFAULT_WINDOW_DAYS), _max_window_days())
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Aware UTC. A naive bound is read as UTC rather than as process-local.
+
+    asyncpg binds a naive datetime with the CLIENT PROCESS timezone, so a
+    naive bound reaching a `timestamptz` column would silently shift the
+    window by the deploy's offset.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class CommerceFunnelWindow:
+    """The time slice a funnel response actually aggregated.
+
+    Every read is bounded. Without a bound the newest-first LIMIT decides the
+    population by itself, and a `refund.succeeded` inside it can belong to an
+    `order.paid` that fell outside — so paid and refunded stop describing the
+    same set of purchases, with nothing in the response saying so.
+    """
+
+    since: datetime
+    until: datetime
+    clamped: bool
+
+    @property
+    def days(self) -> int:
+        span = (self.until - self.since).total_seconds()
+        return max(0, math.ceil(span / 86400.0))
+
+    def as_payload(self) -> Dict[str, Any]:
+        return {
+            "since": self.since.isoformat(),
+            "until": self.until.isoformat(),
+            "days": self.days,
+            "clamped": self.clamped,
+        }
+
+
+def resolve_funnel_window(
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> CommerceFunnelWindow:
+    """Resolve the requested window against the defaults and the hard maximum.
+
+    Neither bound given -> the last COMMERCE_FUNNEL_DEFAULT_WINDOW_DAYS days.
+    A caller may widen up to COMMERCE_FUNNEL_MAX_WINDOW_DAYS; beyond that the
+    `since` is pulled forward and the response says `clamped: true` rather
+    than quietly answering a narrower question than the one asked.
+    """
+    resolved_now = _as_utc(now) if now is not None else datetime.now(timezone.utc)
+    resolved_until = _as_utc(until) if until is not None else resolved_now
+    max_days = _max_window_days()
+    if since is not None:
+        resolved_since = _as_utc(since)
+    else:
+        resolved_since = resolved_until - timedelta(days=_default_window_days())
+    if resolved_since > resolved_until:
+        raise ValueError("since must not be after until")
+    clamped = False
+    if (resolved_until - resolved_since) > timedelta(days=max_days):
+        resolved_since = resolved_until - timedelta(days=max_days)
+        clamped = True
+    return CommerceFunnelWindow(since=resolved_since, until=resolved_until, clamped=clamped)
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
@@ -394,7 +488,9 @@ def empty_event_funnel_result(
     *,
     limit: Optional[int] = None,
     available: bool = True,
+    window: Optional[CommerceFunnelWindow] = None,
 ) -> CommerceEventFunnelResult:
+    resolved_window = window or resolve_funnel_window()
     return CommerceEventFunnelResult(
         payload={
             "summary": {
@@ -410,6 +506,7 @@ def empty_event_funnel_result(
             "slices": [],
             "truncated": False,
             "event_limit": limit or _event_limit(),
+            "window": resolved_window.as_payload(),
             "available": available,
             "unavailable_reason": None if available else "canonical_event_store_unavailable",
         }
@@ -423,12 +520,22 @@ async def _fetch_event_rows(
     platform: Optional[str],
     store_id: Optional[str],
     limit: int,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
 ) -> tuple[List[Dict[str, Any]], bool]:
     if not getattr(database, "is_connected", True):
         raise RuntimeError("database is not connected")
     query = select(commerce_interaction_events).where(
         commerce_interaction_events.c.merchant_id == merchant_id
     )
+    # Bound the population in SQL, not in Python: the point is to stop shipping
+    # a merchant's whole JSONB history to the app, and to make the aggregated
+    # slice a declared one. Both bounds ride the (merchant_id, occurred_at DESC)
+    # index from migration 206, so no new index is needed.
+    if since is not None:
+        query = query.where(commerce_interaction_events.c.occurred_at >= _as_utc(since))
+    if until is not None:
+        query = query.where(commerce_interaction_events.c.occurred_at <= _as_utc(until))
     if surface:
         query = query.where(commerce_interaction_events.c.surface == surface)
     else:
@@ -472,8 +579,14 @@ async def get_merchant_commerce_event_funnel(
     commerce_surface: Optional[str] = None,
     platform: Optional[str] = None,
     store_id: Optional[str] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
 ) -> CommerceEventFunnelResult:
     limit = _event_limit()
+    # Resolved OUTSIDE the try: an unusable window is a caller error, and
+    # swallowing it as "event store unavailable" would answer a bad request
+    # with a plausible-looking empty funnel.
+    window = resolve_funnel_window(since, until)
     try:
         raw_rows, truncated = await _fetch_event_rows(
             merchant_id=merchant_id,
@@ -481,6 +594,8 @@ async def get_merchant_commerce_event_funnel(
             platform=platform,
             store_id=store_id,
             limit=limit,
+            since=window.since,
+            until=window.until,
         )
     except Exception as exc:
         # The legacy funnel remains available during a partial schema rollout.
@@ -489,7 +604,7 @@ async def get_merchant_commerce_event_funnel(
             merchant_id,
             exc,
         )
-        return empty_event_funnel_result(limit=limit, available=False)
+        return empty_event_funnel_result(limit=limit, available=False, window=window)
 
     filters = {
         "source_channel": source_channel,
@@ -524,6 +639,7 @@ async def get_merchant_commerce_event_funnel(
         ],
         "truncated": truncated,
         "event_limit": limit,
+        "window": window.as_payload(),
         "available": True,
         "unavailable_reason": None,
     }
