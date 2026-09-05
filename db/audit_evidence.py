@@ -204,6 +204,46 @@ VERIFICATION_STATUS_FAILED = "failed"
 VERIFICATION_STATUS_EXHAUSTED_RETRIES = "exhausted_retries"
 VERIFICATION_STATUS_BLOCKED = "blocked"
 
+# ---------------------------------------------------------------------------
+# THE HONESTY STATES (P0 Tier-1 item 1).
+#
+# Everything above is a WORK-QUEUE lifecycle: it says what the runner did, not
+# what we know. That is why "we never checked" and "there is no row" are the
+# same thing today, and it is exactly how a projection reads absence as a pass —
+# the failure the migration judgment rates Critical. Each state below records a
+# DIFFERENT reason a check produced no verdict, so a reader can tell them apart
+# instead of inferring from silence:
+#
+#   unverified      — the check was never attempted. The state §23 leans on
+#                     hardest ("payment not attempted -> UNVERIFIED"), and the
+#                     one CONVERT SALES needs while its browser worker is
+#                     disarmed: the lane has produced NO production observation,
+#                     and that must be storable rather than absent.
+#   skipped         — deliberately not run for this subject (out of scope, gated
+#                     off, not applicable). A decision, not a failure.
+#   provider_failed — we attempted it and the upstream provider did not answer
+#                     usefully. Distinct from `blocked`, which means the
+#                     upstream is unavailable and a retry is pointless.
+#   unparseable     — the provider answered and we could not read the answer.
+#                     Ours to fix, not theirs; conflating it with
+#                     provider_failed sends the fix to the wrong team.
+#
+# All four are TERMINAL and none is reachable from `pending`: they describe a
+# check that will not be retried, and a row in one of them must never be claimed
+# by a worker. They are deliberately NOT added to VERIFICATION_ACTIVE.
+VERIFICATION_STATUS_UNVERIFIED = "unverified"
+VERIFICATION_STATUS_SKIPPED = "skipped"
+VERIFICATION_STATUS_PROVIDER_FAILED = "provider_failed"
+VERIFICATION_STATUS_UNPARSEABLE = "unparseable"
+
+# The states that mean "no verdict, and here is why" — as opposed to
+# `succeeded`, which is a verdict. A projection must never read any of these as
+# a pass, and `read_as_pass` has no member here on purpose.
+VERIFICATION_NO_VERDICT = frozenset({
+    VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
+    VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
+})
+
 VERIFICATION_ACTIVE = frozenset({
     VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_CLAIMED,
 })
@@ -211,7 +251,7 @@ VERIFICATION_TERMINAL = frozenset({
     VERIFICATION_STATUS_SUCCEEDED, VERIFICATION_STATUS_FAILED,
     VERIFICATION_STATUS_EXHAUSTED_RETRIES,
     VERIFICATION_STATUS_BLOCKED,
-})
+}) | VERIFICATION_NO_VERDICT
 
 VALID_VERIFICATION_TRANSITIONS: dict = {
     VERIFICATION_STATUS_PENDING: {VERIFICATION_STATUS_CLAIMED},
@@ -220,11 +260,21 @@ VALID_VERIFICATION_TRANSITIONS: dict = {
         VERIFICATION_STATUS_PENDING,
         VERIFICATION_STATUS_EXHAUSTED_RETRIES,
         VERIFICATION_STATUS_BLOCKED,
+        VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
+        VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
     },
     VERIFICATION_STATUS_SUCCEEDED: set(),
     VERIFICATION_STATUS_FAILED: set(),
     VERIFICATION_STATUS_EXHAUSTED_RETRIES: set(),
     VERIFICATION_STATUS_BLOCKED: set(),
+    # Terminal, and reachable only from `claimed` — a worker that took the row
+    # and learned it could not produce a verdict. NOT reachable from `pending`:
+    # a row nobody claimed has no finding to record, and allowing it would let
+    # an enqueue write its own conclusion.
+    VERIFICATION_STATUS_UNVERIFIED: set(),
+    VERIFICATION_STATUS_SKIPPED: set(),
+    VERIFICATION_STATUS_PROVIDER_FAILED: set(),
+    VERIFICATION_STATUS_UNPARSEABLE: set(),
 }
 
 
