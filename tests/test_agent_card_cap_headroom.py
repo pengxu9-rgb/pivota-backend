@@ -766,16 +766,20 @@ def _pivota_warnings(log):
 
 
 def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(pivota_log):
-    """The quiet failure here is NOT a status code -- it is a live card with no provenance.
+    """The quiet failure here is NOT a status code, and NOT a corrupted cap.
 
     A non-dict `quote_snapshot` does not fail the request. Measured: it renders to
-    `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the mint returns 200 with a
-    real spending cap whose audit row no longer records which quote justified it. Every cause of
-    that branch is ours -- a stale cached shape, a hand-built dict, a refactor -- so nothing
-    external will ever report it, and without this line it reaches production silently.
+    `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the mint returns 200. Every
+    cause of that branch is ours -- a stale cached shape, a hand-built dict, a refactor -- so
+    nothing external will ever report it, and without this line it reaches production silently.
 
-    The review that asked for this framed it as a 502 going out under EXTERNAL_SERVICE_ERROR;
-    that is true only of the DEEP non-dict case, which is the rarer one.
+    Two corrections are baked in here, because both directions have been got wrong once.
+    The review that asked for this framed it as a 502 under EXTERNAL_SERVICE_ERROR; that is true
+    only of the DEEP non-dict case, the rarer one. Then the first draft of this test overcorrected
+    to "a live card with no provenance", which overstates it: `quote_total_minor`,
+    `amount_cap_minor` and `currency` are separate columns, `headroom` survives in the degraded
+    snapshot, and `cap_for_quote` never reads `quote_snapshot` -- so no cap is wrong and nothing
+    declines. What is lost is the merchant's raw payload, the evidence behind the numbers.
     """
     from routes.agent_cards import _dump_snapshot
 
@@ -783,8 +787,19 @@ def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(piv
 
     assert _json.loads(out)["unexpected_snapshot_shape"] == "None", "the mint SUCCEEDS"
     assert any("was not a dict" in m and "NoneType" in m for m in _pivota_warnings(pivota_log))
-    # The VALUE must never reach the sink -- `base` is unbounded and partly merchant-derived.
-    assert not any("unexpected_snapshot_shape\": \"" in m for m in _pivota_warnings(pivota_log))
+
+    # THE VALUE MUST NEVER REACH THE SINK -- `base` is unbounded and partly merchant-derived, and
+    # this is a card-issuance path. Driven with a SENTINEL rather than by inspecting the `None`
+    # case, because the first draft asserted the absence of `unexpected_snapshot_shape": "` from
+    # the log message -- a substring that exists only in the JSON dump and can therefore never
+    # appear in any line this function emits. It was an assertion incapable of failing, under a
+    # comment claiming this exact property was pinned. Measured: a mutant ADDING `value=%r`
+    # alongside the type passed all 78 tests in this file.
+    pivota_log.clear()
+    _dump_snapshot({"quote_snapshot": "SENTINEL_MERCHANT_CONTENT"}, {"max_minor": 7500})
+    warnings = _pivota_warnings(pivota_log)
+    assert any("was not a dict" in m and "str" in m for m in warnings), "the type IS logged"
+    assert not any("SENTINEL_MERCHANT_CONTENT" in m for m in warnings), "the value is NOT"
 
 
 def test_a_normal_snapshot_logs_nothing(pivota_log):

@@ -72,16 +72,22 @@ def _snapshot_with_headroom(quote: Dict[str, Any], cap: Dict[str, Any]) -> Dict[
         # LOG IT, because nothing else will and the mint SUCCEEDS. `resolve_merchant_quote`
         # always builds a dict, so reaching here means one of the causes this docstring names --
         # all of them OURS. And measured: a non-dict snapshot does NOT fail the request. It
-        # renders to `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the card is
-        # issued 200 with a real spending cap whose audit row no longer says which quote
-        # justified it. That is the quiet failure, not a status code: a live card with no
-        # provenance. (Only a DEEP non-dict reaches a 502, via `repr()` recursing below.)
+        # renders to `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the card
+        # issues 200. (Only a DEEP non-dict reaches a 502, via `repr()` recursing below.)
+        #
+        # SCOPED, because an earlier draft of this comment called it "a live card with no
+        # provenance" and that overstates it. The audited NUMBERS survive: `quote_total_minor`,
+        # `amount_cap_minor` and `currency` are their own columns on the row, `headroom` survives
+        # inside the degraded snapshot, and `cap_for_quote` never reads `quote_snapshot` at all --
+        # so the cap is not corrupted and nothing declines or overspends. What is lost is the
+        # merchant's raw payload -- `totals`, `picked`, `covers` -- the EVIDENCE BEHIND those
+        # numbers. Forensic only: nothing in the codebase reads this column back.
         #
         # The TYPE, never the value. `base` is unbounded and partly merchant-derived, and this
         # goes to a log sink; the shape is the whole diagnostic anyway.
         logger.warning(
             "agent-card quote_snapshot was not a dict (type=%s); the card still mints and its "
-            "audit row will carry unexpected_snapshot_shape instead of the quote",
+            "audited amounts are intact, but the merchant payload behind them is not recorded",
             type(base).__name__,
         )
         base = {"unexpected_snapshot_shape": repr(base)[:200]}
