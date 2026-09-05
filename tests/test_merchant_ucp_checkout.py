@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 
+import json as _json
+
 import httpx
 import pytest
 
@@ -33,6 +35,7 @@ PROFILE = "https://ucp.pivota.cc/.well-known/ucp-agent"
 def _configured(monkeypatch):
     monkeypatch.setenv("UCP_AGENT_PROFILE_URL", PROFILE)
     monkeypatch.setenv("MERCHANT_UCP_CHECKOUT_ENABLED", "1")
+    monkeypatch.setenv("MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED", "1")
 
 
 class _Capture:
@@ -66,6 +69,7 @@ class _Capture:
 
             def __init__(self):
                 self.headers = httpx.Headers({})
+                self.content = b"{}"
 
             def json(self):
                 return capture.rpc
@@ -751,6 +755,12 @@ class _Redirector:
                 # real httpx.Headers: case-insensitive, exactly like production
                 self.headers = httpx.Headers(headers)
                 self._rpc = rpc
+                # Real bytes, so the size cap in `_discover_endpoint` sees a real length. A stub
+                # reporting b"" would make the cap untestable and always-passing.
+                try:
+                    self.content = _json.dumps(rpc).encode()
+                except Exception:
+                    self.content = b"{}"
 
             def json(self):
                 # A real httpx response RAISES json.JSONDecodeError on a non-JSON body. A stub
@@ -1520,3 +1530,102 @@ async def test_the_apex_endpoint_is_deduped_after_a_www_hop(monkeypatch):
 
     assert "404" in str(excinfo.value), "the sibling's own 404, not a re-POSTed 301"
     assert r.urls.count(APEX) == 1, "the apex must not be POSTed twice"
+
+
+# --------------------------------------------------------------------------------------
+# The three follow-ups from the security review: an independent kill switch, a bound on the
+# profile body, and the accepted-TOCTOU note that had gone stale.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discovery_is_fail_closed_without_its_own_flag(monkeypatch):
+    """The suite's autouse fixture arms discovery, which is exactly why this test unsets it: an
+    always-armed fixture would hide the fail-closed default, and the default IS the control.
+
+    `get_checkout` writes nothing and so never checks `MERCHANT_UCP_CHECKOUT_ENABLED` — that flag
+    is not a kill switch for this capability. Without its own, the widening would ship with none.
+    """
+    monkeypatch.delenv("MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED", raising=False)
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value)
+    assert r.methods == ["POST"], "disarmed, a 403 must not cost the host a discovery GET"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "false", "off", "no", "", "  "])
+async def test_the_discovery_flag_is_fail_closed_for_every_falsey_spelling(
+    monkeypatch, value
+):
+    monkeypatch.setenv("MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED", value)
+    r = _Redirector({APEX: (403, {}, None)}).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError):
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert r.methods == ["POST"]
+
+
+@pytest.mark.asyncio
+async def test_the_flag_is_read_per_call_so_it_kills_without_a_redeploy(monkeypatch):
+    """Read per call, not frozen at import — the same property the seed-variant sourcing lane
+    documents. A switch you must redeploy to flip is not a kill switch."""
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, _profile(WIX)),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+    assert got["id"] == "chk_1"
+
+    monkeypatch.setenv("MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED", "0")
+    with pytest.raises(MerchantUcpError):
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_profile_is_refused_before_it_is_parsed(monkeypatch):
+    """A UCP profile is a few KB. Without a cap the only bound on what a hostile host can make us
+    buffer and hand to a JSON parser is the 12 s timeout."""
+    fat = {"ucp": {"pad": "x" * (muc._MAX_PROFILE_BYTES + 1),
+                   "services": {"dev.ucp.shopping": [{"transport": "mcp", "endpoint": WIX}]}}}
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, fat),
+        WIX: (200, {}, _ok({"id": "pwned"})),
+    }).install(monkeypatch)
+
+    with pytest.raises(MerchantUcpError) as excinfo:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert "403" in str(excinfo.value)
+    assert r.methods == ["POST", "GET"], "the endpoint inside an oversized profile is never used"
+
+
+@pytest.mark.asyncio
+async def test_a_profile_just_under_the_cap_is_still_used(monkeypatch):
+    """The positive counterpart: a cap that refused everything would pass the test above while
+    breaking the feature."""
+    pad = "x" * (muc._MAX_PROFILE_BYTES // 2)
+    ok_profile = {"ucp": {"pad": pad,
+                          "services": {"dev.ucp.shopping": [
+                              {"transport": "mcp", "endpoint": WIX}]}}}
+    r = _Redirector({
+        APEX: (403, {}, None),
+        WK: (200, {}, ok_profile),
+        WIX: (200, {}, _ok({"id": "chk_1"})),
+    }).install(monkeypatch)
+
+    got = await muc.get_checkout("robinsons.com.sg", "chk_1")
+
+    assert got["id"] == "chk_1"
+    assert r.urls == [APEX, WK, WIX]

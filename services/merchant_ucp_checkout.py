@@ -50,6 +50,7 @@ _TIMEOUT_SECONDS = 12.0
 # Mutating ops only. `get_checkout` is a read and the card rail already depends on it, so gating
 # it here would break a merged path rather than protect one.
 _WRITE_FLAG = "MERCHANT_UCP_CHECKOUT_ENABLED"
+_DISCOVERY_FLAG = "MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED"
 
 # What we tell the merchant referred the buyer. Not the API host: this is the surface a human
 # would have seen, which is what an attribution field is for.
@@ -92,6 +93,28 @@ class MerchantUcpError(ValueError):
 
 def write_ops_enabled() -> bool:
     return str(os.getenv(_WRITE_FLAG) or "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def endpoint_discovery_enabled() -> bool:
+    """Its OWN switch, defaulting OFF, read PER CALL.
+
+    Endpoint discovery is a real widening: it lets a merchant name the host we fetch, and it is
+    reachable through `get_checkout`, which does NOT gate on `_WRITE_FLAG` because it writes
+    nothing. So the write flag is not a kill switch for it and the capability would otherwise
+    ship with none at all.
+
+    Default OFF follows this codebase's rule for anything with blast radius — the seed-variant
+    sourcing lane ships the same way, and an empty brand list there means NONE. Read per call so
+    the switch works without a redeploy. Consequence, stated so it cannot surprise: until this is
+    armed, a Wix merchant still reports no door, which is the pre-existing behaviour and not a
+    regression.
+    """
+    return str(os.getenv(_DISCOVERY_FLAG) or "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
 
 
 # The profile we serve today, as a CODE DEFAULT rather than a required variable. This URL
@@ -378,6 +401,9 @@ _HOP_STATUSES = frozenset({301, 302, 307, 308})
 
 _WELL_KNOWN_PATH = "/.well-known/ucp"
 
+# A real UCP profile is a few KB. Shopify's is ~1.5KB, Wix's ~1KB.
+_MAX_PROFILE_BYTES = 256 * 1024
+
 # The pinned path is a SHOPIFY convention, and platforms do not agree on one. When it answers
 # with one of these — "there is no door at this path" — we fall back to reading the endpoint out
 # of the merchant's own profile. Wix serves a real UCP door at
@@ -544,6 +570,18 @@ async def _discover_endpoint(client: Any, domain: str) -> Optional[str]:
                 resp = await client.get(f"https://{sibling}{_WELL_KNOWN_PATH}")
         if resp.status_code != 200:
             return None
+        # Cap the body BEFORE parsing. A UCP profile is a few KB; the 12 s timeout is otherwise
+        # the only bound on how much a hostile host can make us buffer and then hand to a JSON
+        # parser. `content` is already in memory here, so this bounds the parse, not the read —
+        # the honest fix for the read itself is a streaming cap, noted rather than claimed.
+        body = resp.content
+        if len(body) > _MAX_PROFILE_BYTES:
+            logger.info(
+                "merchant-ucp discovery profile too large domain=%s bytes=%d",
+                domain,
+                len(body),
+            )
+            return None
         # INSIDE the try, deliberately. `resp.json()` raises ValueError on a non-JSON body, and
         # `_validated_endpoint` runs `resolves_only_public`, whose getaddrinfo raises UnicodeError
         # (a ValueError, NOT the OSError its own guard catches) for a 64-character DNS label —
@@ -649,7 +687,12 @@ async def _call_tool(
             # discovered endpoint is re-validated host-first by `_validated_endpoint`, and a
             # discovery that yields nothing leaves the original response untouched, so a merchant
             # with genuinely no door still reports its own status rather than a discovery error.
-            if resp.status_code in _DISCOVER_STATUSES:
+            # 403 has to stay in _DISCOVER_STATUSES — it is exactly what the motivating Wix
+            # merchant answers on the pinned path — but 403 is also what a WAF returns to any
+            # unexpected POST, so naming any public host costs that host a discovery GET. That
+            # forced-request budget is the reason this is behind its own switch rather than
+            # riding on the write flag, which `get_checkout` never checks.
+            if resp.status_code in _DISCOVER_STATUSES and endpoint_discovery_enabled():
                 discovered = await _discover_endpoint(client, domain)
                 already_tried = {f"https://{domain}{_MCP_PATH}", f"https://{fetched}{_MCP_PATH}"}
                 if discovered and discovered not in already_tried:
