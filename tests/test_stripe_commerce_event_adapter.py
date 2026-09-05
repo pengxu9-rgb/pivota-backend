@@ -241,6 +241,7 @@ async def test_stripe_ingest_uses_order_store_scope_and_writes_canonical_batch(m
     assert result["status"] == "accepted"
     assert result["store_id"] == "store-1"
     assert captured[0]["agent_identity_confidence"] == "platform_asserted"
+    assert captured[0]["write_path"] == "stripe_webhook"
     assert captured[0]["batch"].events[0].platform == "shopify"
 
 

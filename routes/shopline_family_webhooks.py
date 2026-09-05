@@ -118,6 +118,7 @@ async def _receive(
         merchant_id=str(store["merchant_id"]),
         batch=batch,
         agent_identity_confidence="platform_asserted",
+        write_path="shopline_webhook" if platform == "shopline" else "shoplazza_webhook",
     )
     return {"status": "recorded", "platform": platform, **result}
 

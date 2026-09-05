@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, Index, String, Table, Text
-from sqlalchemy.sql import func
+from sqlalchemy import Boolean, Column, DateTime, Index, String, Table, Text
+from sqlalchemy.sql import false, func
 
 from db.database import JSONB_TYPE, metadata
 
@@ -121,6 +121,14 @@ commerce_interaction_events = Table(
     Column("upstream_idempotency_key", Text, nullable=True),
     Column("actor_type", String(32), nullable=True),
     Column("actor_id", String(128), nullable=True),
+    # Trust provenance (migration 213). These four are stamped by the ingress
+    # that authenticated the caller, never copied from the event payload:
+    # `source` and `surface` above are caller-supplied strings and must not
+    # decide whose money a refund is or whether a row is a probe.
+    Column("write_path", String(48), nullable=True),
+    Column("authority", String(16), nullable=True),
+    Column("agent_identity_confidence", String(24), nullable=True),
+    Column("synthetic", Boolean, nullable=False, server_default=false()),
     Column("payload", JSONB_TYPE, nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
@@ -148,4 +156,13 @@ Index(
     commerce_interaction_events.c.merchant_id,
     commerce_interaction_events.c.store_id,
     commerce_interaction_events.c.occurred_at.desc(),
+)
+# Probe rows are the only ones a retention job deletes wholesale, so the
+# partial index keeps that sweep from scanning real commerce history.
+Index(
+    "idx_commerce_interaction_events_synthetic",
+    commerce_interaction_events.c.merchant_id,
+    commerce_interaction_events.c.occurred_at.desc(),
+    postgresql_where=commerce_interaction_events.c.synthetic.is_(True),
+    sqlite_where=commerce_interaction_events.c.synthetic.is_(True),
 )

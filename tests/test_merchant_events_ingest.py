@@ -99,6 +99,7 @@ def test_signed_platform_neutral_batch_is_accepted_and_normalized(patched_route)
     call = patched_route[0]
     assert call["merchant_id"] == MERCHANT_ID
     assert call["agent_identity_confidence"] == "merchant_asserted"
+    assert call["write_path"] == "merchant_hmac_batch"
     event = call["batch"].events[0]
     assert event.platform == "cafe24"
     assert event.currency == "USD"
@@ -222,6 +223,7 @@ async def test_ingest_maps_adapter_refs_and_idempotency_to_canonical_ledger(monk
         merchant_id=MERCHANT_ID,
         batch=batch,
         agent_identity_confidence="merchant_asserted",
+        write_path="merchant_hmac_batch",
     )
 
     assert result["accepted"] == 1
@@ -268,12 +270,18 @@ async def test_ingest_keeps_claimed_agent_separate_from_authenticated_writer(
         return {"event_id": "evt_ledger", "interaction_id": "int_ledger", "duplicate": False}
 
     monkeypatch.setattr(service, "record_commerce_event", fake_record)
+    # This test pins the writer/actor mapping for EVERY confidence tier,
+    # including `verified` and `unknown`, which no production write path may
+    # assert today (see test_commerce_ledger_write_path_authority). Bypass the
+    # pairing guard so the mapping itself stays covered.
+    monkeypatch.setattr(service, "resolve_ledger_authority", lambda _wp, _c: "merchant")
     batch = service.MerchantEventBatch.model_validate({"events": [_event()]})
 
     await service.ingest_merchant_event_batch(
         merchant_id=MERCHANT_ID,
         batch=batch,
         agent_identity_confidence=confidence,
+        write_path="merchant_hmac_batch",
     )
 
     assert calls[0]["agent_id"] == "chatgpt-agent"
@@ -301,6 +309,7 @@ async def test_ingest_without_agent_does_not_overwrite_stitched_identity_confide
         merchant_id=MERCHANT_ID,
         batch=batch,
         agent_identity_confidence="platform_asserted",
+        write_path="cafe24_webhook",
     )
 
     assert "agent_identity_confidence" not in calls[0]["metadata"]

@@ -204,6 +204,7 @@ async def receive_adobe_commerce_event(
                 events=mapped[offset: offset + MAX_ADOBE_IO_EVENTS_PER_BATCH]
             ),
             agent_identity_confidence="platform_asserted",
+            write_path="adobe_io_events",
         )
         aggregate["accepted"] += int(result.get("accepted") or 0)
         aggregate["duplicates"] += int(result.get("duplicates") or 0)

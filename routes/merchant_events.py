@@ -327,6 +327,7 @@ async def ingest_web_collector_batch(request: Request):
         merchant_id=str(claims["merchant_id"]),
         batch=batch,
         agent_identity_confidence="browser_observed",
+        write_path="universal_web_collector",
     )
     return JSONResponse(
         {"status": "recorded", **result},
@@ -370,6 +371,7 @@ async def ingest_shopify_pixel_batch(request: Request):
         merchant_id=str(claims["merchant_id"]),
         batch=batch,
         agent_identity_confidence="browser_observed",
+        write_path="shopify_web_pixel",
     )
     return JSONResponse(
         {"status": "recorded", **result},
@@ -432,5 +434,6 @@ async def ingest_event_batch(
         merchant_id=str(merchant["merchant_id"]),
         batch=batch,
         agent_identity_confidence="merchant_asserted",
+        write_path="merchant_hmac_batch",
     )
     return {"status": "recorded", **result}

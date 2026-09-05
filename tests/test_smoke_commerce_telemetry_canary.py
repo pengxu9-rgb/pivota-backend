@@ -121,6 +121,15 @@ def test_signed_batch_uses_exact_compact_body() -> None:
     assert signature == hmac.new(b"secret", body, hashlib.sha256).hexdigest()
 
 
+def test_signed_batch_marks_the_probe_synthetic_at_batch_level() -> None:
+    body, signature = module._signed_batch(
+        [{"event_id": "evt_1"}], "secret", synthetic=True
+    )
+
+    assert body == b'{"events":[{"event_id":"evt_1"}],"synthetic":true}'
+    assert signature == hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+
 def test_read_only_audit_never_posts_and_redacts_jwt(tmp_path: Path) -> None:
     args = _args(tmp_path, write=False)
     session = _Session(
@@ -194,6 +203,9 @@ def test_write_canary_proves_ingest_replay_trace_and_stages(tmp_path: Path) -> N
     assert len(post_calls) == 2
     assert all("Authorization" not in call[2]["headers"] for call in post_calls)
     assert post_calls[0][2]["data"] == post_calls[1][2]["data"]
+    # The probe declares itself synthetic at batch level so the ledger stamps
+    # the column; the surface string alone is caller-supplied and not trusted.
+    assert json.loads(post_calls[0][2]["data"])["synthetic"] is True
     assert (
         post_calls[0][2]["headers"]["X-Pivota-Signature"]
         == post_calls[1][2]["headers"]["X-Pivota-Signature"]

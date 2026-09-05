@@ -51,6 +51,83 @@ _AGENT_WRITER_BY_CONFIDENCE = {
     "unknown": "store_adapter",
 }
 
+# The concrete ingress that authenticated a batch. Every production caller
+# names its own path as a literal; the ledger stores it verbatim so a reader
+# can tell a PSP fact from a merchant-asserted one without parsing the
+# caller-supplied `source` string.
+WritePath = Literal[
+    "universal_web_collector",
+    "shopify_web_pixel",
+    "merchant_hmac_batch",
+    "shopify_webhook",
+    "cafe24_webhook",
+    "cafe24_reconciliation",
+    "woocommerce_webhook",
+    "shopline_webhook",
+    "shoplazza_webhook",
+    "sfcc_cartridge",
+    "adobe_io_events",
+    "stripe_webhook",
+]
+
+# Whose statement of fact an event is. Derived from the write path on the
+# server; the event body cannot raise it. `observational` rows may describe a
+# funnel but never money movement; `psp` is the settlement authority and wins
+# a refund de-duplication against `platform` and `merchant` reports.
+LedgerAuthority = Literal["observational", "merchant", "platform", "psp"]
+
+LEDGER_AUTHORITY_BY_WRITE_PATH: Dict[str, str] = {
+    "universal_web_collector": "observational",
+    "shopify_web_pixel": "observational",
+    "merchant_hmac_batch": "merchant",
+    "shopify_webhook": "platform",
+    "cafe24_webhook": "platform",
+    "cafe24_reconciliation": "platform",
+    "woocommerce_webhook": "platform",
+    "shopline_webhook": "platform",
+    "shoplazza_webhook": "platform",
+    "sfcc_cartridge": "platform",
+    "adobe_io_events": "platform",
+    "stripe_webhook": "psp",
+}
+
+# A write path and the confidence it may assert are one contract, fixed here
+# so a future route cannot pair a browser token with a platform-grade claim.
+_ALLOWED_CONFIDENCE_BY_WRITE_PATH: Dict[str, frozenset[str]] = {
+    "universal_web_collector": frozenset({"browser_observed"}),
+    "shopify_web_pixel": frozenset({"browser_observed"}),
+    "merchant_hmac_batch": frozenset({"merchant_asserted"}),
+    "shopify_webhook": frozenset({"platform_asserted"}),
+    "cafe24_webhook": frozenset({"platform_asserted"}),
+    "cafe24_reconciliation": frozenset({"platform_asserted"}),
+    "woocommerce_webhook": frozenset({"platform_asserted"}),
+    "shopline_webhook": frozenset({"platform_asserted"}),
+    "shoplazza_webhook": frozenset({"platform_asserted"}),
+    "sfcc_cartridge": frozenset({"platform_asserted"}),
+    "adobe_io_events": frozenset({"platform_asserted"}),
+    "stripe_webhook": frozenset({"platform_asserted"}),
+}
+
+# The surface ops probes have always written. Rows carrying it are synthetic
+# even when the batch did not say so, which keeps the pre-flag canary honest.
+OPS_CANARY_SURFACE = "ops_canary"
+
+
+def resolve_ledger_authority(
+    write_path: str, agent_identity_confidence: str
+) -> str:
+    """Return the authority a write path carries, refusing a mismatched claim."""
+    try:
+        authority = LEDGER_AUTHORITY_BY_WRITE_PATH[write_path]
+    except KeyError as exc:
+        raise ValueError(f"unknown ledger write_path: {write_path}") from exc
+    if agent_identity_confidence not in _ALLOWED_CONFIDENCE_BY_WRITE_PATH[write_path]:
+        raise ValueError(
+            f"write_path {write_path} cannot assert "
+            f"agent_identity_confidence={agent_identity_confidence}"
+        )
+    return authority
+
 # The public collector is an analytics contract, not an arbitrary document
 # store. Native adapters reduce their payloads to this vocabulary before model
 # validation; custom/headless collectors must do the same.
@@ -326,6 +403,9 @@ class MerchantEventBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     events: List[MerchantCommerceEvent] = Field(min_length=1, max_length=100)
+    # A caller may only lower its own standing: marking a batch synthetic
+    # removes it from the caller's default funnel and nothing else.
+    synthetic: bool = False
 
 
 async def ingest_merchant_event_batch(
@@ -333,14 +413,22 @@ async def ingest_merchant_event_batch(
     merchant_id: str,
     batch: MerchantEventBatch,
     agent_identity_confidence: AgentIdentityConfidence,
+    write_path: WritePath,
+    synthetic: bool = False,
 ) -> Dict[str, Any]:
     """Normalize and append an idempotent batch to the canonical commerce ledger.
 
     Writes are intentionally individually idempotent rather than wrapped in one long
     transaction. A failed batch can be retried safely using the same event ids while
     already-accepted events are returned as duplicates.
+
+    ``write_path`` names the ingress that authenticated this batch. The ledger
+    authority is derived from it here, on the server, so no event body can
+    promote itself to a PSP or platform fact.
     """
     actor_type = _AGENT_WRITER_BY_CONFIDENCE[agent_identity_confidence]
+    authority = resolve_ledger_authority(write_path, agent_identity_confidence)
+    batch_synthetic = bool(synthetic or batch.synthetic)
     results: List[Dict[str, Any]] = []
     for event in batch.events:
         metadata = {
@@ -379,6 +467,10 @@ async def ingest_merchant_event_batch(
                 else merchant_id
             ),
             metadata=metadata,
+            write_path=write_path,
+            authority=authority,
+            agent_identity_confidence=agent_identity_confidence,
+            synthetic=batch_synthetic or event.surface == OPS_CANARY_SURFACE,
             merchant_id=merchant_id,
             platform=event.platform,
             store_id=event.store_id,

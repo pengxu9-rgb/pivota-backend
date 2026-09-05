@@ -758,8 +758,19 @@ async def record_commerce_event(
     upstream_idempotency_key: Optional[str] = None,
     actor_type: Optional[str] = None,
     actor_id: Optional[str] = None,
+    write_path: Optional[str] = None,
+    authority: Optional[str] = None,
+    agent_identity_confidence: Optional[str] = None,
+    synthetic: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
+    """Append one event to the ledger.
+
+    ``write_path`` / ``authority`` / ``agent_identity_confidence`` / ``synthetic``
+    are trust provenance stamped by the authenticated ingress. They are stored
+    as first-class columns and are deliberately NOT read from ``metadata``, so
+    a caller-supplied payload cannot claim a standing its route did not grant.
+    """
     taxonomy = build_traffic_taxonomy(
         metadata,
         metadata=kwargs,
@@ -789,6 +800,10 @@ async def record_commerce_event(
             actor_type=actor_type,
             actor_id=actor_id,
             refs=refs,
+            write_path=write_path,
+            authority=authority,
+            agent_identity_confidence=agent_identity_confidence,
+            synthetic=synthetic,
         )
 
 
@@ -802,6 +817,10 @@ async def _record_commerce_event_unlocked(
     actor_type: Optional[str],
     actor_id: Optional[str],
     refs: Dict[str, Optional[str]],
+    write_path: Optional[str] = None,
+    authority: Optional[str] = None,
+    agent_identity_confidence: Optional[str] = None,
+    synthetic: bool = False,
 ) -> Dict[str, Any]:
     merchant_id = refs.get("merchant_id")
     if not merchant_id:
@@ -866,6 +885,10 @@ async def _record_commerce_event_unlocked(
                 upstream_idempotency_key=upstream_idempotency_key,
                 actor_type=actor_type,
                 actor_id=actor_id,
+                write_path=_normalize_text(write_path),
+                authority=_normalize_text(authority),
+                agent_identity_confidence=_normalize_text(agent_identity_confidence),
+                synthetic=bool(synthetic),
                 payload=payload,
             )
         )
@@ -903,6 +926,10 @@ async def record_commerce_event_best_effort(
     upstream_idempotency_key: Optional[str] = None,
     actor_type: Optional[str] = None,
     actor_id: Optional[str] = None,
+    write_path: Optional[str] = None,
+    authority: Optional[str] = None,
+    agent_identity_confidence: Optional[str] = None,
+    synthetic: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     refs = _coerce_refs(metadata, **kwargs)
@@ -921,6 +948,10 @@ async def record_commerce_event_best_effort(
             upstream_idempotency_key=upstream_idempotency_key,
             actor_type=actor_type,
             actor_id=actor_id,
+            write_path=write_path,
+            authority=authority,
+            agent_identity_confidence=agent_identity_confidence,
+            synthetic=synthetic,
             **kwargs,
         )
     except Exception as exc:

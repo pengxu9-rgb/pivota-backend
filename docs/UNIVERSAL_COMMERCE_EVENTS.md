@@ -99,6 +99,33 @@ identifiers for merchants with multiple stores.
 Agent identity received through this merchant-signed endpoint is stored as
 `merchant_asserted`; it is not equivalent to a cryptographically verified agent.
 
+## Trust provenance
+
+Every ledger row carries four columns stamped by the ingress that authenticated
+the caller. None of them is read from the event body; `source` and `surface`
+remain caller-supplied diagnostics and no longer decide whose money a refund is
+or whether a row is a probe.
+
+| Column | Values | Set by |
+| --- | --- | --- |
+| `write_path` | `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `shopline_webhook`, `shoplazza_webhook`, `sfcc_cartridge`, `adobe_io_events`, `stripe_webhook` | the route that verified the request |
+| `authority` | `observational` (browser), `merchant` (HMAC collector), `platform` (native signed webhook, reconciliation replay), `psp` (Stripe bridge) | derived from `write_path` on the server |
+| `agent_identity_confidence` | `browser_observed` < `merchant_asserted` < `platform_asserted` < `verified` | fixed per `write_path`; a mismatched pair is refused |
+| `synthetic` | boolean, default false | `true` when the batch says `"synthetic": true` or the event surface is `ops_canary` |
+
+`synthetic` is the only provenance a caller may influence, and only downward:
+a synthetic batch is excluded from the caller's own default funnel and nothing
+else. No production ingress issues `verified` today; the tier exists in the
+core and the pairing table keeps it unissued until an ingress actually
+authenticates the agent.
+
+Refund de-duplication in the funnel groups by `authority`: a PSP report and a
+store-platform report of the same refund are kept as two authorities and the
+larger total wins, so a merchant collector that labels itself
+`source="stripe_webhook"` is still counted as `merchant`. Rows written before
+migration 213 have no stamp and fall back to the legacy `source`/`surface`
+inference.
+
 ## Metadata safety
 
 `metadata` is a bounded analytics extension, not an arbitrary native-payload
