@@ -519,6 +519,7 @@ def shopify_product_to_record(
     domain: str,
     category_path: str,
     brand_override: Optional[str] = None,
+    emit_variants: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -554,7 +555,16 @@ def shopify_product_to_record(
     if variant is None:
         return None
     image = _first(product.get("images")) or {}
-    barcode = str(variant.get("barcode") or "").strip() or None
+    # A FOLDED row is a product LINE, not one physical item: its variants are the
+    # shades, each with its own GTIN. Taking the first shade's barcode as the line's
+    # would publish (say) Ruby Woo's GTIN on "Retro Matte Lipstick", and GTIN is
+    # Tier-0a in identity resolution — it OUTRANKS brand+title, so a retailer's
+    # single-shade PDP carrying that GTIN would attach to the whole line. The stub
+    # the fold replaced carried no barcode; the line keeps none.
+    barcode = (
+        None if product.get(FOLDED_INTO_KEY)
+        else (str(variant.get("barcode") or "").strip() or None)
+    )
     # Every sellable variant, when the product has more than one: the ingest
     # writes one SKU + offer per entry beside the canonical SKU, so a folded
     # shade line (see fold_shade_listings) keeps its purchasable SKUs. Single-
@@ -564,21 +574,35 @@ def shopify_product_to_record(
         if isinstance(v, dict) and (_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE
     ]
     pdp_variants: List[Dict[str, Any]] = []
-    if len(sellable) >= 2:
+    # OPT-IN. Emitting variants writes one extra SKU + offer per variant downstream,
+    # which changes recall fan-out, offer aggregation and INCI attachment for EVERY
+    # row a caller ingests — so it fires only for the fold lane that asked for it.
+    # `records_for_brand(base_listings_only=True)` is the only caller that does.
+    if emit_variants and len(sellable) >= 1 and product.get(FOLDED_INTO_KEY):
         seen_ids: set = set()
         for i, v in enumerate(sellable):
             vid = str(v.get("id") or v.get("variant_id") or f"{handle}:{i}").strip()
             if vid in seen_ids:
                 continue
             seen_ids.add(vid)
+            # option1 is the merchant's own shade value and outranks a name derived
+            # from the title suffix; `featured_image` is where a real Shopify variant
+            # carries its swatch (`image_src` is set only by the fold).
+            featured = v.get("featured_image")
+            featured_src = str((featured or {}).get("src") or "").strip() if isinstance(featured, dict) else ""
             pdp_variants.append({
                 "variant_id": vid,
                 "sku": str(v.get("sku") or "").strip() or None,
                 "barcode": str(v.get("barcode") or "").strip() or None,
-                "title": str(v.get("title") or v.get("option1") or "").strip() or None,
+                "title": str(v.get("option1") or v.get("title") or "").strip() or None,
                 "price": _to_float(v.get("price")),
                 "in_stock": bool(v.get("available")),
-                "image_url": str(v.get("image_src") or "").strip() or str(image.get("src") or "").strip() or None,
+                "image_url": (
+                    featured_src
+                    or str(v.get("image_src") or "").strip()
+                    or str(image.get("src") or "").strip()
+                    or None
+                ),
                 "source_handle": str(v.get(FOLDED_FROM_KEY) or "").strip() or None,
             })
     raw_tags = product.get("tags")
@@ -652,6 +676,18 @@ def shopify_product_to_record(
 # every " - " split point is tried, longest base first.
 _SHADE_SEP = " - "
 FOLDED_FROM_KEY = "_folded_from_handle"
+FOLDED_INTO_KEY = "_folded_shades"
+# A suffix that names a merchandising state, not a shade. tarte sells "<line> - <X>
+# charm" as separate $10 accessories and stila suffixes "- Last Chance"/"- Limited
+# Edition" onto whole palettes; folding those makes an accessory a "shade" of the
+# product it accessorises and destroys its own PDP. Measured 2026-09-05: 9 such
+# false folds across the five cached feeds, 0 legitimate shades excluded.
+_NON_SHADE_SUFFIX_RE = re.compile(
+    r"(?i)\b(charm|last chance|limited edition|refill|travel size|mini|set|kit|bundle|gift card|sample)\b"
+)
+# A shade of a product costs what the product costs. A folded row priced far from its
+# base is a different item wearing a similar name.
+_FOLD_PRICE_RATIO = 1.5
 
 
 def _shade_bases(title: str) -> List[str]:
@@ -660,6 +696,24 @@ def _shade_bases(title: str) -> List[str]:
     'Lip Pencil']. Only ' - ' (space-hyphen-space) is a separator."""
     parts = title.split(_SHADE_SEP)
     return [_SHADE_SEP.join(parts[:i]).strip() for i in range(len(parts) - 1, 0, -1)]
+
+
+def _first_price(product: Dict[str, Any]) -> Optional[float]:
+    for v in (product or {}).get("variants") or []:
+        p = _to_float((v or {}).get("price")) if isinstance(v, dict) else None
+        if p is not None and p > 0:
+            return p
+    return None
+
+
+def _fold_refused(base: Dict[str, Any], shade: Dict[str, Any], suffix: str) -> Optional[str]:
+    """Why this row must NOT be folded into that base, or None to fold."""
+    if _NON_SHADE_SUFFIX_RE.search(suffix or ""):
+        return "non_shade_suffix"
+    bp, sp = _first_price(base), _first_price(shade)
+    if bp and sp and (max(bp, sp) / min(bp, sp)) > _FOLD_PRICE_RATIO:
+        return "price_mismatch"
+    return None
 
 
 def _is_stub_variant(product: Dict[str, Any]) -> bool:
@@ -693,6 +747,7 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
             by_norm[key] = p
     folded_into: Dict[int, List[Dict[str, Any]]] = {}  # id(base) -> shade rows
     shade_of: Dict[int, Dict[str, Any]] = {}            # id(shade row) -> base
+    refusals: List[Dict[str, str]] = []
     for p in products:
         title = str((p or {}).get("title") or "").strip()
         variants = (p or {}).get("variants") or []
@@ -700,11 +755,17 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
             continue
         for base_title in _shade_bases(title):
             base = by_norm.get(normalize_title(base_title)) if base_title else None
-            if base is not None and base is not p:
-                folded_into.setdefault(id(base), []).append(p)
-                shade_of[id(p)] = base
+            if base is None or base is p:
+                continue
+            suffix = title[len(base_title):].lstrip(" -").strip()
+            refused = _fold_refused(base, p, suffix)
+            if refused:
+                refusals.append({"handle": str(p.get("handle") or ""), "title": title, "reason": refused})
                 break
-    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "folded": {}}
+            folded_into.setdefault(id(base), []).append(p)
+            shade_of[id(p)] = base
+            break
+    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "folded": {}, "refused": refusals}
     out: List[Dict[str, Any]] = []
     for p in products:
         if id(p) in shade_of:
@@ -732,6 +793,13 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
             else:
                 shade_name = shade_title
             sv = dict((s.get("variants") or [{}])[0] or {})
+            # The shade row's OWN option1 is the merchant's shade value and wins:
+            # stila's "Calligraphy Lip Stain - Last Chance Shade" carries
+            # option1 "Elizabeth (Pinky Nude)", and taking the title suffix minted a
+            # phantom second SKU for the same merchant code.
+            own_label = str(sv.get("option1") or "").strip()
+            if own_label and own_label.lower() not in ("default title",):
+                shade_name = own_label
             sv["title"] = shade_name
             sv["option1"] = shade_name
             sv.setdefault("id", s.get("id"))
@@ -742,6 +810,7 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
             new_variants.append(sv)
             handles.append(str(s.get("handle") or ""))
         base["variants"] = new_variants
+        base[FOLDED_INTO_KEY] = len(shades)
         report["bases"] += 1
         report["shades"] += len(shades)
         report["folded"][str(p.get("handle") or base_title)] = handles
@@ -784,7 +853,8 @@ async def records_for_brand(
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:
         rec = shopify_product_to_record(
-            p, domain=domain, category_path=category_path, brand_override=brand
+            p, domain=domain, category_path=category_path, brand_override=brand,
+            emit_variants=base_listings_only,
         )
         if not rec:
             continue

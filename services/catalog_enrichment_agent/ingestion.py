@@ -211,10 +211,22 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
 VARIANT_SKU_INFIX = "::v:"
 
 
+# catalog_skus.sku_key is VARCHAR(255) and product_key alone can reach 214 chars
+# (derive_product_key: 'ext:' + canonical[:200] + '::' + 8 hex), so the variant
+# suffix has to fit in what is left rather than assume the 11 chars '::canonical'
+# always did. A token that would overflow is hashed, which keeps the key stable
+# across re-runs (the whole point of deriving it from the merchant's variant id).
+_SKU_KEY_MAX = 255
+
+
 def derive_variant_sku_key(product_key: str, variant_id: str) -> str:
     """One SKU per real variant, keyed on the merchant's own variant id so
     re-runs UPSERT; distinct from the canonical '::canonical' SKU."""
     token = _normalize_token(str(variant_id)).replace(" ", "-")[:60] or "v"
+    budget = _SKU_KEY_MAX - len(product_key) - len(VARIANT_SKU_INFIX)
+    if budget < len(token):
+        digest = hashlib.sha1(str(variant_id).encode("utf-8")).hexdigest()[:16]
+        token = digest if budget >= len(digest) else digest[: max(budget, 0)]
     return f"{product_key}{VARIANT_SKU_INFIX}{token}"
 
 
@@ -244,14 +256,15 @@ def _build_variant_sku_inserts(
             continue
         seen.add(sku_key)
         shade = str(v.get("title") or "").strip()
-        labels = [f"shade_{_normalize_token(shade).replace(' ', '_')}"] if shade else []
+        shade_token = _normalize_token(shade).replace(" ", "_").strip("_")
+        labels = [f"shade_{shade_token}"] if shade_token else []
         rows.append({
             "sku_key": sku_key,
             "product_key": product_key,
             "merchant_id": seller["merchant_id"],
             "platform": SYNTHETIC_PLATFORM,
             "source_product_id": canonical_product_name(pdp_payload["brand"], pdp_payload["product_name"]),
-            "source_variant_id": vid,
+            "source_variant_id": vid[:128],
             "source_domain": pdp_payload.get("source_domain") or None,
             "sku": str(v.get("sku") or "").strip() or None,
             "barcode": str(v.get("barcode") or "").strip() or None,

@@ -840,3 +840,14 @@ def test_plan_counts_variant_skus():
     assert len(plan["skus"]) == 4
     assert len(plan["offers"]) == 4
     assert plan["skipped"] == 0
+
+
+def test_variant_sku_key_fits_the_column_for_a_long_product_key():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    long_pk = "ext:" + ("a" * 200) + "::deadbeef"          # 214 chars, the real ceiling
+    key = ing.derive_variant_sku_key(long_pk, "5405734574509012345678901234567890")
+    assert key.startswith(long_pk + ing.VARIANT_SKU_INFIX)
+    assert len(key) <= 255
+    # stable across calls — re-runs must UPSERT, not mint a second row
+    assert key == ing.derive_variant_sku_key(long_pk, "5405734574509012345678901234567890")
