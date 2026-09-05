@@ -18,6 +18,8 @@ top-level, with total_amount/grand_total as scalar fallbacks.
 from __future__ import annotations
 
 import ipaddress
+import json
+import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -141,16 +143,42 @@ def to_minor_units(amount: Any, currency: str) -> Optional[int]:
             d = Decimal(s)
         except Exception:
             return None
+        # BEFORE `d <= 0`, because comparing a NaN raises InvalidOperation rather than answering.
+        # A merchant `amount` of 1e400 / NaN / "sNaN" / "1e999999999" reaches here as request data
+        # via resolve_merchant_quote, and each raises an ArithmeticError that neither this
+        # function nor routes/agent_cards.py (which catches only MerchantQuoteError) translates —
+        # an unhandled 500. Same class as the `int(inf)` fixed for CALLER input in
+        # merchant_ucp_checkout.build_line_items; this is the MERCHANT-input half, one hop down.
+        if not d.is_finite():
+            return None
         if d <= 0:
             return None
         exponent = 0 if currency.upper() in _ZERO_DECIMAL_CURRENCIES else 2
         # ROUND_CEILING, not the Decimal default (banker's): this number becomes a spending CAP.
+        # Caveat: the multiply runs under the default context (prec=28), which rounds BEFORE
+        # to_integral_value sees it, so above 28 significant digits the cap can land one minor
+        # unit LOW — fail-safe (a low cap declines, it cannot overspend) but not "always up".
         # Rounding a half-cent DOWN mints a card the merchant's real charge then declines;
         # rounding up mints at most one extra minor unit of headroom. For a cap, up is safe.
         from decimal import ROUND_CEILING
 
-        minor = (d * (10 ** exponent)).to_integral_value(rounding=ROUND_CEILING)
-        value = int(minor)
+        # MAGNITUDE, before the arithmetic — because the hazard on the next lines is COST, not
+        # exception class. `Decimal("9e999997")` is finite, and `d * 100` lands at exponent
+        # 999999, still inside Emax, so decimal.Overflow never fires; `int()` then materialises a
+        # million-digit integer. Measured: 19.1 SECONDS, from 8 bytes of merchant input, blocking
+        # the whole event loop because this function is sync on an async request path. The
+        # ArithmeticError guard below was necessary and did not cover this at all.
+        # `adjusted()` is O(1) (measured 1 microsecond) and 18 digits is already three orders
+        # above _MAX_CAP_MINOR, so nothing legitimate is refused.
+        if d.adjusted() > 18:
+            return None
+        # `is_finite` is not enough on its own: Decimal("1e999999999") IS finite, and only the
+        # multiply below raises decimal.Overflow. Guard the arithmetic too.
+        try:
+            minor = (d * (10 ** exponent)).to_integral_value(rounding=ROUND_CEILING)
+            value = int(minor)
+        except ArithmeticError:
+            return None
         return value if 0 < value <= _MAX_CAP_MINOR else None
     return None
 
@@ -199,7 +227,10 @@ _SHIPPING_KEYS = ("fulfillment", "total_shipping", "shipping", "delivery")
 _TAX_KEYS = ("tax", "total_tax", "taxes")
 
 
-def _is_quoted_amount(value: Any) -> bool:
+_MAX_AMOUNT_NESTING = 8
+
+
+def _is_quoted_amount(value: Any, _depth: int = 0) -> bool:
     """Did the merchant name an AMOUNT here, or merely a key?
 
     Mirrors the gateway's `pickMoney`, which this backend copy was looser than: a number, a
@@ -210,17 +241,47 @@ def _is_quoted_amount(value: Any) -> bool:
     if value is None or isinstance(value, bool):
         return False
     if isinstance(value, (int, float)):
-        return True
+        # NaN and inf are floats, and `float("NaN")`/`float("inf")` parse from strings too. Read
+        # as a quoted amount they say "the merchant DID quote tax", which strips headroom and
+        # mints a cap that declines the moment real tax lands — the decline direction this
+        # function's docstring exists to prevent for `{}` and `"n/a"`.
+        return math.isfinite(value)
     if isinstance(value, str):
         try:
-            float(value.strip())
+            parsed = float(value.strip())
         except ValueError:
             return False
-        return True
+        return math.isfinite(parsed)
     if isinstance(value, dict):
+        # BOUNDED. This walks merchant-authored JSON, and `{"amount": {"amount": {...}}}` nests
+        # as deep as the merchant likes, one Python frame per level.
+        #
+        # On the PINNED runtime (runtime.txt: python-3.11) this bound is NOT what stops a 500.
+        # C and Python recursion share one budget there, and `resp.json()` is called STRICTLY
+        # DEEPER than this walk -- `resolve_merchant_quote` -> `get_checkout` -> `_call_tool` ->
+        # `resp.json()` -- so the parser always runs out first. Measured end to end through the
+        # real transport with this bound REVERTED: a return below the cliff and a clean 502
+        # above it, near depth 965 through the app. The exact integer is a harness constant --
+        # driving the service directly puts it a few frames higher -- so nothing asserts it. The
+        # 502 is the transport's own "merchant response was not JSON", and NO depth yields a
+        # 500 on either path. An earlier version of this comment claimed a measured 500 here;
+        # that was an artifact of a probe that added a frame PER LEVEL. A deeper stack adds a
+        # CONSTANT, which shifts the parser and this walk equally and preserves the ordering.
+        #
+        # It is load-bearing on 3.12+, where the two budgets are separate: measured on 3.12.8,
+        # `json.loads` accepts 9997 levels while this pure-Python walk still stops at 996. The
+        # parser stops gating and the walk trips first -- and RecursionError is a RuntimeError,
+        # so no `except (TypeError, ValueError)` on this path catches it. This is forward cover
+        # for that upgrade, not a fix for a live 3.11 defect.
+        #
+        # A real quote nests `{"amount": {"amount": 5}}` once or twice; 8 is far past that.
+        # `False` means "the merchant did not quote tax", which ADDS headroom -- and grants
+        # nothing the merchant could not get by simply OMITTING the key.
+        if _depth >= _MAX_AMOUNT_NESTING:
+            return False
         for key in ("amount", "value"):
             if key in value:
-                return _is_quoted_amount(value[key])
+                return _is_quoted_amount(value[key], _depth + 1)
     return False
 
 
@@ -306,6 +367,32 @@ async def resolve_merchant_quote(merchant_domain: str, checkout_id: str) -> Dict
     if total_minor is None:
         raise MerchantQuoteError("merchant quote total was not a positive amount")
     covers = quote_covers(payload)
+    # The snapshot must be JSON-safe HERE, not at the route. `json.loads` accepts bare `NaN` and
+    # `Infinity`, so a merchant `tax: NaN` beside a valid total survives quoting — and then
+    # `json.dumps(..., allow_nan=False)` in the route raises ValueError, which no handler there
+    # translates. That turned a DB-insert 500 into a json-dumps 500 one line earlier rather than
+    # fixing it. This function's whole contract is that a bad merchant answer becomes a
+    # MerchantQuoteError the route maps to 502, so the check belongs where that contract holds.
+    snapshot = {
+        "totals": payload.get("totals"),
+        "currency": currency,
+        "checkout_status": payload.get("status"),
+    }
+    try:
+        json.dumps(snapshot, allow_nan=False)
+    except (ValueError, TypeError):
+        raise MerchantQuoteError("merchant quote carried a non-finite or unserialisable amount")
+    except RecursionError:
+        # `json.dumps` recurses over merchant `totals` too, and RecursionError is a RuntimeError
+        # that the clause above does not catch -- so bounding `_is_quoted_amount` alone would
+        # just move the same 500 four lines down.
+        #
+        # DEFENCE IN DEPTH, not a reachable path, and NOT "forward cover for 3.12" as an earlier
+        # comment claimed: `dumps` and `loads` are the same C encoder on one shared limit,
+        # measured identical on both runtimes (993/993 on 3.11, 9997/9997 on 3.12.8), and
+        # `resp.json()` parses strictly deeper, so the parser always refuses first. The 3.12
+        # argument is real for the pure-Python walk above (996 vs 9997) and only for that.
+        raise MerchantQuoteError("merchant quote nested beyond the readable depth")
     return {
         "total_minor": total_minor,
         "currency": currency,
