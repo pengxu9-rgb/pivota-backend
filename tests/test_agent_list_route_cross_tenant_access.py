@@ -586,3 +586,43 @@ def test_a_padded_owner_email_matches(client, monkeypatch):
     assert _agent_ids(resp.json()) == [AGENT_A], (
         f"a padded owner_email did not match its own token: {resp.text}"
     )
+
+
+def test_a_failed_probe_is_not_cached_forever(client, monkeypatch):
+    """A probe raises for two reasons -- the column is absent, or the database
+    is momentarily unreachable -- and `except Exception` cannot tell them
+    apart. Caching an inconclusive answer would be permanent: one blip on the
+    first request after a deploy would pin the result to () and hand every
+    agent an empty roster, with a 200, until the process restarted.
+
+    Here the first request's probes all fail; the second, with the database
+    healthy, must still find the agent's own record.
+    """
+    from routes import agent_management as mod
+
+    spy = _AgentsDbSpy()
+    failing = {"on": True}
+    real_fetch_one = spy.fetch_one
+
+    async def flaky_fetch_one(query, values=None, *a, **kw):
+        if failing["on"] and "LIMIT 0" in str(query).upper():
+            raise RuntimeError("connection reset")
+        return await real_fetch_one(query, values, *a, **kw)
+
+    monkeypatch.setattr(spy, "fetch_one", flaky_fetch_one)
+    monkeypatch.setattr(mod, "database", spy)
+    token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
+
+    first = client.get("/agents/", headers=_auth(token))
+    assert first.status_code == 200, first.text
+    assert mod._AGENT_EMAIL_COLUMNS is None, (
+        "an inconclusive probe was cached, which is permanent for the process"
+    )
+
+    failing["on"] = False
+    second = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
+
+    assert second.status_code == 200, second.text
+    assert _agent_ids(second.json()) == [AGENT_A], (
+        f"the agent stayed locked out after the database recovered: {second.text}"
+    )

@@ -429,6 +429,17 @@ async def _agent_email_columns() -> Tuple[str, ...]:
     use. The column names are module constants, never request input. Cached
     for the process: a table does not grow a column mid-request, and this must
     not become a second query on every list call.
+
+    CACHED ONLY WHEN CONCLUSIVE. A probe raises for two very different reasons
+    -- the column is absent, or the database is momentarily unreachable -- and
+    an `except Exception` cannot tell them apart. Caching an inconclusive
+    answer would be permanent: one blip on the first request after a deploy
+    would pin the result to () and hand every agent an EMPTY roster, silently
+    and with a 200, until the process restarted. owner_email is known present
+    (agents.select() names it and works in production), so a run where NOTHING
+    probed successfully is a database problem, not a schema answer -- leave the
+    cache unset and let the next request try again. The cost of that is one
+    extra pair of LIMIT 0 queries on a request that was already failing.
     """
     global _AGENT_EMAIL_COLUMNS
     if _AGENT_EMAIL_COLUMNS is not None:
@@ -439,10 +450,18 @@ async def _agent_email_columns() -> Tuple[str, ...]:
         try:
             await database.fetch_one(text(f"SELECT {name} FROM agents LIMIT 0"))
             present.append(name)
-        except Exception:
-            # Absent, or the table is unreadable. Either way this column cannot
-            # carry an ownership match; the id claims still can.
-            logger.info(f"[GET /agents/] agents.{name} not usable for ownership matching")
+        except Exception as exc:
+            logger.info(
+                f"[GET /agents/] agents.{name} not usable for ownership "
+                f"matching: {type(exc).__name__}"
+            )
+
+    if not present:
+        logger.warning(
+            "[GET /agents/] no email column could be probed; not caching the "
+            "result -- treating this as a database problem, not a schema answer"
+        )
+        return ()
 
     _AGENT_EMAIL_COLUMNS = tuple(present)
     return _AGENT_EMAIL_COLUMNS
