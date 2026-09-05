@@ -140,7 +140,7 @@ every site that installed the app delivers there. There is no per-site
 registration call, so this bridge has no subscription manager at all, and the
 store is resolved from the delivery's `instanceId` — the id of the app instance
 on that site, and the only site-scoping key a REST delivery carries. That id is
-new to `merchant_stores`: `POST /merchant-stores/wix/connect` now accepts an
+new to `merchant_stores`: `POST /integrations/wix/connect` now accepts an
 optional `instance_id` and stores the credential as a JSON blob when one is
 given. A store connected in API-key mode without the app installed has no
 instance and can never receive telemetry.

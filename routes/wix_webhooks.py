@@ -31,9 +31,7 @@ resolved -> identify + platform rate limit -> supported event -> map -> ingest.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -41,6 +39,11 @@ from fastapi import APIRouter, HTTPException, Request, status
 from db.database import database
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
 from services.telemetry_ingress import current_ingress, telemetry_ingress_route
+from services.wix_connection import (
+    coerce_wix_credential_blob,
+    find_wix_stores_by_instance_id,
+    normalize_wix_api_key,
+)
 from services.wix_event_adapter import (
     UnsupportedWixEvent,
     is_supported_wix_event,
@@ -67,57 +70,37 @@ MAX_WIX_WEBHOOK_BYTES = 1_000_000
 _UNAUTHORIZED = "Invalid Wix webhook signature"
 _UNKNOWN_STORE = "Unknown Wix app instance"
 
-# A Wix instance id is a GUID. Constraining it before it reaches a SQL LIKE
-# keeps `%`/`_` out of the pattern, and a value that cannot be an instance id
-# is a 404 without touching the database.
-_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$")
-
-
-def _credentials(raw: Any) -> Dict[str, Any]:
-    """The credential JSON in `merchant_stores.api_key`, or `{}` for a bare key."""
-    if isinstance(raw, dict):
-        return dict(raw)
-    value = str(raw or "").strip()
-    if not value.startswith("{"):
-        return {}
-    try:
-        parsed = json.loads(value)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
-    return dict(parsed) if isinstance(parsed, dict) else {}
-
-
-def _stored_instance_id(credentials: Dict[str, Any]) -> str:
-    return str(
-        credentials.get("instance_id") or credentials.get("wix_instance_id") or ""
-    ).strip()
 
 
 async def _resolve_store(instance_id: str) -> Optional[Dict[str, Any]]:
-    """The active Wix store whose stored instance id is exactly `instance_id`.
+    """The ONE active Wix store whose stored instance id is exactly `instance_id`.
 
-    The instance id lives inside the credential JSON, which SQLite and Postgres
-    cannot be asked to index the same way, so the LIKE only NARROWS the scan and
-    the exact comparison happens in Python — a substring match is never allowed
-    to resolve a store.
+    Shape check, `LIKE`-narrowed scan and exact Python comparison all live in
+    `services.wix_connection.find_wix_stores_by_instance_id`, which the connect
+    route uses for its uniqueness check too — one technique, one place.
+
+    `merchant_stores` has no uniqueness constraint on the instance id, so two
+    rows CAN carry the same one. Handing the delivery to whichever row the
+    database returned first would let a second merchant who typed another
+    merchant's instance id receive their signed events, silently. An ambiguous
+    instance is therefore refused outright: a hijack becomes a visible 404 and
+    a logged warning (the instance id, never the credential), not a quiet
+    cross-merchant leak. `POST /integrations/wix/connect` refuses the second
+    claim with a 409, so this state should be unreachable — the warning says it
+    happened anyway.
     """
-    if not _INSTANCE_ID_RE.match(instance_id):
+    matches = await find_wix_stores_by_instance_id(database, instance_id)
+    if not matches:
         return None
-    rows = await database.fetch_all(
-        """
-        SELECT store_id, merchant_id, domain, api_key
-        FROM merchant_stores
-        WHERE platform = 'wix'
-          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
-          AND api_key LIKE :needle
-        """,
-        {"needle": f"%{instance_id}%"},
-    )
-    for row in rows or []:
-        store = dict(row)
-        if _stored_instance_id(_credentials(store.get("api_key"))) == instance_id:
-            return store
-    return None
+    if len(matches) > 1:
+        logger.warning(
+            "Wix instance id %s is claimed by %d active stores; refusing the "
+            "delivery rather than choosing one",
+            instance_id,
+            len(matches),
+        )
+        return None
+    return matches[0]
 
 
 @router.post("")
@@ -154,8 +137,11 @@ async def receive_wix_webhook(request: Request):
 
     store = await _resolve_store(instance_id)
     if not store:
-        # 404 like the static Shopify receiver: Wix must stop retrying a
-        # delivery for a site we do not have, rather than back off for 48h.
+        # 404, the same answer the static Shopify receiver gives an unknown
+        # shop. Wix retries any non-2xx (up to 12 times over ~48h), so this
+        # does NOT stop the retries — it is simply the honest status for a
+        # delivery naming a site we do not have, and it keeps an ambiguous
+        # instance (above) from ever resolving.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_STORE)
 
     store_id = str(store["store_id"])
@@ -175,14 +161,15 @@ async def receive_wix_webhook(request: Request):
 
     order: Optional[Dict[str, Any]] = None
     if needs_wix_order_fetch(event):
-        credentials = _credentials(store.get("api_key"))
-        api_key = str(
-            credentials.get("api_key")
-            or credentials.get("access_token")
-            or credentials.get("token")
-            or (store.get("api_key") if not credentials else "")
-            or ""
-        ).strip()
+        # `normalize_wix_api_key` is the ONE credential reader every other Wix
+        # caller uses (adapters/wix_adapter.py, adapters/product_adapters.py,
+        # services/wix_order_fetch.py's callers): bare key through unchanged,
+        # blob unwrapped with the same precedence — `access_token`,
+        # `wix_access_token`, `token`, `api_key`. Re-deriving that precedence
+        # here got `wix_access_token` wrong, so an OAuth-written blob would
+        # have fetched with an empty Authorization header.
+        credentials = coerce_wix_credential_blob(store.get("api_key"))
+        api_key = normalize_wix_api_key(store.get("api_key"))
         site_id = str(credentials.get("site_id") or store.get("domain") or "").strip()
         try:
             order = await fetch_wix_order(

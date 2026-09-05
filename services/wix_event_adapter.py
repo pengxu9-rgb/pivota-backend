@@ -356,10 +356,22 @@ def _refunded_amount(refund: Dict[str, Any], currency: Optional[str]) -> Optiona
     that refunded successfully" and is preferred. Without it, only the
     ``SUCCEEDED`` refund transactions are summed — ``requestedRefund`` and
     ``PENDING``/``FAILED`` transactions are requests, not money movement.
+
+    A ``summary.refunded`` of **zero** (or one that will not parse) is *not* an
+    answer, it is the absence of one, and settling for it was worse than
+    useless: the refund event id is keyed on the refund id alone, so a
+    ``refund.succeeded`` emitted at 0 while the refund was still ``PENDING``
+    would be the row the real ``refund_completed`` delivery deduped against —
+    the refund lost for good, under its own id, at amount 0. Zero therefore
+    falls through to the transactions sum, and a zero sum emits nothing (the
+    caller's "nothing settled" path), so the later delivery is the first to
+    land.
     """
     summary = _obj(refund.get("summary"))
     if "refunded" in summary:
-        return _amount_cents(_obj(summary.get("refunded")).get("amount"), currency)
+        settled = _amount_cents(_obj(summary.get("refunded")).get("amount"), currency)
+        if settled:
+            return settled
     transactions = refund.get("transactions")
     if not isinstance(transactions, list):
         return None
@@ -380,7 +392,8 @@ def _refunded_amount(refund: Dict[str, Any], currency: Optional[str]) -> Optiona
         found = True
     if not found:
         return None
-    return _amount_cents(total, currency)
+    # A sum of zero is nothing settled, exactly like a zero `summary.refunded`.
+    return _amount_cents(total, currency) or None
 
 
 def map_wix_event(

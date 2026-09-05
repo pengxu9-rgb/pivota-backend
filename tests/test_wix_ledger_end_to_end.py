@@ -275,3 +275,69 @@ async def test_funnel_sums_both_wix_partial_refunds(tmp_path, monkeypatch):
         assert result.payload["slices"][0]["key"] == STORE_ID
     finally:
         await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_pending_refund_does_not_shadow_the_amount_that_later_settles(
+    tmp_path, monkeypatch
+):
+    """The reviewer's reproduction, end to end on the real ledger tables.
+
+    `summary.refunded` lags: the `details_updated` delivery carries the refund
+    with `refunded: 0` while its transaction is still `PENDING`. Treating that
+    zero as "0 settled" emitted `refund.succeeded` at amount 0 — and because a
+    Wix refund event id is keyed on the refund id ALONE, the `refund_completed`
+    delivery that carried the real 10.50 deduped against it and was dropped.
+    The ledger kept ('refund-903', 0) forever.
+    """
+    from sqlalchemy import select
+
+    from db.commerce_interactions import commerce_interaction_events
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "wix-refund-shadow")
+    try:
+        pending = {
+            "id": "refund-903",
+            "transactions": [
+                {
+                    "paymentId": "pay-1",
+                    "amount": {"amount": "10.50", "formattedAmount": "$10.50"},
+                    "refundStatus": "PENDING",
+                }
+            ],
+            "details": {"items": [], "shippingIncluded": False},
+            "createdDate": REFUND_ONE_AT,
+            "summary": {
+                "requestedRefund": {"amount": "10.50"},
+                "refunded": {"amount": "0"},
+                "pending": True,
+            },
+        }
+        settled = _refund("refund-903", "10.50", REFUND_ONE_AT)
+
+        # Delivery 1: nothing has settled. Nothing may be written.
+        from services.wix_event_adapter import NoWixCanonicalEvents
+
+        with pytest.raises(NoWixCanonicalEvents):
+            await _ingest([pending], event_id="delivery-1")
+
+        rows = await test_database.fetch_all(select(commerce_interaction_events))
+        assert list(rows) == []
+
+        # Delivery 2: the same refund id, now settled at 10.50.
+        result = await _ingest([settled], event_id="delivery-2")
+        assert result["accepted"] == 1
+
+        refund_rows = [
+            dict(row)
+            for row in await test_database.fetch_all(
+                select(commerce_interaction_events).where(
+                    commerce_interaction_events.c.event_type == "refund.succeeded"
+                )
+            )
+        ]
+        assert len(refund_rows) == 1
+        assert refund_rows[0]["payload"]["refund_id"] == "refund-903"
+        assert refund_rows[0]["payload"]["amount_cents"] == 1050
+    finally:
+        await test_database.disconnect()

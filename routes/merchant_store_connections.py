@@ -7,7 +7,13 @@ from services.shopify_access_token_service import (
     exchange_shopify_client_credentials_token,
     resolve_shopify_admin_access_token,
 )
-from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
+from services.wix_connection import (
+    WixConnectionValidationError,
+    find_wix_stores_by_instance_id,
+    is_wix_instance_id,
+    merge_wix_credential,
+    validate_wix_catalog_access,
+)
 from services.store_lifecycle_service import sync_catalog_merchant_status
 from services.bigcommerce_event_adapter import SUPPORTED_BIGCOMMERCE_SCOPES
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
@@ -2471,6 +2477,40 @@ async def merchant_connect_wix(
         raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
+        instance_id = str(request.instance_id or "").strip()
+        if instance_id:
+            # Shape-checked with the SAME predicate the receiver uses, so an
+            # id the receiver could never resolve is refused at the door
+            # rather than persisted and silently ignored — and so nothing
+            # carrying a SQL LIKE wildcard reaches the lookup below.
+            if not is_wix_instance_id(instance_id):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "WIX_INSTANCE_ID_INVALID",
+                        "message": "instance_id must be a Wix app instance id (8-64 chars, letters, digits and '-').",
+                    },
+                )
+            # `merchant_stores` has no uniqueness on the instance id, and
+            # `POST /webhooks/wix` resolves a store by nothing else. Without
+            # this check merchant B could type merchant A's instance id and
+            # start receiving A's signed order and refund events. First claim
+            # wins; the second is a 409.
+            claimed = await find_wix_stores_by_instance_id(database, instance_id)
+            foreign = [
+                row
+                for row in claimed
+                if str(row.get("merchant_id") or "") != str(request.merchant_id)
+            ]
+            if foreign:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "WIX_INSTANCE_ID_ALREADY_CLAIMED",
+                        "message": "That Wix app instance is already connected to another merchant.",
+                    },
+                )
+
         try:
             validation = await validate_wix_catalog_access(request.site_id, request.api_key)
         except WixConnectionValidationError as exc:
@@ -2482,42 +2522,50 @@ async def merchant_connect_wix(
         site_id = validation["site_id"]
         api_key = validation["api_key"]
 
-        # An instance id turns the credential into the JSON blob every Wix
-        # reader in this repo already understands (`normalize_wix_api_key`,
-        # `extract_wix_site_id`, `adapters/wix_adapter.py::_wix_credentials`
-        # all read `api_key`/`site_id`/`instance_id` out of one). Without an
-        # instance id the bare key is written exactly as before, so a connect
-        # that does not opt into telemetry is byte-identical to today's.
-        instance_id = str(request.instance_id or "").strip()
-        stored_credential = api_key
-        if instance_id:
-            stored_credential = json.dumps(
-                {"api_key": api_key, "site_id": site_id, "instance_id": instance_id}
-            )
-
         logger.info("Wix credentials verified for merchant=%s", request.merchant_id)
-        
+
         # Check if store already exists
         existing_store = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = 'wix' AND domain = :site_id""",
             {"merchant_id": request.merchant_id, "site_id": site_id}
         )
-        
+
         if existing_store:
+            # `merge_wix_credential`, not a bare write: a reconnect that does
+            # not re-supply `instance_id` must not erase the one already
+            # stored, or the merchant's telemetry goes dark at their next
+            # credential rotation with no error anywhere. A store that never
+            # had a blob and is not opting into telemetry still gets the bare
+            # key, byte-identical to before.
+            stored_credential = merge_wix_credential(
+                dict(existing_store).get("api_key"),
+                api_key=api_key,
+                site_id=site_id,
+                instance_id=instance_id,
+            )
             # Update existing store
             await database.execute(
-                """UPDATE merchant_stores 
+                """UPDATE merchant_stores
                    SET api_key = :token, status = 'active', connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
                 {"store_id": existing_store["store_id"], "token": stored_credential}
             )
             store_id = existing_store["store_id"]
         else:
+            # Nothing stored yet: an instance id makes it the JSON blob every
+            # Wix reader in this repo already understands
+            # (`normalize_wix_api_key`, `extract_wix_site_id`,
+            # `adapters/wix_adapter.py::extract_wix_order_credentials` all read
+            # `api_key`/`site_id`/`instance_id` out of one); without one it is
+            # the bare key, exactly as before.
+            stored_credential = merge_wix_credential(
+                None, api_key=api_key, site_id=site_id, instance_id=instance_id
+            )
             # Insert new store
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
-                """INSERT INTO merchant_stores 
+                """INSERT INTO merchant_stores
                    (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                    VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)""",
                 {

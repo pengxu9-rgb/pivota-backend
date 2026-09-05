@@ -32,6 +32,10 @@ here — a delivery signed with anything else is refused rather than guessed at.
 For the same reason ``exp`` is enforced only when the token carries one: the
 docs do not promise the claim, and REQUIRING it would refuse every real
 delivery if Wix omits it. An expired token is always refused.
+
+The same silence is why every registered-claim check PyJWT turns on by default
+is turned back off here — see ``_DECODE_OPTIONS``. A claim the docs never
+mention must not become a refusal we cannot retry out of.
 """
 
 from __future__ import annotations
@@ -42,6 +46,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import RSAAlgorithm
 
 
 # Wix signs with the app key pair; the public half is pasted into this env var.
@@ -51,6 +57,36 @@ WIX_APP_PUBLIC_KEY_ENV = "WIX_APP_PUBLIC_KEY"
 
 # The only algorithm this receiver will verify. Never read from the token.
 WIX_WEBHOOK_ALGORITHM = "RS256"
+
+# Every registered-claim check PyJWT turns on by DEFAULT, listed explicitly.
+# PyJWT 2.12's defaults are
+# `{verify_signature, verify_exp, verify_nbf, verify_iat, verify_aud,
+#   verify_iss, verify_sub, verify_jti}` all True, and three of them refuse a
+# token this receiver has no business refusing:
+#
+# * `verify_aud` raises `InvalidAudienceError` for ANY token carrying `aud`
+#   when no `audience=` is passed — and the Wix docs never show the registered
+#   claims, so a delivery with `aud: <our app id>` would 401 forever.
+# * `verify_nbf`/`verify_iat` raise `ImmatureSignatureError` on a token whose
+#   `nbf`/`iat` is even slightly ahead of our clock. `iat` is a timestamp, not
+#   a validity window; Wix's signer skewing a second ahead of us is not a
+#   forgery, and PyJWT applies no leeway here unless asked. Both off.
+# * `verify_iss` is inert without an `issuer=` argument, but is pinned off so
+#   that adding one is a deliberate edit rather than a silent behaviour change.
+#
+# Left ON: `verify_sub`/`verify_jti`, which only assert that those claims are
+# strings if present — a type check, not a policy this file has to own.
+#
+# `verify_exp` is off here because `_reject_expired` below does it against an
+# INJECTABLE clock. An expired token is still always refused.
+_DECODE_OPTIONS = {
+    "verify_signature": True,
+    "verify_exp": False,
+    "verify_aud": False,
+    "verify_nbf": False,
+    "verify_iat": False,
+    "verify_iss": False,
+}
 
 
 class WixWebhookAuthError(Exception):
@@ -79,6 +115,33 @@ def load_wix_app_public_key(env: Optional[Dict[str, str]] = None) -> str:
     """The configured app public key, or ``""`` when the app is not set up."""
     source = env if env is not None else os.environ
     return normalize_public_key_pem(source.get(WIX_APP_PUBLIC_KEY_ENV))
+
+
+def _prepared_public_key(pem: str) -> Any:
+    """The parsed RSA public key, or ``WixWebhookKeyNotConfigured``.
+
+    PyJWT parses the key INSIDE ``jwt.decode``, so a malformed
+    ``WIX_APP_PUBLIC_KEY`` surfaces as ``InvalidKeyError`` from the same call
+    that raises ``InvalidSignatureError`` — and a blanket ``except`` there
+    answers a perfectly good delivery with 401. Wix would keep retrying for
+    ~48h and then drop the event, with nothing in the logs to say the operator
+    pasted a truncated PEM. Loading it here makes the two failures separable:
+    OUR key is broken -> 503 (a configuration problem, retry later); the
+    TOKEN is broken -> 401.
+    """
+    try:
+        prepared = RSAAlgorithm(RSAAlgorithm.SHA256).prepare_key(pem)
+    except (jwt.exceptions.InvalidKeyError, ValueError, TypeError, AttributeError) as exc:
+        raise WixWebhookKeyNotConfigured(
+            f"{WIX_APP_PUBLIC_KEY_ENV} is not a usable RSA public key: {exc}"
+        ) from exc
+    if not isinstance(prepared, rsa.RSAPublicKey):
+        # A private key or an EC key in this env var cannot verify a Wix
+        # RS256 delivery; that is our misconfiguration, not a bad delivery.
+        raise WixWebhookKeyNotConfigured(
+            f"{WIX_APP_PUBLIC_KEY_ENV} is not an RSA public key"
+        )
+    return prepared
 
 
 def _decoded_claim(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -149,18 +212,24 @@ def verify_wix_webhook_jwt(
     if not token:
         raise WixWebhookVerificationError("Wix webhook body is empty")
 
+    # Parsed BEFORE decode so a broken key is a 503 and not a 401 (see
+    # `_prepared_public_key`).
+    prepared_key = _prepared_public_key(key)
+
     try:
         payload = jwt.decode(
             token,
-            key=key,
+            key=prepared_key,
             # The algorithm is OURS, never the token's `alg` header: an
             # allow-list of one is what stops `alg: none` and the HS256
             # confusion attack that hands the public key back as an HMAC key.
             algorithms=[WIX_WEBHOOK_ALGORITHM],
-            # `exp` is enforced by _reject_expired below, against an injectable
-            # clock. Nothing else here is optional.
-            options={"verify_signature": True, "verify_exp": False},
+            options=_DECODE_OPTIONS,
         )
+    except jwt.exceptions.InvalidKeyError as exc:  # pragma: no cover - key parsed above
+        raise WixWebhookKeyNotConfigured(
+            f"{WIX_APP_PUBLIC_KEY_ENV} was refused as a verification key: {exc}"
+        ) from exc
     except Exception as exc:
         # PyJWT raises a family (InvalidSignatureError, InvalidAlgorithmError,
         # DecodeError, ...); all of them mean the same thing to a caller.

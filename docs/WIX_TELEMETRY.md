@@ -108,7 +108,7 @@ Webhooks][about]) and a 200 would drop the refund for good.
 The connect call must carry the app's **instance id** for that site:
 
 ```
-POST /merchant-stores/wix/connect
+POST /integrations/wix/connect
 { "merchant_id": "...", "site_id": "...", "api_key": "...",
   "instance_id": "<the app instance id on this site>" }
 ```
@@ -118,20 +118,39 @@ as before (a bare API key string) and catalog sync is unaffected — the store
 simply receives no telemetry, because `POST /webhooks/wix` has nothing to
 resolve it by. With it, the credential is stored as the JSON blob every Wix
 reader in this repo already understands (`normalize_wix_api_key`,
-`extract_wix_site_id`, `adapters/wix_adapter.py::_wix_credentials`).
+`extract_wix_site_id`, `adapters/wix_adapter.py::extract_wix_order_credentials`).
+
+It is **shape-checked** (`services/wix_connection.py::is_wix_instance_id`,
+the same predicate the receiver uses) — 8–64 characters of letters, digits and
+`-`, so an id the receiver could never resolve is a **422** rather than a value
+that persists and is silently ignored. And it is **refused with 409 when
+another merchant's active Wix store already carries it**: `merchant_stores`
+has no uniqueness constraint on the instance id and the receiver resolves a
+store by nothing else, so without that check merchant B could type merchant
+A's instance id and start receiving A's signed order and refund events. First
+claim wins.
+
+Both writers of this column **merge** rather than overwrite:
+`POST /integrations/wix/connect` on an existing store, and
+`POST /integrations/wix/connect-sync` (which extracts the bare key with
+`normalize_wix_api_key` and used to write it back plain). A reconnect that does
+not re-supply `instance_id` keeps the stored one, so a credential rotation no
+longer switches a merchant's telemetry off silently. A store that never had a
+blob and is not opting into telemetry still gets the bare key, byte-identical
+to before.
 
 ### Limitation: API-key mode cannot receive webhooks
 
 Pivota has two Wix connect modes, and only one of them can ever produce
 telemetry:
 
-* **API-key mode** (`POST /merchant-stores/wix/connect`) — the live path.
+* **API-key mode** (`POST /integrations/wix/connect`) — the live path.
   The merchant pastes a Wix API key and a site id. **The Pivota app is not
   installed on the site**, so Wix has no app instance there, no `instanceId`
   exists, and no webhook is ever delivered. Catalog sync and order writeback
   work; telemetry does not. A merchant in this mode who wants telemetry must
   install the app and supply the resulting `instance_id`.
-* **OAuth app mode** (`GET /merchant-stores/wix/oauth/start` and
+* **OAuth app mode** (`GET /integrations/wix/oauth/start` and
   `/callback`) — still a **501 stub** at the time of writing. It reads
   `WIX_APP_CLIENT_ID` / `WIX_APP_CLIENT_SECRET` only to report whether they are
   configured, and persists nothing. When that stub is implemented it must
@@ -151,23 +170,55 @@ is read from the **verified claim**, never from the raw body.
 be asked to index the same way, so the lookup uses a `LIKE` to **narrow the
 scan** over active `platform='wix'` stores and then compares exactly in Python.
 A substring match can never resolve a store. The instance id is also shape-
-checked before it reaches the `LIKE`, which keeps `%`/`_` out of the pattern.
+checked before it reaches the `LIKE`: the character class is letters, digits
+and `-` only, so **neither** SQL `LIKE` wildcard survives it — `%` (any run)
+and `_` (any single character) are both excluded, and no escaping is needed.
+A Wix instance id is a GUID, so nothing legitimate is lost.
 
-An unknown or inactive instance answers **404**, like the static Shopify
-receiver, so Wix stops retrying a delivery for a site we do not have.
+The lookup collects **every** exact match, not the first. `merchant_stores` has
+no uniqueness constraint on the instance id, so two rows can carry the same
+one; picking whichever the database returned first would hand one merchant's
+signed events to another. An ambiguous instance is refused outright — a logged
+warning naming the instance id (never a credential) and a 404 — so a hijack is
+a visible outage rather than a silent cross-merchant leak. The connect route's
+409 above is what should keep this unreachable.
+
+An unknown, ambiguous or inactive instance answers **404**. That is the same
+answer the static Shopify receiver gives an unknown shop, and it is the honest
+status for a delivery naming a site we do not have — it does **not** stop the
+retries: Wix retries any non-2xx up to 12 times over ~48 hours ([About
+Webhooks][about]), which is the same behaviour the 503 branches rely on.
 
 ## Auth chain
 
 1. 1 MB body cap → 413
 2. `WIX_APP_PUBLIC_KEY` configured → else 503
-3. JWT verified: RS256 only, signature, and `exp` when present → else 401
-4. `instanceId` read from the verified claim → else 401
-5. store resolved by exact `instanceId` on an active Wix store → else 404
-6. `identify(merchant_id, store_id)` + `enforce_rate_limit("platform", store_id)`
-7. unsupported event → 200 `ignored` (before any Wix API call)
-8. order read back for the two transactions events → 503 on failure
-9. map → `ingest_merchant_event_batch(write_path="wix_webhook",
-   agent_identity_confidence="platform_asserted")` → authority `platform`
+3. that key **parses** as an RSA public key → else 503
+4. JWT verified: RS256 only, signature, and `exp` when present → else 401
+5. `instanceId` read from the verified claim → else 401
+6. store resolved by exactly ONE active Wix store carrying that `instanceId`
+   → else 404 (unknown, inactive, or ambiguous)
+7. `identify(merchant_id, store_id)` + `enforce_rate_limit("platform", store_id)`
+8. unsupported event → 200 `ignored` (before any Wix API call)
+9. order read back for the two transactions events → 503 on failure
+10. map → `ingest_merchant_event_batch(write_path="wix_webhook",
+    agent_identity_confidence="platform_asserted")` → authority `platform`
+
+Steps 2 and 3 are the same failure to an operator and deliberately NOT a 401:
+a missing or malformed key of ours is a configuration problem, and blaming the
+delivery for it would burn a perfectly good event (401 is final; Wix retries a
+503). PyJWT parses the key inside `jwt.decode`, so step 3 loads it up front to
+keep the two apart.
+
+Step 4 refuses on the signature, the algorithm and `exp` — and on **nothing
+else**. PyJWT 2.12 turns `verify_aud`, `verify_nbf`, `verify_iat` and
+`verify_iss` on by default, and the first of those raises
+`InvalidAudienceError` for any token carrying `aud` when no `audience=` is
+passed. The Wix docs never show the registered claims, so a delivery stamped
+with `aud` (or a signer a second ahead of our clock, for `nbf`/`iat`) would
+401 forever. All four are explicitly off in
+`services/wix_webhook_auth.py::_DECODE_OPTIONS`; `verify_sub`/`verify_jti`,
+which only assert those claims are strings when present, are left on.
 
 ## Event mapping
 
@@ -193,9 +244,16 @@ double-counted.
 A refund's magnitude is `summary.refunded` ("the portion of `requestedRefund`
 that refunded successfully"), falling back to the sum of its `SUCCEEDED`
 transactions. `requestedRefund` and `PENDING`/`FAILED` transactions are requests,
-not money movement, and are never read as an amount; a refund with nothing
-settled is answered 200 `ignored` and lands when its `refund_completed`
-delivery arrives.
+not money movement, and are never read as an amount.
+
+**Zero is not an amount, it is the absence of one.** A `summary.refunded` of
+`0` (or one that will not parse) falls through to the transactions sum, and a
+transactions sum of `0` emits nothing — because a refund event id is keyed on
+the refund id alone, so a `refund.succeeded` written at amount 0 while the
+refund was still `PENDING` is exactly the row the later `refund_completed`
+delivery would dedupe against, losing the real amount for good. So: nothing
+settled → **no event**, and the delivery is answered 200 `ignored` if it
+carried nothing else; the refund lands whole when `refund_completed` arrives.
 
 Refund events are keyed on the **native refund id**, so two partial refunds of
 one order are two ledger facts that dedupe independently across the repeated
@@ -244,6 +302,28 @@ the same exposure the Shopify and WooCommerce bridges already carry.
   the only signal we hold is the `instance_id` the merchant typed in themselves,
   so the endpoint would echo back its own input plus a global env boolean. Not
   worth an authenticated route.
+
+## Residual risks, accepted
+
+* **A token without `exp` can be replayed.** The Wix docs never show the
+  registered claims, so `exp` is enforced only when the delivery carries one
+  (requiring it would refuse every real delivery if Wix omits it) and there is
+  no nonce store. Anyone who captures a signed body can therefore re-POST it.
+  The blast radius is bounded on both sides: every mapped event is keyed on the
+  entity it describes (order id, payment id, refund id) and dedupes in the
+  ledger, so a replay writes nothing new — and the events it carries are the
+  merchant's own. What a replay does cost is **one Wix API call per replayed
+  `order_transactions` delivery** (the currency read-back in
+  `services/wix_order_fetch.py`), bounded only by the platform rate-limit tier
+  the receiver charges before the fetch (`enforce_rate_limit("platform",
+  store_id)`) and by Wix's own quota. If Wix is later confirmed to stamp `exp`
+  (or `jti`), requiring it is the fix.
+* **An `instance_id` is whatever the merchant typed.** Nothing verifies that
+  the app instance really belongs to their site — there is no API-key-mode call
+  that would answer it. The 409 above means the first claim wins, so the
+  exposure is "a merchant who guesses an instance id before its real owner
+  connects", not "a merchant who steals a connected one". An OAuth connect,
+  when implemented, gets the instance id from Wix and closes it.
 
 [about]: https://dev.wix.com/docs/build-apps/develop-your-app/api-integrations/events-and-webhooks/about-webhooks.md
 [no-sdk]: https://dev.wix.com/docs/build-apps/develop-your-app/develop-a-self-managed-app/webhooks/handle-events-with-webhooks-for-self-hosting-without-the-java-script-sdk.md

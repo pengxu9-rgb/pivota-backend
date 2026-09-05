@@ -13,6 +13,7 @@ from datetime import datetime
 import uuid
 from services.wix_connection import (
     WixConnectionValidationError,
+    merge_wix_credential,
     validate_wix_catalog_access,
 )
 
@@ -343,7 +344,7 @@ async def connect_wix_store_sync(
 
         existing = await database.fetch_one(
             """
-            SELECT store_id
+            SELECT store_id, api_key
             FROM merchant_stores
             WHERE merchant_id = :merchant_id
               AND platform = 'wix'
@@ -354,6 +355,12 @@ async def connect_wix_store_sync(
 
         if existing:
             store_id = existing["store_id"]
+            # `normalized_api_key` is the BARE key `normalize_wix_api_key`
+            # extracted out of whatever was stored, so writing it back plain
+            # erased the rest of the credential blob -- including the
+            # `instance_id` that `POST /webhooks/wix` resolves this store by.
+            # Merge instead; a store that never had a blob still gets the bare
+            # key, byte-identical to before.
             await database.execute(
                 """
                 UPDATE merchant_stores
@@ -366,7 +373,11 @@ async def connect_wix_store_sync(
                 {
                     "store_id": store_id,
                     "name": store_name or normalized_site_id,
-                    "api_key": normalized_api_key,
+                    "api_key": merge_wix_credential(
+                        dict(existing).get("api_key"),
+                        api_key=normalized_api_key,
+                        site_id=normalized_site_id,
+                    ),
                     "connected_at": datetime.now(),
                 },
             )
