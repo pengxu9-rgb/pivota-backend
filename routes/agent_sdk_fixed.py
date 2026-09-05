@@ -18,6 +18,7 @@ import time
 import asyncio
 import uuid
 
+from services.seed_variant_options import normalize_seed_variant_options
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -372,6 +373,14 @@ async def _build_external_seed_product(
         else:
             image_url = None
 
+        # The axis, carried through. This builder whitelists variant fields, so
+        # an axis written into the seed reached here and stopped. It is read
+        # through the shared normalizer because the column holds TWO shapes —
+        # a list of pairs from the enrichment lane, a {name: value} mapping from
+        # the employee CSV lane — and a list-only reader silently discards the
+        # axis the CSV lane already had.
+        options = normalize_seed_variant_options(v.get("options"))
+
         variants.append(
             {
                 "id": variant_id,
@@ -383,6 +392,7 @@ async def _build_external_seed_product(
                 "in_stock": in_stock,
                 **({"availability": availability} if availability is not None else {}),
                 **({"image_url": image_url} if image_url else {}),
+                **({"options": options} if options else {}),
             }
         )
         if len(variants) >= 30:
