@@ -197,6 +197,31 @@ def test_admin_ops_routes_refuse_a_bogus_admin_key(client, db_tripwire, method, 
     )
 
 
+def _database_identity(module_names):
+    """(how many of these modules expose `database`, which hold a DIFFERENT one).
+
+    The tripwire patches attributes on the db.database singleton. Route modules
+    do `from db.database import database`, so they hold that same object by
+    reference and see the patch. A module that somehow held its own Database
+    would not -- and the refusal tests would read "handler never ran" off an
+    empty list that only means "the tripwire was never in the way".
+    """
+    import importlib
+
+    from db import database as db_module
+
+    checked = 0
+    strangers = set()
+    for module_name in module_names:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, "database"):
+            continue  # not every guarded module talks to the DB
+        checked += 1
+        if module.database is not db_module.database:
+            strangers.add(module_name)
+    return checked, strangers
+
+
 async def test_the_tripwire_lands_on_the_object_the_routes_use(db_tripwire):
     """The mechanism the three refusal tests now rest on, pinned separately.
 
@@ -215,28 +240,64 @@ async def test_the_tripwire_lands_on_the_object_the_routes_use(db_tripwire):
     guard, so a failure here means the tripwire is broken rather than the
     authentication.
     """
-    import importlib
-
     from db import database as db_module
 
-    checked = 0
-    for module_name in _GUARDED_MODULES:
-        module = importlib.import_module(module_name)
-        if not hasattr(module, "database"):
-            continue  # not every guarded module talks to the DB
-        assert module.database is db_module.database, (
-            f"{module_name} holds a different Database object than the one the "
-            f"tripwire patches -- the `assert not db_tripwire` in every refusal "
-            f"test above is vacuous for this module"
-        )
-        checked += 1
+    checked, strangers = _database_identity(_GUARDED_MODULES)
 
+    assert not strangers, (
+        f"these modules hold a different Database object than the one the "
+        f"tripwire patches -- the `assert not db_tripwire` in every refusal "
+        f"test above is vacuous for them: {sorted(strangers)}"
+    )
     assert checked, "no guarded module exposes `database` -- identity check was vacuous"
 
     with pytest.raises(_HandlerReached):
         await db_module.database.fetch_all("SELECT 1")
 
     assert db_tripwire, "the patched accessor ran but recorded nothing"
+
+
+def test_the_identity_check_can_actually_fail():
+    """Proves the check above detects what it claims to.
+
+    Every guarded module really does share the singleton, so the assertion in
+    `test_the_tripwire_lands_on_the_object_the_routes_use` is true whether or
+    not it is computed correctly -- replacing it with `assert True` changes
+    nothing observable, and the tripwire's silent failure mode comes back. A
+    synthetic module holding a DIFFERENT object must be reported, and one
+    holding the real singleton must not.
+    """
+    import sys
+    import types
+
+    from db import database as db_module
+
+    stranger = types.ModuleType("_probe_stranger_database")
+    stranger.database = object()  # a second Database instance, in effect
+    native = types.ModuleType("_probe_native_database")
+    native.database = db_module.database
+    silent = types.ModuleType("_probe_no_database")  # talks to no DB at all
+
+    for module in (stranger, native, silent):
+        sys.modules[module.__name__] = module
+    try:
+        checked, strangers = _database_identity(
+            (stranger.__name__, native.__name__, silent.__name__)
+        )
+    finally:
+        for module in (stranger, native, silent):
+            sys.modules.pop(module.__name__, None)
+
+    assert stranger.__name__ in strangers, (
+        "the identity check did not flag a module holding a different Database "
+        "object -- it cannot fail, so the assertion it guards proves nothing"
+    )
+    assert native.__name__ not in strangers, (
+        "the identity check flags a module that DOES share the singleton"
+    )
+    assert checked == 2, (
+        f"expected the two modules exposing `database` to be counted, got {checked}"
+    )
 
 
 def test_the_refusal_is_the_guard_not_a_missing_table(client):
