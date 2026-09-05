@@ -276,6 +276,26 @@ def test_an_hs256_token_signed_with_the_public_key_is_refused():
         verify_wix_webhook_jwt(forged, public_key_pem=WIX_PUBLIC_PEM)
 
 
+def test_a_ps256_token_signed_by_the_REAL_wix_key_is_still_refused():
+    """The algorithm allow-list has to do work PyJWT's key guard cannot.
+
+    `alg: none` and the HS256 confusion attack are ALSO refused by PyJWT
+    itself, which will not use an asymmetric PEM as an HMAC secret — so those
+    two tests pass even with the allow-list widened, and neither of them proves
+    the pinning does anything. PS256 is the case that isolates it: RSA-PSS
+    verifies against the very same RSA public key, so PyJWT is perfectly happy
+    to check it and ONLY `algorithms=["RS256"]` turns it away.
+    """
+    from services.wix_webhook_auth import (
+        WixWebhookVerificationError,
+        verify_wix_webhook_jwt,
+    )
+
+    substituted = _token(_claim(_inner_order_event()), algorithm="PS256")
+    with pytest.raises(WixWebhookVerificationError):
+        verify_wix_webhook_jwt(substituted.encode(), public_key_pem=WIX_PUBLIC_PEM)
+
+
 def test_a_missing_public_key_is_a_configuration_error_not_a_rejection():
     from services.wix_webhook_auth import (
         WixWebhookKeyNotConfigured,
