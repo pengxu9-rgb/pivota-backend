@@ -94,6 +94,12 @@ def test_every_production_write_path_has_exactly_one_authority():
     assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["shopify_web_pixel"] == "observational"
     assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["merchant_hmac_batch"] == "merchant"
     assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["stripe_webhook"] == "psp"
+    # The native store bridges speak for the PLATFORM, never for the merchant:
+    # the row is what BigCommerce's own API said, not what a merchant claimed.
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["bigcommerce_webhook"] == "platform"
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["bigcommerce_webhook"] == frozenset(
+        {"platform_asserted"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -103,6 +109,7 @@ def test_every_production_write_path_has_exactly_one_authority():
         ("shopify_web_pixel", "browser_observed"),
         ("merchant_hmac_batch", "merchant_asserted"),
         ("cafe24_webhook", "platform_asserted"),
+        ("bigcommerce_webhook", "platform_asserted"),
         ("stripe_webhook", "platform_asserted"),
     ],
 )
@@ -125,6 +132,8 @@ def test_each_ingress_may_assert_only_its_own_confidence(write_path, confidence)
         ("merchant_hmac_batch", "verified"),
         ("stripe_webhook", "verified"),
         ("cafe24_webhook", "unknown"),
+        ("bigcommerce_webhook", "merchant_asserted"),
+        ("bigcommerce_webhook", "browser_observed"),
     ],
 )
 def test_a_mismatched_write_path_and_confidence_is_refused(write_path, confidence):
@@ -167,7 +176,7 @@ def test_every_production_ingest_call_names_a_literal_write_path():
 
     calls = _production_ingest_calls()
     # The definition itself is not a call; every real ingress is.
-    assert len(calls) >= 11, [str(path) for path, _ in calls]
+    assert len(calls) >= 12, [str(path) for path, _ in calls]
     allowed = set(service.WritePath.__args__)
     for path, node in calls:
         keywords = {kw.arg: kw.value for kw in node.keywords}

@@ -87,6 +87,47 @@ timestamp in the order payload, so `occurred_at` is the order's modification
 time, and `refunds[].reason` is merchant free text that is never copied into
 canonical metadata.
 
+## BigCommerce native webhook bridge
+
+`POST /webhooks/bigcommerce/{store_id}` differs from every other native bridge in
+two ways, both forced by the platform.
+
+**The delivery is thin.** BigCommerce sends `{"scope": ..., "data": {"type":
+"order", "id": 250}, "hash": ..., "producer": "stores/<hash>"}` and no order
+fields at all. `services/bigcommerce_order_fetch.py` reads the order back with
+the merchant's stored access token (`GET /v2/orders/{id}`), and its refunds
+(`GET /v3/orders/{id}/payment_actions/refunds`) only when the scope is
+`store/order/refund/created` or the order's `payment_status` says money went
+back. A fetch failure is answered **503**, never 200: BigCommerce retries a
+non-2xx over ~48 hours, so a 200 after a failed fetch would drop the event. An
+unsupported scope is ignored *before* the fetch, so it can neither cost nor
+drive an API call. v2's `refunded_amount` is documented as "Always returns 0"
+and is never read as a refund magnitude.
+
+**There is no signature.** BigCommerce authenticates deliveries with a custom
+header registered on the hook itself. Pivota mints a per-store random secret at
+subscription time, stores it as `webhook_secret` in the store's credential JSON,
+registers the hook with `{"headers": {"X-Pivota-Webhook-Secret": "<secret>"}}`,
+and compares it with `hmac.compare_digest`. Because a header secret cannot bind
+a delivery to its body, the payload's `producer` must additionally match the
+store's own `store_hash`; every failure — unknown store, inactive store, missing
+or wrong secret — answers the same 401.
+
+`services/bigcommerce_event_adapter.py` maps `order.created` (always),
+`order.paid` for a `captured`/`paid`/`partially refunded`/`refunded`
+`payment_status` (never for `authorized`), `order.cancelled` for `status_id` 5,
+`payment.failed` for `status_id` 6 or a `declined` payment status, and one
+`refund.succeeded` per v3 refund id. Order dates are RFC-2822 and refund
+`created` is ISO 8601; both are accepted for either field. Every BigCommerce
+order is treated as platform-originated (`order_ref = "bigcommerce:<id>"`)
+because the BigCommerce writeback records the Pivota order id only in
+buyer-writable free text. See `docs/BIGCOMMERCE_TELEMETRY.md`.
+
+Subscriptions are installed idempotently through
+`POST /integrations/bigcommerce/{store_id}/webhooks/ensure` for
+`store/order/created`, `store/order/updated`, `store/order/statusUpdated`, and
+`store/order/refund/created`.
+
 ## PSP terminal-event bridge
 
 After the existing Stripe handler has verified the webhook signature, resolved
