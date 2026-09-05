@@ -814,7 +814,15 @@ async def _call_tool(
                     )
                     fetched = urlsplit(discovered).hostname or fetched
                     resp = await _read_bounded(client, "POST", discovered, json_body=body)
-    except (httpx.HTTPError, httpx.InvalidURL) as err:
+    # `except Exception`, not a tuple of httpx classes. Switching this block to `client.stream`
+    # put a whole new exception family on the path: httpx's StreamError/StreamClosed/
+    # StreamConsumed/ResponseNotRead are RuntimeError subclasses, NOT HTTPError, so the tuple
+    # that was correct for `client.post` silently stopped covering the transport. Enumerating
+    # classes here has now been wrong twice (InvalidURL, then the stream family) — the invariant
+    # is that a merchant never produces anything but a MerchantUcpError, so the handler matches
+    # the invariant rather than a list of the ways we currently know it can break. The type is
+    # logged so a bug of OURS stays visible.
+    except Exception as err:
         logger.warning(
             "merchant-ucp %s failed domain=%s host=%s: %s",
             tool,

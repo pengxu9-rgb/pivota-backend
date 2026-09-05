@@ -800,6 +800,19 @@ class _Redirector:
                 yield self.content[:mid]
                 yield self.content[mid:]
 
+            async def aiter_raw(self):
+                """The COMPRESSED bytes — far fewer than `aiter_bytes` yields.
+
+                Without this the two are identical in every fixture, so a mutant counting wire
+                bytes instead of decoded ones died only on `AttributeError: no aiter_raw` — an
+                accident of the stub, not an observation by any test. The whole justification for
+                counting decoded bytes is that these two numbers differ; the harness has to be
+                able to express that or the claim is untested.
+                """
+                import zlib
+
+                yield zlib.compress(self.content, 9)
+
             def json(self):
                 # A real httpx response RAISES json.JSONDecodeError on a non-JSON body. A stub
                 # that returns the raw string instead tests a different branch than the one it
@@ -1889,7 +1902,12 @@ async def test_a_compressed_bomb_is_stopped_by_the_read_not_the_header(monkeypat
     # would fail and discovery would refuse anyway — dropping the `over_limit` check changes no
     # behaviour and survived as an equivalent mutant. What it buys is an operator being told the
     # profile was too large rather than that it was unparseable, and that is what this pins.
-    assert any("exceeded" in m and "262144" in m for m in infos), infos
+    # The exact constant, not a substring of it. `"262144" in m` also matches 2621440 and
+    # 26214400, so a ceiling raised 10x or 100x passed the whole suite — and every over-limit
+    # fixture is written as `_MAX_PROFILE_BYTES * 2`, so the payloads scale with the mutant and
+    # nothing else notices. A derived constant needs its value asserted, not its digits.
+    assert muc._MAX_PROFILE_BYTES == 256 * 1024, "the ceiling itself is the security property"
+    assert any(f"exceeded {256 * 1024} bytes" in m for m in infos), infos
 
 
 @pytest.mark.asyncio
@@ -2002,3 +2020,55 @@ async def test_the_hopped_pinned_url_is_also_deduped(monkeypatch):
 
     assert "404" in str(excinfo.value)
     assert r.urls.count(WWW) == 1, "the hopped pinned url must not be POSTed twice"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rpc, why",
+    [
+        (5, "a bare int where a JSON-RPC object belongs"),
+        ("x", "a string"),
+        ([1, 2], "a list"),
+        (None, "null"),
+        ({"jsonrpc": "2.0", "id": 1, "result": 5}, "a non-dict result"),
+        ({"jsonrpc": "2.0", "id": 1, "result": "x"}, "a string result"),
+        ({"jsonrpc": "2.0", "id": 1, "result": [1]}, "a list result"),
+    ],
+)
+async def test_a_non_dict_rpc_or_result_is_never_a_500(monkeypatch, rpc, why):
+    """The parametrised RPC tests all varied members INSIDE a dict result, so the two isinstance
+    checks guarding the envelope itself were unexercised — `if False` on either passed all 167."""
+    _Redirector({APEX: (200, {}, rpc)}).install(monkeypatch)
+
+    try:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+    except MerchantUcpError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"{why}: produced {type(exc).__name__}, not MerchantUcpError")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.StreamError("stream"),
+        httpx.ResponseNotRead(),
+        httpx.RemoteProtocolError("proto"),
+        RuntimeError("boom"),
+        MemoryError(),
+    ],
+)
+async def test_a_transport_exception_from_the_stream_is_never_a_500(monkeypatch, exc):
+    """Switching the transport to `client.stream` put a NEW exception family on this path:
+    httpx's StreamError/StreamClosed/StreamConsumed/ResponseNotRead are RuntimeError subclasses,
+    NOT HTTPError, so the tuple that was correct for `client.post` silently stopped covering it.
+    `client.post` could never raise these."""
+    _Redirector({APEX: exc}).install(monkeypatch)
+
+    try:
+        await muc.get_checkout("robinsons.com.sg", "chk_1")
+    except MerchantUcpError:
+        pass
+    except Exception as raised:  # noqa: BLE001
+        pytest.fail(f"{type(exc).__name__} surfaced as {type(raised).__name__}")
