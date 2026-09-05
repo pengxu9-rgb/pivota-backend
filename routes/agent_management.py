@@ -4,9 +4,10 @@ Agent 管理 API
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set, Tuple
 from datetime import datetime, timedelta
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import column, func, or_, select, text
 
 from db.agents import (
     create_agent,
@@ -15,7 +16,7 @@ from db.agents import (
     agents
 )
 from db.database import database
-from utils.auth import AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_STAFF_ROLES, can_access_agent, get_current_employee, get_current_user, require_admin, verify_jwt_token
+from utils.auth import AGENT_OR_EMPLOYEE_ROLES, AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_ROLES, EMPLOYEE_STAFF_ROLES, can_access_agent, get_current_employee, get_current_user, require_admin, verify_jwt_token
 from utils.logger import logger
 
 
@@ -91,6 +92,26 @@ async def create_new_agent(
         raise HTTPException(status_code=500, detail="Failed to create agent")
 
 
+def _own_agent_identity(current_user: dict) -> Tuple[Set[str], str]:
+    """The identity claims that can name the agent a token belongs to.
+
+    Single-sourced because the detail route and the list route have to agree:
+    whatever identifies agent_A on GET /agents/{agent_id} must also be what
+    scopes GET /agents/ to agent_A's row, or one of the two is wrong. Returns
+    (ids, lowercased email) -- the ids are matched against `agent_id`, the
+    email against the RECORD's `owner_email`; see _is_own_agent_record for why
+    those are the three spellings and why the email one is not matched against
+    the id.
+    """
+    ids = {
+        str(current_user.get(claim) or "").strip()
+        for claim in ("agent_id", "user_id")
+    }
+    ids.discard("")
+    email = str(current_user.get("email") or "").strip().lower()
+    return ids, email
+
+
 def _is_own_agent_record(current_user: dict, agent_id: str, agent: dict) -> bool:
     """Does this token identify the agent whose record was just loaded?
 
@@ -109,13 +130,9 @@ def _is_own_agent_record(current_user: dict, agent_id: str, agent: dict) -> bool
     the actual relation, `users.email` is UNIQUE NOT NULL so it names exactly
     one account, and it does not care how ids are shaped.
     """
-    target = str(agent_id)
-    if any(
-        str(current_user.get(claim) or "") == target
-        for claim in ("agent_id", "user_id")
-    ):
+    ids, email = _own_agent_identity(current_user)
+    if str(agent_id).strip() in ids:
         return True
-    email = str(current_user.get("email") or "").strip().lower()
     owner_email = str((agent or {}).get("owner_email") or "").strip().lower()
     return bool(email) and email == owner_email
 
@@ -192,9 +209,57 @@ async def update_agent(
 
         current_role = current_user.get("role")
         current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
-        if current_role not in EMPLOYEE_STAFF_ROLES and str(current_agent_id or "") != str(agent_id):
+        is_staff = current_role in EMPLOYEE_STAFF_ROLES
+        if not is_staff and str(current_agent_id or "") != str(agent_id):
             raise HTTPException(status_code=403, detail="Not authorized")
-        
+
+        # SELF-ESCALATION. Owning the record is not permission to widen it.
+        # Three of the fields below are authorization state, not settings, and
+        # an agent could set them on itself:
+        #
+        #   * allowed_merchants is the list of merchants this agent may act
+        #     for, ENFORCED downstream -- routes/fulfillment_api.py filters
+        #     orders by it, routes/agent_api.py `_context_can_access_merchant`
+        #     falls back to it and reads None as "every merchant". An agent
+        #     could add a merchant it was never cleared for, or send null and
+        #     take them all.
+        #   * rate_limit / daily_quota are the commercial limits staff set.
+        #   * is_active is what employee-only DELETE /agents/{agent_id} sets to
+        #     False; an agent flipping it back undoes an employee action.
+        #
+        # Refused on the FIELD, not on a diff against the stored row: a PUT
+        # that resends the current value is one request away from a widening
+        # one, and a diff rule would have to re-derive downstream equality
+        # (list order, null-vs-[]) to stay safe. No client calls this route
+        # with these fields -- the employee portal uses
+        # /employee/agents/{id}/update-rate-limit and .../deactivate.
+        if not is_staff:
+            # Which fields the caller actually SENT -- an omitted field and an
+            # explicit null are different requests, and only the second is an
+            # attempt to set one. Same accessor shape as
+            # routes/agent_shop_gateway.py, tolerant of either pydantic.
+            sent = getattr(request, "model_fields_set", None)
+            if sent is None:
+                sent = getattr(request, "__fields_set__", None) or set()
+            privileged = [
+                name
+                for name in ("allowed_merchants", "rate_limit", "daily_quota", "is_active")
+                if name in sent
+            ]
+            if privileged:
+                logger.warning(
+                    f"[PUT /agents/{{id}}] agent {agent_id} tried to set "
+                    f"{privileged} on itself"
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Not authorized to change "
+                        + ", ".join(privileged)
+                        + " - these are set by Pivota staff"
+                    ),
+                )
+
         # 构建更新数据
         update_data = {}
         if request.agent_name is not None:
@@ -330,6 +395,115 @@ async def deactivate_agent(
 # Agent 列表和搜索
 # ============================================================================
 
+# Which email-bearing column the DEPLOYED agents table actually has, resolved
+# once. None until probed.
+_AGENT_EMAIL_COLUMNS: Optional[Tuple[str, ...]] = None
+
+# `owner_email` is NOT probed: it is proven present. agents.select() -- the
+# query this route has always run -- selects every column of the model,
+# owner_email among them, and that query works in production today (it is the
+# leak being fixed). A deployed table without the column would already be
+# raising, not leaking.
+#
+# `email` is the open question. routes/employee_agent_mgmt.py:433 creates
+# agents with `INSERT INTO agents (agent_id, name, email, ...)` and never
+# writes owner_email, and five read paths in that module coalesce
+# `agent.get("email") or agent.get("owner_email")` -- so rows whose address
+# lives only in `email` either exist or that creation path has been failing.
+# Which one is true depends on how the deployed table was built (the SQLAlchemy
+# model in db/agents.py, or the raw CREATE TABLE at main.py:1588, which have
+# different column sets), and prod Postgres is private-IP only, so it cannot be
+# settled from a checkout. scripts/backfill_auth_identities.py:85 settles it
+# the same way at runtime, with a try/except around the same question.
+#
+# Probing keeps the answer out of the guess: if `email` is absent the filter is
+# exactly what it would have been anyway, and if it is present an agent whose
+# address lives there is no longer locked out of its own record.
+_CANDIDATE_EMAIL_COLUMNS = ("owner_email", "email")
+
+
+async def _agent_email_columns() -> Tuple[str, ...]:
+    """The subset of _CANDIDATE_EMAIL_COLUMNS the live agents table has.
+
+    `LIMIT 0` reads no rows and works on every dialect the suite and production
+    use. The column names are module constants, never request input. Cached
+    for the process: a table does not grow a column mid-request, and this must
+    not become a second query on every list call.
+
+    CACHED ONLY WHEN CONCLUSIVE. A probe raises for two very different reasons
+    -- the column is absent, or the database is momentarily unreachable -- and
+    an `except Exception` cannot tell them apart. Caching an inconclusive
+    answer would be permanent: one blip on the first request after a deploy
+    would pin the result to () and hand every agent an EMPTY roster, silently
+    and with a 200, until the process restarted. owner_email is known present
+    (agents.select() names it and works in production), so a run where NOTHING
+    probed successfully is a database problem, not a schema answer -- leave the
+    cache unset and let the next request try again. The cost of that is one
+    extra pair of LIMIT 0 queries on a request that was already failing.
+    """
+    global _AGENT_EMAIL_COLUMNS
+    if _AGENT_EMAIL_COLUMNS is not None:
+        return _AGENT_EMAIL_COLUMNS
+
+    present = []
+    for name in _CANDIDATE_EMAIL_COLUMNS:
+        try:
+            await database.fetch_one(text(f"SELECT {name} FROM agents LIMIT 0"))
+            present.append(name)
+        except Exception as exc:
+            logger.info(
+                f"[GET /agents/] agents.{name} not usable for ownership "
+                f"matching: {type(exc).__name__}"
+            )
+
+    if not present:
+        logger.warning(
+            "[GET /agents/] no email column could be probed; not caching the "
+            "result -- treating this as a database problem, not a schema answer"
+        )
+        return ()
+
+    _AGENT_EMAIL_COLUMNS = tuple(present)
+    return _AGENT_EMAIL_COLUMNS
+
+
+def _own_agent_rows_filter(current_user: dict, email_columns: Tuple[str, ...] = ("owner_email",)):
+    """The WHERE clause that is this route's version of an ownership check.
+
+    On GET /agents/{agent_id} ownership is a 403; on a list there is no
+    requested id to refuse, so the same relation has to be a filter. The
+    predicate is the disjunction _is_own_agent_record tests one record at a
+    time: the row's agent_id is one of the token's id claims, OR the row's
+    owner_email is the token's email. Both halves are guarded against the
+    empty string -- an `owner_email = ''` comparison would otherwise sweep in
+    every row whose owner_email is blank.
+
+    Returns None when the token carries no usable identity at all, which the
+    caller must read as "no rows", never as "no filter".
+    """
+    ids, email = _own_agent_identity(current_user)
+
+    conditions = []
+    if ids:
+        conditions.append(agents.c.agent_id.in_(sorted(ids)))
+    if email:
+        for name in email_columns:
+            # agents.c.<name> for a column the model declares, an unbound
+            # column() for one it does not -- the latter renders as a bare
+            # identifier against the FROM already in the query, and cannot
+            # pollute the FROM list.
+            col = agents.c[name] if name in agents.c else column(name)
+            # trim as well as lower: _is_own_agent_record normalizes the stored
+            # value with .strip().lower(), and a SQL half that only lowercased
+            # would disagree with it on a padded address -- the exact drift
+            # _own_agent_identity exists to prevent.
+            conditions.append(func.lower(func.trim(col)) == email)
+
+    if not conditions:
+        return None
+    return or_(*conditions)
+
+
 @router.get("/")
 async def list_agents(
     is_active: Optional[bool] = None,
@@ -337,31 +511,85 @@ async def list_agents(
     search: Optional[str] = None,
     limit: int = Query(default=50, le=100),
     offset: int = Query(default=0, ge=0),
-    admin_user: dict = Depends(get_current_user)  # Allow authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    列出所有 Agents
-    
+    列出 Agents（员工看全部，agent 只看自己）
+
     支持过滤和搜索
     """
+    # AUTHORIZATION. This route used to depend on get_current_user alone --
+    # "# Allow authenticated users" -- and select every column of every row,
+    # popping only api_key/api_key_hash. That made the ownership check added to
+    # GET /agents/{agent_id} a confidentiality no-op: the same owner_email,
+    # webhook_url, allowed_merchants, metadata and quotas were one request away
+    # here, for any authenticated principal at all -- another agent, but also a
+    # `merchant` or `buyer`, roles the detail route refuses outright. `search`
+    # runs an ilike over owner_email, so it was an email-enumeration oracle on
+    # top of that.
+    #
+    # Same two-part shape as the detail route: the role constant decides who
+    # may ATTEMPT the route, and ownership decides whose rows come back -- here
+    # as a WHERE clause rather than a 403, because a list has no requested id
+    # to refuse. Staff (EMPLOYEE_ROLES, `outsourced` included, which is why
+    # this gate is the full-employee constant and not the STAFF variant) keep
+    # the whole roster; that is what the endpoint is for, and it is what
+    # /employee/agents and the employee portal expect. `merchant` and `buyer`
+    # lose a route no client calls: the employee portal reads /employee/agents,
+    # and the merchants portal's only agent call is
+    # /merchants/{id}/agents/{id}/bank-details.
+    current_role = current_user.get("role")
+    if current_role not in AGENT_OR_EMPLOYEE_ROLES:
+        logger.warning(
+            f"[GET /agents/] role '{current_role}' refused "
+            f"({current_user.get('email')})"
+        )
+        raise HTTPException(
+            status_code=403, detail=f"Access denied - invalid role: {current_role}"
+        )
+
+    scope = None
+    if current_role not in EMPLOYEE_ROLES:
+        scope = _own_agent_rows_filter(current_user, await _agent_email_columns())
+        if scope is None:
+            # An agent token with no id and no email names no record. Returning
+            # the unfiltered roster here is exactly the bug being fixed.
+            logger.warning(
+                "[GET /agents/] agent token carries no identity claim; "
+                "returning an empty roster"
+            )
+            return {
+                "status": "success",
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "agents": [],
+            }
+
     try:
         # 构建查询
-        query = agents.select()
-        
+        conditions = []
+        if scope is not None:
+            conditions.append(scope)
+
         if is_active is not None:
-            query = query.where(agents.c.is_active == is_active)
-        
+            conditions.append(agents.c.is_active == is_active)
+
         if agent_type:
-            query = query.where(agents.c.agent_type == agent_type)
-        
+            conditions.append(agents.c.agent_type == agent_type)
+
         if search:
             search_pattern = f"%{search}%"
-            query = query.where(
+            conditions.append(
                 (agents.c.agent_name.ilike(search_pattern)) |
                 (agents.c.description.ilike(search_pattern)) |
                 (agents.c.owner_email.ilike(search_pattern))
             )
-        
+
+        query = agents.select()
+        for condition in conditions:
+            query = query.where(condition)
+
         # 排序和分页
         query = query.order_by(agents.c.created_at.desc()).limit(limit).offset(offset)
         
@@ -376,11 +604,15 @@ async def list_agents(
             agent_dict.pop("api_key_hash", None)
             agent_list.append(agent_dict)
         
-        # 获取总数
-        count_query = "SELECT COUNT(*) as count FROM agents"
-        if is_active is not None:
-            count_query += f" WHERE is_active = {is_active}"
-        
+        # 获取总数。Built from the SAME conditions as the page above: the count
+        # was a hand-rolled "SELECT COUNT(*) FROM agents" that honoured only
+        # is_active, so it published the size of the whole agent roster to a
+        # caller who is allowed to see one row of it -- and disagreed with its
+        # own page for agent_type/search besides.
+        count_query = select(func.count().label("count")).select_from(agents)
+        for condition in conditions:
+            count_query = count_query.where(condition)
+
         count_result = await database.fetch_one(count_query)
         total = count_result["count"] if count_result else 0
         

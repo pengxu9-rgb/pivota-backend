@@ -373,6 +373,22 @@ MERCHANT_OR_EMPLOYEE_STAFF_ROLES = ["merchant"] + EMPLOYEE_STAFF_ROLES
 # from the response is not an ownership check.
 AGENT_OR_EMPLOYEE_STAFF_ROLES = ["agent"] + EMPLOYEE_STAFF_ROLES
 
+# Same idea, but over the FULL employee set -- for surfaces `outsourced` staff
+# already reach. can_access_agent() grants every EMPLOYEE_ROLES member blanket
+# agent access, so a gate spelled with the STAFF variant would refuse
+# `outsourced` a list its own ownership helper says it may read. Use this where
+# the route is a roster read that outsourced staff have today (GET /agents/),
+# and the STAFF variant where the narrower contractor scope is deliberate.
+#
+# The ownership rule is identical: this decides who may ATTEMPT the route.
+# can_access_agent() decides WHOSE records come back -- and on a LIST route
+# "whose" is a WHERE clause, not a 403. GET /agents/ had neither: it depended on
+# get_current_user alone and selected every column of every row, which made the
+# ownership check added to GET /agents/{agent_id} a no-op -- the same
+# owner_email, webhook_url, allowed_merchants, metadata and quotas were one
+# request away on the sibling route.
+AGENT_OR_EMPLOYEE_ROLES = ["agent"] + EMPLOYEE_ROLES
+
 # Permission guarding /api/operations/* (merchant & agent onboarding, approval,
 # verification, API-key issuance, audit log). A named permission, not a role
 # name — see the note in check_permission's permission_map.
@@ -472,7 +488,18 @@ def can_access_merchant(user_info: Dict[str, Any], merchant_id: str) -> bool:
         True if user can access merchant data
     """
     role = user_info.get("role", "")
-    
+
+    # A falsy target is never an answerable question, and both branches below
+    # answered YES to it. `routes/auth.py` mints merchant tokens with an
+    # Optional merchant_id, so a `merchant` token can carry merchant_id=None --
+    # and `None == None` is True, handing that caller a target it proved
+    # nothing about. The agent branch reaches its "no scoping claims means all
+    # merchants" fallback and returns True for the same target. Every caller
+    # today rejects an empty merchant_id before asking (they 400), so this
+    # guards the next one rather than closing a live path.
+    if not merchant_id:
+        return False
+
     # Employees can access all merchants
     if role in EMPLOYEE_ROLES:
         return True
