@@ -910,6 +910,23 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
     }
 
 
+# RECALL DIVERSITY. The candidate CTE below matches at (product x SKU) grain and
+# then takes the top `candidate_limit` ROWS — 40 for a default limit=10 query.
+# Every curated/Path-C product carried exactly ONE catalog_skus row
+# (`<product_key>::canonical`) when that budget was chosen, so 40 rows meant 40
+# products. It stops meaning that the moment a lane writes one SKU per real
+# variant: a 60-shade lipstick's rows all share the same p.title / p.brand terms,
+# so they cluster together under `ORDER BY rank_score DESC` and can occupy every
+# slot, returning ONE product where the query should return ~40.
+#
+# The fix is a per-product cap, NOT a dedupe: `_build_canonical_items` groups on
+# sku_key, so one result item IS one SKU, and collapsing to a single row per
+# product would drop the other variants of every ordinary multi-variant product
+# from search. The cap only bites the pathological tail — a product contributes
+# at most this many candidate rows, the rest of the budget goes to other products.
+RECALL_MAX_SKUS_PER_PRODUCT = max(1, int(os.getenv("RECALL_MAX_SKUS_PER_PRODUCT") or 12))
+
+
 async def _fetch_canonical_search_rows(
     *,
     query: str,
@@ -937,6 +954,7 @@ async def _fetch_canonical_search_rows(
         "query_like": f"%{lowered}%",
         "candidate_limit": candidate_limit,
         "row_limit": row_limit,
+        "per_product_sku_cap": RECALL_MAX_SKUS_PER_PRODUCT,
     }
     merchant_clause = ""
     if merchant_id:
@@ -1264,7 +1282,7 @@ async def _fetch_canonical_search_rows(
 
     rows = await database.fetch_all(
         f"""
-        WITH candidate_skus AS (
+        WITH matched_skus AS (
             SELECT
                 m.merchant_id AS merchant_id,
                 m.merchant_name AS merchant_name,
@@ -1298,6 +1316,7 @@ async def _fetch_canonical_search_rows(
                 s.visible_option_labels,
                 s.ingredient_ids,
                 s.image_url AS sku_image_url,
+                s.updated_at AS sku_updated_at,
                 (
                     CASE WHEN LOWER(COALESCE(s.sku, '')) = :query_exact THEN 120 ELSE 0 END +
                     CASE WHEN LOWER(COALESCE(s.source_variant_id, '')) = :query_exact THEN 110 ELSE 0 END +
@@ -1387,7 +1406,26 @@ async def _fetch_canonical_search_rows(
             {signature_clause}
             {indexable_clause}
             {sku_suppression_clause}
-            ORDER BY rank_score DESC, p.updated_at DESC, s.updated_at DESC
+        ),
+        -- Cap each product's contribution BEFORE the budget is spent, then take
+        -- the top `candidate_limit` rows exactly as before. Ordering inside the
+        -- window mirrors the outer one, so the rows a product keeps are the ones
+        -- it would have won anyway (an exact-SKU match scores +120 and stays
+        -- rank 1, so a SKU-code lookup is unaffected). See
+        -- RECALL_MAX_SKUS_PER_PRODUCT for why this is a cap and not a DISTINCT.
+        candidate_skus AS (
+            SELECT *
+            FROM (
+                SELECT
+                    ms.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ms.product_key
+                        ORDER BY ms.rank_score DESC, ms.sku_updated_at DESC, ms.sku_key
+                    ) AS product_sku_rank
+                FROM matched_skus ms
+            ) ranked
+            WHERE ranked.product_sku_rank <= :per_product_sku_cap
+            ORDER BY rank_score DESC, product_updated_at DESC, sku_updated_at DESC
             LIMIT :candidate_limit
         )
         SELECT
