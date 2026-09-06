@@ -30,6 +30,27 @@
 # and the distinction matters: an auto-deploy that silently fails, skips or is dropped rebuilds
 # the identical gap, and a pipeline is not allowed to be its own only witness.
 #
+# ── #2010 FOUND THE SAME BLIND SPOT INDEPENDENTLY, AND IS FOLDED IN HERE ───────────────────────
+# It landed on main while this was in review, adding a SECOND, separate step that checked the
+# worker on its own. Two checks for one service is worse than one: they can disagree, and the
+# reader has to work out which is authoritative. So the worker lives in the loop below, once, and
+# that step is gone. What #2010 got right is kept:
+#
+#   - ITS DEGRADE. A read that fails because GCP said no is this job's OWN PLUMBING failing, and
+#     "a job that reddens on its own plumbing gets muted exactly like one that cries wolf". That
+#     is right, and it is now the behaviour for an unreadable service - see UNKNOWN below.
+#   - ITS INSTINCT ABOUT THE WINDOW, for the world it was written in. `WORKER_GRACE_MINUTES: 1440`
+#     is deliberately NOT carried over, and dropping it is not a disagreement: it existed because
+#     "the worker is manual BY DESIGN … a 4h window on a service nobody promises to deploy in 4h
+#     would make this job permanently red". As of this change nobody has to promise - the worker
+#     deploys on every push, like `web` - so the premise is retired and the single GRACE_MINUTES
+#     applies to all three. If the worker ever goes back to manual, that reasoning comes back with
+#     it.
+#
+# What it got wrong, and why this file does not copy it: it read `spec.template`, which names the
+# LAST REVISION CREATED rather than the one serving. See live_sha_image below for why that reports
+# a FAILED deploy as shipped.
+#
 # HOW EACH IS READ, and why they differ. `web` is still read by curling the PUBLIC health endpoint:
 # that traverses DNS, the load balancer and the traffic split, so it answers "what are users
 # actually reaching", which describing the service cannot. `worker` (--ingress internal) and
@@ -172,10 +193,29 @@ jobs:
           # built for: is the commit that is SERVING the one main says it should be.
           live_sha_image(){
             local svc="$1" rev sha
-            rev="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 --format=json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); live=[t["revisionName"] for t in (d.get("status",{}).get("traffic") or []) if t.get("percent")==100 and t.get("revisionName")]; print(live[0] if len(live)==1 else "")' 2>/dev/null || true)"
+
+            # TWO KINDS OF "CANNOT ANSWER", AND THEY ARE NOT THE SAME FACT.
+            #
+            #   THE API FAILED (auth blip, quota, 5xx)     -> return 2, a WARNING. This job's own
+            #     plumbing broke; production may be perfectly fine. Reddening on it trains people
+            #     to mute the alarm, which is #2010's point and it is correct.
+            #   PRODUCTION IS IN A STATE WE REFUSE TO READ  -> return 1, an ERROR. Split traffic,
+            #     a revision declaring no commit, a commit that is not a sha. Nothing is broken
+            #     with US; the service is genuinely unverifiable, and that is the condition under
+            #     which the worker stayed invisible for a month. It must not decay to a warning.
+            #
+            # Collapsing the two - in either direction - loses one of them.
+            local describe rc=0
+            describe="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 --format=json 2>/dev/null)" || rc=$?
+            if [ "$rc" != 0 ] || [ -z "$describe" ]; then
+              echo "::warning::could not describe '$svc' (gcloud exited $rc) - its drift is UNKNOWN this run, not clean"
+              return 2
+            fi
+            rev="$(printf '%s' "$describe" | python3 -c 'import json,sys; d=json.load(sys.stdin); live=[t["revisionName"] for t in (d.get("status",{}).get("traffic") or []) if t.get("percent")==100 and t.get("revisionName")]; print(live[0] if len(live)==1 else "")' 2>/dev/null || true)"
             if [ -z "$rev" ]; then
-              echo "::error::could not resolve a single 100%-traffic revision for '$svc' - the service is" >&2
-              echo "::error::either undescribable or its traffic is split. What it serves is unknown." >&2
+              echo "::error::'$svc' has no single 100%-traffic revision - its traffic is split, so there" >&2
+              echo "::error::is no one answer to what it serves. This is a real production state, not a" >&2
+              echo "::error::read failure, and a half-finished deploy is exactly what it looks like." >&2
               return 1
             fi
             # PIVOTA_COMMIT_SHA ON THAT REVISION, not its image reference. MEASURED against prod
@@ -191,7 +231,13 @@ jobs:
             # both restamp, and the very same variable that reaches `web`'s /health as
             # version.full_sha. So all three services end up answering one question through one
             # value, rather than two services answering a similar question through a different field.
-            sha="$(gcloud run revisions describe "$rev" --project pivota-prod --region us-west1 --format=json 2>/dev/null | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["containers"][0]; print(next((e.get("value","") for e in (c.get("env") or []) if e.get("name")=="PIVOTA_COMMIT_SHA"), ""))' 2>/dev/null || true)"
+            local revjson revrc=0
+            revjson="$(gcloud run revisions describe "$rev" --project pivota-prod --region us-west1 --format=json 2>/dev/null)" || revrc=$?
+            if [ "$revrc" != 0 ] || [ -z "$revjson" ]; then
+              echo "::warning::could not describe revision '$rev' of '$svc' (gcloud exited $revrc) - drift UNKNOWN this run"
+              return 2
+            fi
+            sha="$(printf '%s' "$revjson" | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["containers"][0]; print(next((e.get("value","") for e in (c.get("env") or []) if e.get("name")=="PIVOTA_COMMIT_SHA"), ""))' 2>/dev/null || true)"
             if [ -z "$sha" ]; then
               echo "::error::revision '$rev' of '$svc' declares no PIVOTA_COMMIT_SHA, so what commit" >&2
               echo "::error::it runs is unknown. Nothing in Cloud Run injects that variable - the deploy" >&2
@@ -296,12 +342,19 @@ jobs:
           # would report `worker` and never mention `proof-issuer`, and the operator would fix one,
           # re-run, and find the next - which is how a two-service gap gets discovered one service
           # at a time over two days.
-          UNREADABLE=0
+          UNREADABLE=""; UNKNOWN=""
           for svc in $SERVICES; do
+            rc=0
             case "$svc" in
-              web) LIVE="$(live_sha_web)" || { UNREADABLE=1; continue; } ;;
-              *)   LIVE="$(live_sha_image "$svc")" || { UNREADABLE=1; continue; } ;;
+              # web is read over the PUBLIC health endpoint, and an unreachable api.pivota.cc is
+              # not this job's plumbing - it means the public API is not answering, which is a
+              # production fact and keeps its long-standing hard failure.
+              web) LIVE="$(live_sha_web)" || rc=$? ;;
+              *)   LIVE="$(live_sha_image "$svc")" || rc=$? ;;
             esac
+            # 2 = we could not ask (API/auth). 1 = we asked and refuse to interpret the answer.
+            if [ "$rc" = 2 ]; then UNKNOWN="$UNKNOWN $svc"; echo; continue; fi
+            if [ "$rc" != 0 ]; then UNREADABLE="$UNREADABLE $svc"; echo; continue; fi
             echo "$svc: $LIVE"
             classify "$svc" "$LIVE" || DRIFTED="$DRIFTED $svc"
             echo
@@ -309,7 +362,16 @@ jobs:
 
           # An unreadable service is NOT a passing one. Whatever it runs is unknown, and this job's
           # entire job is to refuse to let "unknown" read as "fine".
-          [ "$UNREADABLE" = 0 ] || { echo "::error::at least one service could not be read - see above"; exit 1; }
+          # A service we COULD NOT ASK about is reported and does not fail the run: this job's own
+          # GCP access is new plumbing, and an alarm that reddens on its own dependencies gets
+          # muted, taking the checks that DO work down with it (#2010's reasoning, adopted).
+          # It is still said out loud every run, because a permanently unreadable service is a
+          # silent gap wearing a warning label - and that is the thing this file exists to catch.
+          if [ -n "$UNKNOWN" ]; then
+            echo "::warning::drift is UNKNOWN this run for:$UNKNOWN (could not reach the Cloud Run API)"
+          fi
+          # A service whose ANSWER we refuse to interpret is a different matter and still fails.
+          [ -z "$UNREADABLE" ] || { echo "::error::unverifiable:$UNREADABLE - see above"; exit 1; }
           # "no service is ALARMING" is not the same claim as "everything is on main" - a
           # docs-only gap and a merge inside the grace window both pass, deliberately, while the
           # service really is behind. Saying the stronger thing would make the passing line a

@@ -27,10 +27,26 @@ connected stores) and must NOT be pinned to `*.myshopify.com`, or a store connec
 domain stops matching its own deliveries. `normalize_myshopify_domain` is for the sites that turn a
 domain into an Admin API URL; `canonicalize_shop_domain` is for the sites that compare.
 
-Several credential-sending sites are still unpinned — `services/shopify_products_sync.py`,
-`routes/ops_shopify_integration_routes.py`, `readiness/service.py`, `jobs/catalog_import_worker.py`,
-`routes/agent_products.py`, `routes/merchant_api_extensions.py`. They deserve one sweep rather than
-one-at-a-time patches; naming them here so this module is not read as a claim that the job is done.
+Several credential-sending sites are still unpinned. This list is what a later sweep phase reads, so
+keeping it accurate matters in BOTH directions — a fixed file left on it wastes the next reader's
+time, and a missing one is how a site survives the sweep entirely:
+
+  * `services/shopify_products_sync.py`, `readiness/service.py`, `jobs/catalog_import_worker.py`,
+    `routes/agent_products.py`, `routes/merchant_api_extensions.py`
+  * `routes/merchant_risk_api.py` and `routes/agent_commerce.py` — both pass a RAW
+    `merchant_stores.domain` and the raw `api_key` column into `sync_shopify_returns_best_effort`,
+    which is a byte-twin of the `/returns/sync` pinned in `ops_shopify_integration_routes.py`.
+    `agent_commerce.py` separately hands the raw host to
+    `probe_shopify_return_eligibility_best_effort`.
+
+`routes/ops_shopify_integration_routes.py` came OFF this list when its four network-touching routes
+were pinned.
+
+The right fix for the returns family is the helper, not its callers — but
+`sync_shopify_returns_best_effort` cannot simply raise: `readiness/service.py:1200` and
+`routes/agent_commerce.py:511` call it with no exception handling, so a raise there turns a
+recoverable miss into a 500. It needs to refuse in its own best-effort return shape, which is why it
+is a separate change rather than a line in this one.
 """
 
 from __future__ import annotations

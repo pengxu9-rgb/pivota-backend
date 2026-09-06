@@ -36,6 +36,73 @@
             }
           ]
         }
+      },
+      {
+        "@type-id": "custom.PivotaSettlementSweep",
+        "@supports-site-context": true,
+        "@supports-organization-context": false,
+        "@supports-parallel-execution": false,
+        "description": "Observes settled, cancelled and refunded orders SFCC fires no event for, and enqueues them into the Pivota telemetry outbox.",
+        "module": "int_pivota_telemetry/cartridge/scripts/jobs/SweepPivotaSettlements.js",
+        "function": "execute",
+        "transactional": false,
+        "timeout-in-seconds": 1800,
+        "parameters": {
+          "parameter": [
+            {
+              "@name": "MaxOrders",
+              "@type": "long",
+              "description": "Orders examined per run (1-5000).",
+              "@required": false,
+              "default-value": 500,
+              "min-value": 1,
+              "max-value": 5000
+            },
+            {
+              "@name": "OverlapMinutes",
+              "@type": "long",
+              "description": "Minutes the cursor is rewound each run so a missed tick loses nothing (1-1440).",
+              "@required": false,
+              "default-value": 10,
+              "min-value": 1,
+              "max-value": 1440
+            },
+            {
+              "@name": "InitialLookbackHours",
+              "@type": "long",
+              "description": "How far back the first run reaches when no cursor exists yet (1-720).",
+              "@required": false,
+              "default-value": 24,
+              "min-value": 1,
+              "max-value": 720
+            },
+            {
+              "@name": "MaxFailureLagHours",
+              "@type": "long",
+              "description": "How far behind the newest observed order an undeliverable order may hold the cursor before it is abandoned and logged at ERROR (1-168). Without this bound one permanently failing order stalls the whole site's settlement telemetry.",
+              "@required": false,
+              "default-value": 24,
+              "min-value": 1,
+              "max-value": 168
+            }
+          ]
+        },
+        "status-codes": {
+          "status": [
+            {
+              "@code": "OK",
+              "description": "The sweep completed; per-order failures are counted in the message and retried next run."
+            },
+            {
+              "@code": "ABANDONED",
+              "description": "The MaxFailureLagHours bound moved the cursor past order(s) that failed every attempt. Their settlement, cancellation and refund events were never emitted and must be replayed by hand; the order numbers are in the job log at ERROR. Reported as a step ERROR so Business Manager job notifications fire; the step is enforce-restart=\"false\", so the next scheduled run still proceeds."
+            },
+            {
+              "@code": "ERROR",
+              "description": "The cursor could not be read or the order search failed; nothing was swept."
+            }
+          ]
+        }
       }
     ]
   }

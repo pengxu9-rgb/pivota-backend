@@ -287,18 +287,46 @@ def test_the_grace_window_expires(tmp_path):
 
 
 @pytest.mark.parametrize("svc", ["worker", "proof-issuer"])
-def test_an_unreadable_service_blocks_rather_than_passes(tmp_path, svc):
-    """An unknown state is not a good one. This is the same rule the deploy gate applies
-    to an unreadable API: silence must never be able to read as fine, which is precisely
-    how these two services stayed invisible for a month."""
+def test_an_unreachable_cloud_run_api_warns_but_does_not_redden(tmp_path, svc):
+    """THE PLUMBING HALF, adopted from #2010. When the Cloud Run API will not answer, this
+    job's own dependency has failed — production may be perfectly fine. Failing here trains
+    people to mute the alarm, which would take the checks that DO work down with it.
+
+    The counterpart is the test below: this must never become "an unreadable service is
+    fine". It is reported, loudly, every single run."""
     root = _repo(tmp_path)
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
                           capture_output=True, text=True).stdout.strip()
     code, out = _run_drift(tmp_path, root, web=head,
-                           images={"worker": head, "proof-issuer": head},
-                           gcloud_fails=svc)
-    assert code != 0, f"an undescribable {svc} must alarm, not pass:\n{out}"
-    assert svc in out
+                           images={"worker": head, "proof-issuer": head}, gcloud_fails=svc)
+    assert code == 0, f"an API failure is not drift and must not redden the alarm:\n{out}"
+    assert "UNKNOWN" in out and svc in out, (
+        f"the unreadable service must still be named out loud — a silent gap wearing a warning "
+        f"label is the thing this file exists to catch:\n{out}"
+    )
+
+
+@pytest.mark.parametrize(
+    "case, kwargs",
+    [
+        ("split traffic", {"split": "proof-issuer"}),
+        ("two revisions both at 100%", {"both100": "proof-issuer"}),
+        ("a revision declaring no commit", {"no_commit": "proof-issuer"}),
+    ],
+)
+def test_a_production_state_we_cannot_interpret_still_fails(tmp_path, case, kwargs):
+    """THE OTHER HALF, and the reason the degrade above is not a blanket one. Nothing is wrong
+    with US in these cases — we asked, we got an answer, and the answer describes a service
+    that cannot be checked against main. That is exactly the condition under which the worker
+    stayed invisible for a month, and it must not decay into a warning nobody reads."""
+    root = _repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    images = {"worker": head, "proof-issuer": "" if "no_commit" in kwargs else head}
+    kwargs = {k: v for k, v in kwargs.items() if k != "no_commit"}
+    code, out = _run_drift(tmp_path, root, web=head, images=images, **kwargs)
+    assert code != 0, f"{case} is a production state, not a read failure, and must alarm:\n{out}"
+    assert "proof-issuer" in out
 
 
 def test_an_unreachable_web_still_blocks(tmp_path):
