@@ -72,7 +72,12 @@ def test_sfcc_settlement_sweep_step_is_registered_as_a_job_and_a_step_type():
         parameter["@name"]: parameter
         for parameter in sweep["parameters"]["parameter"]
     }
-    assert set(parameters) == {"MaxOrders", "OverlapMinutes", "InitialLookbackHours"}
+    assert set(parameters) == {
+        "MaxOrders",
+        "OverlapMinutes",
+        "InitialLookbackHours",
+        "MaxFailureLagHours",
+    }
     assert parameters["MaxOrders"]["max-value"] == 5000
 
     jobs = ElementTree.parse(CARTRIDGE / "metadata/jobs.xml").getroot()
@@ -177,6 +182,153 @@ def test_sfcc_settlement_sweep_has_a_bounded_cursor_with_an_overlap_window():
     # search itself is guarded.
     assert "catch (orderError)" in sweep
     assert "new Status(Status.OK, 'OK', message)" in sweep
+
+
+def test_sfcc_settlement_sweep_bounds_the_failure_clamp_so_a_poison_order_cannot_stall_the_site():
+    """`firstFailureAt` clamps the cursor to the first undeliverable order.
+
+    Unbounded, that is a silent site-wide outage: an order that fails on EVERY
+    tick — bad data, an exception inside `buildEvent` — pins the cursor to its
+    own `lastModified` forever, and because `MaxOrders` bounds each run the
+    sweep re-scans the same window and never reaches a newer order. Every later
+    settlement, cancellation and refund for the site is lost, and the only
+    symptom is a `failed=` count in the merchant's own job log.
+
+    So the clamp is bounded by `MaxFailureLagHours`, and when the bound
+    overrides the clamp the abandoned order numbers are logged at ERROR.
+    """
+    steptypes = json.loads((CARTRIDGE / "int_pivota_telemetry/steptypes.json").read_text())
+    sweep_step = next(
+        step
+        for step in steptypes["step-types"]["script-module-step"]
+        if step["@type-id"] == "custom.PivotaSettlementSweep"
+    )
+    parameters = {
+        parameter["@name"]: parameter for parameter in sweep_step["parameters"]["parameter"]
+    }
+    # Registered, or the job cannot be tuned and the default is the only value.
+    assert "MaxFailureLagHours" in parameters
+    lag = parameters["MaxFailureLagHours"]
+    assert lag["@type"] == "long"
+    assert lag["default-value"] == 24
+    assert lag["min-value"] == 1
+    assert lag["max-value"] == 168
+    assert lag["@required"] is False
+
+    jobs_text = (CARTRIDGE / "metadata/jobs.xml").read_text()
+    assert '<parameter name="MaxFailureLagHours">24</parameter>' in jobs_text
+
+    sweep = (
+        CARTRIDGE
+        / "int_pivota_telemetry/cartridge/scripts/jobs/SweepPivotaSettlements.js"
+    ).read_text()
+    # The same 1..168 bound is enforced in code, not only declared in the manifest:
+    # a job imported before this steptypes.json would otherwise pass anything.
+    assert "DEFAULT_MAX_FAILURE_LAG_HOURS = 24" in sweep
+    assert "MIN_MAX_FAILURE_LAG_HOURS = 1" in sweep
+    assert "MAX_MAX_FAILURE_LAG_HOURS = 168" in sweep
+    assert "parameters && parameters.MaxFailureLagHours" in sweep
+    assert "DEFAULT_MAX_FAILURE_LAG_HOURS,\n        MIN_MAX_FAILURE_LAG_HOURS," in sweep
+
+    # The bound is measured against the newest order OBSERVED, not against the
+    # watermark: a run in which every order failed has no watermark, and that is
+    # precisely the run that needs the bound.
+    assert "newestSeen" in sweep
+    assert (
+        "var lagBound = new Date(newestSeen.getTime() - maxFailureLagHours * 60 * 60 * 1000);"
+        in sweep
+    )
+    # …and the clamp still wins whenever it is INSIDE the bound, so an ordinary
+    # transient failure is still retried rather than abandoned.
+    assert "if (firstFailureAt && (!effective || firstFailureAt.getTime() < effective.getTime()))" in sweep
+
+    # The override and its ERROR log must be the same branch — a log placed
+    # outside it would never fire on the run that abandons an order.
+    override = sweep.split("if (effective.getTime() < lagBound.getTime()) {", 1)
+    assert len(override) == 2, "the lag bound must override the failure clamp"
+    override_body = override[1].split("\n        }", 1)[0]
+    assert "logger.error(" in override_body
+    assert "ABANDONED" in override_body
+    # The log names the orders, so support can replay them by hand.
+    assert "abandoned.join(', ')" in override_body
+    assert "failure.orderNo" in override_body
+    assert "effective = lagBound;" in override_body
+
+    docs = (ROOT / "docs/SFCC_TELEMETRY.md").read_text()
+    assert "MaxFailureLagHours" in docs
+    assert "abandon" in docs.lower()
+    readme = (CARTRIDGE / "README.md").read_text()
+    assert "MaxFailureLagHours" in readme
+    assert "abandon" in readme.lower()
+
+
+def test_sfcc_settlement_sweep_reads_the_invoice_type_under_its_real_property_name():
+    """`dw.order.Invoice`'s accessor is `getInvoiceType()`, so the script-API
+    property is `invoiceType`. Reading only `type` — very likely `undefined` —
+    made the credit-invoice fallback dead code: the grand-total refund path was
+    unreachable and the "skipped, amount is not positive" WARN could never fire
+    for a real credit invoice.
+    """
+    sweep = (
+        CARTRIDGE
+        / "int_pivota_telemetry/cartridge/scripts/jobs/SweepPivotaSettlements.js"
+    ).read_text()
+    # `invoiceType` is the real name and is read FIRST; `type` is the fallback.
+    assert "invoice.invoiceType || invoice.type" in sweep
+    assert "invoice.type || invoice.invoiceType" not in sweep
+    # The token matching is kept — the class constants are an Order Management
+    # surface this cartridge must not import, and a mis-named constant is
+    # `undefined`, which matches nothing.
+    assert "CREDIT_TYPE_TOKENS = ['credit', 'return', 'appeasement']" in sweep
+    assert "type.indexOf(CREDIT_TYPE_TOKENS[index]) !== -1" in sweep
+    # The old, wrong-only read must be gone.
+    assert "invoice && invoice.type ? String(invoice.type).toLowerCase()" not in sweep
+
+    docs = (ROOT / "docs/SFCC_TELEMETRY.md").read_text()
+    # Both names are listed with their verification status.
+    assert "`Invoice.invoiceType`" in docs
+    assert "getInvoiceType()" in docs
+
+
+def test_sfcc_sweep_cursor_is_scoped_to_the_site_like_the_outbox_it_feeds():
+    """`OrderMgr.searchOrders` only ever sees the current site's orders, so the
+    cursor must be per site too. It is site-SCOPED (like `PivotaTelemetryOutbox`)
+    rather than site-KEYED, and the bare id `settlement` is only correct because
+    of that — so the scope is pinned here.
+    """
+    namespace = {"m": "http://www.demandware.com/xml/impex/metadata/2006-10-31"}
+    root = ElementTree.parse(
+        CARTRIDGE / "metadata/meta/custom-objecttype-definitions.xml"
+    ).getroot()
+    scopes = {
+        custom_type.attrib["type-id"]: custom_type.find("m:storage-scope", namespace).text
+        for custom_type in root.findall("m:custom-type", namespace)
+    }
+    assert scopes == {
+        "PivotaTelemetryOutbox": "site",
+        "PivotaTelemetrySweepCursor": "site",
+    }
+
+    sweep = (
+        CARTRIDGE
+        / "int_pivota_telemetry/cartridge/scripts/jobs/SweepPivotaSettlements.js"
+    ).read_text()
+    assert "CURSOR_ID = 'settlement'" in sweep
+    # The bare id is deliberate and the reason is written down next to it, so a
+    # later scope change cannot silently make one site's cursor hide another's.
+    assert "storage-scope" in sweep
+    assert "dw/system/Site" in sweep
+
+    # The step runs in site context, which is what makes that scope resolvable
+    # at all — an organization-context step would find no site cursor.
+    steptypes = json.loads((CARTRIDGE / "int_pivota_telemetry/steptypes.json").read_text())
+    sweep_step = next(
+        step
+        for step in steptypes["step-types"]["script-module-step"]
+        if step["@type-id"] == "custom.PivotaSettlementSweep"
+    )
+    assert sweep_step["@supports-site-context"] is True
+    assert sweep_step["@supports-organization-context"] is False
 
 
 def test_sfcc_once_only_markers_and_sweep_cursor_are_declared_in_the_impex():

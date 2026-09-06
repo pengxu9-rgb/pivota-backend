@@ -123,6 +123,11 @@ cartridge's outbox deletes the batch rather than retrying forever.
 
 `order_ref` is always `salesforce_commerce_cloud:<orderNo>`.
 
+`refund.succeeded` is keyed on the **invoice number** and its amount is frozen
+at first observation, so a further partial refund later recorded against the
+**same** invoice is never re-emitted — only a new invoice produces a new refund
+row.
+
 ### Event keys, and why they are deterministic
 
 The shopper hooks mint a random UUID per event, because a hook fires once and
@@ -203,7 +208,17 @@ total is still reported on a later tick.
 ### The cursor
 
 Stored in a `PivotaTelemetrySweepCursor` custom object (key `settlement`,
-site-scoped, `cursorAt` + `updatedAt`).
+`cursorAt` + `updatedAt`).
+
+The custom type is declared **`<storage-scope>site</storage-scope>`**, the same
+scope as `PivotaTelemetryOutbox`, and that is load-bearing rather than
+incidental: `OrderMgr.searchOrders` only ever sees the **current site's** orders,
+so a cursor shared across sites would let one site's watermark hide another
+site's orders entirely. Because the scope is per site, the object id is the bare
+literal `settlement` rather than being keyed on
+`require('dw/system/Site').getCurrent().getID()`; if the scope is ever changed to
+`organization`, the id must become site-keyed in the same commit.
+`tests/test_sfcc_cartridge_contract.py` pins the scope of both custom types.
 
 * Orders are read `lastModified >= cursorAt`, ordered `lastModified asc`,
   bounded by `MaxOrders` (default 500, max 5000).
@@ -212,9 +227,34 @@ site-scoped, `cursorAt` + `updatedAt`).
   `lastModified` lands inside the window just closed is re-examined rather than
   lost. Re-examination is free: both once-only layers hold.
 * It never moves backwards, and it never steps past an order whose enqueue
-  failed in this run (the first such order clamps the watermark).
+  failed in this run (the first such order clamps the watermark) — **up to
+  `MaxFailureLagHours`**, below.
 * With no cursor yet, the first run reaches back `InitialLookbackHours`
   (default 24).
+
+#### `MaxFailureLagHours`: why the failure clamp is bounded
+
+The failure clamp on its own is a **silent site-wide outage waiting to happen**.
+An order that fails on *every* tick — unreadable custom attributes, an exception
+raised inside `buildEvent`, an invoice member that throws — pins the clamp, and
+therefore the cursor, to its own `lastModified` for good. Each run then re-reads
+the same window, and because `MaxOrders` bounds the run the sweep never reaches
+the orders behind it. Every later settlement, cancellation and refund for the
+whole site is lost, and the only symptom is a `failed=` count in the merchant's
+own job log — which, per *Not built* below, nothing on the Pivota side reads.
+
+So the clamp is bounded by a job parameter, `MaxFailureLagHours` (default 24,
+clamped 1–168 in both `steptypes.json` and the code): the clamp may hold the
+cursor at most that far behind the **newest order the run observed** — newest
+observed, not the watermark, because a run in which every order failed has no
+watermark and is exactly the run that needs the bound.
+
+When the bound overrides the clamp, the failing orders are **abandoned**: their
+`order.paid` / `order.cancelled` / `refund.succeeded` facts are never emitted,
+and Pivota will never learn them. That loss is deliberate — a named loss beats a
+silent stall — and it is logged at **ERROR** naming the order numbers (up to 50
+per run) so support can replay them by hand. A transient failure well inside the
+bound is still simply retried on the next tick.
 
 Writing a once-only marker updates the order's `lastModified`, so an order the
 sweep just marked is re-examined on the following tick and then skipped without
@@ -251,8 +291,10 @@ marked ASSUMED is a claim a merchant install will be the first thing to test.
 | `OrderMgr.searchOrders(query, sort, args…)` returns a `SeekableIterator` that must be `close()`d | VERIFIED — `dw.order.OrderMgr` |
 | `lastModified` is queryable in an `OrderMgr.searchOrders` query string, and `'lastModified asc'` is a valid sort | **ASSUMED** — stated in the programme brief; not re-verified against the search-attribute reference. If it is not queryable the sweep finds nothing and says `scanned=0`, which is a loud, safe failure |
 | `Order.getInvoices()` returns a collection of `dw.order.Invoice` | **ASSUMED** — `Invoice` is an Order Management extension surface; the call is wrapped in `try/catch` and a realm without it logs one INFO line and reports no refunds |
-| `Invoice.invoiceNumber`, `Invoice.status`, `Invoice.type`, `Invoice.grandTotal`, `Invoice.refundedAmount` | **ASSUMED** — same family. Absent members read as `undefined` and the invoice is skipped, never crash-emitted |
-| `Invoice.INVOICE_TYPE_CREDIT` exists as a constant with that exact name | **NOT RELIED ON.** The author could not confirm this spelling (the type constants may be `TYPE_RETURN` / `TYPE_APPEASEMENT` / `TYPE_RETURN_CASE`), and a mis-named constant reads as `undefined`, which would match no invoice and silently report zero refunds. So the sweep classifies by lowercase substring of `String(invoice.type)` — `credit`, `return`, `appeasement` — and only as a FALLBACK: the primary rule is `refundedAmount > 0`, which needs no type at all |
+| `Invoice.invoiceNumber`, `Invoice.status`, `Invoice.grandTotal`, `Invoice.refundedAmount` | **ASSUMED** — same family. Absent members read as `undefined` and the invoice is skipped, never crash-emitted |
+| `Invoice.invoiceType` is the invoice's type property | **ASSUMED, and read FIRST** — the documented accessor is `getInvoiceType()`, so the script-API property is `invoiceType`. Not executed, hence assumed |
+| `Invoice.type` is *also* a readable type property | **ASSUMED FALSE / very likely `undefined`** — there is no `getType()` on `dw.order.Invoice`. It is read only as the SECOND choice, which costs nothing if it is absent. An earlier revision of this cartridge read `type` **alone**, which made the whole credit-invoice fallback dead code against a real credit invoice: `refundAmount`'s grand-total path was unreachable and the "skipped, amount is not positive" WARN could never fire |
+| `Invoice.INVOICE_TYPE_CREDIT` exists as a constant with that exact name | **NOT RELIED ON.** The author could not confirm this spelling (the type constants may be `TYPE_RETURN` / `TYPE_APPEASEMENT` / `TYPE_RETURN_CASE`), and a mis-named constant reads as `undefined`, which would match no invoice and silently report zero refunds. So the sweep classifies by lowercase substring of `String(invoice.invoiceType \|\| invoice.type)` — `credit`, `return`, `appeasement` — and only as a FALLBACK: the primary rule is `refundedAmount > 0`, which needs no type at all |
 | `Invoice.status` string contains `paid` when the invoice settled | **ASSUMED** — matched case-insensitively, and only on the fallback path; `refundedAmount > 0` is trusted on its own |
 | A refund made in the PSP's own dashboard leaves no trace in SFCC | VERIFIED — SFCC learns of it only if an integration writes an invoice back. Documented gap, below |
 | Custom attributes on `Order` require `metadata/meta/system-objecttype-extensions.xml` and a `Transaction` to write | VERIFIED — standard SFCC |

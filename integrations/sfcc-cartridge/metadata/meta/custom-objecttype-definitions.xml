@@ -58,6 +58,12 @@
         <display-name xml:lang="x-default">Pivota Telemetry Sweep Cursor</display-name>
         <description xml:lang="x-default">Where the settlement sweep last reached. One row per site, key "settlement".</description>
         <staging-mode>no-staging</staging-mode>
+        <!-- SITE scope is load-bearing, and must match PivotaTelemetryOutbox above.
+             `OrderMgr.searchOrders` only ever sees the current site's orders, so a
+             cursor shared across sites would let one site's watermark hide another
+             site's orders entirely. Because the scope is `site`, the sweep may use
+             the bare id "settlement"; if this is ever changed to `organization`,
+             SweepPivotaSettlements.js MUST key CURSOR_ID on the current site id. -->
         <storage-scope>site</storage-scope>
         <key-definition attribute-id="ID">
             <display-name xml:lang="x-default">Cursor ID</display-name>

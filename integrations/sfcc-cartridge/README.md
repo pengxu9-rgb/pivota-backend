@@ -47,6 +47,10 @@ ordered `lastModified asc`, bounded by `MaxOrders`, and enqueues:
 | `status == CANCELLED` | `order.cancelled` | none | `order.cancelled:<orderNo>` |
 | a credit `Invoice` with a positive refund | `refund.succeeded` | that invoice's refund | `refund.succeeded:<invoiceNumber>` |
 
+`refund.succeeded` is keyed on the invoice number and its amount is frozen at
+first observation, so a further partial refund later recorded against the
+**same** invoice is not re-emitted — only a new invoice is.
+
 `order.paid` carries the **order total**, not a capture, and its `occurred_at`
 is the order's **`lastModified`**, not the settlement instant — SFCC records no
 settlement instant, and `lastModified` is the transition only when nothing
@@ -78,12 +82,37 @@ just marked is re-examined on the following run and then skipped without a
 write. That converges after one extra pass; it is not a loop.
 
 The cursor lives in a `PivotaTelemetrySweepCursor` custom object (key
-`settlement`, site-scoped) and is always stored **rewound by
-`OverlapMinutes`** (default 10), so a run that dies mid-batch, or an order whose
-`lastModified` lands inside the window just closed, is re-examined rather than
-lost. It never moves backwards, and it never steps over an order whose enqueue
-failed in this run. With no cursor yet, the first run reaches back
-`InitialLookbackHours` (default 24).
+`settlement`) and is always stored **rewound by `OverlapMinutes`** (default 10),
+so a run that dies mid-batch, or an order whose `lastModified` lands inside the
+window just closed, is re-examined rather than lost. It never moves backwards,
+and it never steps over an order whose enqueue failed in this run. With no
+cursor yet, the first run reaches back `InitialLookbackHours` (default 24).
+
+That custom type is declared **`<storage-scope>site</storage-scope>`**, the same
+scope as the outbox it feeds, and the scope is load-bearing:
+`OrderMgr.searchOrders` only ever sees the current site's orders, so a cursor
+shared across sites would let one site's watermark hide another site's orders.
+Because the scope is per site, the object id is the plain literal `settlement`
+rather than being keyed on the site id.
+
+### Why the failure clamp is bounded — `MaxFailureLagHours`
+
+"Never steps over an order whose enqueue failed" is a stall if it is unbounded.
+An order that fails on **every** run — bad data, an exception while the event is
+built, an invoice member that throws — pins the cursor to its own `lastModified`
+for good; because `MaxOrders` bounds each run, the sweep then re-reads the same
+window forever and never reaches newer orders. The site's whole settlement
+telemetry stops, and the only symptom is a `failed=` count in this job's log.
+
+So `MaxFailureLagHours` (default 24, range 1–168) caps how far behind the newest
+order a run observed the clamp may hold the cursor. Past that cap the failing
+orders are **abandoned** — their `order.paid`, `order.cancelled` and
+`refund.succeeded` events are never emitted and Pivota will never learn them —
+and the job logs an **ERROR naming the abandoned order numbers** (up to 50 per
+run) so they can be replayed by hand. Watch that ERROR: it is the only notice
+that settlement facts were dropped. Raise the parameter to give a flapping
+integration longer to recover; lower it to keep the cursor moving on a site
+where a stall matters more than a few orders.
 
 ### What the sweep must never do
 

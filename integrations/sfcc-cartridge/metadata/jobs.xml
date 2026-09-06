@@ -33,6 +33,11 @@
                     <parameter name="MaxOrders">500</parameter>
                     <parameter name="OverlapMinutes">10</parameter>
                     <parameter name="InitialLookbackHours">24</parameter>
+                    <!-- An order that fails on every tick would otherwise pin the
+                         cursor forever and stall the whole site's settlement
+                         telemetry. Past this lag the sweep abandons it and logs
+                         the order numbers at ERROR so they can be replayed. -->
+                    <parameter name="MaxFailureLagHours">24</parameter>
                 </parameters>
             </step>
         </flow>

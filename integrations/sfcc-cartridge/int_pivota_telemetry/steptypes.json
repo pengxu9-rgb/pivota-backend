@@ -75,6 +75,15 @@
               "default-value": 24,
               "min-value": 1,
               "max-value": 720
+            },
+            {
+              "@name": "MaxFailureLagHours",
+              "@type": "long",
+              "description": "How far behind the newest observed order an undeliverable order may hold the cursor before it is abandoned and logged at ERROR (1-168). Without this bound one permanently failing order stalls the whole site's settlement telemetry.",
+              "@required": false,
+              "default-value": 24,
+              "min-value": 1,
+              "max-value": 168
             }
           ]
         },

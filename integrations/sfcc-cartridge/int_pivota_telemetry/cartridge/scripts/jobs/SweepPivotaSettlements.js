@@ -54,6 +54,18 @@ var Status = require('dw/system/Status');
 var Transaction = require('dw/system/Transaction');
 var Telemetry = require('*/cartridge/scripts/pivota/Telemetry');
 
+// The cursor id is the bare literal `settlement` — NOT keyed on the site id —
+// and that is only correct because `PivotaTelemetrySweepCursor` is declared
+// `<storage-scope>site</storage-scope>` in
+// metadata/meta/custom-objecttype-definitions.xml, exactly like the
+// `PivotaTelemetryOutbox` type this job feeds. A site-scoped custom object is
+// resolved within the current site, so each site gets its own `settlement`
+// row. That has to match the data: `OrderMgr.searchOrders` only ever sees the
+// current site's orders, so a cursor shared across sites would let one site's
+// watermark hide another site's orders. If the storage scope is ever changed
+// to `organization`, this id MUST become
+// 'settlement:' + require('dw/system/Site').getCurrent().getID().
+// `tests/test_sfcc_cartridge_contract.py` pins the scope of both types.
 var CURSOR_TYPE = 'PivotaTelemetrySweepCursor';
 var CURSOR_ID = 'settlement';
 
@@ -68,6 +80,15 @@ var DEFAULT_OVERLAP_MINUTES = 10;
 var MAX_OVERLAP_MINUTES = 1440;
 var DEFAULT_LOOKBACK_HOURS = 24;
 var MAX_LOOKBACK_HOURS = 720;
+// How far behind the newest order this run saw the failure clamp is allowed to
+// hold the cursor. Past this, the failing order is abandoned so the sweep can
+// reach newer orders again. See the comment at the clamp in `execute`.
+var DEFAULT_MAX_FAILURE_LAG_HOURS = 24;
+var MIN_MAX_FAILURE_LAG_HOURS = 1;
+var MAX_MAX_FAILURE_LAG_HOURS = 168;
+// The abandonment log names order numbers so support can replay them by hand.
+// It is bounded so one catastrophic run cannot write an unbounded log line.
+var MAX_REPORTED_FAILURES = 50;
 var MAX_INVOICES_PER_ORDER = 50;
 // A set-of-string cannot grow without bound. An order with more credit
 // invoices than this loses its oldest markers; the deterministic refund event
@@ -227,8 +248,23 @@ function refundAmount(invoice) {
     return 0;
 }
 
+/**
+ * Is this invoice one that returns money to the shopper?
+ *
+ * The property is read as `invoiceType` FIRST and `type` only second. On
+ * `dw.order.Invoice` the accessor is `getInvoiceType()`, so the script-API
+ * property is `invoiceType`; `type` is very likely `undefined` there. Reading
+ * `type` alone therefore made this entire fallback dead code against a real
+ * credit invoice — `refundAmount`'s grand-total path could never be reached,
+ * and the "skipped, amount is not positive" WARN that a support engineer would
+ * use to notice a mis-shaped credit invoice could never fire. `type` is kept as
+ * the second reading because it costs nothing and a realm that does surface it
+ * still classifies. Both names, and their verification status, are in the table
+ * in docs/SFCC_TELEMETRY.md.
+ */
 function isCreditInvoice(invoice) {
-    var type = invoice && invoice.type ? String(invoice.type).toLowerCase() : '';
+    var raw = invoice ? (invoice.invoiceType || invoice.type) : null;
+    var type = raw ? String(raw).toLowerCase() : '';
     if (!type) {
         return false;
     }
@@ -395,6 +431,12 @@ function execute(parameters) {
         1,
         MAX_LOOKBACK_HOURS
     );
+    var maxFailureLagHours = bounded(
+        parameters && parameters.MaxFailureLagHours,
+        DEFAULT_MAX_FAILURE_LAG_HOURS,
+        MIN_MAX_FAILURE_LAG_HOURS,
+        MAX_MAX_FAILURE_LAG_HOURS
+    );
     var counts = {scanned: 0, paid: 0, cancelled: 0, refunds: 0, skipped: 0, failed: 0};
     var cursor;
     var since;
@@ -408,6 +450,12 @@ function execute(parameters) {
 
     var watermark = null;
     var firstFailureAt = null;
+    // The newest `lastModified` this run OBSERVED, successful or not. The lag
+    // bound below is measured against this rather than against `watermark`,
+    // because a run in which every order failed has no watermark at all — and
+    // that is exactly the run that most needs the bound.
+    var newestSeen = null;
+    var failures = [];
     var iterator = null;
     try {
         iterator = OrderMgr.searchOrders('lastModified >= {0}', 'lastModified asc', since);
@@ -428,10 +476,19 @@ function execute(parameters) {
                     orderError.message
                 );
             }
+            if (lastModified && (!newestSeen || lastModified.getTime() > newestSeen.getTime())) {
+                newestSeen = new Date(lastModified.getTime());
+            }
             if (!complete) {
                 counts.failed += 1;
                 if (!firstFailureAt && lastModified) {
                     firstFailureAt = new Date(lastModified.getTime());
+                }
+                if (failures.length < MAX_REPORTED_FAILURES) {
+                    failures.push({
+                        orderNo: order && order.orderNo ? String(order.orderNo) : '(unknown)',
+                        at: lastModified ? new Date(lastModified.getTime()) : null
+                    });
                 }
                 continue;
             }
@@ -448,10 +505,50 @@ function execute(parameters) {
         }
     }
 
-    // The cursor must never step over an order this run could not deliver.
+    // The cursor must never step over an order this run could not deliver…
     var effective = watermark;
     if (firstFailureAt && (!effective || firstFailureAt.getTime() < effective.getTime())) {
         effective = firstFailureAt;
+    }
+    // …but that clamp cannot be unbounded, or one poison order STALLS THE SITE.
+    //
+    // An order that fails on every single tick — unreadable custom attributes,
+    // an exception raised inside `buildEvent`, an invoice member that throws —
+    // pins `firstFailureAt`, and therefore the cursor, to its own
+    // `lastModified` forever. Each run then re-reads the same window, and
+    // because `MaxOrders` bounds the run, the sweep never reaches the newer
+    // orders behind it. Every later settlement, cancellation and refund for the
+    // whole site is silently lost, and the only symptom is a `failed=` count in
+    // the merchant's own job log, which nothing on the Pivota side reads.
+    //
+    // So the clamp may hold the cursor at most `MaxFailureLagHours` behind the
+    // newest order this run observed. Beyond that the failing orders are
+    // ABANDONED — their facts are never emitted — and the abandonment is a loud
+    // ERROR naming the order numbers, because a silent stall is worse than a
+    // named loss that support can replay by hand.
+    if (newestSeen && effective) {
+        var lagBound = new Date(newestSeen.getTime() - maxFailureLagHours * 60 * 60 * 1000);
+        if (effective.getTime() < lagBound.getTime()) {
+            var abandoned = [];
+            for (var failureIndex = 0; failureIndex < failures.length; failureIndex += 1) {
+                var failure = failures[failureIndex];
+                if (!failure.at || failure.at.getTime() < lagBound.getTime()) {
+                    abandoned.push(failure.orderNo);
+                }
+            }
+            logger.error(
+                'Pivota settlement sweep ABANDONED order(s) so the cursor could move past ' +
+                'them: {0}. They failed every attempt for longer than MaxFailureLagHours={1}h; ' +
+                'their settlement, cancellation and refund events were NEVER emitted and must ' +
+                'be replayed by hand. {2} order(s) failed this run in total; at most {3} order ' +
+                'numbers are listed here.',
+                abandoned.join(', ') || '(no order number was readable)',
+                maxFailureLagHours,
+                counts.failed,
+                MAX_REPORTED_FAILURES
+            );
+            effective = lagBound;
+        }
     }
     try {
         if (effective) {
