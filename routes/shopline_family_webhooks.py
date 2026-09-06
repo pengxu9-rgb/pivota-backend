@@ -10,12 +10,18 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from db.database import database
+from services.commerce_interaction_service import (
+    order_money_read_modify_write_lock,
+    recorded_refund_amount_cents,
+)
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
 from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.shopline_family_event_adapter import (
+    SHOPLAZZA_REFUND_TOPICS,
     UnsupportedShoplineFamilyEvent,
     map_shopline_webhook,
     map_shoplazza_webhook,
+    shoplazza_order_ref,
 )
 from services.shopline_family_webhook_auth import resolve_webhook_secret
 
@@ -106,20 +112,82 @@ async def _receive(
         raise HTTPException(status_code=400, detail=f"Invalid {platform} webhook JSON") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail=f"{platform} webhook body must be an object")
-    try:
-        mapper = map_shopline_webhook if platform == "shopline" else map_shoplazza_webhook
-        batch = mapper(
-            payload,
-            topic=str(topic or ""),
-            delivery_id=delivery_id,
+    merchant_id = str(store["merchant_id"])
+    # Shoplazza's refund deliveries carry only a CUMULATIVE `total_refund_price`
+    # and no per-refund identity, so the new money in one delivery is that total
+    # minus what this write path has already recorded for the order. The read
+    # belongs here, not in the mapper: the mapper stays pure, and the read and
+    # the write it feeds are held under one lock.
+    refund_order_ref = (
+        shoplazza_order_ref(payload)
+        if platform == "shoplazza"
+        and str(topic or "").strip().lower() in SHOPLAZZA_REFUND_TOPICS
+        else None
+    )
+    if refund_order_ref is None:
+        return await _map_and_record(
+            platform=platform,
+            merchant_id=merchant_id,
             store_id=store_id,
+            payload=payload,
+            topic=topic,
+            delivery_id=delivery_id,
         )
+    async with order_money_read_modify_write_lock(
+        merchant_id=merchant_id,
+        store_id=store_id,
+        order_ref=refund_order_ref,
+        scope="shoplazza_refund",
+    ):
+        previously_recorded = await recorded_refund_amount_cents(
+            merchant_id=merchant_id,
+            store_id=store_id,
+            order_ref=refund_order_ref,
+            write_path="shoplazza_webhook",
+        )
+        return await _map_and_record(
+            platform=platform,
+            merchant_id=merchant_id,
+            store_id=store_id,
+            payload=payload,
+            topic=topic,
+            delivery_id=delivery_id,
+            previously_recorded_refund_cents=previously_recorded,
+        )
+
+
+async def _map_and_record(
+    *,
+    platform: str,
+    merchant_id: str,
+    store_id: str,
+    payload: Dict[str, Any],
+    topic: Optional[str],
+    delivery_id: Optional[str],
+    **mapper_kwargs: Any,
+):
+    try:
+        if platform == "shopline":
+            batch = map_shopline_webhook(
+                payload,
+                topic=str(topic or ""),
+                delivery_id=delivery_id,
+                store_id=store_id,
+            )
+        else:
+            batch = map_shoplazza_webhook(
+                payload,
+                topic=str(topic or ""),
+                delivery_id=delivery_id,
+                store_id=store_id,
+                **mapper_kwargs,
+            )
     except UnsupportedShoplineFamilyEvent as exc:
         return {"status": "ignored", "platform": platform, "reason": str(exc)}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     result = await ingest_merchant_event_batch(
-        merchant_id=str(store["merchant_id"]),
+        merchant_id=merchant_id,
         batch=batch,
         agent_identity_confidence="platform_asserted",
         write_path="shopline_webhook" if platform == "shopline" else "shoplazza_webhook",

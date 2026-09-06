@@ -999,6 +999,113 @@ async def record_commerce_event_best_effort(
         }
 
 
+def _payload_mapping(value: Any) -> Dict[str, Any]:
+    """The ``payload`` column as a dict, whichever dialect handed it over.
+
+    On SQLite the JSON column is deserialized for us; on Postgres a `jsonb`
+    read can arrive as the raw JSON text depending on the driver's codec, and
+    silently reading `.get` off a string would make every refund total zero.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def recorded_refund_amount_cents(
+    *,
+    merchant_id: str,
+    store_id: Optional[str],
+    order_ref: str,
+    write_path: str,
+) -> int:
+    """Minor units this write path has ALREADY recorded as refunded for one order.
+
+    The caller is a receiver whose platform reports a CUMULATIVE refund total
+    and no per-refund identity (Shoplazza), so the only way it can tell new
+    money from money it has already counted is to subtract this.
+
+    Scoped to one ``write_path`` on purpose: a PSP mirror of the same refund is
+    a different authority with its own native ids, and subtracting it from a
+    platform total would make the platform's next partial refund disappear.
+    Synthetic (probe) rows are excluded for the same reason — a canary must not
+    be able to suppress real money.
+
+    The sum is taken in Python over the matching rows, not in SQL. ``amount_cents``
+    lives inside the ``payload`` JSON column, whose JSON accessors and numeric
+    typing differ between Postgres and SQLite; one order's refund rows are a
+    handful, and the filter is an indexed ``order_ref`` lookup.
+    """
+    if not merchant_id or not order_ref or not write_path:
+        return 0
+    conditions = [
+        commerce_interaction_events.c.merchant_id == merchant_id,
+        commerce_interaction_events.c.event_type == "refund.succeeded",
+        commerce_interaction_events.c.write_path == write_path,
+        commerce_interaction_events.c.order_ref == order_ref,
+        commerce_interaction_events.c.synthetic.is_(False),
+    ]
+    conditions.append(
+        commerce_interaction_events.c.store_id == store_id
+        if store_id
+        else commerce_interaction_events.c.store_id.is_(None)
+    )
+    rows = await database.fetch_all(
+        select(commerce_interaction_events.c.payload).where(and_(*conditions))
+    )
+    total = 0
+    for row in rows:
+        amount = _payload_mapping(dict(row).get("payload")).get("amount_cents")
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            total += amount
+    return total
+
+
+@asynccontextmanager
+async def order_money_read_modify_write_lock(
+    *,
+    merchant_id: str,
+    store_id: Optional[str],
+    order_ref: str,
+    scope: str,
+):
+    """Serialize a read-then-write money computation for ONE order.
+
+    A receiver that derives an amount by subtracting what it already recorded
+    is doing a read-modify-write. Two deliveries for the same order that
+    interleave both read the same "already recorded" figure, so the second
+    delta is computed against a stale baseline: the order's refunded total is
+    understated by one delta, and both events land on the same deterministic
+    key so the ledger keeps only the first.
+
+    On Postgres the read AND the ledger write run inside one transaction that
+    holds ``pg_advisory_xact_lock``, so the second delivery reads only after the
+    first has committed. SQLite has no advisory locks, so this is a plain no-op
+    there and a concurrent pair can still interleave — SQLite is tests and local
+    development only, and the deterministic key still keeps a raced pair from
+    double-counting (it collapses them to one, understating rather than
+    inflating).
+    """
+    if not IS_POSTGRES:
+        yield
+        return
+    async with database.transaction():
+        await database.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+            {"lock_key": f"{scope}|{merchant_id}|{store_id or ''}|{order_ref}"},
+        )
+        yield
+
+
 async def find_interaction_by_checkout_id(
     checkout_id: str,
     *,
