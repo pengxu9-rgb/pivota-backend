@@ -24,11 +24,16 @@ BigCommerce and PrestaShop, so no schema change is needed::
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
+
+from services.merchant_store_credentials import (
+    merge_store_credentials,
+    parse_store_credentials,
+    serialize_store_credentials,
+)
 
 
 logger = logging.getLogger("squarespace_connection")
@@ -85,23 +90,17 @@ def parse_squarespace_credentials(raw: Any) -> Dict[str, Any]:
 
     A bare string is read as the API key so a row written by some other path
     is not silently treated as credential-less.
+
+    The codec is the platform-agnostic one in
+    services/merchant_store_credentials.py; this name is kept because it is what
+    the receiver, the sweep and the routes import, and because a platform that
+    ever needs a different on-disk shape changes it here rather than everywhere.
     """
-    if isinstance(raw, dict):
-        return dict(raw)
-    value = str(raw or "").strip()
-    if not value:
-        return {}
-    if not value.startswith("{"):
-        return {"api_key": value}
-    try:
-        parsed = json.loads(value)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {"api_key": value}
-    return dict(parsed) if isinstance(parsed, dict) else {"api_key": value}
+    return parse_store_credentials(raw)
 
 
 def serialize_squarespace_credentials(credentials: Dict[str, Any]) -> str:
-    return json.dumps(credentials, separators=(",", ":"))
+    return serialize_store_credentials(credentials)
 
 
 def squarespace_read_tokens(credentials: Dict[str, Any]) -> List[str]:
@@ -208,73 +207,26 @@ async def merge_squarespace_credentials(
 ) -> Dict[str, Any]:
     """Read-modify-write the store's credential blob ATOMICALLY, then re-read it.
 
-    Never an overwrite. The blob holds the webhook secret (the only copy Pivota
-    has), the OAuth token, the website binding and the reconciliation cursor
-    all in one cell; a whole-cell write is exactly the PrestaShop P1 where
-    reconnecting a shop silently disarmed its telemetry.
+    A thin delegate to
+    `services.merchant_store_credentials.merge_store_credentials`, which is the
+    same function generalized so a second platform does not hand-copy the
+    critical section. The behaviour is unchanged, and deliberately so: the
+    reasoning, the lost-update interleavings it closes, and the Postgres-only
+    row lock are all documented on the shared helper.
 
-    A read-modify-write is not enough on its own, which is what this function
-    exists to fix. Read, mutate, write, re-read with no transaction is a
-    LOST-UPDATE window: a sweep persisting its cursor between `ensure`'s read
-    and its write erases the once-shown `webhook_secret` (after which every
-    delivery 401s and no reconnect can recover it, because Squarespace shows
-    that secret exactly once), and the reverse interleaving reverts a reconnect
-    to the credential the merchant just replaced. So the whole cycle runs
-    inside `database.transaction()` and, on Postgres, behind `SELECT ... FOR
-    UPDATE` on the store row — the row lock is what makes a concurrent merge
-    WAIT rather than read a value that is about to be stale.
-
-    On SQLite there is no `FOR UPDATE`; the select is plain. That is tolerable
-    only because SQLite here is tests and local development, and it is why the
-    serialization claim is pinned in the Postgres gate
-    (`tests/test_squarespace_ledger_postgres.py`) rather than in the SQLite
-    suite, which cannot observe it.
-
-    `updates` is merged over the stored blob. `mutate` receives the LOCKED blob
-    and returns the one to persist, which is how the connect path expresses
-    "drop these keys when the credential now belongs to a different site"
-    inside the same critical section instead of hand-rolling a second one.
-    `mark_connected` additionally refreshes the row's connect bookkeeping, so a
-    reconnect is one statement rather than a merge racing an UPDATE.
-
-    The re-read is not belt-and-braces: `databases` + asyncpg reports no
-    rowcount from an UPDATE, so reading the row back is the only proof the
-    write landed.
+    Why the name survives: every Squarespace caller — connect, `webhooks/ensure`
+    and the sweep — imports THIS symbol, and the tests that stub the merge do it
+    by patching this module attribute. Keeping it is what makes the
+    generalization a refactor rather than a behaviour change.
     """
-    from db.database import IS_POSTGRES
-    from db.database import database as default_database
-
-    handle = db if db is not None else default_database
-    select_sql = "SELECT api_key FROM merchant_stores WHERE store_id = :store_id"
-    # The row lock is the whole point of the transaction: without it two merges
-    # both read the pre-write blob and the second silently discards the first.
-    locking_sql = f"{select_sql} FOR UPDATE" if IS_POSTGRES else select_sql
-    assignments = "api_key = :api_key"
-    if mark_connected:
-        assignments += (
-            ", status = 'active', last_sync = CURRENT_TIMESTAMP,"
-            " connected_at = CURRENT_TIMESTAMP"
-        )
-
-    async with handle.transaction():
-        row = await handle.fetch_one(locking_sql, {"store_id": store_id})
-        credentials = parse_squarespace_credentials(
-            dict(row).get("api_key") if row else None
-        )
-        if mutate is not None:
-            credentials = dict(mutate(credentials))
-        if updates:
-            credentials.update(updates)
-        await handle.execute(
-            f"UPDATE merchant_stores SET {assignments} WHERE store_id = :store_id",
-            {
-                "store_id": store_id,
-                "api_key": serialize_squarespace_credentials(credentials),
-            },
-        )
-        persisted = await handle.fetch_one(select_sql, {"store_id": store_id})
-    return parse_squarespace_credentials(
-        dict(persisted).get("api_key") if persisted else None
+    return await merge_store_credentials(
+        store_id=store_id,
+        updates=updates,
+        mutate=mutate,
+        mark_connected=mark_connected,
+        db=db,
+        parse=parse_squarespace_credentials,
+        serialize=serialize_squarespace_credentials,
     )
 
 
