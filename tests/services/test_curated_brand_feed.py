@@ -732,11 +732,11 @@ def test_the_record_carries_the_storefronts_currency_and_market():
     2026-09-06 on jsmbeauty.sg: 170 offers, all USD, against a storefront whose /meta.json says
     SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00."""
     rec = shopify_product_to_record(_product(), domain="jsmbeauty.sg",
-                                    category_path="beauty/makeup/lip",
-                                    currency="SGD", market="SG")
+                                    category_path="beauty/makeup/lip", currency="SGD")
 
     assert rec["pdp"]["currency"] == "SGD"
-    assert rec["pdp"]["market"] == "SG"
+    # market is NOT carried: it is a hard serving partition on seeds, not this lane's axis.
+    assert "market" not in rec["pdp"]
 
 
 def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
@@ -746,24 +746,23 @@ def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
     rec = shopify_product_to_record(_product(), domain="x.com", category_path="x")
 
     assert rec["pdp"]["currency"] is None
-    assert rec["pdp"]["market"] is None
 
 
 @pytest.mark.parametrize(
     "body,expected",
     [
-        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD", "country": "SG"}),
-        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD", "country": "SG"}),
-        ({"currency": "USD", "country": "US"}, {"currency": "USD", "country": "US"}),
+        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD"}),
+        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD"}),
+        ({"currency": "USD", "country": "US"}, {"currency": "USD"}),
         # merchant-controlled: anything not ISO-shaped is refused, not written through
         # An unparseable currency invalidates the WHOLE record, country included:
         # `storefront_currency` returns None rather than half an answer, because it "returns None
         # when it cannot prove the answer". Asserted as its behaviour, not worked around.
-        ({"currency": "dollars", "country": "SG"}, {"currency": None, "country": None}),
-        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD", "country": None}),
-        ({"currency": 5, "country": None}, {"currency": None, "country": None}),
-        ({}, {"currency": None, "country": None}),
-        ([], {"currency": None, "country": None}),
+        ({"currency": "dollars", "country": "SG"}, {"currency": None}),
+        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD"}),
+        ({"currency": 5, "country": None}, {"currency": None}),
+        ({}, {"currency": None}),
+        ([], {"currency": None}),
     ],
 )
 @pytest.mark.asyncio
@@ -826,7 +825,7 @@ async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypat
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
     _silence_politeness(monkeypatch)
     _clear_locale_cache()
-    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "country": None}
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None}
 
 
 @pytest.mark.asyncio
@@ -842,7 +841,7 @@ async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch)
         return [_product()]
 
     async def _locale(domain, **kw):
-        return {"currency": "SGD", "country": "SG"}
+        return {"currency": "SGD"}
 
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
@@ -851,7 +850,6 @@ async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch)
 
     assert recs, "the stub returned a product, so a record must come back"
     assert {r["pdp"]["currency"] for r in recs} == {"SGD"}
-    assert {r["pdp"]["market"] for r in recs} == {"SG"}
 
 
 @pytest.mark.asyncio
@@ -866,7 +864,7 @@ async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_pr
 
     async def _locale(domain, **kw):
         calls.append(domain)
-        return {"currency": "SGD", "country": "SG"}
+        return {"currency": "SGD"}
 
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
@@ -919,4 +917,101 @@ async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, st
     _silence_politeness(monkeypatch)
     _clear_locale_cache()
 
-    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "country": None}, label
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None}, label
+
+
+@pytest.mark.asyncio
+async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch):
+    """PINNED DELIBERATELY, not incidentally.
+
+    This lane crawls merchant hosts from the shared crawl-egress IP, and the ratchet in
+    tests/test_crawl_politeness.py counts the string `crawl_politeness.before_request` in this
+    file -- which a nested function nobody calls would satisfy. Measured: with
+    `fetch=_gated_fetch` removed, the ratchet still PASSED, and the only thing failing was a test
+    double that happened to lack `raise_for_status`. That is a guard held up by an accident.
+
+    So: assert the gate actually saw the meta.json URL, with the same user agent the request
+    carries, and that the response was reported back to it.
+    """
+    import httpx
+
+    seen = {"before": [], "note": []}
+
+    async def _before(url, **kw):
+        seen["before"].append((url, kw.get("user_agent"), kw.get("max_wait")))
+
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _before)
+    monkeypatch.setattr(
+        cbf.crawl_politeness, "note_response",
+        lambda url, status, **kw: seen["note"].append((url, status)),
+    )
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = '{"currency": "SGD", "country": "SG"}'
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
+
+    assert seen["before"], "the politeness gate never saw the meta.json request"
+    url, ua, max_wait = seen["before"][0]
+    assert url.endswith("/meta.json")
+    assert ua == cbf._UA, "the gate must be asked about the SAME agent the request then sends"
+    assert max_wait == 0, "batch lane: wait rather than drop"
+    assert seen["note"] and seen["note"][0][1] == 200, "the response must be reported back"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypatch):
+    """`fetch_storefront_meta` caches per domain for the PROCESS lifetime, NEGATIVES INCLUDED, and
+    this lane runs inside a queue-draining worker with its own retry budget. One transient failure
+    would otherwise pin that brand to None -> USD for the whole process, silently defeating both
+    the retry and this entire change."""
+    import httpx
+
+    calls = {"n": 0}
+
+    class _Resp:
+        def __init__(self, ok):
+            self.status_code = 200 if ok else 503
+            self.headers = {"content-type": "application/json"}
+            self.text = '{"currency": "SGD", "country": "SG"}' if ok else ""
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            calls["n"] += 1
+            return _Resp(calls["n"] > 1)      # first attempt fails, second succeeds
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": None}
+    # the retry must actually reach the network again, not read a cached None
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
+    assert calls["n"] == 2

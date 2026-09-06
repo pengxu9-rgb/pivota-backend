@@ -189,6 +189,15 @@ _SEED_UPSERT_SQL = """
                   canonical_url = EXCLUDED.canonical_url,
                   image_url = EXCLUDED.image_url,
                   price_amount = EXCLUDED.price_amount,
+                  -- PRICE_CURRENCY IS UPDATED, and this is a DE-INDEXING guard, not tidiness.
+                  -- `derive_seed_id` is stable, so re-ingesting an already-indexed storefront
+                  -- takes this arm and refreshes `seed_data` (whose nested variants now carry the
+                  -- real currency) while this column would keep the USD the first ingest guessed.
+                  -- `external_seed_audit.detect_price_currency_mismatch` compares exactly those
+                  -- two, `price_currency_mismatch` is a BLOCKER anomaly, and a blocked seed makes
+                  -- `_build_external_seed_product` return None -- so every already-indexed
+                  -- non-USD storefront would DROP OFF the agent surface on its next ingest.
+                  price_currency = EXCLUDED.price_currency,
                   status = EXCLUDED.status,
                   availability = EXCLUDED.availability,
                   seed_data = EXCLUDED.seed_data,

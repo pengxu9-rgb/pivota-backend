@@ -185,13 +185,18 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
             "mpn": str(mpn_raw).strip() if mpn_raw else None,
         },
         "source_domain": source_domain,
-        # The storefront's own currency/market. This payload is a WHITELIST -- a field absent
-        # here is dropped no matter what the record carried -- so omitting these made the
-        # passthrough a silent no-op even with every consumer reading them. Left unvalidated
-        # here and validated at the point of USE (`_currency_of` / `_market_of`), so a record
-        # arriving from any other lane gets the same check rather than trusting this one.
+        # The storefront's own currency. This payload is a WHITELIST -- a field absent here is
+        # dropped no matter what the record carried -- so omitting it made the passthrough a
+        # silent no-op even with every consumer reading it. Validated at the point of USE
+        # (`_currency_of`), so a record arriving from any other lane gets the same check.
+        #
+        # CURRENCY ONLY. `market` is a different axis (destination served vs store base
+        # currency) and this lane does not own it: `external_product_seeds.market` is a HARD
+        # serving partition -- `external_seed_search` appends `market = :market`, called with
+        # DEFAULT_EXTERNAL_SEED_MARKET="US" -- so stamping a storefront's country there deletes
+        # it from US seed search. `catalog_offers.market` only feeds a warn-only counter. See
+        # services/storefront_currency.py for the axis argument.
         "currency": pdp.get("currency"),
-        "market": pdp.get("market"),
         "tags": tags,
         "agent_version": AGENT_VERSION,
         # Optional review signal → catalog_products.rating_value/rating_count.
@@ -509,10 +514,8 @@ def _taxonomy_v1_payload(pdp_payload: Dict[str, Any], offers: List[Dict[str, Any
 
 
 DEFAULT_CURRENCY = "USD"
-DEFAULT_MARKET = "US"
 
 _ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
-_ISO_MARKET = re.compile(r"^[A-Z]{2}$")
 
 
 def _currency_of(pdp_payload: Dict[str, Any]) -> str:
@@ -530,24 +533,6 @@ def _currency_of(pdp_payload: Dict[str, Any]) -> str:
     """
     raw = str((pdp_payload or {}).get("currency") or "").strip().upper()
     return raw if _ISO_CURRENCY.match(raw) else DEFAULT_CURRENCY
-
-
-def _market_of(pdp_payload: Dict[str, Any], fallback: str = DEFAULT_MARKET) -> str:
-    """The record's own market, or the caller's default.
-
-    `_build_seed_inserts` already had `market: str = "US"` -- a parameter NO caller has ever
-    passed, so every seed row in the index says US regardless of where the storefront sells.
-
-    SEEDS ONLY, deliberately. `catalog_offers.market` is NOT written from this: it is a different
-    axis from the store's home country -- destination served vs store base currency -- and
-    `services/storefront_currency.py` records why equating them destroys real inventory (a KR/HK
-    exporter legitimately prices in USD, and stamping market=KR beside currency=USD manufactures
-    a `_run_market_currency_disagreement` violation out of honest data). A seed carries the
-    storefront's own market because that is what a seed IS; an offer's serving region is decided
-    by its CURRENCY, which `has_offer_priced_for_region_sql` is the single source of truth for.
-    """
-    raw = str((pdp_payload or {}).get("market") or "").strip().upper()
-    return raw if _ISO_MARKET.match(raw) else fallback
 
 
 def _build_seed_inserts(
@@ -640,7 +625,7 @@ def _build_seed_inserts(
         rows.append({
             "id": seed_id,
             "external_product_id": external_product_id,
-            "market": _market_of(pdp_payload, market),
+            "market": market,
             "tool": AGENT_VERSION,
             "title": pdp_payload["product_name"],
             "image_url": offer.get("image_url") or None,

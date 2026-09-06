@@ -969,14 +969,23 @@ def test_a_storefronts_own_currency_reaches_every_row_it_prices():
     # to "USD" survived two review rounds: no assertion reached it.
     assert {v["currency"] for v in out["variant_skus"]} == {"SGD"}
     assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
-    assert {s["market"] for s in out["seeds"]} == {"SG"}
     # The seed's NESTED variant list, which is a separate site from every row above and was the
     # one replacement no assertion reached: reverting it alone to a literal "USD" left the whole
     # file green. This is what the serving lane renders, so it is not an internal detail.
     assert _seed_variant_currencies(out) == {"SGD"}
+    # BOTH KEYS, on the REAL-VARIANT branch specifically. Two consumers disagree about which one
+    # wins: serving reads `price_currency or currency`, while `external_seed_audit`'s
+    # `normalize_seed_variants` reads `currency or price_currency` -- the OPPOSITE order -- and it
+    # is the audit's reading that raises `price_currency_mismatch`, a BLOCKER anomaly that drops
+    # the seed from the agent surface entirely. So the serving-order assertion above cannot see a
+    # wrong `currency` while `price_currency` is right, which is exactly the mutant that survived
+    # two rounds. A first attempt at this assertion was added to the SYNTHETIC-variant test by
+    # mistake, where this branch never runs -- and the mutant survived a third time.
+    assert _seed_variant_currencies(out, "currency") == {"SGD"}
+    assert _seed_variant_currencies(out, "price_currency") == {"SGD"}
 
 
-def test_the_pdp_payload_whitelist_does_not_drop_currency_and_market():
+def test_the_pdp_payload_whitelist_does_not_drop_the_currency():
     """`_build_pdp_payload` is a WHITELIST -- a field absent from its dict literal is dropped no
     matter what the record carried. The first draft of this change threaded currency through the
     crawler and every consumer and was still a COMPLETE no-op, because these two keys were not in
@@ -987,7 +996,10 @@ def test_the_pdp_payload_whitelist_does_not_drop_currency_and_market():
     payload = _build_pdp_payload(_sgd_record())
 
     assert payload["currency"] == "SGD"
-    assert payload["market"] == "SG"
+    # market is deliberately NOT carried: `external_product_seeds.market` is a hard serving
+    # partition (`external_seed_search` appends `market = :market`, defaulted to "US"), so
+    # stamping a storefront's country there deletes it from US seed search.
+    assert "market" not in payload
 
 
 def test_a_record_with_no_currency_is_still_USD_and_US():
@@ -1001,8 +1013,9 @@ def test_a_record_with_no_currency_is_still_USD_and_US():
     assert {o["currency"] for o in out["offers"]} == {"USD"}
     assert out["sku"]["currency"] == "USD"
     assert {s["price_currency"] for s in out["seeds"]} == {"USD"}
-    assert {s["market"] for s in out["seeds"]} == {"US"}
+    assert {s["market"] for s in out["seeds"]} == {"US"}   # unchanged: not this lane's axis
     assert _seed_variant_currencies(out) == {"USD"}
+    assert _seed_variant_currencies(out, "currency") == {"USD"}
 
 
 @pytest.mark.parametrize(
@@ -1030,17 +1043,22 @@ def test_a_valid_currency_is_normalised_and_kept(good, expected):
     assert _currency_of({"currency": good}) == expected
 
 
-def test_market_prefers_the_record_over_the_callers_default():
-    """`_build_seed_inserts(market="US")` is a parameter NO caller has ever passed, so every seed
-    row said US regardless of where the storefront sells. The record must win when it knows, and
-    the caller's default must still apply when it does not."""
-    from services.catalog_enrichment_agent.ingestion import _market_of
+def test_the_seed_market_is_NOT_taken_from_the_storefronts_country():
+    """This lane writes CURRENCY and not market, on purpose.
 
-    assert _market_of({"market": "SG"}, "US") == "SG"
-    assert _market_of({"market": "sg"}, "US") == "SG"
-    assert _market_of({}, "US") == "US"
-    assert _market_of({"market": "SGP"}, "US") == "US"      # alpha-3 is not alpha-2
-    assert _market_of({"market": None}, "JP") == "JP"
+    Measured: `external_seed_search` appends a hard `market = :market` conjunct and every serving
+    caller passes DEFAULT_EXTERNAL_SEED_MARKET="US", so a seed stamped with the storefront's own
+    country vanishes from US seed search entirely. `catalog_offers.market` by contrast only feeds
+    a warn-only counter. An earlier draft stamped both; the harm was asymmetric and this is the
+    half that hurt.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record())
+
+    assert {s["market"] for s in out["seeds"]} == {"US"}
+    assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
+
 
 
 def test_the_synthetic_canonical_variant_also_carries_the_storefronts_currency():
@@ -1055,6 +1073,7 @@ def test_the_synthetic_canonical_variant_also_carries_the_storefronts_currency()
     out = ingest_validated_record(_sgd_record(variants=[]))
 
     assert _seed_variant_currencies(out) == {"SGD"}
+    assert _seed_variant_currencies(out, "currency") == {"SGD"}
     assert {o["currency"] for o in out["offers"]} == {"SGD"}
 
 
@@ -1129,3 +1148,14 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
     assert "currency = EXCLUDED.currency" in update_arm
     # market is a DIFFERENT AXIS and this lane does not own it -- see services/storefront_currency.py
     assert "market" not in update_arm
+
+    # The SEED upsert too. Missing `price_currency` there is not cosmetic: it de-indexes every
+    # already-indexed non-USD storefront on its next ingest (see the test below).
+    from services.catalog_enrichment_agent.apply import _SEED_UPSERT_SQL
+
+    seed_arm = "\n".join(
+        _re.sub(r"--.*$", "", line)
+        for line in _SEED_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
+    )
+    assert "price_currency = EXCLUDED.price_currency" in seed_arm
+    assert "market" not in seed_arm

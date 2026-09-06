@@ -48,7 +48,6 @@ def _clean_domain(domain: str) -> str:
 
 
 _ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
-_ISO_COUNTRY = re.compile(r"^[A-Z]{2}$")
 
 
 async def fetch_shopify_shop_locale(
@@ -56,7 +55,7 @@ async def fetch_shopify_shop_locale(
     *,
     timeout_s: float = 10.0,
 ) -> Dict[str, Optional[str]]:
-    """The storefront's own currency/country, via the module that already reads /meta.json.
+    """The storefront's own currency, via the module that already reads /meta.json.
 
     `/products.json` carries prices but NEVER the currency they are in, so every record this
     module built was currency-less and the ingest lane stamped USD on all of them. Measured
@@ -73,14 +72,22 @@ async def fetch_shopify_shop_locale(
     `fetch` seam precisely so a caller can supply its own transport, so the shared gate still sees
     every request this crawl lane makes against a merchant host.
 
-    ONLY `currency` IS RETURNED FOR THE WRITE PATH's use. `storefront_currency`'s own docstring
-    records why: "`market` and `currency` are different axes (destination served vs store base
-    currency) -- a KR/HK exporter legitimately prices in USD". `country` is passed through for
-    callers that want the storefront's home, never as a synonym for the market an offer serves.
+    CURRENCY ONLY, and `country` is deliberately NOT returned. `storefront_currency`'s own
+    docstring records why they are different axes ("a KR/HK exporter legitimately prices in USD"),
+    and measurement made the asymmetry concrete: `external_product_seeds.market` is a HARD serving
+    partition -- `external_seed_search` appends `market = :market` and every serving caller passes
+    DEFAULT_EXTERNAL_SEED_MARKET="US" -- so a seed stamped with the storefront's country vanishes
+    from US seed search. Returning the value at all invites that mistake again.
+
+    NEGATIVE RESULTS ARE NOT CACHED ACROSS BRANDS. `fetch_storefront_meta` caches per domain for
+    the PROCESS lifetime, negatives included, and its docstring says a long-lived caller should
+    clear periodically. This lane is exactly that caller (`catalog_onboard_worker` drains a queue
+    with a retry budget), and a single transient timeout would otherwise pin that brand to None ->
+    USD for the whole process, silently defeating the retry AND the fix. So a miss is evicted.
     """
     host = _clean_domain(domain)
     if not host:
-        return {"currency": None, "country": None}
+        return {"currency": None}
 
     async def _gated_fetch(url: str) -> Optional[str]:
         headers = {"User-Agent": _UA, "Accept": "application/json"}
@@ -104,13 +111,11 @@ async def fetch_shopify_shop_locale(
 
     meta = await storefront_currency.fetch_storefront_meta(host, fetch=_gated_fetch)
     if not isinstance(meta, dict):
-        return {"currency": None, "country": None}
+        # Evict the negative so the next brand (or a retry of this one) asks again.
+        storefront_currency.clear_cache()
+        return {"currency": None}
     cur = str(meta.get("currency") or "").strip().upper()
-    country = str(meta.get("country") or "").strip().upper()
-    return {
-        "currency": cur if _ISO_CURRENCY.match(cur) else None,
-        "country": country if _ISO_COUNTRY.match(country) else None,
-    }
+    return {"currency": cur if _ISO_CURRENCY.match(cur) else None}
 
 
 async def fetch_shopify_products(
@@ -589,7 +594,6 @@ def shopify_product_to_record(
     brand_override: Optional[str] = None,
     emit_variants: bool = False,
     currency: Optional[str] = None,
-    market: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -721,11 +725,10 @@ def shopify_product_to_record(
             # on this lane (captured on the retailer-PDP lane instead).
             "rating_value": None,
             "rating_count": None,
-            # The STOREFRONT's own currency/market, from /meta.json. Omitted (None) rather than
+            # The STOREFRONT's own currency, from /meta.json. Omitted (None) rather than
             # defaulted here: the ingest lane owns the fallback, so a record that never learned
             # its currency is indistinguishable from one that did and is genuinely USD.
             "currency": currency,
-            "market": market,
             "variants": pdp_variants,
         },
         "offers": [
@@ -975,7 +978,7 @@ async def records_for_brand(
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand,
             emit_variants=base_listings_only,
-            currency=locale.get("currency"), market=locale.get("country"),
+            currency=locale.get("currency"),
         )
         if not rec:
             continue
