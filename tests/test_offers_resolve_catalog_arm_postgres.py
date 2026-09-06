@@ -56,7 +56,8 @@ def _seed(engine):
     with engine.begin() as conn:
         for t in ("catalog_offers", "catalog_skus", "catalog_products", "catalog_merchants"):
             conn.execute(text(f"DELETE FROM {t}"))
-        for mid, name in (("m_arm", "Arm Merchant"), ("stylekorean_global", "StyleKorean")):
+        for mid, name in (("m_arm", "Arm Merchant"), ("stylekorean_global", "StyleKorean"),
+                          ("oliveyoung_global", "Olive Young")):
             conn.execute(text(
                 "INSERT INTO catalog_merchants (merchant_id, merchant_name, primary_platform, status)"
                 " VALUES (:m, :n, 'external_seed', 'active')"
@@ -79,7 +80,8 @@ def _seed(engine):
             " VALUES (:sk,:pk,'m_arm','external_seed',:pk,'v1','Snail Essence','USD',NOW())"
         ), {"sk": sku_key, "pk": _PK})
 
-        def offer(oid, merchant, price, offer_type, mode="redirect", suppressed=False):
+        def offer(oid, merchant, price, offer_type, mode="redirect", suppressed=False,
+                  dest="https://www.stylekorean.com/p/1"):
             conn.execute(text(
                 "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
                 " catalog_track, truth_tier, readiness_tier, offer_mode, channel, availability,"
@@ -87,15 +89,17 @@ def _seed(engine):
                 " source_ref, offer_payload, suppressed_at, updated_at)"
                 " VALUES (:oid,:sk,:pk,:m,'external_referral','observed','referral_only',:mode,"
                 "         'external_referral','in_stock','USD',:p,:p,:ot,false,"
-                "         'https://www.stylekorean.com/p/1',"
+                "         :dest,"
                 "         cast(:payload AS jsonb), :sup, NOW())"
             ), {"oid": oid, "sk": sku_key, "pk": _PK, "m": merchant, "p": price,
                 "ot": offer_type, "mode": mode,
-                "payload": '{"destination_url": "https://www.stylekorean.com/p/1"}',
+                "dest": dest,
+                "payload": '{"destination_url": "%s"}' % dest,
                 "sup": "2026-01-01T00:00:00" if suppressed else None})
 
         offer("of_retailer_cheap", "stylekorean_global", 17.50, "retailer")
-        offer("of_retailer_dear", "stylekorean_global", 29.00, "retailer")
+        offer("of_retailer_dear", "oliveyoung_global", 29.00, "retailer",
+              dest="https://global.oliveyoung.com/p/2")
         offer("of_brand_direct", "m_arm", 9.00, "brand_direct")          # must not be sourced
         offer("of_suppressed", "stylekorean_global", 1.00, "retailer", suppressed=True)
         offer("of_not_redirect", "stylekorean_global", 2.00, "retailer", mode="checkout")
@@ -214,3 +218,27 @@ def test_a_foreign_market_offer_does_not_answer_a_us_request(pg_engine):
 
     res = _resolve(_SIG)
     assert (res.get("offers") or []) == [], "a KR offer must not be sold into a US request"
+
+
+def test_two_offers_to_the_same_destination_are_offered_once(pg_engine):
+    """Dedupe is on the DESTINATION HOST, so it collapses a repeat within this source as well as
+    one shared with the seed lane — two links to the same page are one place to send the buyer,
+    whatever the price says. Found by this fixture: the first version gave both retailer rows the
+    same URL and the second row correctly vanished."""
+    from sqlalchemy import text
+
+    _seed(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE catalog_offers"
+            "   SET source_ref = 'https://www.stylekorean.com/p/1',"
+            "       offer_payload = cast('{\"destination_url\": \"https://www.stylekorean.com/p/1\"}' AS jsonb)"
+            " WHERE offer_id = 'of_retailer_dear'"))
+
+    res = _resolve(_SIG)
+    ids = {str(o.get("offer_id") or "").rsplit(":", 1)[-1] for o in (res.get("offers") or [])}
+    assert ids == {"of_retailer_cheap"}, "the same destination must be offered once"
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
+        for s in ((res.get("metadata") or {}).get("sources") or [])
+    )

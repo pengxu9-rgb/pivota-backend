@@ -5453,7 +5453,21 @@ async def _handle_offers_resolve(
     # `source.merchant_id`, so their offers reach an agent unable to name the merchant. This arm
     # emits both spellings. Fixing the other two lanes is a separate change and is why an offer
     # here carries `seller` as well.
-    if not internal_offers and not external_offers:
+    # UNGATED, and deduped on destination host.
+    #
+    # The first cut of this arm ran only when nothing else resolved, which made it safe to ship
+    # and nearly inert: measured 2026-09-06, 1,124 products carry an unsuppressed retailer offer
+    # and 1,110 of them are ALSO seeded, so the gate left it serving about 14. The competition
+    # worth showing — a StyleKorean price beside the brand's own — lives on exactly the products
+    # the gate excluded.
+    #
+    # WHAT THE DEDUPE IS FOR, and what it must NOT eat. `external_offer_dual_write` writes some
+    # destinations into both stores, so the same retailer can arrive twice: measured over 400
+    # product/offer/seed triples, 19 shared a destination host. The other 381 are the case we are
+    # here for — offer host `stylekorean.com` beside seed host `rovectin.com` is two real sellers,
+    # not a duplicate. So the key is the DESTINATION HOST, not the product: same host means we
+    # would send the buyer to the same place twice.
+    if True:
         catalog_started = time.perf_counter()
         try:
             ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
@@ -5504,12 +5518,39 @@ async def _handle_offers_resolve(
                     timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
                 )
 
+            # Hosts the seed lane already claimed. Read from `source`, which carries the raw
+            # destination — `affiliate_url` is a signed /r link and every one of them shares OUR
+            # host, so comparing those would collapse every offer into one.
+            #
+            # THREE KEYS ON PURPOSE, and they are redundant on a row that has all three: a seed
+            # may carry `domain` without a usable url, or a url without `domain`. Removing either
+            # source alone leaves the dedupe working (neither mutant dies); removing BOTH lets a
+            # duplicate through. Noted because one of them otherwise reads as dead code.
+            seen_hosts = set()
+            for prior in external_offers:
+                src = prior.get("source") or {}
+                for key in ("canonical_url", "destination_url"):
+                    h = _offer_destination_host(src.get(key))
+                    if h:
+                        seen_hosts.add(h)
+                domain_host = _offer_destination_host(f"https://{src.get('domain')}"
+                                                      if src.get("domain") else None)
+                if domain_host:
+                    seen_hosts.add(domain_host)
+
             unattributed = 0
+            deduped = 0
             for row in catalog_rows or []:
                 r = dict(row)
                 destination = str(r.get("destination_url") or "").strip()
                 if not destination.startswith(("http://", "https://")):
                     continue
+                dest_host = _offer_destination_host(destination)
+                if dest_host and dest_host in seen_hosts:
+                    deduped += 1
+                    continue
+                if dest_host:
+                    seen_hosts.add(dest_host)
                 offer_merchant = str(r.get("merchant_id") or "").strip() or None
 
                 # ATTRIBUTED when we can, VISIBLE either way. The outbound allowlist is empty in
@@ -5573,7 +5614,11 @@ async def _handle_offers_resolve(
                         # `false` would license an agent to tell a buyer what they will land on.
                         "cart_prefilled": None,
                         "internal_checkout_items": None,
-                        "confidence": 1.0,
+                        # PRODUCT grain, like the seed lane's own 0.8. The identity match is
+                        # exact, but a retailer offer names a product page, not a variant — and
+                        # 1.0 is what this handler reserves for a SKU-level match. Claiming it
+                        # here would outrank a seed offer that really did match a variant.
+                        "confidence": 0.8,
                         **({"price_confidence": r.get("price_confidence")}
                            if r.get("price_confidence") is not None else {}),
                         **({"updated_at": r.get("updated_at")}
@@ -5598,7 +5643,7 @@ async def _handle_offers_resolve(
                     mapping_candidates.append(
                         _conf(
                             "catalog_offer",
-                            1.0,
+                            0.8,
                             "matched_canonical_identity",
                             {"product_key": str(r.get("product_key") or "")},
                         )
@@ -5611,7 +5656,8 @@ async def _handle_offers_resolve(
                 source_started=catalog_started,
                 row_count=len(catalog_rows or []),
                 query="catalog_offers_by_canonical_identity",
-                extra={"unattributed": unattributed} if unattributed else None,
+                extra={k: v for k, v in
+                       (("unattributed", unattributed), ("deduped", deduped)) if v} or None,
             )
         except Exception as e:
             logger.info("offers.resolve.catalog_offers.failed", extra={"error": str(e)})
@@ -7768,6 +7814,18 @@ def _seed_domain_from_url(url: Optional[str]) -> str:
     if ":" in host:
         host = host.split(":")[0]
     return host.lower()
+
+
+def _offer_destination_host(url: Optional[str]) -> str:
+    """The host two offers must share to be the SAME destination, for dedupe.
+
+    Deliberately not `_format_domain_display_name`, which returns a human label
+    ("Ulta Official Site"), and deliberately stripping only `www.`: collapsing
+    `shop.` or `store.` too would merge storefronts that can genuinely differ,
+    and over-merging here DROPS a real competing offer, which is the worse error.
+    """
+    host = _seed_domain_from_url(url)
+    return host[4:] if host.startswith("www.") else host
 
 
 def _format_domain_display_name(domain: str) -> str:

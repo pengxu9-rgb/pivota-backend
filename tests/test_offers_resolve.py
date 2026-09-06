@@ -3752,20 +3752,18 @@ def test_catalog_offers_arm_surfaces_a_retailer_by_signature(
     assert body.get("resolution_mode") == "external_only"
 
 
-def test_catalog_offers_arm_is_skipped_when_another_source_answered(
+def test_catalog_offers_arm_now_RUNS_beside_the_seed_lane(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    """GATED ON EMPTY, deliberately: the arm must not reorder, dedupe against or otherwise change
-    ANY response that is non-empty today. Merging it with the seed lane needs a destination-host
-    dedupe and is its own change."""
+    """UNGATED. The first cut ran only when nothing else resolved, which made it nearly inert:
+    measured 2026-09-06, 1,124 products carry an unsuppressed retailer offer and 1,110 of them are
+    ALSO seeded — so the gate left the arm serving about 14. The competition worth showing lives
+    on exactly the products the gate excluded."""
     import routes.agent_shop_gateway as gateway
-
-    seen: list[str] = []
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
         if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
-            seen.append("catalog_arm")
             return [_CATALOG_OFFER_ROW]
         return _sig_lane_fetch_all(query, values)
 
@@ -3777,7 +3775,7 @@ def test_catalog_offers_arm_is_skipped_when_another_source_answered(
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(
         gateway, "_make_external_redirect_url",
-        AsyncMock(return_value="https://example.com/r?token=sig"))
+        AsyncMock(return_value="https://example.com/r?token=x"))
 
     res = client.post(
         "/agent/shop/v1/invoke",
@@ -3788,9 +3786,60 @@ def test_catalog_offers_arm_is_skipped_when_another_source_answered(
     )
     assert res.status_code == 200
     offers = res.json().get("offers") or []
-    assert offers, "the seed lane still answers"
-    assert all(not str(o.get("offer_id", "")).startswith("of:catalog_offer:") for o in offers)
-    assert seen == [], "the catalog query must not even be issued when a source already answered"
+    ids = [str(o.get("offer_id") or "") for o in offers]
+    assert any(i.startswith("of:external_seed:") for i in ids), "the seed lane still answers"
+    assert any(i.startswith("of:catalog_offer:") for i in ids), (
+        "the retailer must now appear BESIDE the seed offer — that is the competition"
+    )
+
+
+def test_the_same_destination_is_not_offered_twice(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`external_offer_dual_write` writes some destinations into BOTH stores, so the same retailer
+    can arrive twice. Measured over 400 product/offer/seed triples, 19 shared a destination host.
+    The key is the HOST, not the product: same host means we would send the buyer to the same
+    place twice."""
+    import routes.agent_shop_gateway as gateway
+
+    # a catalog offer pointing at the SAME host the seed lane's offer uses
+    same_host_row = {**_CATALOG_OFFER_ROW,
+                     "destination_url": "https://www.sigbrand.example/products/dup",
+                     "merchant_id": "dup_merchant"}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [same_host_row]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    ids = [str(o.get("offer_id") or "") for o in (body.get("offers") or [])]
+    assert not any(i.startswith("of:catalog_offer:") for i in ids), (
+        "a catalog offer pointing at a host the seed lane already claimed is a duplicate"
+    )
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
+        for s in ((body.get("metadata") or {}).get("sources") or [])
+    ), "the dedupe must be counted, not silent"
 
 
 def test_catalog_offers_arm_reports_an_empty_answer_as_such(
