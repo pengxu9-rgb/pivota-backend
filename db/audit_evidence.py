@@ -204,6 +204,47 @@ VERIFICATION_STATUS_FAILED = "failed"
 VERIFICATION_STATUS_EXHAUSTED_RETRIES = "exhausted_retries"
 VERIFICATION_STATUS_BLOCKED = "blocked"
 
+# ---------------------------------------------------------------------------
+# THE HONESTY STATES (P0 Tier-1 item 1).
+#
+# Everything above is a WORK-QUEUE lifecycle: it says what the runner did, not
+# what we know. That is why "we never checked" and "there is no row" are the
+# same thing today, and it is exactly how a projection reads absence as a pass —
+# the failure the migration judgment rates Critical. Each state below records a
+# DIFFERENT reason a check produced no verdict, so a reader can tell them apart
+# instead of inferring from silence:
+#
+#   unverified      — the check was never attempted. The state §23 leans on
+#                     hardest ("payment not attempted -> UNVERIFIED"), and the
+#                     one CONVERT SALES needs while its browser worker is
+#                     disarmed: the lane has produced NO production observation,
+#                     and that must be storable rather than absent.
+#   skipped         — deliberately not run for this subject (out of scope, gated
+#                     off, not applicable). A decision, not a failure.
+#   provider_failed — we attempted it and the upstream provider did not answer
+#                     usefully. Distinct from `blocked`, which means the
+#                     upstream is unavailable and a retry is pointless.
+#   unparseable     — the provider answered and we could not read the answer.
+#                     Ours to fix, not theirs; conflating it with
+#                     provider_failed sends the fix to the wrong team.
+#
+# All four are TERMINAL and none is reachable from `pending`: they describe a
+# check that will not be retried, and a row in one of them must never be claimed
+# by a worker. They are deliberately NOT added to VERIFICATION_ACTIVE.
+VERIFICATION_STATUS_UNVERIFIED = "unverified"
+VERIFICATION_STATUS_SKIPPED = "skipped"
+VERIFICATION_STATUS_PROVIDER_FAILED = "provider_failed"
+VERIFICATION_STATUS_UNPARSEABLE = "unparseable"
+
+# The states that mean "no verdict, and here is why" — as opposed to
+# `succeeded`, which is a verdict. A projection must never read any of these as
+# a pass. There is deliberately no "treat as success" set for these to be
+# a member of — the absence IS the contract.
+VERIFICATION_NO_VERDICT = frozenset({
+    VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
+    VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
+})
+
 VERIFICATION_ACTIVE = frozenset({
     VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_CLAIMED,
 })
@@ -211,7 +252,7 @@ VERIFICATION_TERMINAL = frozenset({
     VERIFICATION_STATUS_SUCCEEDED, VERIFICATION_STATUS_FAILED,
     VERIFICATION_STATUS_EXHAUSTED_RETRIES,
     VERIFICATION_STATUS_BLOCKED,
-})
+}) | VERIFICATION_NO_VERDICT
 
 VALID_VERIFICATION_TRANSITIONS: dict = {
     VERIFICATION_STATUS_PENDING: {VERIFICATION_STATUS_CLAIMED},
@@ -220,11 +261,21 @@ VALID_VERIFICATION_TRANSITIONS: dict = {
         VERIFICATION_STATUS_PENDING,
         VERIFICATION_STATUS_EXHAUSTED_RETRIES,
         VERIFICATION_STATUS_BLOCKED,
+        VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
+        VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
     },
     VERIFICATION_STATUS_SUCCEEDED: set(),
     VERIFICATION_STATUS_FAILED: set(),
     VERIFICATION_STATUS_EXHAUSTED_RETRIES: set(),
     VERIFICATION_STATUS_BLOCKED: set(),
+    # Terminal, and reachable only from `claimed` — a worker that took the row
+    # and learned it could not produce a verdict. NOT reachable from `pending`:
+    # a row nobody claimed has no finding to record, and allowing it would let
+    # an enqueue write its own conclusion.
+    VERIFICATION_STATUS_UNVERIFIED: set(),
+    VERIFICATION_STATUS_SKIPPED: set(),
+    VERIFICATION_STATUS_PROVIDER_FAILED: set(),
+    VERIFICATION_STATUS_UNPARSEABLE: set(),
 }
 
 
@@ -2246,6 +2297,94 @@ async def mark_verification_succeeded(
         logger.warning(
             "mark_verification_succeeded failed for verify=%s: %s",
             verify_id, str(exc)[:200],
+        )
+        return False
+
+
+async def mark_verification_no_verdict(
+    *,
+    verify_id: str,
+    worker_id: str,
+    status: str,
+    reason: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Terminal "no verdict, and here is why" transition.
+
+    The four states exist so a reader can tell "we never checked" from "we
+    checked and it was fine" — but a constant nothing can write is not storable,
+    and until this function existed the vocabulary had no producer at all.
+
+    `reason` is REQUIRED and non-empty. The whole point of these states is that
+    the row explains itself; one written without a reason reproduces the silence
+    the states were added to remove, one column over. It is stored inside
+    evidence_jsonb rather than in a new column so this needs no migration.
+
+    Guarded on worker ownership exactly like the other terminal transitions, and
+    reachable ONLY from `claimed`: a worker took the row and learned it could not
+    produce a verdict. A row still `pending` has not been attempted, so nothing
+    yet knows it has no verdict — that is a different fact, and giving it this
+    state here would be a claim we cannot support.
+    """
+    await ensure_audit_evidence_tables()
+    if status not in VERIFICATION_NO_VERDICT:
+        # Refuse rather than coerce: silently writing `succeeded` for a caller
+        # that meant `unparseable` is precisely the pass-by-absence this whole
+        # item removes.
+        logger.warning(
+            "mark_verification_no_verdict refused status=%r for verify=%s "
+            "(expected one of %s)",
+            status, verify_id, sorted(VERIFICATION_NO_VERDICT),
+        )
+        return False
+    if not (reason or "").strip():
+        logger.warning(
+            "mark_verification_no_verdict refused an empty reason for "
+            "verify=%s status=%s", verify_id, status,
+        )
+        return False
+
+    now = _now_utc()
+    clean_reason = reason.strip()[:2000]
+    values: Dict[str, Any] = {
+        "status": status,
+        "completed_at": now,
+        "last_checked_at": now,
+        # The reason goes in error_message, NOT only in evidence_jsonb: the live
+        # ops rollup (scripts/diagnose_store_audit_lane.py) groups by
+        # (status, error_message), so a reason hidden in JSONB shows there as
+        # NULL — invisible on the one surface an operator actually reads.
+        # Truncated at 2000 to match every other free-text field in this module.
+        "error_message": clean_reason,
+    }
+    if evidence_jsonb is not None:
+        # Written ONLY when the caller supplies one, exactly like
+        # mark_verification_succeeded and _blocked. Building a payload
+        # unconditionally would REPLACE the column, so a row that had partial
+        # verifier output would lose it — the one semantic where this writer
+        # diverged from all three siblings, and it diverged toward data loss.
+        values["evidence_jsonb"] = _json_safe({
+            **evidence_jsonb,
+            "no_verdict_reason": clean_reason,
+        })
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
+            )
+            .values(**values)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_no_verdict failed for verify=%s status=%s: %s",
+            verify_id, status, str(exc)[:200],
         )
         return False
 
