@@ -6,10 +6,10 @@ Webhook 处理路由
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import canonicalize_shop_domain, normalize_myshopify_domain
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional, Dict, Any, Tuple, List
-from urllib.parse import urlparse
 import stripe
 import os
 import hmac
@@ -843,19 +843,16 @@ async def _finalize_stripe_refund_failure(
     )
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    candidate = raw if "://" in raw else f"https://{raw}"
-    try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").strip().lower()
-        return host or None
-    except Exception:
-        return raw.lower()
+# Re-exported under the module-local name so the six call sites below read unchanged. The body was
+# byte-identical to services/shopify_domain.canonicalize_shop_domain; keeping two copies of a host
+# rule that decides where a credential may be sent is how they drift.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO: canonicalising is not pinning. Five of the six call sites here
+# COMPARE hosts -- the untrusted X-Shopify-Shop-Domain header against the stores connected to a
+# merchant -- and pinning those to *.myshopify.com would make any store whose stored domain is not
+# canonical stop matching its own webhooks, silently dropping deliveries. Only the site that turns a
+# domain into an Admin API URL is pinned, at that site.
+_canonicalize_shop_domain = canonicalize_shop_domain
 
 
 async def _stripe_webhook_secret_candidates(psp_id: Optional[str]) -> list[str]:
@@ -3064,19 +3061,32 @@ async def _process_shopify_webhook_event(
                 from db.database import database
 
                 canon_domain = _canonicalize_shop_domain(shop_domain)
-                if canon_domain:
-                    await database.execute(
-                        """
-                        UPDATE merchant_stores
-                        SET status = 'disconnected',
-                            api_key = NULL,
-                            last_sync = NOW()
-                        WHERE merchant_id = :merchant_id
-                          AND platform = 'shopify'
-                          AND lower(domain) = :domain
-                        """,
-                        {"merchant_id": merchant_id, "domain": canon_domain},
+                if not canon_domain:
+                    # Refuse to act on an uninstall whose shop we cannot name. The store UPDATE
+                    # is domain-scoped, but the merchant_onboarding one is keyed on merchant_id
+                    # ALONE -- so an uninstall we could not attribute still cleared that
+                    # merchant's MCP token and delisted them from public recall. Reachable only
+                    # by an allowlisted shop now that the allowlist no longer short-circuits on
+                    # a falsy canonical host, but a destructive branch must not depend on a
+                    # caller's guard for its safety.
+                    logger.warning(
+                        "Shopify app/uninstalled ignored: shop domain not canonicalisable merchant=%s",
+                        merchant_id,
                     )
+                    return {"status": "ignored", "topic": topic, "reason": "unidentifiable_shop"}
+
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET status = 'disconnected',
+                        api_key = NULL,
+                        last_sync = NOW()
+                    WHERE merchant_id = :merchant_id
+                      AND platform = 'shopify'
+                      AND lower(domain) = :domain
+                    """,
+                    {"merchant_id": merchant_id, "domain": canon_domain},
+                )
                 await database.execute(
                     """
                     UPDATE merchant_onboarding
@@ -3090,7 +3100,7 @@ async def _process_shopify_webhook_event(
                     event_type="shopify_app_uninstalled",
                     order_id=f"shopify_app_uninstalled_{merchant_id}",
                     merchant_id=merchant_id,
-                    metadata={"shop_domain": canon_domain or shop_domain},
+                    metadata={"shop_domain": canon_domain},
                 )
                 # Public recall gates on catalog_merchants.status, which nothing
                 # used to write — so an uninstalled merchant kept serving on
@@ -3782,7 +3792,18 @@ async def handle_shopify_webhook(
                     got_canon,
                 )
                 raise HTTPException(status_code=400, detail="No Shopify store connected")
-            if got_canon and got_canon not in allowed_domains:
+            # `not got_canon or ...`, NOT `got_canon and ...`.
+            #
+            # The 401 above tests the RAW header; this tests the CANONICALISED one, and several
+            # non-empty headers canonicalise to None -- "/", "://", "?", "#", " ", "\t",
+            # "//victim.myshopify.com". Each of those cleared the 401 and then SKIPPED this check
+            # entirely, because a falsy got_canon short-circuits the `and`. This allowlist is the
+            # only binding between the merchant_id in the URL path and the shop the payload came
+            # from (the HMAC covers the body alone), so skipping it let any app-secret-signed body
+            # be replayed into any merchant's path -- including app/uninstalled, which clears that
+            # merchant's stored token and delists them. A header we cannot canonicalise is not a
+            # header that matches; it is one we cannot check, and it must be refused.
+            if not got_canon or got_canon not in allowed_domains:
                 record_shopify_webhook(result="error", reason="shop_domain_mismatch", topic=topic)
                 logger.error(
                     "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",
@@ -3897,19 +3918,27 @@ async def register_shopify_webhooks(
         if not shopify_store:
             raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-        shop_domain = shopify_store.get("domain")
+        # Pinned BEFORE the token resolve, not after. The resolver POSTs client credentials to
+        # {domain}/admin/oauth/access_token, and the loop below POSTs a live Admin token to
+        # {domain}/admin/api/.../webhooks.json once per topic -- about twenty requests. The old order
+        # canonicalised only after the resolver had already been handed the raw column.
+        shop_domain_canon = normalize_myshopify_domain(shopify_store.get("domain"))
+        if not shop_domain_canon:
+            # Does not echo the stored value: it is untrusted text and the merchant id already
+            # identifies the row.
+            raise HTTPException(
+                status_code=400,
+                detail="Stored Shopify domain is not a *.myshopify.com host",
+            )
+
         access_token, _ = await resolve_shopify_admin_access_token(
-            shop_domain=shop_domain,
+            shop_domain=shop_domain_canon,
             api_key_raw=shopify_store.get("api_key_raw") or shopify_store.get("api_key"),
             store_id=str(shopify_store.get("store_id") or "").strip() or None,
         )
-        
-        if not shop_domain or not access_token:
-            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
 
-        shop_domain_canon = _canonicalize_shop_domain(shop_domain)
-        if not shop_domain_canon:
-            raise HTTPException(status_code=400, detail="Invalid Shopify store domain")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
         
         # 要注册的 webhook topics
         topics = [
@@ -3973,7 +4002,7 @@ async def register_shopify_webhooks(
                         "topic": topic,
                         "webhook_id": webhook["id"]
                     })
-                    logger.info(f"Registered webhook for {topic} on {shop_domain}")
+                    logger.info(f"Registered webhook for {topic} on {shop_domain_canon}")
                 else:
                     # Common idempotency response: address already taken
                     if response.status_code == 422:

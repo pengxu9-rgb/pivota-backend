@@ -18,12 +18,19 @@ The regex is deliberately identical to the gateway's `normalizeShopifyAdminHost`
 (PIVOTA-Agent `src/services/shopifyAdminHost.js`, #2145) so the two repos agree on one shop-handle
 contract rather than drifting into two.
 
-NOT YET THE ONLY DEFINITION IN THIS REPO. `routes/webhook_routes.py:846` still holds a
-byte-identical private copy of the old `_canonicalize_shop_domain`, feeding six call sites including
-an Admin API webhook URL. It is used for webhook-header comparison rather than for choosing a host
-to send a credential to, so it is not the same exposure and is deliberately out of scope here — but
-it is a second definition, free to drift. Said plainly rather than left implied by this module's
-existence.
+THE ONLY DEFINITION OF THE CANONICALISER, since #2081 merged `routes/webhook_routes.py`'s
+byte-identical private copy into this one.
+
+That is NOT the same as saying every host is pinned. Canonicalising and pinning are different jobs:
+webhook_routes compares hosts (an untrusted `X-Shopify-Shop-Domain` header against a merchant's
+connected stores) and must NOT be pinned to `*.myshopify.com`, or a store connected under any other
+domain stops matching its own deliveries. `normalize_myshopify_domain` is for the sites that turn a
+domain into an Admin API URL; `canonicalize_shop_domain` is for the sites that compare.
+
+Several credential-sending sites are still unpinned — `services/shopify_products_sync.py`,
+`routes/ops_shopify_integration_routes.py`, `readiness/service.py`, `jobs/catalog_import_worker.py`,
+`routes/agent_products.py`, `routes/merchant_api_extensions.py`. They deserve one sweep rather than
+one-at-a-time patches; naming them here so this module is not read as a claim that the job is done.
 """
 
 from __future__ import annotations
