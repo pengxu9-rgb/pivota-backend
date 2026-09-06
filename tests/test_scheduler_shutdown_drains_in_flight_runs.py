@@ -77,6 +77,47 @@ def test_the_wait_argument_is_a_no_op_for_this_scheduler():
     )
 
 
+# ── the configured default, which every case above monkeypatches away ─────────────────
+
+
+def test_the_shipped_default_is_sane():
+    """Every behavioural case sets `_DRAIN_SECONDS` explicitly, so the value the worker
+    ACTUALLY runs with is exercised by none of them. Mutating the default to 0 (feature
+    silently off) or 3600 (holds shutdown until the container is killed) shipped green."""
+    mod = importlib.import_module("services.audit_scheduler")
+    assert 0 < mod._DRAIN_SECONDS <= mod._DRAIN_MAX_SECONDS, (
+        f"the shipped drain default is {mod._DRAIN_SECONDS}s, outside "
+        f"(0, {mod._DRAIN_MAX_SECONDS}]. Zero disables the drain everywhere; anything past "
+        "the ceiling risks the container being killed mid-shutdown."
+    )
+
+
+@pytest.mark.parametrize(
+    "raw, expected, why",
+    [
+        (None, 5.0, "unset is the ordinary case"),
+        ("", 5.0, "an empty value is not a request for zero"),
+        ("2.5", 2.5, "a sane value is honoured"),
+        ("0", 0.0, "zero is the documented opt-out"),
+        ("-1", 0.0, "negative means off, not a negative timeout"),
+        ("3600", 8.0, "clamped: past the ceiling loses database.disconnect()"),
+        ("5s", 5.0, "A TYPO MUST NOT RAISE - see the docstring; it used to"),
+        ("abc", 5.0, "nor any other non-number"),
+    ],
+)
+def test_the_env_var_can_never_break_the_import(monkeypatch, raw, expected, why):
+    """`float(os.getenv(...))` at import raised ValueError on a typo — and main.py imports
+    this module inside `except Exception`, which turns that into "audit_scheduler boot failed
+    (continuing degraded ... no worker will drain them)". A typo in a shutdown-timing knob
+    would have silently disabled EVERY cron and drainer on the worker."""
+    if raw is None:
+        monkeypatch.delenv("SCHEDULER_DRAIN_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("SCHEDULER_DRAIN_SECONDS", raw)
+    mod = importlib.import_module("services.audit_scheduler")
+    assert mod._read_drain_seconds() == expected, why
+
+
 # ── behaviour ──────────────────────────────────────────────────────────────────────────
 
 
@@ -85,25 +126,35 @@ async def test_a_short_run_in_flight_is_allowed_to_finish(runner, monkeypatch):
     """The whole point. Before this, a redeploy cancelled it — and with the worker now
     rolled on every push to main, that happens 15-34 times a day."""
     landed = []
+    seen_by_the_run = []
+    sched = _FakeScheduler()
 
     async def work():
         await asyncio.sleep(0.05)
+        # WHAT THE SCHEDULER HAD ALREADY BEEN TOLD, observed from INSIDE the drain window.
+        # Asserting on `sched.calls` afterwards cannot see this: the double records nothing
+        # for the drain itself, so moving pause() to AFTER the drain leaves the final call
+        # list byte-identical and the ordering claim unfalsifiable. Measured by a mutation
+        # audit — that exact mutant survived, in the test whose message names the ordering.
+        seen_by_the_run.append(list(sched.calls))
         landed.append("done")
 
     task = runner.spawn_isolated(work(), name="job:short")
     st = runner._state("short", 30.0)
     st.active[task] = 0.0
 
-    sched = _FakeScheduler()
     mod = await _install(sched, monkeypatch, drain=5.0)
     await mod.stop_scheduler()
 
     assert landed == ["done"], "the in-flight run was cancelled instead of being drained"
     assert task.done() and not task.cancelled()
-    assert sched.calls == ["pause", "shutdown(wait=False)"], (
-        f"the scheduler must be paused BEFORE draining, or the set of runs grows while we "
-        f"wait on it; got {sched.calls}"
+    assert seen_by_the_run == [["pause"]], (
+        "the run did not observe a PAUSED scheduler while it was being drained (it saw "
+        f"{seen_by_the_run}). Pause must come before the drain, or the timer keeps firing "
+        "and the runs it spawns are not in the set being waited on — they get cancelled by "
+        "shutdown() and adopted as zombies, which is the ERROR noise this change removes."
     )
+    assert sched.calls == ["pause", "shutdown(wait=False)"], f"got {sched.calls}"
 
 
 @pytest.mark.asyncio
@@ -119,7 +170,8 @@ async def test_a_long_run_does_not_hold_shutdown_open(runner, monkeypatch):
     st.active[task] = 0.0
 
     sched = _FakeScheduler()
-    mod = await _install(sched, monkeypatch, drain=0.15)
+    drain = 0.2
+    mod = await _install(sched, monkeypatch, drain=drain)
     started = asyncio.get_running_loop().time()
     # wait_for, NOT a bare await plus an elapsed-time assertion. Measured while mutating:
     # dropping the drain's own `timeout=` makes stop_scheduler never return, so a bare await
@@ -137,9 +189,53 @@ async def test_a_long_run_does_not_hold_shutdown_open(runner, monkeypatch):
         )
     elapsed = asyncio.get_running_loop().time() - started
 
-    assert elapsed < 2.0, f"shutdown was held open for {elapsed:.1f}s by a long-running job"
+    # PROPORTIONAL TO THE CAP, not a flat 2s. With drain=0.15 and a 2.0s assertion there was
+    # 13x of slack, so a cap that was wrong by 10x still passed — and 10x of the real 5s
+    # default is a 50s drain, far past the platform grace this whole design is bounded by.
+    # 6x absorbs a loaded CI runner without admitting an order-of-magnitude error.
+    assert elapsed < drain * 6, (
+        f"shutdown took {elapsed:.2f}s against a {drain}s cap - the bound is not being applied"
+    )
     assert "shutdown(wait=False)" in sched.calls, "it never reached the actual shutdown"
     task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_every_in_flight_run_is_waited_on_not_just_the_first(runner, monkeypatch):
+    """`asyncio.wait` defaults to ALL_COMPLETED, and with a single in-flight task that is
+    indistinguishable from FIRST_COMPLETED — adding `return_when=FIRST_COMPLETED` survived a
+    mutation audit. Two runs of different lengths is the input that separates them."""
+    landed = []
+
+    async def work(n, delay):
+        await asyncio.sleep(delay)
+        landed.append(n)
+
+    st = runner._state("multi", 30.0)
+    for n, delay in (("fast", 0.02), ("slow", 0.12)):
+        t = runner.spawn_isolated(work(n, delay), name=f"job:{n}")
+        st.active[t] = 0.0
+
+    mod = await _install(_FakeScheduler(), monkeypatch, drain=5.0)
+    await mod.stop_scheduler()
+    assert sorted(landed) == ["fast", "slow"], (
+        f"only {landed} landed - the drain returned as soon as one run finished and "
+        "cancelled the rest"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_work_means_no_drain_and_no_noise(runner, monkeypatch, caplog):
+    """`asyncio.wait(set())` raises ValueError, which the drain's own `except` would swallow
+    into a "drain failed" WARNING on EVERY clean shutdown — a log line that says something
+    went wrong when nothing did. Deleting the empty-set guard is invisible without this."""
+    import logging as _logging
+    caplog.set_level(_logging.WARNING)
+    mod = await _install(_FakeScheduler(), monkeypatch, drain=5.0)
+    await mod.stop_scheduler()
+    noisy = [r.getMessage() for r in caplog.records
+             if "drain" in r.getMessage().lower()]
+    assert not noisy, f"a shutdown with nothing in flight logged: {noisy}"
 
 
 @pytest.mark.asyncio
@@ -184,10 +280,29 @@ async def test_a_broken_registry_does_not_break_shutdown(runner, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_calling_it_with_no_scheduler_is_a_no_op(monkeypatch):
+async def test_calling_it_with_no_scheduler_is_a_no_op(runner, monkeypatch, caplog):
+    """"Must not raise" alone is satisfied by almost any implementation, because the whole
+    body sits inside `except Exception` — deleting the `sched is None` guard passed. Assert
+    that it does NOTHING: no drain, no warning."""
+    import logging as _logging
+    caplog.set_level(_logging.WARNING)
+
+    async def forever():
+        await asyncio.sleep(3600)
+
+    t = runner.spawn_isolated(forever(), name="job:none")
+    runner._state("none", 30.0).active[t] = 0.0
+
     mod = importlib.import_module("services.audit_scheduler")
     monkeypatch.setattr(mod, "_SCHEDULER", None, raising=False)
-    await mod.stop_scheduler()  # must not raise
+    monkeypatch.setattr(mod, "_DRAIN_SECONDS", 5.0, raising=False)
+    await mod.stop_scheduler()
+
+    assert not t.done(), "it drained even though there was no scheduler to shut down"
+    assert not [r for r in caplog.records if "drain" in r.getMessage().lower()], (
+        f"it logged about draining with no scheduler: {[r.getMessage() for r in caplog.records]}"
+    )
+    t.cancel()
 
 
 @pytest.mark.asyncio

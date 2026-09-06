@@ -1258,7 +1258,50 @@ async def restart_scheduler() -> dict:
 # Losing the connection teardown to save a job is a strictly worse trade than cancelling the
 # job, so this stays well inside any plausible grace and leaves room for the rest of shutdown.
 # Set SCHEDULER_DRAIN_SECONDS=0 to restore the previous cancel-immediately behaviour.
-_DRAIN_SECONDS = float(os.getenv("SCHEDULER_DRAIN_SECONDS", "5") or 0)
+_DRAIN_DEFAULT_SECONDS = 5.0
+# An absolute ceiling on what the env var may ask for. Not a tuning limit — a blast-radius
+# bound: the whole argument above is that overrunning the platform's grace loses
+# `database.disconnect()`, so a value that does that is never what anyone meant. Chosen
+# against Cloud Run's documented ~10s SIGTERM grace, leaving room for the rest of
+# main.shutdown_event. A larger request is honoured up to here and says so.
+_DRAIN_MAX_SECONDS = 8.0
+
+
+def _read_drain_seconds() -> float:
+    """SCHEDULER_DRAIN_SECONDS, parsed so a typo cannot cost more than the drain.
+
+    THIS FUNCTION EXISTS BECAUSE THE ONE-LINER IT REPLACED WAS A LANDMINE. It was
+    `float(os.getenv(...))` evaluated at IMPORT, so `SCHEDULER_DRAIN_SECONDS=5s` raised
+    ValueError while this module was being imported — and main.py:891 imports it inside
+    `except Exception`, which turns that into "audit_scheduler boot failed (continuing
+    degraded ... no worker will drain them)". A typo in a shutdown-timing knob would have
+    silently disabled EVERY cron and drainer on the worker. That is not a proportionate
+    consequence, so nothing here may raise.
+    """
+    raw = (os.getenv("SCHEDULER_DRAIN_SECONDS") or "").strip()
+    if not raw:
+        return _DRAIN_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a number - using the "
+            "default %.1fs. Set 0 to disable the shutdown drain.", raw, _DRAIN_DEFAULT_SECONDS,
+        )
+        return _DRAIN_DEFAULT_SECONDS
+    if value <= 0:
+        return 0.0          # explicit opt-out
+    if value > _DRAIN_MAX_SECONDS:
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%s exceeds the %.1fs ceiling and would "
+            "risk the container being killed mid-shutdown, losing database.disconnect(). "
+            "Using %.1fs.", raw, _DRAIN_MAX_SECONDS, _DRAIN_MAX_SECONDS,
+        )
+        return _DRAIN_MAX_SECONDS
+    return value
+
+
+_DRAIN_SECONDS = _read_drain_seconds()
 
 
 async def _drain_running_jobs(seconds: float) -> None:
