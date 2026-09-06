@@ -3,6 +3,7 @@
 import pytest
 
 import services.curated_brand_feed as cbf
+
 from services.curated_brand_feed import inci_from_pdp_html, shopify_product_to_record
 
 
@@ -697,6 +698,32 @@ async def test_records_for_brand_enrich_skips_when_body_html_has_inci(monkeypatc
 
 
 
+
+@pytest.fixture(autouse=True)
+def _no_live_meta_json(monkeypatch, request):
+    """Keep `records_for_brand` off the live network.
+
+    It gained an unconditional `fetch_shopify_shop_locale(domain)`, and the four older
+    `records_for_brand` tests stub only `fetch_shopify_products` -- so from that change onward this
+    file really did GET maccosmetics.com/robots.txt and /meta.json on every suite run. Measured:
+    those tests took 0.73s and 0.69s against <0.02s for everything else in the file, and returned
+    a REAL currency from the live host. It never failed without egress (`_gated_fetch` swallows
+    the error), which is what made it invisible -- a non-hermetic test that passes either way.
+    Worse, `max_wait=0` means an unbounded wait in the politeness gate, so a merchant Crawl-delay
+    could stall the suite.
+
+    Autouse so a future `records_for_brand` test cannot reintroduce it by omission. Tests that are
+    ABOUT the locale opt out via `@pytest.mark.live_locale` and stub it themselves.
+    """
+    if request.node.get_closest_marker("live_locale"):
+        return
+
+    async def _offline(domain, **kw):
+        return {"currency": None}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _offline)
+
+
 def _clear_locale_cache():
     """`storefront_currency` caches per domain for the PROCESS lifetime, negatives included.
 
@@ -766,6 +793,7 @@ def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
     ],
 )
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, expected):
     """The value lands in a currency column that is a join key for price comparison, and it comes
     from the merchant. Shape-check it at the door."""
@@ -807,6 +835,7 @@ async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, e
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypatch):
     """A non-Shopify host, a 404 or a hung socket must not fail the whole brand's ingest -- the
     caller keeps its default and the crawl proceeds."""
@@ -829,6 +858,7 @@ async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch):
     """THE SEAM. `fetch_shopify_shop_locale` can be perfect and `shopify_product_to_record` can
     stamp perfectly, and the feature is still dead in production if the caller never passes one
@@ -853,6 +883,7 @@ async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_product(monkeypatch):
     """It is one storefront-wide setting. A per-product fetch would multiply outbound requests by
     the catalogue size against a single host -- 170 extra requests for jsmbeauty.sg alone -- which
@@ -885,6 +916,7 @@ async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_pr
     ],
 )
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, status, ctype, label):
     """Both gates matter and neither was pinned. Storefronts that are not Shopify commonly answer
     /meta.json with a 200 HTML soft-404, and `resp.json()` on that either raises or -- worse --
@@ -921,6 +953,7 @@ async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, st
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch):
     """PINNED DELIBERATELY, not incidentally.
 
@@ -964,7 +997,13 @@ async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch)
         async def get(self, url):
             return _Resp()
 
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    sent = {}
+
+    def _client(**kw):
+        sent.update(kw)          # capture what the REQUEST carries, not just what the gate hears
+        return _Client()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
     _clear_locale_cache()
 
     assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
@@ -973,11 +1012,15 @@ async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch)
     url, ua, max_wait = seen["before"][0]
     assert url.endswith("/meta.json")
     assert ua == cbf._UA, "the gate must be asked about the SAME agent the request then sends"
+    # AND the request must actually send it. Asserting only the gate side is the same accident
+    # this test replaced, one layer down: a mutant changing the outgoing header survived.
+    assert (sent.get("headers") or {}).get("User-Agent") == cbf._UA
     assert max_wait == 0, "batch lane: wait rather than drop"
     assert seen["note"] and seen["note"][0][1] == 200, "the response must be reported back"
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_locale
 async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypatch):
     """`fetch_storefront_meta` caches per domain for the PROCESS lifetime, NEGATIVES INCLUDED, and
     this lane runs inside a queue-draining worker with its own retry budget. One transient failure
@@ -1015,3 +1058,34 @@ async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypat
     # the retry must actually reach the network again, not read a cached None
     assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypatch):
+    """Pins the autouse offline stub, which is otherwise invisible: removing it fails nothing, it
+    just makes the suite quietly crawl merchant hosts again (measured: 0.56s -> 1.74s for this
+    file, with real GETs to maccosmetics.com/robots.txt and /meta.json).
+
+    A non-hermetic test that passes either way is the worst kind, so this asserts the property
+    directly: with `httpx.AsyncClient` rigged to explode, `records_for_brand` must still complete.
+    """
+    import httpx
+
+    class _LiveRequestAttempted(BaseException):
+        """BaseException on purpose. `_gated_fetch` wraps its request in `except Exception`, so an
+        ordinary error -- including AssertionError -- is SWALLOWED and the test passes anyway.
+        That broad catch is exactly why the live calls were invisible for two rounds."""
+
+    def _explode(**kw):
+        raise _LiveRequestAttempted("a default-path test attempted a live HTTP request")
+
+    async def _products(domain, **kw):
+        return [_product()]
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(httpx, "AsyncClient", _explode)
+
+    recs = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
+
+    assert recs, "the stub returned a product, so a record must come back"
+    assert recs[0]["pdp"]["currency"] is None, "offline: no currency learned, ingest defaults USD"

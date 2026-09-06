@@ -101,7 +101,7 @@ async def _fetch_agent_seeds_for(product_key: str) -> List[Dict[str, Any]]:
     return await _db.fetch_all(
         """
         SELECT canonical_url, destination_url, image_url, price_amount,
-               domain, seed_data
+               price_currency, domain, seed_data
         FROM external_product_seeds
         WHERE attached_product_key = :pk
           AND tool = :tool
@@ -261,10 +261,20 @@ async def _drive(args: argparse.Namespace, pdps: List[Dict[str, Any]]) -> int:
             image_url=pdp.get("image_url"),
         )
         merchant_rows = _build_merchant_upserts(offers)
+        # The seed already knows its currency; without passing it this call takes
+        # `_build_offer_inserts`'s USD default and mints a USD offer for an SGD seed, two lines
+        # after reading the right answer. Harmless for EXISTING rows (this script's own upsert
+        # does not update currency) but wrong for every new offer_id it creates.
+        seed_currency = next(
+            (str(s.get("price_currency") or "").strip().upper() for s in seeds
+             if str(s.get("price_currency") or "").strip()),
+            None,
+        )
         offer_rows = _build_offer_inserts(
             product_key=product_key,
             sku_key=sku_row["sku_key"],
             offers=offers,
+            **({"currency": seed_currency} if seed_currency else {}),
         )
 
         if args.dry_run:

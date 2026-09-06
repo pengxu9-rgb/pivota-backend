@@ -126,6 +126,16 @@ _SKU_UPSERT_SQL = """
                        CAST(:ingredient_ids AS jsonb),
                        CAST(:sku_payload AS jsonb), :readiness_tier)
                     ON CONFLICT (sku_key) DO UPDATE SET
+                      -- THE THIRD ARM. `catalog_skus.currency` is not internal bookkeeping:
+                      -- `agent_pdp_view_assembler` SELECTs it and emits it as
+                      -- `variants[].currency` in the served payload. `derive_sku_key` is stable,
+                      -- so without this a re-ingested SGD storefront serves one payload that
+                      -- CONTRADICTS ITSELF -- product-level SGD from catalog_offers beside every
+                      -- variant stamped USD from here. Before this change both sites wrote the
+                      -- literal "USD" and at least agreed; correcting one and not the other is
+                      -- the "worse than the uniform wrongness it replaced" failure again, for
+                      -- the third time in this branch.
+                      currency = EXCLUDED.currency,
                       source_domain = EXCLUDED.source_domain,
                       barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,

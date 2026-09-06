@@ -1159,3 +1159,20 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
     )
     assert "price_currency = EXCLUDED.price_currency" in seed_arm
     assert "market" not in seed_arm
+
+    # THE THIRD ARM, because the first version of this test checked two of three and stopped.
+    # `catalog_skus.currency` is SELECTed by `agent_pdp_view_assembler` and served as
+    # `variants[].currency`, so a stale one makes the payload contradict itself: product-level
+    # SGD from catalog_offers beside variants stamped USD from here.
+    from services.catalog_enrichment_agent.apply import _SKU_UPSERT_SQL
+
+    sku_arm = "\n".join(
+        _re.sub(r"--.*$", "", line)
+        for line in _SKU_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
+    )
+    assert "currency = EXCLUDED.currency" in sku_arm
+
+    # ALL THREE, asserted together: every table this lane writes a currency into must be able to
+    # correct it on re-ingest, or the tables disagree with each other.
+    for name, arm in (("offer", update_arm), ("seed", seed_arm), ("sku", sku_arm)):
+        assert _re.search(r"(price_)?currency = EXCLUDED", arm), f"{name} arm cannot correct currency"
