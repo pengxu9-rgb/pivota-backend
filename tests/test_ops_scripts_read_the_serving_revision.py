@@ -34,8 +34,21 @@ SERVING = "a" * 40          # what the 100%-traffic revision runs
 TEMPLATE = "b" * 40         # what the template asks for — a deploy that did not take
 
 
-def _stub_gcloud(tmp_path: Path, *, armed_serving="true", armed_template="false") -> Path:
-    """A `gcloud` whose service TEMPLATE and SERVING revision deliberately disagree."""
+# The default traffic block: one revision serving, plus a 0%-traffic candidate left behind by a
+# deploy that did not take. That split is the whole subject of this module.
+_DEFAULT_TRAFFIC = ('{"revisionName":"rev-live","percent":100},'
+                    '{"revisionName":"rev-cand","percent":0,"tag":"c-x"}')
+
+
+def _stub_gcloud(tmp_path: Path, *, armed_serving="true", armed_template="false",
+                 traffic: str = _DEFAULT_TRAFFIC, extra_status: str = "") -> Path:
+    """A `gcloud` whose service TEMPLATE and SERVING revision deliberately disagree.
+
+    `traffic` is DATA, not a string patched into the generated script afterwards. The stub is
+    written with shell line-continuations, so a test doing surgery on the combined JSON matched
+    nothing, silently exercised the default shape, and reported the opposite of what it
+    claimed. Measured: that is exactly what happened to the lone-nameless case.
+    """
     binn = tmp_path / "bin"
     binn.mkdir(exist_ok=True)
     log = tmp_path / "calls.log"
@@ -54,8 +67,7 @@ if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
   case "$*" in
     *status.url*) echo "https://svc-xyz.a.run.app"; exit 0 ;;
     *--format=json*)
-      echo '{{"status":{{"traffic":[{{"revisionName":"rev-live","percent":100}},'\\
-'{{"revisionName":"rev-cand","percent":0,"tag":"c-x"}}]}},'\\
+      echo '{{"status":{{{extra_status}"traffic":[{traffic}]}},'\\
 '"spec":{{"template":{{"spec":{{"containers":[{{"image":"{img}:{TEMPLATE}",'\\
 '"env":[{{"name":"AUDIT_WORKER_ENABLED","value":"{armed_template}"}}]}}]}}}}}}}}'
       exit 0 ;;
@@ -128,9 +140,9 @@ def test_two_revisions_both_claiming_all_traffic_are_refused(tmp_path):
     mutation audit. Two entries both claiming 100 is an inconsistent traffic block, and it is
     the shape that separates the two guards. Two guards that both close a door pin neither.
     """
-    binn = _stub_gcloud(tmp_path)
-    both = (binn / "gcloud").read_text().replace('"percent":0,"tag":"c-x"', '"percent":100')
-    (binn / "gcloud").write_text(both)
+    binn = _stub_gcloud(
+        tmp_path,
+        traffic='{"revisionName":"rev-live","percent":100},{"revisionName":"rev-cand","percent":100}')
     script = f'''
 set -euo pipefail
 GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
@@ -146,10 +158,9 @@ serving_image worker && echo UNEXPECTED_SUCCESS || echo REFUSED
 def test_split_traffic_is_refused(tmp_path):
     """Two revisions sharing traffic have no single answer, and a lingering 0%-traffic candidate
     is exactly the half-finished state these scripts must not paper over."""
-    binn = _stub_gcloud(tmp_path)
-    split = (binn / "gcloud").read_text().replace('"percent":100', '"percent":50').replace(
-        '"percent":0,"tag":"c-x"', '"percent":50')
-    (binn / "gcloud").write_text(split)
+    binn = _stub_gcloud(
+        tmp_path,
+        traffic='{"revisionName":"rev-live","percent":50},{"revisionName":"rev-cand","percent":50}')
     script = f'''
 set -euo pipefail
 GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
@@ -173,11 +184,8 @@ def test_a_tagged_serving_revision_is_still_found(tmp_path):
     setup_scheduler.sh had already removed that conjunct and written down why. The sibling copy
     kept it — which is precisely the drift one definition exists to prevent.
     """
-    binn = _stub_gcloud(tmp_path)
-    tagged = (binn / "gcloud").read_text().replace(
-        '{"revisionName":"rev-live","percent":100}',
-        '{"revisionName":"rev-live","percent":100,"tag":"c-abc123"}')
-    (binn / "gcloud").write_text(tagged)
+    binn = _stub_gcloud(
+        tmp_path, traffic='{"revisionName":"rev-live","percent":100,"tag":"c-abc123"}')
     script = f'''
 set -euo pipefail
 GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
@@ -191,15 +199,50 @@ serving_revision worker
     )
 
 
+def test_a_lone_nameless_entry_is_refused(tmp_path):
+    """The input that pins the NAME clause specifically.
+
+    The two-entry case below is already refused by `len(live) != 1`, so it never exercises the
+    name check beside it — two guards closing one door. A single entry at 100 with no
+    revisionName and no latestRevision reaches the name clause and nothing else.
+    """
+    binn = _stub_gcloud(tmp_path, traffic='{"percent":100}')
+    script = f'''
+set -euo pipefail
+GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
+. "{GCP / '_serving_revision.sh'}"
+serving_revision worker && echo UNEXPECTED_SUCCESS || echo REFUSED
+'''
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert "REFUSED" in done.stdout + done.stderr
+
+
+def test_a_latest_revision_entry_without_a_name_falls_back(tmp_path):
+    """The fallback the UCP guard carried, preserved when the helper absorbed it: an entry
+    marked `latestRevision` resolves through `status.latestReadyRevisionName`. Dropping it
+    would make that script exit 2 forever if the shape ever appeared — the same failure this
+    whole change removes from its sibling."""
+    binn = _stub_gcloud(tmp_path, traffic='{"percent":100,"latestRevision":true}',
+                        extra_status='"latestReadyRevisionName":"rev-live",')
+    script = f'''
+set -euo pipefail
+GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
+. "{GCP / '_serving_revision.sh'}"
+serving_revision worker
+'''
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0 and "rev-live" in done.stdout, (
+        f"the latestRevision fallback was dropped: {done.stdout!r} {done.stderr!r}"
+    )
+
+
 def test_a_nameless_hundred_percent_entry_is_refused(tmp_path):
     """An entry at 100 with no revisionName is an inconsistent traffic block. Filtering it out
     and answering with its neighbour would resolve a split by ignoring half of it — so the
     filter keeps such entries and the count check then refuses. This matches the pre-existing
     Store Audit guards, whose semantics the helper had to preserve when it absorbed them."""
-    binn = _stub_gcloud(tmp_path)
-    broken = (binn / "gcloud").read_text().replace(
-        '{"revisionName":"rev-cand","percent":0,"tag":"c-x"}', '{"percent":100}')
-    (binn / "gcloud").write_text(broken)
+    binn = _stub_gcloud(
+        tmp_path, traffic='{"revisionName":"rev-live","percent":100},{"percent":100}')
     script = f'''
 set -euo pipefail
 GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
@@ -215,16 +258,22 @@ def test_the_return_contract_holds_without_pipefail(tmp_path):
     describe returned 0 with empty output — an unreadable service looking clean, which is the
     one thing the header promises cannot happen. Latent while every caller sets pipefail, but
     this is a shared file and a GitHub Actions `run:` step is `bash -e` WITHOUT it."""
-    binn = _stub_gcloud(tmp_path)
+    # THE SECOND gcloud CALL, not the first. `serving_image nosuchsvc` fails inside
+    # `serving_revision` and returns before the `revisions describe` pipeline ever runs — so
+    # this case passed with `| head -1` restored, which is the exact bug it names. A mutation
+    # audit caught that. The service must RESOLVE and its revision must then be undescribable.
+    binn = _stub_gcloud(tmp_path, traffic='{"revisionName":"rev-ghost","percent":100}')
     script = f'''
 set -eu
 GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
 . "{GCP / '_serving_revision.sh'}"
-serving_image nosuchsvc && echo UNEXPECTED_SUCCESS || echo REFUSED
+serving_image worker && echo UNEXPECTED_SUCCESS || echo REFUSED
 '''
     done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
     assert "REFUSED" in done.stdout, (
-        f"without pipefail an unreadable service returned success: {done.stdout!r}"
+        "without pipefail, a describable service whose REVISION cannot be described returned "
+        f"success with empty output: {done.stdout!r}. deploy_worker.sh would read that as "
+        "'service absent', take the create path, and deploy with no rollback anchor."
     )
 
 
@@ -235,7 +284,11 @@ serving_image nosuchsvc && echo UNEXPECTED_SUCCESS || echo REFUSED
 # `--format=value(spec.template...)` literal banned ONE syntactic form: a mutation audit read
 # the same field via `--format=json | python3 -c '...["spec"]["template"]...'` and every case
 # stayed green. A ratchet that matches one form permits the others.
-_TEMPLATE_READS = ("spec.template", '["template"]', "['template']", '"template"')
+# Every way a script might read something OTHER than the serving revision. Not just the
+# `spec.template` spellings: `latestCreatedRevisionName` reaches the same wrong answer by a
+# different field, and a mutation audit used it to defeat the earlier version of this list.
+_TEMPLATE_READS = ("spec.template", '["template"]', "['template']", '"template"',
+                   "latestCreatedRevisionName")
 
 
 def _code_only(path: Path) -> str:
@@ -267,7 +320,12 @@ def _code_only(path: Path) -> str:
 def test_scripts_asking_what_is_running_use_the_helper(script, why):
     body = _code_only(GCP / script)
     assert "_serving_revision.sh" in body, f"{script} does not source the helper. {why}"
-    assert "serving_revision" in body or "serving_image" in body or "serving_env" in body, (
+    # THE SOURCE LINE ITSELF CONTAINS "serving_revision", so searching the whole body for that
+    # substring could never fail once the assert above passed — "sources it but never calls it"
+    # was undetectable, and a mutant that swapped a call for a raw runtime read while keeping
+    # the source line survived. Drop the sourcing line before looking for a CALL.
+    calls = "\n".join(l for l in body.splitlines() if "_serving_revision.sh" not in l)
+    assert any(f in calls for f in ("serving_revision", "serving_image", "serving_env")), (
         f"{script} sources the helper but never calls it. {why}"
     )
     hit = [t for t in _TEMPLATE_READS if t in body]
@@ -315,11 +373,22 @@ def test_scripts_asking_what_the_next_deploy_inherits_keep_the_template(
 def test_the_serving_read_is_defined_once():
     """The whole point of the helper. Every inline re-implementation is a place to drift, and
     one of them HAD drifted — see test_a_tagged_serving_revision_is_still_found."""
+    # NOT a search for one spelling of the predicate. `x["percent"] == 100`, single quotes,
+    # reversed operands and extra whitespace all evade that, and a mutation audit used the
+    # subscript form to smuggle a drifting copy back in. Flag any script that inspects a
+    # traffic block AT ALL: outside the helper, none has business doing so.
     copies = []
     for f in sorted(GCP.glob("*.sh")):
         if f.name == "_serving_revision.sh":
             continue
-        if 'percent") == 100' in _code_only(f) or 'percent")==100' in _code_only(f):
+        body = _code_only(f)
+        # `percent` AND `revisionName` together = resolving WHICH REVISION is serving, which is
+        # the helper's job. Matching one spelling of the predicate was not a ratchet (a mutation
+        # audit smuggled a copy back in as `x["percent"] == 100`); matching merely "touches
+        # traffic" is too wide the other way — deploy_backend.sh's sweep_stale_tags reads
+        # tag/percent to find STALE TAGS, a different question, and flagging it would make this
+        # cry wolf until someone deleted it.
+        if "percent" in body and "revisionName" in body:
             copies.append(f.name)
     assert not copies, (
         f"these scripts carry their own 100%-traffic resolution instead of sourcing the "

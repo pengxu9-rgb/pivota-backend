@@ -27,9 +27,9 @@
 # serving revision. deploy_backend.sh's pool-drift guard and restore_to_cloudsql.sh's minScale
 # capture are both that question and both correctly read the template. Do not "fix" them.
 #
-# Requires GCLOUD and REGION. PROJECT is optional: callers that instead export
-# CLOUDSDK_CORE_PROJECT (setup_store_audit_*.sh do) are honoured by omitting --project, exactly
-# as their own gcloud calls do. Every function prints nothing on
+# Requires GCLOUD and REGION. PROJECT is optional -- omitted from the gcloud call when unset, so
+# a caller relying on CLOUDSDK_CORE_PROJECT still works. NOTE: every caller today sets PROJECT
+# before sourcing, so that branch is currently unexercised; it is defensive, not load-bearing. Every function prints nothing on
 # stdout and returns non-zero when it cannot answer — an unreadable service must never look like a
 # clean one.
 #
@@ -48,13 +48,20 @@ serving_revision(){ # <service>
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(1)
-live = [t for t in (d.get("status", {}).get("traffic") or []) if t.get("percent") == 100]
-# Exactly one entry at 100, AND it must be named. A nameless 100% entry is an inconsistent
-# traffic block; filtering it out and answering with its neighbour would resolve a split by
-# ignoring half of it. This matches the two pre-existing Store Audit guards in
-# setup_scheduler.sh, which now call this function instead of carrying their own copy.
-if len(live) != 1 or not live[0].get("revisionName"): sys.exit(1)
-print(live[0]["revisionName"])' 2>/dev/null
+st = d.get("status", {})
+live = [t for t in (st.get("traffic") or []) if t.get("percent") == 100]
+# Exactly one entry at 100. A nameless entry is kept in the list rather than filtered out:
+# filtering would let a two-entry split resolve by ignoring half of itself.
+if len(live) != 1: sys.exit(1)
+# `revisionName` on a STATUS traffic target is the resolved one and is populated in practice
+# (measured across web/worker/proof-issuer/gateway 2026-09-06: always present, and always equal
+# to latestReadyRevisionName). The latestRevision fallback is kept anyway because the UCP guard
+# this function absorbed carried it -- dropping a fallback that costs one line, on a script that
+# provisions secret-bearing Jobs, is not a trade worth making for tidiness.
+name = live[0].get("revisionName") or (
+    st.get("latestReadyRevisionName", "") if live[0].get("latestRevision") else "")
+if not name: sys.exit(1)
+print(name)' 2>/dev/null
 }
 
 # The container image on the revision that is serving.
