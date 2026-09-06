@@ -15,14 +15,26 @@ record — brand-authored copy only (ADR-001), never synthesized, never from a
 retailer.
 
 Rows whose storefront has no usable body_html (some brands leave it empty) are
-left untouched and reported — they stay draft honestly and route to the LLM
-enrichment lane later.
+left untouched and reported — they stay draft honestly.
+
+--pdp-fallback (OPT-IN) tries one more BRAND-AUTHORED source before giving up on
+such a row: the product's own PDP meta description. Measured on jsmbeauty.sg
+2026-09-06, 158 of 232 products publish under 50 chars of body_html text while
+their PDPs carry 150-340 chars. It costs one merchant-host request per
+already-skipped row, which is why it is not the default, and it refuses the
+theme's store blurb (see description_from_pdp_html). Rows filled this way are
+recorded under REFRESH_SOURCE_PDP_META, not the body_html source. Anything still
+empty after that routes to the LLM enrichment lane, as before.
 
 Dry-run (default): report per-domain fill/skip counts, write nothing.
     DATABASE_URL=... python3 scripts/backfill_brand_official_descriptions.py
 
 Apply:
     DATABASE_URL=... python3 scripts/backfill_brand_official_descriptions.py --apply
+
+With the PDP fallback (one extra request per empty-body row):
+    DATABASE_URL=... python3 scripts/backfill_brand_official_descriptions.py \\
+        --domains jsmbeauty.sg --pdp-fallback --apply
 """
 
 from __future__ import annotations
@@ -49,6 +61,13 @@ from services.curated_brand_feed import (  # noqa: E402
 from services.pdp_lifecycle import compute_lifecycle_stage  # noqa: E402
 
 REFRESH_SOURCE = "brand_official_description_backfill_v1"
+# PROVENANCE, recorded rather than left implicit. ADR-001's closing item asks for "provenance
+# tagging on each canonical field", and this lane honours it elsewhere (`inci_source`,
+# readiness/sources/shopify_live.py's `field_sources`). Before --pdp-fallback,
+# catalog_products.description on this lane had exactly ONE possible origin; it now has two, and
+# a later reader must be able to tell which filled a given row -- both to audit PDP-meta copy and
+# to find it again if the meta-description route is ever judged a lower tier than body copy.
+REFRESH_SOURCE_PDP_META = "brand_official_description_backfill_pdp_meta_v1"
 MIN_DESC_LEN = 50          # is_candidate_ready's CANDIDATE_DESCRIPTION_MIN_LEN
 
 # Population: Path-C enrichment-minted rows stuck below 'published' whose
@@ -133,6 +152,37 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
     }
 
 
+async def resolve_description(
+    body: str,
+    domain: str,
+    handle: str,
+    *,
+    pdp_fallback: bool,
+    fetch=None,
+) -> tuple:
+    """Which copy fills this row, and did the PDP supply it? -> (description|None, from_pdp).
+
+    EXTRACTED so the two safety properties are testable at all. They were prose in a docstring,
+    and mutation proved that: making the fetch unconditional, or ignoring `--pdp-fallback`, left
+    the whole suite green because nothing drove this decision. It decides whether a routine re-run
+    quietly starts crawling merchant hosts and prefers meta copy over real body copy, which is too
+    load-bearing to leave as a comment inside a loop nothing tests.
+
+    Order matters and is the whole contract: usable body copy wins and costs NO request; the
+    fallback is consulted only after body copy has already failed the floor, and only when asked
+    for; and the SAME floor applies to what comes back -- a 9-character meta description is how
+    these rows got blocked in the first place.
+    """
+    if len(body or "") >= MIN_DESC_LEN:
+        return body, False
+    if not pdp_fallback:
+        return None, False
+    meta = await (fetch or fetch_pdp_description)(domain, handle)
+    if meta and len(meta) >= MIN_DESC_LEN:
+        return meta, True
+    return None, False
+
+
 async def run(apply: bool, domains_filter: List[str], max_products: int,
               pdp_fallback: bool = False) -> int:
     # initial connect through the same healer as mid-run reconnects —
@@ -186,27 +236,15 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
             if body is None:
                 not_in_feed += 1
                 continue
-            if len(body) < MIN_DESC_LEN:
-                # STRICTLY A FALLBACK, and only once body_html has already failed the floor: a
-                # row with real body copy takes the branch above and is byte-identical to before
-                # this fallback existed. Some storefronts publish their copy on the PDP but not
-                # in body_html -- measured on jsmbeauty.sg 2026-09-06, 158 of 232 products carry
-                # under 50 characters of body_html TEXT while the same PDPs serve 150-340
-                # characters in og:description, so the whole cohort was blocked over a field
-                # choice rather than missing content. Still ADR-001 brand-authored: the
-                # merchant's own words on the merchant's own page, a different SURFACE from
-                # body_html rather than a different tier.
-                if pdp_fallback:
-                    meta = await fetch_pdp_description(domain, r["_handle"], client=None)
-                    if meta and len(meta) >= MIN_DESC_LEN:
-                        body = meta
-                        from_pdp += 1
-                    else:
-                        no_body += 1
-                        continue
-                else:
-                    no_body += 1
-                    continue
+            body, from_pdp_row = await resolve_description(
+                body, domain, r["_handle"], pdp_fallback=pdp_fallback
+            )
+            if body is None:
+                no_body += 1
+                continue
+            if from_pdp_row:
+                r["_from_pdp"] = True
+                from_pdp += 1
             new_row = {**r, "description": body}
             new_stage = compute_lifecycle_stage(new_row)
             totals[new_stage] = totals.get(new_stage, 0) + 1
@@ -246,7 +284,11 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
         for ck in distinct:
             for attempt in (1, 2):
                 try:
-                    await refresh_agent_pdp_view_for_content_key(ck, refresh_source=REFRESH_SOURCE)
+                    await refresh_agent_pdp_view_for_content_key(
+                        ck,
+                        refresh_source=(REFRESH_SOURCE_PDP_META if r.get("_from_pdp")
+                                       else REFRESH_SOURCE),
+                    )
                     break
                 except Exception as exc:  # noqa: BLE001 — a transport failure
                     # poisons the pinned connection ("Connection is already

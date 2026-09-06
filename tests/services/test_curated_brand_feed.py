@@ -1280,17 +1280,76 @@ def test_the_pdp_meta_description_is_recovered():
     assert description_from_pdp_html(page) == "A lip tint that gives off a watery glow."
 
 
-def test_og_description_wins_over_the_plain_one():
-    """Themes commonly set both, and the og: variant is the richer copy. Asserted because a
-    'first meta tag wins' implementation passes every single-tag test and silently takes the
-    worse string on a real page."""
+def test_the_per_product_name_tag_wins_over_the_theme_generated_og_one():
+    """og is NOT the richer copy, which an earlier version of this asserted.
+
+    The og tag is frequently theme-generated; `name="description"` is the per-product SEO field a
+    merchant fills. Measured live on kyliecosmetics.com: og carried the STORE blurb while name
+    carried the product's own line, so preferring og took the strictly worse string on a real page.
+    """
     from services.curated_brand_feed import description_from_pdp_html
 
     page = """
-      <meta name="description" content="Short SEO blurb.">
-      <meta property="og:description" content="The fuller brand-authored sentence.">
+      <meta property="og:description" content="Shop award-winning makeup and skincare.">
+      <meta name="description" content="Kylie Cosmetics - Glossy Pink Makeup Bag + Samples">
     """
-    assert description_from_pdp_html(page) == "The fuller brand-authored sentence."
+    assert description_from_pdp_html(page) == "Kylie Cosmetics - Glossy Pink Makeup Bag + Samples"
+
+
+def test_a_present_but_EMPTY_name_tag_means_og_is_the_shops_blurb_not_the_products():
+    """THE BOILERPLATE GUARD, and the reason this is not merely "stays blocked".
+
+    When a Shopify product has no SEO description the theme substitutes the SHOP description into
+    og: 135 characters of "Discover JUNGSAEMMOOL, the epitome of Korean makeup..." with zero
+    product information, comfortably over the 50-char floor, identical across every such product.
+    Measured on jsmbeauty.sg: 5 of a 30-product sample received that exact string. And because
+    `is_published_ready` auto-publishes this lane's rows, it would not merely unblock them -- it
+    would enter serving as brand-official PRODUCT copy.
+
+    The tell is exact on that storefront: every boilerplate page carries a present-but-empty
+    `name="description"` and no legitimate page does.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <meta name="description" content="">
+      <meta property="og:description" content="Discover JUNGSAEMMOOL, the epitome of Korean
+      makeup and cosmetic products, blending artistry with skincare for every day.">
+    """
+    assert description_from_pdp_html(page) is None
+
+
+def test_an_ABSENT_name_tag_is_not_the_same_signal_as_an_empty_one():
+    """Present-but-empty is the tell; absent is no signal at all. Conflating them would throw
+    away legitimate copy on any theme that simply does not emit a name tag."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta property="og:description" content="A lip tint with a watery glow and vivid colour.">'
+    assert description_from_pdp_html(page) == "A lip tint with a watery glow and vivid colour."
+
+
+def test_an_apostrophe_inside_a_double_quoted_attribute_does_not_truncate():
+    """The capture must match the OPENING delimiter. A character class of both quotes ends at the
+    first apostrophe inside a double-quoted attribute -- measured live on kyliecosmetics.com, an
+    88-character sentence truncated to 25 at "that's", which still cleared the 50-char floor and
+    was written as a mid-sentence fragment. Raw apostrophes are ubiquitous in this copy, and the
+    earlier entity test only covered the ones a theme had already escaped.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = ("<meta property=\"og:description\" content=\"Clean vegan skincare that's "
+            "dermatologist-tested and cruelty-free for every skin type.\">")
+    out = description_from_pdp_html(page)
+    assert out == "Clean vegan skincare that's dermatologist-tested and cruelty-free for every skin type."
+    assert not out.endswith("that"), "truncated at the apostrophe"
+
+
+def test_a_single_quoted_content_attribute_still_parses():
+    """The mirror case: matching only double quotes would drop these entirely."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = "<meta property='og:description' content='A tint with a glassy, watery finish.'>"
+    assert description_from_pdp_html(page) == "A tint with a glassy, watery finish."
 
 
 def test_the_plain_description_is_used_when_there_is_no_og_one():

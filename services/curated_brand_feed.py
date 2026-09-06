@@ -621,28 +621,38 @@ _META_DESC_RE = re.compile(
 
 
 def description_from_pdp_html(raw_html: str) -> Optional[str]:
-    """Brand-authored copy from a PDP's own meta description.
+    """Brand-authored copy from a PDP's own meta description, or None.
 
     WHY THIS EXISTS. `backfill_brand_official_descriptions` takes body copy from
     `/products.json` body_html, and some storefronts publish none — measured on jsmbeauty.sg
     2026-09-06: 158 of 232 products carry under 50 characters of body_html TEXT (LIP-PRESSION
-    Glowy Tint has 123 characters of markup that render to zero), so every one of them failed the
-    50-char floor and stayed blocked. The copy is not missing from the site, only from that field:
-    the same PDP serves 190 characters of real prose in `og:description`. 10 of a 12-row sample
-    had a usable one.
+    Glowy Tint's 123 characters of markup render to zero), so the whole cohort failed the 50-char
+    floor. The copy is not missing from the site, only from that field: the same PDP serves 190
+    characters of real prose in its meta description.
 
-    STILL BRAND-AUTHORED (ADR-001). This is the merchant's own text on the merchant's own page —
-    a different SURFACE from body_html, not a different tier, and never a retailer's words and
-    never synthesized. What it is NOT is a substitute for a real description where one exists,
-    which is why the caller uses it strictly as a fallback.
+    PREFERS `name="description"`, NOT og. The og tag is frequently theme-generated; the name tag
+    is the per-product SEO field a merchant fills. Measured on kyliecosmetics.com: og carried the
+    STORE blurb while name carried the product's own line, so preferring og took the strictly
+    worse string.
 
-    Prefers `og:description`, falls back to `name="description"`. Attribute order varies between
-    themes, so this parses each tag's attributes rather than assuming `property` precedes
-    `content`. Returns None when there is nothing usable — never a partial or a guess.
+    REFUSES THE THEME'S STORE BLURB. When a Shopify product has no SEO description, the theme
+    substitutes the SHOP description into og — 135 characters of "Discover JUNGSAEMMOOL, the
+    epitome of Korean makeup..." with zero product information, comfortably over the floor, and
+    identical across every such product. That is worse than staying blocked: `is_published_ready`
+    auto-publishes this lane's rows, so it would enter serving as brand-official product copy.
+    The tell is exact — on jsmbeauty.sg every boilerplate page carries a PRESENT BUT EMPTY
+    `name="description"` tag and no legitimate page does (12/12 vs 0/136). An ABSENT name tag is
+    a different case: no signal either way, so og is trusted there.
+
+    Returns None when there is nothing trustworthy — never a partial and never a guess.
     """
     if not raw_html:
         return None
-    best: Optional[str] = None
+
+    og: Optional[str] = None
+    name: Optional[str] = None
+    name_tag_present = False
+
     for tag in _META_DESC_RE.findall(raw_html)[:400]:
         key = ""
         for attr in ("property", "name"):
@@ -652,16 +662,28 @@ def description_from_pdp_html(raw_html: str) -> Optional[str]:
                 break
         if key not in ("og:description", "description"):
             continue
-        m = re.search(r'content\s*=\s*["\']([^"\']*)["\']', tag, re.I | re.S)
+        # MATCH THE OPENING DELIMITER. A character class of both quotes ends the capture at the
+        # first apostrophe inside a double-quoted attribute — measured live on kyliecosmetics.com,
+        # an 88-character sentence truncated to 25 at "that's", which still cleared the 50-char
+        # floor as a mid-sentence fragment. Raw apostrophes are ubiquitous in this copy.
+        m = re.search(r'content\s*=\s*"([^"]*)"', tag, re.I | re.S) or re.search(
+            r"content\s*=\s*'([^']*)'", tag, re.I | re.S
+        )
         if not m:
             continue
         value = re.sub(r"\s+", " ", html.unescape(m.group(1))).strip()
-        if not value:
-            continue
-        if key == "og:description":
-            return value          # the richer of the two when a theme sets both
-        best = best or value
-    return best
+        if key == "description":
+            name_tag_present = True
+            name = name or (value or None)
+        elif og is None and value:
+            og = value
+
+    if name:
+        return name
+    if name_tag_present:
+        # Present and empty: the og value beside it is the theme's shop blurb, not this product.
+        return None
+    return og
 
 
 async def fetch_pdp_description(
