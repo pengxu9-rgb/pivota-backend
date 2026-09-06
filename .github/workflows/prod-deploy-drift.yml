@@ -388,18 +388,23 @@ jobs:
             gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
               --substitutions=COMMIT_SHA=<sha> .
 
-            web           infra/gcp/deploy_backend.sh prod <sha>
-            worker        infra/gcp/deploy_worker.sh prod <sha>
+            web           CONFIG=preserve infra/gcp/deploy_backend.sh prod <sha>
+            worker        CONFIG=preserve infra/gcp/deploy_worker.sh prod <sha>
             proof-issuer  SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
                             RUN_COMMAND=python \
                             RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
                             CONFIG=preserve CPU_LIMIT=2 MEMORY_LIMIT=4Gi CONCURRENCY_LIMIT=80 \
-                            MIN_INSTANCES=2 MAX_INSTANCES=20 \
+                            MIN_INSTANCES=2 MAX_INSTANCES=20 PROMOTE=1 \
                             infra/gcp/deploy_backend.sh prod <sha>
 
           The shape pins on proof-issuer are not optional: deploy_backend.sh's own constants are
           WEB's connection budget, and an unpinned roll cuts proof-issuer from concurrency 80 /
-          maxScale 20 to 20 / 10 as a side effect. Scheduler triggers and Cloud Run Jobs are a
-          separate concern - that is still setup_scheduler.sh.
+          maxScale 20 to 20 / 10 as a side effect. CONFIG=preserve is not optional either: the
+          default, CONFIG=apply, rewrites env + secrets from env.prod.yaml / secrets.prod.list,
+          ported from a Railway that was decommissioned 2026-08-22 - a stale copy is how five
+          variables were wiped once. These lines are pinned to deploy-prod.yml's own
+          invocations by tests/test_drift_alarm_remediation_is_runnable.py; change both or
+          neither. Scheduler triggers and Cloud Run Jobs are a separate concern - that is
+          still setup_scheduler.sh.
           EOF
           exit 1
