@@ -163,12 +163,53 @@ def test_a_lone_candidate_is_kept_when_it_is_not_the_shop_blurb():
     assert bf.drop_shared_boilerplate({"pk1": real}, _BLURB) == {"pk1": real}
 
 
-def test_an_unavailable_shop_blurb_leaves_the_repetition_guard_armed():
-    """fetch_shop_description returns None on any failure. That must disarm only the comparison it
-    feeds, never the repetition rule beside it."""
+def test_an_unavailable_shop_blurb_still_drops_a_REPEATED_value():
+    """fetch_shop_description returns None on any failure. Mechanism 2 does not depend on it, so
+    repetition keeps working -- but a SINGLETON has nothing left checking it (next test)."""
     assert bf.drop_shared_boilerplate({"a": _BOGOS, "b": _BOGOS}, None) == {}
+
+
+def test_an_unavailable_shop_blurb_REFUSES_an_unrepeated_value():
+    """FAIL CLOSED. With no blurb to compare against, a value with no sibling is simply
+    uncheckable -- and this lane auto-publishes, so 'uncheckable' must mean refused. An earlier
+    version kept it, which let a homepage 403 silently re-open the hole."""
     real = "A watery lip tint that layers into a vivid stain without drying the lips out."
-    assert bf.drop_shared_boilerplate({"a": real}, None) == {"a": real}
+    assert bf.drop_shared_boilerplate({"a": real}, None) == {}
+    assert bf.drop_shared_boilerplate({"a": real}, _BLURB) == {"a": real}
+
+
+def test_one_product_behind_TWO_rows_is_not_mistaken_for_a_shared_string():
+    """The repetition unit is the PRODUCT PAGE, not the row. Two catalog rows can share one
+    canonical_url; they fetch the same PDP and get the same value, and counting rows would drop
+    both as 'shared' when it is one product represented twice."""
+    real = "A watery lip tint that layers into a vivid stain without drying the lips out."
+    kept = bf.drop_shared_boilerplate(
+        {"pk1": real, "pk2": real}, _BLURB, handles={"pk1": "same-handle", "pk2": "same-handle"})
+    assert kept == {"pk1": real, "pk2": real}
+
+    # ...and two DIFFERENT pages carrying it are still shared boilerplate.
+    assert bf.drop_shared_boilerplate(
+        {"pk1": real, "pk2": real}, _BLURB, handles={"pk1": "a", "pk2": "b"}) == {}
+
+
+def test_a_brand_plus_title_echo_is_dropped():
+    """MECHANISM 3, invisible to the other two: kyliecosmetics.com renders its name tag from a
+    template, "Kylie Cosmetics - {title}". Per-product so repetition never fires, not the shop
+    blurb so the comparison never fires, and admitted purely by whether the title is long enough
+    to clear the 50-char floor -- 2 of 3 accepted values on that storefront."""
+    echo = "Kylie Cosmetics - Glossy Pink Makeup Bag + Deluxe Samples"
+    kept = bf.drop_shared_boilerplate(
+        {"pk1": echo}, _BLURB, titles={"pk1": "Glossy Pink Makeup Bag + Deluxe Samples"})
+    assert kept == {}
+
+
+def test_a_real_description_that_merely_MENTIONS_the_title_survives():
+    """The echo rule must key on 'there is nothing here but the title', not on 'the title appears'
+    -- brand-authored copy routinely opens with the product's own name."""
+    title = "Glossy Pink Makeup Bag"
+    real = (f"The {title} is a compact vegan-leather pouch with a wipe-clean lining, sized for a "
+            "full brush set and a cushion compact.")
+    assert bf.drop_shared_boilerplate({"pk1": real}, _BLURB, titles={"pk1": title}) == {"pk1": real}
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +242,7 @@ def _row(pk, ck, handle):
     }
 
 
-def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=None):
+def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=_BLURB):
     """Drive run() against stubs, recording what each content_key was refreshed AS."""
     db = _FakeDB(rows)
     refreshed = {}
@@ -282,19 +323,145 @@ def test_the_call_site_honours_the_opt_in_not_just_the_helper(monkeypatch):
 def test_a_storefront_wide_blurb_never_reaches_the_database(monkeypatch):
     """END TO END, the defect this whole change exists to close: the shop blurb clears the 50-char
     floor, and `is_published_ready` auto-publishes this lane -- so an accepted blurb enters serving
-    as brand-official PRODUCT copy. It must not survive as far as an UPDATE."""
+    as brand-official PRODUCT copy.
+
+    ONE blurb candidate and ONE genuine candidate, deliberately DIFFERENT strings, so repetition
+    cannot fire and only the blurb comparison can explain the drop. An earlier version gave both
+    rows the same blurb; that made it a repetition test wearing a shop-blurb label, and a mutant
+    deleting the entire `_load_shop_blurb` call at the call site survived the whole suite.
+    """
     rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
     db, refreshed, _ = _harness(
         monkeypatch, rows,
         body_map={"h1": "tiny", "h2": "tiny"},
-        pdp={"h1": _BLURB, "h2": _BLURB},
+        pdp={"h1": _BLURB, "h2": _LONG_META},
         blurb=_BLURB,
     )
 
     assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
                               pdp_fallback=True)) == 0
 
-    assert db.updates == [], "the shop blurb was written as a product description"
+    written = [u["product_key"] for u in db.updates]
+    assert written == ["pk2"], f"expected only the genuine row to be written, got {written}"
+    assert _BLURB not in " ".join(str(u) for u in db.updates)
+    assert refreshed == {"ck2": bf.REFRESH_SOURCE_PDP_META}
+
+
+def test_an_unavailable_shop_blurb_refuses_an_unrepeated_candidate(monkeypatch):
+    """FAIL CLOSED. `fetch_shop_description` swallows every failure into None, so a homepage 403
+    disarms mechanism 1 -- and a lone candidate then has NOTHING checking it. Letting it through
+    silently re-opens the hole this change exists to close, printing `boilerplate=0` as though
+    nothing had happened."""
+    rows = [_row("pk1", "ck1", "h1")]
+    db, refreshed, _ = _harness(
+        monkeypatch, rows, body_map={"h1": "tiny"}, pdp={"h1": _BLURB}, blurb=None)
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    assert db.updates == [], "an uncheckable candidate must not be written"
     assert refreshed == {}
-    written = " ".join(str(u) for u in db.updates)
-    assert "JUNGSAEMMOOL" not in written
+
+
+def test_the_blurb_fetch_is_retried_before_it_is_believed(monkeypatch):
+    """`_load_body_map` retries 3x precisely because this module's fetches swallow errors into a
+    falsy value. The blurb fetch has the identical swallow and the failure is in the DANGEROUS
+    direction, so it retries too -- otherwise one transient 503 refuses a whole domain."""
+    calls = []
+
+    async def _flaky(domain, **k):
+        calls.append(domain)
+        return _BLURB if len(calls) >= 2 else None
+
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(bf, "fetch_shop_description", _flaky)
+    monkeypatch.setattr(bf.asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))
+
+    assert asyncio.run(bf._load_shop_blurb("jsmbeauty.sg")) == _BLURB
+    assert len(calls) == 2, "a transient failure must not be taken as 'no blurb'"
+
+
+def test_a_truncated_feed_skips_the_fallback_rather_than_judging_half_a_storefront(monkeypatch):
+    """NON-DETERMINISM, proven on real data: the same 24 jsmbeauty.sg candidates kept 13 as one
+    batch and 15 as two, and the string that survived the split was a shared one. The census votes
+    on whatever it is handed, so a storefront sliced by --max-products gets a verdict that depends
+    on the cut -- in the direction that WRITES."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+    db, _, fetched = _harness(
+        monkeypatch, rows,
+        body_map={"h1": "tiny", "h2": "tiny"},
+        pdp={"h1": _LONG_META, "h2": _LONG_META + " Distinct."},
+        blurb=_BLURB,
+    )
+
+    # body_map has 2 entries and the cap is 2 -- indistinguishable from a truncated feed.
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=2,
+                              pdp_fallback=True)) == 0
+
+    assert fetched == [], "a partial storefront must not be judged, nor crawled"
+    assert db.updates == []
+
+
+@pytest.mark.parametrize("order", [["pdp", "body"], ["body", "pdp"]])
+def test_two_rows_behind_ONE_content_key_are_marked_if_EITHER_came_from_the_pdp(monkeypatch, order):
+    """Several product_keys can share a content_key, and the view is refreshed once per KEY. If
+    any contributing row carries PDP meta copy the marker must say so -- OR, never overwrite.
+
+    PARAMETRISED ON ORDER, and that is the whole test. With the PDP row written LAST, plain
+    assignment reaches the same answer as the OR, so a single ordering cannot tell them apart --
+    a mutant replacing `or` with `=` survived my first attempt at this test for exactly that
+    reason. It is the PDP-row-FIRST case where a later body row would erase the marker.
+    """
+    _h = {"body": ("pk-body", "h-body"), "pdp": ("pk-pdp", "h-pdp")}
+    rows = [_row(_h[k][0], "CK", _h[k][1]) for k in order]
+    _, refreshed, _ = _harness(
+        monkeypatch, rows,
+        body_map={"h-body": _LONG_BODY, "h-pdp": "tiny"},
+        pdp={"h-pdp": _LONG_META},
+        blurb=_BLURB,
+    )
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    assert refreshed == {"CK": bf.REFRESH_SOURCE_PDP_META}, \
+        "a body row must not erase a sibling's PDP-meta provenance"
+
+
+def test_the_boilerplate_drop_is_counted_not_just_performed(monkeypatch):
+    """The operator reads these counters to decide whether a run did what they asked. A silent
+    drop is indistinguishable from a storefront that simply had nothing to fill."""
+    rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
+    db, _, _ = _harness(
+        monkeypatch, rows,
+        body_map={"h1": "tiny", "h2": "tiny"},
+        pdp={"h1": _BOGOS, "h2": _BOGOS},
+        blurb=_BLURB,
+    )
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    done = [ln for ln in printed if ln.startswith("[done]")]
+    assert done and "'boilerplate': 2" in done[0], done
+    assert db.updates == []
+
+
+def test_the_title_echo_threshold_keeps_its_margin_on_both_sides():
+    """PINS THE NUMBER, so a later edit has to argue with the measurement rather than nudge it.
+
+    Observed echoes leave 5-15 characters once the title is removed; observed genuine copy leaves
+    76-101. The threshold sits in that gap. It is deliberately not raised to catch every template
+    imaginable: a longer SEO scaffold leaves 36 and is knowingly missed, because tuning to an
+    unobserved case is how the previous guard overfitted, and because genuine copy just over the
+    50-char floor leaves only about `50 - len(title)`.
+    """
+    title = "Glossy Pink Makeup Bag"
+    assert bf._is_title_echo(f"Kylie Cosmetics - {title}", title) is True
+    assert bf._is_title_echo(
+        f"The {title} is a compact vegan-leather pouch with a wipe-clean lining.", title) is False
+    # The knowingly-missed family, asserted as MISSED so the gap is visible, not forgotten.
+    assert bf._is_title_echo(f"Buy {title} online at JUNGSAEMMOOL Singapore", title) is False
+    assert bf._is_title_echo("Anything at all", None) is False, "no title means no signal"

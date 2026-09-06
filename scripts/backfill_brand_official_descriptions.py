@@ -162,44 +162,129 @@ def _norm_copy(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
+async def _load_shop_blurb(domain: str, attempts: int = 3) -> Optional[str]:
+    """The storefront's blurb, retried like `_load_body_map` and for the same reason.
+
+    `fetch_shop_description` swallows every failure into None, exactly as `fetch_shopify_products`
+    does -- and `_load_body_map` already retries 3x because a transient failure there silently
+    marks a whole domain 'not_in_feed'. Here the silent failure is in the DANGEROUS direction: an
+    unavailable blurb disarms mechanism 1, and the counters would print `boilerplate=0` as though
+    nothing had happened. Retry first; `drop_shared_boilerplate` handles a genuine absence.
+    """
+    for attempt in range(1, attempts + 1):
+        blurb = await fetch_shop_description(domain)
+        if blurb:
+            return blurb
+        if attempt < attempts:
+            await asyncio.sleep(0.5 * attempt)
+    return None
+
+
+# A candidate whose only content beyond the product's own title is this much or less is a
+# title echo, not a description. "Kylie Cosmetics - Glossy Pink Makeup Bag + Deluxe Samples"
+# leaves "kylie cosmetics" (15 chars) once the title is removed.
+_ECHO_REMAINDER_MIN = 30
+
+
+def _is_title_echo(value: str, title: Optional[str]) -> bool:
+    """Is this value just the product's title with a brand name bolted on?
+
+    THE THIRD BOILERPLATE FAMILY, and the one both other mechanisms are blind to. kyliecosmetics
+    .com renders its name tag from a template, `"Kylie Cosmetics - {title}"`. That is PER-PRODUCT,
+    so repetition never fires, and it is not the shop blurb, so the comparison never fires -- yet
+    it carries zero product information and is admitted or refused purely by whether the title is
+    long enough to clear the 50-char floor (2 of 3 accepted values on that storefront; 34 chars
+    saved a third by accident). Auto-published as brand-official copy.
+
+    THE THRESHOLD IS A MARGIN, NOT A TUNING. Measured remainders: observed echoes leave 5-15
+    characters once the title is removed, observed genuine copy leaves 76-101. 30 sits in that gap
+    with room on both sides, and is deliberately NOT raised to catch every template I can imagine
+    -- a longer SEO scaffold such as "Buy {title} online at {brand} {country}" leaves 36 and is
+    MISSED. That family was not observed in the 2026-09-06 sweep, and fitting the number to a case
+    I invented rather than measured is how the previous version of this guard went wrong. Raising
+    it also costs real copy: genuine text only just over the 50-char floor leaves roughly
+    `50 - len(title)`, so a high threshold starts refusing short descriptions of long-named
+    products.
+    """
+    if not title:
+        return False
+    v, t = _norm_copy(value), _norm_copy(title)
+    if not t or t not in v:
+        return False
+    remainder = re.sub(r"[^a-z0-9]+", " ", v.replace(t, " ")).strip()
+    return len(remainder) < _ECHO_REMAINDER_MIN
+
+
 def drop_shared_boilerplate(
-    candidates: Dict[str, str], shop_blurb: Optional[str] = None
+    candidates: Dict[str, str],
+    shop_blurb: Optional[str] = None,
+    *,
+    handles: Optional[Dict[str, str]] = None,
+    titles: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """Keep only the PDP meta descriptions that are about ONE product. Pure; no I/O.
 
     WHY A WHOLE-DOMAIN DECISION. Body copy from /products.json is per-product by construction.
-    PDP meta copy is not: two different mechanisms put the same string on many PDPs at once, and
-    neither is detectable in a single page's markup.
+    PDP meta copy is not: several mechanisms put the same string on many PDPs at once, and none of
+    them is detectable in a single page's markup.
 
       1. THE SHOP BLURB. A theme renders og:description as
          `page_description | default: shop.description`, so a product with no SEO description
          serves the storefront's own blurb. Caught by exact comparison against
-         `fetch_shop_description`.
-      2. APP-VENDOR TEXT. Apps write operational strings into the name tag —
+         `fetch_shop_description`. LOAD-BEARING and not redundant with (2): measured 2026-09-06,
+         jsmbeauty.sg's `artist-eyelash-ampoule-serum` served the blurb as the ONLY product in its
+         batch to do so, and repetition could not see it.
+      2. APP-VENDOR TEXT. Apps write operational strings into the name tag --
          "This product is used for the app BOGOS.io ... Please do not delete/edit it". 231
-         characters, comfortably over the floor, and on 5 of 5 sampled jsmbeauty.sg products.
-         No shop-blurb comparison can catch it; repetition can.
+         characters, over the floor, on 20+ `gwp-*_freegift` products of jsmbeauty.sg. No
+         shop-blurb comparison reaches it; repetition does.
+      3. A TITLE ECHO from a themed name-tag template -- see `_is_title_echo`. Per-product, not
+         the blurb, invisible to both of the above.
 
-    So the rule is repetition itself: a value that is byte-identical (modulo case and
-    whitespace) to ANOTHER product's on the same storefront is not that product's description,
-    whatever produced it. Measured over 59 accepted values on 10 storefronts 2026-09-06, 19
-    (32%) were shared with a sibling.
+    THE REPETITION UNIT IS THE PRODUCT PAGE, NOT THE ROW. Two catalog rows can share one
+    canonical_url; they fetch the same PDP and produce the same value, and counting rows would
+    drop both as "shared" when it is one product represented twice. `handles` supplies the
+    identity to count by.
 
-    Dropping is the SAFE direction. A rejected row keeps its existing description and stays
-    blocked — exactly where it was — and routes to the LLM enrichment lane, whereas a false
-    ACCEPT auto-publishes boilerplate as brand-official copy (`is_published_ready`). A genuine
-    description shared verbatim by two products is a false reject we take knowingly.
+    AN UNAVAILABLE BLURB DISARMS THE FALLBACK FOR SINGLETONS, rather than letting them through.
+    With `shop_blurb=None` mechanism 1 is off, so a value with no sibling has nothing checking it
+    at all -- and a homepage 403 would silently re-open exactly the hole this exists to close.
 
-    A single candidate for a domain has no repetition signal; only the shop-blurb comparison
-    guards it, which is why that fetch is worth its one request.
+    MEASURED COST, because "the safe direction" is not the same as "free". Over 39 candidates on
+    7 storefronts (2026-09-06), 21 were dropped and 4 of those were genuine per-product copy
+    shared by a sibling -- 10% of candidates, and 17% on jsmbeauty.sg, the storefront this lane
+    exists for. Two eyeshadow palettes share family copy; a merchant copy-pasted one brush kit's
+    description onto another, and the second kit's own real copy is lost with it. We take that
+    knowingly: a rejected row keeps its description and stays blocked exactly where it was, and
+    routes to the LLM enrichment lane, whereas a false ACCEPT auto-publishes boilerplate as
+    brand-official copy (`is_published_ready`).
+
+    KNOWN LIMIT, not closed here: the census covers the candidates of THIS run. The population
+    query excludes rows already at >= 50 chars, so if another lane fills one member of a shared
+    pair, the survivor becomes a singleton in a later run and only mechanism 1 still guards it.
+    A stable verdict across runs needs a persisted per-domain ledger of rejected values.
     """
-    counts = Counter(_norm_copy(v) for v in candidates.values())
+    handles = handles or {}
+    titles = titles or {}
+    # Count DISTINCT product pages per value, so one product behind two rows is not "shared".
+    seen: Dict[str, set] = {}
+    for pk, v in candidates.items():
+        seen.setdefault(_norm_copy(v), set()).add(handles.get(pk, pk))
     blurb = _norm_copy(shop_blurb)
-    return {
-        pk: v
-        for pk, v in candidates.items()
-        if counts[_norm_copy(v)] == 1 and not (blurb and _norm_copy(v) == blurb)
-    }
+
+    kept = {}
+    for pk, v in candidates.items():
+        n = _norm_copy(v)
+        if len(seen[n]) > 1:                       # (2) shared across product pages
+            continue
+        if blurb and n == blurb:                   # (1) the storefront's own blurb
+            continue
+        if not blurb:                              # (1) unavailable -> nothing guards a singleton
+            continue
+        if _is_title_echo(v, titles.get(pk)):      # (3) the title with a brand bolted on
+            continue
+        kept[pk] = v
+    return kept
 
 
 async def resolve_description(
@@ -274,7 +359,8 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
           f"across {len(by_domain)} domain(s)  (apply={apply})")
 
     totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0, "from_pdp": 0,
-              "not_in_feed": 0, "boilerplate": 0, "update_failed": 0, "refresh_failed": 0}
+              "not_in_feed": 0, "boilerplate": 0, "blurb_unavailable": 0,
+              "update_failed": 0, "refresh_failed": 0}
     # content_key -> did ANY row behind it come from PDP meta. A flat list cannot carry this:
     # the refresh runs in its own loop below, and an earlier version read a LEAKED `r` from the
     # fill loop there, stamping every key with the last row of the last domain's provenance.
@@ -291,13 +377,24 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
         # (drop_shared_boilerplate). So both take the same two-pass route.
         resolved: Dict[str, str] = {}    # product_key -> body copy
         candidates: Dict[str, str] = {}  # product_key -> PDP meta copy, still suspect
+        # A TRUNCATED FEED MAKES THE CENSUS NON-DETERMINISTIC. `drop_shared_boilerplate` votes on
+        # the candidates it is given, so a storefront split by --max-products is judged in halves:
+        # measured on jsmbeauty.sg 2026-09-06, the same 24 candidates kept 13 as one batch and 15
+        # as two, and the string that survived the split was a shared one. Rather than write a
+        # verdict that depends on the cut, refuse the fallback for this domain and say so.
+        domain_pdp_fallback = pdp_fallback
+        if pdp_fallback and len(body_map) >= max_products:
+            print(f"  WARN {domain}: feed hit the --max-products cap ({max_products}) — the "
+                  f"boilerplate census would cover only part of the storefront, so the PDP "
+                  f"fallback is skipped here. Re-run with a higher --max-products.")
+            domain_pdp_fallback = False
         for r in drows:
             body = body_map.get(r["_handle"])
             if body is None:
                 not_in_feed += 1
                 continue
             body, from_pdp_row = await resolve_description(
-                body, domain, r["_handle"], pdp_fallback=pdp_fallback
+                body, domain, r["_handle"], pdp_fallback=domain_pdp_fallback
             )
             if body is None:
                 no_body += 1
@@ -305,7 +402,18 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
             (candidates if from_pdp_row else resolved)[str(r["product_key"])] = body
 
         if candidates:
-            kept = drop_shared_boilerplate(candidates, await fetch_shop_description(domain))
+            blurb = await _load_shop_blurb(domain)
+            if not blurb:
+                # Not a warning to skim past: with mechanism 1 off, every singleton candidate is
+                # dropped below, so this line explains a sudden `boilerplate` spike.
+                print(f"  WARN {domain}: shop blurb unavailable — the blurb comparison is "
+                      f"disarmed and unrepeated candidates will be refused")
+                totals["blurb_unavailable"] += 1
+            kept = drop_shared_boilerplate(
+                candidates, blurb,
+                handles={str(r["product_key"]): r["_handle"] for r in drows},
+                titles={str(r["product_key"]): r.get("title") for r in drows},
+            )
             boilerplate = len(candidates) - len(kept)
             totals["boilerplate"] += boilerplate
             candidates = kept
