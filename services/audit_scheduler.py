@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from typing import Optional
 
@@ -1254,9 +1255,14 @@ async def restart_scheduler() -> dict:
 # SMALL ON PURPOSE, and the ceiling is not ours to choose: Cloud Run sends SIGTERM and then
 # kills the container, and uvicorn is started with no --timeout-graceful-shutdown, so it waits
 # on this lifespan indefinitely. Overrun the platform's grace and the process is SIGKILLed
-# MID-DRAIN — which skips the rest of main.shutdown_event, including `database.disconnect()`.
-# Losing the connection teardown to save a job is a strictly worse trade than cancelling the
-# job, so this stays well inside any plausible grace and leaves room for the rest of shutdown.
+# MID-DRAIN, before `database.disconnect()` has run -- losing the connection teardown to save a
+# job is a strictly worse trade than cancelling the job.
+#
+# That sentence is only true because main.app_lifespan now calls shutdown_event() BEFORE
+# shutdown(); when it was the other way round the pool was already closed by the time this
+# ran, so the drain could not let a DB-touching job finish at all -- it just gave it a few
+# seconds to fail its recording write. If that ordering is ever reverted, this budget argument
+# stops holding and so does the drain.
 # Set SCHEDULER_DRAIN_SECONDS=0 to restore the previous cancel-immediately behaviour.
 _DRAIN_DEFAULT_SECONDS = 5.0
 # An absolute ceiling on what the env var may ask for. Not a tuning limit — a blast-radius
@@ -1287,6 +1293,17 @@ def _read_drain_seconds() -> float:
         logger.warning(
             "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a number - using the "
             "default %.1fs. Set 0 to disable the shutdown drain.", raw, _DRAIN_DEFAULT_SECONDS,
+        )
+        return _DRAIN_DEFAULT_SECONDS
+    # NON-FINITE FIRST, because the comparisons below cannot reject them: `nan <= 0` is
+    # False AND `nan > _DRAIN_MAX_SECONDS` is False, so a value of `nan` would fall straight
+    # through both guards and reach `asyncio.wait(timeout=nan)`, which never fires — shutdown
+    # hangs until the platform kills the container. `inf` is caught by the ceiling below, but
+    # is rejected here too so the reason in the log is the true one.
+    if not math.isfinite(value):
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a finite number - using the "
+            "default %.1fs.", raw, _DRAIN_DEFAULT_SECONDS,
         )
         return _DRAIN_DEFAULT_SECONDS
     if value <= 0:

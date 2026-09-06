@@ -433,6 +433,11 @@ def active_tasks() -> set:
     missed its deadline and refused to unwind, so waiting on one would burn the whole
     drain budget on the single task least likely to finish — and it has already been
     accounted for, logged, and had its DB connection terminated.
+
+    NOT excluded, and worth knowing: a run that has passed its deadline and is inside its
+    cancel-grace window is still in `active` (run_isolated pops it only in `_finish`), so
+    the drain can spend some of its budget on a task that is already being abandoned. It is
+    bounded by the drain timeout, so this costs time and never correctness.
     """
     out = set()
     for st in _REGISTRY.values():

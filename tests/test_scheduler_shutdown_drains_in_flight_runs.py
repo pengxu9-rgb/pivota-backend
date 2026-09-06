@@ -77,6 +77,50 @@ def test_the_wait_argument_is_a_no_op_for_this_scheduler():
     )
 
 
+# ── the ordering the drain depends on ─────────────────────────────────────────────────
+
+
+def test_the_scheduler_is_stopped_before_the_database_is_disconnected():
+    """A DRAIN AFTER `database.disconnect()` IS WORSE THAN NO DRAIN, which is how this
+    shipped until review caught it.
+
+    `shutdown()` is `database.disconnect()`; `shutdown_event()` stops the scheduler. With the
+    disconnect first, `PostgresConnection.acquire` asserts "DatabaseBackend is not running",
+    so a run that had already made its external call (settlement, refund) failed its RECORDING
+    write instead of completing — and the drain handed it seconds of extra life in which to
+    reach its own end and be booked `ok`. A silent half-completed run on the money path, where
+    the previous behaviour was a prompt cancel.
+
+    Asserted on the source of `app_lifespan` rather than by executing it: the lifespan boots
+    the whole application, and the fact under test is a two-line ordering.
+    """
+    import inspect
+    import main as main_mod
+
+    src = inspect.getsource(main_mod.app_lifespan)
+    body = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    ev, sd = body.find("await shutdown_event()"), body.find("await shutdown()")
+    assert ev != -1 and sd != -1, f"app_lifespan no longer calls both:\n{body[-800:]}"
+    assert ev < sd, (
+        "app_lifespan calls `shutdown()` (database.disconnect) BEFORE `shutdown_event()` "
+        "(stop_scheduler). The scheduler drain then runs against a closed pool: jobs cannot "
+        "finish, they fail their recording writes, and the drain merely delays the failure."
+    )
+
+
+def test_the_disconnect_still_happens_if_the_drain_is_cancelled():
+    """`stop_scheduler` now contains an await, so a CancelledError can land inside it. An
+    `except Exception` does not catch that, so without a `finally` the disconnect would be
+    skipped entirely and the pool left open."""
+    import inspect
+    import main as main_mod
+
+    src = inspect.getsource(main_mod.shutdown_event)
+    assert "finally:" in src and src.index("finally:") < src.index("database.disconnect()"), (
+        f"shutdown_event does not guarantee the disconnect after stop_scheduler:\n{src}"
+    )
+
+
 # ── the configured default, which every case above monkeypatches away ─────────────────
 
 
@@ -103,6 +147,13 @@ def test_the_shipped_default_is_sane():
         ("3600", 8.0, "clamped: past the ceiling loses database.disconnect()"),
         ("5s", 5.0, "A TYPO MUST NOT RAISE - see the docstring; it used to"),
         ("abc", 5.0, "nor any other non-number"),
+        # NON-FINITE: `float()` accepts all three, and neither `<= 0` nor `> ceiling` can
+        # reject nan (both comparisons are False), so it would reach asyncio.wait as a nan
+        # timeout - which never fires. Shutdown hangs until the platform kills the container.
+        ("nan", 5.0, "nan slips BOTH numeric guards and hangs asyncio.wait"),
+        ("NaN", 5.0, "and float() is case-insensitive about it"),
+        ("inf", 5.0, "infinite is not a timeout"),
+        ("1e400", 5.0, "overflows to inf on the way in"),
     ],
 )
 def test_the_env_var_can_never_break_the_import(monkeypatch, raw, expected, why):
