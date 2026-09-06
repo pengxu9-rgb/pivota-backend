@@ -614,6 +614,170 @@ def inci_from_pdp_html(page_html: Optional[str]) -> Optional[str]:
     return _pdp_collapse_shades(survivors)
 
 
+_META_DESC_RE = re.compile(
+    r"<meta\b[^>]*>",
+    re.I,
+)
+
+
+def description_from_pdp_html(raw_html: str) -> Optional[str]:
+    """Brand-authored copy from a PDP's own meta description, or None.
+
+    WHY THIS EXISTS. `backfill_brand_official_descriptions` takes body copy from
+    `/products.json` body_html, and some storefronts publish none — measured on jsmbeauty.sg
+    2026-09-06: 158 of 232 products carry under 50 characters of body_html TEXT (LIP-PRESSION
+    Glowy Tint's 123 characters of markup render to zero), so the whole cohort failed the 50-char
+    floor. The copy is not missing from the site, only from that field: the same PDP serves 190
+    characters of real prose in its meta description.
+
+    PREFERS `name="description"`, NOT og. The og tag is frequently theme-generated; the name tag
+    is the per-product SEO field a merchant fills. Measured on kyliecosmetics.com: og carried the
+    STORE blurb while name carried the product's own line, so preferring og took the strictly
+    worse string.
+
+    BOILERPLATE IS NOT REJECTED HERE, and deliberately so. A theme with no per-product SEO
+    description substitutes the SHOP blurb (`page_description | default: shop.description`), and
+    app vendors write operational text into the name tag; both clear the 50-char floor with zero
+    product information, and both are worse than staying blocked, because `is_published_ready`
+    auto-publishes this lane. But neither is visible in ONE page's markup — the tell is that the
+    value REPEATS across the storefront, or equals the shop's own blurb. That needs the whole
+    domain, so it lives in the caller (`backfill_brand_official_descriptions.
+    drop_shared_boilerplate`), against `fetch_shop_description` below.
+
+    An earlier version of this function keyed on a PRESENT-BUT-EMPTY name tag. That is a THEME
+    detail, not the substitution mechanism: Dawn-family themes wrap the name tag in
+    `{% if page_description %}` and so OMIT it entirely. A 60-PDP sweep across 10 storefronts
+    (2026-09-06) found the shop blurb served under an ABSENT name tag 9 times and under a
+    present-but-empty one 0 times — the rule fired only on the single storefront it was derived
+    from, and three parser paths (a raw `>` inside the value, a `content`-less tag, an unquoted
+    value) silently disabled it even there.
+
+    Returns None when there is nothing trustworthy — never a partial and never a guess.
+    """
+    if not raw_html:
+        return None
+
+    og: Optional[str] = None
+    name: Optional[str] = None
+
+    for tag in _META_DESC_RE.findall(raw_html)[:400]:
+        key = ""
+        for attr in ("property", "name"):
+            m = re.search(rf'{attr}\s*=\s*"([^"]+)"', tag, re.I) or re.search(
+                rf"{attr}\s*=\s*'([^']+)'", tag, re.I
+            )
+            if m:
+                key = m.group(1).strip().lower()
+                break
+        if key not in ("og:description", "description"):
+            continue
+        # MATCH THE OPENING DELIMITER. A character class of both quotes ends the capture at the
+        # first apostrophe inside a double-quoted attribute — measured live on kyliecosmetics.com,
+        # an 88-character sentence truncated to 25 at "that's", which still cleared the 50-char
+        # floor as a mid-sentence fragment. Raw apostrophes are ubiquitous in this copy.
+        m = re.search(r'content\s*=\s*"([^"]*)"', tag, re.I | re.S) or re.search(
+            r"content\s*=\s*'([^']*)'", tag, re.I | re.S
+        )
+        if not m:
+            continue
+        value = re.sub(r"\s+", " ", html.unescape(m.group(1))).strip()
+        if key == "description":
+            name = name or (value or None)
+        elif og is None and value:
+            og = value
+
+    if name:
+        return name
+    return og
+
+
+async def fetch_pdp_description(
+    domain: str,
+    handle: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout_s: float = 15.0,
+) -> Optional[str]:
+    """Fetch one brand PDP and recover its meta description.
+
+    Deliberately the same shape as `fetch_pdp_inci` beside it, including gating BOTH branches:
+    the caller-supplied-client branch is the one a batch loop uses, so gating only the standalone
+    branch would leave the high-volume path unpaced. Any failure returns None — a brand site
+    hiccup must never fabricate copy or raise into a backfill loop.
+    """
+    host = _clean_domain(domain)
+    handle = str(handle or "").strip().strip("/")
+    if not host or not handle:
+        return None
+    url = f"https://{host}/products/{handle}"
+    timeout = httpx.Timeout(timeout_s, connect=5.0)
+    headers = {"User-Agent": _UA, "Accept": "text/html"}
+    try:
+        await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+        if client is not None:
+            resp = await client.get(url)
+        else:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as c:
+                resp = await c.get(url)
+        crawl_politeness.note_response(
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        )
+        if resp.status_code != 200:
+            return None
+        return description_from_pdp_html(resp.text)
+    except Exception as exc:  # noqa: BLE001 — a brand PDP being down must not break the batch
+        logger.debug("fetch_pdp_description failed for %s/%s: %s", host, handle, str(exc)[:160])
+        return None
+
+
+async def fetch_shop_description(
+    domain: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout_s: float = 15.0,
+) -> Optional[str]:
+    """The storefront's OWN blurb, from its homepage meta description, or None.
+
+    NOT product copy — the opposite of it, and that is the point. A Shopify theme renders
+    og:description as `page_description | default: shop.description`, so every product without an
+    SEO description serves THIS string on its PDP: over the 50-char floor, identical across the
+    storefront, and carrying no product information. Measured 2026-09-06, it reached
+    `description_from_pdp_html` unchallenged on 9 of 60 PDPs across cosrx.com, mixsoon.us and
+    medicube.us.
+
+    Fetching it once per domain turns "is this the shop blurb?" from a guess about the theme's
+    markup into an exact string comparison against the blurb itself — the substitution mechanism,
+    not a symptom of it. One request per domain, gated like every other call in this module.
+    Returns None on any failure, which simply leaves the comparison unarmed.
+    """
+    host = _clean_domain(domain)
+    if not host:
+        return None
+    url = f"https://{host}/"
+    timeout = httpx.Timeout(timeout_s, connect=5.0)
+    headers = {"User-Agent": _UA, "Accept": "text/html"}
+    try:
+        await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+        if client is not None:
+            resp = await client.get(url)
+        else:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as c:
+                resp = await c.get(url)
+        crawl_politeness.note_response(
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        )
+        if resp.status_code != 200:
+            return None
+        return description_from_pdp_html(resp.text)
+    except Exception as exc:  # noqa: BLE001 — a homepage being down must not break the batch
+        logger.debug("fetch_shop_description failed for %s: %s", host, str(exc)[:160])
+        return None
+
+
 async def fetch_pdp_inci(
     domain: str,
     handle: str,

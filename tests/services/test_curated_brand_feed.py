@@ -1260,3 +1260,168 @@ def test_a_real_shade_is_still_published(shade):
         shade_titles=[shade],
     )
     assert by_title[shade] == "Color"
+
+
+# -- PDP meta description fallback ---------------------------------------------------------------
+# 158 of jsmbeauty.sg's 232 products publish under 50 chars of body_html TEXT (LIP-PRESSION Glowy
+# Tint: 123 chars of markup rendering to zero), so the whole cohort failed the 50-char floor and
+# stayed blocked -- while the same PDPs serve 150-340 chars in og:description. The copy was never
+# missing from the site, only from the field the backfill read.
+
+
+def test_the_pdp_meta_description_is_recovered():
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <html><head>
+        <meta property="og:description" content="A lip tint that gives off a watery glow." />
+      </head><body>x</body></html>
+    """
+    assert description_from_pdp_html(page) == "A lip tint that gives off a watery glow."
+
+
+def test_the_per_product_name_tag_wins_over_the_theme_generated_og_one():
+    """og is NOT the richer copy, which an earlier version of this asserted.
+
+    The og tag is frequently theme-generated; `name="description"` is the per-product SEO field a
+    merchant fills. Measured live on kyliecosmetics.com: og carried the STORE blurb while name
+    carried the product's own line, so preferring og took the strictly worse string on a real page.
+
+    This asserts the PREFERENCE only. The name value here is a thin brand+title echo, and calling
+    it good copy would over-claim -- but it is at least about this product, where the og value is
+    about the shop. Storefront-wide strings that reach the name tag (an app vendor's operational
+    text, say) are dropped downstream by repetition, not here.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <meta property="og:description" content="Shop award-winning makeup and skincare.">
+      <meta name="description" content="Kylie Cosmetics - Glossy Pink Makeup Bag + Samples">
+    """
+    assert description_from_pdp_html(page) == "Kylie Cosmetics - Glossy Pink Makeup Bag + Samples"
+
+
+def test_the_parser_does_NOT_try_to_recognise_the_shops_blurb_by_itself():
+    """The boilerplate decision is NOT a property of one page, and an earlier version of this
+    file asserted that it was.
+
+    That version keyed on a PRESENT-BUT-EMPTY `name="description"`, because on jsmbeauty.sg every
+    boilerplate page carried one. It is a THEME detail, not the substitution mechanism: Dawn-family
+    themes wrap the name tag in `{% if page_description %}` and OMIT it, so a 60-PDP sweep across
+    10 storefronts (2026-09-06) found the shop blurb served under an ABSENT name tag 9 times
+    (cosrx.com, mixsoon.us, medicube.us) and under a present-but-empty one 0 times outside the one
+    storefront the rule came from. The guard fired only where it was born.
+
+    So the parser now reports what the page says, and `drop_shared_boilerplate` decides — with the
+    whole domain and the shop's own blurb in hand. Here that means the og value comes back, and it
+    is the CALLER's job to throw it away.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <meta name="description" content="">
+      <meta property="og:description" content="Discover JUNGSAEMMOOL, the epitome of Korean
+      makeup and cosmetic products, blending artistry with skincare for every day.">
+    """
+    out = description_from_pdp_html(page)
+    assert out is not None and out.startswith("Discover JUNGSAEMMOOL")
+
+
+def test_an_ABSENT_name_tag_is_not_the_same_signal_as_an_empty_one():
+    """A theme that emits no name tag at all is the COMMON case (Dawn-family), not a special one,
+    and its og value is read normally. Whether that value is this product's copy or the shop's
+    blurb is settled downstream by comparison, not here."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta property="og:description" content="A lip tint with a watery glow and vivid colour.">'
+    assert description_from_pdp_html(page) == "A lip tint with a watery glow and vivid colour."
+
+
+def test_an_apostrophe_inside_a_double_quoted_attribute_does_not_truncate():
+    """The capture must match the OPENING delimiter. A character class of both quotes ends at the
+    first apostrophe inside a double-quoted attribute -- measured live on kyliecosmetics.com, an
+    88-character sentence truncated to 25 at "that's", which still cleared the 50-char floor and
+    was written as a mid-sentence fragment. Raw apostrophes are ubiquitous in this copy, and the
+    earlier entity test only covered the ones a theme had already escaped.
+    """
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = ("<meta property=\"og:description\" content=\"Clean vegan skincare that's "
+            "dermatologist-tested and cruelty-free for every skin type.\">")
+    out = description_from_pdp_html(page)
+    assert out == "Clean vegan skincare that's dermatologist-tested and cruelty-free for every skin type."
+    assert not out.endswith("that"), "truncated at the apostrophe"
+
+
+def test_a_single_quoted_content_attribute_still_parses():
+    """The mirror case: matching only double quotes would drop these entirely."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = "<meta property='og:description' content='A tint with a glassy, watery finish.'>"
+    assert description_from_pdp_html(page) == "A tint with a glassy, watery finish."
+
+
+def test_the_plain_description_is_used_when_there_is_no_og_one():
+    from services.curated_brand_feed import description_from_pdp_html
+
+    assert description_from_pdp_html('<meta name="description" content="Only this one.">') \
+        == "Only this one."
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        "",
+        "<html><head><title>no meta at all</title></head></html>",
+        '<meta property="og:description" content="">',
+        '<meta property="og:description" content="   ">',
+        '<meta property="og:image" content="https://x/i.jpg">',      # a meta tag, wrong key
+        '<meta name="keywords" content="lip, tint, glow">',
+    ],
+)
+def test_nothing_usable_returns_None_rather_than_a_guess(page):
+    """None, never a partial. The caller treats a short string as 'no copy' and leaves the row
+    honestly blocked; inventing something here would publish copy nobody wrote."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    assert description_from_pdp_html(page) is None
+
+
+def test_attribute_order_and_entities_are_handled():
+    """Real themes put `content` before `property`, and the copy is HTML-escaped. A regex that
+    assumes the order, or forgets to unescape, silently drops or mangles real descriptions."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta content="Glass &amp; glow &#8212; non-sticky" property="og:description">'
+    assert description_from_pdp_html(page) == "Glass & glow — non-sticky"
+
+
+def test_whitespace_is_collapsed_so_the_length_floor_measures_words():
+    """The gate compares LENGTH against 50, so a description padded with newlines would pass the
+    floor while carrying almost no copy."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta property="og:description" content="A   lip\n\n  tint.">'
+    assert description_from_pdp_html(page) == "A lip tint."
+
+
+@pytest.mark.live_locale
+@pytest.mark.asyncio
+async def test_a_pdp_that_is_down_yields_None_and_never_raises(monkeypatch):
+    """It runs inside a backfill loop over hundreds of rows; one dead PDP must not end the batch."""
+    import httpx
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
+    _silence_politeness(monkeypatch)
+
+    assert await cbf.fetch_pdp_description("jsmbeauty.sg", "lip-pression-glowy-tint") is None
