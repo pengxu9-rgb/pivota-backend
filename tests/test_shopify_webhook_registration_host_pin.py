@@ -21,10 +21,20 @@ WHAT IS AND IS NOT PINNED, because the distinction is the whole design:
     `{domain}/admin/oauth/access_token` before that. THAT one is pinned, and pinned above the
     resolver, which previously received the raw column.
 
-REAL SOCKETS: a listening socket counts connection attempts whatever HTTP client made them, so
-these cannot be satisfied later by swapping clients. Bound on `::` -- a v4-only bind cannot observe
-a dial to `[::1]`, it just gets ECONNREFUSED, so an IPv6 case would assert `count == 0` against code
-that connected perfectly well.
+REAL SOCKETS, AND WHERE THEY DO AND DO NOT CARRY THE KILL. A listening socket counts connection
+attempts whatever HTTP client made them, so these cannot be satisfied later by swapping clients.
+Bound on `::` -- a v4-only bind cannot observe a dial to `[::1]`, it just gets ECONNREFUSED, so an
+IPv6 case would assert `count == 0` against code that connected perfectly well.
+
+Stated precisely, because review showed the headline was thinner than it read:
+  * the `evil.example` and `shop.myshopify.com.evil.example` parameters never NAME the listener, so
+    their `count == 0` holds whatever the code does -- the status assertion is what kills there;
+  * `canonicalize_shop_domain("127.0.0.1:PORT")` drops the PORT, so a build that merely canonicalises
+    instead of pinning dials `127.0.0.1:443`, not the listener -- again killed by status;
+  * the one place the socket genuinely carries the kill is
+    `test_the_credential_exchange_itself_never_dials_a_hostile_stored_host`, because the resolver's
+    own `_normalize_shop_domain` PRESERVES the port and nothing between the handler and the socket is
+    stubbed there. Verified: against the pre-PR ordering it fails with `assert 1 == 0`.
 """
 from __future__ import annotations
 
@@ -183,6 +193,9 @@ def test_webhook_registration_still_reaches_a_valid_shop(client, listener, monke
 
     class _Resp:
         status_code = 201
+        # `.text` is read on every non-201 branch of the handler. Present so a mutant that changes
+        # the accepted status fails on an assertion rather than an AttributeError-driven 500.
+        text = ""
 
         @staticmethod
         def json():
@@ -204,7 +217,11 @@ def test_webhook_registration_still_reaches_a_valid_shop(client, listener, monke
     assert seen, "the validated domain never reached a Shopify request"
     # Exact URL, not merely the host: a mutant keeping the host but moving the path would survive.
     assert set(seen) == {"https://cosrx-renewal.myshopify.com/admin/api/2025-10/webhooks.json"}
-    assert listener.count == 0
+    # ...and the COUNT, because a set collapses every topic into one element: `break` after the
+    # first successful registration survived this test until the length was asserted.
+    assert len(seen) == 18, "every topic must be registered, not just the first"
+    # NOTE: no `listener.count == 0` here. It would be unconditionally vacuous -- the domain is
+    # valid and httpx.post is stubbed, so no path could reach the listener whatever the code did.
 
 
 def test_the_token_resolver_receives_the_pinned_host_not_the_raw_column(client, monkeypatch):
@@ -310,3 +327,52 @@ def test_an_uninstall_we_cannot_attribute_does_not_wipe_credentials():
     assert guard < early_return < onboarding, (
         "the merchant_onboarding wipe must sit behind the unidentifiable-shop return"
     )
+
+
+def test_the_credential_exchange_itself_never_dials_a_hostile_stored_host(client, listener, monkeypatch):
+    """The scenario this whole file is ABOUT, which every other test here stubs away.
+
+    `resolve_shopify_admin_access_token` POSTs client_id/client_secret to
+    {domain}/admin/oauth/access_token. It only does so when the stored api_key is a JSON blob
+    carrying client credentials -- with a plain `shpat_...` string it returns without a packet, so
+    the other tests cover that leg with a stub and the socket assertion there carries no weight.
+
+    Two details make this the strongest case in the file:
+      * the resolver's own `_normalize_shop_domain` PRESERVES the port, unlike the canonicaliser the
+        route used before this change -- so the pre-fix code dialled the listener EXACTLY, and this
+        assertion is load-bearing rather than incidental;
+      * httpx is left REAL here. Nothing is stubbed between the handler and the socket.
+    """
+    import json
+
+    blob = json.dumps({"client_id": "test_client_id", "client_secret": "test_client_secret"})
+
+    async def _fake_active_stores(_merchant_id):
+        return [{
+            "store_id": "store_x",
+            "platform": "shopify",
+            "domain": f"127.0.0.1:{listener.port}",
+            "status": "active",
+            # No access_token in the blob, so _token_needs_refresh() is True and the resolver
+            # actually performs the client-credentials exchange.
+            "api_key": blob,
+            "api_key_raw": blob,
+        }]
+
+    async def _fake_onboarding(_merchant_id):
+        return {"merchant_id": MERCHANT, "business_name": "Test"}
+
+    monkeypatch.setattr(wr, "get_merchant_active_stores", _fake_active_stores, raising=True)
+    monkeypatch.setattr(wr, "get_merchant_onboarding", _fake_onboarding, raising=True)
+
+    resp = client.post(
+        f"/webhooks/register/shopify/{MERCHANT}",
+        params={"callback_base_url": "https://api.example"},
+        headers=_auth(),
+    )
+
+    assert listener.count == 0, (
+        "the client-credentials exchange dialled the stored host; the client secret went to it"
+    )
+    assert resp.status_code == 400
+    assert "myshopify.com" in str(resp.json().get("detail", ""))
