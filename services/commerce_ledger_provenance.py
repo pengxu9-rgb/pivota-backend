@@ -31,6 +31,14 @@ WritePath = Literal[
     "wix_webhook",
     "shopline_webhook",
     "shoplazza_webhook",
+    # Squarespace is observed through TWO ingresses that report the same
+    # platform facts: the signed webhook (OAuth-connected sites only) and the
+    # Orders-API reconciliation sweep (every site, and the ONLY path for
+    # API-key sites). Both carry the same `platform` authority; the pair is
+    # what services.commerce_interaction_service.recorded_refund_amount_cents
+    # reads across so a cumulative refund total is never counted twice.
+    "squarespace_webhook",
+    "squarespace_reconciliation",
     "sfcc_cartridge",
     # PrestaShop has no outbound webhooks; the signed sender is the module
     # Pivota ships (integrations/prestashop-module/).
@@ -64,6 +72,8 @@ LEDGER_AUTHORITY_BY_WRITE_PATH: Dict[str, str] = {
     "wix_webhook": "platform",
     "shopline_webhook": "platform",
     "shoplazza_webhook": "platform",
+    "squarespace_webhook": "platform",
+    "squarespace_reconciliation": "platform",
     "sfcc_cartridge": "platform",
     "prestashop_module": "platform",
     "adobe_io_events": "platform",
@@ -102,6 +112,8 @@ _ALLOWED_CONFIDENCE_BY_WRITE_PATH: Dict[str, frozenset[str]] = {
     "wix_webhook": frozenset({"platform_asserted"}),
     "shopline_webhook": frozenset({"platform_asserted"}),
     "shoplazza_webhook": frozenset({"platform_asserted"}),
+    "squarespace_webhook": frozenset({"platform_asserted"}),
+    "squarespace_reconciliation": frozenset({"platform_asserted"}),
     "sfcc_cartridge": frozenset({"platform_asserted"}),
     "prestashop_module": frozenset({"platform_asserted"}),
     "adobe_io_events": frozenset({"platform_asserted"}),

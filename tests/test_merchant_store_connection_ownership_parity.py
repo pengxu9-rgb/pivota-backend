@@ -172,6 +172,13 @@ _ROUTES = [
         "Can only connect your own store",
     ),
     (
+        "squarespace_connect",
+        "POST",
+        "/integrations/squarespace/connect",
+        lambda m: {"json": {"merchant_id": m, "api_key": "sq-key-x"}},
+        "Can only connect your own store",
+    ),
+    (
         "prestashop_connect",
         "POST",
         "/integrations/prestashop/connect",
@@ -326,34 +333,68 @@ def store_db(monkeypatch) -> _StoreDatabaseSpy:
     return spy
 
 
-# Every store_id-keyed `.../ensure` route belongs here. They all select the row
-# on the caller-supplied store_id ALONE, so the owning merchant is a property of
-# the ROW and nothing in the request says who it is. A new platform's ensure
-# route that is not in this list is not covered by the ratchet.
+# Every store_id-keyed MUTATING route belongs here, not just the ones spelled
+# `.../ensure`. They all select the row on the caller-supplied store_id ALONE,
+# so the owning merchant is a property of the ROW and nothing in the request
+# says who it is. Keying the completeness check on the word "ensure" was itself
+# the gap: `/squarespace/{store_id}/reconcile` is exactly the same hazard —
+# it runs a sweep against another merchant's credential and writes to their
+# ledger — and the old regex could not see it.
 _ENSURE_PATHS = [
     ("woocommerce", f"/integrations/woocommerce/{STORE_B}/webhooks/ensure"),
     ("bigcommerce", f"/integrations/bigcommerce/{STORE_B}/webhooks/ensure"),
     ("prestashop", f"/integrations/prestashop/{STORE_B}/telemetry/ensure"),
+    ("squarespace", f"/integrations/squarespace/{STORE_B}/webhooks/ensure"),
+    ("squarespace-reconcile", f"/integrations/squarespace/{STORE_B}/reconcile"),
 ]
 _ENSURE_IDS = [p[0] for p in _ENSURE_PATHS]
 _ENSURE_PATH = _ENSURE_PATHS[0][1]
 
 
-def test_the_ensure_ratchet_covers_every_store_keyed_ensure_route():
+def test_the_ensure_ratchet_covers_every_store_keyed_mutating_route():
     """The list above is the ratchet's whole reach, so it must not silently
-    fall behind the router."""
+    fall behind the router.
+
+    The pattern matches ANY store_id-keyed mutating route, not only the ones
+    whose path happens to end in `ensure`. A completeness check narrowed to one
+    spelling grants a free pass to every route named anything else, which is
+    how `/squarespace/{store_id}/reconcile` shipped uncovered.
+    """
     import re
     from pathlib import Path
 
     source = (
         Path(__file__).resolve().parents[1] / "routes" / "merchant_store_connections.py"
     ).read_text(encoding="utf-8")
-    declared = set(re.findall(r'@router\.post\("(/[^"]*\{store_id\}[^"]*ensure)"\)', source))
+    declared = set(
+        re.findall(
+            r'@router\.(?:post|put|patch|delete)\("(/[^"]*\{store_id\}[^"]*)"\)', source
+        )
+    )
     covered = {
-        path.replace(f"/integrations/", "/").replace(STORE_B, "{store_id}")
+        path.replace("/integrations/", "/").replace(STORE_B, "{store_id}")
         for _, path in _ENSURE_PATHS
     }
     assert declared == covered, sorted(declared ^ covered)
+
+
+def test_the_ratchets_own_pattern_can_see_a_non_ensure_route():
+    """The regex above is the ratchet's detection floor, so pin it directly.
+
+    Without this, narrowing the pattern back to `...ensure` would still pass
+    the completeness test — the enumeration and the pattern would simply agree
+    on a smaller world — and the reconcile route would fall out of coverage
+    silently. Asserting the pattern matches a non-`ensure` path is what makes
+    that narrowing fail.
+    """
+    import re
+
+    pattern = re.compile(
+        r'@router\.(?:post|put|patch|delete)\("(/[^"]*\{store_id\}[^"]*)"\)'
+    )
+    assert pattern.findall('@router.post("/squarespace/{store_id}/reconcile")') == [
+        "/squarespace/{store_id}/reconcile"
+    ]
 
 
 @pytest.mark.parametrize("platform,path", _ENSURE_PATHS, ids=_ENSURE_IDS)

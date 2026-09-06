@@ -12,8 +12,10 @@ a failed delivery at escalating intervals over roughly 48 hours, so answering
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -23,6 +25,13 @@ from services.bigcommerce_event_adapter import refunds_are_relevant
 
 BIGCOMMERCE_API_ROOT = "https://api.bigcommerce.com"
 BIGCOMMERCE_FETCH_TIMEOUT_SECONDS = 15.0
+# The order id is interpolated into a URL PATH and comes out of a webhook body.
+# The delivery is signature-checked, but a signature proves the SENDER, not the
+# shape of a field inside it: an id of `../../v2/store` walks the path out of
+# the orders collection. BigCommerce order ids are integers; the pattern is
+# deliberately a little wider than that so a future id spelling is not a
+# breaking change, and `quote` is the second belt.
+BIGCOMMERCE_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class BigCommerceOrderFetchError(RuntimeError):
@@ -61,6 +70,9 @@ async def fetch_bigcommerce_order_context(
     order_key = str(order_id or "").strip()
     if not hash_value or not token or not order_key:
         raise BigCommerceOrderFetchError("BigCommerce order fetch credentials are incomplete")
+    if not BIGCOMMERCE_ORDER_ID_PATTERN.match(order_key):
+        raise BigCommerceOrderFetchError("BigCommerce order id is not a valid identifier")
+    order_key = quote(order_key, safe="")
 
     headers = build_bigcommerce_headers(token, client_id)
     base = f"{BIGCOMMERCE_API_ROOT}/stores/{hash_value}"

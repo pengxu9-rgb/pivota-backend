@@ -225,3 +225,99 @@ async def test_funnel_sums_both_bigcommerce_partial_refunds(tmp_path, monkeypatc
         assert result.payload["slices"][0]["key"] == STORE_ID
     finally:
         await test_database.disconnect()
+
+
+# ---- the order id reaches a URL PATH ---------------------------------------
+#
+# Same one-line hardening as `services/squarespace_order_fetch.py`, applied here
+# because it is the same hazard in the same shape: `order_id` comes out of a
+# signed webhook body and is interpolated into TWO paths (`/v2/orders/{id}` and
+# `/v3/orders/{id}/payment_actions/refunds`). A signature proves the SENDER, not
+# the shape of a field inside the body.
+
+
+class _UrlSpyClient:
+    """Stands in for `httpx.AsyncClient`, capturing every URL it is asked for."""
+
+    urls: list = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, headers=None, **kwargs):
+        type(self).urls.append(str(url))
+
+        class _Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"id": 1, "status": "Completed"}
+
+        return _Response()
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../../v2/store",
+        "..%2f..%2fv2%2fstore",
+        "250/../../v2/store",
+        "250?include=x",
+        "250#frag",
+        "x" * 129,
+    ],
+)
+async def test_a_hostile_bigcommerce_order_id_never_reaches_the_url(
+    hostile, monkeypatch
+):
+    import httpx
+
+    from services.bigcommerce_order_fetch import (
+        BigCommerceOrderFetchError,
+        fetch_bigcommerce_order_context,
+    )
+
+    _UrlSpyClient.urls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _UrlSpyClient)
+
+    with pytest.raises(BigCommerceOrderFetchError, match="not a valid identifier"):
+        await fetch_bigcommerce_order_context(
+            store_hash="abc123",
+            access_token="tok",
+            client_id=None,
+            order_id=hostile,
+            scope="store/order/updated",
+        )
+    assert _UrlSpyClient.urls == [], _UrlSpyClient.urls
+
+
+async def test_a_real_bigcommerce_order_id_still_reaches_the_orders_collection(
+    monkeypatch,
+):
+    """The positive counterpart: the guard must not refuse the integer ids
+    BigCommerce actually sends."""
+    import httpx
+
+    from services.bigcommerce_order_fetch import fetch_bigcommerce_order_context
+
+    _UrlSpyClient.urls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _UrlSpyClient)
+
+    await fetch_bigcommerce_order_context(
+        store_hash="abc123",
+        access_token="tok",
+        client_id=None,
+        order_id="250",
+        scope="store/order/updated",
+    )
+
+    assert _UrlSpyClient.urls == [
+        "https://api.bigcommerce.com/stores/abc123/v2/orders/250"
+    ]

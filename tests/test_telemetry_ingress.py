@@ -343,6 +343,9 @@ _TELEMETRY_ROUTE_FILES = {
     Path("routes/woocommerce_webhooks.py"): {"receive_woocommerce_webhook": ("woocommerce_webhook", "platform")},
     Path("routes/bigcommerce_webhooks.py"): {"receive_bigcommerce_webhook": ("bigcommerce_webhook", "platform")},
     Path("routes/wix_webhooks.py"): {"receive_wix_webhook": ("wix_webhook", "platform")},
+    Path("routes/squarespace_webhooks.py"): {
+        "receive_squarespace_webhook": ("squarespace_webhook", "platform")
+    },
     Path("routes/shopline_family_webhooks.py"): {
         "receive_shopline_webhook": ("shopline_webhook", "platform"),
         "receive_shoplazza_webhook": ("shoplazza_webhook", "platform"),

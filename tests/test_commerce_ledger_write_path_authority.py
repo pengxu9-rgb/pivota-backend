@@ -117,6 +117,20 @@ def test_every_production_write_path_has_exactly_one_authority():
     assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["prestashop_module"] == frozenset(
         {"platform_asserted"}
     )
+    # Squarespace is observed through TWO ingresses, and they must carry the
+    # SAME authority. If the polling sweep were anything weaker than the
+    # webhook, the refund baseline that reads across both
+    # (recorded_refund_amount_cents) would be mixing authorities, and an
+    # API-key store — which has no webhook path at all — would have every one
+    # of its orders filed below the standing of an identical OAuth store's.
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["squarespace_webhook"] == "platform"
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["squarespace_reconciliation"] == "platform"
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["squarespace_webhook"] == frozenset(
+        {"platform_asserted"}
+    )
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH[
+        "squarespace_reconciliation"
+    ] == frozenset({"platform_asserted"})
 
 
 @pytest.mark.parametrize(
@@ -129,6 +143,8 @@ def test_every_production_write_path_has_exactly_one_authority():
         ("bigcommerce_webhook", "platform_asserted"),
         ("wix_webhook", "platform_asserted"),
         ("prestashop_module", "platform_asserted"),
+        ("squarespace_webhook", "platform_asserted"),
+        ("squarespace_reconciliation", "platform_asserted"),
         ("stripe_webhook", "platform_asserted"),
     ],
 )
@@ -159,6 +175,10 @@ def test_each_ingress_may_assert_only_its_own_confidence(write_path, confidence)
         ("prestashop_module", "merchant_asserted"),
         ("prestashop_module", "browser_observed"),
         ("prestashop_module", "verified"),
+        ("squarespace_webhook", "merchant_asserted"),
+        ("squarespace_webhook", "verified"),
+        ("squarespace_reconciliation", "merchant_asserted"),
+        ("squarespace_reconciliation", "browser_observed"),
     ],
 )
 def test_a_mismatched_write_path_and_confidence_is_refused(write_path, confidence):

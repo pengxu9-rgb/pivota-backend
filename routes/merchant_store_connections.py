@@ -1524,6 +1524,35 @@ def _bigcommerce_webhook_callback_url(store_id: str) -> str:
     return callback_url
 
 
+def _squarespace_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("SQUARESPACE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure SQUARESPACE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/squarespace/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
 def _bigcommerce_credentials(raw: object) -> dict:
     if isinstance(raw, dict):
         return dict(raw)
@@ -1638,6 +1667,19 @@ async def _woocommerce_webhook_install_lock(store_id: str):
 
 _WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
 _BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+_SQUARESPACE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+
+# One in-flight sweep per store. Two sweeps of the SAME store race on one
+# `reconciliation` cell: whichever merge lands last decides the cursor, so the
+# other run's pages are either re-read or, if it advanced further, skipped.
+# This is per-process, which is the honest bound — it stops the operator
+# double-click and the retry-on-timeout, not two replicas. The sweep's own
+# correctness under a genuinely concurrent merge is the transaction in
+# `merge_squarespace_credentials`, not this set.
+_SQUARESPACE_SWEEPS_IN_FLIGHT: set[str] = set()
+# A full sweep is `max_pages` (<=200) sequential upstream calls at a 15s
+# timeout each. The request must not outlive the proxy in front of it.
+SQUARESPACE_RECONCILE_TIMEOUT_SECONDS = 240.0
 
 
 class ConnectBigCommerceRequest(BaseModel):
@@ -1651,6 +1693,32 @@ class ConnectPrestaShopRequest(BaseModel):
     merchant_id: str
     store_url: str
     api_key: str
+
+
+class ConnectSquarespaceRequest(BaseModel):
+    """A Squarespace connection is a credential plus, optionally, an OAuth token.
+
+    `api_key` is the per-site Developer API key (Settings -> Developer API
+    Keys), which reaches the Orders API and nothing else. `oauth_access_token`
+    is accepted so a site connected through a Squarespace Developer Platform app
+    can also provision webhooks; without it the store is sweep-only and
+    `/webhooks/ensure` answers 409 `oauth_required`.
+
+    `oauth_refresh_token` and `oauth_expires_at` are PERSISTED BUT NOT YET USED:
+    a Developer-Platform access token is short-lived (assumed ~30 minutes) and
+    this repo has no refresh path, so reads fall back to the API key on 401
+    instead. Storing them now means the refresh, when it lands, does not need
+    every OAuth store to reconnect first. See the Residual gaps section of
+    docs/SQUARESPACE_TELEMETRY.md.
+    """
+
+    merchant_id: str = Field(min_length=1, max_length=128)
+    api_key: str = Field(min_length=1, max_length=512)
+    oauth_access_token: Optional[str] = Field(default=None, max_length=2048)
+    oauth_refresh_token: Optional[str] = Field(default=None, max_length=2048)
+    oauth_expires_at: Optional[str] = Field(default=None, max_length=64)
+    store_name: Optional[str] = Field(default=None, max_length=255)
+    domain: Optional[str] = Field(default=None, max_length=2048)
 
 
 class ConnectCustomStoreRequest(BaseModel):
@@ -2998,6 +3066,470 @@ async def ensure_bigcommerce_webhooks(
         ) from exc
     return {"status": "success", "store_id": store_id, **result}
 
+
+
+# ---------------------------------------------------------------------------
+# Squarespace. Two credential models that do NOT reach the same APIs: a per-site
+# Developer API key reads the Orders API, and only an OAuth app token can create
+# a webhook subscription. See docs/SQUARESPACE_TELEMETRY.md.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/squarespace/connect")
+async def merchant_connect_squarespace(
+    request: ConnectSquarespaceRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect a Squarespace site for commerce telemetry.
+
+    The API key is validated by calling `GET /1.0/authorization/website`, which
+    is also the BINDING step: the website id it returns is persisted and every
+    webhook delivery must name it. Without that binding a notification signed
+    with some other Squarespace site's subscription secret could not be
+    distinguished from this store's own.
+
+    The key is never logged, and a reconnect READ-MODIFY-WRITEs the credential
+    blob: the same cell holds the webhook secret (Pivota's only copy) and the
+    reconciliation cursor, and overwriting it is exactly the PrestaShop P1 where
+    re-entering a key silently disarmed a shop's telemetry.
+    """
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    from services import squarespace_connection as squarespace
+    from services.squarespace_connection import (
+        SquarespaceConnectionError,
+        serialize_squarespace_credentials,
+    )
+
+    api_key = request.api_key.strip()
+    oauth_access_token = (request.oauth_access_token or "").strip() or None
+    oauth_refresh_token = (request.oauth_refresh_token or "").strip() or None
+    oauth_expires_at = (request.oauth_expires_at or "").strip() or None
+    if not api_key:
+        raise HTTPException(status_code=400, detail="A Squarespace API key is required")
+
+    try:
+        # Validated with the credential that will be used for reads: when an
+        # OAuth token is supplied it is the one that also carries webhook
+        # subscriptions, so it is the identity worth proving.
+        website = await squarespace.fetch_squarespace_website(
+            oauth_access_token or api_key
+        )
+    except SquarespaceConnectionError as exc:
+        # The upstream status is part of the detail. That `GET
+        # /1.0/authorization/website` answers a per-site API key at all is an
+        # ASSUMED claim (docs/SQUARESPACE_TELEMETRY.md row 4); if it is wrong,
+        # a 404 here says so immediately, while a bare "connection failed"
+        # would look exactly like a mistyped key.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Squarespace connection failed: {exc}"
+                + (
+                    f" (upstream HTTP {exc.status_code})"
+                    if getattr(exc, "status_code", None)
+                    else ""
+                )
+            ),
+        ) from exc
+
+    website_id = str(website.get("id") or "").strip()
+    store_domain = (
+        (request.domain or "").strip()
+        or str(website.get("identifier") or "").strip()
+        or f"squarespace:{website_id}"
+    )
+    store_name = (
+        (request.store_name or "").strip()
+        or str(website.get("title") or "").strip()
+        or "Squarespace Store"
+    )
+
+    existing_store = await database.fetch_one(
+        """SELECT store_id, api_key FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND platform = 'squarespace' AND domain = :domain""",
+        {"merchant_id": request.merchant_id, "domain": store_domain},
+    )
+
+    def _reconnect(preserved: dict) -> dict:
+        """The blob to persist, computed INSIDE the merge's critical section.
+
+        This runs under the same row lock as the read and the write, which is
+        the whole reason connect no longer hand-rolls its own read-modify-write:
+        two of them meant two critical sections over one cell, and a sweep's
+        cursor write landing between a connect's read and its write reverted
+        the merchant's new credential.
+        """
+        previous_website_id = str(preserved.get("website_id") or "").strip()
+        if previous_website_id and previous_website_id != website_id:
+            # The credential now belongs to a DIFFERENT site. Everything issued
+            # for or derived from the OLD site goes, and that INCLUDES the old
+            # OAuth token: it is preferred over the API key on every read, so
+            # leaving it behind makes the sweep keep listing the old site's
+            # orders and record them under the store that now represents the
+            # new one. The secret would authenticate deliveries the `websiteId`
+            # bind then rejects, and the cursor is a high-water mark over
+            # another site's orders. Everything else in the blob is preserved.
+            for stale in (
+                "webhook_secret",
+                "webhook_subscription_id",
+                "reconciliation",
+                "oauth_access_token",
+                "oauth_refresh_token",
+                "oauth_expires_at",
+            ):
+                preserved.pop(stale, None)
+        preserved.update({"api_key": api_key, "website_id": website_id})
+        if oauth_access_token:
+            preserved["oauth_access_token"] = oauth_access_token
+            if oauth_refresh_token:
+                preserved["oauth_refresh_token"] = oauth_refresh_token
+            if oauth_expires_at:
+                preserved["oauth_expires_at"] = oauth_expires_at
+        return preserved
+
+    if existing_store:
+        existing_store = dict(existing_store)
+        store_id = existing_store["store_id"]
+        persisted = await squarespace.merge_squarespace_credentials(
+            store_id=store_id,
+            mutate=_reconnect,
+            mark_connected=True,
+            db=database,
+        )
+    else:
+        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+        blob = {"api_key": api_key, "website_id": website_id}
+        if oauth_access_token:
+            blob["oauth_access_token"] = oauth_access_token
+            if oauth_refresh_token:
+                blob["oauth_refresh_token"] = oauth_refresh_token
+            if oauth_expires_at:
+                blob["oauth_expires_at"] = oauth_expires_at
+        persisted = dict(blob)
+        await database.execute(
+            """INSERT INTO merchant_stores
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'squarespace', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+            {
+                "store_id": store_id,
+                "merchant_id": request.merchant_id,
+                "domain": store_domain,
+                "name": store_name,
+                "api_key": serialize_squarespace_credentials(blob),
+            },
+        )
+
+    logger.info(
+        "squarespace_connect store_id=%s merchant_id=%s website_id=%s oauth=%s",
+        store_id,
+        request.merchant_id,
+        website_id,
+        bool(oauth_access_token),
+    )
+    return {
+        "status": "success",
+        "message": "Squarespace store connected successfully",
+        "store_id": store_id,
+        "website_id": website_id,
+        "domain": store_domain,
+        # Read off the BLOB THAT PERSISTED, not off the request field. A
+        # reconnect that supplies no OAuth token still has webhooks if the
+        # stored one survived, and answering `sweep_only` there would tell the
+        # merchant their armed subscription is not armed.
+        "telemetry_mode": (
+            "webhook_and_sweep"
+            if str(persisted.get("oauth_access_token") or "").strip()
+            else "sweep_only"
+        ),
+        "webhook_path": f"/webhooks/squarespace/{store_id}",
+        "webhook_subscription_path": (
+            f"/integrations/squarespace/{store_id}/webhooks/ensure"
+        ),
+        "reconcile_path": f"/integrations/squarespace/{store_id}/reconcile",
+    }
+
+
+async def _squarespace_store_for_caller(store_id: str, current_user: dict) -> dict:
+    """The store row, with the role gate and the ROW's ownership check applied.
+
+    `store_id` is caller-supplied and the SELECT keys on it alone, so the owning
+    merchant is a property of the ROW and nothing in the request says who it is.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'squarespace'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected Squarespace store not found")
+    store = dict(store)
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+    return store
+
+
+@router.post("/squarespace/{store_id}/webhooks/ensure")
+async def ensure_squarespace_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create the Squarespace subscription that feeds `/webhooks/squarespace/{id}`.
+
+    Requires an OAuth access token on the store. The Webhook Subscriptions API
+    is a Developer-Platform surface and a per-site Developer API key cannot
+    create a subscription, so an API-key-only store is answered 409
+    `oauth_required` and pointed at the reconciliation sweep. Faking a
+    provisioning here would leave a store that reports telemetry as armed and
+    receives nothing.
+
+    The secret comes FROM Squarespace and is shown exactly once, which inverts
+    the BigCommerce lifecycle: it is persisted after the create, re-read to
+    learn whether this request's write won, and never returned or logged.
+    """
+    store = await _squarespace_store_for_caller(store_id, current_user)
+
+    from services.squarespace_connection import (
+        merge_squarespace_credentials,
+        parse_squarespace_credentials,
+    )
+    from services.squarespace_event_adapter import (
+        SQUARESPACE_ORDER_TOPICS,
+        SQUARESPACE_UNINSTALL_TOPIC,
+    )
+    from services.squarespace_webhook_subscriptions import (
+        SquarespaceWebhookSubscriptionError,
+        delete_squarespace_subscription,
+        ensure_squarespace_subscription,
+    )
+
+    credentials = parse_squarespace_credentials(store.get("api_key"))
+    oauth_access_token = str(credentials.get("oauth_access_token") or "").strip()
+    website_id = str(credentials.get("website_id") or "").strip()
+    if not oauth_access_token:
+        logger.info(
+            "squarespace_webhooks_ensure action=oauth_required store_id=%s "
+            "store_merchant_id=%s actor_role=%s actor_user_id=%s",
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "oauth_required",
+                "message": (
+                    "Squarespace webhook subscriptions require an OAuth access "
+                    "token from a Squarespace Developer Platform app; a per-site "
+                    "Developer API key cannot create one. This store's telemetry "
+                    "runs through the reconciliation sweep instead: "
+                    f"POST /integrations/squarespace/{store_id}/reconcile."
+                ),
+                "store_id": store_id,
+                "reconcile_path": f"/integrations/squarespace/{store_id}/reconcile",
+            },
+        )
+    if not website_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Squarespace store has no website_id binding; reconnect it "
+                "so deliveries can be bound to the site they came from"
+            ),
+        )
+
+    callback_url = _squarespace_webhook_callback_url(store_id)
+    topics = list(SQUARESPACE_ORDER_TOPICS) + [SQUARESPACE_UNINSTALL_TOPIC]
+    try:
+        async with asyncio.timeout(90.0):
+            async with _SQUARESPACE_WEBHOOK_INSTALL_CONCURRENCY:
+                result = await ensure_squarespace_subscription(
+                    access_token=oauth_access_token,
+                    callback_url=callback_url,
+                    topics=topics,
+                )
+    except SquarespaceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail="Squarespace webhook management request failed"
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504, detail="Squarespace webhook installation timed out"
+        ) from exc
+
+    persisted = await merge_squarespace_credentials(
+        store_id=store_id,
+        updates={
+            "webhook_secret": result.secret,
+            "webhook_subscription_id": result.subscription_id,
+        },
+    )
+    persisted_secret = str(persisted.get("webhook_secret") or "").strip()
+    if not persisted_secret:
+        # The subscription is live and the receiver holds no secret for it:
+        # every delivery would 401. Undo the create rather than leave that.
+        await _discard_squarespace_subscription(
+            oauth_access_token, result.subscription_id, delete_squarespace_subscription
+        )
+        raise HTTPException(
+            status_code=503, detail="Squarespace webhook secret could not be persisted"
+        )
+    if not hmac.compare_digest(persisted_secret, result.secret):
+        # A concurrent ensure won the write. The receiver holds THAT secret, so
+        # this request's subscription can never authenticate; discard it and
+        # report the state that actually exists.
+        await _discard_squarespace_subscription(
+            oauth_access_token, result.subscription_id, delete_squarespace_subscription
+        )
+        # The same principal fields as `oauth_required` and `provisioned`. A
+        # lost race is the one outcome where a subscription was created and
+        # then deleted against Squarespace, so the audit trail needs to name
+        # who caused that as much as it does for the other two.
+        logger.info(
+            "squarespace_webhooks_ensure action=lost_race store_id=%s "
+            "store_merchant_id=%s actor_role=%s actor_user_id=%s "
+            "discarded_subscription_id=%s",
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            result.subscription_id or "-",
+        )
+        return {
+            "status": "success",
+            "store_id": store_id,
+            "endpoint": callback_url,
+            "topics": topics,
+            "secret_provisioned": True,
+            "subscription_id": str(persisted.get("webhook_subscription_id") or ""),
+        }
+
+    logger.info(
+        "squarespace_webhooks_ensure action=provisioned store_id=%s "
+        "store_merchant_id=%s actor_role=%s actor_user_id=%s "
+        "subscription_id=%s replaced=%s",
+        store_id,
+        store.get("merchant_id") or "-",
+        current_user.get("role") or "-",
+        current_user.get("sub") or "-",
+        result.subscription_id or "-",
+        len(result.replaced_subscription_ids),
+    )
+    return {
+        "status": "success",
+        "store_id": store_id,
+        "endpoint": callback_url,
+        "topics": result.topics,
+        # The value itself is never returned and never logged: Pivota installs
+        # the subscription, so no human needs to see it.
+        "secret_provisioned": True,
+        "subscription_id": result.subscription_id,
+        "replaced_subscriptions": len(result.replaced_subscription_ids),
+    }
+
+
+async def _discard_squarespace_subscription(access_token, subscription_id, delete) -> None:
+    """Best-effort removal of a subscription whose secret we cannot use.
+
+    A failure here is logged and swallowed: the caller is already answering an
+    error (or reporting the winner's state), and raising a second failure over
+    the first would hide what actually happened.
+    """
+    try:
+        await delete(access_token=access_token, subscription_id=subscription_id)
+    except Exception:
+        logger.warning(
+            "squarespace_webhooks_ensure could not discard subscription_id=%s",
+            subscription_id or "-",
+        )
+
+
+@router.post("/squarespace/{store_id}/reconcile")
+async def run_squarespace_reconciliation(
+    store_id: str,
+    apply: bool = Query(default=True),
+    overlap_minutes: int = Query(default=30, ge=0, le=1440),
+    initial_lookback_days: int = Query(default=7, ge=1, le=90),
+    max_pages: int = Query(default=20, ge=1, le=200),
+    modified_before: Optional[str] = Query(default=None, max_length=64),
+    current_user: dict = Depends(get_current_user),
+):
+    """Run the Orders-API reconciliation sweep for one store, now.
+
+    This is the authenticated face of `scripts/sweep_squarespace_orders.py`.
+    Both exist because CI deploys no Cloud Run job for this lane and the
+    APScheduler lane runs on a service that is not deployed on merge — see the
+    scheduling section of docs/SQUARESPACE_TELEMETRY.md.
+
+    `modified_before` pins the window's end for ONE run: the operator escape
+    hatch over the automatic bisect, for digging a store out of a range the
+    page cap cannot read in one pass.
+
+    Two guards wrap the sweep, both because it is an unbounded outbound loop
+    over somebody else's API. A per-store lock answers 409 rather than letting
+    two sweeps of the same store interleave — they would race on the same
+    cursor cell, and the loser's pages would be re-read or skipped depending on
+    which merge landed last. The timeout bounds the request itself: a sweep
+    that pages 200 times against a slow upstream would otherwise hold the
+    connection until the proxy gives up, with no cursor written either way.
+    """
+    store = await _squarespace_store_for_caller(store_id, current_user)
+
+    from services.squarespace_order_sweep import (
+        SquarespaceSweepError,
+        sweep_squarespace_store,
+    )
+
+    resolved_store_id = str(store["store_id"])
+    # Check-and-add with no `await` between them, so this is atomic on the
+    # event loop without a lock of its own.
+    if resolved_store_id in _SQUARESPACE_SWEEPS_IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "sweep_already_running",
+                "message": (
+                    "A Squarespace reconciliation sweep is already running for "
+                    "this store; wait for it to finish rather than racing it on "
+                    "the same cursor."
+                ),
+                "store_id": resolved_store_id,
+            },
+        )
+    _SQUARESPACE_SWEEPS_IN_FLIGHT.add(resolved_store_id)
+    try:
+        async with asyncio.timeout(SQUARESPACE_RECONCILE_TIMEOUT_SECONDS):
+            return await sweep_squarespace_store(
+                store_id=resolved_store_id,
+                apply=apply,
+                overlap_minutes=overlap_minutes,
+                initial_lookback_days=initial_lookback_days,
+                max_pages=max_pages,
+                modified_before=modified_before,
+            )
+    except SquarespaceSweepError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        # The cursor is untouched: the sweep persists it only after the whole
+        # page loop completes, so a timeout re-reads rather than skips.
+        raise HTTPException(
+            status_code=504, detail="Squarespace reconciliation sweep timed out"
+        ) from exc
+    finally:
+        _SQUARESPACE_SWEEPS_IN_FLIGHT.discard(resolved_store_id)
 
 @router.post("/prestashop/connect")
 async def merchant_connect_prestashop(

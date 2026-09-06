@@ -97,6 +97,10 @@ ALLOWED_MERCHANT_METADATA_KEYS = frozenset(
         "native_mall_id",
         "native_shop_no",
         "native_order_place_id",
+        # Squarespace's human-facing order number, e.g. "00042". A native
+        # identifier, not buyer data: the ledger keys on `order_id`/`order_ref`
+        # and this is what the merchant sees in their own back office.
+        "native_order_number",
         "native_paid_state",
         "native_payment_gateway",
         "native_shipping_type",
