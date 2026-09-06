@@ -5308,6 +5308,50 @@ def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
 # PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md).
 
 
+def _destination_claims(probe_runs: Any, brand: Optional[str]) -> List[Dict[str, Any]]:
+    """P0 item 8 (§14) — official-store claims made in the ANSWER PROSE.
+
+    EXTRACTED HERE, AT BUILD TIME, ON PURPOSE. §14 says this "needs answer-text
+    parse, not chunk metadata", and the answer text exists only in this
+    process: `_run_text(run)` reads it off the probe run, and it is never
+    persisted. The first implementation parsed `evidence_excerpt` from the
+    stored report instead — a model-authored, 280-character, first-wins-per-host
+    SKU-relevance snippet — which is why it found nothing across 63 of them.
+
+    The alternative was persisting every answer so a later pure function could
+    parse them. Measured on a real run that is ~74 answers against a report
+    already 602 KB, a ~38% increase carrying full model prose for every SKU and
+    query. Extracting here and persisting only the STRUCTURED CLAIM costs a few
+    hundred bytes and reads the same text.
+
+    Each claim keeps the sentence, the query that produced it and the provider,
+    so the merchant-facing evidence can be checked against the run.
+    """
+    from services.destination_claim import extract_destination_claims
+
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for run in _flatten_probe_runs(probe_runs):
+        if not isinstance(run, dict):
+            continue
+        text = _run_text(run)
+        if not text:
+            continue
+        meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
+        for claim in extract_destination_claims(text, brand=brand):
+            key = (claim.get("claimed_host"), claim.get("brand_bound"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                **claim,
+                "query": str(run.get("query") or "")[:300],
+                "axis": str(meta.get("axis") or "") or None,
+                "provider": run.get("_provider"),
+            })
+    return out
+
+
 def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:
     """Per-SKU citation rate grouped by fine intent axis: for each intent, how many
     of its probed queries cited the merchant. Surfaces WHERE the SKU wins by question
@@ -7657,6 +7701,12 @@ async def build_per_sku_report(
         # nav). Snapshot of WHERE this SKU is cited by question type. Additive.
         "citation_by_intent": _citation_by_intent(
             opportunity.get("per_prompt") if isinstance(opportunity, dict) else None
+        ),
+        # §14: what the ANSWER said this brand's official store is. Extracted
+        # from the answer prose here because that text lives only in this
+        # process; only the structured claim is persisted.
+        "destination_claims": _destination_claims(
+            probe_runs, product.get("brand") or product.get("vendor"),
         ),
         # Sibling-conflation split: queries where the BRAND is cited but THIS
         # SKU never verified — brand visibility the SKU doesn't own (AI often

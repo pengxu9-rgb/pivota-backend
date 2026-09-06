@@ -638,28 +638,44 @@ FINDING_UNVERIFIED_OFFICIAL_STORE = "ai_named_an_unverified_official_store"
 
 
 def _known_official_hosts(brand_report: Dict[str, Any]) -> List[str]:
-    """The merchant's own hosts, as this REPORT can establish them.
+    """The merchant's own hosts — by IDENTITY, not by resemblance.
 
     Deliberately NOT called "verified": the verified set is item 5 and lives in
-    `merchant_official_domains`, which a pure function cannot read. This is the
-    report's own `merchant_domain` plus the hosts its classifier already marked
-    first-party. The basis is named in every finding built from it so nobody
-    downstream mistakes an inference for a verification.
+    `merchant_official_domains`, which a pure function cannot read. The basis is
+    named in every finding built from this so nobody mistakes an inference for a
+    verification.
+
+    IT DOES NOT USE `first_party`, and that is the whole point. `first_party` is
+    computed by `_host_is_first_party`, which returns True when a host's
+    registrable label merely CONTAINS a brand alias, optionally wrapped in a
+    generic affix (`shop|try|get|the|official|store|hq|us|global|...`). So it
+    marks `judydoll.shop`, `judydollofficial.com` and `shopjudydoll.com` as
+    first-party — every one of them a brand-named lookalike, which is exactly
+    the shape §14 exists to catch. Building the comparison set from it made the
+    module's own flagship example (`judydoll.shop`, a host with no DNS record at
+    all) compare EQUAL to the merchant and vanish. The suppressor was the thing
+    being reported.
+
+    Identity only, therefore: the report's `merchant_domain`, plus its exact
+    subdomains. `us.brand.com` is the merchant; `brand.shop` is a claim to
+    check.
     """
-    hosts: List[str] = []
     md = brand_report.get("merchant_domain")
-    if isinstance(md, str) and md.strip():
-        hosts.append(md.strip())
-    authority = brand_report.get("authority_map")
-    if isinstance(authority, dict):
-        for sku in (authority.get("skus") or []):
-            if not isinstance(sku, dict):
-                continue
-            for host in (sku.get("authority_hosts") or []):
-                if isinstance(host, dict) and host.get("first_party") \
-                        and isinstance(host.get("host"), str):
-                    hosts.append(host["host"])
-    return sorted(set(hosts))
+    if not isinstance(md, str) or not md.strip():
+        return []
+    return [md.strip()]
+
+
+def _host_is_merchants_own(host: str, official: List[str]) -> bool:
+    """Exact host or a subdomain of one. No affix or alias resemblance."""
+    h = (host or "").strip().lower().lstrip(".")
+    for own in official:
+        o = (own or "").strip().lower().lstrip(".")
+        if not o:
+            continue
+        if h == o or h.endswith("." + o):
+            return True
+    return False
 
 
 def _findings_from_destination_claims(
@@ -667,77 +683,69 @@ def _findings_from_destination_claims(
 ) -> List[Dict[str, Any]]:
     """P0 item 8 (§14) — "AI told your buyers your official store is <host>".
 
-    The highest-cost error an engine makes, and the one no host-frequency metric
-    can see: it is a RELATIONSHIP asserted in the answer's prose, not a citation.
-    Measured at 3.1% of brand-intent responses, on the single query where being
-    wrong costs the most.
+    READS THE CLAIMS THE REPORT BUILDER EXTRACTED, and does not re-parse prose.
+    The claim lives in the ANSWER, which exists only inside
+    agent_center_bd_report_service at build time (`_run_text`), so
+    `_destination_claims` extracts it there and persists the structured result
+    on each per-SKU report. The first cut parsed `evidence_excerpt` from the
+    stored report instead — a model-authored, 280-char, first-wins-per-host
+    SKU-relevance snippet — and consequently found nothing in 63 of them.
 
-    Only claims pointing AWAY from the merchant's own hosts become findings. A
-    claim naming the right domain is correct behaviour, and an unknown verdict
-    (no host set available) is not evidence of anything — `claims_pointing_away`
-    drops both.
+    Only claims pointing AWAY from the merchant's own hosts become findings; a
+    claim naming the right domain is correct behaviour, and an unbound, hedged
+    or unknown-verdict claim is not evidence of anything.
     """
-    from services.destination_claim import (
-        claims_pointing_away, extract_destination_claims,
-    )
+    from services.destination_claim import claims_pointing_away
 
-    authority = brand_report.get("authority_map")
-    if not isinstance(authority, dict):
-        return []
     official = _known_official_hosts(brand_report)
     if not official:
-        # An EARLY-OUT, not the safety net — and the comment used to claim
-        # otherwise. Correctness here comes from `matches_verified`, which is
-        # None (not False) when no host set was supplied, and
-        # `claims_pointing_away` drops anything that is not explicitly False.
-        # A mutant deleting this line changes no output, which is how the
-        # over-claim was found. It stays because parsing every excerpt to
-        # produce nothing is wasted work, and it goes on saying only that.
+        # An EARLY-OUT, not the safety net: `matches_verified` is None without a
+        # host set and `claims_pointing_away` drops that. It saves the walk.
         return []
-
-    brand = None
-    facts = (brand_report.get("brand_rollup") or {}).get("run_facts")
-    if isinstance(facts, dict):
-        brand = (facts.get("identity") or {}).get("brand")
 
     seen: set = set()
     out: List[Dict[str, Any]] = []
-    for sku in (authority.get("skus") or []):
+    for sku in (brand_report.get("per_sku_reports") or []):
         if not isinstance(sku, dict):
             continue
-        for host in (sku.get("authority_hosts") or []):
-            if not isinstance(host, dict):
+        raw = sku.get("destination_claims")
+        if not isinstance(raw, list):
+            continue
+        # The builder extracted without a host set (it has no verified domains),
+        # so the verdict is decided HERE, where merchant_domain is known.
+        scored = [
+            {
+                **c,
+                "matches_verified": _host_is_merchants_own(
+                    str(c.get("claimed_host") or ""), official,
+                ),
+            }
+            for c in raw if isinstance(c, dict)
+        ]
+        for claim in claims_pointing_away(scored):
+            key = claim.get("claimed_host")
+            if key in seen:
                 continue
-            claims = extract_destination_claims(
-                host.get("evidence_excerpt"),
-                verified_official_hosts=official,
-                brand=brand,
-            )
-            for claim in claims_pointing_away(claims):
-                key = claim["claimed_host"]
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append({
-                    "finding_type": FINDING_UNVERIFIED_OFFICIAL_STORE,
-                    "severity": "high",
-                    "payload": {
-                        "claimed_host": key,
-                        "excerpt": claim["excerpt"],
-                        "cited_on_host": host.get("host"),
-                        "brand_mentioned": claim.get("brand_mentioned"),
-                        # Name the basis. These are the report's own
-                        # merchant_domain + first-party hosts, NOT item 5's
-                        # verified set, and a reader must be able to tell.
-                        "compared_against": official,
-                        "comparison_basis": "report_merchant_domain_and_first_party",
-                    },
-                    "confidence": CONFIDENCE_FINDING_HIGH,
-                    "short_summary": (
-                        f"An AI answer told shoppers your official store is "
-                        f"{key}, which is not one of your known domains."
-                    ),
-                })
+            seen.add(key)
+            out.append({
+                "finding_type": FINDING_UNVERIFIED_OFFICIAL_STORE,
+                "severity": "high",
+                "payload": {
+                    "claimed_host": key,
+                    "excerpt": claim.get("excerpt"),
+                    "query": claim.get("query"),
+                    "provider": claim.get("provider"),
+                    "axis": claim.get("axis"),
+                    "compared_against": official,
+                    # Named so nobody mistakes this for item 5's verified set.
+                    "comparison_basis": "report_merchant_domain_exact_or_subdomain",
+                },
+                "confidence": CONFIDENCE_FINDING_HIGH,
+                "short_summary": (
+                    f"An AI answer told shoppers your official store is "
+                    f"{key}, which is not one of your domains."
+                ),
+            })
     return out
 
 

@@ -32,25 +32,67 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional
 
-from services.brand_claim_service import normalize_host
+from services.brand_claim_service import is_valid_public_hostname, normalize_host
 
 # The relationship words that make a sentence a CLAIM rather than a mention.
-# "available at", "sold on", "you can buy it at" are deliberately NOT here: they
-# describe a retailer, which is normal and correct, and treating them as an
-# official-store claim would fire on almost every commerce answer.
-_RELATIONSHIP = r"(?:official\s+(?:web\s?site|site|store|shop|online\s+store|retailer))"
+#
+# "official retailer" is DELIBERATELY ABSENT, and was present in the first cut,
+# contradicting the paragraph above. "ANUKO's official retailer is
+# oliveyoung.com" is a correct, desirable and very common sentence in this
+# vertical; reporting it as "AI named a store you do not own" is precisely the
+# false alarm this module is built to avoid.
+_RELATIONSHIP = r"(?:official\s+(?:web\s?site|site|store|shop|online\s+store))"
 
-# A host, as it appears in prose: at least two labels and a TLD, optionally
-# wrapped in a URL. Trailing sentence punctuation is stripped by the caller.
-_HOST = r"(?:https?://)?(?:www\.)?([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)"
+# A host as it appears in prose. Validated against is_valid_public_hostname
+# afterwards — this pattern alone matches "5.0", which was reported to a
+# merchant as their official store.
+_HOST = (
+    r"(?P<host>(?:https?://)?(?:www\.)?"
+    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)"
+)
+
+# The brand, bound TIGHTLY to the relationship phrase: at most three words
+# immediately adjacent to it.
+#
+# The first cut used `[^,.;:]{1,60}?`, which swallowed the whole clause — so
+# "Judydoll is sold at Sephora and Sephora's official website is sephora.com"
+# captured "Judydoll is sold at Sephora and Sephora", matched the merchant by
+# SUBSTRING, and told them AI had named Sephora as their official store.
+_BRAND = r"(?P<brand>(?:[A-Za-z0-9&'’\-]+(?:\s+|$)){1,3}?)"
+
+# The possessive form needs a brand class WITHOUT the apostrophe: otherwise the
+# brand group swallows the "'s" that the pattern then expects to match, and
+# "Joocyee's official website is joocyeebeauty.com" — a real engine claim, and
+# one of this module's three motivating examples — silently stops matching.
+_BRAND_POSS = r"(?P<brand>(?:[A-Za-z0-9&\-]+\s+){0,2}[A-Za-z0-9&\-]+)"
+
+# Hedges and negations. A sentence that questions or denies the relationship is
+# not an assertion of it, and reporting "It is unclear whether X is official" as
+# a claim overstates what the engine said.
+_HEDGE = re.compile(
+    r"\b(?:unclear|not\s+clear|no\s+evidence|cannot\s+confirm|can'?t\s+confirm|"
+    r"unverified|allegedly|claims?\s+to\s+be|purports?|may\s+be|might\s+be|"
+    r"appears\s+to\s+be|seems\s+to\s+be|possibly|reportedly)\b",
+    re.I,
+)
 
 _PATTERNS = (
     # "The official website for Judydoll is judydoll.shop"
-    re.compile(rf"\b{_RELATIONSHIP}\s+(?:for|of)\s+(?P<brand>[^,.;:]{{1,60}}?)\s+is\s+{_HOST}", re.I),
+    re.compile(rf"\b{_RELATIONSHIP}\s+(?:for|of)\s+{_BRAND}is\s+{_HOST}", re.I),
     # "Joocyee's official website is joocyeebeauty.com"
     # "Joocyee's official website for US shoppers is joocyee.co"
-    re.compile(rf"(?P<brand>[^,.;:]{{1,60}}?)(?:'s|’s)\s+{_RELATIONSHIP}(?:\s+for\s+[^,.;:]{{1,40}}?)?\s+is\s+{_HOST}", re.I),
-    # "Judydoll's products are sold on their official website, judydoll.shop"
+    re.compile(
+        rf"{_BRAND_POSS}(?:'s|’s)\s+{_RELATIONSHIP}"
+        rf"(?:\s+for\s+[^,.;:]{{1,40}}?)?\s+is\s+{_HOST}",
+        re.I,
+    ),
+    # "…their official website, judydoll.shop"  /  "Official site: judydoll.shop"
+    #
+    # This pattern has NO brand group, so the brand guard cannot apply to it —
+    # in the first cut that made it attribute ANY "official website, <host>" to
+    # whatever merchant the report belonged to, including a competitor's. It is
+    # kept because the shape is real, but it now yields claims marked
+    # `brand_bound=False`, and the finding layer requires a bound claim.
     re.compile(rf"\b{_RELATIONSHIP}\s*[,:]\s*{_HOST}", re.I),
 )
 
@@ -93,26 +135,31 @@ def extract_destination_claims(
         normalize_host(h) for h in (verified_official_hosts or []) if h
     }
     verified.discard("")
+    brand_norm = _norm(brand) if brand else ""
 
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for sentence in _sentences(text or ""):
+        hedged = bool(_HEDGE.search(sentence))
         for pattern in _PATTERNS:
             for m in pattern.finditer(sentence):
-                host = normalize_host((m.group(m.lastindex) or "").rstrip(".,;:!?"))
-                if not host or "." not in host:
+                host = normalize_host((m.group("host") or "").rstrip(".,;:!?"))
+                # A dotted token is not a hostname. Without this the extractor
+                # reported "5.0" (from "…is 5.0 out of 5 stars") to a merchant
+                # as their official store.
+                if not host or not is_valid_public_hostname(host):
                     continue
-                claimed_brand = ""
-                try:
-                    claimed_brand = (m.groupdict().get("brand") or "").strip()
-                except Exception:  # noqa: BLE001 - group may not exist on pattern 3
-                    claimed_brand = ""
-                # A brand was supplied and the sentence names a DIFFERENT one:
-                # the answer is talking about somebody else's official store,
-                # which is not this merchant's evidence.
-                if brand and claimed_brand:
-                    if brand.strip().lower() not in claimed_brand.lower() \
-                            and claimed_brand.lower() not in brand.strip().lower():
+                groups = m.groupdict()
+                claimed_brand = (groups.get("brand") or "").strip()
+                # Pattern 3 carries no brand group, so nothing binds its claim
+                # to this merchant. Recorded, but never merchant evidence.
+                brand_bound = "brand" in groups and bool(claimed_brand)
+                if brand_norm and brand_bound:
+                    # TOKEN equality, not substring. `brand in claimed_brand`
+                    # is a "appears anywhere in the clause" test: it bound
+                    # "Anua" inside "Manual" and matched a competitor named
+                    # three words earlier.
+                    if not _tokens_match(brand_norm, _norm(claimed_brand)):
                         continue
                 if host in seen:
                     continue
@@ -120,19 +167,74 @@ def extract_destination_claims(
                 out.append({
                     "claim_kind": CLAIM_OFFICIAL_STORE,
                     "claimed_host": host,
-                    "matches_verified": (host in verified) if verified else None,
+                    "matches_verified": (
+                        _is_own_host(host, verified) if verified else None
+                    ),
                     "brand_mentioned": claimed_brand or None,
+                    "brand_bound": brand_bound,
+                    "hedged": hedged,
                     "excerpt": sentence[:300],
                 })
                 break
     return out
 
 
-def claims_pointing_away(claims: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The subset that is merchant evidence: an answer named an official store
-    that is NOT one of the merchant's verified domains.
+def _is_own_host(host: str, own: Iterable[str]) -> bool:
+    """Exact host or a subdomain of one.
 
-    `matches_verified is None` is excluded on purpose — unknown is not wrong,
-    and this list is what a merchant-facing finding is built from.
+    Subdomain-aware because `us.brand.com` IS the merchant and reporting it as
+    a foreign store would be a false alarm on the merchant's own regional site.
+    Resemblance is deliberately NOT accepted: `brand.shop` is a claim to check,
+    not a match — see _known_official_hosts in audit_evidence_builder for why
+    that distinction is the whole feature.
     """
-    return [c for c in claims if c.get("matches_verified") is False]
+    h = (host or "").strip().lower().lstrip(".")
+    for o in own:
+        o = (o or "").strip().lower().lstrip(".")
+        if o and (h == o or h.endswith("." + o)):
+            return True
+    return False
+
+
+def _norm(value: str) -> str:
+    """Casefold and strip punctuation that differs between a brand record and
+    an engine's prose (possessives, accents are left alone deliberately —
+    see the note in _tokens_match)."""
+    return re.sub(r"[^\w\s]", " ", str(value or "")).casefold().strip()
+
+
+def _tokens_match(brand: str, claimed: str) -> bool:
+    """True when the claimed brand IS the brand, on token boundaries.
+
+    Accepts a claimed string that ends with the brand ("the retailer Judydoll")
+    or equals it, and rejects one that merely contains it as a substring of a
+    different word. Multi-word brands are matched as a contiguous token run.
+    """
+    b = brand.split()
+    c = claimed.split()
+    if not b or not c:
+        return False
+    n = len(b)
+    return any(c[i:i + n] == b for i in range(len(c) - n + 1))
+
+
+def claims_pointing_away(claims: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The subset that is merchant evidence.
+
+    Four conditions, each removing a way the first cut produced a false alarm:
+
+      matches_verified is False  — not None. Unknown is not wrong; with no
+                                   host set we know a claim was made and
+                                   nothing about whether it is right.
+      brand_bound                — the sentence tied the claim to THIS brand.
+                                   Pattern 3 has no brand group, so its claims
+                                   are observations, never accusations.
+      not hedged                 — "it is unclear whether X is official" is a
+                                   question, not an assertion.
+    """
+    return [
+        c for c in claims
+        if c.get("matches_verified") is False
+        and c.get("brand_bound")
+        and not c.get("hedged")
+    ]
