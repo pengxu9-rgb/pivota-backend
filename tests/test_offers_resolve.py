@@ -3666,3 +3666,249 @@ def test_verification_dropping_an_internal_substitution_clears_the_target_too(
     assert body["resolved_target"] is None
     assert body["substitution_reason_codes"] == []
     assert (body.get("metadata") or {}).get("has_internal") is False
+
+
+# --- catalog_offers arm -------------------------------------------------------------------
+#
+# WHAT WAS DARK. offers.resolve sourced internal offers from `products_cache` and external offers
+# from `external_product_seeds`, and read `catalog_offers` nowhere. Measured in prod 2026-09-06:
+# 13,151 priced offers over 137 merchants, 1,246 of them `offer_type='retailer'` on 729
+# multi-seller products — and `get_offers` returned a retailer for none of them, because
+# `products_cache` held 24 unexpired rows against 15,419 catalog products.
+
+_CATALOG_OFFER_ROW = {
+    "offer_id": "of_sk_1",
+    "product_key": "prod::merch_obs_x::external_seed::cosrx-snail-essence",
+    "merchant_id": "stylekorean_global",
+    "currency": "USD",
+    "availability": "in_stock",
+    "offer_type": "retailer",
+    "is_first_party": False,
+    "readiness_tier": "referral_only",
+    "price_confidence": 0.9,
+    "updated_at": None,
+    "price_amount": 17.50,
+    "destination_url": "https://www.stylekorean.com/product/detail?pid=123",
+    "merchant_name": "StyleKorean",
+    "content_key": "ck_cosrx_snail",
+}
+
+
+def _catalog_arm_fetch_all(query: str, values=None, *, offer_rows=None):
+    """Every OTHER source misses, so only the catalog arm can answer."""
+    q = str(query)
+    if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+        return list(offer_rows if offer_rows is not None else [_CATALOG_OFFER_ROW])
+    return []
+
+
+def test_catalog_offers_arm_surfaces_a_retailer_by_signature(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A retailer offer attached by scripts/attach_retailer_offer.py becomes visible to an agent."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _catalog_arm_fetch_all(query, values)
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "an attached retailer offer must reach the agent"
+    o = offers[0]
+    # THE SHAPE THE GATEWAY READS. offerToSignal reads TOP-LEVEL merchant_id/merchant_name/
+    # availability/url; the seed and internal lanes emit seller/in_stock/source.merchant_id only,
+    # which is why their offers reach an agent that cannot name the merchant.
+    assert o["merchant_id"] == "stylekorean_global"
+    assert o["merchant_name"] == "StyleKorean"
+    assert o["availability"] == "in_stock"
+    assert o["url"] == "https://www.stylekorean.com/product/detail?pid=123"
+    assert o["price"] == 17.5 and o["currency"] == "USD"
+    assert o["purchase_route"] == "affiliate_outbound"
+    assert o["affiliate_url"] == "https://example.com/r?token=catalog"
+    assert o["cart_prefilled"] is None, "we do not know what a retailer destination lands on"
+    metadata = body.get("metadata") or {}
+    assert metadata.get("has_external") is True
+    assert any(
+        str(s.get("source")) == "catalog_offers"
+        and str(s.get("status")) == "ok"
+        and str(s.get("query")) == "catalog_offers_by_canonical_identity"
+        for s in (metadata.get("sources") or [])
+    )
+    # No new resolution_mode literal: an external-only answer keeps the existing vocabulary.
+    assert body.get("resolution_mode") == "external_only"
+
+
+def test_catalog_offers_arm_is_skipped_when_another_source_answered(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """GATED ON EMPTY, deliberately: the arm must not reorder, dedupe against or otherwise change
+    ANY response that is non-empty today. Merging it with the seed lane needs a destination-host
+    dedupe and is its own change."""
+    import routes.agent_shop_gateway as gateway
+
+    seen: list[str] = []
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            seen.append("catalog_arm")
+            return [_CATALOG_OFFER_ROW]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=sig"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    assert offers, "the seed lane still answers"
+    assert all(not str(o.get("offer_id", "")).startswith("of:catalog_offer:") for o in offers)
+    assert seen == [], "the catalog query must not even be issued when a source already answered"
+
+
+def test_catalog_offers_arm_reports_an_empty_answer_as_such(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A zero must be diagnosable. The failure this system keeps producing is a silent empty that
+    reads as 'nothing matched' when a filter quietly dropped everything."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _catalog_arm_fetch_all(query, values, offer_rows=[])
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_empty"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    metadata = res.json().get("metadata") or {}
+    assert any(
+        str(s.get("source")) == "catalog_offers" and str(s.get("status")) == "empty"
+        and str(s.get("reason_code")) == "no_candidates"
+        for s in (metadata.get("sources") or [])
+    ), "the arm must record that it ran and matched nothing"
+
+
+def test_catalog_offers_arm_ships_the_offer_even_when_attribution_fails(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """_make_external_redirect_url returns None for a destination it will not sign. The seed lane
+    `continue`s on that — a silent drop. Here the offer still ships with its plain destination and
+    the shortfall is COUNTED, because an agent seeing nothing cannot tell 'no offers' from
+    'we refused to sign the link'. The outbound allowlist is empty in every market today
+    (measured 2026-09-06) and an empty allowlist allows all, so this is the guard, not the norm."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        return _catalog_arm_fetch_all(query, values)
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value=None))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    offers = body.get("offers") or []
+    assert offers, "an unsignable destination must not silently drop the offer"
+    # VISIBLE, but not mislabelled: `affiliate_url` means an attributed /r link, so a refusal
+    # leaves it None rather than smuggling the raw destination under the signed-link key.
+    assert offers[0]["affiliate_url"] is None
+    assert offers[0]["url"] == "https://www.stylekorean.com/product/detail?pid=123"
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("unattributed") == 1
+        for s in ((body.get("metadata") or {}).get("sources") or [])
+    ), "the unattributed count must be visible in the source entry"
+
+
+def test_catalog_offers_arm_sources_only_retailer_offers(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """DEDUPE GUARD. `catalog_offers` also holds a `brand_direct` row for the same product, and the
+    seed lane already emits that destination — sourcing both would double-list the brand.
+
+    The fake SIMULATES THE DATABASE rather than ignoring the query: it applies the conjunct the way
+    Postgres would, so deleting the filter from the SQL changes what comes back. A fake that
+    returns its row whatever the query says cannot see this filter at all — the first version of
+    this suite had exactly that hole, and the mutant survived."""
+    import routes.agent_shop_gateway as gateway
+
+    brand_direct_row = {
+        **_CATALOG_OFFER_ROW,
+        "offer_id": "of_brand_1",
+        "merchant_id": "cosrx_direct",
+        "merchant_name": "COSRX",
+        "offer_type": "brand_direct",
+        "is_first_party": True,
+        "destination_url": "https://cosrx.com/products/snail-essence",
+    }
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            # apply the conjunct as the DB would
+            if "offer_type = 'retailer'" in q:
+                return [_CATALOG_OFFER_ROW]
+            return [brand_direct_row, _CATALOG_OFFER_ROW]
+        return []
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_catalog_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    assert offers, "the retailer offer must still ship"
+    assert all(o["source"]["offer_type"] == "retailer" for o in offers), (
+        "a brand_direct row must never be sourced here — the seed lane already emits that "
+        "destination"
+    )
+    assert all(o["merchant_id"] != "cosrx_direct" for o in offers)

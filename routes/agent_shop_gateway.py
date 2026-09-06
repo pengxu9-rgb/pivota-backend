@@ -5416,6 +5416,214 @@ async def _handle_offers_resolve(
                 query="external_seed_by_internal_identity",
             )
 
+    # CATALOG OFFERS — the third source, and the one that holds the retailer competition.
+    #
+    # WHAT WAS DARK. This handler sources internal offers from `products_cache` and external
+    # offers from `external_product_seeds`, and reads `catalog_offers` nowhere. Measured in prod
+    # 2026-09-06: `catalog_offers` held 13,151 priced offers over 137 merchants — 1,246 of them
+    # `offer_type='retailer'` across 14 retailers, on 729 products with more than one seller — and
+    # `get_offers` returned a retailer for exactly none of them. `products_cache` had 24 unexpired
+    # rows against 15,419 catalog products, so the internal path can resolve ~0.2% of the index and
+    # the seed path only reaches products that were mirrored from a seed. Everything the
+    # `attach_retailer_offer.py` lane has ever written was invisible to an agent.
+    #
+    # WHY HERE AND WHY GATED. Only when nothing else resolved. That is deliberate and it is what
+    # makes this safe to ship: it cannot reorder, dedupe against, or otherwise change ANY response
+    # that is non-empty today. The seed lane already emits the brand-direct destination for
+    # mirrored products, and merging the two sources needs a destination-host dedupe that is its
+    # own change.
+    #
+    # IDENTITY. The catalog already carries the identity the agent actually holds —
+    # `search_catalog` hands out `pivota_signature_id`, and `resolved_target` is built ONLY from a
+    # `products_cache` row (it stays None on every external-only answer by contract), so a catalog
+    # match must not try to populate it. It reports itself through `mapping.candidates` and
+    # `metadata.sources` instead, and ships `purchase_route="affiliate_outbound"` so the
+    # reconciliation below lands on `external_only` — no new `resolution_mode` literal, which
+    # tests/test_offers_resolve.py::test_every_resolution_mode_assignment_is_in_the_vocabulary
+    # AST-walks this function to forbid.
+    #
+    # DESTINATION, not the view. `agent_pdp_view.offers` looks like the obvious source and is the
+    # wrong one: its `url` comes from a per-merchant map built only from `catalog_products` rows in
+    # the content_key cluster, and a retailer owns no product row — so the view carries `url: None`
+    # for precisely the offers worth showing. `catalog_offers` has the real destination, written by
+    # the attach lane into `offer_payload->>'destination_url'` with `source_ref` as its twin.
+    #
+    # SHAPE. `offerToSignal` in the gateway reads TOP-LEVEL `merchant_id` / `merchant_name` /
+    # `availability` / `url`; the other two lanes here emit `seller` / `in_stock` /
+    # `source.merchant_id`, so their offers reach an agent unable to name the merchant. This arm
+    # emits both spellings. Fixing the other two lanes is a separate change and is why an offer
+    # here carries `seller` as well.
+    if not internal_offers and not external_offers:
+        catalog_started = time.perf_counter()
+        try:
+            ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
+            catalog_rows = []
+            if ident_aliases:
+                catalog_rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
+                               o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
+                               o.price_confidence, o.updated_at,
+                               coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                        o.list_price) AS price_amount,
+                               coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                                   AS destination_url,
+                               m.merchant_name AS merchant_name,
+                               p.content_key AS content_key
+                          FROM catalog_products p
+                          JOIN catalog_offers o ON o.product_key = p.product_key
+                          LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
+                         WHERE (p.pivota_signature_id = ANY(:aliases)
+                                OR p.content_key = ANY(:aliases)
+                                OR p.product_key = ANY(:aliases))
+                           -- The PRODUCT's own suppression, not just the offer's. Every serving
+                           -- read in services/pivot_query_service.py applies this pair, and
+                           -- scripts/withdraw_catalog_rows.py takes a product down by setting
+                           -- exactly these — so without it a withdrawn product still ships its
+                           -- retailer offer here, and the takedown silently misses this lane.
+                           AND p.suppressed_at IS NULL
+                           AND p.suppression_reason IS NULL
+                           -- Market, mirroring the seed lane at the attached-ref query above.
+                           -- Latent today (the gateway sends no market and the retailer ingest
+                           -- writes 'US'), and live the moment a caller passes market=KR.
+                           AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
+                           AND o.offer_type = 'retailer'
+                           AND o.offer_mode = 'redirect'
+                           AND o.suppressed_at IS NULL
+                           AND coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                        o.list_price) > 0
+                           AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                               IS NOT NULL
+                         ORDER BY price_amount ASC
+                         LIMIT :limit
+                        """,
+                        {"aliases": ident_aliases, "limit": max(limit, 1),
+                         "market": market_hint},
+                    ),
+                    timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+                )
+
+            unattributed = 0
+            for row in catalog_rows or []:
+                r = dict(row)
+                destination = str(r.get("destination_url") or "").strip()
+                if not destination.startswith(("http://", "https://")):
+                    continue
+                offer_merchant = str(r.get("merchant_id") or "").strip() or None
+
+                # ATTRIBUTED when we can, VISIBLE either way. The outbound allowlist is empty in
+                # every market today (measured 2026-09-06), and an empty allowlist means allow-all
+                # — so this should mint a signed /r link. If it ever cannot, the offer still ships
+                # with its plain destination and the shortfall is COUNTED into the source entry,
+                # because the failure this system keeps producing is a silent zero that reads as
+                # "nothing matched".
+                redirect_url = await _make_external_redirect_url(
+                    market=market_hint or "US",
+                    tool=tool_hint or "offers.resolve",
+                    destination_url=destination,
+                    utm_template=None,
+                    ctx={
+                        "eventType": "outbound_opened",
+                        "source": "offers.resolve.catalog_offer",
+                        "offerId": str(r.get("offer_id") or ""),
+                        **({"productId": product_id} if product_id else {}),
+                    },
+                    merchant_id=offer_merchant,
+                    product_id=str(r.get("product_key") or "") or None,
+                    variant_id=None,
+                    # The retailer's own page, never a Shopify cart permalink: this lane has no
+                    # merchant-issued variant id it could justify, and the parameter has no default
+                    # precisely so a caller must say so explicitly.
+                    cart_variant_id=None,
+                    seller_ref=offer_merchant,
+                    seed_kind="retailer_offer",
+                )
+                if not redirect_url:
+                    unattributed += 1
+
+                availability = str(r.get("availability") or "").strip() or None
+                price_amount = r.get("price_amount")
+                external_offers.append(
+                    {
+                        "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
+                        # Both spellings — see SHAPE above.
+                        "merchant_id": offer_merchant,
+                        "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
+                        "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
+                        "price": float(price_amount) if price_amount is not None else None,
+                        "currency": str(r.get("currency") or "USD").strip() or "USD",
+                        "availability": availability,
+                        "in_stock": (availability or "").strip().lower()
+                        not in {"out_of_stock", "outofstock", "sold_out",
+                                "soldout", "unavailable"},
+                        "url": destination,
+                        "purchase_route": "affiliate_outbound",
+                        # NEVER the raw destination under this key. `affiliate_url` MEANS an
+                        # attributed `/r` link: the gateway's sanitizer only passes it verbatim
+                        # when it matches the signed-token shape, and everything else goes
+                        # through the normal scrub — so an unsigned value here is both a
+                        # mislabel and liable to be rewritten. `_make_external_redirect_url`
+                        # declines for exactly one reachable reason, an allowlist refusal, and
+                        # that is a serving decision: the offer stays visible under `url`, the
+                        # signed key stays honest at None, and the shortfall is counted.
+                        "affiliate_url": redirect_url,
+                        # UNKNOWN, stated as such. A retailer destination is a product page as far
+                        # as we know; `null` is the vocabulary's "we do not know", and claiming
+                        # `false` would license an agent to tell a buyer what they will land on.
+                        "cart_prefilled": None,
+                        "internal_checkout_items": None,
+                        "confidence": 1.0,
+                        **({"price_confidence": r.get("price_confidence")}
+                           if r.get("price_confidence") is not None else {}),
+                        **({"updated_at": r.get("updated_at")}
+                           if r.get("updated_at") is not None else {}),
+                        "source": {
+                            "type": "catalog_offer",
+                            "offer_id": str(r.get("offer_id") or ""),
+                            "product_key": str(r.get("product_key") or ""),
+                            "content_key": str(r.get("content_key") or ""),
+                            "merchant_id": offer_merchant,
+                            # `live_offer_verification._target` reads
+                            # `source.canonical_url or source.destination_url`; without one of
+                            # them every offer from this arm is UNVERIFIED "no_verifiable_url".
+                            "destination_url": destination,
+                            "offer_type": str(r.get("offer_type") or ""),
+                            "is_first_party": bool(r.get("is_first_party")),
+                            "readiness_tier": str(r.get("readiness_tier") or ""),
+                        },
+                    }
+                )
+                if catalog_rows:
+                    mapping_candidates.append(
+                        _conf(
+                            "catalog_offer",
+                            1.0,
+                            "matched_canonical_identity",
+                            {"product_key": str(r.get("product_key") or "")},
+                        )
+                    )
+
+            _record_source(
+                source="catalog_offers",
+                status="ok" if catalog_rows else "empty",
+                reason_code="ok" if catalog_rows else "no_candidates",
+                source_started=catalog_started,
+                row_count=len(catalog_rows or []),
+                query="catalog_offers_by_canonical_identity",
+                extra={"unattributed": unattributed} if unattributed else None,
+            )
+        except Exception as e:
+            logger.info("offers.resolve.catalog_offers.failed", extra={"error": str(e)})
+            _record_source(
+                source="catalog_offers",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=catalog_started,
+                error=type(e).__name__,
+                query="catalog_offers_by_canonical_identity",
+            )
+
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
