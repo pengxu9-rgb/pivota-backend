@@ -387,6 +387,7 @@ from routes.bigcommerce_webhooks import router as bigcommerce_webhooks_router
 from routes.wix_webhooks import router as wix_webhooks_router
 from routes.sfcc_integration import router as sfcc_integration_router
 from routes.sfcc_events import router as sfcc_events_router
+from routes.prestashop_webhooks import router as prestashop_webhooks_router
 from routes.shopline_integrations import router as shopline_integrations_router
 from routes.shopline_family_webhooks import router as shopline_family_webhooks_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
@@ -1303,6 +1304,7 @@ app.include_router(bigcommerce_webhooks_router)  # Header-authenticated BigComme
 app.include_router(wix_webhooks_router)  # JWT-verified Wix eCom order + transaction events (static, app-level)
 app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
 app.include_router(sfcc_events_router)  # Signed SFCC cartridge order/cart/payment events
+app.include_router(prestashop_webhooks_router)  # Signed PrestaShop module order/refund events (no native webhooks)
 app.include_router(shopline_integrations_router)  # SHOPLINE / Shoplazza native REST catalog adapters
 app.include_router(shopline_family_webhooks_router)  # Signed SHOPLINE / Shoplazza order lifecycle events
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)

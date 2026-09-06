@@ -32,6 +32,9 @@ WritePath = Literal[
     "shopline_webhook",
     "shoplazza_webhook",
     "sfcc_cartridge",
+    # PrestaShop has no outbound webhooks; the signed sender is the module
+    # Pivota ships (integrations/prestashop-module/).
+    "prestashop_module",
     "adobe_io_events",
     "stripe_webhook",
     # First-party writers that call record_commerce_event directly
@@ -62,6 +65,7 @@ LEDGER_AUTHORITY_BY_WRITE_PATH: Dict[str, str] = {
     "shopline_webhook": "platform",
     "shoplazza_webhook": "platform",
     "sfcc_cartridge": "platform",
+    "prestashop_module": "platform",
     "adobe_io_events": "platform",
     "stripe_webhook": "psp",
     "agent_commerce_api": "pivota",
@@ -99,6 +103,7 @@ _ALLOWED_CONFIDENCE_BY_WRITE_PATH: Dict[str, frozenset[str]] = {
     "shopline_webhook": frozenset({"platform_asserted"}),
     "shoplazza_webhook": frozenset({"platform_asserted"}),
     "sfcc_cartridge": frozenset({"platform_asserted"}),
+    "prestashop_module": frozenset({"platform_asserted"}),
     "adobe_io_events": frozenset({"platform_asserted"}),
     "stripe_webhook": frozenset({"platform_asserted"}),
     "agent_commerce_api": frozenset({"verified"}),

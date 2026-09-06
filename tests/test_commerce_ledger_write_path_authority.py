@@ -106,6 +106,17 @@ def test_every_production_write_path_has_exactly_one_authority():
     assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["wix_webhook"] == frozenset(
         {"platform_asserted"}
     )
+    # PrestaShop is the one platform whose SENDER Pivota ships, because
+    # PrestaShop has no outbound webhooks at all. That does not make the row a
+    # merchant assertion: the module reads the shop's own Order/OrderSlip
+    # objects and signs with a secret only Pivota and that shop hold, so it is
+    # `platform` — the same standing as the SFCC cartridge — and may assert
+    # nothing else. Calling it `merchant` would let a shop's own report win a
+    # refund de-duplication it should lose.
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["prestashop_module"] == "platform"
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["prestashop_module"] == frozenset(
+        {"platform_asserted"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -117,6 +128,7 @@ def test_every_production_write_path_has_exactly_one_authority():
         ("cafe24_webhook", "platform_asserted"),
         ("bigcommerce_webhook", "platform_asserted"),
         ("wix_webhook", "platform_asserted"),
+        ("prestashop_module", "platform_asserted"),
         ("stripe_webhook", "platform_asserted"),
     ],
 )
@@ -144,6 +156,9 @@ def test_each_ingress_may_assert_only_its_own_confidence(write_path, confidence)
         ("wix_webhook", "merchant_asserted"),
         ("wix_webhook", "browser_observed"),
         ("wix_webhook", "verified"),
+        ("prestashop_module", "merchant_asserted"),
+        ("prestashop_module", "browser_observed"),
+        ("prestashop_module", "verified"),
     ],
 )
 def test_a_mismatched_write_path_and_confidence_is_refused(write_path, confidence):

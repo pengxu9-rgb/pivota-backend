@@ -38,6 +38,7 @@ from urllib.parse import quote, urlparse, urlencode
 from db.database import IS_POSTGRES, database
 from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
 from utils.auth import (
+    MERCHANT_OR_ADMIN_ROLES,
     MERCHANT_OR_EMPLOYEE_STAFF_ROLES,
     can_access_merchant,
     get_current_user,
@@ -3034,25 +3035,50 @@ async def merchant_connect_prestashop(
         
         logger.info(f"✅ PrestaShop credentials verified for {request.store_url}")
         
-        # Check if store already exists
+        # Check if store already exists. `api_key` is SELECTed too, not just
+        # `store_id`: that cell is a credential BLOB once telemetry has been
+        # provisioned -- `{"api_key": ..., "webhook_secret": ...}` -- and the
+        # telemetry secret is the only copy Pivota has (the merchant holds the
+        # other, pasted into the module).
         existing_store = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = 'prestashop' AND domain = :domain""",
             {"merchant_id": request.merchant_id, "domain": request.store_url}
         )
-        
+
         if existing_store:
-            # Update existing store
+            # Update existing store. READ-MODIFY-WRITE, not an overwrite: this
+            # UPDATE used to put the bare Webservice key over the whole cell,
+            # which destroyed the `webhook_secret`
+            # `ensure_prestashop_telemetry` had minted. After that the receiver
+            # answered every signed module delivery with 401, and the module --
+            # which cannot tell a rotated secret from an outage -- burned its
+            # 20-attempt budget and dropped the events. Reconnecting a shop is
+            # a routine thing to do; silently disarming its telemetry is not.
+            existing_store = dict(existing_store)
+            preserved = _prestashop_credentials(existing_store.get("api_key"))
+            preserved.pop("api_key", None)
+            stored_api_key = (
+                json.dumps({"api_key": request.api_key, **preserved}, separators=(",", ":"))
+                if preserved
+                # Nothing to preserve: keep the plain-string shape this column
+                # has always had for a store with no telemetry, so the generic
+                # `parse_api_key` readers see exactly what they see today.
+                else request.api_key
+            )
             await database.execute(
-                """UPDATE merchant_stores 
+                """UPDATE merchant_stores
                    SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
                        connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "api_key": request.api_key}
+                {"store_id": existing_store["store_id"], "api_key": stored_api_key}
             )
             store_id = existing_store["store_id"]
         else:
-            # Insert new store
+            # Insert new store. No telemetry secret can exist for a store row
+            # that does not exist yet, so the bare key is written as-is;
+            # `ensure_prestashop_telemetry` migrates the cell to the blob shape
+            # the first time it mints.
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
                 """INSERT INTO merchant_stores 
@@ -3080,6 +3106,199 @@ async def merchant_connect_prestashop(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to connect PrestaShop: {str(e)}")
+
+
+class EnsurePrestaShopTelemetryRequest(BaseModel):
+    """Body of the PrestaShop telemetry provisioning call.
+
+    `rotate` is the only knob: it mints a NEW secret and returns it once,
+    which is what a merchant does after the old one leaked or after moving
+    the shop.
+    """
+
+    rotate: bool = False
+
+
+def _prestashop_credentials(raw: object) -> dict:
+    """The credential JSON in `merchant_stores.api_key`.
+
+    `merchant_connect_prestashop` persists the BARE Webservice key (a plain
+    string, not JSON), so a store connected before telemetry existed is
+    migrated here to `{"api_key": "<the bare key>"}` rather than having its
+    key destroyed by the secret write.
+    """
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    if not value.startswith("{"):
+        return {"api_key": value}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"api_key": value}
+    return dict(parsed) if isinstance(parsed, dict) else {"api_key": value}
+
+
+def _prestashop_telemetry_endpoint(store_id: str) -> str:
+    return (
+        f"{resolve_public_api_base_url().rstrip('/')}"
+        f"/webhooks/prestashop/{quote(store_id, safe='')}"
+    )
+
+
+@router.post("/prestashop/{store_id}/telemetry/ensure")
+async def ensure_prestashop_telemetry(
+    store_id: str,
+    request: EnsurePrestaShopTelemetryRequest = Body(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Mint the shared secret the PrestaShop module signs its batches with.
+
+    PrestaShop is the one platform where the secret has to reach a HUMAN:
+    there is no OAuth handshake and no webhook API to register a callback
+    through, so the merchant pastes this value into the module's configuration
+    page. That forces a different lifecycle from `ensure_bigcommerce_webhooks`,
+    which never returns its secret because the server installs the hooks
+    itself:
+
+    * the call that MINTS the secret returns it, exactly once;
+    * every later call returns `secret_provisioned: true` and no secret;
+    * `{"rotate": true}` mints a replacement and returns that one once.
+
+    A merchant who loses the value rotates; there is no read-back path, and
+    the secret is never logged.
+
+    Because the secret LEAVES the system here, the two paths that return one
+    (the first mint and a rotation) are held to `MERCHANT_OR_ADMIN_ROLES`, not
+    to the whole staff tier `can_access_merchant` waves through: every employee
+    role could otherwise mint a per-store signing credential for any merchant,
+    or rotate a live one and silently sever a shop's telemetry until a human
+    re-pastes it. The wider staff tier still reaches the read-only answer
+    (`secret_provisioned: true/false`). Every call is logged with the actor,
+    the target and what it did -- never the value.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'prestashop'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected PrestaShop store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    rotate = bool(request.rotate) if request is not None else False
+    credentials = _prestashop_credentials(store.get("api_key"))
+    existing_secret = str(credentials.get("webhook_secret") or "").strip()
+    endpoint = _prestashop_telemetry_endpoint(store_id)
+
+    def _audit(action: str) -> None:
+        """One line per call: who, which store, what happened.
+
+        This route mints, rotates and hands out a per-store SIGNING credential
+        and staff roles can reach any merchant's store, so a call that leaves
+        no trace is an untraceable credential event. The secret itself is
+        never an argument here -- `secret_provisioned` is a boolean.
+        """
+        logger.info(
+            "prestashop_telemetry_ensure action=%s store_id=%s store_merchant_id=%s "
+            "actor_role=%s actor_user_id=%s actor_merchant_id=%s rotate_requested=%s "
+            "secret_was_provisioned=%s",
+            action,
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            current_user.get("merchant_id") or "-",
+            rotate,
+            bool(existing_secret),
+        )
+
+    # The secret-RETURNING paths are owner-or-admin only. Reading the state is
+    # not: an employee troubleshooting a shop may still ask whether it is
+    # provisioned, they just cannot cause a value to be handed out, and cannot
+    # rotate one -- a rotation is a silent telemetry outage for the shop until
+    # a human re-pastes the new value into the module.
+    if (rotate or not existing_secret) and current_user.get("role") not in MERCHANT_OR_ADMIN_ROLES:
+        _audit("denied_rotate" if rotate else "denied_mint")
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the merchant or an admin may mint or rotate the "
+                "PrestaShop telemetry secret"
+            ),
+        )
+
+    if existing_secret and not rotate:
+        # The secret exists and this call did not mint it, so it is not ours to
+        # hand out again. Rotation is the only way back to a readable value.
+        _audit("noop")
+        return {
+            "status": "success",
+            "store_id": store_id,
+            "endpoint": endpoint,
+            "shop_url": store.get("domain"),
+            "secret_provisioned": True,
+        }
+
+    minted = secrets.token_urlsafe(32)
+    await database.execute(
+        """
+        UPDATE merchant_stores
+        SET api_key = :api_key
+        WHERE store_id = :store_id
+        """,
+        {
+            "store_id": store_id,
+            "api_key": json.dumps(
+                {**credentials, "webhook_secret": minted}, separators=(",", ":")
+            ),
+        },
+    )
+    # Two first-time calls (or two rotations) can race and the last UPDATE
+    # wins. The merchant must paste the secret the RECEIVER will hold, so
+    # re-read the row and return whatever actually persisted; the loser's
+    # minted value is discarded, never shown. `databases`+asyncpg reports no
+    # rowcount from an UPDATE, so the re-read is also the only proof the write
+    # landed at all.
+    persisted = await database.fetch_one(
+        "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+        {"store_id": store_id},
+    )
+    persisted_secret = str(
+        _prestashop_credentials(dict(persisted).get("api_key") if persisted else None)
+        .get("webhook_secret")
+        or ""
+    ).strip()
+    if not persisted_secret:
+        _audit("mint_failed")
+        raise HTTPException(
+            status_code=503, detail="PrestaShop telemetry secret could not be persisted"
+        )
+    _audit("rotated" if existing_secret else "minted")
+    return {
+        "status": "success",
+        "store_id": store_id,
+        "endpoint": endpoint,
+        "shop_url": store.get("domain"),
+        # The ONE response that carries it. Nothing logs this value.
+        "secret": persisted_secret,
+        "secret_provisioned": True,
+        "rotated": bool(existing_secret),
+    }
+
 
 
 @router.post("/stores/support-email")
