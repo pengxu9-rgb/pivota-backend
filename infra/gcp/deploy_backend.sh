@@ -274,6 +274,17 @@ if [ "$CONFIG" = preserve ]; then
   # ~20 Cloud Run Jobs share the same 300, and an operator needs a session to
   # diagnose whatever went wrong. 180 leaves 40% for them.
   POOL_FLEET_BUDGET="${POOL_FLEET_BUDGET:-180}"
+  # `spec.template` IS THE RIGHT READ HERE, and it is deliberately not the serving revision.
+  # This guard predicts what THIS DEPLOY will apply, and `gcloud run deploy --update-env-vars`
+  # merges into the SERVICE TEMPLATE, so the template is the base the new revision inherits.
+  # Reading the serving revision would compute the ceiling for a configuration the deploy is
+  # about to replace. (Contrast infra/gcp/_serving_revision.sh, which answers the other
+  # question — "what is running" — for the callers that need it. Both questions are real; the
+  # bug is answering one with the other.)
+  #
+  # The variable is named LIVE_* and the messages below say "live", which is imprecise when a
+  # previous deploy left the template ahead of what serves. That is called out where it is
+  # printed rather than renamed, because the name appears in operator runbooks.
   LIVE_POOL_MAX="$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" \
     --region "$REGION" --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
     | tr ';' '\n' | grep "'DB_POOL_MAX_SIZE'" | grep -oE "'value': '[0-9]+'" \
@@ -303,7 +314,7 @@ if [ "$CONFIG" = preserve ]; then
     FLEET_CEILING=$((LIVE_POOL_MAX * APPLIED_MAX_INSTANCES))
     if [ "$FLEET_CEILING" -gt "$POOL_FLEET_BUDGET" ]; then
       echo "REFUSING to deploy: the service would open up to $FLEET_CEILING database" >&2
-      echo "connections (live DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$APPLIED_MAX_INSTANCES" >&2
+      echo "connections (configured DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$APPLIED_MAX_INSTANCES" >&2
       echo "as this deploy would apply it; live maxScale is currently $LIVE_MAX_INSTANCES)," >&2
       echo "over the $POOL_FLEET_BUDGET budget and against a max_connections of 300 shared" >&2
       echo "with worker/gateway/jobs. This script would set POOL_MAX=$POOL_MAX; preserve mode" >&2
@@ -318,7 +329,8 @@ if [ "$CONFIG" = preserve ]; then
     # script's intent and production can disagree silently and indefinitely. Say so on every
     # deploy: this is exactly how the live pool sat at 6 while this file said otherwise.
     if [ "$LIVE_POOL_MAX" != "$POOL_MAX" ]; then
-      echo "   WARNING: live DB_POOL_MAX_SIZE=$LIVE_POOL_MAX but this script intends $POOL_MAX." >&2
+      echo "   WARNING: configured DB_POOL_MAX_SIZE=$LIVE_POOL_MAX (the service template, i.e." >&2
+      echo "   what the next revision inherits) but this script intends $POOL_MAX." >&2
       echo "   preserve mode will NOT change it. To adopt the intended value:" >&2
       echo "     gcloud run services update $SERVICE --region $REGION --project $PROJECT \\" >&2
       echo "       --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2

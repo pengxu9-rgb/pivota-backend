@@ -56,6 +56,10 @@ def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bo
     describe_error_block = (
         f'echo "{describe_error}" >&2; exit 1;; *) ' if describe_error else ""
     )
+    # One 100%-traffic revision, named so `run revisions describe` can answer for it. An empty
+    # `prev` (service absent) still produces valid JSON; the script's not-found handling is
+    # driven by `describe_error`, which is what real gcloud actually emits.
+    traffic_json = '{"status":{"traffic":[{"revisionName":"worker-live","percent":100}]}}'
     stub.write_text(f"""#!/usr/bin/env bash
 # Flatten newlines: the probe program is a multi-line `python -c` argument, and a
 # line-based log would record only its first line — so an assertion about the probe's
@@ -72,8 +76,16 @@ esac
 if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
   case "$*" in
     *status.url*) echo "https://worker-xyz.a.run.app" ;;
+    # The service describe now answers the TRAFFIC question, because the script resolves the
+    # 100%-traffic revision rather than reading spec.template: the rollback target has to be a
+    # known-good image, and the template can name a revision that never became Ready.
+    *--format=json*) {describe_error_block}printf '%s\\n' '{traffic_json}' ;;
     *) {describe_error_block}printf '%s\\n' "{prev}" ;;
   esac
+  exit 0
+fi
+if [ "$1" = run ] && [ "$2" = revisions ] && [ "$3" = describe ]; then
+  printf '%s\\n' "{prev}"
   exit 0
 fi
 if [ "$1" = run ] && [ "$2" = jobs ] && [ "$3" = execute ]; then

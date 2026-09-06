@@ -145,6 +145,8 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL%/}"
 fi
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=infra/gcp/_serving_revision.sh
+. "$HERE/_serving_revision.sh"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
 GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
@@ -847,10 +849,11 @@ echo
 # done. That is worse than the crash it replaced: `WORKERS=true ... setup_scheduler.sh` used to
 # die loudly at deploy_worker.sh's guard, and briefly instead exited 0 having reconciled
 # everything while telling the operator the drainers were armed. Read the live service.
-WORKER_ARMED="$("$GCLOUD" run services describe worker --region "$REGION" \
-  --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
-  | tr ';' '\n' | grep "'AUDIT_WORKER_ENABLED'" | grep -oE "'value': '[a-z]+'" \
-  | grep -oE "'[a-z]+'$" | tr -d "'" || true)"
+# THE SERVING REVISION, because the line below says "live" and an operator will read it that
+# way. `spec.template` is what the last deploy ASKED FOR; if that deploy did not take, the two
+# disagree and this would report the arming state of a revision serving nobody. Written the
+# first time as a template read, in the same commit whose comment said "Read the live service".
+WORKER_ARMED="$(serving_env worker AUDIT_WORKER_ENABLED || true)"
 echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=${WORKER_ARMED:-<unreadable>})"
 if [ "$CONFIG" != apply ] && [ -n "${WORKERS_REQUESTED:-}" ] && [ "${WORKERS_REQUESTED:-}" != "$WORKER_ARMED" ]; then
   echo "   NOTE: you passed WORKERS=$WORKERS_REQUESTED, and CONFIG=preserve did NOT apply it." >&2

@@ -84,6 +84,8 @@ fi
 GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=infra/gcp/_serving_revision.sh
+. "$HERE/_serving_revision.sh"
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$TAG"
 
@@ -120,10 +122,14 @@ trap _cleanup EXIT INT TERM
 # yet", and - the part that matters - leaves NOTHING TO ROLL BACK TO. A probe failure after that
 # exits 1 with production stranded on the broken image. So: keep stderr, and let only a genuine
 # not-found mean absent. Anything else refuses while refusing is still free.
+# THE ROLLBACK TARGET IS WHAT IS SERVING, not what the template asks for. Those differ exactly
+# when it matters: if an earlier deploy created a revision that never became Ready — including
+# this script's own rollback failing — the template names that broken image while the previous
+# revision still serves. Rolling "back" to the template would then roll FORWARD into the thing
+# that was already broken. See _serving_revision.sh.
 PREV_ERR="$(mktemp)"; _TMPFILES="$_TMPFILES $PREV_ERR"
 PREV_RC=0
-PREV_IMAGE="$("$GCLOUD" run services describe worker --project "$PROJECT" --region "$REGION" \
-  --format='value(spec.template.spec.containers[0].image)' 2>"$PREV_ERR")" || PREV_RC=$?
+PREV_IMAGE="$(serving_image worker 2>"$PREV_ERR")" || PREV_RC=$?
 if [ "$PREV_RC" != 0 ]; then
   # MEASURED against gcloud 581.0.0, because the previous pattern here was guessed and the
   # guess was wrong: a missing Cloud Run service produces
