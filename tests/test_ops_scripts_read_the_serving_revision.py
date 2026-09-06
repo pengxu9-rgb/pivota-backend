@@ -277,24 +277,32 @@ def test_scripts_asking_what_is_running_use_the_helper(script, why):
 
 
 @pytest.mark.parametrize(
-    "script, why",
+    "script, expected_read, why",
     [
-        ("deploy_backend.sh",
-         "its pool guard predicts what THIS deploy will apply, and --update-env-vars merges "
+        ("deploy_backend.sh", "value(spec.template.spec.containers[0].env)",
+         "the pool guard predicts what THIS deploy will apply, and --update-env-vars merges "
          "into the template - the serving revision is the config being replaced"),
+        ("deploy_backend.sh",
+         'value(spec.template.metadata.annotations."autoscaling.knative.dev/maxScale")',
+         "same guard, the other half of its arithmetic"),
         ("restore_to_cloudsql.sh",
+         "value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])",
          "it captures minScale to PUT BACK with `run services update`, which sets the template"),
     ],
 )
-def test_scripts_asking_what_the_next_deploy_inherits_keep_the_template(script, why):
+def test_scripts_asking_what_the_next_deploy_inherits_keep_the_template(
+        script, expected_read, why):
     """The counterpart, and the reason this module is not "spec.template is banned".
 
-    Asserted against COMMENT-STRIPPED source. Reading raw text made this vacuous: switching
-    both real reads to runtime reads while leaving the explanatory comments passed.
+    THE EXACT READ, not "some template read somewhere". deploy_backend.sh has two, so an
+    `any(...)` over the file was satisfied by whichever one had not been mutated — switching
+    the pool guard alone to `value(status.traffic)` passed. Asserted against comment-stripped
+    source, because a seven-line comment explaining the read satisfied the earlier version.
     """
     body = _code_only(GCP / script)
-    assert any(t in body for t in _TEMPLATE_READS), (
-        f"{script} no longer reads the template in its code (only, perhaps, in a comment). {why}"
+    assert expected_read in body, (
+        f"{script} no longer performs `{expected_read}` in its code (only, perhaps, in a "
+        f"comment). {why}"
     )
     assert "serving_revision" not in body and "serving_image" not in body, (
         f"{script} switched to the serving revision. {why}"
