@@ -1,4 +1,5 @@
-# Ship a commit on main to GCP Cloud Run `web` - the service behind api.pivota.cc.
+# Ship a commit on main to GCP Cloud Run: `web` (the service behind api.pivota.cc), `worker`
+# (the single-instance drainer) and `proof-issuer`. See SCOPE below for why all three.
 #
 # Before this existed, the only way to deploy production was a human running four commands from a
 # laptop that happened to hold gcloud credentials and a git-ignored env file. That is why prod sat
@@ -13,9 +14,31 @@
 # (#1812). The dispatch trigger stays for rollbacks (any merged SHA) and 0%-traffic candidates,
 # and the drift alarm stays as the independent check on this pipeline itself.
 #
-# Scope is `web` only. `worker` is the single-instance drainer and rolling it has queue semantics
-# this does not model; `proof-issuer` runs a different ASGI app from the same image; the gateway
-# ships from the PIVOTA-Agent repo entirely. Those stay manual on purpose.
+# ── SCOPE: web, worker AND proof-issuer, as of 2026-09-05 ──────────────────────────────────────
+# This file used to say "`web` only", on the argument that rolling `worker` "has queue semantics
+# this does not model" and that `proof-issuer` runs a different ASGI app. Measured against that
+# argument:
+#
+#   worker         94 commits behind `web` for a month (fixed by hand 2026-09-05). Every
+#                  scheduler-lane change merged in that window - including the audit
+#                  evidence/projection fixes in #2074/#2077 - was dark in production while `web`
+#                  reported itself green and current.
+#   proof-issuer   184 commits and 9 days behind on 2026-09-05, and frozen at the PRE-08-29
+#                  service shape because it had not been deployed since.
+#
+# Neither gap was detectable: prod-deploy-drift.yml measured drift by curling api.pivota.cc/health,
+# which is `web`. `worker` is `--ingress internal` and answers nobody. So the manual half was not
+# merely manual, it was unobserved - the same shape as the 08-22 cutover this file was written
+# about, one service over. The drift alarm now reads all three (it authenticates to GCP and
+# compares image tags), and all three deploy here.
+#
+# The queue-semantics argument was real, and it is answered rather than ignored: see the "what a
+# roll costs" section of infra/gcp/deploy_worker.sh. In short, a rolled worker's in-flight work is
+# cancelled, not lost - audit runs hold a 600s lease that the next worker reclaims inline - and
+# that cost was already being paid by every hand-deploy. What automation changes is the frequency
+# (main takes 15-34 merges/day) and the predictability, not the failure mode.
+#
+# The gateway still ships from the PIVOTA-Agent repo entirely and is out of scope here.
 #
 # ── AND IT NOW WAITS FOR THE TESTS ─────────────────────────────────────────────────────────────
 # Measured on 2026-09-03. `Backend Test Sweep` was RED on main for six consecutive commits -
@@ -475,3 +498,127 @@ jobs:
         run: |
           echo "::notice::Candidate for $SHA passed its health check and is at 0% traffic."
           echo "Re-run with promote checked to shift traffic."
+
+  # ── THE OTHER TWO SERVICES ─────────────────────────────────────────────────────────────────────
+  # Both `needs: [test-gate, deploy]`, and the second half of that is deliberate.
+  #
+  # WHY AFTER WEB, NOT ALONGSIDE IT. These three services run the SAME IMAGE against the SAME
+  # DATABASE, so a commit is only ever half-shipped between them. Ordering them behind `web` means
+  # the failure mode is always "worker/proof-issuer lag web", which is the one this codebase has
+  # tooling and habits for: the drift alarm names it, and `web` is the surface a human looks at
+  # first. The reverse - a worker running a migration-dependent commit that `web` failed to take -
+  # is the same drift pointed the other way, with nothing accustomed to reading it.
+  #
+  # It also costs nothing: `deploy` has already built and pushed backend:<sha>, so both jobs below
+  # reuse that image and neither pays the ~8-minute build. `needs:` alone gates them - see the note
+  # on the `deploy` job about why there is no `if: always()` anywhere near a gate.
+
+  deploy-worker:
+    needs: [test-gate, deploy]
+    # A candidate deploy (dispatch with promote unchecked) is defined as "build and health-check
+    # without putting anything in front of users". The worker has no such state to be in: it takes
+    # no traffic, so there is no 0% to hold it at, and a worker instance drains queues from its app
+    # lifespan whether or not any request ever reaches it. Deploying it under PROMOTE=0 would mean
+    # a "candidate" that is fully live. Skip instead, and say so.
+    if: ${{ github.event_name == 'push' || inputs.promote }}
+    runs-on: ubuntu-latest
+    environment: gcp-prod
+    env:
+      SHA: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
+    steps:
+      # ONE checkout, `ref: main`, and the security reasoning is the `deploy` job's verbatim:
+      # without it, checkout defaults to `github.ref`, which under workflow_dispatch is the branch
+      # the run was dispatched FROM - so anyone with push access could dispatch a branch carrying a
+      # hostile deploy_worker.sh and have it run against production. No `src` checkout here: this
+      # job builds nothing, it rolls the image `deploy` already built and verified.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          filter: blob:none
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/371394967380/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: sa-github-deploy@pivota-shared.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Roll the worker to this commit
+        run: |
+          set -euo pipefail
+          # CONFIG=preserve (the script's default, stated anyway because it is the whole safety
+          # story): the worker carries ~242 env vars and every secret mount it needs, and a deploy
+          # that rewrote them is how five flags were lost on the gateway on 2026-08-30. WORKERS is
+          # deliberately NOT passed - AUDIT_WORKER_ENABLED is a deliberate human decision that only
+          # travels through the env file, and the script refuses an explicit WORKERS under preserve
+          # rather than accepting one it would silently ignore.
+          #
+          # The script verifies /__scheduler_health from inside the VPC before calling this a
+          # success, and rolls the image back if the scheduler did not come up.
+          CONFIG=preserve infra/gcp/deploy_worker.sh prod "$SHA"
+
+  deploy-proof-issuer:
+    needs: [test-gate, deploy]
+    if: ${{ github.event_name == 'push' || inputs.promote }}
+    runs-on: ubuntu-latest
+    environment: gcp-prod
+    env:
+      SHA: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          filter: blob:none
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/371394967380/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: sa-github-deploy@pivota-shared.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Roll proof-issuer to this commit
+        run: |
+          set -euo pipefail
+          # SAME IMAGE AS web, DIFFERENT ASGI APP. RUN_COMMAND/RUN_ARGS are not optional decoration:
+          # deploy_backend.sh passes them UNCONDITIONALLY once either is set, and an empty pair is
+          # gcloud's documented reset - so omitting them here would boot `main:app` behind a /health
+          # that answers 200 either way, and the candidate check would happily promote the wrong
+          # application onto this service.
+          #
+          # THE SHAPE PINS ARE THE POINT OF THIS JOB BEING SAFE TO AUTOMATE. deploy_backend.sh's
+          # constants are WEB's connection budget (concurrency 20, max-instances 10, recomputed
+          # 2026-08-29 after two pool-exhaustion outages). proof-issuer has been running
+          # concurrency 80 / maxScale 20 since 08-27, so an unpinned roll would cut its request
+          # slots from 1600 to 200 as a side effect of shipping a commit - an unreviewed capacity
+          # change that nobody asked this workflow to make. These five values are proof-issuer's
+          # CURRENT live shape, measured 2026-09-05; changing the service's capacity stays a
+          # deliberate edit to this block, which is what review can see.
+          #
+          # cpu 2 / 4Gi happen to equal web's prod constants today. Pinned explicitly anyway: they
+          # are only equal by coincidence, and the next change to web's budget must not silently
+          # become a change to this service too.
+          #
+          # MAX_INSTANCES=20 IS CHECKED AGAINST THE POOL BUDGET, and that is worth writing down
+          # because it is not obvious a pin can make a deploy REFUSE. The preserve-mode guard in
+          # deploy_backend.sh is not scoped to web: it computes live DB_POOL_MAX_SIZE x the
+          # maxScale this deploy would apply, against POOL_FLEET_BUDGET (default 180, sized when
+          # web's MAX was 10). Measured on prod proof-issuer 2026-09-05: DB_POOL_MAX_SIZE=6, so
+          # 6 x 20 = 120, inside the budget - and it holds no DATABASE_URL at all (MOUNT_DB
+          # defaults to 0 for this service), so that pool is nominal. If either changes - a DSN
+          # gets mounted, or the pool is raised past 9 - this job starts failing closed with
+          # "REFUSING to deploy": safe, but it would leave proof-issuer undeployed and the drift
+          # alarm red. Set POOL_FLEET_BUDGET here deliberately at that point rather than widening
+          # the budget everything else shares.
+          SERVICE=proof-issuer \
+          IMAGE_NAME=backend \
+          ENV_PREFIX=proofissuer \
+          RUN_COMMAND=python \
+          RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
+          CONFIG=preserve \
+          CPU_LIMIT=2 MEMORY_LIMIT=4Gi CONCURRENCY_LIMIT=80 \
+          MIN_INSTANCES=2 MAX_INSTANCES=20 \
+          PROMOTE=1 \
+            infra/gcp/deploy_backend.sh prod "$SHA"

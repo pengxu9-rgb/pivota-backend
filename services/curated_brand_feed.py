@@ -40,6 +40,89 @@ _PER_PAGE = 250  # Shopify max
 # priced under a dollar; a floor this low cannot drop a real product.
 MIN_SELLABLE_PRICE = 1.0
 
+# The axis a variant varies on, named the way the shop names it. Shopify reports
+# a product's axes in `options`, and `option1` is a value on the FIRST of them.
+# A shop with no axis at all reports the placeholder "Title" / "Default Title",
+# which names nothing.
+# "Color", NOT "Shade", and the difference is not cosmetic. The renderer treats
+# the two names ASYMMETRICALLY when its own keyword gate does not read the
+# product as cosmetic: `shade|tone|hue|undertone` falls through to
+# NON_DISPLAYABLE, while `color|colour` falls through to a working `color` axis
+# (both still divert a volume-looking value to a volume axis first). Measured
+# across the folded bases of the six cached brand feeds, this literal alone is
+# the difference between 48 and 75 of 79 products rendering a selector — the
+# axis we invent should be the one the consumer accepts.
+_DEFAULT_SHADE_OPTION_NAME = "Color"
+_PLACEHOLDER_OPTION_NAMES = {"title", "option", "variant", "selection", "default title"}
+_SHADE_AXIS_NAMES = {"shade", "color", "colour", "tone", "hue"}
+
+
+def _base_option_name(product: Dict[str, Any]) -> str:
+    """The shop's own name for the product's FIRST option axis, "" if it names none."""
+    # Shopify `/products.json` emits `options` as a list of dicts, and it is the
+    # only writer that reaches here — the string-shaped branches this used to
+    # carry were unfalsifiable by any input, so they are gone rather than left
+    # as coverage nobody can earn.
+    options = product.get("options")
+    first = options[0] if isinstance(options, list) and options else None
+    name = str(first.get("name") or "").strip() if isinstance(first, dict) else ""
+    if name.lower() in _PLACEHOLDER_OPTION_NAMES:
+        return ""
+    return name
+
+
+_SIZE_LIKE_VALUE = re.compile(
+    r"""(?ix)
+    ^\s*(?:
+        [\d.,/]+\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz|floz|lb|ct|count|pc|pcs|pack|x)\b
+      | (?:x?\s*[\d.,]+\s*(?:ml|g|oz))
+      | (?:travel|mini|deluxe|jumbo|full|full\s*size|trial|sample|refill)\s*(?:size)?
+      | (?:small|medium|large|x-?large|xs|s|m|l|xl|xxl|one\s*size)
+    )\s*$
+    """
+)
+
+
+def _looks_like_a_size(value: str) -> bool:
+    """A quantity, a pack, or a garment/format size — never a colour."""
+    return bool(_SIZE_LIKE_VALUE.match(value or ""))
+
+
+def _variant_option_name(variant: Dict[str, Any], base_option_name: str) -> str:
+    """The axis THIS variant varies on — per variant, because a folded product's
+    variant list is not homogeneous.
+
+    `fold_shade_listings` appends variants taken from OTHER products (the
+    per-shade listings) onto a base that keeps its own `options`. On a base whose
+    real axis is Size — a foundation sold in 30ml and 50ml — naming every variant
+    from `options[0]` published the shades as "Size: NC15". That is not just an
+    ugly label: the renderer only demands a swatch when the axis reads as a
+    shade, so a mislabelled shade also rendered without one.
+
+    A folded-in variant is on the shade axis BY CONSTRUCTION, whatever the base
+    calls its own. The base's own variants really are on the base's axis, so they
+    keep it — and "" when the shop names no axis, because a guess would be a
+    label the merchant never wrote.
+    """
+    # PRESENCE, not truthiness. The fold stamps this key with the handle it took
+    # the variant from, and a shade row with an empty handle stores "" — which a
+    # truthiness test reads as "not folded", handing that shade the base's own
+    # axis and reproducing the mislabel this function exists to prevent.
+    if FOLDED_FROM_KEY in variant:
+        if base_option_name.strip().lower() in _SHADE_AXIS_NAMES:
+            return base_option_name
+        # The fold collapses listings that differ by a TITLE SUFFIX, and a suffix
+        # is not always a shade: "Fix+ - 3.4 fl oz" and "Blot Powder - Medium"
+        # fold exactly like "Retro Matte Lipstick - Ruby Woo". Inventing a colour
+        # axis over a quantity publishes "Color: 3.4 fl oz". When the shop has not
+        # named an axis we can trust and the value reads as a size, decline —
+        # naming nothing is the honest answer, and by the product-level rule the
+        # whole product then serves as the bare list it was before.
+        if _looks_like_a_size(str(variant.get("option1") or variant.get("title") or "")):
+            return ""
+        return _DEFAULT_SHADE_OPTION_NAME
+    return base_option_name
+
 
 def _clean_domain(domain: str) -> str:
     d = str(domain or "").strip().lower()
@@ -667,6 +750,7 @@ def shopify_product_to_record(
     # `records_for_brand(base_listings_only=True)` is the only caller that does.
     if emit_variants and len(sellable) >= 1 and product.get(FOLDED_INTO_KEY):
         seen_ids: set = set()
+        base_option_name = _base_option_name(product)
         for i, v in enumerate(sellable):
             vid = str(v.get("id") or v.get("variant_id") or f"{handle}:{i}").strip()
             if vid in seen_ids:
@@ -682,6 +766,7 @@ def shopify_product_to_record(
                 "sku": str(v.get("sku") or "").strip() or None,
                 "barcode": str(v.get("barcode") or "").strip() or None,
                 "title": str(v.get("option1") or v.get("title") or "").strip() or None,
+                "option_name": _variant_option_name(v, base_option_name),
                 "price": _to_float(v.get("price")),
                 "in_stock": bool(v.get("available")),
                 "image_url": (

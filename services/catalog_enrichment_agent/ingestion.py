@@ -584,11 +584,12 @@ def _build_seed_inserts(
             "availability": availability,
             "in_stock": in_stock,
         }
-        # REAL variants when the record carries them. The external-seed serving
-        # lane builds its variant list from seed_data['variants']
-        # (routes/agent_api.py::_seed_variants -> _build_external_seed_product),
-        # NOT from catalog_skus — so a folded shade line whose shades exist as
-        # SKUs still served a single synthetic "canonical" variant and the shade
+        # REAL variants when the record carries them. Every external-seed lane
+        # builds its variant list from seed_data['variants'], NOT from
+        # catalog_skus — the deployed PDP reads this column directly with its own
+        # SQL, and the backend's search and checkout builders read it through
+        # `_seed_variants`. So a folded shade line whose shades exist as SKUs
+        # still served a single synthetic "canonical" variant and the shade
         # identity was invisible on the PDP (measured on MAC 2026-09-05: 1,869
         # shade SKUs in the catalog, one variant on the page).
         #
@@ -606,21 +607,29 @@ def _build_seed_inserts(
                 if not vid:
                     continue
                 v_in_stock = bool(v.get("in_stock"))
+                shade = str(v.get("title") or "").strip()
+                image_url = str(v.get("image_url") or "").strip() or None
                 built.append({
                     "variant_id": vid,
                     "id": vid,
                     "sku": str(v.get("sku") or "").strip() or None,
                     "barcode": str(v.get("barcode") or "").strip() or None,
-                    "title": str(v.get("title") or "").strip() or pdp_payload["product_name"],
+                    "title": shade or pdp_payload["product_name"],
                     "currency": _currency_of(pdp_payload),
                     "price_currency": _currency_of(pdp_payload),
                     "price_amount": v.get("price"),
                     "price": v.get("price"),
                     "availability": "in_stock" if v_in_stock else "out_of_stock",
                     "in_stock": v_in_stock,
-                    "image_url": str(v.get("image_url") or "").strip() or None,
+                    "image_url": image_url,
+                    "options": _seed_variant_options(
+                        shade,
+                        v.get("option_name"),
+                        pdp_payload["product_name"],
+                    ),
                 })
             if built:
+                _drop_options_that_do_not_distinguish(built)
                 seed_variants = built
         rows.append({
             "id": seed_id,
@@ -652,6 +661,104 @@ def _build_seed_inserts(
             }),
         })
     return rows
+
+
+_PLACEHOLDER_SHADE_VALUES = {
+    "default",
+    "default title",
+    "title",
+    "variant",
+    "single item",
+    "one size",
+    "n/a",
+}
+
+
+def _seed_variant_options(
+    shade: str, option_name: Any, product_name: str
+) -> List[Dict[str, str]]:
+    """The name/value pair that makes a seed variant a labelled CHOICE.
+
+    WHAT THIS BUYS. The renderer already exposed the variant LIST — a variant
+    with a non-placeholder title was enough for that. What it would not do
+    without a named axis is render the SELECTOR: `variantHasDisplayableChoice`
+    reads `options` first and an explicit `display_label` second, so #2073's real
+    MAC shades arrived as an unlabelled list with no way to pick one (measured on
+    the deployed gateway 2026-09-05). Real variant identity was necessary and not
+    sufficient.
+
+    A pair is emitted only for a value that names something, on an axis we were
+    TOLD about. The mapper's fallback title is the product name, and
+    "Default Title" is what a shop with no axis returns; either would render as a
+    selector entry naming no choice. An absent `option_name` is not a shade
+    signal either — `_build_seed_inserts` runs on any record with two or more
+    variants, including hand-validated JSONL for a lane that never folded
+    anything, and guessing "Shade" there published a volume axis as
+    "Shade: 30 ml". Only the fold knows the axis, and it always names it.
+    """
+    value = (shade or "").strip()
+    if not value:
+        return []
+    if value.lower() in _PLACEHOLDER_SHADE_VALUES:
+        return []
+    if value.lower() == (product_name or "").strip().lower():
+        return []
+    name = str(option_name or "").strip()
+    if not name:
+        return []
+    return [{"name": name, "value": value}]
+
+
+def _drop_options_that_do_not_distinguish(variants: List[Dict[str, Any]]) -> None:
+    """A product's variants carry ONE axis, every variant labelled, all labels
+    distinct — or no variant is labelled at all.
+
+    Three ways a partial labelling makes the page worse than the bare list it
+    replaces, all measured against the deployed renderer:
+
+    LABELS ON SOME. The renderer shows a picker as soon as ONE variant is
+    displayable, and lists only the displayable ones. A base whose own variants
+    sit on an axis the renderer does not recognise, with shades folded in beside
+    them, rendered a picker offering 1 of 3 purchasable variants — the other two
+    titled "Default". Before this lane wrote any options that product showed
+    nothing, so a partial labelling is a regression, not a partial win.
+
+    TWO AXES. The renderer accepts a colour axis only on a product its own
+    keyword gate reads as cosmetic, and drops the option otherwise — so on a
+    mixed product whose gate is closed it keeps "Size", drops the shades, and
+    manufactures the partial picker above downstream of us whatever we write.
+    When that gate is OPEN it renders both axes correctly (measured: a foundation
+    with Size and Shade renders 4/4), so this rule is deliberately CONSERVATIVE
+    rather than forced: we cannot see the gate from here, and a product served as
+    the bare list it was before is a worse outcome than a correct two-axis picker
+    but a better one than a picker missing half its variants. Revisit if the gate
+    ever becomes visible to this side.
+
+    THE SAME LABEL TWICE. `option1` is only the first axis, so a gloss sold
+    Full/Pink and Full/Sample yields two variants both labelled "Size: Full" —
+    a picker whose entries cannot be told apart.
+
+    All-or-nothing is the point rather than a shortcut: dropping just the
+    offending labels lands back in the first case. A product that loses its
+    labels is served exactly as it was before this lane named any axis.
+
+    LIMIT OF THIS RULE. It reasons about LABELS, and the renderer additionally
+    demands per-variant visual evidence on a colour axis — so a product whose
+    variants are labelled but partly imageless can still render a partial picker,
+    and nothing here can see that. In this lane variant images fall back to the
+    product image, so it does not arise today.
+    """
+    labelled = [v for v in variants if v.get("options")]
+    if not labelled:
+        return
+
+    axes = {o.get("name") for v in labelled for o in v["options"]}
+    keys = {tuple((o.get("name"), o.get("value")) for o in v["options"]) for v in labelled}
+    if len(labelled) == len(variants) and len(keys) == len(labelled) and len(axes) == 1:
+        return
+
+    for v in variants:
+        v["options"] = []
 
 
 def derive_seed_id(product_key: str, destination_url: str) -> str:

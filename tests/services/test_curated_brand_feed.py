@@ -1089,3 +1089,174 @@ async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypa
 
     assert recs, "the stub returned a product, so a record must come back"
     assert recs[0]["pdp"]["currency"] is None, "offline: no currency learned, ingest defaults USD"
+
+def _folded(base_options, own_variants, shade_titles):
+    """Drive the REAL fold. A hand-marked `_multi(FOLDED_INTO_KEY=2)` product is
+    NOT what the fold produces: `fold_shade_listings` stamps each folded-in
+    variant with the handle it came from, and that marker is what tells a shade
+    apart from one of the base's own variants."""
+    base = _product(title="Studio Fix Fluid", handle="sff", images=[{"src": "https://cdn.x/b.jpg"}],
+                    options=base_options, variants=own_variants)
+    shades = [
+        _product(title=f"Studio Fix Fluid - {t}", handle=f"sff-{t.lower()}",
+                 images=[{"src": f"https://cdn.x/{t}.jpg"}],
+                 options=[{"name": "Title", "values": ["Default Title"]}],
+                 variants=[{"id": 100 + i, "sku": f"S{i}", "price": "42.00", "available": True}])
+        for i, t in enumerate(shade_titles)
+    ]
+    out, _ = cbf.fold_shade_listings([base] + shades)
+    vs = shopify_product_to_record(out[0], domain="x.com", category_path="x",
+                                   emit_variants=True)["pdp"]["variants"]
+    return {v["title"]: v["option_name"] for v in vs}
+
+
+def test_mapper_carries_the_shops_own_name_for_a_real_shade_axis():
+    """Shopify shops name the axis themselves ("Color", "Colour", "Shade"); using
+    the shop's own word keeps the PDP reading the way their store does."""
+    by_title = _folded(
+        base_options=[{"name": "Colour", "position": 1, "values": ["NC15"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "NC15", "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title == {"NC15": "Colour", "NC20": "Colour"}
+
+
+def test_a_folded_shade_is_never_named_for_the_bases_own_axis():
+    """THE MISLABEL. `fold_shade_listings` appends variants taken from OTHER
+    products onto a base that keeps its own `options`. A foundation really sold
+    in 30ml and 50ml published its shades as "Size: NC15" — and because the
+    renderer only demands a swatch when the axis READS as a shade, a mislabelled
+    shade also rendered without one."""
+    by_title = _folded(
+        base_options=[{"name": "Size", "position": 1, "values": ["30ml", "50ml"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "30ml", "available": True},
+                      {"id": 12, "sku": "B", "price": "52.00", "option1": "50ml", "available": True}],
+        shade_titles=["NC15", "NC20"],
+    )
+    assert by_title["30ml"] == "Size" and by_title["50ml"] == "Size"    # the base's OWN axis survives
+    assert by_title["NC15"] == "Color" and by_title["NC20"] == "Color"  # folded shades are shades
+
+
+def test_a_collapsed_per_shade_listing_falls_back_to_the_shade_axis():
+    """A stub base has no variants of its own and reports the placeholder axis
+    "Title", which names nothing. The fold is what established the axis."""
+    by_title = _folded(
+        base_options=[{"name": "Title", "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Default Title",
+                       "available": True}],
+        shade_titles=["NC15", "NC20"],
+    )
+    assert by_title["NC15"] == "Color" and by_title["NC20"] == "Color"
+
+
+def test_a_bases_own_variant_gets_no_axis_invented_when_the_shop_names_none():
+    """A guessed axis is a label the merchant never wrote. The base's own
+    variants keep the base's axis — and nothing when there is none to keep."""
+    by_title = _folded(
+        base_options=[],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "One", "available": True},
+                      {"id": 12, "sku": "B", "price": "43.00", "option1": "Two", "available": True}],
+        shade_titles=["NC15"],
+    )
+    assert by_title["NC15"] == "Color"
+    assert by_title["One"] == "" and by_title["Two"] == ""
+
+
+def test_a_folded_shade_with_an_empty_handle_is_still_a_shade():
+    """PRESENCE, not truthiness. The fold stamps the key with the handle it took
+    the variant from; an empty handle stored "" and a truthiness test read that
+    as "not folded", handing the shade the base's own axis — the exact mislabel
+    the per-variant rule exists to prevent."""
+    base = _product(title="Studio Fix Fluid", handle="sff", images=[{"src": "https://cdn.x/b.jpg"}],
+                    options=[{"name": "Size", "values": ["30ml"]}],
+                    variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "30ml",
+                               "available": True}])
+    shade = _product(title="Studio Fix Fluid - NC15", handle="",
+                     images=[{"src": "https://cdn.x/nc15.jpg"}],
+                     options=[{"name": "Title", "values": ["Default Title"]}],
+                     variants=[{"id": 101, "sku": "S1", "price": "42.00", "available": True}])
+    out, _ = cbf.fold_shade_listings([base, shade])
+    vs = shopify_product_to_record(out[0], domain="x.com", category_path="x",
+                                   emit_variants=True)["pdp"]["variants"]
+    by_title = {v["title"]: v["option_name"] for v in vs}
+    assert by_title["NC15"] == "Color"
+    assert by_title["30ml"] == "Size"
+
+
+@pytest.mark.parametrize("axis", ["Color", "Colour", "Shade", "SHADE", "Tone", "Hue",
+                                  "COLOR", " color ", " shade "])
+def test_every_recognised_shade_axis_keeps_the_shops_own_spelling(axis):
+    """`_SHADE_AXIS_NAMES` was pinned at ONE element by the tests — deleting
+    `color`, the commonest spelling on a US storefront, stayed green while
+    silently relabelling every such shop's axis as "Shade"."""
+    by_title = _folded(
+        base_options=[{"name": axis, "position": 1, "values": ["NC15"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "NC15",
+                       "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title["NC20"] == axis.strip(), f"{axis} should be kept as the shop wrote it"
+
+
+@pytest.mark.parametrize("axis", ["Size", "Finish", "Format", "Colour Family", "Color/Shade"])
+def test_an_axis_the_renderer_will_not_read_as_a_shade_is_replaced(axis):
+    """The renderer matches the axis name EXACTLY against its own shade
+    vocabulary, so "Colour Family" is not a shade axis to it. A folded-in
+    variant is a shade whatever the base calls itself."""
+    by_title = _folded(
+        base_options=[{"name": axis, "position": 1, "values": ["A"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "A", "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title["NC20"] == "Color"
+    assert by_title["A"] == axis      # the base's own variants keep their real axis
+
+
+@pytest.mark.parametrize("placeholder", ["Title", "Option", "Variant", "Selection", "Default Title"])
+def test_a_placeholder_axis_name_is_not_published_for_a_bases_own_variants(placeholder):
+    """The placeholder set was entirely unexercised: every existing case used a
+    STUB base, whose own variants the fold discards, so the folded shades
+    returned "Shade" regardless of whether the placeholder was ever filtered.
+    This drives a base that KEEPS its own variants."""
+    by_title = _folded(
+        base_options=[{"name": placeholder, "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Regular",
+                       "available": True},
+                      {"id": 12, "sku": "B", "price": "42.00", "option1": "Deluxe",
+                       "available": True}],
+        shade_titles=["NC20"],
+    )
+    assert by_title["Regular"] == "" and by_title["Deluxe"] == ""
+    assert by_title["NC20"] == "Color"
+
+
+# "travel size" / "mini" / "refill" are refused by the FOLD itself, so they never
+# reach the axis namer — these are the size-shaped suffixes that do fold.
+@pytest.mark.parametrize("suffix", ["3.4 fl oz", "50ml", "100 g", "2 pack",
+                                    "Medium", "One Size"])
+def test_a_size_suffix_is_never_published_as_a_colour(suffix):
+    """The fold collapses listings that differ by a TITLE SUFFIX, and a suffix is
+    not always a shade — "Fix+ - 3.4 fl oz" folds exactly like
+    "Retro Matte Lipstick - Ruby Woo". Inventing a colour axis over a quantity
+    publishes "Color: 3.4 fl oz"."""
+    by_title = _folded(
+        base_options=[{"name": "Title", "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Default Title",
+                       "available": True}],
+        shade_titles=[suffix],
+    )
+    assert by_title[suffix] == "", f"{suffix} must not be named as a colour axis"
+
+
+@pytest.mark.parametrize("shade", ["Ruby Woo", "NC15", "Lavender", "M0N904", "01 Nude",
+                                   "Relentlessly Red"])
+def test_a_real_shade_is_still_published(shade):
+    """The positive counterpart — the size guard must not eat real shade names,
+    including numeric merchant codes."""
+    by_title = _folded(
+        base_options=[{"name": "Title", "values": ["Default Title"]}],
+        own_variants=[{"id": 11, "sku": "A", "price": "42.00", "option1": "Default Title",
+                       "available": True}],
+        shade_titles=[shade],
+    )
+    assert by_title[shade] == "Color"

@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 
 from config.settings import resolve_public_api_base_url, settings
+from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import could_upgrade_at_click_time
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
@@ -7528,7 +7529,15 @@ def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 },
                 "availability": v.get("availability"),
                 "image_url": v.get("image_url") or v.get("image"),
-                "options": v.get("options") or {},
+                # Either stored shape -> the {name: value} mapping THIS lane has
+                # always emitted. The field was a raw passthrough of a column
+                # only ever written as a mapping, and the enrichment lane now
+                # writes a list of pairs into it. Normalising here keeps this
+                # lane's own output shape unchanged, which is the conservative
+                # choice: flipping a public field's type as a side effect of a
+                # writer-side change is not something to do on the strength of
+                # having traced the consumers we happened to look at.
+                "options": seed_variant_options_as_mapping(v.get("options")),
             }
         )
         if len(variants) >= 30:
