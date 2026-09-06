@@ -64,6 +64,7 @@ force a run with POST /admin/scheduler/jobs/{id}/run-now.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -1248,18 +1249,87 @@ async def restart_scheduler() -> dict:
     return scheduler_diagnostics()
 
 
-async def stop_scheduler() -> None:
-    """Graceful shutdown of the scheduler. Called from
-    main.shutdown_event. Best-effort."""
-    global _SCHEDULER
-    if _SCHEDULER is None:
+# How long shutdown may wait for in-flight runs before cancelling them.
+#
+# SMALL ON PURPOSE, and the ceiling is not ours to choose: Cloud Run sends SIGTERM and then
+# kills the container, and uvicorn is started with no --timeout-graceful-shutdown, so it waits
+# on this lifespan indefinitely. Overrun the platform's grace and the process is SIGKILLed
+# MID-DRAIN — which skips the rest of main.shutdown_event, including `database.disconnect()`.
+# Losing the connection teardown to save a job is a strictly worse trade than cancelling the
+# job, so this stays well inside any plausible grace and leaves room for the rest of shutdown.
+# Set SCHEDULER_DRAIN_SECONDS=0 to restore the previous cancel-immediately behaviour.
+_DRAIN_SECONDS = float(os.getenv("SCHEDULER_DRAIN_SECONDS", "5") or 0)
+
+
+async def _drain_running_jobs(seconds: float) -> None:
+    """Wait, briefly, for in-flight scheduler runs to finish. Never raises."""
+    if seconds <= 0:
         return
     try:
-        # AsyncIOScheduler.shutdown(wait=False) cancels in-flight
-        # jobs immediately. We prefer wait=True so a re-audit in
-        # progress completes — but capped at 30s so deploys aren't
-        # blocked by a hanging job.
-        _SCHEDULER.shutdown(wait=False)
+        from services.scheduler_job_runner import active_tasks
+        tasks = active_tasks()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_scheduler: could not read in-flight runs: %s", exc)
+        return
+    if not tasks:
+        return
+    # WARNING, not info: this process ships no logging config, so the root logger sits at
+    # WARNING and every logger.info is dropped. A drain that only logged at info would be
+    # invisible in exactly the situation someone is reading logs to understand.
+    logger.warning("audit_scheduler: draining %d in-flight run(s), up to %.1fs", len(tasks), seconds)
+    try:
+        _done, pending = await asyncio.wait(tasks, timeout=seconds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_scheduler: drain failed, cancelling instead: %s", exc)
+        return
+    if pending:
+        logger.warning(
+            "audit_scheduler: %d run(s) still going after %.1fs - cancelling them",
+            len(pending), seconds,
+        )
+
+
+async def stop_scheduler() -> None:
+    """Shut the scheduler down, letting in-flight runs finish first if they can.
+
+    WHY THIS IS NOT JUST `shutdown(wait=True)`, which is what this function used to claim
+    it wanted. For an AsyncIOScheduler the `wait` argument IS A NO-OP. APScheduler 3.11's
+    AsyncIOExecutor.shutdown says so in its own body -- "there is no way to honor wait=True
+    without converting this method into a coroutine method" -- and then cancels every pending
+    future regardless of the flag. So `wait=True` and `wait=False` are byte-identical here,
+    and the old comment ("we prefer wait=True ... capped at 30s") described behaviour that
+    could not exist: `shutdown()` takes no timeout either. Flipping the flag would have
+    turned a visible mismatch into an invisible one.
+
+    Draining therefore has to be done BY US, before handing control to APScheduler, and the
+    runner already tracks the real asyncio.Tasks so no private state is touched.
+
+    WHY IT IS WORTH DOING AT ALL. Since 2026-09-06 the worker is rolled on every push to main
+    (15-34 merges/day), so this path now runs constantly rather than at a human's pace. Every
+    cancelled in-flight run takes `run_isolated`'s wrapper-cancelled branch, which adopts it
+    as a ZOMBIE: an ERROR log naming the #1754 wedge class, plus a terminated DB connection.
+    Those are the right responses to a run that would not unwind; they are noise for an
+    ordinary redeploy, and repeated dozens of times a day they teach people to ignore an
+    error that elsewhere means something is genuinely stuck. Letting short runs land also
+    matters for the settlement and refund lanes, where being cancelled mid-call is the
+    hazard, not the tidy-up.
+
+    Best-effort throughout: nothing here may raise, and nothing may hang.
+    """
+    global _SCHEDULER
+    sched = _SCHEDULER
+    if sched is None:
+        return
+    try:
+        # PAUSE FIRST. Without it the timer keeps firing during the drain and we would be
+        # waiting on a set of runs that grows while we wait.
+        try:
+            sched.pause()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: pause before drain failed: %s", exc)
+        await _drain_running_jobs(_DRAIN_SECONDS)
+        # Whatever is still running is cancelled here, exactly as before.
+        sched.shutdown(wait=False)
     except Exception as exc:  # noqa: BLE001
         logger.warning("audit_scheduler: stop error: %s", exc)
     finally:
