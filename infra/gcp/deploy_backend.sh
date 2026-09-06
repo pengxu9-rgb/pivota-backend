@@ -150,8 +150,12 @@ fi
 : "${CPU_LIMIT:=}"
 : "${MEMORY_LIMIT:=}"
 : "${CONCURRENCY_LIMIT:=}"
+# `0` is the trap here and is why this is not a plain digit check: Cloud Run reads
+# `--concurrency 0` as UNLIMITED, so the one value that looks like the tightest possible budget
+# is in fact the removal of the budget. A leading-zero form is refused too - gcloud accepts `007`
+# but it reads as octal to a human skimming a diff.
 [ -z "$CONCURRENCY_LIMIT" ] || case "$CONCURRENCY_LIMIT" in
-  ''|*[!0-9]*) echo "CONCURRENCY_LIMIT must be a positive integer (got '$CONCURRENCY_LIMIT')" >&2; exit 2 ;;
+  *[!0-9]*|''|0|0*) echo "CONCURRENCY_LIMIT must be a positive integer with no leading zero (got '$CONCURRENCY_LIMIT'). Cloud Run reads 0 as UNLIMITED, not as a limit." >&2; exit 2 ;;
 esac
 # A prefix TYPO fails closed on the -f check below. A prefix OMISSION does not: it silently hands
 # another service the backend's entire env file and secret list. Require them to agree.

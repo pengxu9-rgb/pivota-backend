@@ -194,6 +194,29 @@ def test_the_other_services_wait_for_web(job):
     )
 
 
+@pytest.mark.parametrize("job", [j for j in DEPLOY_JOBS if j != "deploy"])
+def test_a_candidate_dispatch_does_not_deploy_the_other_services(job):
+    """A dispatch with promote unchecked means "build and health-check without putting
+    anything in front of users". Neither service has such a state — the worker takes no
+    traffic at all, so there is no 0% to hold it at, and it drains queues from its app
+    lifespan the moment it boots. Deploying them there makes "candidate" mean "fully live".
+    Nothing asserted this until a mutation audit removed the `if:` and the suite stayed green."""
+    condition = str(_jobs()[job].get("if") or "")
+    assert "inputs.promote" in condition and "push" in condition, (
+        f"`{job}` carries `if: {condition}` — it no longer skips on a candidate dispatch."
+    )
+
+
+@pytest.mark.parametrize("job", DEPLOY_JOBS)
+def test_every_deploy_runs_in_the_protected_environment(job):
+    """`environment: gcp-prod` is where required reviewers attach without touching this file.
+    A job that quietly drops it deploys production outside whatever protection is configured
+    there, and looks identical in a diff."""
+    assert _jobs()[job].get("environment") == "gcp-prod", (
+        f"`{job}` is not in the `gcp-prod` environment, so it deploys production outside it."
+    )
+
+
 def test_the_worker_is_not_deployed_through_deploy_backend_sh():
     """deploy_backend.sh would be wrong here in three independent ways, and two of them
     fail silently — see the header of infra/gcp/deploy_worker.sh. The one that matters
@@ -218,11 +241,16 @@ def test_the_proof_issuer_deploy_pins_the_shape_it_is_not_allowed_to_change():
     200 as a side effect of shipping a commit — an unreviewed capacity change nobody asked
     this workflow to make."""
     body = yaml.dump(_jobs()["deploy-proof-issuer"])
-    for pin in ("CPU_LIMIT=", "MEMORY_LIMIT=", "CONCURRENCY_LIMIT=",
-                "MIN_INSTANCES=", "MAX_INSTANCES="):
-        assert pin in body, (
-            f"the proof-issuer job does not pin {pin!r}, so it adopts web's shape "
-            "constants and silently reshapes the service on every push to main."
+    # THE VALUES, not merely the presence of the flags. `"CONCURRENCY_LIMIT=" in body` passed
+    # for `CONCURRENCY_LIMIT=20 MAX_INSTANCES=10` — which IS the 1600-to-200 request-slot cut
+    # this test exists to prevent, applied, with the suite green. Found by a mutation audit,
+    # 2026-09-05. These are proof-issuer's live values as measured that day; changing the
+    # service's capacity means editing them here, where review can see it.
+    for pin, value in (("CPU_LIMIT", "2"), ("MEMORY_LIMIT", "4Gi"), ("CONCURRENCY_LIMIT", "80"),
+                       ("MIN_INSTANCES", "2"), ("MAX_INSTANCES", "20")):
+        assert f"{pin}={value}" in body, (
+            f"the proof-issuer job does not pin {pin}={value}. Without it the service adopts "
+            "web's shape constants and is silently reshaped on every push to main."
         )
     # The entrypoint override is load-bearing for a different reason: deploy_backend.sh
     # passes RUN_COMMAND/RUN_ARGS unconditionally once either is set, and proof_issuer_main

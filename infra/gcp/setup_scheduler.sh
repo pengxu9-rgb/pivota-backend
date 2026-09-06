@@ -284,10 +284,19 @@ echo "== worker service (delegating to deploy_worker.sh)"
 # REFUSES an explicit WORKERS under `preserve` rather than accepting one it would ignore. Since
 # this script defaults WORKERS to false unconditionally, forwarding it always would make every
 # ordinary `setup_scheduler.sh prod <a> <b>` reconcile run die on that guard.
+#
+# `env -u WORKERS` IS LOAD-BEARING, and omitting it broke a documented command. An operator who
+# writes `WORKERS=true ... setup_scheduler.sh prod <a> <b>` puts WORKERS in THIS script's own
+# environment, so the child inherits it no matter which branch below runs - simply not naming it
+# on the preserve branch does nothing. The arming command in infra/gcp/README.md is exactly that
+# shape, and with CONFIG at its default `preserve` it would hit deploy_worker.sh's guard, exit 2,
+# and `set -e` would kill this script before ONE Cloud Run Job or Scheduler trigger was
+# reconciled. Unsetting it in the child's environment is what actually restores "inert under
+# preserve". Caught in review, 2026-09-05.
 if [ "$CONFIG" = apply ]; then
-  CONFIG=apply WORKERS="$WORKERS" GCLOUD="$GCLOUD" "$HERE/deploy_worker.sh" "$ENV" "$BACKEND_TAG"
+  env CONFIG=apply WORKERS="$WORKERS" GCLOUD="$GCLOUD" "$HERE/deploy_worker.sh" "$ENV" "$BACKEND_TAG"
 else
-  CONFIG=preserve GCLOUD="$GCLOUD" "$HERE/deploy_worker.sh" "$ENV" "$BACKEND_TAG"
+  env -u WORKERS CONFIG=preserve GCLOUD="$GCLOUD" "$HERE/deploy_worker.sh" "$ENV" "$BACKEND_TAG"
 fi
 
 # ---------------------------------------------------------------- 2. Cloud Run Jobs

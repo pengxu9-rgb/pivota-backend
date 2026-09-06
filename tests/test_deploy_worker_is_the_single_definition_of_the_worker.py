@@ -37,7 +37,7 @@ PREV = "b" * 40
 
 
 def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bool = False,
-                 prev_image: str = PREV) -> Path:
+                 prev_image: str = PREV, describe_error: str = "") -> Path:
     """A `gcloud` that records every invocation and can fail on demand.
 
     Recording matters more than answering: the assertions below read the RECORDED argv of
@@ -47,15 +47,24 @@ def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bo
     binn = tmp_path / "bin"
     binn.mkdir(exist_ok=True)
     log = tmp_path / "calls.log"
+    argvlog = tmp_path / "argv.log"
     prev = (f"us-west1-docker.pkg.dev/pivota-shared/pivota/backend:{prev_image}"
             if prev_image else "")
     stub = binn / "gcloud"
+    # An empty `prev` models a service that does not exist. `describe_error` models the
+    # DIFFERENT thing the old code could not distinguish: the API failing for any other reason.
+    describe_error_block = (
+        f'echo "{describe_error}" >&2; exit 1;; *) ' if describe_error else ""
+    )
     stub.write_text(f"""#!/usr/bin/env bash
 # Flatten newlines: the probe program is a multi-line `python -c` argument, and a
 # line-based log would record only its first line — so an assertion about the probe's
 # CONTENT would silently be reading an empty string. Measured: that is exactly what
 # happened on the first run of this module.
 printf '%s\\n' "${{*//$'\\n'/ }}" >> {log}
+# ...and again, losslessly: args separated by \\037, calls by \\036, so a multi-line argument
+# (the probe's `python -c` program) survives intact for tests that EXECUTE it.
+printf '%s\\037' "$@" >> {argvlog}; printf '\\036' >> {argvlog}
 case "$1 $2" in
   "artifacts docker")
       {"exit 1" if image_missing else "exit 0"} ;;
@@ -63,7 +72,7 @@ esac
 if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
   case "$*" in
     *status.url*) echo "https://worker-xyz.a.run.app" ;;
-    *) printf '%s\\n' "{prev}" ;;
+    *) {describe_error_block}printf '%s\\n' "{prev}" ;;
   esac
   exit 0
 fi
@@ -91,6 +100,30 @@ def _deploys(calls: list[str]) -> list[str]:
     return [c for c in calls if c.startswith("run deploy worker")]
 
 
+def _argv_calls(tmp_path: Path) -> list[list[str]]:
+    raw = tmp_path / "argv.log"
+    if not raw.exists():
+        return []
+    return [[a for a in call.split("\x1f") if a]
+            for call in raw.read_bytes().decode().split("\x1e")]
+
+
+def _deploy_argvs(tmp_path: Path) -> list[list[str]]:
+    return [a for a in _argv_calls(tmp_path) if a[:3] == ["run", "deploy", "worker"]]
+
+
+def _flag(argv: list[str], name: str) -> str:
+    """The VALUE of a flag, by position.
+
+    Not a substring search, and that distinction is why this helper exists: `assert
+    "--max-instances 1" in sent` is satisfied by `--max-instances 10`, so the single-instance
+    invariant — the one thing that makes this the single-instance drainer — passed for a
+    ten-instance deploy. Found by a mutation audit, 2026-09-05.
+    """
+    assert name in argv, f"{name} was not passed to gcloud run deploy: {argv}"
+    return argv[argv.index(name) + 1]
+
+
 # ── the shape, measured off what the script actually sends ─────────────────────────────
 
 
@@ -102,13 +135,16 @@ def test_the_worker_is_deployed_as_exactly_one_instance(tmp_path):
     is `FOR UPDATE SKIP LOCKED`); the third-party side effects do not."""
     code, out, calls = _run(tmp_path, "prod", SHA)
     assert code == 0, f"the happy path must succeed:\n{out}"
-    deploys = _deploys(calls)
-    assert len(deploys) == 1, f"expected exactly one deploy, got {deploys}"
-    sent = deploys[0]
-    assert "--min-instances 1" in sent and "--max-instances 1" in sent, (
-        f"the worker must be deployed at exactly one instance, got: {sent}"
+    argvs = _deploy_argvs(tmp_path)
+    assert len(argvs) == 1, f"expected exactly one deploy, got {len(argvs)}"
+    argv = argvs[0]
+    # EXACT equality: `"--max-instances 1" in sent` is also true of `--max-instances 10`.
+    assert _flag(argv, "--min-instances") == "1", f"min-instances: {argv}"
+    assert _flag(argv, "--max-instances") == "1", f"max-instances: {argv}"
+    assert _flag(argv, "--concurrency") == "1", f"concurrency: {argv}"
+    assert _flag(argv, "--cpu") == "1" and _flag(argv, "--memory") == "2Gi", (
+        f"the worker's cpu/memory must not drift to web's: {argv}"
     )
-    assert "--concurrency 1" in sent, f"expected --concurrency 1, got: {sent}"
 
 
 def test_the_worker_never_takes_public_traffic(tmp_path):
@@ -220,12 +256,17 @@ def test_an_unhealthy_worker_fails_the_deploy_and_is_rolled_back(tmp_path):
     instance alive and draining alongside the old one."""
     code, out, calls = _run(tmp_path, "prod", SHA, probe_fails=True)
     assert code != 0, f"a worker whose scheduler did not come up must fail the deploy:\n{out}"
-    deploys = _deploys(calls)
-    assert len(deploys) == 2, (
-        f"expected a deploy then a rollback deploy, got {len(deploys)}:\n{deploys}"
+    argvs = _deploy_argvs(tmp_path)
+    assert len(argvs) == 2, f"expected a deploy then a rollback deploy, got {len(argvs)}"
+    # THE IMAGE IS THE ROLLBACK. Asserting `PREV in <the whole line>` was satisfied by the
+    # PIVOTA_COMMIT_SHA restamp alone, so a rollback that redeployed the BROKEN image while
+    # stamping the old sha passed — producing exactly the "reports the sha it failed to run"
+    # state this test names. Found by a mutation audit, 2026-09-05.
+    assert _flag(argvs[0], "--image").endswith(f":{SHA}"), "the forward deploy shipped the wrong image"
+    assert _flag(argvs[1], "--image").endswith(f":{PREV}"), (
+        f"the rollback did not redeploy the previous IMAGE: {_flag(argvs[1], '--image')}"
     )
-    assert PREV in deploys[1], f"the rollback did not target the previous image: {deploys[1]}"
-    assert f"PIVOTA_COMMIT_SHA={PREV}" in deploys[1], (
+    assert f"PIVOTA_COMMIT_SHA={PREV}" in " ".join(argvs[1]), (
         "the rollback restamped the wrong commit — the service would report the sha it "
         "failed to run"
     )
@@ -239,6 +280,113 @@ def test_a_failed_probe_with_no_previous_image_still_fails(tmp_path):
     assert len(_deploys(calls)) == 1, "nothing to roll back to, so exactly one deploy"
 
 
+# ── the probe program, EXECUTED ────────────────────────────────────────────────────────
+# Everything above asserts the probe's TEXT — that the call contains "__scheduler_health",
+# "fireable_job_count". That is a paraphrase, and a mutation audit proved it: replacing the
+# whole verdict with `ok = True` left this module green, because those strings still appear
+# in the diagnostic print(). So the program is lifted out of the recorded argv and RUN
+# against a local HTTP server, once per payload the real worker can produce.
+
+
+def _probe_program(tmp_path: Path) -> str:
+    """The exact `python -c` program the script ships, byte for byte.
+
+    From the LOSSLESS argv log, not the flattened line log: the latter joins the program's
+    lines into one and glues the following `--quiet` onto the end, so the recovered text is a
+    SyntaxError rather than the shipped program — a harness artifact that would be reported
+    as a defect in the script.
+    """
+    _run(tmp_path, "prod", SHA)
+    for args in _argv_calls(tmp_path):
+        if args[:3] == ["run", "jobs", "create"]:
+            for a in args:
+                if a.startswith("--args=") and "^|^-c|" in a:
+                    return a.split("^|^-c|", 1)[1]
+    raise AssertionError("no `run jobs create` carrying a probe program was recorded")
+
+
+@pytest.mark.parametrize(
+    "health, build, expect_ok, why",
+    [
+        ({"state_name": "RUNNING", "boot_error": None, "fireable_job_count": 7,
+          "worker_enabled": True}, {"full_sha": SHA}, True,
+         "a healthy armed worker on the right commit is the only thing that may pass"),
+        ({"state_name": "RUNNING", "boot_error": None, "fireable_job_count": 0,
+          "worker_enabled": False}, {"full_sha": SHA}, False,
+         "fireable_job_count 0 means _add_job registered nothing - the drainers are disarmed"),
+        ({"state_name": "RUNNING", "boot_error": "boom", "fireable_job_count": 7,
+          "worker_enabled": True}, {"full_sha": SHA}, False,
+         "a scheduler that raised on boot still answers 200; boot_error is the only tell"),
+        ({"state_name": "PAUSED", "boot_error": None, "fireable_job_count": 7,
+          "worker_enabled": True}, {"full_sha": SHA}, False,
+         "PAUSED fires nothing, and `running` cannot distinguish it from RUNNING"),
+        ({"state_name": "RUNNING", "boot_error": None, "fireable_job_count": 7,
+          "worker_enabled": True}, {"full_sha": "0" * 40}, False,
+         "a stale commit means the restamp did not take"),
+        ({"state_name": "RUNNING", "boot_error": None, "fireable_job_count": 7,
+          "worker_enabled": True}, {}, False,
+         "NO sha must fail: full_sha is None exactly when PIVOTA_COMMIT_SHA is missing, which "
+         "is the 'new code under the old commit' state the restamp exists to prevent"),
+        ({"state_name": "RUNNING", "boot_error": None, "fireable_job_count": 7,
+          "worker_enabled": True}, {"full_sha": ""}, False,
+         "an empty sha is the same absence, spelled differently"),
+    ],
+)
+def test_the_probe_program_verdict(tmp_path, health, build, expect_ok, why):
+    import http.server, json as _json, threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _json.dumps(health if "scheduler" in self.path else build).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        prog = _probe_program(tmp_path).replace(
+            "https://worker-xyz.a.run.app", f"http://127.0.0.1:{srv.server_address[1]}"
+        )
+        done = subprocess.run(["python3", "-c", prog], capture_output=True, text=True, timeout=60)
+    finally:
+        srv.shutdown()
+    ok = done.returncode == 0
+    assert ok == expect_ok, (
+        f"probe returned rc={done.returncode} (ok={ok}), expected ok={expect_ok}.\n"
+        f"WHY THIS CASE EXISTS: {why}\nhealth={health}\nbuild={build}\n"
+        f"output={done.stdout}{done.stderr}"
+    )
+
+
+def test_an_unreadable_current_image_refuses_before_deploying(tmp_path):
+    """`|| true` on the describe could not tell "no such service" from "the API failed", and
+    both produced an empty PREV_IMAGE. That reads as a first deploy, silently disabling the
+    rollback — and a probe failure then strands production on the broken image with nothing to
+    go back to. An unknown current state must refuse while refusing is still free."""
+    code, out, calls = _run(tmp_path, "prod", SHA,
+                            describe_error="ERROR: (gcloud.run.services.describe) INTERNAL: 500")
+    assert code != 0, f"an unreadable current image must refuse:\n{out}"
+    assert not _deploys(calls), (
+        "it deployed anyway. The point is to refuse BEFORE the service is changed, while "
+        "there is still something to roll back to."
+    )
+
+
+def test_a_genuinely_absent_service_is_still_created(tmp_path):
+    """The counterpart, and why the test above is not merely 'refuse on any error': a real
+    first deploy must still work, or the refusal has broken bootstrapping."""
+    code, out, calls = _run(tmp_path, "prod", SHA, prev_image="",
+                            describe_error="ERROR: Cannot find service worker (NOT_FOUND)")
+    assert code == 0, f"a genuinely absent service must still be created:\n{out}"
+    assert len(_deploys(calls)) == 1
+
+
 # ── one definition ─────────────────────────────────────────────────────────────────────
 
 
@@ -246,9 +394,24 @@ def test_setup_scheduler_does_not_carry_its_own_copy_of_the_worker_deploy():
     """The whole point. Two definitions of the worker's shape drift, and the drift is
     invisible until production disagrees with the file someone was reading."""
     text = SCHEDULER.read_text()
-    assert "deploy_worker.sh" in text, (
-        "setup_scheduler.sh no longer delegates the worker deploy — if it grew its own "
-        "copy back, the shape now has two definitions again."
+    # STRIP COMMENTS FIRST. `"deploy_worker.sh" in text` was satisfied by the prose block
+    # explaining the delegation, so a script that had stopped deploying the worker entirely
+    # still passed — the "mentions it in a comment" hole this module's own docstring warns
+    # about, in this module. Found by a mutation audit, 2026-09-05.
+    code_only = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    assert re.search(r'deploy_worker\.sh"?\s', code_only), (
+        "setup_scheduler.sh no longer CALLS deploy_worker.sh (a comment naming it does not "
+        "count) — if it grew its own copy back, the shape has two definitions again."
+    )
+    assert '"$ENV" "$BACKEND_TAG"' in code_only, (
+        "the delegation no longer passes (env, tag) in that order — deploy_worker.sh takes "
+        "`staging|prod <tag>`, so swapping them deploys a tag named 'prod'."
+    )
+    assert "env -u WORKERS" in code_only, (
+        "the preserve branch no longer unsets WORKERS for the child. WORKERS arrives through "
+        "the ENVIRONMENT, so not naming it does nothing: deploy_worker.sh's guard then kills "
+        "`WORKERS=true ... setup_scheduler.sh` — the documented arming command — before a "
+        "single Cloud Run Job or Scheduler trigger is reconciled."
     )
     body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
     assert not re.search(r"run deploy worker\b", body), (
@@ -260,7 +423,10 @@ def test_setup_scheduler_does_not_carry_its_own_copy_of_the_worker_deploy():
 def test_the_workflow_and_the_scheduler_script_call_the_same_file():
     """If CI rolled the worker one way and the reconcile script another, the two would
     produce different services and only one of them would be reviewed."""
-    workflow = (REPO / ".github" / "workflows" / "deploy-prod.yml").read_text()
+    workflow = "\n".join(
+        l for l in (REPO / ".github" / "workflows" / "deploy-prod.yml").read_text().splitlines()
+        if not l.lstrip().startswith("#")
+    )
     assert "deploy_worker.sh" in workflow, (
         "deploy-prod.yml does not call deploy_worker.sh, so CI is not using the single "
         "definition this module is holding down."

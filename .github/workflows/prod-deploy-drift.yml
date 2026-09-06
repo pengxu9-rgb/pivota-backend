@@ -145,23 +145,53 @@ jobs:
             printf '%s' "$sha"
           }
 
-          # worker and proof-issuer: the image tag on the serving revision, via the Cloud Run admin
-          # API. Neither can be probed from a GitHub runner - worker is `--ingress internal`, and
-          # Google's front end answers 404 before the request reaches the app even with a valid
-          # identity token.
+          # worker and proof-issuer: the image on the revision that is actually SERVING, via the
+          # Cloud Run admin API. Neither can be probed from a GitHub runner - worker is
+          # `--ingress internal`, and Google's front end answers 404 before the request reaches
+          # the app even with a valid identity token.
           #
-          # SAY WHAT THIS SIGNAL IS WORTH. An image tag is the CONFIGURATION, not a running
+          # NOT `spec.template`, AND THIS IS THE WHOLE CORRECTNESS OF THE JOB. `spec.template` is
+          # the template of the LAST REVISION CREATED, which is not the same thing as the one
+          # taking traffic. deploy_backend.sh - which is how proof-issuer ships - creates every
+          # revision `--tag c-<sha> --no-traffic`, health-checks it, and only then promotes; if
+          # that health check fails it exits 1 and leaves the candidate at 0% with the PREVIOUS
+          # revision still serving. Read from `spec.template`, this job would then report the new
+          # sha and go green for a deploy that FAILED, and keep doing so - an alarm quietly
+          # certifying the success of the exact event it exists to catch. Resolve the 100%-traffic
+          # revision and read ITS image instead. Found in review, 2026-09-05.
+          #
+          # A SPLIT traffic state has no single answer, so it is refused rather than guessed at.
+          # That is not hypothetical tidiness: a 0%-traffic candidate left behind by a
+          # half-finished deploy is precisely the state this job most needs to not paper over.
+          #
+          # SAY WHAT THIS SIGNAL IS WORTH. An image tag is still the CONFIGURATION, not a running
           # process: it cannot see a revision that boots and does nothing, which for the worker is
           # a real and silent failure mode (a scheduler that raised on boot still serves 200). The
           # deploy-time check for that lives in deploy_worker.sh, which probes /__scheduler_health
           # from inside the VPC. What this job answers is narrower and is the question it was
-          # built for: is the deployed commit the one main says it should be.
+          # built for: is the commit that is SERVING the one main says it should be.
           live_sha_image(){
-            local svc="$1" image
-            image="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 \
-              --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)"
-            [ -n "$image" ] || { echo "::error::could not describe Cloud Run service '$svc' - what it runs is unknown" >&2; return 1; }
-            printf '%s' "${image##*:}"
+            local svc="$1" rev image tag
+            rev="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 --format=json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); live=[t["revisionName"] for t in (d.get("status",{}).get("traffic") or []) if t.get("percent")==100 and t.get("revisionName")]; print(live[0] if len(live)==1 else "")' 2>/dev/null || true)"
+            if [ -z "$rev" ]; then
+              echo "::error::could not resolve a single 100%-traffic revision for '$svc' - the service is" >&2
+              echo "::error::either undescribable or its traffic is split. What it serves is unknown." >&2
+              return 1
+            fi
+            image="$(gcloud run revisions describe "$rev" --project pivota-prod --region us-west1 --format='value(spec.containers[0].image)' 2>/dev/null || true)"
+            [ -n "$image" ] || { echo "::error::could not describe revision '$rev' of '$svc' - what it runs is unknown" >&2; return 1; }
+            tag="${image##*:}"
+            # The tag is about to be handed to `git cat-file` / `git merge-base` as a REVISION
+            # EXPRESSION, so ANY string git can resolve would be accepted as "the live commit".
+            # A moving tag is the realistic way that happens - an image tagged `latest`, or `main`,
+            # resolves against this checkout and the job reports "running main" having compared
+            # production to itself. Demand a full sha, the same check deploy-prod.yml applies to
+            # its dispatch input. A digest ref (`...@sha256:<64hex>`) is refused too: 64, not 40.
+            case "$tag" in
+              ""|*[!0-9a-f]*) echo "::error::'$svc' serves image tag '$tag', which is not a commit sha - refusing to read it as one" >&2; return 1 ;;
+            esac
+            [ "${#tag}" = 40 ] || { echo "::error::'$svc' serves image tag '$tag' (${#tag} chars, want 40) - refusing to read it as a commit" >&2; return 1; }
+            printf '%s' "$tag"
           }
 
           # ── THE CLASSIFICATION, UNCHANGED IN SUBSTANCE, NOW APPLIED PER SERVICE ────────────────
@@ -263,7 +293,11 @@ jobs:
           # An unreadable service is NOT a passing one. Whatever it runs is unknown, and this job's
           # entire job is to refuse to let "unknown" read as "fine".
           [ "$UNREADABLE" = 0 ] || { echo "::error::at least one service could not be read - see above"; exit 1; }
-          [ -n "$DRIFTED" ] || { echo "all services are running main"; exit 0; }
+          # "no service is ALARMING" is not the same claim as "everything is on main" - a
+          # docs-only gap and a merge inside the grace window both pass, deliberately, while the
+          # service really is behind. Saying the stronger thing would make the passing line a
+          # small lie, and this job's whole value is that its output can be believed.
+          [ -n "$DRIFTED" ] || { echo "no service is drifted (some may be behind but forgiven - see above)"; exit 0; }
 
           echo "::error::drifted:$DRIFTED"
           cat <<'EOF'

@@ -600,6 +600,18 @@ jobs:
           # cpu 2 / 4Gi happen to equal web's prod constants today. Pinned explicitly anyway: they
           # are only equal by coincidence, and the next change to web's budget must not silently
           # become a change to this service too.
+          #
+          # MAX_INSTANCES=20 IS CHECKED AGAINST THE POOL BUDGET, and that is worth writing down
+          # because it is not obvious a pin can make a deploy REFUSE. The preserve-mode guard in
+          # deploy_backend.sh is not scoped to web: it computes live DB_POOL_MAX_SIZE x the
+          # maxScale this deploy would apply, against POOL_FLEET_BUDGET (default 180, sized when
+          # web's MAX was 10). Measured on prod proof-issuer 2026-09-05: DB_POOL_MAX_SIZE=6, so
+          # 6 x 20 = 120, inside the budget - and it holds no DATABASE_URL at all (MOUNT_DB
+          # defaults to 0 for this service), so that pool is nominal. If either changes - a DSN
+          # gets mounted, or the pool is raised past 9 - this job starts failing closed with
+          # "REFUSING to deploy": safe, but it would leave proof-issuer undeployed and the drift
+          # alarm red. Set POOL_FLEET_BUDGET here deliberately at that point rather than widening
+          # the budget everything else shares.
           SERVICE=proof-issuer \
           IMAGE_NAME=backend \
           ENV_PREFIX=proofissuer \

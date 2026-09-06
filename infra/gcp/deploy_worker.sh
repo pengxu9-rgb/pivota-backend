@@ -107,8 +107,34 @@ CPU=1; MEM=2Gi; CONCURRENCY=1; MIN=1; MAX=1
 # it back. Read from the service rather than remembered from a previous run of this script: the
 # thing to roll back to is whatever is actually serving, including a revision this file never
 # deployed.
+# ONE trap for every temp file this script makes. `trap` REPLACES the handler rather than
+# appending, so a second `trap ... EXIT` further down would silently disable the first and leak
+# whatever it guarded - which is what happened when each temp file brought its own.
+_TMPFILES=""
+_cleanup(){ [ -z "$_TMPFILES" ] || rm -f $_TMPFILES; }
+trap _cleanup EXIT INT TERM
+
+# `|| true` ON A FAILING describe IS NOT SAFE HERE, and that was the bug: it cannot tell "the
+# service does not exist yet" from "the API returned 500 / auth blipped / we were throttled".
+# Both produced an empty PREV_IMAGE, which reads as a first deploy, prints a false "does not exist
+# yet", and - the part that matters - leaves NOTHING TO ROLL BACK TO. A probe failure after that
+# exits 1 with production stranded on the broken image. So: keep stderr, and let only a genuine
+# not-found mean absent. Anything else refuses while refusing is still free.
+PREV_ERR="$(mktemp)"; _TMPFILES="$_TMPFILES $PREV_ERR"
+PREV_RC=0
 PREV_IMAGE="$("$GCLOUD" run services describe worker --project "$PROJECT" --region "$REGION" \
-  --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)"
+  --format='value(spec.template.spec.containers[0].image)' 2>"$PREV_ERR")" || PREV_RC=$?
+if [ "$PREV_RC" != 0 ]; then
+  if grep -qiE 'NOT_FOUND|could not be found|does not exist|not found' "$PREV_ERR"; then
+    PREV_IMAGE=""
+  else
+    echo "could not read the worker's current image (gcloud exited $PREV_RC):" >&2
+    sed 's/^/  /' "$PREV_ERR" >&2
+    echo "Refusing to deploy: without knowing what is running there is nothing to roll back to," >&2
+    echo "and a failed probe would leave production on the new image with no way back." >&2
+    exit 1
+  fi
+fi
 if [ -n "$PREV_IMAGE" ]; then
   echo "worker is on ${PREV_IMAGE##*:}"
   if [ "$PREV_IMAGE" = "$IMAGE" ]; then
@@ -126,7 +152,7 @@ CONFIG_ARGS=()
 if [ "$CONFIG" = apply ]; then
   [ -f "$ENV_FILE" ] && [ -f "$SECRETS_FILE" ] \
     || { echo "CONFIG=apply needs $ENV_FILE / $SECRETS_FILE - run port_railway_env.py first (it reads Railway, which is retired)" >&2; exit 1; }
-  MERGED=$(mktemp); chmod 600 "$MERGED"; trap 'rm -f "$MERGED"' EXIT INT TERM
+  MERGED=$(mktemp); chmod 600 "$MERGED"; _TMPFILES="$_TMPFILES $MERGED"
   # gcloud's --env-vars-file resolves a DUPLICATE KEY to the FIRST occurrence, not the last, so an
   # override appended after the ported file does nothing whenever that file already defines the
   # key. Strip the keys we are about to set before appending them.
@@ -191,14 +217,21 @@ PROBE_JOB="verify-worker-$$-$RANDOM"
 # EXPECT the tag we just shipped. Asking the RUNNING PROCESS what commit it is is a stronger claim
 # than reading the image off the service spec: the spec says what was requested, /__build says what
 # is executing. `full_sha` and `commit_sha` are both top-level keys of _runtime_build_payload().
+#
+# AN ABSENT SHA IS A FAILURE, not a pass. main.py computes `full_sha = commit_sha or None` from
+# PIVOTA_COMMIT_SHA, which nothing in Cloud Run injects and which THIS DEPLOY sets - so a process
+# reporting no sha is one that did not get the variable this script just wrote, which is precisely
+# the "new code under the old commit" state the restamp exists to prevent. An earlier version
+# guarded this with `if sha and ...`, so an empty string skipped the comparison entirely and the
+# probe exited 0 having verified nothing about the commit. Caught in review, 2026-09-05.
 PROBE_PY="import json,urllib.request,sys
 d=json.load(urllib.request.urlopen('$WORKER_URL/__scheduler_health',timeout=25))
 b=json.load(urllib.request.urlopen('$WORKER_URL/__build',timeout=25))
 sha=str(b.get('full_sha') or b.get('commit_sha') or '')
 print('PROBE state='+str(d.get('state_name'))+' fireable='+str(d.get('fireable_job_count'))+' worker_enabled='+str(d.get('worker_enabled'))+' boot_error='+str(d.get('boot_error'))+' sha='+sha)
 ok = d.get('state_name')=='RUNNING' and not d.get('boot_error') and (d.get('fireable_job_count') or 0)>0
-if sha and sha != '$TAG' and not sha.startswith('$TAG'):
-    print('SHA MISMATCH: running '+sha+' but deployed $TAG'); ok=False
+if sha != '$TAG' and not sha.startswith('$TAG'):
+    print('SHA MISMATCH: running '+(sha or '<none>')+' but deployed $TAG'); ok=False
 sys.exit(0 if ok else 1)"
 # ^|^ below sets the --args delimiter to `|`, because gcloud splits --args on COMMAS by default and
 # this probe is Python full of them. That makes `|` the one character the program may not contain -
@@ -223,16 +256,33 @@ if [ "$create_rc" != 0 ]; then
   echo "  gcloud run services describe worker --project $PROJECT --region $REGION" >&2
   exit 1
 fi
-"$GCLOUD" run jobs execute "$PROBE_JOB" --region "$REGION" --project "$PROJECT" --wait --quiet >/dev/null 2>&1 \
-  || probe_rc=$?
+PROBE_ERR="$(mktemp)"; _TMPFILES="$_TMPFILES $PROBE_ERR"
+"$GCLOUD" run jobs execute "$PROBE_JOB" --region "$REGION" --project "$PROJECT" --wait --quiet \
+  >/dev/null 2>"$PROBE_ERR" || probe_rc=$?
 # Best-effort cleanup, never fatal: a leaked probe JOB costs nothing (jobs hold no instances, which
 # is why this pattern is safe here and a tagged candidate REVISION is not).
 "$GCLOUD" run jobs delete "$PROBE_JOB" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
 
 if [ "$probe_rc" != 0 ]; then
-  echo "::error::the worker deployed but its scheduler did not come up healthy on $TAG." >&2
+  echo "::error::the worker deployed but did not verify on $TAG." >&2
   echo "The probe asserts state_name=RUNNING, no boot_error, fireable_job_count>0, and that the" >&2
   echo "running process reports this commit. Its line is in the job's logs:" >&2
+  # `jobs execute` exits non-zero both when the TASK failed and when the API CALL failed, and
+  # those are different facts: the first is evidence about the worker, the second is evidence
+  # about nothing. Do not assert the scheduler is broken on the strength of a quota error.
+  if [ -s "$PROBE_ERR" ]; then
+    echo "gcloud also wrote to stderr, so this may be an API failure rather than a verdict:" >&2
+    sed 's/^/  /' "$PROBE_ERR" >&2
+  fi
+  # AND THE MOST LIKELY NON-BUG CAUSE, named so it is not misdiagnosed as a boot failure:
+  # services/audit_scheduler.py's _add_job registers a job ONLY `if worker_enabled`, so a worker
+  # with AUDIT_WORKER_ENABLED=false reports state RUNNING, boot_error None, and fireable_job_count
+  # exactly 0. That is a DISARMED worker, not a broken one - and since this script deliberately
+  # cannot set that flag, the fix is not here.
+  echo "If the probe line says worker_enabled=False the drainers are DISARMED and this is NOT a" >&2
+  echo "boot failure - arm them deliberately, then redeploy:" >&2
+  echo "  gcloud run services update worker --region $REGION --project $PROJECT \\" >&2
+  echo "    --update-env-vars AUDIT_WORKER_ENABLED=true" >&2
   echo "  gcloud logging read 'resource.labels.job_name=\"$PROBE_JOB\"' --project $PROJECT --limit 20" >&2
   if [ -n "$PREV_IMAGE" ] && [ "$PREV_IMAGE" != "$IMAGE" ]; then
     echo "rolling back to ${PREV_IMAGE##*:}" >&2

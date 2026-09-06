@@ -202,7 +202,17 @@ def test_the_web_deploy_does_not_override_the_shape_it_is_budgeted_for() -> None
 
     job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["deploy"]
     body = yaml.dump(job)
+    # BOTH SPELLINGS. `VAR=value cmd` inline in a `run:` and a YAML `env:` mapping
+    # (`CONCURRENCY_LIMIT: 80`) reach deploy_backend.sh identically, and checking only the
+    # first let the second through — restoring the shape that wedged production twice, with
+    # this test green. A ratchet matching one syntactic form permits the others. Found by a
+    # mutation audit, 2026-09-05.
     for override in SHAPE_OVERRIDES:
+        assert f"{override}:" not in body, (
+            f"the `web` deploy job sets {override} as an `env:` key, which reaches "
+            "deploy_backend.sh exactly as the inline form does and bypasses the connection "
+            "budget every other test in this module pins."
+        )
         assert f"{override}=" not in body, (
             f"the `web` deploy job sets {override}, bypassing the connection budget that "
             f"every other test in this module is pinning. web's shape lives in "
@@ -223,9 +233,12 @@ def test_an_override_reaches_the_deploy_when_it_is_given(tmp_path: Path) -> None
         # budget, which is correct behaviour and not what this case is measuring.
         "POOL_FLEET_BUDGET": "0",
     })
-    assert _flag(argv, "--concurrency") == "80", (
-        f"CONCURRENCY_LIMIT did not reach the deploy: {argv}"
-    )
-    assert _flag(argv, "--max-instances") == "20", (
-        f"MAX_INSTANCES did not reach the deploy: {argv}"
-    )
+    # ALL of them. Asserting only two left --cpu and --memory unplumbed-and-unnoticed; they
+    # are harmless today only because proof-issuer's values coincide with web's constants,
+    # which the workflow's own comment calls a coincidence. Found by a mutation audit.
+    for flag, want in (("--concurrency", "80"), ("--max-instances", "20"), ("--cpu", "2"),
+                       ("--memory", "4Gi"), ("--min-instances", "2")):
+        assert _flag(argv, flag) == want, (
+            f"the override for {flag} did not reach the deploy (got {_flag(argv, flag)!r}, "
+            f"want {want!r}): {argv}"
+        )
