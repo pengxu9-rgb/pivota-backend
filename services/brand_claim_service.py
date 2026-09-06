@@ -471,13 +471,16 @@ async def declare_official_domain(
     if not _is_registrable_base(host):
         return {"status": DECLARE_NOT_REGISTRABLE, "domain": host}
 
+    # STRICT: the resolver's default swallows a DB error into None, and `None`
+    # reads as "nobody owns it" below -- a grant. The except was unreachable
+    # through the real function and only its monkeypatched test ever hit it.
     owner = None
     try:
-        owner = await mod.resolve_verified_merchant_for_domain(host)
+        owner = await mod.resolve_verified_merchant_for_domain(host, strict=True)
     except Exception:  # noqa: BLE001 — a lookup failure must not grant the write
         logger.warning("declare_official_domain owner lookup failed for %s",
                        host, exc_info=True)
-        return {"status": DECLARE_TAKEN, "domain": host}
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
     if owner and str(owner) != str(merchant_id):
         return {"status": DECLARE_TAKEN, "domain": host}
     # `resolve_verified_merchant_for_domain` only finds `verified` owners, but
@@ -492,7 +495,9 @@ async def declare_official_domain(
     except Exception:  # noqa: BLE001 — fails CLOSED, like the lookup above
         logger.warning("declare_official_domain proof lookup failed for %s",
                        host, exc_info=True)
-        return {"status": DECLARE_TAKEN, "domain": host}
+        # UNAVAILABLE, not TAKEN: "we could not check" told as "a rival owns
+        # your domain" is a 409 that lies about the world, on our outage.
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
     if proven_elsewhere:
         return {"status": DECLARE_TAKEN, "domain": host}
 
@@ -533,8 +538,28 @@ async def declare_official_domain(
     #     table exists to remove; and
     #   - the audit basis stopped recording a host the run demonstrably used.
     #
-    # A declaration can therefore only ever create a genuinely NEW host, and
-    # `declared` rows and the used set stay disjoint by construction.
+    # A declaration can therefore only ever create a host that is NEW AT
+    # DECLARE TIME. That is the whole guarantee this guard gives -- not
+    # "disjoint by construction", which three review rounds asserted and the
+    # fourth falsified: declare anua.us before the catalog carries it, then
+    # ingest, and inference produces a host whose row says `declared`. The
+    # other ordering is healed elsewhere: the liveness seeder promotes such a
+    # row to `inferred` (services/official_domain_liveness.seed_inferred_domains)
+    # and the audit basis records a declared host that inference also produces
+    # (services/audit_evidence_builder.record_audit_basis). Both read the USED
+    # set, not the source column alone.
+    #
+    # The CAP is checked before this load on purpose: the owned-set read is a
+    # 500-row catalog scan plus an onboarding read on an unrate-limited route,
+    # and a merchant already at the cap should not get it for free.
+    declared_count = sum(
+        1 for r in existing.values()
+        if str(r.get("source") or "") == mod.SOURCE_DECLARED
+    )
+    if declared_count >= _MAX_DECLARED_PER_MERCHANT:
+        return {"status": DECLARE_TOO_MANY, "domain": host,
+                "declared_count": declared_count}
+
     try:
         already = await merchant_owned_domains(str(merchant_id), strict=True)
     except Exception:  # noqa: BLE001 — fails CLOSED, and says so
@@ -543,18 +568,6 @@ async def declare_official_domain(
         return {"status": DECLARE_UNAVAILABLE, "domain": host}
     if host in already:
         return {"status": DECLARE_ALREADY_KNOWN, "domain": host}
-
-    # Counted AFTER the already-known checks, so it bounds only rows a
-    # declaration can actually create. Keyed on the whole stored set rather
-    # than `host not in existing`, which skipped the cap for any host that had
-    # a row of any source — the same lever as the flip above.
-    declared_count = sum(
-        1 for r in existing.values()
-        if str(r.get("source") or "") == mod.SOURCE_DECLARED
-    )
-    if declared_count >= _MAX_DECLARED_PER_MERCHANT:
-        return {"status": DECLARE_TOO_MANY, "domain": host,
-                "declared_count": declared_count}
 
     # INSERT-ONLY, never the upsert. The upsert's `source = excluded.source`
     # is the lever behind every downgrade this function has had to guard

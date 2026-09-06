@@ -304,6 +304,25 @@ INSERT INTO merchant_official_domains (
 ON CONFLICT (merchant_id, domain) DO NOTHING
 """
 
+# THE HEAL. A `declared` row whose host inference has since started producing is
+# in the USED set (the inferred branch counts it) but the liveness due-queues
+# skip `declared` and the audit basis drops it -- a host that can never be
+# measured dead while it stays counted official, reachable with no DB error and
+# no race: declare anua.us before the catalog carries it, then ingest. Refusing
+# the declaration only covers the order in which inference came FIRST. The
+# liveness seeder runs this when inference catches up: the row becomes what it
+# would have been had inference come first. Grants nothing new -- the host was
+# already used -- and touches only `declared` rows, never a proven one.
+PROMOTE_DECLARED_TO_INFERRED_SQL = """
+UPDATE merchant_official_domains
+   SET source              = 'inferred',
+       verification_status = NULL,
+       updated_at          = :now
+ WHERE merchant_id = :merchant_id
+   AND domain = :domain
+   AND source = 'declared'
+"""
+
 # The liveness sweep's write. It touches ONLY the liveness columns: a probe
 # knows nothing about who asserted the domain, and an observation must never
 # rewrite provenance.
@@ -483,7 +502,34 @@ async def insert_declared_domain(*, merchant_id: str, domain: str) -> Optional[s
     )
     return str(row["source"]) if row is not None and row["source"] else None
 
-async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
+
+async def promote_declared_to_inferred(
+    *, merchant_id: str, domain: str, now: Optional[datetime] = None,
+) -> bool:
+    """Turn a `declared` row into `inferred` because inference now produces the
+    host. Returns True when the row is now `inferred` (whether this call changed
+    it), False when there is no row or it carries another source. Guarded in SQL
+    by `source = 'declared'`, so it can never touch a proven row. RAISES on a DB
+    error: the caller is the liveness seeder, which treats a failed heal as a
+    failed seed rather than as a row it can skip.
+    """
+    if not merchant_id or not domain:
+        return False
+    await ensure_merchant_official_domains_table()
+    await database.execute(
+        PROMOTE_DECLARED_TO_INFERRED_SQL,
+        {"merchant_id": merchant_id, "domain": domain, "now": now or _now_utc()},
+    )
+    row = await database.fetch_one(
+        "SELECT source FROM merchant_official_domains "
+        "WHERE merchant_id = :merchant_id AND domain = :domain",
+        {"merchant_id": merchant_id, "domain": domain},
+    )
+    return row is not None and str(row["source"]) == SOURCE_INFERRED
+
+async def resolve_verified_merchant_for_domain(
+    domain: str, *, strict: bool = False,
+) -> Optional[str]:
     """The merchant that has PROVEN this domain is theirs, or None.
 
     `execution_routes.merchant_id` looks like the natural answer to "whose store
@@ -502,6 +548,9 @@ async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
         LIMIT 2 exists to SEE the second row rather than silently take the first.
       * a lookup failure is not an absence; it returns None either way, but the
         caller must treat None as "we do not know", never as "not a merchant".
+        A caller that cannot do that -- a GUARD deciding whether to WRITE --
+        passes `strict=True` and gets the exception instead: `None` reads as
+        "nobody owns it" in `if owner and ...`, which is a grant.
     """
     normalized = str(domain or "").strip().lower().lstrip(".")
     if not normalized:
@@ -518,6 +567,8 @@ async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
             },
         )
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning(
             "resolve_verified_merchant_for_domain failed for %s: %s",
             normalized, str(exc)[:200],

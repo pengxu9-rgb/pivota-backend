@@ -1338,21 +1338,33 @@ async def record_audit_basis(
         # so a domain added between two runs moves the headline number with no
         # change in the world. `dead` rows are excluded here for the same reason
         # the report excludes them — the set recorded must be the set used.
-        # `declared` EXCLUDED, and only `declared`. The comment above
-        # says "the set recorded must be the set used", and `declared` rows are
-        # stored but deliberately NOT used — they do not widen the set that
-        # decides first_party. Recording them would write a false claim about
-        # which domains a run measured into an INSERT-ONLY basis row, and,
-        # because official_domains is a COMPARABILITY key, would make that run
-        # non-comparable with every prior one while moving no number.
+        # `declared` EXCLUDED -- unless inference ALSO produces the host. The
+        # comment above says "the set recorded must be the set used", and a
+        # `declared` row is stored but NOT used: it does not widen the set that
+        # decides first_party. Recording it would write a false claim into an
+        # INSERT-ONLY basis row and, because official_domains is a
+        # COMPARABILITY key, make the run non-comparable while moving no
+        # number. But the used set is (stored official) UNION (inferred), and a
+        # host declared BEFORE the catalog carried it is used by the inferred
+        # branch while its row still says `declared`. A source-only filter
+        # dropped a host the run demonstrably used -- the D2 shape, one
+        # ordering later. So the filter asks the same question the report
+        # asks: is this host in the used set. Best-effort like the rest of
+        # this snapshot: an inference failure records the source-only view.
         from db.merchant_official_domains import SOURCE_DECLARED
+        from services.brand_claim_service import _inferred_merchant_hosts
 
+        rows = await list_official_domains(str(merchant_id))
+        inferred = set()
+        if any(str(r.get("source") or "") == SOURCE_DECLARED for r in rows):
+            inferred = await _inferred_merchant_hosts(str(merchant_id))
         domains = [
             row.get("domain")
-            for row in (await list_official_domains(str(merchant_id)))
+            for row in rows
             if row.get("domain")
             and not is_excluded(row.get("liveness_status"))
-            and str(row.get("source") or "") != SOURCE_DECLARED
+            and (str(row.get("source") or "") != SOURCE_DECLARED
+                 or row.get("domain") in inferred)
         ]
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning(

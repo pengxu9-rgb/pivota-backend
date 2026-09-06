@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_merchant_official_domains_domain;

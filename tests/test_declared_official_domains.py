@@ -79,7 +79,7 @@ async def test_a_declared_domain_does_not_join_the_owned_set(monkeypatch):
 async def test_a_domain_another_merchant_PROVED_cannot_be_declared(monkeypatch):
     """Declaration is cheap and unproven, so without this it is a way to attach
     a rival's verified storefront to your own audit."""
-    async def _owner(_domain):
+    async def _owner(_domain, **_kw):
         return "someone-else"
 
     wrote = []
@@ -101,7 +101,7 @@ async def test_a_domain_another_merchant_PROVED_cannot_be_declared(monkeypatch):
 async def test_a_lookup_failure_refuses_rather_than_grants(monkeypatch):
     """Fail closed: if we cannot tell whether someone else proved this domain,
     the answer is no. The alternative writes an unproven row on a DB blip."""
-    async def _boom(_domain):
+    async def _boom(_domain, **_kw):
         raise RuntimeError("db down")
 
     wrote = []
@@ -115,7 +115,7 @@ async def test_a_lookup_failure_refuses_rather_than_grants(monkeypatch):
 
     out = await svc.declare_official_domain("m1", "rival.com")
 
-    assert out["status"] == svc.DECLARE_TAKEN
+    assert out["status"] == svc.DECLARE_UNAVAILABLE  # our outage, not a rival
     assert not wrote
 
 
@@ -124,7 +124,7 @@ async def test_declaring_a_domain_you_already_proved_does_not_downgrade_it(
     monkeypatch,
 ):
     """A verified row must not be overwritten with an unproven one."""
-    async def _owner(_domain):
+    async def _owner(_domain, **_kw):
         return "m1"
 
     async def _stored(_mid, **_kw):
@@ -202,7 +202,7 @@ async def test_a_declaration_is_written_pending_and_never_verified():
 
 @pytest.mark.asyncio
 async def test_declare_normalizes_the_host_before_the_writer_sees_it(monkeypatch):
-    async def _owner(_domain):
+    async def _owner(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -241,7 +241,7 @@ async def test_declare_normalizes_the_host_before_the_writer_sees_it(monkeypatch
 async def test_junk_is_refused_before_any_lookup(monkeypatch, bad):
     called = []
 
-    async def _owner(_domain):
+    async def _owner(_domain, **_kw):
         called.append(_domain)
         return None
 
@@ -409,9 +409,17 @@ async def test_a_declared_domain_is_not_recorded_in_the_audit_basis(monkeypatch)
              "liveness_status": "unchecked"},
             {"domain": "gone.com", "source": real_mod.SOURCE_VERIFIED,
              "liveness_status": "dead"},
+            # Declared BEFORE the catalog carried it, then ingested: inference
+            # now produces it, so the run USES it and the basis must say so.
+            {"domain": "declared-then-ingested.com", "source": real_mod.SOURCE_DECLARED,
+             "liveness_status": "unchecked"},
         ]
 
+    async def _inferred(_mid, **_kw):
+        return {"inferred.com", "declared-then-ingested.com"}
+
     monkeypatch.setattr(real_mod, "list_official_domains", _rows)
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
 
     basis = await aeb.record_audit_basis(
         audit_run_id="r1",
@@ -421,9 +429,10 @@ async def test_a_declared_domain_is_not_recorded_in_the_audit_basis(monkeypatch)
     )
 
     recorded = sorted((basis or {}).get("official_domains") or [])
-    assert recorded == ["brand.com", "inferred.com", "second.com"], (
-        f"the basis recorded {recorded}; a DECLARED domain must not appear as "
-        f"one the run measured, and a dead one must not either"
+    assert recorded == ["brand.com", "declared-then-ingested.com", "inferred.com", "second.com"], (
+        f"the basis recorded {recorded}; a DECLARED-only domain must not appear "
+        f"as one the run measured, a dead one must not either, and a declared "
+        f"host that inference ALSO produces is USED and must appear"
     )
 
 
@@ -466,7 +475,7 @@ async def test_a_domain_another_merchant_ASSERTED_is_also_refused(monkeypatch):
     cross-tenant guard checked only `verified`, so someone else's PROVEN domain
     could still be declared. A proof is a proof for the purpose of refusing an
     unproven declaration."""
-    async def _no_verified_owner(_domain):
+    async def _no_verified_owner(_domain, **_kw):
         return None
 
     async def _proven_elsewhere(_domain, _mid):
@@ -492,7 +501,7 @@ async def test_a_domain_another_merchant_ASSERTED_is_also_refused(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_proof_lookup_also_fails_closed(monkeypatch):
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _boom(_domain, _mid):
@@ -510,7 +519,7 @@ async def test_the_proof_lookup_also_fails_closed(monkeypatch):
 
     out = await svc.declare_official_domain("m1", "rival.com")
 
-    assert out["status"] == svc.DECLARE_TAKEN
+    assert out["status"] == svc.DECLARE_UNAVAILABLE  # our outage, not a rival
     assert not wrote
 
 
@@ -518,7 +527,7 @@ async def test_the_proof_lookup_also_fails_closed(monkeypatch):
 async def test_declarations_are_capped_per_merchant(monkeypatch):
     """Each declaration is a free write that every later reader must skip, and
     unbounded rows are a denial-of-service on the readers as well as a mess."""
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -577,7 +586,7 @@ async def test_declaring_a_host_inference_already_produces_is_refused(monkeypatc
     Refusing the declaration makes `declared` rows and the used set disjoint by
     construction, instead of patching each consumer.
     """
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -613,7 +622,7 @@ async def test_declaring_a_host_inference_already_produces_is_refused(monkeypatc
 
 @pytest.mark.asyncio
 async def test_the_owned_set_load_fails_closed(monkeypatch):
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -650,7 +659,7 @@ async def test_the_owned_set_load_fails_closed(monkeypatch):
 async def test_a_write_failure_does_not_blame_the_hostname(monkeypatch, failure):
     """A failed write is OUR failure. Reporting it as "domain must be a valid
     public hostname" is how the missing migration presented to merchants."""
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -734,7 +743,7 @@ async def test_a_stored_set_read_failure_refuses_instead_of_downgrading(monkeypa
     the write went ahead — and the old upsert's `source = excluded.source`
     turned a VERIFIED row into declared/pending. The two ownership lookups
     before it fail closed; this one now does too, with its own status."""
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -773,7 +782,7 @@ async def test_an_inference_read_failure_refuses_under_the_guard(monkeypatch):
     guard a DB blip made an inferred host look undeclared — the exact D1 flip
     through a different door. Under strict it raises, and the declaration is
     refused."""
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -871,7 +880,7 @@ async def test_declare_never_reaches_the_upsert(monkeypatch):
     """A regression that re-routes the declare write through
     `upsert_official_domain` re-opens every downgrade above at once. The guards
     are set to pass so the write is reached, and the upsert is a tripwire."""
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -908,7 +917,7 @@ async def test_declare_never_reaches_the_upsert(monkeypatch):
 async def test_losing_the_write_race_is_reported_not_overwritten(monkeypatch):
     """Guards pass, then a claim lands the row first: the writer finds a row of
     another source and declare says so, rather than claiming it wrote."""
-    async def _none(_domain):
+    async def _none(_domain, **_kw):
         return None
 
     async def _not_proven(_domain, _mid):
@@ -982,3 +991,206 @@ async def test_the_proof_lookup_uses_the_domain_index_on_the_real_table():
         assert "idx_merchant_official_domains_domain" in details, details
     finally:
         await database.disconnect()
+
+
+# ---------------------------------------------------------------------
+# Seventh round: the disjointness held only at declare time
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inference_catching_up_heals_a_declared_row_into_the_sweep(monkeypatch):
+    """THE ORDERING THE GUARD CANNOT SEE. Declare anua.us before the catalog
+    carries it (the guard correctly accepts), then ingest: inference produces
+    the host, the inferred branch counts it official, and the row still says
+    `declared` -- which the due-queues skip and the basis drops. Real table:
+    the seeder promotes it, the due-queue then returns it, nothing is granted
+    that was not already used."""
+    from db.database import database
+    from db import merchant_official_domains as m
+    from datetime import timedelta
+    from services import official_domain_liveness as liveness
+
+    mid = "test-heal-merchant"
+
+    async def _inferred(_mid, **_kw):
+        return {"anua.us"}
+
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
+
+    await database.connect()
+    try:
+        await m.ensure_merchant_official_domains_table()
+        await database.execute(
+            "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+        )
+        assert await m.insert_declared_domain(merchant_id=mid, domain="anua.us") == m.SOURCE_DECLARED
+
+        before = await m.list_domains_due_for_liveness(ttl=timedelta(0), merchant_id=mid, limit=10)
+        assert [r["domain"] for r in before] == [], "a declared row must not be probed as-is"
+
+        healed = await liveness.seed_inferred_domains(mid)
+        assert healed == 1
+
+        rows = {r["domain"]: r for r in await m.list_official_domains(mid)}
+        assert rows["anua.us"]["source"] == m.SOURCE_INFERRED
+        assert rows["anua.us"]["verification_status"] is None
+
+        after = await m.list_domains_due_for_liveness(ttl=timedelta(0), merchant_id=mid, limit=10)
+        assert [r["domain"] for r in after] == ["anua.us"], "the healed row is now sweepable"
+
+        # Idempotent: a second pass finds nothing to heal or seed.
+        assert await liveness.seed_inferred_domains(mid) == 0
+    finally:
+        try:
+            await database.execute(
+                "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+            )
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_heal_never_touches_a_proven_row():
+    """`promote_declared_to_inferred` is guarded in SQL by source='declared'. A
+    verified row that inference also produces is left exactly as it is: the
+    seeder's original rule ("existing rows are left alone") still holds for
+    every source but `declared`."""
+    from db.database import database
+    from db import merchant_official_domains as m
+
+    mid = "test-heal-proven"
+    await database.connect()
+    try:
+        await m.ensure_merchant_official_domains_table()
+        await database.execute(
+            "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+        )
+        assert await m.upsert_official_domain(
+            merchant_id=mid, domain="brand.com", source=m.SOURCE_VERIFIED,
+            verification_status=m.VERIFICATION_VERIFIED,
+        ) is True
+        assert await m.promote_declared_to_inferred(merchant_id=mid, domain="brand.com") is False
+        rows = {r["domain"]: r for r in await m.list_official_domains(mid)}
+        assert rows["brand.com"]["source"] == m.SOURCE_VERIFIED
+        assert rows["brand.com"]["verification_status"] == m.VERIFICATION_VERIFIED
+        assert await m.promote_declared_to_inferred(merchant_id=mid, domain="nowhere.com") is False
+    finally:
+        try:
+            await database.execute(
+                "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+            )
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_verified_owner_resolver_raises_only_when_asked(monkeypatch):
+    """P2 of the sixth review: the guard's except around this resolver was
+    unreachable, because the resolver swallows its own errors into None -- and
+    `None` reads as "nobody owns it" in the guard, which is a grant. Strict
+    raises; the default keeps the best-effort contract every other caller has."""
+    from db.database import database as real_db
+
+    async def _boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(real_db, "fetch_all", _boom)
+    assert await mod.resolve_verified_merchant_for_domain("brand.com") is None
+    with pytest.raises(RuntimeError):
+        await mod.resolve_verified_merchant_for_domain("brand.com", strict=True)
+
+
+@pytest.mark.asyncio
+async def test_the_guard_asks_the_resolver_strictly(monkeypatch):
+    seen = []
+
+    async def _owner(_domain, **kw):
+        seen.append(kw)
+        raise RuntimeError("db down")
+
+    wrote = []
+
+    async def _insert(**kw):
+        wrote.append(kw)
+        return mod.SOURCE_DECLARED
+
+    monkeypatch.setattr(mod, "resolve_verified_merchant_for_domain", _owner)
+    monkeypatch.setattr(mod, "insert_declared_domain", _insert)
+
+    out = await svc.declare_official_domain("m1", "brand.com")
+    assert out["status"] == svc.DECLARE_UNAVAILABLE
+    assert not wrote
+    assert seen and seen[0].get("strict") is True
+
+
+@pytest.mark.asyncio
+async def test_the_owned_set_detail_read_is_strict_at_its_own_level(monkeypatch):
+    """Survivor (j) of the sixth review: every strict test patched the
+    outermost function, so `merchant_owned_domains_detailed`'s own stored read
+    could silently go back to best-effort. Drive it directly."""
+    seen = []
+
+    async def _boom(_mid, **kw):
+        seen.append(kw)
+        raise RuntimeError("db down")
+
+    async def _no_inference(_mid, **_kw):
+        return set()
+
+    monkeypatch.setattr(mod, "list_official_domains", _boom)
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _no_inference)
+
+    with pytest.raises(RuntimeError):
+        await svc.merchant_owned_domains_detailed("m1", strict=True)
+    # The fake raises regardless, so the exception alone proves nothing --
+    # pin that the STRICT form was requested (a best-effort real call would
+    # have returned [] and this function would have carried on).
+    assert seen and seen[0].get("strict") is True
+
+
+@pytest.mark.asyncio
+async def test_the_inference_loader_is_strict_on_the_onboarding_read_too(monkeypatch):
+    """Survivor (k): `_inferred_merchant_hosts` has TWO try blocks and only the
+    catalog one was ever exercised under strict. Make the onboarding read fail
+    and drive the REAL loader."""
+    import db.merchant_onboarding as onboarding
+
+    async def _boom(_mid):
+        raise RuntimeError("onboarding down")
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _boom)
+
+    with pytest.raises(RuntimeError):
+        await svc._inferred_merchant_hosts("m1", strict=True)
+    # And the default still degrades, as every report-path caller relies on.
+    assert isinstance(await svc._inferred_merchant_hosts("m1"), set)
+
+
+@pytest.mark.asyncio
+async def test_a_merchant_at_the_cap_does_not_get_the_catalog_scan(monkeypatch):
+    """The cap is checked BEFORE the owned-set load: that load is a 500-row
+    catalog scan plus an onboarding read, on a route with no rate limit."""
+    async def _none(_domain, **_kw):
+        return None
+
+    async def _not_proven(_domain, _mid):
+        return False
+
+    async def _stored(_mid, **_kw):
+        return [
+            {"domain": f"d{i}.com", "source": mod.SOURCE_DECLARED,
+             "verification_status": "pending"}
+            for i in range(svc._MAX_DECLARED_PER_MERCHANT)
+        ]
+
+    async def _owned_tripwire(_mid, **_kw):
+        raise AssertionError("the owned-set scan ran for a merchant already at the cap")
+
+    monkeypatch.setattr(mod, "resolve_verified_merchant_for_domain", _none)
+    monkeypatch.setattr(mod, "domain_is_proven_by_other_merchant", _not_proven)
+    monkeypatch.setattr(mod, "list_official_domains", _stored)
+    monkeypatch.setattr(svc, "merchant_owned_domains", _owned_tripwire)
+
+    out = await svc.declare_official_domain("m1", "one-too-many.com")
+    assert out["status"] == svc.DECLARE_TOO_MANY

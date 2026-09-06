@@ -296,9 +296,19 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
     it grants nothing that inference did not already grant. It only makes the
     domain addressable by a liveness verdict.
 
-    Existing rows are left alone. `upsert_official_domain` would otherwise
-    rewrite an asserted/verified row's source back down to `inferred` and blank
-    the verdict a previous run recorded.
+    Existing rows are left alone -- with ONE exception. `upsert_official_domain`
+    would otherwise rewrite an asserted/verified row's source back down to
+    `inferred` and blank the verdict a previous run recorded.
+
+    The exception is a `declared` row whose host inference now produces. The
+    declare guard refuses a host already inferred, but that covers only the
+    order in which inference came FIRST: declare anua.us, then ingest the
+    catalog that carries it, and the row is `declared` while the inferred
+    branch counts the host official. The due-queues skip `declared` and the
+    audit basis drops it, so the host could never be measured dead. Promoting
+    it to `inferred` here makes the row what it would have been had inference
+    come first; it grants nothing, because the host was already in the used
+    set. Counted in the return value: it is a row the sweep can now check.
     """
     from services.brand_claim_service import _inferred_merchant_hosts
 
@@ -307,10 +317,17 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
     hosts = await _inferred_merchant_hosts(merchant_id)
     if not hosts:
         return 0
-    known = {str(r.get("domain") or "") for r in await mod.list_official_domains(merchant_id)}
+    known = {
+        str(r.get("domain") or ""): str(r.get("source") or "")
+        for r in await mod.list_official_domains(merchant_id)
+    }
     seeded = 0
     for host in sorted(hosts):
         if host in known:
+            if known[host] == mod.SOURCE_DECLARED and await mod.promote_declared_to_inferred(
+                merchant_id=merchant_id, domain=host, now=now,
+            ):
+                seeded += 1
             continue
         if await mod.upsert_official_domain(
             merchant_id=merchant_id,
