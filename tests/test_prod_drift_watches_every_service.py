@@ -340,17 +340,42 @@ def test_split_traffic_is_refused_rather_than_guessed(tmp_path):
     assert "proof-issuer" in out
 
 
-@pytest.mark.parametrize("tag", ["latest", "HEAD", "main", "deadbeef"])
-def test_an_image_tag_that_is_not_a_commit_sha_is_refused(tmp_path, tag):
-    """The tag is handed to `git cat-file` / `git merge-base` as a REVISION EXPRESSION, so
-    anything git can resolve is accepted as 'the live commit'. A moving tag is the realistic
-    way that happens: measured in review, with `backend:HEAD` the job compared production to
-    itself and exited 0 reporting 'none touching code the container runs'."""
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "latest", "HEAD", "main", "deadbeef",
+        # EXACTLY 40 CHARACTERS, and not hex. Every case above is short, so the LENGTH check
+        # alone rejects them and the character-class guard beside it was never exercised —
+        # deleting that guard left this parametrisation green. Two guards that both close a
+        # door pin neither; this input can only be caught by the character check.
+        "z" * 40,
+        # 40 characters, hex-looking but with one stray character in the middle.
+        "a" * 20 + "g" + "a" * 19,
+    ],
+)
+def test_a_declared_commit_that_is_not_a_sha_is_refused(tmp_path, tag):
+    """The declared commit is handed to `git cat-file` / `git merge-base` as a REVISION
+    EXPRESSION, so anything git can resolve is accepted as 'the live commit'. Measured in
+    review: a value of `HEAD` made the job compare production to itself and exit 0 reporting
+    'none touching code the container runs'."""
     root = _repo(tmp_path)
     head = _commit(root, "services/app.py", "v1\n", age_minutes=600)
     code, out = _run_drift(tmp_path, root, web=head, images={"worker": tag, "proof-issuer": head})
-    assert code != 0, f"image tag {tag!r} was read as a commit and the job went green:\n{out}"
-    assert "worker" in out
+    assert code != 0, f"declared commit {tag!r} was read as a commit and the job went green:\n{out}"
+    # ASSERT WHICH GUARD FIRED, not merely that the job went red. A junk value that survives
+    # resolution still makes the job exit non-zero further downstream — `git cat-file` fails
+    # and classify reports "NOT an ancestor of main - the two have diverged". So `code != 0`
+    # cannot distinguish "refused at read time" from "alarmed for the wrong reason", and
+    # deleting the sha validation left this case green. The message is the distinguishing
+    # evidence, so the message is what gets asserted.
+    assert "refusing to read it as" in out, (
+        f"the value was not refused when it was READ; the job went red for some other reason, "
+        f"which means the validation is not what stopped it:\n{out}"
+    )
+    assert "diverged" not in out, (
+        f"{tag!r} reached the ancestry comparison — it should never have been accepted as a "
+        f"commit at all:\n{out}"
+    )
 
 
 def test_a_revision_that_declares_no_commit_is_refused(tmp_path):
