@@ -545,7 +545,24 @@ def _headline_distribution(
         if str((finding or {}).get("finding_type") or "").strip().lower() == (
             _HEADLINE_FINDING
         ):
-            payload = (finding.get("payload") or {})
+            # READ THE SHAPE THE WRITER PRODUCES. This projection is fed by
+            # `list_findings_for_run`, which returns raw `readiness_findings`
+            # ROWS — the column is `payload_jsonb`, and under the `databases`
+            # driver it can arrive as a JSON STRING. `payload` is the
+            # EXTRACTOR's key, which only ever appears in-process.
+            #
+            # Reading `payload` alone shipped a headline that was empty on
+            # every real run: verified against production run
+            # 0d56bf71-d63b-4103-9520-e0abf66bb57e, whose revenue_recovery
+            # projection rendered `dimensions: []` while the run's own
+            # brand_headline_distribution finding held all four dimensions.
+            # The tests missed it because they piped extract_findings() output
+            # straight in, so they only ever exercised the in-process shape.
+            payload = (
+                coerce_jsonb_to_dict(finding.get("payload_jsonb"))
+                or finding.get("payload")
+                or {}
+            )
             break
 
     dims = payload.get("dimensions")
