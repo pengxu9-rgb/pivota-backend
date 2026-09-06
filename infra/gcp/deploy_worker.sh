@@ -4,7 +4,7 @@
 #
 #   CONFIG=preserve  (default) change the image, restamp PIVOTA_COMMIT_SHA, re-pin the handful of
 #                    knobs this file owns, and leave every other env var and secret mount exactly
-#                    as the running revision has them. No prereqs, no Railway. This is what CI uses.
+#                    as the SERVICE TEMPLATE has them. No prereqs, no Railway. This is what CI uses.
 #   CONFIG=apply     rewrite env + secrets from the ported files. Needs env.<env>.yaml and
 #                    secrets.<env>.list, which port_railway_env.py generates from `railway
 #                    variables` - Railway was decommissioned 2026-08-22, so this mode cannot be
@@ -145,8 +145,22 @@ if [ "$PREV_RC" != 0 ]; then
   if grep -qiE 'cannot find service \[?worker\]?' "$PREV_ERR"; then
     PREV_IMAGE=""
   else
-    echo "could not read the worker's current image (gcloud exited $PREV_RC):" >&2
-    sed 's/^/  /' "$PREV_ERR" >&2
+    # SAY WHICH FAILURE THIS IS. Three different things land here — gcloud itself failing, a
+    # traffic block with no single named 100% revision, and the JSON/python read not working —
+    # and they used to print one empty-bodied message asserting "gcloud exited 1", which is
+    # false for the last two (gcloud exited 0). An operator got a blocked production deploy
+    # with no cause. The exit code is the helper's, not gcloud's, so it cannot be reported as
+    # gcloud's.
+    if [ -s "$PREV_ERR" ]; then
+      echo "could not read the worker's current image; gcloud said:" >&2
+      sed 's/^/  /' "$PREV_ERR" >&2
+    else
+      echo "could not read the worker's current image, and gcloud reported no error." >&2
+      echo "That means the service was describable but had no single NAMED revision at 100%" >&2
+      echo "traffic (a split or a half-finished rollout), or its JSON could not be parsed." >&2
+      echo "  gcloud run services describe worker --project $PROJECT --region $REGION \\" >&2
+      echo "    --format='value(status.traffic)'" >&2
+    fi
     echo "Refusing to deploy: without knowing what is running there is nothing to roll back to," >&2
     echo "and a failed probe would leave production on the new image with no way back." >&2
     exit 1
@@ -184,7 +198,10 @@ if [ "$CONFIG" = apply ]; then
 else
   # PRESERVE. Restamp the commit and re-pin the knobs this file owns, and NOTHING else:
   # `--update-env-vars` merges these keys and leaves the other ~236 variables and every secret
-  # mount exactly as the running revision has them. AUDIT_WORKER_ENABLED is deliberately absent -
+  # mount exactly as the SERVICE TEMPLATE has them -- `--update-env-vars` merges into the
+  # template, not into whatever is serving, and the two differ after a deploy that did not
+  # take. Worth knowing for the rollback below: it restores the SERVING revision's IMAGE onto
+  # the template's env. AUDIT_WORKER_ENABLED is deliberately absent -
   # see the WORKERS guard above.
   #
   # PIVOTA_COMMIT_SHA is not optional and not cosmetic. config/platform.py cannot read the commit

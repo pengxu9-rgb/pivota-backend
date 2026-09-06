@@ -315,10 +315,10 @@ if [ "$CONFIG" = preserve ]; then
     if [ "$FLEET_CEILING" -gt "$POOL_FLEET_BUDGET" ]; then
       echo "REFUSING to deploy: the service would open up to $FLEET_CEILING database" >&2
       echo "connections (configured DB_POOL_MAX_SIZE=$LIVE_POOL_MAX x maxScale=$APPLIED_MAX_INSTANCES" >&2
-      echo "as this deploy would apply it; live maxScale is currently $LIVE_MAX_INSTANCES)," >&2
+      echo "as this deploy would apply it; the template's maxScale is $LIVE_MAX_INSTANCES)," >&2
       echo "over the $POOL_FLEET_BUDGET budget and against a max_connections of 300 shared" >&2
       echo "with worker/gateway/jobs. This script would set POOL_MAX=$POOL_MAX; preserve mode" >&2
-      echo "does not apply it, so the live value drifted and every deploy has carried it." >&2
+      echo "does not apply it, so the template drifted and every deploy has carried it." >&2
       echo "Fix the service, then redeploy:" >&2
       echo "  gcloud run services update $SERVICE --region $REGION --project $PROJECT \\" >&2
       echo "    --update-env-vars DB_POOL_MAX_SIZE=$POOL_MAX" >&2

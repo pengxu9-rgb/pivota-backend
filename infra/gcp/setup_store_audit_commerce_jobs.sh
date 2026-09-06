@@ -12,6 +12,8 @@ esac
 [ -n "$BACKEND_TAG" ] && [ -n "$BROWSER_TAG" ] || { echo "backend-tag and browser-tag are required" >&2; exit 2; }
 
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; SHARED=pivota-shared
+# shellcheck source=infra/gcp/_serving_revision.sh
+. "$(cd "$(dirname "$0")" && pwd)/_serving_revision.sh"
 SECRET=STORE_AUDIT_COMMERCE_PROBE_INTERNAL_KEY
 CRAWL_SA="sa-store-audit-commerce-crawl@$PROJECT.iam.gserviceaccount.com"
 SELECTOR_SA="sa-store-audit-commerce-sel@$PROJECT.iam.gserviceaccount.com"
@@ -31,11 +33,15 @@ done
 # before a job with the receipt key can exist.
 WEB_SPEC="$("$GCLOUD" run services describe web --region "$REGION" --format=json)"
 WEB_URL="$(printf '%s' "$WEB_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["url"])')"
-WEB_REVISION="$(printf '%s' "$WEB_SPEC" | python3 -c '
-import json,sys
-traffic=json.load(sys.stdin).get("status",{}).get("traffic",[])
-active=[x.get("revisionName") for x in traffic if x.get("percent")==100 and not x.get("tag")]
-print(active[0] if len(active)==1 else "")')"
+# THE 100%-TRAFFIC REVISION, via the shared helper. The copy that used to live here also
+# required `not x.get("tag")` — and deploy_backend.sh tags EVERY candidate (`--tag c-<sha>`)
+# and the promoted revision keeps that tag until a later sweep, so on real production that
+# filter matched nothing and this script exited 2 ("web needs exactly one untagged
+# 100%-traffic revision") every time it was run. Verified against prod 2026-09-06:
+# web-00560-caw serves 100% carrying tag c-d222cb8c4a51. setup_scheduler.sh removed the same
+# conjunct and wrote down why; this sibling copy kept it, which is the drift a shared
+# definition exists to stop.
+WEB_REVISION="$(serving_revision web || true)"
 [ -n "$WEB_REVISION" ] || { echo "web needs exactly one untagged 100%-traffic revision" >&2; exit 2; }
 READY="$("$GCLOUD" run revisions describe "$WEB_REVISION" --region "$REGION" --format=json | python3 -c '
 import json,sys

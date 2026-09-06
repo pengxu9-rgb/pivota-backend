@@ -160,26 +160,119 @@ serving_image worker && echo UNEXPECTED_SUCCESS || echo REFUSED
     assert "REFUSED" in done.stdout + done.stderr
 
 
+def test_a_tagged_serving_revision_is_still_found(tmp_path):
+    """THE BUG THIS CONSOLIDATION ACTUALLY FIXED, and it was live.
+
+    `deploy_backend.sh` ships every candidate as `--tag c-<sha> --no-traffic`, health-checks
+    it, then promotes — and the promoted revision KEEPS that tag until a later sweep. So the
+    100%-traffic entry normally carries a tag. `setup_store_audit_commerce_jobs.sh` filtered
+    with `and not x.get("tag")`, matched nothing, and exited 2 ("web needs exactly one untagged
+    100%-traffic revision") on every run against real production. Measured 2026-09-06:
+    web-00560-caw served 100% carrying tag c-d222cb8c4a51.
+
+    setup_scheduler.sh had already removed that conjunct and written down why. The sibling copy
+    kept it — which is precisely the drift one definition exists to prevent.
+    """
+    binn = _stub_gcloud(tmp_path)
+    tagged = (binn / "gcloud").read_text().replace(
+        '{"revisionName":"rev-live","percent":100}',
+        '{"revisionName":"rev-live","percent":100,"tag":"c-abc123"}')
+    (binn / "gcloud").write_text(tagged)
+    script = f'''
+set -euo pipefail
+GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
+. "{GCP / '_serving_revision.sh'}"
+serving_revision worker
+'''
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0 and "rev-live" in done.stdout, (
+        "a tagged 100%-traffic revision was not found. That is the NORMAL post-deploy state "
+        f"here, not an edge case: {done.stdout!r} {done.stderr!r}"
+    )
+
+
+def test_a_nameless_hundred_percent_entry_is_refused(tmp_path):
+    """An entry at 100 with no revisionName is an inconsistent traffic block. Filtering it out
+    and answering with its neighbour would resolve a split by ignoring half of it — so the
+    filter keeps such entries and the count check then refuses. This matches the pre-existing
+    Store Audit guards, whose semantics the helper had to preserve when it absorbed them."""
+    binn = _stub_gcloud(tmp_path)
+    broken = (binn / "gcloud").read_text().replace(
+        '{"revisionName":"rev-cand","percent":0,"tag":"c-x"}', '{"percent":100}')
+    (binn / "gcloud").write_text(broken)
+    script = f'''
+set -euo pipefail
+GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
+. "{GCP / '_serving_revision.sh'}"
+serving_revision worker && echo UNEXPECTED_SUCCESS || echo REFUSED
+'''
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert "REFUSED" in done.stdout + done.stderr
+
+
+def test_the_return_contract_holds_without_pipefail(tmp_path):
+    """`serving_image` ended in `| head -1`, so the pipeline's status was head's and a failing
+    describe returned 0 with empty output — an unreadable service looking clean, which is the
+    one thing the header promises cannot happen. Latent while every caller sets pipefail, but
+    this is a shared file and a GitHub Actions `run:` step is `bash -e` WITHOUT it."""
+    binn = _stub_gcloud(tmp_path)
+    script = f'''
+set -eu
+GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
+. "{GCP / '_serving_revision.sh'}"
+serving_image nosuchsvc && echo UNEXPECTED_SUCCESS || echo REFUSED
+'''
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert "REFUSED" in done.stdout, (
+        f"without pipefail an unreadable service returned success: {done.stdout!r}"
+    )
+
+
 # ── which script asks which question ───────────────────────────────────────────────────
 
 
+# A template read, in every spelling a script might plausibly use. Matching only the
+# `--format=value(spec.template...)` literal banned ONE syntactic form: a mutation audit read
+# the same field via `--format=json | python3 -c '...["spec"]["template"]...'` and every case
+# stayed green. A ratchet that matches one form permits the others.
+_TEMPLATE_READS = ("spec.template", '["template"]', "['template']", '"template"')
+
+
+def _code_only(path: Path) -> str:
+    """Source with comment lines removed.
+
+    Load-bearing, not tidiness: the previous version of these tests searched raw text, so a
+    seven-line comment block *explaining* the template read satisfied every assertion. Two
+    mutants that switched the real reads to runtime reads, leaving the comments untouched,
+    survived — the classification these tests claim to pin was not pinned at all.
+    """
+    return "\n".join(l for l in path.read_text().splitlines()
+                      if not l.lstrip().startswith("#"))
+
+
 @pytest.mark.parametrize(
-    "script, must_use_serving, why",
+    "script, why",
     [
-        ("deploy_worker.sh", True,
-         "its rollback target must be a KNOWN-GOOD image; the template may name one that "
+        ("deploy_worker.sh",
+         "its rollback target must be a KNOWN-GOOD image; the template can name one that "
          "never became Ready, so rolling 'back' to it rolls forward into the breakage"),
-        ("setup_scheduler.sh", True,
+        ("setup_scheduler.sh",
          "its summary line says 'live', and an operator reads it that way"),
+        ("setup_store_audit_commerce_jobs.sh",
+         "it gates job creation on the revision actually serving web"),
+        ("setup_store_audit_ucp_jobs.sh",
+         "same gate, same question"),
     ],
 )
-def test_scripts_asking_what_is_running_use_the_helper(script, must_use_serving, why):
-    body = "\n".join(l for l in (GCP / script).read_text().splitlines()
-                     if not l.lstrip().startswith("#"))
+def test_scripts_asking_what_is_running_use_the_helper(script, why):
+    body = _code_only(GCP / script)
     assert "_serving_revision.sh" in body, f"{script} does not source the helper. {why}"
-    assert not [l for l in body.splitlines()
-                if "spec.template.spec.containers" in l], (
-        f"{script} still reads spec.template for a runtime question. {why}"
+    assert "serving_revision" in body or "serving_image" in body or "serving_env" in body, (
+        f"{script} sources the helper but never calls it. {why}"
+    )
+    hit = [t for t in _TEMPLATE_READS if t in body]
+    assert not hit, (
+        f"{script} still reads the template ({hit}) for a runtime question. {why}"
     )
 
 
@@ -194,11 +287,34 @@ def test_scripts_asking_what_is_running_use_the_helper(script, must_use_serving,
     ],
 )
 def test_scripts_asking_what_the_next_deploy_inherits_keep_the_template(script, why):
-    """The counterpart, and the reason this module is not "spec.template is banned". Blanket-
-    replacing these would be a regression, so they are pinned deliberately."""
-    text = (GCP / script).read_text()
-    assert "spec.template" in text, f"{script} no longer reads the template. {why}"
-    assert "_serving_revision.sh" in text, (
-        f"{script} reads the template but does not explain why, so the next reader "
-        f"'fixes' it. It should reference the helper and say it is asking the other question."
+    """The counterpart, and the reason this module is not "spec.template is banned".
+
+    Asserted against COMMENT-STRIPPED source. Reading raw text made this vacuous: switching
+    both real reads to runtime reads while leaving the explanatory comments passed.
+    """
+    body = _code_only(GCP / script)
+    assert any(t in body for t in _TEMPLATE_READS), (
+        f"{script} no longer reads the template in its code (only, perhaps, in a comment). {why}"
+    )
+    assert "serving_revision" not in body and "serving_image" not in body, (
+        f"{script} switched to the serving revision. {why}"
+    )
+    assert "_serving_revision.sh" in (GCP / script).read_text(), (
+        f"{script} reads the template but does not explain why, so the next reader 'fixes' it."
+    )
+
+
+def test_the_serving_read_is_defined_once():
+    """The whole point of the helper. Every inline re-implementation is a place to drift, and
+    one of them HAD drifted — see test_a_tagged_serving_revision_is_still_found."""
+    copies = []
+    for f in sorted(GCP.glob("*.sh")):
+        if f.name == "_serving_revision.sh":
+            continue
+        if 'percent") == 100' in _code_only(f) or 'percent")==100' in _code_only(f):
+            copies.append(f.name)
+    assert not copies, (
+        f"these scripts carry their own 100%-traffic resolution instead of sourcing the "
+        f"helper: {copies}. That is how the `not x.get(\"tag\")` conjunct survived in one "
+        f"copy after being removed from another."
     )
