@@ -1260,3 +1260,100 @@ def test_a_real_shade_is_still_published(shade):
         shade_titles=[shade],
     )
     assert by_title[shade] == "Color"
+
+
+# -- PDP meta description fallback ---------------------------------------------------------------
+# 158 of jsmbeauty.sg's 232 products publish under 50 chars of body_html TEXT (LIP-PRESSION Glowy
+# Tint: 123 chars of markup rendering to zero), so the whole cohort failed the 50-char floor and
+# stayed blocked -- while the same PDPs serve 150-340 chars in og:description. The copy was never
+# missing from the site, only from the field the backfill read.
+
+
+def test_the_pdp_meta_description_is_recovered():
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <html><head>
+        <meta property="og:description" content="A lip tint that gives off a watery glow." />
+      </head><body>x</body></html>
+    """
+    assert description_from_pdp_html(page) == "A lip tint that gives off a watery glow."
+
+
+def test_og_description_wins_over_the_plain_one():
+    """Themes commonly set both, and the og: variant is the richer copy. Asserted because a
+    'first meta tag wins' implementation passes every single-tag test and silently takes the
+    worse string on a real page."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = """
+      <meta name="description" content="Short SEO blurb.">
+      <meta property="og:description" content="The fuller brand-authored sentence.">
+    """
+    assert description_from_pdp_html(page) == "The fuller brand-authored sentence."
+
+
+def test_the_plain_description_is_used_when_there_is_no_og_one():
+    from services.curated_brand_feed import description_from_pdp_html
+
+    assert description_from_pdp_html('<meta name="description" content="Only this one.">') \
+        == "Only this one."
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        "",
+        "<html><head><title>no meta at all</title></head></html>",
+        '<meta property="og:description" content="">',
+        '<meta property="og:description" content="   ">',
+        '<meta property="og:image" content="https://x/i.jpg">',      # a meta tag, wrong key
+        '<meta name="keywords" content="lip, tint, glow">',
+    ],
+)
+def test_nothing_usable_returns_None_rather_than_a_guess(page):
+    """None, never a partial. The caller treats a short string as 'no copy' and leaves the row
+    honestly blocked; inventing something here would publish copy nobody wrote."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    assert description_from_pdp_html(page) is None
+
+
+def test_attribute_order_and_entities_are_handled():
+    """Real themes put `content` before `property`, and the copy is HTML-escaped. A regex that
+    assumes the order, or forgets to unescape, silently drops or mangles real descriptions."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta content="Glass &amp; glow &#8212; non-sticky" property="og:description">'
+    assert description_from_pdp_html(page) == "Glass & glow — non-sticky"
+
+
+def test_whitespace_is_collapsed_so_the_length_floor_measures_words():
+    """The gate compares LENGTH against 50, so a description padded with newlines would pass the
+    floor while carrying almost no copy."""
+    from services.curated_brand_feed import description_from_pdp_html
+
+    page = '<meta property="og:description" content="A   lip\n\n  tint.">'
+    assert description_from_pdp_html(page) == "A lip tint."
+
+
+@pytest.mark.live_locale
+@pytest.mark.asyncio
+async def test_a_pdp_that_is_down_yields_None_and_never_raises(monkeypatch):
+    """It runs inside a backfill loop over hundreds of rows; one dead PDP must not end the batch."""
+    import httpx
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
+    _silence_politeness(monkeypatch)
+
+    assert await cbf.fetch_pdp_description("jsmbeauty.sg", "lip-pression-glowy-tint") is None

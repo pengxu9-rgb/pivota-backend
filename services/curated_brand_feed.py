@@ -614,6 +614,97 @@ def inci_from_pdp_html(page_html: Optional[str]) -> Optional[str]:
     return _pdp_collapse_shades(survivors)
 
 
+_META_DESC_RE = re.compile(
+    r"<meta\b[^>]*>",
+    re.I,
+)
+
+
+def description_from_pdp_html(raw_html: str) -> Optional[str]:
+    """Brand-authored copy from a PDP's own meta description.
+
+    WHY THIS EXISTS. `backfill_brand_official_descriptions` takes body copy from
+    `/products.json` body_html, and some storefronts publish none — measured on jsmbeauty.sg
+    2026-09-06: 158 of 232 products carry under 50 characters of body_html TEXT (LIP-PRESSION
+    Glowy Tint has 123 characters of markup that render to zero), so every one of them failed the
+    50-char floor and stayed blocked. The copy is not missing from the site, only from that field:
+    the same PDP serves 190 characters of real prose in `og:description`. 10 of a 12-row sample
+    had a usable one.
+
+    STILL BRAND-AUTHORED (ADR-001). This is the merchant's own text on the merchant's own page —
+    a different SURFACE from body_html, not a different tier, and never a retailer's words and
+    never synthesized. What it is NOT is a substitute for a real description where one exists,
+    which is why the caller uses it strictly as a fallback.
+
+    Prefers `og:description`, falls back to `name="description"`. Attribute order varies between
+    themes, so this parses each tag's attributes rather than assuming `property` precedes
+    `content`. Returns None when there is nothing usable — never a partial or a guess.
+    """
+    if not raw_html:
+        return None
+    best: Optional[str] = None
+    for tag in _META_DESC_RE.findall(raw_html)[:400]:
+        key = ""
+        for attr in ("property", "name"):
+            m = re.search(rf'{attr}\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+            if m:
+                key = m.group(1).strip().lower()
+                break
+        if key not in ("og:description", "description"):
+            continue
+        m = re.search(r'content\s*=\s*["\']([^"\']*)["\']', tag, re.I | re.S)
+        if not m:
+            continue
+        value = re.sub(r"\s+", " ", html.unescape(m.group(1))).strip()
+        if not value:
+            continue
+        if key == "og:description":
+            return value          # the richer of the two when a theme sets both
+        best = best or value
+    return best
+
+
+async def fetch_pdp_description(
+    domain: str,
+    handle: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout_s: float = 15.0,
+) -> Optional[str]:
+    """Fetch one brand PDP and recover its meta description.
+
+    Deliberately the same shape as `fetch_pdp_inci` beside it, including gating BOTH branches:
+    the caller-supplied-client branch is the one a batch loop uses, so gating only the standalone
+    branch would leave the high-volume path unpaced. Any failure returns None — a brand site
+    hiccup must never fabricate copy or raise into a backfill loop.
+    """
+    host = _clean_domain(domain)
+    handle = str(handle or "").strip().strip("/")
+    if not host or not handle:
+        return None
+    url = f"https://{host}/products/{handle}"
+    timeout = httpx.Timeout(timeout_s, connect=5.0)
+    headers = {"User-Agent": _UA, "Accept": "text/html"}
+    try:
+        await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+        if client is not None:
+            resp = await client.get(url)
+        else:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as c:
+                resp = await c.get(url)
+        crawl_politeness.note_response(
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        )
+        if resp.status_code != 200:
+            return None
+        return description_from_pdp_html(resp.text)
+    except Exception as exc:  # noqa: BLE001 — a brand PDP being down must not break the batch
+        logger.debug("fetch_pdp_description failed for %s/%s: %s", host, handle, str(exc)[:160])
+        return None
+
+
 async def fetch_pdp_inci(
     domain: str,
     handle: str,

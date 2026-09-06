@@ -43,6 +43,7 @@ from services.agent_pdp_view_assembler import (  # noqa: E402
 from services.catalog_enrichment_agent.bulk_writer import is_transport_error  # noqa: E402
 from services.curated_brand_feed import (  # noqa: E402
     body_html_to_text,
+    fetch_pdp_description,
     fetch_shopify_products,
 )
 from services.pdp_lifecycle import compute_lifecycle_stage  # noqa: E402
@@ -132,7 +133,8 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
     }
 
 
-async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
+async def run(apply: bool, domains_filter: List[str], max_products: int,
+              pdp_fallback: bool = False) -> int:
     # initial connect through the same healer as mid-run reconnects —
     # a proxy TLS bad-window at process start must not burn a whole
     # stage attempt (observed 2026-07-17).
@@ -171,22 +173,40 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
     print(f"[population] {sum(len(v) for v in by_domain.values())} rows "
           f"across {len(by_domain)} domain(s)  (apply={apply})")
 
-    totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0,
+    totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0, "from_pdp": 0,
               "not_in_feed": 0, "update_failed": 0, "refresh_failed": 0}
     touched_cks: List[str] = []
 
     for domain in sorted(by_domain):
         drows = by_domain[domain]
         body_map = await _load_body_map(domain, max_products)
-        filled = no_body = not_in_feed = 0
+        filled = no_body = not_in_feed = from_pdp = 0
         for r in drows:
             body = body_map.get(r["_handle"])
             if body is None:
                 not_in_feed += 1
                 continue
             if len(body) < MIN_DESC_LEN:
-                no_body += 1
-                continue
+                # STRICTLY A FALLBACK, and only once body_html has already failed the floor: a
+                # row with real body copy takes the branch above and is byte-identical to before
+                # this fallback existed. Some storefronts publish their copy on the PDP but not
+                # in body_html -- measured on jsmbeauty.sg 2026-09-06, 158 of 232 products carry
+                # under 50 characters of body_html TEXT while the same PDPs serve 150-340
+                # characters in og:description, so the whole cohort was blocked over a field
+                # choice rather than missing content. Still ADR-001 brand-authored: the
+                # merchant's own words on the merchant's own page, a different SURFACE from
+                # body_html rather than a different tier.
+                if pdp_fallback:
+                    meta = await fetch_pdp_description(domain, r["_handle"], client=None)
+                    if meta and len(meta) >= MIN_DESC_LEN:
+                        body = meta
+                        from_pdp += 1
+                    else:
+                        no_body += 1
+                        continue
+                else:
+                    no_body += 1
+                    continue
             new_row = {**r, "description": body}
             new_stage = compute_lifecycle_stage(new_row)
             totals[new_stage] = totals.get(new_stage, 0) + 1
@@ -214,9 +234,11 @@ async def run(apply: bool, domains_filter: List[str], max_products: int) -> int:
                         break
         totals["filled"] += filled
         totals["no_body"] += no_body
+        totals["from_pdp"] = totals.get("from_pdp", 0) + from_pdp
         totals["not_in_feed"] += not_in_feed
         print(f"  {domain:22s} rows={len(drows):4d} feed={len(body_map):4d} "
-              f"fill={filled:4d} empty_body={no_body:3d} not_in_feed={not_in_feed:3d}")
+              f"fill={filled:4d} empty_body={no_body:3d} not_in_feed={not_in_feed:3d} "
+              f"from_pdp={from_pdp:3d}")
 
     if apply and touched_cks:
         distinct = sorted(set(touched_cks))
@@ -248,9 +270,13 @@ def main() -> int:
     p.add_argument("--apply", action="store_true", help="write updates (default: dry-run)")
     p.add_argument("--domains", default="", help="comma-separated domain allowlist")
     p.add_argument("--max-products", type=int, default=800)
+    # OPT-IN. It costs one PDP fetch per row whose body_html already failed, against a merchant
+    # host, so it must be a choice rather than something a routine re-run starts doing.
+    p.add_argument("--pdp-fallback", action="store_true",
+                   help="when body_html is empty, take the PDP's own meta description")
     args = p.parse_args()
     domains = [d.strip().lower() for d in args.domains.split(",") if d.strip()]
-    return asyncio.run(run(args.apply, domains, args.max_products))
+    return asyncio.run(run(args.apply, domains, args.max_products, args.pdp_fallback))
 
 
 if __name__ == "__main__":

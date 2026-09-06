@@ -784,8 +784,10 @@ _GATED_CRAWL_LANES = {
     "services/brand_product_discovery.py": 1,
     "services/co_occurrence_finder.py": 1,
     # products.json paging + PDP INCI fetch + meta.json (the storefront's own currency/market,
-    # added 2026-09-06 so a Singapore storefront is not ingested as USD).
-    "services/curated_brand_feed.py": 3,
+    # added 2026-09-06 so a Singapore storefront is not ingested as USD) + the PDP meta
+    # description (added 2026-09-06: 158 of jsmbeauty.sg's 232 products publish no body_html
+    # text, so the copy the 50-char floor wants is only on the PDP itself).
+    "services/curated_brand_feed.py": 4,
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }
