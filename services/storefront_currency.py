@@ -14,8 +14,11 @@ domain for the process lifetime, and returns None when it cannot prove the answe
 Callers must treat None as "unknown" (keep the existing value + flag for review) —
 never as "assume USD", which is the bug this exists to detect.
 
-Scope note: this is a DETECTIVE aid (used by scripts/audit_offer_currency.py). It
-intentionally does NOT gate the write path. `market` and `currency` are different
+Scope note: this began as a DETECTIVE aid (scripts/audit_offer_currency.py). Since
+2026-09-06 it is ALSO read on the ingest write path -- services/curated_brand_feed.py
+delegates to it so a storefront's own currency reaches the rows instead of a USD
+default -- so a change here now moves what gets persisted, not just what gets audited.
+What has NOT changed is the market half: `market` and `currency` are different
 axes (destination served vs store base currency) — a KR/HK exporter legitimately
 prices in USD — so equating them and rejecting offers at ingest would destroy real
 inventory. The serving layer already excludes non-USD offers from US answers

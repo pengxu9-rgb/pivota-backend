@@ -1148,15 +1148,73 @@ def test_every_row_this_lane_builds_binds_against_the_real_upsert_SQL():
 
     out = ingest_validated_record(_sgd_record())
 
+    # EVERY collection the lane returns, not the four I thought of first. `ingest_validated_record`
+    # yields seven; naming the test "every row" while covering four is the same over-claim this
+    # branch kept making, and the three uncovered ones bind against their own statements.
     for label, sql, rows in (
         ("sku", apply_mod._SKU_UPSERT_SQL, [out["sku"]]),
         ("variant_skus", apply_mod._SKU_UPSERT_SQL, out["variant_skus"]),
         ("offers", apply_mod._OFFER_UPSERT_SQL, out["offers"]),
         ("seeds", apply_mod._SEED_UPSERT_SQL, out["seeds"]),
+        ("pdp", apply_mod._PDP_UPSERT_SQL, [out["pdp"]]),
+        ("merchants", apply_mod._MERCHANT_UPSERT_SQL, out["merchants"]),
+        # `inci` is deliberately absent: this fixture produces none, so an arm for it would
+        # iterate zero rows and read as coverage while asserting nothing. A vacuous arm is worse
+        # than a named gap.
     ):
+        assert rows, f"{label} produced no rows; this arm would assert nothing"
         for row in rows:
             params = {k: v for k, v in row.items() if k != "_ensure_only"}
             try:
                 text(sql).bindparams(**params)
             except Exception as exc:  # noqa: BLE001 - the failure IS the assertion
                 raise AssertionError(f"{label} row will not bind: {exc}") from exc
+
+
+def test_a_seed_row_never_disagrees_with_its_own_seed_data():
+    """The seed upsert rewrites `seed_data` unconditionally, and this lane now varies the nested
+    `variants[].currency` -- so the scalar `price_currency` column MUST move with it.
+
+    Leaving it behind splits the row against its own JSON, which is exactly what
+    `external_seed_audit.detect_price_currency_mismatch` looks for. That is a BLOCKER anomaly
+    (`EXTERNAL_REFERRAL_BLOCKER_ANOMALIES`), it makes `_build_external_seed_product` return None,
+    and no other lane writes this column -- so the seed leaves the agent surface permanently.
+
+    Reachable two ordinary ways: any storefront already indexed as USD, and a first ingest whose
+    /meta.json read failed followed by one that succeeded. Asserted in BOTH directions, because
+    the currency can move either way and only one of them was the motivating case.
+    """
+    import json as _json
+    import re as _re
+
+    import services.catalog_enrichment_agent.apply as apply_mod
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+    from services.external_seed_audit import detect_price_currency_mismatch, normalize_seed_variants
+
+    arm = "\n".join(
+        _re.sub(r"--.*$", "", line)
+        for line in apply_mod._SEED_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
+    )
+    updated = set(_re.findall(r"(\w+)\s*=\s*EXCLUDED", arm))
+    assert "seed_data" in updated, "the premise: seed_data is refreshed on every re-ingest"
+    assert "price_currency" in updated, "so the column it must agree with has to be refreshed too"
+
+    for first, second in (("SGD", None), (None, "SGD")):
+        run1 = ingest_validated_record(_sgd_record(currency=first))["seeds"][0]
+        run2 = ingest_validated_record(_sgd_record(currency=second))["seeds"][0]
+        assert run1["id"] == run2["id"], "stable ids are why the conflict arm is reached at all"
+
+        stored = dict(run1)
+        for column in updated:          # apply the real arm
+            if column in run2:
+                stored[column] = run2[column]
+
+        data = stored["seed_data"]
+        if isinstance(data, str):
+            data = _json.loads(data)
+        variants = normalize_seed_variants(data, stored)
+
+        assert detect_price_currency_mismatch(stored, variants) is None, (
+            f"{first} -> {second}: row says {stored['price_currency']}, "
+            f"seed_data says {sorted({v.get('currency') for v in variants})}"
+        )
