@@ -236,6 +236,67 @@ with every call logged (actor, store, action, never the value). The delivery is 
 `X-Pivota-PrestaShop-Shop-Url` header and the signed body's `shop_url` must both
 resolve to the host the store was connected with.
 
+## Salesforce B2C (SFCC) native cartridge bridge
+
+`POST /webhooks/salesforce-commerce-cloud/{store_id}` is the first bridge whose
+**sender Pivota ships** — the cartridge at
+`integrations/sfcc-cartridge/int_pivota_telemetry/`, unlinted and unexecuted
+JavaScript held to the receiver only by
+`tests/test_sfcc_cartridge_contract.py`. SFCC has no outbound commerce
+webhooks: no subscription API for order or payment lifecycle, no signed
+delivery, no callback registry.
+
+**Nothing in SFCC fires on settlement.** `Order.paymentStatus`
+(`NOTPAID` / `PARTPAID` / `PAID`) is written by the merchant's payment-processor
+cartridge, by an OMS integration, or by a Business Manager user, and no hook and
+no event accompanies the transition. `Order.status` becoming `CANCELLED` is the
+same; a credit `Invoice` appearing is the same. Five OCAPI/SCAPI hooks therefore
+carried the funnel only as far as `payment.authorized`.
+
+**So the cartridge looks instead of listening.** The `PivotaSettlementSweep` job
+step walks the orders modified since a persisted cursor
+(`lastModified >= cursorAt`, ordered ascending, bounded by `MaxOrders`) and
+enqueues `order.paid` when `paymentStatus == PAID` (amount =
+`Order.totalGrossPrice`, `native_amount_semantics = order_total_gross`,
+`occurred_at` = the order's `lastModified`, which is the best time SFCC has),
+`order.cancelled` when `status == CANCELLED`, and one `refund.succeeded` per
+credit `Invoice` with a positive refunded amount. Events go into the same local
+outbox the shopper hooks use, so the existing drain job's signing, batching and
+retry apply unchanged. The cursor is always stored **rewound by
+`OverlapMinutes`** and never steps past an order whose enqueue failed.
+
+**It deliberately does NOT register on `dw.order.payment.capture` or
+`dw.order.payment.refund`.** Those are `PaymentHooks` *implementation*
+extension points that the merchant's PSP cartridge implements to move the money,
+resolved to a single implementation by cartridge-path order — an observer
+registered there could shadow the real processor and break capture. The contract
+test fails if either name ever appears in `hooks.json`.
+
+**No per-capture `payment.succeeded`.** `_PAID_EVENTS` feeds one `paid` stage
+and takes the MAX amount per resolved order rather than summing captures, so a
+second event per capture would add rows and no money. `order.paid` alone is what
+the funnel counts.
+
+Once-only has two layers, and neither substitutes for the other: order custom
+attributes written only after a successful enqueue (`pivotaPaidEmittedAt`,
+`pivotaCancelledEmittedAt`, `pivotaRefundedInvoices`), and a **deterministic
+`event_id`** per fact — `order.paid:<orderNo>`,
+`refund.succeeded:<invoiceNumber>` — which the ledger dedupes first-write-wins.
+Two credit invoices on one order stay two rows; a redelivery is a duplicate.
+
+`order.paid`, `payment.succeeded` and `refund.succeeded` are **rejected** when
+the amount is not positive or the currency is missing. Dedupe is first-write-wins
+on a key derived from the order or the invoice, so a zero-amount money event is
+not an under-report but a permanent shadow over the real figure. The cartridge
+enforces the same rule one step earlier, and leaves its once-only marker unset
+so a corrected total is still reported later.
+
+A refund issued in the PSP's own dashboard leaves no trace in SFCC at all: for
+Stripe that residual is covered by the PSP bridge below, and for every other
+processor it is a documented gap. `PARTPAID` emits nothing. See
+`docs/SFCC_TELEMETRY.md`, which also carries the verified-vs-assumed table for
+every SFCC API fact the cartridge relies on.
+
 ## PSP terminal-event bridge
 
 After the existing Stripe handler has verified the webhook signature, resolved
