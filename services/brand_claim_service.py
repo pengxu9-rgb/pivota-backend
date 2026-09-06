@@ -397,6 +397,97 @@ async def record_official_domain(
         return False
 
 
+DECLARE_OK = "declared"
+DECLARE_INVALID_HOST = "invalid_hostname"
+DECLARE_TAKEN = "claimed_by_another_merchant"
+DECLARE_ALREADY_PROVEN = "already_proven"
+
+
+async def declare_official_domain(
+    merchant_id: str, domain: Optional[str],
+) -> Dict[str, Any]:
+    """P0 item 5 — a merchant states an additional official domain.
+
+    WHY A THIRD SOURCE. `verified` and `asserted` both mean CONTROL WAS PROVEN
+    (they differ on whether the domain is also bound to the brand identity). A
+    self-declaration has proven nothing, so it is written as `declared`, which
+    is deliberately NOT in OFFICIAL_SOURCES: it is stored so the portal can
+    offer to verify it and so a claim can be started against it, and it does not
+    widen the set that decides `first_party`. A merchant who declared a retailer
+    would otherwise reclassify that retailer's citations as their own.
+
+    WHY THIS MATTERS. Measured in production: 1 of 42 merchants has any official
+    domain row, and 16 of 17 audited merchants fall back entirely to inference —
+    the condition the evidence base measured as a 13-point error on Anua's
+    headline, because inference knew `anua.com` and not `anua.us`.
+
+    Refuses a domain another merchant has already PROVEN. Declaration is cheap
+    and unproven, so without that guard it would be a way to attach a rival's
+    verified storefront to your own audit. It does NOT refuse a domain another
+    merchant merely declared — two unproven claims on one host is a conflict for
+    verification to settle, not for whoever typed first to win.
+
+    Returns {status, domain, ...}; never raises for ordinary refusals.
+    """
+    from db import merchant_official_domains as mod
+
+    host = normalize_host(domain)
+    if not merchant_id or not is_valid_public_hostname(host):
+        return {"status": DECLARE_INVALID_HOST, "domain": host or None}
+
+    owner = None
+    try:
+        owner = await mod.resolve_verified_merchant_for_domain(host)
+    except Exception:  # noqa: BLE001 — a lookup failure must not grant the write
+        logger.warning("declare_official_domain owner lookup failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_TAKEN, "domain": host}
+    if owner and str(owner) != str(merchant_id):
+        return {"status": DECLARE_TAKEN, "domain": host}
+
+    # Already proven for THIS merchant: declaring adds nothing and must not
+    # downgrade a verified row to an unproven one.
+    try:
+        existing = {
+            str(r.get("domain") or ""): r
+            for r in (await mod.list_official_domains(merchant_id) or [])
+        }
+    except Exception:  # noqa: BLE001
+        existing = {}
+    row = existing.get(host)
+    if row and str(row.get("source") or "") in mod.OFFICIAL_SOURCES:
+        return {"status": DECLARE_ALREADY_PROVEN, "domain": host,
+                "source": row.get("source")}
+
+    ok = False
+    try:
+        ok = await mod.upsert_official_domain(
+            merchant_id=merchant_id,
+            domain=host,
+            source=mod.SOURCE_DECLARED,
+            # PENDING, not VERIFIED. record_official_domain hardcodes VERIFIED
+            # because both of its sources mean control was proven; this one does
+            # not, and stamping it verified would make an unproven row
+            # indistinguishable from a proven one in every later read.
+            verification_status=mod.VERIFICATION_PENDING,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("declare_official_domain write failed for %s/%s",
+                       merchant_id, host, exc_info=True)
+        return {"status": DECLARE_INVALID_HOST, "domain": host}
+
+    return {
+        "status": DECLARE_OK if ok else DECLARE_INVALID_HOST,
+        "domain": host,
+        "source": mod.SOURCE_DECLARED,
+        "counts_toward_official_set": False,
+        "next_step": (
+            "Start a brand claim for this domain and publish the DNS TXT "
+            "record to prove control; it is not counted until then."
+        ),
+    }
+
+
 async def record_verified_official_domain(
     merchant_id: str, domain: Optional[str]
 ) -> bool:

@@ -50,10 +50,28 @@ logger = logging.getLogger(__name__)
 SOURCE_ASSERTED = "asserted"
 SOURCE_VERIFIED = "verified"
 SOURCE_INFERRED = "inferred"
-VALID_SOURCES = frozenset({SOURCE_ASSERTED, SOURCE_VERIFIED, SOURCE_INFERRED})
+# A merchant SAID this domain is theirs, and nothing has been proven.
+#
+# The distinction from `asserted` is the point. Both existing sources mean
+# CONTROL WAS PROVEN — `verified` adds "and the domain is bound to this
+# merchant's brand identity", `asserted` means proven but unbound. A
+# self-declaration has neither, and recording one as `asserted` would put an
+# unproven host into a tier whose whole meaning is proof.
+SOURCE_DECLARED = "declared"
+
+VALID_SOURCES = frozenset({
+    SOURCE_ASSERTED, SOURCE_VERIFIED, SOURCE_INFERRED, SOURCE_DECLARED,
+})
 
 # The two tiers a merchant (or a proven claim) put there on purpose. Membership
 # of the official set is granted by these regardless of what inference found.
+#
+# SOURCE_DECLARED IS DELIBERATELY ABSENT. A declared domain is stored so the
+# portal can offer to verify it and so a claim can be started against it, but it
+# must not widen the set that decides `first_party` on every cited host: a
+# merchant who declared a retailer — by mistake or otherwise — would otherwise
+# reclassify that retailer's citations as their own and inflate their official
+# share. Declaration is an intent to prove, not evidence.
 OFFICIAL_SOURCES = frozenset({SOURCE_ASSERTED, SOURCE_VERIFIED})
 
 LIVENESS_LIVE = "live"
@@ -587,6 +605,7 @@ def is_excluded(liveness_status: Optional[str]) -> bool:
 
 __all__: Sequence[str] = (
     "EXCLUDING_LIVENESS",
+    "SOURCE_DECLARED",
     "LIVENESS_DEAD",
     "LIVENESS_LIVE",
     "LIVENESS_UNCHECKED",
