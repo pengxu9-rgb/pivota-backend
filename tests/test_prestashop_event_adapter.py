@@ -205,6 +205,42 @@ def test_a_partial_slip_with_only_the_legacy_columns_still_reports_a_refund():
     assert events[0].amount_cents == 1500
 
 
+def test_a_slip_whose_every_basis_is_zero_is_rejected_not_a_zero_refund():
+    """A zero-amount money event under a native id is a PERMANENT shadow.
+
+    The ledger dedupes first-write-wins on the event key, and for a refund that
+    key is the slip id -- so `refund.succeeded` with `amount_cents = 0` does not
+    merely under-report this delivery, it makes the real amount for that slip
+    unwritable forever. `in`/non-None is not a settlement check: emit only on a
+    positive settled amount, and let the receiver count the rest `rejected`.
+    """
+    slip = _slip(
+        total_products_tax_incl="0.00",
+        total_shipping_tax_incl="0.00",
+        amount="0.00",
+        shipping_cost_amount="0.00",
+    )
+
+    with pytest.raises(ValueError, match="positive refund amount"):
+        _map(_event("actionOrderSlipAdd", slip=slip, order=_order()))
+
+
+def test_a_slip_with_only_a_positive_shipping_refund_still_maps():
+    """The positive counterpart: the refusal above must be about the AMOUNT
+    being zero, not about the modern totals being zero."""
+    slip = _slip(
+        total_products_tax_incl="0.00",
+        total_shipping_tax_incl="0.00",
+        amount="0.00",
+        shipping_cost_amount="4.00",
+    )
+
+    events = _map(_event("actionOrderSlipAdd", slip=slip, order=_order()))
+
+    assert [event.event_type for event in events] == ["refund.succeeded"]
+    assert events[0].amount_cents == 400
+
+
 def test_two_slips_are_two_refunds_with_distinct_ids():
     first = _map(_event("actionOrderSlipAdd", slip=_slip(id=77), order=_order()))
     second = _map(_event("actionOrderSlipAdd", slip=_slip(id=78), order=_order()))
@@ -459,6 +495,71 @@ def test_a_batch_of_only_ignorable_events_records_nothing(monkeypatch):
     assert ingested == []
 
 
+def test_a_non_ascii_signature_header_is_401_not_an_unauthenticated_500(monkeypatch):
+    """Starlette decodes header bytes as latin-1, so a signature header of
+    `sha256=\xe9...` reaches the verifier as a str holding a non-ASCII code
+    point -- and `hmac.compare_digest` raises TypeError on those, which came
+    back as a 500 to an UNAUTHENTICATED caller (and, through the ingress
+    envelope, as an `error` rather than an `unauthenticated` outcome). Every
+    malformed signature must be the one 401."""
+    ingested = []
+    client = _client(monkeypatch, ingested)
+    raw = json.dumps({"events": [_event()], "shop_url": SHOP_URL}).encode()
+
+    response = client.post(
+        f"/webhooks/prestashop/{STORE_ID}",
+        content=raw,
+        headers={
+            "Content-Type": "application/json",
+            # Sent as raw bytes: this is exactly what a shop with a mangled
+            # secret field puts on the wire.
+            "X-Pivota-PrestaShop-Signature": "sha256=\xe9deadbeef".encode("latin-1"),
+            "X-Pivota-PrestaShop-Timestamp": str(NOW),
+            "X-Pivota-PrestaShop-Shop-Url": SHOP_URL,
+        },
+    )
+
+    assert response.status_code == 401, response.text
+    assert ingested == []
+
+
+def test_a_batch_whose_only_event_is_rejected_still_reports_the_rejection(monkeypatch):
+    """`status: "ignored"` short-circuits `TelemetryIngress.record_result`,
+    which then records exactly one `ignored` event and nothing else -- so a
+    delivery whose every event was REJECTED counted as ignored and the
+    rejection disappeared from the metrics. The response keeps the summary
+    shape (with `accepted: 0`) so the ingress walks its outcome fields."""
+    from observability import commerce_telemetry_metrics as metrics
+
+    ingested = []
+    client = _client(monkeypatch, ingested)
+    broken = _event()
+    broken["order"] = dict(broken["order"])
+    broken["order"].pop("currency")
+
+    def _events_counter(outcome):
+        value = metrics.counter_value(
+            "events", write_path="prestashop_module", outcome=outcome
+        )
+        assert value is not None, "prometheus_client is required for this test"
+        return value
+
+    before_rejected = _events_counter("rejected")
+    before_ignored = _events_counter("ignored")
+
+    response = _post(client, [broken])
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["rejected"] == 1
+    assert body["accepted"] == 0
+    assert body["status"] != "ignored"
+    assert ingested == []
+    assert _events_counter("rejected") == before_rejected + 1
+    # ...and it was not silently re-labelled as an ignore.
+    assert _events_counter("ignored") == before_ignored
+
+
 def test_more_than_a_hundred_events_is_422(monkeypatch):
     ingested = []
     client = _client(monkeypatch, ingested)
@@ -641,6 +742,272 @@ def test_provisioning_never_writes_the_secret_to_a_log(monkeypatch, caplog):
     secret = response.json()["secret"]
     assert secret
     assert secret not in caplog.text
+
+
+# ---- provisioning: who may mint, and what it leaves behind ------------------------
+
+
+def test_a_non_admin_employee_may_not_mint_or_rotate_the_secret(monkeypatch):
+    """`can_access_merchant` is true for EVERY employee role, so before this
+    gate any employee could mint a per-store signing credential for any
+    merchant and read the value, or rotate a live one -- which silently severs
+    that shop's telemetry until a human re-pastes the new secret into the
+    module. Both paths hand out or destroy a credential; both are owner-or-
+    admin."""
+    import routes.merchant_store_connections as route
+
+    provisioned = _EnsureStoreDB(
+        json.dumps({"api_key": "ws-key", "webhook_secret": "live-secret"})
+    )
+    monkeypatch.setattr(route, "database", provisioned)
+    client = _ensure_client({"role": "employee", "sub": "u-emp"})
+
+    rotate = _ensure(client, {"rotate": True})
+    assert rotate.status_code == 403, rotate.text
+    assert "mint or rotate" in rotate.text
+    assert provisioned.updates == [], "a refused rotation still wrote"
+    assert "live-secret" not in rotate.text
+
+    # ...and a call that would have to MINT is refused for the same reason.
+    unprovisioned = _EnsureStoreDB(json.dumps({"api_key": "ws-key"}))
+    monkeypatch.setattr(route, "database", unprovisioned)
+
+    mint = _ensure(client)
+    assert mint.status_code == 403, mint.text
+    assert unprovisioned.updates == []
+
+
+def test_a_non_admin_employee_still_sees_whether_a_store_is_provisioned(monkeypatch):
+    """The positive counterpart: the gate is on the secret-RETURNING paths, not
+    on the route. A refusal everywhere would be a different (and unrequested)
+    behaviour change."""
+    import routes.merchant_store_connections as route
+
+    db = _EnsureStoreDB(json.dumps({"api_key": "ws-key", "webhook_secret": "live-secret"}))
+    monkeypatch.setattr(route, "database", db)
+    client = _ensure_client({"role": "employee", "sub": "u-emp"})
+
+    response = _ensure(client)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["secret_provisioned"] is True
+    assert "secret" not in response.json()
+    assert "live-secret" not in response.text
+    assert db.updates == []
+
+
+@pytest.mark.parametrize("role", ["admin", "super_admin"])
+def test_an_admin_tier_employee_may_rotate(monkeypatch, role):
+    import routes.merchant_store_connections as route
+
+    db = _EnsureStoreDB(json.dumps({"api_key": "ws-key", "webhook_secret": "old-secret"}))
+    monkeypatch.setattr(route, "database", db)
+    client = _ensure_client({"role": role, "sub": f"u-{role}"})
+
+    response = _ensure(client, {"rotate": True})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["secret"] not in ("", "old-secret")
+    assert response.json()["rotated"] is True
+    assert len(db.updates) == 1
+
+
+def test_the_owning_merchant_may_still_mint(monkeypatch):
+    import routes.merchant_store_connections as route
+
+    db = _EnsureStoreDB(json.dumps({"api_key": "ws-key"}))
+    monkeypatch.setattr(route, "database", db)
+    client = _ensure_client({"role": "merchant", "merchant_id": MERCHANT_ID, "sub": "u-m"})
+
+    response = _ensure(client)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["secret"]
+
+
+@pytest.mark.parametrize(
+    ("stored", "user", "body", "action"),
+    [
+        (json.dumps({"api_key": "ws-key"}), {"role": "merchant", "merchant_id": MERCHANT_ID}, None, "minted"),
+        (
+            json.dumps({"api_key": "ws-key", "webhook_secret": "live-secret"}),
+            {"role": "merchant", "merchant_id": MERCHANT_ID},
+            {"rotate": True},
+            "rotated",
+        ),
+        (
+            json.dumps({"api_key": "ws-key", "webhook_secret": "live-secret"}),
+            {"role": "merchant", "merchant_id": MERCHANT_ID},
+            None,
+            "noop",
+        ),
+        (json.dumps({"api_key": "ws-key"}), {"role": "employee", "sub": "u-emp"}, None, "denied_mint"),
+        (
+            json.dumps({"api_key": "ws-key", "webhook_secret": "live-secret"}),
+            {"role": "employee", "sub": "u-emp"},
+            {"rotate": True},
+            "denied_rotate",
+        ),
+    ],
+)
+def test_every_call_leaves_an_audit_line_that_names_the_actor_and_not_the_secret(
+    monkeypatch, caplog, stored, user, body, action
+):
+    """Minting, rotating and reading back the state of a per-store SIGNING
+    credential are credential events, and staff reach every store. A call that
+    leaves no trace is an untraceable one."""
+    import routes.merchant_store_connections as route
+
+    db = _EnsureStoreDB(stored)
+    monkeypatch.setattr(route, "database", db)
+    client = _ensure_client({"sub": "u-actor", **user})
+
+    with caplog.at_level(logging.DEBUG):
+        response = _ensure(client, body)
+
+    line = next(
+        (
+            record.getMessage()
+            for record in caplog.records
+            if "prestashop_telemetry_ensure" in record.getMessage()
+        ),
+        None,
+    )
+    assert line is not None, caplog.text
+    assert f"action={action}" in line
+    assert f"store_id={STORE_ID}" in line
+    assert f"store_merchant_id={MERCHANT_ID}" in line
+    assert f"actor_role={user['role']}" in line
+    assert "actor_user_id=u-" in line
+    # The value never appears -- neither the one that was minted nor the one
+    # that was already stored.
+    assert "live-secret" not in caplog.text
+    minted = response.json().get("secret") if response.status_code == 200 else None
+    if minted:
+        assert minted not in caplog.text
+
+
+# ---- reconnecting a shop must not disarm its telemetry -----------------------------
+
+
+class _StoreCellDB:
+    """ONE PrestaShop store row, whose `api_key` cell both the connect route and
+    the ensure route read and write. The point of the shared cell is that a
+    write from one route is visible to the other -- which is exactly what the
+    clobber was."""
+
+    def __init__(self, cell):
+        self.cell = cell
+        self.executed = []
+
+    async def fetch_one(self, query, values=None):
+        flat = " ".join(str(query).split())
+        if flat.startswith("SELECT api_key FROM merchant_stores"):
+            return {"api_key": self.cell}
+        if "domain = :domain" in flat:
+            # merchant_connect_prestashop's "does this store exist" probe.
+            return {"store_id": STORE_ID, "api_key": self.cell}
+        return {
+            "store_id": STORE_ID,
+            "merchant_id": MERCHANT_ID,
+            "domain": SHOP_URL,
+            "api_key": self.cell,
+        }
+
+    async def execute(self, query, values=None):
+        self.executed.append(" ".join(str(query).split()))
+        if values and "api_key" in values:
+            self.cell = values["api_key"]
+        return None
+
+
+class _StubPrestaShopAdapter:
+    def __init__(self, config):
+        self.config = config
+
+    def validate_config(self):
+        return True, None
+
+    async def test_connection(self):
+        return {"success": True, "store_name": "Shop"}
+
+
+def test_reconnecting_the_store_keeps_the_telemetry_secret_alive(monkeypatch):
+    """The reconnect UPDATE used to put the bare Webservice key over the whole
+    credential cell, erasing the `webhook_secret` the ensure route had minted.
+    Nothing announced it: the receiver simply 401'd every signed delivery, and
+    the module -- which cannot tell a rotated secret from an outage -- spent its
+    20-attempt budget and gave up on the events.
+
+    So this drives the real sequence: provision, reconnect with a NEW
+    Webservice key, then deliver a batch signed with the secret the merchant
+    pasted."""
+    import adapters.prestashop_adapter as adapter_module
+    import routes.merchant_store_connections as connect_route
+    from routes import prestashop_webhooks as receiver_route
+
+    db = _StoreCellDB("bare-webservice-key")
+    monkeypatch.setattr(connect_route, "database", db)
+    monkeypatch.setattr(adapter_module, "PrestaShopAdapter", _StubPrestaShopAdapter)
+    client = _ensure_client({"role": "merchant", "merchant_id": MERCHANT_ID, "sub": "u-m"})
+
+    secret = _ensure(client).json()["secret"]
+    assert secret
+
+    reconnect = client.post(
+        "/integrations/prestashop/connect",
+        json={
+            "merchant_id": MERCHANT_ID,
+            "store_url": SHOP_URL,
+            "api_key": "new-ws-key",
+        },
+    )
+    assert reconnect.status_code == 200, reconnect.text
+
+    # Both credentials survive, in one blob.
+    assert db.cell.startswith("{"), (
+        f"the reconnect overwrote the credential blob with a bare key: {db.cell!r}"
+    )
+    stored = json.loads(db.cell)
+    assert stored["api_key"] == "new-ws-key"
+    assert stored["webhook_secret"] == secret
+
+    # ...and the module's next delivery, signed with the secret the merchant
+    # pasted, is still accepted.
+    ingested = []
+    receiver = _client(monkeypatch, ingested, row=_store_row(api_key=db.cell))
+    monkeypatch.setattr(receiver_route.time, "time", lambda: NOW)
+
+    response = _post(receiver, [_event()], secret=secret)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["accepted"] == 2
+
+
+def test_a_reconnect_with_no_secret_to_keep_leaves_the_plain_key_shape(monkeypatch):
+    """The merge must not convert every PrestaShop credential cell to JSON: the
+    generic `parse_api_key` readers return "" for a blob with no
+    access_token/token/consumer_key, so a store that never provisioned
+    telemetry keeps the exact shape it has today."""
+    import adapters.prestashop_adapter as adapter_module
+    import routes.merchant_store_connections as connect_route
+
+    db = _StoreCellDB("bare-webservice-key")
+    monkeypatch.setattr(connect_route, "database", db)
+    monkeypatch.setattr(adapter_module, "PrestaShopAdapter", _StubPrestaShopAdapter)
+    client = _ensure_client({"role": "merchant", "merchant_id": MERCHANT_ID})
+
+    response = client.post(
+        "/integrations/prestashop/connect",
+        json={
+            "merchant_id": MERCHANT_ID,
+            "store_url": SHOP_URL,
+            "api_key": "new-ws-key",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert db.cell == "new-ws-key"
 
 
 # ---- the retired fail-open stub ---------------------------------------------------

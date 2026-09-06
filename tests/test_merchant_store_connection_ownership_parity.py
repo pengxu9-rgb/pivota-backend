@@ -326,14 +326,44 @@ def store_db(monkeypatch) -> _StoreDatabaseSpy:
     return spy
 
 
-_ENSURE_PATH = f"/integrations/woocommerce/{STORE_B}/webhooks/ensure"
+# Every store_id-keyed `.../ensure` route belongs here. They all select the row
+# on the caller-supplied store_id ALONE, so the owning merchant is a property of
+# the ROW and nothing in the request says who it is. A new platform's ensure
+# route that is not in this list is not covered by the ratchet.
+_ENSURE_PATHS = [
+    ("woocommerce", f"/integrations/woocommerce/{STORE_B}/webhooks/ensure"),
+    ("bigcommerce", f"/integrations/bigcommerce/{STORE_B}/webhooks/ensure"),
+    ("prestashop", f"/integrations/prestashop/{STORE_B}/telemetry/ensure"),
+]
+_ENSURE_IDS = [p[0] for p in _ENSURE_PATHS]
+_ENSURE_PATH = _ENSURE_PATHS[0][1]
 
 
-def test_merchant_cannot_manage_another_merchants_store_by_store_id(client, store_db):
+def test_the_ensure_ratchet_covers_every_store_keyed_ensure_route():
+    """The list above is the ratchet's whole reach, so it must not silently
+    fall behind the router."""
+    import re
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "routes" / "merchant_store_connections.py"
+    ).read_text(encoding="utf-8")
+    declared = set(re.findall(r'@router\.post\("(/[^"]*\{store_id\}[^"]*ensure)"\)', source))
+    covered = {
+        path.replace(f"/integrations/", "/").replace(STORE_B, "{store_id}")
+        for _, path in _ENSURE_PATHS
+    }
+    assert declared == covered, sorted(declared ^ covered)
+
+
+@pytest.mark.parametrize("platform,path", _ENSURE_PATHS, ids=_ENSURE_IDS)
+def test_merchant_cannot_manage_another_merchants_store_by_store_id(
+    client, store_db, platform, path
+):
     """`store_id` is caller-supplied and the row is selected on store_id alone,
     so the owning merchant is a property of the ROW. Same shape as the
     cross-tenant hazard fixed in wix_sync.py."""
-    resp = client.post(_ENSURE_PATH, headers=_auth("merchant", MERCHANT_A))
+    resp = client.post(path, headers=_auth("merchant", MERCHANT_A))
 
     assert _ownership_refusal(resp, "Can only manage your own store"), (
         f"{resp.status_code} {resp.text[:300]}"
@@ -341,16 +371,25 @@ def test_merchant_cannot_manage_another_merchants_store_by_store_id(client, stor
     assert not store_db.executes, "refused request still wrote"
 
 
-def test_merchant_reaches_the_handler_for_their_own_store(client, store_db):
+@pytest.mark.parametrize("platform,path", _ENSURE_PATHS, ids=_ENSURE_IDS)
+def test_merchant_reaches_the_handler_for_their_own_store(
+    client, store_db, platform, path
+):
     store_db.store_owner = MERCHANT_A
 
-    resp = client.post(_ENSURE_PATH, headers=_auth("merchant", MERCHANT_A))
+    resp = client.post(path, headers=_auth("merchant", MERCHANT_A))
 
     assert not _ownership_refusal(resp, "Can only manage your own store"), resp.text
 
 
-def test_staff_reach_the_handler_for_any_store(client, store_db):
-    resp = client.post(_ENSURE_PATH, headers=_auth("employee"))
+@pytest.mark.parametrize("platform,path", _ENSURE_PATHS, ids=_ENSURE_IDS)
+def test_staff_reach_the_handler_for_any_store(client, store_db, platform, path):
+    """Past the OWNERSHIP gate, which is what this file is about. The
+    PrestaShop route has a second, narrower gate behind it -- minting or
+    rotating its signing secret is owner-or-admin -- and that 403 carries its
+    own message, so it is not this assertion's business
+    (tests/test_prestashop_event_adapter.py pins it)."""
+    resp = client.post(path, headers=_auth("employee"))
 
     assert not _ownership_refusal(resp, "Can only manage your own store"), resp.text
 

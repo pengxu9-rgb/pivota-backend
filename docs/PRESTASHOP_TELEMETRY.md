@@ -26,8 +26,10 @@ only thing holding the two sides together, and it is a text-level test.
    back office (**Modules → Module Manager → Upload a module**). PrestaShop
    writes the module's `config.xml` itself during installation, so the
    directory does not ship one; `logo.png` is optional.
-3. Paste `endpoint`, `store_id` and `secret` into the module's **Configure**
-   page.
+3. Paste `endpoint` and `secret` into the module's **Configure** page. There is
+   no store-id field: the store id is the last segment of the endpoint URL. The
+   page refuses an endpoint that does not start with `https://` — the body is
+   signed, not encrypted.
 4. Add the cron line the Configure page prints, e.g. every two minutes:
 
    ```
@@ -50,6 +52,21 @@ which never returns its secret because the server installs the hooks itself:
 | Every later call | `{endpoint, store_id, shop_url, secret_provisioned: true}` — **no secret** |
 | `{"rotate": true}` | A new secret, returned once, `rotated: true`. The old one stops working immediately. |
 
+**Who may mint.** The two paths that RETURN a secret — the first mint and a
+rotation — are restricted to `MERCHANT_OR_ADMIN_ROLES` (the owning merchant,
+`admin`, `super_admin`). `can_access_merchant` is true for every employee role,
+so without that gate any employee could mint a per-store signing credential for
+any merchant, or rotate a live one and silently sever a shop's telemetry until
+a human re-pastes the new value. The wider staff tier still reaches the
+read-only answer (`secret_provisioned`), and a non-admin staff call that would
+have to mint or rotate gets 403.
+
+**Every call is logged.** One `prestashop_telemetry_ensure` line per call, at
+INFO, naming the action (`minted`, `rotated`, `noop`, `denied_mint`,
+`denied_rotate`, `mint_failed`), the store, the store's merchant, and the
+actor's role / user id / merchant id. The secret is never an argument;
+`secret_was_provisioned` is a boolean.
+
 The secret is written into the store's credential JSON in
 `merchant_stores.api_key`, then **re-read** before it is returned: two
 first-time calls can race and the merchant must paste the value the receiver
@@ -61,7 +78,14 @@ read-back path.
 `merchant_connect_prestashop` stores the bare Webservice key as a plain string,
 so a store connected before this existed is migrated to
 `{"api_key": "<the bare key>", "webhook_secret": "…"}` rather than having its
-key destroyed.
+key destroyed. The reverse direction matters just as much: **reconnecting** a
+PrestaShop store read-modify-writes that cell instead of overwriting it, so a
+merchant who re-enters their Webservice key keeps the telemetry secret. An
+overwrite there was invisible — the receiver simply 401'd every delivery, and
+the module, which cannot tell a rotated secret from an outage, burned its
+20-attempt budget and marked the events dead. When the cell holds nothing but
+the key, the plain-string shape is kept, so `parse_api_key` readers see exactly
+what they saw before.
 
 ## The wire
 
@@ -97,7 +121,12 @@ signature, which is why the signed body must agree with it.
 
 An unsupported hook is counted `ignored`; a malformed event is counted
 `rejected` and its siblings still ingest. Both answer 2xx so the module's
-outbox deletes the batch rather than retrying forever.
+outbox deletes the batch rather than retrying forever. When nothing maps and
+something was rejected, the response is the normal summary shape with
+`accepted: 0` and `status: "rejected"`, **not** `status: "ignored"`:
+`TelemetryIngress.record_result` short-circuits on that one status and records
+a single `ignored` event, which used to make the `rejected` count vanish from
+the metrics entirely.
 
 ## Mapping
 
@@ -111,7 +140,14 @@ outbox deletes the batch rather than retrying forever.
 | `actionOrderStatusPostUpdate`, `state_key = refund` | **nothing** | — |
 | `actionOrderStatusPostUpdate`, `shipped` / `delivered` / `other` | nothing | — |
 | `actionOrderSlipAdd` | `refund.succeeded`, keyed on the slip id | `total_products_tax_incl + total_shipping_tax_incl` |
+| `actionOrderSlipAdd`, every basis zero | **nothing** — `rejected` | — |
 
+`order.paid` is emitted at the **first** paid transition and its amount is
+frozen there. The ledger dedupes first-write-wins on the event key, and that key
+is derived from the order, so a later partial-payment top-up (a second capture
+raising `total_paid_real`) does **not** update the recorded amount. The
+`native_amount_semantics` metadata says which field the frozen figure came from,
+which is what makes the under-report diagnosable rather than invisible.
 `order_ref` is always `prestashop:<id_order>`: there is no PrestaShop order
 writeback in this repo (`create_prestashop_order` does not exist), so every
 order originated in the shop. `buyer_id` is `id_customer` when non-zero,
@@ -150,6 +186,13 @@ it anywhere in the 8.2.x tree, but a third-party module can, so a slip whose
 totals are missing or sum to zero while `amount` is non-zero falls back to
 `amount + shipping_cost_amount` rather than reporting a refund of nothing.
 
+A slip on which **every** basis is zero is refused — `ValueError`, counted
+`rejected`, no ledger row. Emitting `refund.succeeded` with `amount_cents = 0`
+would be worse than dropping it: the ledger dedupes first-write-wins on the
+event key, which for a refund is the slip id, so the zero row would permanently
+shadow the real amount for that slip. Money is emitted only on a positive
+settled amount.
+
 ## What the module never sends
 
 No name, no e-mail, no telephone number, no postal or billing details, no
@@ -181,6 +224,8 @@ Verified against the PrestaShop 8.2.x source and devdocs on 2026-09-05.
 | `config.xml` auto-generated at install; `logo.png` recommended not required | VERIFIED — devdocs |
 | `Db::getInstance()->execute()` / `->insert()` / `->executeS()` contract | **UNVERIFIED from devdocs** — used pervasively in core, but no devdocs page states it |
 | `Tools::passwdGen()`, `Tools::getShopDomainSsl()`, `PrestaShopLogger::addLog()`, `HelperForm` | **UNVERIFIED from devdocs** — core helpers, not covered by the pages checked |
+| `Db::getInstance()->getValue()` and `SHOW TABLES LIKE` (the dead/pending row counts) | **UNVERIFIED from devdocs** — same family as `executeS()` above |
+| `Configuration::get()` returns `false` for a key that was never set (how install() avoids blanking the endpoint and secret on a Reset) | **UNVERIFIED from devdocs** |
 
 ## Not built
 
@@ -188,6 +233,17 @@ Verified against the PrestaShop 8.2.x source and devdocs on 2026-09-05.
 and `order_slip` resources would be a *different* ingress (a replay is not a
 signed live delivery) and would need its own `prestashop_reconciliation` write
 path in `services/commerce_ledger_provenance.py`. It is not in this change. The
-outbox already survives an outage — rows are kept, retried with backoff for up
-to 20 attempts, and only then dropped — so the gap it would close is a shop
-whose cron never ran for long enough to exhaust that budget.
+outbox already survives an outage — rows are kept and retried with backoff for
+up to 20 attempts — so the gap it would close is a shop whose cron never ran for
+long enough to exhaust that budget.
+
+**No receiver-side staleness signal, and no replay path.** A row that exhausts
+its 20 attempts is marked `dead` in the shop's outbox rather than deleted: the
+drain skips it, the shop's log gets one error line naming the event id, the
+order and the attempt count, and the module's configuration page shows the
+merchant a count of dead rows. That is the whole of the story on the *shop*
+side. On the *Pivota* side nothing notices: there is no alert for a PrestaShop
+store that stopped delivering, and no endpoint that re-ingests a dead row.
+Recovering them is a support action against the rows still sitting in
+`ps_pivota_telemetry_outbox` with `status = 'dead'`. Fixing the endpoint or the
+secret does not resurrect them.

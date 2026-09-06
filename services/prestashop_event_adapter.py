@@ -248,28 +248,33 @@ def _slip_amount_cents(slip: Dict[str, Any], currency: str) -> int:
     falls back to ``amount + shipping_cost_amount`` rather than reporting a
     refund of nothing. The module sends all four fields so this choice is made
     HERE, where it is tested, and not in unlinted PHP.
+
+    A slip on which EVERY basis is zero is refused outright, as a
+    ``ValueError`` the receiver counts as ``rejected``. The ledger dedupes
+    first-write-wins on the event key, and that key is the slip id — so a
+    ``refund.succeeded`` carrying ``amount_cents = 0`` is not a harmless
+    under-report, it is a permanent shadow: the real amount for the same slip
+    can never be written afterwards. Money is emitted only on a positive
+    settled amount.
     """
     products = _text(slip.get("total_products_tax_incl"))
     shipping = _text(slip.get("total_shipping_tax_incl"))
-    modern = 0
     if products is not None:
         modern = _amount_cents(products, currency) or 0
         if shipping is not None:
             modern += _amount_cents(shipping, currency) or 0
-        if modern:
+        if modern > 0:
             return modern
+    legacy = 0
     legacy_raw = _text(slip.get("amount"))
-    if legacy_raw is None:
-        if products is None:
-            raise ValueError("PrestaShop credit slip has no refund amount")
-        return modern
-    legacy = _amount_cents(legacy_raw, currency) or 0
-    shipping_cost = _text(slip.get("shipping_cost_amount"))
-    if shipping_cost is not None:
-        legacy += _amount_cents(shipping_cost, currency) or 0
-    if not legacy and products is None:
-        raise ValueError("PrestaShop credit slip has no refund amount")
-    return legacy
+    if legacy_raw is not None:
+        legacy = _amount_cents(legacy_raw, currency) or 0
+        shipping_cost = _text(slip.get("shipping_cost_amount"))
+        if shipping_cost is not None:
+            legacy += _amount_cents(shipping_cost, currency) or 0
+    if legacy > 0:
+        return legacy
+    raise ValueError("PrestaShop credit slip has no positive refund amount")
 
 
 def _order_facts(event: Dict[str, Any]) -> Dict[str, Any]:

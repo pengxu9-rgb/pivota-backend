@@ -34,8 +34,16 @@ class PivotaTelemetry extends Module
     const MAX_EVENTS_PER_BATCH = 100;
     const MAX_BATCHES_PER_RUN = 10;
 
-    /** After this many failed deliveries a row is dropped, not retried forever. */
+    /**
+     * After this many failed deliveries a row stops being retried. It is NOT
+     * deleted: it is marked `dead` and counted on the configuration page, so a
+     * shop that was misconfigured for a week can say how much it lost.
+     */
     const MAX_ATTEMPTS = 20;
+
+    /** Outbox row states. `dead` rows are never selected by the drain again. */
+    const STATUS_PENDING = 'pending';
+    const STATUS_DEAD = 'dead';
 
     public function __construct()
     {
@@ -53,7 +61,13 @@ class PivotaTelemetry extends Module
         $this->description = $this->l(
             'Signs and forwards order and credit-slip events to Pivota. No personal data leaves the shop.'
         );
-        $this->confirmUponUninstall = $this->l('Uninstalling drops any events still waiting to be sent.');
+        // Reset, in the back office, is uninstall + install. So uninstalling
+        // keeps the endpoint and the signing secret (a merchant who reset the
+        // module would otherwise have to rotate the secret and re-paste it),
+        // and keeps the outbox table whenever anything is still queued in it.
+        $this->confirmUponUninstall = $this->l(
+            'Uninstalling keeps your endpoint, signing secret and any events still waiting to be sent.'
+        );
     }
 
     /**
@@ -76,23 +90,49 @@ class PivotaTelemetry extends Module
         // It is NOT the signing secret and is deliberately shown in the back
         // office so the merchant can build the cron line.
         Configuration::updateValue('PIVOTA_TELEMETRY_CRON_TOKEN', Tools::passwdGen(48));
-        Configuration::updateValue('PIVOTA_TELEMETRY_ENDPOINT', '');
-        Configuration::updateValue('PIVOTA_TELEMETRY_STORE_ID', '');
-        Configuration::updateValue('PIVOTA_TELEMETRY_SECRET', '');
+        // The endpoint and the secret are only initialised when they are not
+        // already set: a back-office **Reset** is uninstall + install, and
+        // blanking them there would silently stop a working shop.
+        if (Configuration::get('PIVOTA_TELEMETRY_ENDPOINT') === false) {
+            Configuration::updateValue('PIVOTA_TELEMETRY_ENDPOINT', '');
+        }
+        if (Configuration::get('PIVOTA_TELEMETRY_SECRET') === false) {
+            Configuration::updateValue('PIVOTA_TELEMETRY_SECRET', '');
+        }
 
         return $this->registerHook('actionValidateOrder')
             && $this->registerHook('actionOrderStatusPostUpdate')
             && $this->registerHook('actionOrderSlipAdd');
     }
 
+    /**
+     * Uninstall keeps anything a merchant cannot re-create by themselves.
+     *
+     * The back office's **Reset** button is uninstall + install, so this runs
+     * on a path a merchant takes to FIX the module. Dropping the outbox there
+     * threw away every event the shop had not managed to deliver yet, and
+     * deleting PIVOTA_TELEMETRY_SECRET forced a rotation in the Pivota console
+     * plus a re-paste — for a reset. So: the table is dropped only when it is
+     * empty of work, and the endpoint and the secret are never deleted. Only
+     * the cron token, which install() mints again, goes.
+     */
     public function uninstall()
     {
-        Db::getInstance()->execute(
-            'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . self::OUTBOX_TABLE . '`'
-        );
-        Configuration::deleteByName('PIVOTA_TELEMETRY_ENDPOINT');
-        Configuration::deleteByName('PIVOTA_TELEMETRY_STORE_ID');
-        Configuration::deleteByName('PIVOTA_TELEMETRY_SECRET');
+        $pending = $this->pendingCount();
+        if ($pending > 0) {
+            PrestaShopLogger::addLog(
+                'Pivota telemetry uninstalled with ' . (int) $pending
+                . ' event(s) still queued: the outbox table was KEPT so they can still be sent'
+                . ' after a reinstall.',
+                2,
+                null,
+                'PivotaTelemetry'
+            );
+        } else {
+            Db::getInstance()->execute(
+                'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . self::OUTBOX_TABLE . '`'
+            );
+        }
         Configuration::deleteByName('PIVOTA_TELEMETRY_CRON_TOKEN');
 
         return parent::uninstall();
@@ -105,13 +145,45 @@ class PivotaTelemetry extends Module
             `event_id` VARCHAR(191) NOT NULL,
             `payload` LONGTEXT NOT NULL,
             `attempts` INT UNSIGNED NOT NULL DEFAULT 0,
+            `status` VARCHAR(16) NOT NULL DEFAULT "' . pSQL(self::STATUS_PENDING) . '",
             `available_at` DATETIME NOT NULL,
             `date_add` DATETIME NOT NULL,
             PRIMARY KEY (`id_outbox`),
-            KEY `pivota_outbox_due` (`available_at`, `id_outbox`)
+            KEY `pivota_outbox_due` (`status`, `available_at`, `id_outbox`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8';
 
         return Db::getInstance()->execute($sql);
+    }
+
+    /**
+     * Rows the drain gave up on. Surfaced on the configuration page: a merchant
+     * whose endpoint was wrong for a week must be able to SEE that events were
+     * lost, rather than find a silently shorter ledger in Pivota.
+     */
+    public function deadCount()
+    {
+        return $this->countByStatus(self::STATUS_DEAD);
+    }
+
+    private function pendingCount()
+    {
+        return $this->countByStatus(self::STATUS_PENDING);
+    }
+
+    private function countByStatus($status)
+    {
+        $table = _DB_PREFIX_ . self::OUTBOX_TABLE;
+        // The table is gone after an uninstall, and getValue() on a missing
+        // table raises in debug mode, so check first.
+        $exists = Db::getInstance()->executeS('SHOW TABLES LIKE "' . pSQL($table) . '"');
+        if (!$exists) {
+            return 0;
+        }
+
+        return (int) Db::getInstance()->getValue(
+            'SELECT COUNT(*) FROM `' . $table . '`
+             WHERE `status` = "' . pSQL($status) . '"'
+        );
     }
 
     // ---- configuration ------------------------------------------------------
@@ -125,23 +197,37 @@ class PivotaTelemetry extends Module
     {
         $output = '';
         if (Tools::isSubmit('submitPivotaTelemetry')) {
-            Configuration::updateValue(
-                'PIVOTA_TELEMETRY_ENDPOINT',
-                trim((string) Tools::getValue('PIVOTA_TELEMETRY_ENDPOINT'))
-            );
-            Configuration::updateValue(
-                'PIVOTA_TELEMETRY_STORE_ID',
-                trim((string) Tools::getValue('PIVOTA_TELEMETRY_STORE_ID'))
-            );
-            $submittedSecret = trim((string) Tools::getValue('PIVOTA_TELEMETRY_SECRET'));
-            if ($submittedSecret !== '') {
-                Configuration::updateValue('PIVOTA_TELEMETRY_SECRET', $submittedSecret);
+            $submittedEndpoint = trim((string) Tools::getValue('PIVOTA_TELEMETRY_ENDPOINT'));
+            // https ONLY. The body is signed, not encrypted: over http the
+            // whole payload — and a valid signature for it — travels in
+            // cleartext for anyone on the path to read and replay within the
+            // receiver's 300 s window. A typo'd scheme must be a form error,
+            // not a silently downgraded shop.
+            if ($submittedEndpoint !== '' && stripos($submittedEndpoint, 'https://') !== 0) {
+                $output .= $this->displayError(
+                    $this->l('The endpoint must start with https:// — telemetry is never sent over http.')
+                );
+            } else {
+                Configuration::updateValue('PIVOTA_TELEMETRY_ENDPOINT', $submittedEndpoint);
+                $submittedSecret = trim((string) Tools::getValue('PIVOTA_TELEMETRY_SECRET'));
+                if ($submittedSecret !== '') {
+                    Configuration::updateValue('PIVOTA_TELEMETRY_SECRET', $submittedSecret);
+                }
+                $output .= $this->displayConfirmation($this->l('Settings saved.'));
             }
-            $output .= $this->displayConfirmation($this->l('Settings saved.'));
         }
         $output .= $this->displayInformation(
             $this->l('Cron URL (run every minute or two):') . ' ' . $this->cronUrl()
         );
+        $dead = $this->deadCount();
+        if ($dead > 0) {
+            $output .= $this->displayError(
+                sprintf(
+                    $this->l('%d event(s) could not be delivered and are no longer being retried. Contact Pivota support to have them replayed.'),
+                    (int) $dead
+                )
+            );
+        }
 
         return $output . $this->renderForm();
     }
@@ -169,13 +255,7 @@ class PivotaTelemetry extends Module
                         'type' => 'text',
                         'label' => $this->l('Endpoint'),
                         'name' => 'PIVOTA_TELEMETRY_ENDPOINT',
-                        'desc' => $this->l('The https URL Pivota gave you, ending in your store id.'),
-                        'required' => true,
-                    ),
-                    array(
-                        'type' => 'text',
-                        'label' => $this->l('Store id'),
-                        'name' => 'PIVOTA_TELEMETRY_STORE_ID',
+                        'desc' => $this->l('The https URL Pivota gave you, ending in your store id. http is refused.'),
                         'required' => true,
                     ),
                     array(
@@ -200,7 +280,6 @@ class PivotaTelemetry extends Module
         $helper->submit_action = 'submitPivotaTelemetry';
         $helper->fields_value = array(
             'PIVOTA_TELEMETRY_ENDPOINT' => Configuration::get('PIVOTA_TELEMETRY_ENDPOINT'),
-            'PIVOTA_TELEMETRY_STORE_ID' => Configuration::get('PIVOTA_TELEMETRY_STORE_ID'),
             // Intentionally blank. See the comment on the field above.
             'PIVOTA_TELEMETRY_SECRET' => '',
         );
@@ -384,6 +463,7 @@ class PivotaTelemetry extends Module
                 'event_id' => pSQL($eventId),
                 'payload' => pSQL($encoded, true),
                 'attempts' => 0,
+                'status' => pSQL(self::STATUS_PENDING),
                 'available_at' => pSQL($now),
                 'date_add' => pSQL($now),
             )

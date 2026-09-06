@@ -46,16 +46,21 @@ refund — the credit slip's id, amounts and timestamp.
    `POST /integrations/prestashop/{store_id}/telemetry/ensure`. The response
    carries `endpoint`, `store_id` and — **only on the call that mints it** —
    `secret`. Copy the secret now; it is never shown again. If you lose it,
-   call the same endpoint with `{"rotate": true}` for a new one.
+   call the same endpoint with `{"rotate": true}` for a new one. Minting and
+   rotating are restricted to the merchant themselves and to Pivota admins;
+   other staff can only see *whether* a store is provisioned.
 2. Zip this `pivotatelemetry` directory and upload it in the back office under
    **Modules → Module Manager → Upload a module**, then install it.
    PrestaShop writes the module's `config.xml` itself during installation, so
    this directory does not ship one. A `logo.png` in this folder is optional
    and only affects the back-office listing.
-3. Open the module's **Configure** page and paste the endpoint, the store id
-   and the secret. The secret field is a password input and its stored value is
-   never rendered back — leaving it empty on a later save keeps the current
-   secret.
+3. Open the module's **Configure** page and paste the endpoint and the secret.
+   There is no separate "store id" field: the store id is the last segment of
+   the endpoint URL. The endpoint **must start with `https://`** — the page
+   refuses anything else, because the body is signed but not encrypted and over
+   http it (and a valid signature for it) would travel in cleartext. The secret
+   field is a password input and its stored value is never rendered back —
+   leaving it empty on a later save keeps the current secret.
 4. The Configure page prints the **cron URL** (it carries a cron token minted
    at install; that token is *not* the signing secret). Add a cron line, e.g.
 
@@ -91,10 +96,35 @@ store was connected with.
 
 A 2xx deletes the delivered rows. Anything else keeps them, increments
 `attempts`, backs off exponentially (15 s doubling to a 1 h ceiling) and stops
-that run. After 20 failed attempts a row is dropped so a permanently
-misconfigured shop cannot grow an unbounded table.
+that run.
+
+## Events that could not be delivered
+
+After 20 failed attempts a row is **not deleted**. Its `status` column flips
+from `pending` to `dead`, the drain never selects it again, and the shop's own
+log (**Advanced Parameters → Logs**, source `PivotaTelemetry`) gets one error
+line naming the event id, the order and the attempt count. The module's
+**Configure** page shows a red banner counting the dead rows, so a shop that
+was misconfigured for a week can see how much it lost rather than discovering a
+short ledger in Pivota.
+
+> **Gap, stated on purpose.** Nothing on the *receiver* side notices the
+> silence: Pivota has no staleness signal for a PrestaShop store that stopped
+> delivering, and the module has no self-service replay. Dead rows are replayed
+> by Pivota support, from the rows still sitting in `ps_pivota_telemetry_outbox`
+> with `status = 'dead'`. Fixing the endpoint or the secret does **not**
+> resurrect them.
 
 ## Uninstall
 
-Uninstalling drops `ps_pivota_telemetry_outbox` (including any events still
-waiting to be sent) and deletes the four configuration values.
+Uninstalling is deliberately conservative, because the back office's **Reset**
+button is uninstall followed by install:
+
+* `ps_pivota_telemetry_outbox` is dropped **only when nothing is queued in it**.
+  If pending events remain, the table is kept and a warning is logged, so a
+  reinstall can still deliver them.
+* `PIVOTA_TELEMETRY_ENDPOINT` and `PIVOTA_TELEMETRY_SECRET` are **kept**. A
+  reset would otherwise force the merchant to rotate the secret in the Pivota
+  console and paste it again.
+* Only `PIVOTA_TELEMETRY_CRON_TOKEN` is deleted; install mints a new one. Update
+  the cron line after a reinstall.

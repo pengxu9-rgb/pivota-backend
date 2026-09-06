@@ -7,14 +7,18 @@ renamed payload key in `pivotatelemetry.php` and a receiver that silently maps
 `None`. Same shape and the same reason as
 `tests/test_sfcc_cartridge_contract.py`.
 
-Four claims are pinned:
+Five claims are pinned:
 
 1. the hooks never touch the network — only the cron drain controller does;
 2. the header names, the signed string and the batch bounds match the receiver;
 3. every payload key the module emits is declared in the mapper's wire
    contract, and every key the mapper reads is one the module emits;
 4. nothing personal is serialized, and the secret is a password field that is
-   never rendered back.
+   never rendered back;
+5. what the module does with what it CANNOT deliver, or is asked to keep: an
+   exhausted row is marked dead and logged rather than deleted, the endpoint
+   must be https, and uninstall does not throw away queued events or the
+   secret.
 """
 
 from __future__ import annotations
@@ -277,3 +281,113 @@ def test_the_secret_is_a_password_field_that_is_never_rendered_back(module_php, 
     for line in drain_php.splitlines():
         if "addLog(" in line or "$secret" in line:
             assert "'. $secret" not in line and "$secret . " not in line
+
+
+# ---- 5. exhaustion, transport, and what uninstall keeps --------------------------
+
+
+def test_an_exhausted_row_is_marked_dead_and_logged_not_deleted(module_php, drain_php):
+    """A DELETE here was silent data loss: the shop had no record that anything
+    was dropped and Pivota's ledger was simply short. The row stays, the drain
+    stops selecting it, and the shop's own log names it once."""
+    exhausted = _between(
+        drain_php,
+        "if ($attempts >= PivotaTelemetry::MAX_ATTEMPTS) {",
+        "continue;",
+    )
+    assert "DELETE" not in exhausted.upper(), exhausted
+    assert "$this->markDead($row, $attempts);" in exhausted
+
+    dead = _between(drain_php, "private function markDead(array $row, $attempts)", "\n    }")
+    assert "DELETE" not in dead.upper(), dead
+    assert "`status` = \"' . pSQL(PivotaTelemetry::STATUS_DEAD)" in dead
+    # ...and it says so, at error severity, with the identifiers a human needs.
+    assert "PrestaShopLogger::addLog(" in dead
+    assert "$row['event_id']" in dead
+    assert "$orderId" in dead
+    assert "$attempts" in dead
+    assert "\n            3,\n" in dead, "the give-up log must be severity 3 (error)"
+
+    # The ONLY delete left in the drain is the one that removes DELIVERED rows.
+    deletes = [
+        line for line in drain_php.splitlines() if "DELETE FROM" in line.upper()
+    ]
+    assert len(deletes) == 1, deletes
+    remove = _between(drain_php, "private function removeRows(array $rows)", "\n    }")
+    assert "DELETE FROM" in remove.upper(), "the surviving DELETE is not the delivered-row one"
+
+
+def test_the_drain_never_selects_a_dead_row(module_php, drain_php):
+    """Without this filter a dead row is re-POSTed every two minutes forever."""
+    due = _between(drain_php, "private function dueRows()", "\n    }")
+    assert "`status` = \"' . pSQL(PivotaTelemetry::STATUS_PENDING)" in due
+    # The column it filters on is one the install SQL actually creates, with the
+    # value the enqueue actually writes.
+    install = _between(module_php, "private function createOutboxTable()", "return Db::getInstance()")
+    assert "`status` VARCHAR(16) NOT NULL DEFAULT" in install
+    assert "pSQL(self::STATUS_PENDING)" in install
+    assert "const STATUS_PENDING = 'pending';" in module_php
+    assert "const STATUS_DEAD = 'dead';" in module_php
+    enqueue = _between(module_php, "Db::getInstance()->insert(", "\n        );")
+    assert "'status' => pSQL(self::STATUS_PENDING)," in enqueue
+
+
+def test_the_merchant_can_see_how_many_events_were_lost(module_php):
+    """A dead row nobody can count is the same silence as a deleted one."""
+    assert "public function deadCount()" in module_php
+    assert "self::STATUS_DEAD" in _between(module_php, "public function deadCount()", "\n    }")
+    content = _between(module_php, "public function getContent()", "return $output . $this->renderForm();")
+    assert "$this->deadCount()" in content
+    assert "could not be delivered" in content
+
+
+def test_the_endpoint_must_be_https(module_php):
+    """The body is signed, not encrypted. Over http the payload and a valid
+    signature for it travel in cleartext, replayable inside the receiver's
+    300 s window."""
+    content = _between(module_php, "public function getContent()", "return $output . $this->renderForm();")
+    assert "stripos($submittedEndpoint, 'https://') !== 0" in content
+    assert "$this->displayError(" in content
+    # The rejected value is not written anyway.
+    saved = content.split("} else {", 1)[1]
+    assert "Configuration::updateValue('PIVOTA_TELEMETRY_ENDPOINT', $submittedEndpoint);" in saved
+
+
+def test_uninstall_keeps_queued_events_and_the_secret(module_php):
+    """Back-office **Reset** is uninstall + install, so uninstall runs on a path
+    a merchant takes to FIX the module. Dropping the outbox there threw away
+    undelivered events; deleting the secret forced a rotation and a re-paste."""
+    uninstall = _between(module_php, "public function uninstall()", "return parent::uninstall();")
+    assert "$this->pendingCount()" in uninstall
+    assert "if ($pending > 0)" in uninstall
+    assert "PrestaShopLogger::addLog(" in uninstall
+    # The DROP is inside the else, i.e. only when nothing is queued.
+    dropped = uninstall.split("} else {", 1)
+    assert len(dropped) == 2, uninstall
+    assert "DROP TABLE" not in dropped[0].upper()
+    assert "DROP TABLE IF EXISTS" in dropped[1]
+    # The two values a merchant cannot re-create are never deleted.
+    assert "deleteByName('PIVOTA_TELEMETRY_SECRET')" not in module_php
+    assert "deleteByName('PIVOTA_TELEMETRY_ENDPOINT')" not in module_php
+    # ...and the one that install() mints again still is.
+    assert "deleteByName('PIVOTA_TELEMETRY_CRON_TOKEN')" in uninstall
+
+
+def test_the_dead_row_replay_gap_is_written_down(module_php):
+    """A stated gap, not a silent one: nothing on the receiver side notices a
+    shop that stopped delivering, and there is no self-service replay."""
+    readme = (MODULE_DIR / "README.md").read_text(encoding="utf-8")
+    doc = (ROOT / "docs" / "PRESTASHOP_TELEMETRY.md").read_text(encoding="utf-8")
+    for text in (readme, doc):
+        assert "dead" in text.lower()
+        assert "support" in text.lower()
+    assert "staleness signal" in doc
+
+
+def test_the_unread_store_id_setting_is_gone(module_php):
+    """`PIVOTA_TELEMETRY_STORE_ID` was a REQUIRED configuration field nothing
+    read: the store id is already the last segment of the endpoint URL, so the
+    only thing it could do was be typed wrong."""
+    assert "PIVOTA_TELEMETRY_STORE_ID" not in module_php
+    readme = (MODULE_DIR / "README.md").read_text(encoding="utf-8")
+    assert "PIVOTA_TELEMETRY_STORE_ID" not in readme

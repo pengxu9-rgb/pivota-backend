@@ -129,7 +129,16 @@ def _verify_signature(
         str(timestamp_int).encode("ascii") + b"." + raw,
         hashlib.sha256,
     ).hexdigest()
-    if not hmac.compare_digest(expected, supplied[7:]):
+    # BYTES, not str. `hmac.compare_digest` raises TypeError when either str
+    # holds a non-ASCII code point, and Starlette decodes header bytes as
+    # latin-1 — so a header of `sha256=\xe9...` reached this line as a str the
+    # comparison could not accept and became an UNAUTHENTICATED 500. Encoding
+    # here turns every malformed value back into the one 401.
+    try:
+        candidate = supplied[7:].encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise HTTPException(status_code=401, detail=_UNAUTHORIZED) from exc
+    if not hmac.compare_digest(expected.encode("ascii"), candidate):
         raise HTTPException(status_code=401, detail=_UNAUTHORIZED)
 
 
@@ -225,6 +234,22 @@ async def receive_prestashop_events(
             # batch; the count stays observable without echoing the payload.
             rejected += 1
     if not mapped:
+        if rejected:
+            # NOT `status: "ignored"`. `TelemetryIngress.record_result`
+            # short-circuits on that status and records exactly one `ignored`
+            # event, so a delivery whose every event was REJECTED counted as
+            # ignored and the rejection never reached the metrics. Returning
+            # the normal summary shape (with `accepted = 0`) makes the ingress
+            # walk its accepted/duplicate/ignored/rejected fields instead.
+            return {
+                "status": "rejected",
+                "platform": "prestashop",
+                "accepted": 0,
+                "duplicates": 0,
+                "events": [],
+                "ignored": ignored,
+                "rejected": rejected,
+            }
         return {
             "status": "ignored",
             "platform": "prestashop",

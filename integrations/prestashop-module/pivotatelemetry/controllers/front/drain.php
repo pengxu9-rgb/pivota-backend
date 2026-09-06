@@ -17,8 +17,10 @@
  *   - 2xx deletes the rows;
  *   - anything else keeps them, increments `attempts`, backs off
  *     exponentially, and stops the run (the next tick retries);
- *   - a row that has failed MAX_ATTEMPTS times is dropped, so a permanently
- *     misconfigured shop does not grow an unbounded table.
+ *   - a row that has failed MAX_ATTEMPTS times is marked `dead` and logged, so
+ *     a permanently misconfigured shop stops retrying it but can still SEE it:
+ *     the module's configuration page counts dead rows. They are never deleted
+ *     here, because deleting them was the only record that anything was lost.
  *
  * Unlinted: written on a machine with no php binary.
  */
@@ -92,10 +94,14 @@ class PivotaTelemetryDrainModuleFrontController extends ModuleFrontController
 
     private function dueRows()
     {
+        // `status` first: a dead row is never selected again, so a shop that
+        // exhausted the attempt budget stops re-POSTing the same batch every
+        // two minutes forever.
         return Db::getInstance()->executeS(
-            'SELECT `id_outbox`, `payload`, `attempts`
+            'SELECT `id_outbox`, `event_id`, `payload`, `attempts`
              FROM `' . _DB_PREFIX_ . PivotaTelemetry::OUTBOX_TABLE . '`
-             WHERE `available_at` <= "' . pSQL(date('Y-m-d H:i:s')) . '"
+             WHERE `status` = "' . pSQL(PivotaTelemetry::STATUS_PENDING) . '"
+               AND `available_at` <= "' . pSQL(date('Y-m-d H:i:s')) . '"
              ORDER BY `id_outbox` ASC
              LIMIT ' . (int) PivotaTelemetry::MAX_EVENTS_PER_BATCH
         );
@@ -127,10 +133,7 @@ class PivotaTelemetryDrainModuleFrontController extends ModuleFrontController
         foreach ($rows as $row) {
             $attempts = (int) $row['attempts'] + 1;
             if ($attempts >= PivotaTelemetry::MAX_ATTEMPTS) {
-                Db::getInstance()->execute(
-                    'DELETE FROM `' . _DB_PREFIX_ . PivotaTelemetry::OUTBOX_TABLE . '`
-                     WHERE `id_outbox` = ' . (int) $row['id_outbox']
-                );
+                $this->markDead($row, $attempts);
                 continue;
             }
             $delay = min(3600, pow(2, min($attempts, 10)) * 15);
@@ -141,6 +144,40 @@ class PivotaTelemetryDrainModuleFrontController extends ModuleFrontController
                  WHERE `id_outbox` = ' . (int) $row['id_outbox']
             );
         }
+    }
+
+    /**
+     * The attempt budget is spent: stop retrying, but KEEP the row and say so.
+     *
+     * Deleting it here was silent data loss — the shop had no record that
+     * anything was dropped and Pivota's ledger was simply short. A dead row is
+     * still in the table, still counted by PivotaTelemetry::deadCount() on the
+     * configuration page, and named once in the shop's own log with the event
+     * id, the order it belongs to and how many attempts it took. Nothing on
+     * the RECEIVER side notices the silence (see the README): replaying a dead
+     * row is a support action.
+     */
+    private function markDead(array $row, $attempts)
+    {
+        $payload = json_decode($row['payload'], true);
+        $orderId = 0;
+        if (is_array($payload) && isset($payload['order']['id'])) {
+            $orderId = (int) $payload['order']['id'];
+        }
+        Db::getInstance()->execute(
+            'UPDATE `' . _DB_PREFIX_ . PivotaTelemetry::OUTBOX_TABLE . '`
+             SET `attempts` = ' . (int) $attempts . ',
+                 `status` = "' . pSQL(PivotaTelemetry::STATUS_DEAD) . '"
+             WHERE `id_outbox` = ' . (int) $row['id_outbox']
+        );
+        PrestaShopLogger::addLog(
+            'Pivota telemetry gave up on event ' . (string) $row['event_id']
+            . ' (order ' . $orderId . ') after ' . (int) $attempts
+            . ' attempts; it is kept as dead and will NOT be retried.',
+            3,
+            null,
+            'PivotaTelemetry'
+        );
     }
 
     private function shopUrl()

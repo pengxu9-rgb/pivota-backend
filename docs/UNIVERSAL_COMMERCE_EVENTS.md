@@ -191,7 +191,10 @@ each write ONE row into a local outbox table (`ps_pivota_telemetry_outbox`) and
 return, so a Pivota outage can never slow a checkout. A cron-driven front
 controller (`controllers/front/drain.php`, token-guarded) is the only code that
 opens a socket: at most 100 events per POST, 10 POSTs per run, exponential
-backoff on a non-2xx, and a row dropped after 20 failed attempts.
+backoff on a non-2xx, and a row marked `dead` — kept, logged and counted on the
+module's configuration page, never deleted — after 20 failed attempts. Nothing
+on the receiver side notices that silence; replaying a dead row is a support
+action (`docs/PRESTASHOP_TELEMETRY.md`, "Not built").
 
 `actionOrderStatusPostUpdate` is registered rather than
 `actionOrderStatusUpdate` because `OrderHistory` fires the `Update` variant
@@ -214,6 +217,12 @@ one `refund.succeeded` per **credit slip**, keyed on the slip id. A `refund`
 STATE alone emits nothing: it carries no amount and no per-refund identity, and
 counting both it and the slip would double-count every refund.
 
+A slip whose every basis is zero emits nothing and is counted `rejected`: the
+ledger dedupes first-write-wins on the slip id, so a zero-amount
+`refund.succeeded` would permanently shadow the real one. `order.paid` is
+likewise frozen at the first paid transition — a later partial-payment top-up
+does not update it, and `native_amount_semantics` names the field it came from.
+
 The refund total is `total_products_tax_incl + total_shipping_tax_incl`, never
 the legacy `amount` column — `OrderSlipCreator` writes `amount` as
 products-only and tax-EXCLUDED on the default path, with nothing on the row
@@ -222,7 +231,8 @@ saying which basis was used. See `docs/PRESTASHOP_TELEMETRY.md`.
 Auth is a per-store secret the **merchant pastes** into the module (there is no
 handshake to mint it through), so
 `POST /integrations/prestashop/{store_id}/telemetry/ensure` returns it exactly
-once, on the call that mints it. The delivery is bound to the shop by URL: the
+once, on the call that mints it — and only to the owning merchant or an admin,
+with every call logged (actor, store, action, never the value). The delivery is bound to the shop by URL: the
 `X-Pivota-PrestaShop-Shop-Url` header and the signed body's `shop_url` must both
 resolve to the host the store was connected with.
 
