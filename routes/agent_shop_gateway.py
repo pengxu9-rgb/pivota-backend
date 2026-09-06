@@ -5477,6 +5477,17 @@ async def _handle_offers_resolve(
                          WHERE (p.pivota_signature_id = ANY(:aliases)
                                 OR p.content_key = ANY(:aliases)
                                 OR p.product_key = ANY(:aliases))
+                           -- The PRODUCT's own suppression, not just the offer's. Every serving
+                           -- read in services/pivot_query_service.py applies this pair, and
+                           -- scripts/withdraw_catalog_rows.py takes a product down by setting
+                           -- exactly these — so without it a withdrawn product still ships its
+                           -- retailer offer here, and the takedown silently misses this lane.
+                           AND p.suppressed_at IS NULL
+                           AND p.suppression_reason IS NULL
+                           -- Market, mirroring the seed lane at the attached-ref query above.
+                           -- Latent today (the gateway sends no market and the retailer ingest
+                           -- writes 'US'), and live the moment a caller passes market=KR.
+                           AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
                            AND o.offer_type = 'retailer'
                            AND o.offer_mode = 'redirect'
                            AND o.suppressed_at IS NULL
@@ -5487,7 +5498,8 @@ async def _handle_offers_resolve(
                          ORDER BY price_amount ASC
                          LIMIT :limit
                         """,
-                        {"aliases": ident_aliases, "limit": max(limit, 1)},
+                        {"aliases": ident_aliases, "limit": max(limit, 1),
+                         "market": market_hint},
                     ),
                     timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
                 )
@@ -5547,7 +5559,15 @@ async def _handle_offers_resolve(
                                 "soldout", "unavailable"},
                         "url": destination,
                         "purchase_route": "affiliate_outbound",
-                        "affiliate_url": redirect_url or destination,
+                        # NEVER the raw destination under this key. `affiliate_url` MEANS an
+                        # attributed `/r` link: the gateway's sanitizer only passes it verbatim
+                        # when it matches the signed-token shape, and everything else goes
+                        # through the normal scrub — so an unsigned value here is both a
+                        # mislabel and liable to be rewritten. `_make_external_redirect_url`
+                        # declines for exactly one reachable reason, an allowlist refusal, and
+                        # that is a serving decision: the offer stays visible under `url`, the
+                        # signed key stays honest at None, and the shortfall is counted.
+                        "affiliate_url": redirect_url,
                         # UNKNOWN, stated as such. A retailer destination is a product page as far
                         # as we know; `null` is the vocabulary's "we do not know", and claiming
                         # `false` would license an agent to tell a buyer what they will land on.
@@ -5564,6 +5584,10 @@ async def _handle_offers_resolve(
                             "product_key": str(r.get("product_key") or ""),
                             "content_key": str(r.get("content_key") or ""),
                             "merchant_id": offer_merchant,
+                            # `live_offer_verification._target` reads
+                            # `source.canonical_url or source.destination_url`; without one of
+                            # them every offer from this arm is UNVERIFIED "no_verifiable_url".
+                            "destination_url": destination,
                             "offer_type": str(r.get("offer_type") or ""),
                             "is_first_party": bool(r.get("is_first_party")),
                             "readiness_tier": str(r.get("readiness_tier") or ""),

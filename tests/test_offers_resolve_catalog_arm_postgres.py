@@ -99,6 +99,16 @@ def _seed(engine):
         offer("of_brand_direct", "m_arm", 9.00, "brand_direct")          # must not be sourced
         offer("of_suppressed", "stylekorean_global", 1.00, "retailer", suppressed=True)
         offer("of_not_redirect", "stylekorean_global", 2.00, "retailer", mode="checkout")
+        offer("of_zero_price", "stylekorean_global", 0, "retailer")
+        conn.execute(text(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
+            " catalog_track, truth_tier, readiness_tier, offer_mode, channel, availability,"
+            " currency, list_price, merchant_effective_price, offer_type, is_first_party,"
+            " updated_at)"
+            " VALUES ('of_no_destination',:sk,:pk,'stylekorean_global','external_referral',"
+            "         'observed','referral_only','redirect','external_referral','in_stock',"
+            "         'USD',:p,:p,'retailer',false,NOW())"
+        ), {"sk": sku_key, "pk": _PK, "p": 12.00})
 
 
 def _resolve(product_id):
@@ -138,6 +148,12 @@ def test_the_catalog_arm_sql_executes_on_postgres_and_returns_the_retailer(pg_en
     assert "of_brand_direct" not in sourced, "brand_direct must not be sourced (the seed lane emits it)"
     assert "of_suppressed" not in sourced, "suppressed_at must be honoured"
     assert "of_not_redirect" not in sourced, "only redirect-mode offers are referral offers"
+    assert "of_zero_price" not in sourced, "an unpriced offer cannot be shown to a buyer"
+    # TWO guards cover this, deliberately: the SQL `destination IS NOT NULL` conjunct and the
+    # Python `startswith(("http://", "https://"))` skip. Removing EITHER alone leaves the other,
+    # so neither mutant dies on its own — removing BOTH fails this assertion. Recorded because a
+    # future reader will otherwise see one of them as dead code and delete it.
+    assert "of_no_destination" not in sourced, "an offer with nowhere to send the buyer is not an offer"
     assert sourced == {"of_retailer_cheap", "of_retailer_dear"}
 
     # ORDER BY on the computed alias — cheapest first
@@ -167,3 +183,34 @@ def test_an_unknown_identity_returns_no_offers_and_says_so(pg_engine):
         str(s.get("source")) == "catalog_offers" and str(s.get("status")) == "empty"
         for s in sources
     ), "an empty answer must be recorded, not silent"
+
+
+def test_a_withdrawn_product_ships_no_offers(pg_engine):
+    """`scripts/withdraw_catalog_rows.py` takes a product down by setting `suppressed_at` +
+    `suppression_reason` on the PRODUCT. Every serving read in pivot_query_service applies that
+    pair; without it here a withdrawn product keeps selling through this lane and the takedown
+    silently misses it."""
+    from sqlalchemy import text
+
+    _seed(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE catalog_products SET suppressed_at = NOW(), suppression_reason = 'test_takedown'"
+            " WHERE product_key = :pk"
+        ), {"pk": _PK})
+
+    res = _resolve(_SIG)
+    assert (res.get("offers") or []) == [], "a withdrawn product must not ship a retailer offer"
+
+
+def test_a_foreign_market_offer_does_not_answer_a_us_request(pg_engine):
+    """The seed lane filters on market; this arm must too. Latent today — the gateway sends no
+    market and the retailer ingest writes 'US' — and live the moment a caller passes one."""
+    from sqlalchemy import text
+
+    _seed(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text("UPDATE catalog_offers SET market = 'KR' WHERE offer_id LIKE 'of_retailer%'"))
+
+    res = _resolve(_SIG)
+    assert (res.get("offers") or []) == [], "a KR offer must not be sold into a US request"

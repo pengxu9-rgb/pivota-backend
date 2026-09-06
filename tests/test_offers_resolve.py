@@ -3685,7 +3685,7 @@ _CATALOG_OFFER_ROW = {
     "offer_type": "retailer",
     "is_first_party": False,
     "readiness_tier": "referral_only",
-    "price_confidence": "curated",
+    "price_confidence": 0.9,
     "updated_at": None,
     "price_amount": 17.50,
     "destination_url": "https://www.stylekorean.com/product/detail?pid=123",
@@ -3850,7 +3850,10 @@ def test_catalog_offers_arm_ships_the_offer_even_when_attribution_fails(
     body = res.json()
     offers = body.get("offers") or []
     assert offers, "an unsignable destination must not silently drop the offer"
-    assert offers[0]["affiliate_url"] == "https://www.stylekorean.com/product/detail?pid=123"
+    # VISIBLE, but not mislabelled: `affiliate_url` means an attributed /r link, so a refusal
+    # leaves it None rather than smuggling the raw destination under the signed-link key.
+    assert offers[0]["affiliate_url"] is None
+    assert offers[0]["url"] == "https://www.stylekorean.com/product/detail?pid=123"
     assert any(
         str(s.get("source")) == "catalog_offers" and s.get("unattributed") == 1
         for s in ((body.get("metadata") or {}).get("sources") or [])
