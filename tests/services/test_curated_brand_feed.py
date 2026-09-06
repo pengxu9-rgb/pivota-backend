@@ -3,6 +3,7 @@
 import pytest
 
 import services.curated_brand_feed as cbf
+
 from services.curated_brand_feed import inci_from_pdp_html, shopify_product_to_record
 
 
@@ -695,6 +696,399 @@ async def test_records_for_brand_enrich_skips_when_body_html_has_inci(monkeypatc
                                        enrich_missing_inci=True, pdp_delay_s=0.0)
     assert recs[0]["pdp"]["raw_inci"].startswith("Water, Glycerin")
 
+
+
+
+@pytest.fixture(autouse=True)
+def _no_live_meta_json(monkeypatch, request):
+    """Keep `records_for_brand` off the live network.
+
+    It gained an unconditional `fetch_shopify_shop_locale(domain)`, and the four older
+    `records_for_brand` tests stub only `fetch_shopify_products` -- so from that change onward this
+    file really did GET maccosmetics.com/robots.txt and /meta.json on every suite run. Measured:
+    those tests took 0.73s and 0.69s against <0.02s for everything else in the file, and returned
+    a REAL currency from the live host. It never failed without egress (`_gated_fetch` swallows
+    the error), which is what made it invisible -- a non-hermetic test that passes either way.
+    Worse, `max_wait=0` means an unbounded wait in the politeness gate, so a merchant Crawl-delay
+    could stall the suite.
+
+    Autouse so a future `records_for_brand` test cannot reintroduce it by omission. Tests that are
+    ABOUT the locale opt out via `@pytest.mark.live_locale` and stub it themselves.
+    """
+    if request.node.get_closest_marker("live_locale"):
+        return
+
+    async def _offline(domain, **kw):
+        return {"currency": None}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _offline)
+
+
+def _clear_locale_cache():
+    """`storefront_currency` caches per domain for the PROCESS lifetime, negatives included.
+
+    Without this, the first test to record a None for a host fixes that answer for every later
+    test -- and the assertions would then be measuring the cache, not the code.
+    """
+    from services import storefront_currency
+
+    storefront_currency.clear_cache()
+
+
+def _silence_politeness(monkeypatch):
+    """Neutralise the shared crawl politeness gate for a unit test.
+
+    It issues its own robots.txt GET through whatever httpx client is installed, so a stubbed
+    client answers robots.txt with the meta.json body and the function under test never gets its
+    turn. Stubbed rather than worked around so these tests fail for meta.json reasons only.
+    """
+    async def _before(*a, **kw):
+        return None
+
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _before)
+    monkeypatch.setattr(cbf.crawl_politeness, "note_response", lambda *a, **kw: None)
+
+
+
+# -- storefront currency / market ---------------------------------------------------------------
+
+
+def test_the_record_carries_the_storefronts_currency_and_market():
+    """`/products.json` carries prices but never the currency they are in, so every record this
+    module produced was currency-less and the ingest lane stamped USD on all of them. Measured
+    2026-09-06 on jsmbeauty.sg: 170 offers, all USD, against a storefront whose /meta.json says
+    SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00."""
+    rec = shopify_product_to_record(_product(), domain="jsmbeauty.sg",
+                                    category_path="beauty/makeup/lip", currency="SGD")
+
+    assert rec["pdp"]["currency"] == "SGD"
+    # market is NOT carried: it is a hard serving partition on seeds, not this lane's axis.
+    assert "market" not in rec["pdp"]
+
+
+def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
+    """None, NOT a USD default. The ingest lane owns the fallback, and defaulting here would make
+    a storefront we failed to read indistinguishable from one that genuinely sells in USD --
+    which is the difference between a known fact and a guess in a currency column."""
+    rec = shopify_product_to_record(_product(), domain="x.com", category_path="x")
+
+    assert rec["pdp"]["currency"] is None
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD"}),
+        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD"}),
+        ({"currency": "USD", "country": "US"}, {"currency": "USD"}),
+        # merchant-controlled: anything not ISO-shaped is refused, not written through
+        # An unparseable currency invalidates the WHOLE record, country included:
+        # `storefront_currency` returns None rather than half an answer, because it "returns None
+        # when it cannot prove the answer". Asserted as its behaviour, not worked around.
+        ({"currency": "dollars", "country": "SG"}, {"currency": None}),
+        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD"}),
+        ({"currency": 5, "country": None}, {"currency": None}),
+        ({}, {"currency": None}),
+        ([], {"currency": None}),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, expected):
+    """The value lands in a currency column that is a join key for price comparison, and it comes
+    from the merchant. Shape-check it at the door."""
+    import httpx
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        # TEXT, not .json(). `fetch_storefront_meta`'s injected-fetch seam consumes the response
+        # BODY as a string and parses it itself, so a double exposing only .json() returns None
+        # for every case and the parametrisation silently tests nothing.
+        @property
+        def text(self):
+            import json as _j
+
+            return _j.dumps(body)
+
+        def json(self):
+            return body
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    # The politeness gate fetches robots.txt through this same client, so without stubbing it the
+    # stub answers robots.txt with JSON and the function under test never runs. It has its own
+    # tests; this one is about the meta.json contract.
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypatch):
+    """A non-Shopify host, a 404 or a hung socket must not fail the whole brand's ingest -- the
+    caller keeps its default and the crawl proceeds."""
+    import httpx
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch):
+    """THE SEAM. `fetch_shopify_shop_locale` can be perfect and `shopify_product_to_record` can
+    stamp perfectly, and the feature is still dead in production if the caller never passes one
+    to the other. Deleting that one argument left both unit files green -- the same shape as the
+    whitelist drop on the ingest side, where every consumer read a field nobody ever set.
+
+    Stubs both fetches so this asserts the WIRING and nothing else.
+    """
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup/lip")
+
+    assert recs, "the stub returned a product, so a record must come back"
+    assert {r["pdp"]["currency"] for r in recs} == {"SGD"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_product(monkeypatch):
+    """It is one storefront-wide setting. A per-product fetch would multiply outbound requests by
+    the catalogue size against a single host -- 170 extra requests for jsmbeauty.sg alone -- which
+    is exactly the shape the shared politeness gate exists to prevent."""
+    calls = []
+
+    async def _products(domain, **kw):
+        return [_product(), _product(handle="second", title="Second Product")]
+
+    async def _locale(domain, **kw):
+        calls.append(domain)
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup/lip")
+
+    assert len(recs) >= 2, "two products in, so the per-product count is meaningful"
+    assert calls == ["jsmbeauty.sg"], f"locale fetched {len(calls)} times for one brand"
+
+
+@pytest.mark.parametrize(
+    "status,ctype,label",
+    [
+        (404, "application/json", "a 404 body"),
+        (500, "application/json", "an error page"),
+        (200, "text/html", "an HTML soft-404"),
+        (200, "", "a response with no content-type"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, status, ctype, label):
+    """Both gates matter and neither was pinned. Storefronts that are not Shopify commonly answer
+    /meta.json with a 200 HTML soft-404, and `resp.json()` on that either raises or -- worse --
+    parses embedded JSON. Refuse on the status AND on the content-type, so the caller keeps its
+    default instead of inheriting a currency from someone's error page."""
+    import httpx
+
+    class _Resp:
+        status_code = status
+        headers = {"content-type": ctype}
+
+        @property
+        def text(self):
+            return '{"currency": "XXX", "country": "ZZ"}'
+
+        def json(self):
+            return {"currency": "XXX", "country": "ZZ"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None}, label
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_the_meta_json_fetch_goes_through_the_politeness_gate(monkeypatch):
+    """PINNED DELIBERATELY, not incidentally.
+
+    This lane crawls merchant hosts from the shared crawl-egress IP, and the ratchet in
+    tests/test_crawl_politeness.py counts the string `crawl_politeness.before_request` in this
+    file -- which a nested function nobody calls would satisfy. Measured: with
+    `fetch=_gated_fetch` removed, the ratchet still PASSED, and the only thing failing was a test
+    double that happened to lack `raise_for_status`. That is a guard held up by an accident.
+
+    So: assert the gate actually saw the meta.json URL, with the same user agent the request
+    carries, and that the response was reported back to it.
+    """
+    import httpx
+
+    seen = {"before": [], "note": []}
+
+    async def _before(url, **kw):
+        seen["before"].append((url, kw.get("user_agent"), kw.get("max_wait")))
+
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _before)
+    monkeypatch.setattr(
+        cbf.crawl_politeness, "note_response",
+        lambda url, status, **kw: seen["note"].append((url, status)),
+    )
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = '{"currency": "SGD", "country": "SG"}'
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    sent = {}
+
+    def _client(**kw):
+        sent.update(kw)          # capture what the REQUEST carries, not just what the gate hears
+        return _Client()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
+
+    assert seen["before"], "the politeness gate never saw the meta.json request"
+    url, ua, max_wait = seen["before"][0]
+    assert url.endswith("/meta.json")
+    assert ua == cbf._UA, "the gate must be asked about the SAME agent the request then sends"
+    # AND the request must actually send it. Asserting only the gate side is the same accident
+    # this test replaced, one layer down: a mutant changing the outgoing header survived.
+    assert (sent.get("headers") or {}).get("User-Agent") == cbf._UA
+    assert max_wait == 0, "batch lane: wait rather than drop"
+    assert seen["note"] and seen["note"][0][1] == 200, "the response must be reported back"
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_locale
+async def test_a_failed_meta_json_is_not_cached_against_the_next_brand(monkeypatch):
+    """`fetch_storefront_meta` caches per domain for the PROCESS lifetime, NEGATIVES INCLUDED, and
+    this lane runs inside a queue-draining worker with its own retry budget. One transient failure
+    would otherwise pin that brand to None -> USD for the whole process, silently defeating both
+    the retry and this entire change."""
+    import httpx
+
+    calls = {"n": 0}
+
+    class _Resp:
+        def __init__(self, ok):
+            self.status_code = 200 if ok else 503
+            self.headers = {"content-type": "application/json"}
+            self.text = '{"currency": "SGD", "country": "SG"}' if ok else ""
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            calls["n"] += 1
+            return _Resp(calls["n"] > 1)      # first attempt fails, second succeeds
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+    _clear_locale_cache()
+
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": None}
+    # the retry must actually reach the network again, not read a cached None
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == {"currency": "SGD"}
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_test_in_this_file_reaches_the_live_network_by_default(monkeypatch):
+    """Pins the autouse offline stub, which is otherwise invisible: removing it fails nothing, it
+    just makes the suite quietly crawl merchant hosts again (measured: 0.56s -> 1.74s for this
+    file, with real GETs to maccosmetics.com/robots.txt and /meta.json).
+
+    A non-hermetic test that passes either way is the worst kind, so this asserts the property
+    directly: with `httpx.AsyncClient` rigged to explode, `records_for_brand` must still complete.
+    """
+    import httpx
+
+    class _LiveRequestAttempted(BaseException):
+        """BaseException on purpose. `_gated_fetch` wraps its request in `except Exception`, so an
+        ordinary error -- including AssertionError -- is SWALLOWED and the test passes anyway.
+        That broad catch is exactly why the live calls were invisible for two rounds."""
+
+    def _explode(**kw):
+        raise _LiveRequestAttempted("a default-path test attempted a live HTTP request")
+
+    async def _products(domain, **kw):
+        return [_product()]
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(httpx, "AsyncClient", _explode)
+
+    recs = await cbf.records_for_brand(domain="maccosmetics.com", category_path="beauty/makeup")
+
+    assert recs, "the stub returned a product, so a record must come back"
+    assert recs[0]["pdp"]["currency"] is None, "offline: no currency learned, ingest defaults USD"
 
 def _folded(base_options, own_variants, shade_titles):
     """Drive the REAL fold. A hand-marked `_multi(FOLDED_INTO_KEY=2)` product is

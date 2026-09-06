@@ -185,6 +185,18 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
             "mpn": str(mpn_raw).strip() if mpn_raw else None,
         },
         "source_domain": source_domain,
+        # The storefront's own currency. This payload is a WHITELIST -- a field absent here is
+        # dropped no matter what the record carried -- so omitting it made the passthrough a
+        # silent no-op even with every consumer reading it. Validated at the point of USE
+        # (`_currency_of`), so a record arriving from any other lane gets the same check.
+        #
+        # CURRENCY ONLY. `market` is a different axis (destination served vs store base
+        # currency) and this lane does not own it: `external_product_seeds.market` is a HARD
+        # serving partition -- `external_seed_search` appends `market = :market`, called with
+        # DEFAULT_EXTERNAL_SEED_MARKET="US" -- so stamping a storefront's country there deletes
+        # it from US seed search. `catalog_offers.market` only feeds a warn-only counter. See
+        # services/storefront_currency.py for the axis argument.
+        "currency": pdp.get("currency"),
         "tags": tags,
         "agent_version": AGENT_VERSION,
         # Optional review signal → catalog_products.rating_value/rating_count.
@@ -273,7 +285,7 @@ def _build_variant_sku_inserts(
             "sku": str(v.get("sku") or "").strip() or None,
             "barcode": str(v.get("barcode") or "").strip() or None,
             "title": shade or pdp_payload["product_name"],
-            "currency": "USD",
+            "currency": _currency_of(pdp_payload),
             "image_url": str(v.get("image_url") or "").strip() or None,
             "visible_attributes": json.dumps({"shade": shade} if shade else {}),
             "visible_option_labels": json.dumps(labels),
@@ -501,6 +513,28 @@ def _taxonomy_v1_payload(pdp_payload: Dict[str, Any], offers: List[Dict[str, Any
     }
 
 
+DEFAULT_CURRENCY = "USD"
+
+_ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
+
+
+def _currency_of(pdp_payload: Dict[str, Any]) -> str:
+    """The record's own currency, or USD.
+
+    Every currency in this module was the literal "USD", in seven places, and nothing ever read
+    one off the record -- so a Singapore storefront pricing in SGD was ingested as USD. Measured
+    2026-09-06 on jsmbeauty.sg: 170 offers, `{'USD': 170}`, against a storefront whose meta.json
+    says SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00. A currency is a join key for
+    price comparison and ranking, so a wrong one is not a display bug.
+
+    USD REMAINS THE DEFAULT, deliberately: every record built before this change carries no
+    currency, and defaulting preserves exactly what those rows already have. Validated because
+    the value originates in merchant-controlled JSON.
+    """
+    raw = str((pdp_payload or {}).get("currency") or "").strip().upper()
+    return raw if _ISO_CURRENCY.match(raw) else DEFAULT_CURRENCY
+
+
 def _build_seed_inserts(
     *,
     product_key: str,
@@ -544,7 +578,7 @@ def _build_seed_inserts(
             "id": f"{external_product_id}::canonical",
             "sku": external_product_id,
             "title": pdp_payload["product_name"],
-            "currency": "USD",
+            "currency": _currency_of(pdp_payload),
             "price_amount": price,
             "price": price,
             "availability": availability,
@@ -581,8 +615,8 @@ def _build_seed_inserts(
                     "sku": str(v.get("sku") or "").strip() or None,
                     "barcode": str(v.get("barcode") or "").strip() or None,
                     "title": shade or pdp_payload["product_name"],
-                    "currency": "USD",
-                    "price_currency": "USD",
+                    "currency": _currency_of(pdp_payload),
+                    "price_currency": _currency_of(pdp_payload),
                     "price_amount": v.get("price"),
                     "price": v.get("price"),
                     "availability": "in_stock" if v_in_stock else "out_of_stock",
@@ -605,7 +639,7 @@ def _build_seed_inserts(
             "title": pdp_payload["product_name"],
             "image_url": offer.get("image_url") or None,
             "price_amount": price,
-            "price_currency": "USD",
+            "price_currency": _currency_of(pdp_payload),
             "destination_url": destination_url,
             "canonical_url": canonical_url or None,
             "domain": _domain_of(canonical_url or destination_url),
@@ -809,7 +843,7 @@ def _build_sku_insert(
         "sku": None,
         "barcode": strong_identifier.value if strong_identifier else None,
         "title": pdp_payload["product_name"],
-        "currency": "USD",
+        "currency": _currency_of(pdp_payload),
         "image_url": image_url or None,
         "visible_attributes": json.dumps({}),
         "visible_option_labels": json.dumps([]),
@@ -862,6 +896,7 @@ def _build_offer_inserts(
     sku_key: str,
     offers: List[Dict[str, Any]],
     source_domain: Optional[str] = None,
+    currency: str = DEFAULT_CURRENCY,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
@@ -899,7 +934,7 @@ def _build_offer_inserts(
             "channel": "default",
             "availability": availability,
             "inventory_quantity": 999 if offer.get("in_stock") else 0,
-            "currency": "USD",
+            "currency": currency,
             "list_price": price_value,
             "merchant_effective_price": price_value,
             "estimated_best_price": price_value,
@@ -1012,6 +1047,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         sku_key=sku_row["sku_key"],
         offers=offers,
         source_domain=pdp_row.get("source_domain"),
+        # Resolved HERE because this builder is the one consumer without the pdp payload in
+        # scope; passing the payload just to read one field would widen its interface.
+        currency=_currency_of(pdp_payload),
     )
     # Real variants ride beside the canonical SKU: one SKU + one offer each,
     # priced and stocked per variant, at the brand-direct destination.
@@ -1032,6 +1070,13 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 sku_key=vsku["sku_key"],
                 offers=[dict(primary, price=v.get("price"), in_stock=bool(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
+                # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
+                # created an eighth CALL that silently took the default -- so a shade line landed
+                # canonical=SGD beside variants=USD. Worse than the uniform wrongness it replaced:
+                # `_HAS_US_OFFER_EXISTS` is an EXISTS over catalog_offers by PRODUCT_KEY, so one
+                # USD variant offer keeps the whole product on the US surface, now serving SGD
+                # amounts labelled USD. Measured on a 3-shade SGD line: offers {SGD: 1, USD: 3}.
+                currency=_currency_of(pdp_payload),
             ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],

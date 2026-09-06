@@ -901,6 +901,324 @@ def test_seed_variants_are_bounded():
     assert len(variants) == ing.MAX_SEED_VARIANTS
 
 
+# -- currency / market passthrough ------------------------------------------------------------
+# Every currency in ingestion.py was the literal "USD" in seven places and nothing read one off
+# the record, so a Singapore storefront pricing in SGD was ingested as USD. Measured 2026-09-06
+# on jsmbeauty.sg: 170 offers, all USD, against a storefront whose /meta.json says SGD/SG and
+# whose LIP-PRESSION Glowy Tint is SGD 30.00.
+
+
+
+def _seed_variant_currencies(out, key=None):
+    """Currencies on the variants nested inside every seed's `seed_data`.
+
+    With no `key`, computes what the SERVING lane computes:
+    `v.get("price_currency") or v.get("currency")` (routes/agent_api.py). Asserting only
+    `currency` measures the surface the code reaches SECOND -- a mutant flipping `price_currency`
+    alone survived a full review round for exactly that reason. The synthetic canonical variant
+    legitimately sets only `currency`, which is what that `or` is for, so the effective value is
+    the honest assertion for both branches.
+    """
+    import json as _json
+
+    found = set()
+    for seed in out["seeds"]:
+        data = seed.get("seed_data")
+        if isinstance(data, str):
+            data = _json.loads(data)
+        for v in (data or {}).get("variants") or []:
+            found.add(v.get(key) if key else (v.get("price_currency") or v.get("currency")))
+    return found
+
+
+# THREE REAL VARIANTS, deliberately. The first draft of this fixture had none, so it never
+# entered the real-variant branch -- and the eighth currency site (the variant `_build_offer_inserts`
+# call) went unnoticed while a ten-mutant pass reported all-clear. A shade line is also the SHAPE
+# that matters: `_HAS_US_OFFER_EXISTS` is an EXISTS over catalog_offers by PRODUCT_KEY, so a
+# single USD-stamped variant offer keeps the whole product on the US surface.
+_SGD_VARIANTS = [
+    {"variant_id": "v1", "title": "Early Peach", "price": 30.0, "in_stock": True},
+    {"variant_id": "v2", "title": "Rose Beige", "price": 30.0, "in_stock": True},
+    {"variant_id": "v3", "title": "Coral", "price": 30.0, "in_stock": True},
+]
+
+
+def _sgd_record(**extras):
+    extras.setdefault("variants", _SGD_VARIANTS)
+    extras.setdefault("currency", "SGD")      # override with currency=None for the unknown case
+    return _record(brand="JUNGSAEMMOOL", product_name="LIP-PRESSION Glowy Tint",
+                   source_domain="jsmbeauty.sg", **extras)
+
+
+def test_a_storefronts_own_currency_reaches_every_row_it_prices():
+    """The whole point: offers, SKUs and seeds must all carry the record's currency.
+
+    Asserted across ALL THREE collections rather than one, because they are built by three
+    different functions -- `_build_offer_inserts` does not even receive the pdp payload -- and a
+    fix that reached only the one under test would look complete.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record())
+
+    # EVERY offer, canonical AND per-variant. Asserting a set means one USD straggler fails,
+    # which is exactly the shape the eighth site produced: {SGD: 1, USD: 3}.
+    assert len(out["offers"]) >= 4, "the fixture must produce variant offers, not just canonical"
+    assert {o["currency"] for o in out["offers"]} == {"SGD"}
+    assert out["sku"]["currency"] == "SGD"
+    # THE VARIANT SKUs. Nothing else reads this column, which is exactly why a mutant flipping it
+    # to "USD" survived two review rounds: no assertion reached it.
+    assert {v["currency"] for v in out["variant_skus"]} == {"SGD"}
+    assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
+    # The seed's NESTED variant list, which is a separate site from every row above and was the
+    # one replacement no assertion reached: reverting it alone to a literal "USD" left the whole
+    # file green. This is what the serving lane renders, so it is not an internal detail.
+    assert _seed_variant_currencies(out) == {"SGD"}
+    # BOTH KEYS, on the REAL-VARIANT branch specifically. Two consumers disagree about which one
+    # wins: serving reads `price_currency or currency`, while `external_seed_audit`'s
+    # `normalize_seed_variants` reads `currency or price_currency` -- the OPPOSITE order -- and it
+    # is the audit's reading that raises `price_currency_mismatch`, a BLOCKER anomaly that drops
+    # the seed from the agent surface entirely. So the serving-order assertion above cannot see a
+    # wrong `currency` while `price_currency` is right, which is exactly the mutant that survived
+    # two rounds. A first attempt at this assertion was added to the SYNTHETIC-variant test by
+    # mistake, where this branch never runs -- and the mutant survived a third time.
+    assert _seed_variant_currencies(out, "currency") == {"SGD"}
+    assert _seed_variant_currencies(out, "price_currency") == {"SGD"}
+
+
+def test_the_pdp_payload_whitelist_does_not_drop_the_currency():
+    """`_build_pdp_payload` is a WHITELIST -- a field absent from its dict literal is dropped no
+    matter what the record carried. The first draft of this change threaded currency through the
+    crawler and every consumer and was still a COMPLETE no-op, because these two keys were not in
+    that literal. This pins the seam itself, so the passthrough cannot be silently severed while
+    every consumer keeps reading a field that never arrives."""
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
+
+    payload = _build_pdp_payload(_sgd_record())
+
+    assert payload["currency"] == "SGD"
+    # market is deliberately NOT carried: `external_product_seeds.market` is a hard serving
+    # partition (`external_seed_search` appends `market = :market`, defaulted to "US"), so
+    # stamping a storefront's country there deletes it from US seed search.
+    assert "market" not in payload
+
+
+def test_a_record_with_no_currency_is_still_USD_and_US():
+    """The POSITIVE counterpart and the backward-compatibility guarantee: every record built
+    before this change carries no currency and must land exactly as it did. Verified against the
+    live lane too -- flowerbeauty.com and maccosmetics.com both report USD/US."""
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_record())
+
+    assert {o["currency"] for o in out["offers"]} == {"USD"}
+    assert out["sku"]["currency"] == "USD"
+    assert {s["price_currency"] for s in out["seeds"]} == {"USD"}
+    assert {s["market"] for s in out["seeds"]} == {"US"}   # unchanged: not this lane's axis
+    assert _seed_variant_currencies(out) == {"USD"}
+    assert _seed_variant_currencies(out, "currency") == {"USD"}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "  ", "sgd dollars", "S", "SGDX", "$", "12", None, 5, ["SGD"], {"c": "SGD"}, "SG D",
+     "USD DROP TABLE catalog_offers", "US" + chr(0) + "D"],
+)
+def test_a_merchant_supplied_currency_that_is_not_ISO_falls_back_to_USD(bad):
+    """`/meta.json` is MERCHANT-CONTROLLED and its value lands in a currency column that is a
+    join key for price comparison. Anything that is not ISO-4217 alpha-3 is refused rather than
+    written through -- including an embedded NUL, which Postgres rejects with 22P05, and a
+    non-string, which would otherwise reach `.upper()`."""
+    from services.catalog_enrichment_agent.ingestion import _currency_of
+
+    assert _currency_of({"currency": bad}) == "USD"
+
+
+@pytest.mark.parametrize("good,expected", [("sgd", "SGD"), ("SGD", "SGD"), (" jpy ", "JPY")])
+def test_a_valid_currency_is_normalised_and_kept(good, expected):
+    """The counterpart to the refusal test: a real code must survive, case- and
+    space-insensitively -- a refusal test alone passes for a function that returns USD
+    unconditionally."""
+    from services.catalog_enrichment_agent.ingestion import _currency_of
+
+    assert _currency_of({"currency": good}) == expected
+
+
+def test_the_seed_market_is_NOT_taken_from_the_storefronts_country():
+    """This lane writes CURRENCY and not market, on purpose.
+
+    Measured: `external_seed_search` appends a hard `market = :market` conjunct and every serving
+    caller passes DEFAULT_EXTERNAL_SEED_MARKET="US", so a seed stamped with the storefront's own
+    country vanishes from US seed search entirely. `catalog_offers.market` by contrast only feeds
+    a warn-only counter. An earlier draft stamped both; the harm was asymmetric and this is the
+    half that hurt.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record())
+
+    assert {s["market"] for s in out["seeds"]} == {"US"}
+    assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
+
+
+
+def test_the_synthetic_canonical_variant_also_carries_the_storefronts_currency():
+    """A product with FEWER THAN TWO real variants takes the synthetic-canonical branch instead
+    of the real-variant loop, and they are different code with their own currency literal.
+
+    Adding `variants` to `_sgd_record` closed the real-variant gap and REMOVED this one -- net
+    coverage moved sideways. Both branches now have a fixture.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record(variants=[]))
+
+    assert _seed_variant_currencies(out) == {"SGD"}
+    assert _seed_variant_currencies(out, "currency") == {"SGD"}
+    assert {o["currency"] for o in out["offers"]} == {"SGD"}
+
+
+# -- the offer upsert SQL itself ---------------------------------------------------------------
+# The whole apply.py contribution of the currency change went untested for two review rounds. A
+# mutant that dropped one bind while keeping its column produced a 21-column / 20-value INSERT --
+# a hard runtime failure on the core catalog write path -- with the entire suite green, because
+# every unit test drives a fake DB that never parses the statement.
+
+
+def _insert_columns_and_binds(sql):
+    """The INSERT column list and the VALUES bind list, as parallel sequences."""
+    import re as _re
+
+    cols = _re.search(r"INSERT INTO catalog_offers\s*\((.*?)\)\s*VALUES", sql, _re.S).group(1)
+    vals = _re.search(r"VALUES\s*\((.*?)\)\s*ON CONFLICT", sql, _re.S).group(1)
+    col_names = [c.strip() for c in cols.split(",") if c.strip()]
+    bind_names = []
+    for v in vals.split(","):
+        v = v.strip()
+        m = _re.search(r":([a-z_]+)", v)      # survives CAST(:x AS jsonb)
+        if m:
+            bind_names.append(m.group(1))
+    return col_names, bind_names
+
+
+def test_the_offer_upsert_columns_and_binds_line_up():
+    """A column with no bind (or the reverse) is a runtime error on every ingest, and no fake-DB
+    test can see it. Asserted positionally, not just by count, so a swap is caught too."""
+    from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL
+
+    cols, binds = _insert_columns_and_binds(_OFFER_UPSERT_SQL)
+
+    assert len(cols) == len(binds), f"{len(cols)} columns vs {len(binds)} binds"
+    assert cols == binds, [c for c, b in zip(cols, binds) if c != b]
+
+
+def test_every_offer_row_the_builder_makes_supplies_every_bind():
+    """The other half: the SQL and the row dict must agree. A bind the builder never emits is the
+    same runtime failure from the opposite direction."""
+    from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    _, binds = _insert_columns_and_binds(_OFFER_UPSERT_SQL)
+    offers = ingest_validated_record(_sgd_record())["offers"]
+
+    assert offers
+    for row in offers:
+        missing = [b for b in binds if b not in row]
+        assert not missing, f"offer row is missing binds the SQL requires: {missing}"
+
+
+def test_every_row_this_lane_builds_binds_against_the_real_upsert_SQL():
+    """THE INVARIANT THAT WOULD HAVE CAUGHT A SILENT TOTAL WRITE OUTAGE.
+
+    An earlier version of this branch added a `currency_known` key to every row so a SQL guard
+    could read it. Production `databases.Database.execute` does `text(sql).bindparams(**values)`,
+    which RAISES on a key the statement does not define -- and every write sits inside
+    `except Exception: logger.exception(...)`. So the plan reported 4 skus / 4 offers / 1 seed and
+    the counts came back 0 / 0 / 0: pdps and merchants landed, every child row was silently
+    dropped, on the default ingest path.
+
+    The whole suite stayed green through it, because every test drives a double that never binds.
+    This asserts the one property those doubles cannot: a row this lane builds must carry no key
+    the statement it is executed against does not define.
+    """
+    from sqlalchemy import text
+
+    import services.catalog_enrichment_agent.apply as apply_mod
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record())
+
+    # EVERY collection the lane returns, not the four I thought of first. `ingest_validated_record`
+    # yields seven; naming the test "every row" while covering four is the same over-claim this
+    # branch kept making, and the three uncovered ones bind against their own statements.
+    for label, sql, rows in (
+        ("sku", apply_mod._SKU_UPSERT_SQL, [out["sku"]]),
+        ("variant_skus", apply_mod._SKU_UPSERT_SQL, out["variant_skus"]),
+        ("offers", apply_mod._OFFER_UPSERT_SQL, out["offers"]),
+        ("seeds", apply_mod._SEED_UPSERT_SQL, out["seeds"]),
+        ("pdp", apply_mod._PDP_UPSERT_SQL, [out["pdp"]]),
+        ("merchants", apply_mod._MERCHANT_UPSERT_SQL, out["merchants"]),
+        # `inci` is deliberately absent: this fixture produces none, so an arm for it would
+        # iterate zero rows and read as coverage while asserting nothing. A vacuous arm is worse
+        # than a named gap.
+    ):
+        assert rows, f"{label} produced no rows; this arm would assert nothing"
+        for row in rows:
+            params = {k: v for k, v in row.items() if k != "_ensure_only"}
+            try:
+                text(sql).bindparams(**params)
+            except Exception as exc:  # noqa: BLE001 - the failure IS the assertion
+                raise AssertionError(f"{label} row will not bind: {exc}") from exc
+
+
+def test_a_seed_row_never_disagrees_with_its_own_seed_data():
+    """The seed upsert rewrites `seed_data` unconditionally, and this lane now varies the nested
+    `variants[].currency` -- so the scalar `price_currency` column MUST move with it.
+
+    Leaving it behind splits the row against its own JSON, which is exactly what
+    `external_seed_audit.detect_price_currency_mismatch` looks for. That is a BLOCKER anomaly
+    (`EXTERNAL_REFERRAL_BLOCKER_ANOMALIES`), it makes `_build_external_seed_product` return None,
+    and no other lane writes this column -- so the seed leaves the agent surface permanently.
+
+    Reachable two ordinary ways: any storefront already indexed as USD, and a first ingest whose
+    /meta.json read failed followed by one that succeeded. Asserted in BOTH directions, because
+    the currency can move either way and only one of them was the motivating case.
+    """
+    import json as _json
+    import re as _re
+
+    import services.catalog_enrichment_agent.apply as apply_mod
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+    from services.external_seed_audit import detect_price_currency_mismatch, normalize_seed_variants
+
+    arm = "\n".join(
+        _re.sub(r"--.*$", "", line)
+        for line in apply_mod._SEED_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
+    )
+    updated = set(_re.findall(r"(\w+)\s*=\s*EXCLUDED", arm))
+    assert "seed_data" in updated, "the premise: seed_data is refreshed on every re-ingest"
+    assert "price_currency" in updated, "so the column it must agree with has to be refreshed too"
+
+    for first, second in (("SGD", None), (None, "SGD")):
+        run1 = ingest_validated_record(_sgd_record(currency=first))["seeds"][0]
+        run2 = ingest_validated_record(_sgd_record(currency=second))["seeds"][0]
+        assert run1["id"] == run2["id"], "stable ids are why the conflict arm is reached at all"
+
+        stored = dict(run1)
+        for column in updated:          # apply the real arm
+            if column in run2:
+                stored[column] = run2[column]
+
+        data = stored["seed_data"]
+        if isinstance(data, str):
+            data = _json.loads(data)
+        variants = normalize_seed_variants(data, stored)
+
+        assert detect_price_currency_mismatch(stored, variants) is None, (
+            f"{first} -> {second}: row says {stored['price_currency']}, "
+            f"seed_data says {sorted({v.get('currency') for v in variants})}"
+        )
+
 def test_seed_variants_announce_the_axis_they_vary_on():
     """WHY THIS EXISTS. Real variant identity (#2073) was necessary and not
     sufficient. The renderer already exposed the variant LIST — a variant with a

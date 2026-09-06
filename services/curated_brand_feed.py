@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from services import storefront_currency
+
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness
 
@@ -126,6 +128,77 @@ def _clean_domain(domain: str) -> str:
     d = str(domain or "").strip().lower()
     d = d.replace("https://", "").replace("http://", "").rstrip("/")
     return d.split("/")[0]
+
+
+_ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
+
+
+async def fetch_shopify_shop_locale(
+    domain: str,
+    *,
+    timeout_s: float = 10.0,
+) -> Dict[str, Optional[str]]:
+    """The storefront's own currency, via the module that already reads /meta.json.
+
+    `/products.json` carries prices but NEVER the currency they are in, so every record this
+    module built was currency-less and the ingest lane stamped USD on all of them. Measured
+    2026-09-06: jsmbeauty.sg prices LIP-PRESSION Glowy Tint at 3000 minor = SGD 30.00, and
+    ingesting it through that lane wrote USD 30.
+
+    DELEGATES to `services.storefront_currency.fetch_storefront_meta` rather than fetching here.
+    A first draft of this function was a second, uncached reader of the same endpoint -- which is
+    why a THIRD gated fetch had to be registered in this file's crawl-politeness budget. That
+    module already validates the currency, caches per domain for the process lifetime, and is the
+    place this knowledge belongs.
+
+    The politeness gate is preserved by injecting the fetch: `fetch_storefront_meta` takes a
+    `fetch` seam precisely so a caller can supply its own transport, so the shared gate still sees
+    every request this crawl lane makes against a merchant host.
+
+    CURRENCY ONLY, and `country` is deliberately NOT returned. `storefront_currency`'s own
+    docstring records why they are different axes ("a KR/HK exporter legitimately prices in USD"),
+    and measurement made the asymmetry concrete: `external_product_seeds.market` is a HARD serving
+    partition -- `external_seed_search` appends `market = :market` and every serving caller passes
+    DEFAULT_EXTERNAL_SEED_MARKET="US" -- so a seed stamped with the storefront's country vanishes
+    from US seed search. Returning the value at all invites that mistake again.
+
+    NEGATIVE RESULTS ARE NOT CACHED ACROSS BRANDS. `fetch_storefront_meta` caches per domain for
+    the PROCESS lifetime, negatives included, and its docstring says a long-lived caller should
+    clear periodically. This lane is exactly that caller (`catalog_onboard_worker` drains a queue
+    with a retry budget), and a single transient timeout would otherwise pin that brand to None ->
+    USD for the whole process, silently defeating the retry AND the fix. So a miss is evicted.
+    """
+    host = _clean_domain(domain)
+    if not host:
+        return {"currency": None}
+
+    async def _gated_fetch(url: str) -> Optional[str]:
+        headers = {"User-Agent": _UA, "Accept": "application/json"}
+        timeout = httpx.Timeout(timeout_s, connect=5.0)
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as client:
+                await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+                resp = await client.get(url)
+                crawl_politeness.note_response(
+                    url, resp.status_code, retry_after=resp.headers.get("retry-after")
+                )
+                if resp.status_code != 200:
+                    return None
+                if "application/json" not in (resp.headers.get("content-type") or ""):
+                    return None
+                return resp.text
+        except Exception:
+            return None
+
+    meta = await storefront_currency.fetch_storefront_meta(host, fetch=_gated_fetch)
+    if not isinstance(meta, dict):
+        # Evict the negative so the next brand (or a retry of this one) asks again.
+        storefront_currency.clear_cache()
+        return {"currency": None}
+    cur = str(meta.get("currency") or "").strip().upper()
+    return {"currency": cur if _ISO_CURRENCY.match(cur) else None}
 
 
 async def fetch_shopify_products(
@@ -603,6 +676,7 @@ def shopify_product_to_record(
     category_path: str,
     brand_override: Optional[str] = None,
     emit_variants: bool = False,
+    currency: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -736,6 +810,10 @@ def shopify_product_to_record(
             # on this lane (captured on the retailer-PDP lane instead).
             "rating_value": None,
             "rating_count": None,
+            # The STOREFRONT's own currency, from /meta.json. Omitted (None) rather than
+            # defaulted here: the ingest lane owns the fallback, so a record that never learned
+            # its currency is indistinguishable from one that did and is genuinely USD.
+            "currency": currency,
             "variants": pdp_variants,
         },
         "offers": [
@@ -973,6 +1051,9 @@ async def records_for_brand(
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
+    # ONCE per brand, not per product: it is one storefront-wide setting and a per-product fetch
+    # would multiply outbound requests by the catalogue size against a single host.
+    locale = await fetch_shopify_shop_locale(domain)
     if base_listings_only:
         products, fold_report = fold_shade_listings(products)
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
@@ -982,6 +1063,7 @@ async def records_for_brand(
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand,
             emit_variants=base_listings_only,
+            currency=locale.get("currency"),
         )
         if not rec:
             continue

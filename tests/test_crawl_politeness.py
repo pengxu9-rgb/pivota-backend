@@ -783,7 +783,9 @@ _GATED_CRAWL_LANES = {
     "services/external_seed_destination_liveness.py": 2,
     "services/brand_product_discovery.py": 1,
     "services/co_occurrence_finder.py": 1,
-    "services/curated_brand_feed.py": 2,       # products.json paging + PDP INCI fetch
+    # products.json paging + PDP INCI fetch + meta.json (the storefront's own currency/market,
+    # added 2026-09-06 so a Singapore storefront is not ingested as USD).
+    "services/curated_brand_feed.py": 3,
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }

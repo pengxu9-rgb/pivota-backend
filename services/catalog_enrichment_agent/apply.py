@@ -180,6 +180,23 @@ _SEED_UPSERT_SQL = """
                   canonical_url = EXCLUDED.canonical_url,
                   image_url = EXCLUDED.image_url,
                   price_amount = EXCLUDED.price_amount,
+                  -- REFRESHED BECAUSE `seed_data` IS. `seed_data = EXCLUDED.seed_data` below
+                  -- rewrites the nested `variants[].currency`, so leaving this column at its
+                  -- first-written value splits the row against its own JSON --
+                  -- `external_seed_audit.detect_price_currency_mismatch` compares exactly those
+                  -- two, `price_currency_mismatch` is a BLOCKER anomaly, and a blocked seed makes
+                  -- `_build_external_seed_product` return None. Measured: first ingest with an
+                  -- unreadable /meta.json writes USD, the next successful one writes SGD variants,
+                  -- and the seed leaves the agent surface -- unrepairable, since no other lane
+                  -- writes this column.
+                  --
+                  -- The cost is the opposite direction: a flaky read can write USD over a proved
+                  -- SGD. That is TRANSIENT and self-heals on the next good ingest, where a
+                  -- split-brain row is permanent. Preferring the recoverable failure is the whole
+                  -- of the trade; a per-row conditional cannot live in this arm anyway, because
+                  -- `bulk_writer.split_upsert_sql` suffixes VALUES binds per row while this tail
+                  -- is shared.
+                  price_currency = EXCLUDED.price_currency,
                   status = EXCLUDED.status,
                   availability = EXCLUDED.availability,
                   seed_data = EXCLUDED.seed_data,
