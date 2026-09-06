@@ -3752,20 +3752,18 @@ def test_catalog_offers_arm_surfaces_a_retailer_by_signature(
     assert body.get("resolution_mode") == "external_only"
 
 
-def test_catalog_offers_arm_is_skipped_when_another_source_answered(
+def test_catalog_offers_arm_now_RUNS_beside_the_seed_lane(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    """GATED ON EMPTY, deliberately: the arm must not reorder, dedupe against or otherwise change
-    ANY response that is non-empty today. Merging it with the seed lane needs a destination-host
-    dedupe and is its own change."""
+    """UNGATED. The first cut ran only when nothing else resolved, which made it nearly inert:
+    measured 2026-09-06, 1,124 products carry an unsuppressed retailer offer and 1,110 of them are
+    ALSO seeded — so the gate left the arm serving about 14. The competition worth showing lives
+    on exactly the products the gate excluded."""
     import routes.agent_shop_gateway as gateway
-
-    seen: list[str] = []
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
         if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
-            seen.append("catalog_arm")
             return [_CATALOG_OFFER_ROW]
         return _sig_lane_fetch_all(query, values)
 
@@ -3777,7 +3775,7 @@ def test_catalog_offers_arm_is_skipped_when_another_source_answered(
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(
         gateway, "_make_external_redirect_url",
-        AsyncMock(return_value="https://example.com/r?token=sig"))
+        AsyncMock(return_value="https://example.com/r?token=x"))
 
     res = client.post(
         "/agent/shop/v1/invoke",
@@ -3788,9 +3786,67 @@ def test_catalog_offers_arm_is_skipped_when_another_source_answered(
     )
     assert res.status_code == 200
     offers = res.json().get("offers") or []
-    assert offers, "the seed lane still answers"
-    assert all(not str(o.get("offer_id", "")).startswith("of:catalog_offer:") for o in offers)
-    assert seen == [], "the catalog query must not even be issued when a source already answered"
+    ids = [str(o.get("offer_id") or "") for o in offers]
+    assert any(i.startswith("of:external_seed:") for i in ids), "the seed lane still answers"
+    assert any(i.startswith("of:catalog_offer:") for i in ids), (
+        "the retailer must now appear BESIDE the seed offer — that is the competition"
+    )
+    # `row_count` is what the query FOUND; `emitted` is what this arm APPENDED. Without the second
+    # number a fully-truncated arm reads as "ok, row_count=1" while the buyer saw nothing from it.
+    assert any(
+        str(src.get("source")) == "catalog_offers" and src.get("emitted") == 1
+        for src in ((res.json().get("metadata") or {}).get("sources") or [])
+    ), "the arm must report what it actually emitted"
+
+
+def test_the_same_destination_is_not_offered_twice(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """`external_offer_dual_write` writes some destinations into BOTH stores, so the same retailer
+    can arrive twice. Measured over 400 product/offer/seed triples, 19 shared a destination host.
+    The key is the HOST, not the product: same host means we would send the buyer to the same
+    place twice."""
+    import routes.agent_shop_gateway as gateway
+
+    # a catalog offer pointing at the SAME host the seed lane's offer uses
+    same_host_row = {**_CATALOG_OFFER_ROW,
+                     "destination_url": "https://www.sigbrand.example/products/dup",
+                     "merchant_id": "dup_merchant"}
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [same_host_row]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    ids = [str(o.get("offer_id") or "") for o in (body.get("offers") or [])]
+    assert not any(i.startswith("of:catalog_offer:") for i in ids), (
+        "a catalog offer pointing at a host the seed lane already claimed is a duplicate"
+    )
+    assert any(
+        str(s.get("source")) == "catalog_offers" and s.get("deduped") == 1
+        and s.get("emitted") is None  # deduped away, so nothing was emitted
+        for s in ((body.get("metadata") or {}).get("sources") or [])
+    ), "the dedupe must be counted, not silent"
 
 
 def test_catalog_offers_arm_reports_an_empty_answer_as_such(
@@ -3912,3 +3968,145 @@ def test_catalog_offers_arm_sources_only_retailer_offers(
         "destination"
     )
     assert all(o["merchant_id"] != "cosrx_direct" for o in offers)
+
+
+def test_a_sku_matched_seed_offer_outranks_a_catalog_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """RANKING, now that both sources compete. A catalog retailer offer names a PRODUCT page, so
+    it carries the handler's product-grain confidence (0.8); a seed offer that matched a variant
+    carries 1.0 and must stay ahead of it. Before the merge nothing ranked against this arm, so
+    its earlier 1.0 was an unfalsifiable overclaim — this is the test that would have caught it."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            # cheaper than the seed offer, to prove ordering is by tier and not by price alone
+            return [{**_CATALOG_OFFER_ROW, "price_amount": 1.00}]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    offers = res.json().get("offers") or []
+    ids = [str(o.get("offer_id") or "") for o in offers]
+    assert len(ids) >= 2, ids
+    seed_at = next(i for i, x in enumerate(ids) if x.startswith("of:external_seed:"))
+    cat_at = next(i for i, x in enumerate(ids) if x.startswith("of:catalog_offer:"))
+    assert seed_at < cat_at, (
+        "a variant-matched seed offer must outrank a product-grain catalog offer even when the "
+        "catalog offer is cheaper"
+    )
+    assert offers[cat_at]["confidence"] == 0.8
+
+
+def _many_variant_seed_row(n: int):
+    row = _sig_lane_seed_row()
+    data = dict(row.get("seed_data") or {})
+    data["variants"] = [
+        {"variant_id": f"v{i}", "id": f"v{i}", "title": f"Shade {i}", "sku": f"S{i}",
+         "price_amount": 45.0 + i, "price": 45.0 + i, "currency": "USD",
+         "price_currency": "USD", "availability": "in_stock", "in_stock": True,
+         "image_url": f"https://cdn.x/{i}.jpg"}
+        for i in range(n)
+    ]
+    row["seed_data"] = data
+    return row
+
+
+def test_a_variant_fan_out_cannot_truncate_the_competing_retailer_away(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """THE BLOCKING CASE. With no sku_id the seed lane emits one offer PER VARIANT — all to the
+    SAME host, all at the same confidence as a catalog retailer offer. Stable sort plus
+    seeds-first meant a ten-shade lipstick shipped ten links to one seller and truncated the
+    competing retailer away, while `metadata.sources` still said `catalog_offers: ok`.
+
+    Measured against the real route before the fix: 10 variants at limit=10 shipped 0 catalog
+    offers; 3 variants at limit=3 the same. In prod that is 6 products at limit=10 but 50 at
+    limit=3 and 98 at limit=2 — and the caller picks the limit."""
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        if "FROM catalog_products" in q and "pivota_signature_id = ANY" in q:
+            return [{"source_ref": "eps_sig_1"}]
+        if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
+            return [_many_variant_seed_row(12)]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    for limit in (10, 3, 2):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": limit,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+        assert res.status_code == 200
+        offers = res.json().get("offers") or []
+        ids = [str(o.get("offer_id") or "") for o in offers]
+        assert len(ids) <= limit, f"limit={limit} must still be honoured: {ids}"
+        # ...and the head must FILL: 12 seed variants + 1 retailer is 13 offers, so a limit of 10
+        # ships 10. Taking only one per host and stopping would ship 2 and waste the budget.
+        assert len(ids) == limit, f"limit={limit} must be filled, not just diversified: {ids}"
+        assert any(i.startswith("of:catalog_offer:") for i in ids), (
+            f"limit={limit}: the competing retailer must survive a variant fan-out — {ids}"
+        )
+        assert any(i.startswith("of:external_seed:") for i in ids), (
+            f"limit={limit}: the seed must still be represented — {ids}"
+        )
+
+
+def test_host_diverse_head_treats_hostless_offers_as_distinct() -> None:
+    """Internal (buy-here) offers name no destination host at all. Keying them all on the empty
+    string would collapse every one of them into a single slot and hand back one offer where the
+    caller asked for five — the opposite of the starvation this function exists to prevent."""
+    from routes.agent_shop_gateway import _host_diverse_head
+
+    hostless = [{"offer_id": f"of:internal:{i}", "source": {}} for i in range(5)]
+    assert len(_host_diverse_head(hostless, 5)) == 5
+    assert [o["offer_id"] for o in _host_diverse_head(hostless, 3)] == [
+        "of:internal:0", "of:internal:1", "of:internal:2"
+    ]
+
+    # THE CASE THAT DISTINGUISHES THE SENTINEL. Two hostless offers must BOTH reach the head in
+    # rank order; keying them on the empty string collapses them to one and lets a lower-ranked
+    # real host take the freed slot. The fill pass hides this whenever there is room, so the
+    # fixture must carry more offers than `limit`.
+    mixed = [
+        {"offer_id": "of:a", "url": "https://one.example/p"},
+        {"offer_id": "of:b", "source": {}},
+        {"offer_id": "of:c", "source": {}},
+        {"offer_id": "of:d", "url": "https://two.example/p"},
+        {"offer_id": "of:e", "url": "https://three.example/p"},
+    ]
+    assert [o["offer_id"] for o in _host_diverse_head(mixed, 3)] == ["of:a", "of:b", "of:c"]

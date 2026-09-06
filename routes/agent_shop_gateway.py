@@ -5453,181 +5453,232 @@ async def _handle_offers_resolve(
     # `source.merchant_id`, so their offers reach an agent unable to name the merchant. This arm
     # emits both spellings. Fixing the other two lanes is a separate change and is why an offer
     # here carries `seller` as well.
-    if not internal_offers and not external_offers:
-        catalog_started = time.perf_counter()
-        try:
-            ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
-            catalog_rows = []
-            if ident_aliases:
-                catalog_rows = await asyncio.wait_for(
-                    database.fetch_all(
-                        """
-                        SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
-                               o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
-                               o.price_confidence, o.updated_at,
-                               coalesce(o.merchant_effective_price, o.estimated_best_price,
-                                        o.list_price) AS price_amount,
-                               coalesce(o.offer_payload->>'destination_url', o.source_ref)
-                                   AS destination_url,
-                               m.merchant_name AS merchant_name,
-                               p.content_key AS content_key
-                          FROM catalog_products p
-                          JOIN catalog_offers o ON o.product_key = p.product_key
-                          LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
-                         WHERE (p.pivota_signature_id = ANY(:aliases)
-                                OR p.content_key = ANY(:aliases)
-                                OR p.product_key = ANY(:aliases))
-                           -- The PRODUCT's own suppression, not just the offer's. Every serving
-                           -- read in services/pivot_query_service.py applies this pair, and
-                           -- scripts/withdraw_catalog_rows.py takes a product down by setting
-                           -- exactly these — so without it a withdrawn product still ships its
-                           -- retailer offer here, and the takedown silently misses this lane.
-                           AND p.suppressed_at IS NULL
-                           AND p.suppression_reason IS NULL
-                           -- Market, mirroring the seed lane at the attached-ref query above.
-                           -- Latent today (the gateway sends no market and the retailer ingest
-                           -- writes 'US'), and live the moment a caller passes market=KR.
-                           AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
-                           AND o.offer_type = 'retailer'
-                           AND o.offer_mode = 'redirect'
-                           AND o.suppressed_at IS NULL
-                           AND coalesce(o.merchant_effective_price, o.estimated_best_price,
-                                        o.list_price) > 0
-                           AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
-                               IS NOT NULL
-                         ORDER BY price_amount ASC
-                         LIMIT :limit
-                        """,
-                        {"aliases": ident_aliases, "limit": max(limit, 1),
-                         "market": market_hint},
-                    ),
-                    timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
-                )
+    # UNGATED, and deduped on destination host.
+    #
+    # The first cut of this arm ran only when nothing else resolved, which made it safe to ship
+    # and nearly inert: measured 2026-09-06, 1,124 products carry an unsuppressed retailer offer
+    # and 1,110 of them are ALSO seeded, so the gate left it serving about 14. The competition
+    # worth showing — a StyleKorean price beside the brand's own — lives on exactly the products
+    # the gate excluded.
+    #
+    # WHAT THE DEDUPE IS FOR, and what it must NOT eat. `external_offer_dual_write` writes some
+    # destinations into both stores, so the same retailer can arrive twice: measured over 400
+    # product/offer/seed triples, 19 shared a destination host. The other 381 are the case we are
+    # here for — offer host `stylekorean.com` beside seed host `rovectin.com` is two real sellers,
+    # not a duplicate. So the key is the DESTINATION HOST, not the product: same host means we
+    # would send the buyer to the same place twice.
+    catalog_started = time.perf_counter()
+    try:
+        ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
+        catalog_rows = []
+        if ident_aliases:
+            catalog_rows = await asyncio.wait_for(
+                database.fetch_all(
+                    """
+                    SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
+                           o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
+                           o.price_confidence, o.updated_at,
+                           coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                    o.list_price) AS price_amount,
+                           coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                               AS destination_url,
+                           m.merchant_name AS merchant_name,
+                           p.content_key AS content_key
+                      FROM catalog_products p
+                      JOIN catalog_offers o ON o.product_key = p.product_key
+                      LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
+                     WHERE (p.pivota_signature_id = ANY(:aliases)
+                            OR p.content_key = ANY(:aliases)
+                            OR p.product_key = ANY(:aliases))
+                       -- The PRODUCT's own suppression, not just the offer's. Every serving
+                       -- read in services/pivot_query_service.py applies this pair, and
+                       -- scripts/withdraw_catalog_rows.py takes a product down by setting
+                       -- exactly these — so without it a withdrawn product still ships its
+                       -- retailer offer here, and the takedown silently misses this lane.
+                       AND p.suppressed_at IS NULL
+                       AND p.suppression_reason IS NULL
+                       -- Market, mirroring the seed lane at the attached-ref query above.
+                       -- Latent today (the gateway sends no market and the retailer ingest
+                       -- writes 'US'), and live the moment a caller passes market=KR.
+                       AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
+                       AND o.offer_type = 'retailer'
+                       AND o.offer_mode = 'redirect'
+                       AND o.suppressed_at IS NULL
+                       AND coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                    o.list_price) > 0
+                       AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                           IS NOT NULL
+                     ORDER BY price_amount ASC
+                     LIMIT :limit
+                    """,
+                    {"aliases": ident_aliases, "limit": max(limit, 1),
+                     "market": market_hint},
+                ),
+                timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+            )
 
-            unattributed = 0
-            for row in catalog_rows or []:
-                r = dict(row)
-                destination = str(r.get("destination_url") or "").strip()
-                if not destination.startswith(("http://", "https://")):
-                    continue
-                offer_merchant = str(r.get("merchant_id") or "").strip() or None
+        # Hosts the seed lane already claimed. Read from `source`, which carries the raw
+        # destination — `affiliate_url` is a signed /r link and every one of them shares OUR
+        # host, so comparing those would collapse every offer into one.
+        #
+        # THREE KEYS ON PURPOSE, and they are redundant on a row that has all three: a seed
+        # may carry `domain` without a usable url, or a url without `domain`. Removing either
+        # source alone leaves the dedupe working (neither mutant dies); removing BOTH lets a
+        # duplicate through. Noted because one of them otherwise reads as dead code.
+        seen_hosts = set()
+        for prior in external_offers:
+            src = prior.get("source") or {}
+            for key in ("canonical_url", "destination_url"):
+                h = _offer_destination_host(src.get(key))
+                if h:
+                    seen_hosts.add(h)
+            domain_host = _offer_destination_host(f"https://{src.get('domain')}"
+                                                  if src.get("domain") else None)
+            if domain_host:
+                seen_hosts.add(domain_host)
 
-                # ATTRIBUTED when we can, VISIBLE either way. The outbound allowlist is empty in
-                # every market today (measured 2026-09-06), and an empty allowlist means allow-all
-                # — so this should mint a signed /r link. If it ever cannot, the offer still ships
-                # with its plain destination and the shortfall is COUNTED into the source entry,
-                # because the failure this system keeps producing is a silent zero that reads as
-                # "nothing matched".
-                redirect_url = await _make_external_redirect_url(
-                    market=market_hint or "US",
-                    tool=tool_hint or "offers.resolve",
-                    destination_url=destination,
-                    utm_template=None,
-                    ctx={
-                        "eventType": "outbound_opened",
-                        "source": "offers.resolve.catalog_offer",
-                        "offerId": str(r.get("offer_id") or ""),
-                        **({"productId": product_id} if product_id else {}),
-                    },
-                    merchant_id=offer_merchant,
-                    product_id=str(r.get("product_key") or "") or None,
-                    variant_id=None,
-                    # The retailer's own page, never a Shopify cart permalink: this lane has no
-                    # merchant-issued variant id it could justify, and the parameter has no default
-                    # precisely so a caller must say so explicitly.
-                    cart_variant_id=None,
-                    seller_ref=offer_merchant,
-                    seed_kind="retailer_offer",
-                )
-                if not redirect_url:
-                    unattributed += 1
+        unattributed = 0
+        deduped = 0
+        for row in catalog_rows or []:
+            r = dict(row)
+            destination = str(r.get("destination_url") or "").strip()
+            if not destination.startswith(("http://", "https://")):
+                continue
+            dest_host = _offer_destination_host(destination)
+            if dest_host and dest_host in seen_hosts:
+                deduped += 1
+                continue
+            if dest_host:
+                seen_hosts.add(dest_host)
+            offer_merchant = str(r.get("merchant_id") or "").strip() or None
 
-                availability = str(r.get("availability") or "").strip() or None
-                price_amount = r.get("price_amount")
-                external_offers.append(
-                    {
-                        "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
-                        # Both spellings — see SHAPE above.
+            # ATTRIBUTED when we can, VISIBLE either way. The outbound allowlist is empty in
+            # every market today (measured 2026-09-06), and an empty allowlist means allow-all
+            # — so this should mint a signed /r link. If it ever cannot, the offer still ships
+            # with its plain destination and the shortfall is COUNTED into the source entry,
+            # because the failure this system keeps producing is a silent zero that reads as
+            # "nothing matched".
+            redirect_url = await _make_external_redirect_url(
+                market=market_hint or "US",
+                tool=tool_hint or "offers.resolve",
+                destination_url=destination,
+                utm_template=None,
+                ctx={
+                    "eventType": "outbound_opened",
+                    "source": "offers.resolve.catalog_offer",
+                    "offerId": str(r.get("offer_id") or ""),
+                    **({"productId": product_id} if product_id else {}),
+                },
+                merchant_id=offer_merchant,
+                product_id=str(r.get("product_key") or "") or None,
+                variant_id=None,
+                # The retailer's own page, never a Shopify cart permalink: this lane has no
+                # merchant-issued variant id it could justify, and the parameter has no default
+                # precisely so a caller must say so explicitly.
+                cart_variant_id=None,
+                seller_ref=offer_merchant,
+                seed_kind="retailer_offer",
+            )
+            if not redirect_url:
+                unattributed += 1
+
+            availability = str(r.get("availability") or "").strip() or None
+            price_amount = r.get("price_amount")
+            external_offers.append(
+                {
+                    "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
+                    # Both spellings — see SHAPE above.
+                    "merchant_id": offer_merchant,
+                    "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
+                    "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
+                    "price": float(price_amount) if price_amount is not None else None,
+                    "currency": str(r.get("currency") or "USD").strip() or "USD",
+                    "availability": availability,
+                    "in_stock": (availability or "").strip().lower()
+                    not in {"out_of_stock", "outofstock", "sold_out",
+                            "soldout", "unavailable"},
+                    "url": destination,
+                    "purchase_route": "affiliate_outbound",
+                    # NEVER the raw destination under this key. `affiliate_url` MEANS an
+                    # attributed `/r` link: the gateway's sanitizer only passes it verbatim
+                    # when it matches the signed-token shape, and everything else goes
+                    # through the normal scrub — so an unsigned value here is both a
+                    # mislabel and liable to be rewritten. `_make_external_redirect_url`
+                    # declines for exactly one reachable reason, an allowlist refusal, and
+                    # that is a serving decision: the offer stays visible under `url`, the
+                    # signed key stays honest at None, and the shortfall is counted.
+                    "affiliate_url": redirect_url,
+                    # UNKNOWN, stated as such. A retailer destination is a product page as far
+                    # as we know; `null` is the vocabulary's "we do not know", and claiming
+                    # `false` would license an agent to tell a buyer what they will land on.
+                    "cart_prefilled": None,
+                    "internal_checkout_items": None,
+                    # PRODUCT grain, like the seed lane's own 0.8. The identity match is
+                    # exact, but a retailer offer names a product page, not a variant — and
+                    # 1.0 is what this handler reserves for a SKU-level match. Claiming it
+                    # here would outrank a seed offer that really did match a variant.
+                    "confidence": 0.8,
+                    **({"price_confidence": r.get("price_confidence")}
+                       if r.get("price_confidence") is not None else {}),
+                    **({"updated_at": r.get("updated_at")}
+                       if r.get("updated_at") is not None else {}),
+                    "source": {
+                        "type": "catalog_offer",
+                        "offer_id": str(r.get("offer_id") or ""),
+                        "product_key": str(r.get("product_key") or ""),
+                        "content_key": str(r.get("content_key") or ""),
                         "merchant_id": offer_merchant,
-                        "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
-                        "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
-                        "price": float(price_amount) if price_amount is not None else None,
-                        "currency": str(r.get("currency") or "USD").strip() or "USD",
-                        "availability": availability,
-                        "in_stock": (availability or "").strip().lower()
-                        not in {"out_of_stock", "outofstock", "sold_out",
-                                "soldout", "unavailable"},
-                        "url": destination,
-                        "purchase_route": "affiliate_outbound",
-                        # NEVER the raw destination under this key. `affiliate_url` MEANS an
-                        # attributed `/r` link: the gateway's sanitizer only passes it verbatim
-                        # when it matches the signed-token shape, and everything else goes
-                        # through the normal scrub — so an unsigned value here is both a
-                        # mislabel and liable to be rewritten. `_make_external_redirect_url`
-                        # declines for exactly one reachable reason, an allowlist refusal, and
-                        # that is a serving decision: the offer stays visible under `url`, the
-                        # signed key stays honest at None, and the shortfall is counted.
-                        "affiliate_url": redirect_url,
-                        # UNKNOWN, stated as such. A retailer destination is a product page as far
-                        # as we know; `null` is the vocabulary's "we do not know", and claiming
-                        # `false` would license an agent to tell a buyer what they will land on.
-                        "cart_prefilled": None,
-                        "internal_checkout_items": None,
-                        "confidence": 1.0,
-                        **({"price_confidence": r.get("price_confidence")}
-                           if r.get("price_confidence") is not None else {}),
-                        **({"updated_at": r.get("updated_at")}
-                           if r.get("updated_at") is not None else {}),
-                        "source": {
-                            "type": "catalog_offer",
-                            "offer_id": str(r.get("offer_id") or ""),
-                            "product_key": str(r.get("product_key") or ""),
-                            "content_key": str(r.get("content_key") or ""),
-                            "merchant_id": offer_merchant,
-                            # `live_offer_verification._target` reads
-                            # `source.canonical_url or source.destination_url`; without one of
-                            # them every offer from this arm is UNVERIFIED "no_verifiable_url".
-                            "destination_url": destination,
-                            "offer_type": str(r.get("offer_type") or ""),
-                            "is_first_party": bool(r.get("is_first_party")),
-                            "readiness_tier": str(r.get("readiness_tier") or ""),
-                        },
-                    }
-                )
-                if catalog_rows:
-                    mapping_candidates.append(
-                        _conf(
-                            "catalog_offer",
-                            1.0,
-                            "matched_canonical_identity",
-                            {"product_key": str(r.get("product_key") or "")},
-                        )
+                        # `live_offer_verification._target` reads
+                        # `source.canonical_url or source.destination_url`; without one of
+                        # them every offer from this arm is UNVERIFIED "no_verifiable_url".
+                        "destination_url": destination,
+                        "offer_type": str(r.get("offer_type") or ""),
+                        "is_first_party": bool(r.get("is_first_party")),
+                        "readiness_tier": str(r.get("readiness_tier") or ""),
+                    },
+                }
+            )
+            if catalog_rows:
+                mapping_candidates.append(
+                    _conf(
+                        "catalog_offer",
+                        0.8,
+                        "matched_canonical_identity",
+                        {"product_key": str(r.get("product_key") or "")},
                     )
+                )
 
-            _record_source(
-                source="catalog_offers",
-                status="ok" if catalog_rows else "empty",
-                reason_code="ok" if catalog_rows else "no_candidates",
-                source_started=catalog_started,
-                row_count=len(catalog_rows or []),
-                query="catalog_offers_by_canonical_identity",
-                extra={"unattributed": unattributed} if unattributed else None,
-            )
-        except Exception as e:
-            logger.info("offers.resolve.catalog_offers.failed", extra={"error": str(e)})
-            _record_source(
-                source="catalog_offers",
-                status="error",
-                reason_code=_classify_db_reason_code(e),
-                source_started=catalog_started,
-                error=type(e).__name__,
-                query="catalog_offers_by_canonical_identity",
-            )
+        _record_source(
+            source="catalog_offers",
+            status="ok" if catalog_rows else "empty",
+            reason_code="ok" if catalog_rows else "no_candidates",
+            source_started=catalog_started,
+            row_count=len(catalog_rows or []),
+            query="catalog_offers_by_canonical_identity",
+            # `row_count` is what the QUERY found; `emitted` is what this arm actually
+            # appended. Reporting only the former let a fully-truncated arm read as
+            # "ok, row_count=1" while the buyer saw nothing from it.
+            extra={k: v for k, v in
+                   (("unattributed", unattributed), ("deduped", deduped),
+                    ("emitted", len(catalog_rows or []) - deduped)) if v} or None,
+        )
+    except Exception as e:
+        logger.info("offers.resolve.catalog_offers.failed", extra={"error": str(e)})
+        _record_source(
+            source="catalog_offers",
+            status="error",
+            reason_code=_classify_db_reason_code(e),
+            source_started=catalog_started,
+            error=type(e).__name__,
+            query="catalog_offers_by_canonical_identity",
+        )
 
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
-    offers = offers[:limit]
+    # HOST-DIVERSE, not merely top-N — see _host_diverse_head. A plain [:limit] lets one seller's
+    # variant fan-out truncate away every competing merchant, which is the one thing this op is for.
+    offers = _host_diverse_head(offers, limit)
 
     # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
@@ -7768,6 +7819,64 @@ def _seed_domain_from_url(url: Optional[str]) -> str:
     if ":" in host:
         host = host.split(":")[0]
     return host.lower()
+
+
+def _offer_destination_host(url: Optional[str]) -> str:
+    """The host two offers must share to be the SAME destination, for dedupe.
+
+    Deliberately not `_format_domain_display_name`, which returns a human label
+    ("Ulta Official Site"), and deliberately stripping only `www.`: collapsing
+    `shop.` or `store.` too would merge storefronts that can genuinely differ,
+    and over-merging here DROPS a real competing offer, which is the worse error.
+    """
+    host = _seed_domain_from_url(url)
+    return host[4:] if host.startswith("www.") else host
+
+
+def _host_diverse_head(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Truncate to `limit` while keeping one offer per DESTINATION HOST at the front.
+
+    WHY. This op exists to show cross-merchant competition, and a plain `[:limit]` destroys exactly
+    that. With no `sku_id` the seed lane fans out one offer PER VARIANT — up to `min(12, limit)`
+    of them, all to the same host and all at the same confidence as a catalog retailer offer.
+    Stable sort plus seeds-appended-first means a ten-shade lipstick ships ten links to ONE seller
+    and truncates the competing retailer away. Measured against the real route: 10 variants at
+    limit=10 shipped 0 catalog offers; 3 variants at limit=3 the same. In prod that is 6 products
+    at limit=10, 50 at limit=3 and 98 at limit=2 — and the CALLER picks the limit.
+
+    The head takes the first offer of each distinct host in RANK order — never reordering within a
+    host, never promoting a worse offer above a better one from the same seller — then fills the
+    remaining slots in rank order. An offer whose host cannot be derived counts as its own host:
+    collapsing those would merge every internal offer, which names no destination at all, into a
+    single slot.
+    """
+    if limit <= 0 or len(offers) <= limit:
+        return offers[:limit]
+
+    seen: set = set()
+    head: List[Dict[str, Any]] = []
+    head_ids: set = set()
+    for idx, offer in enumerate(offers):
+        src = offer.get("source") or {}
+        host = _offer_destination_host(
+            offer.get("url") or src.get("canonical_url") or src.get("destination_url")
+        )
+        key = host or f"no-host-{idx}"
+        if key in seen:
+            continue
+        seen.add(key)
+        head.append(offer)
+        head_ids.add(id(offer))
+        if len(head) >= limit:
+            return head
+
+    for offer in offers:
+        if id(offer) in head_ids:
+            continue
+        head.append(offer)
+        if len(head) >= limit:
+            break
+    return head
 
 
 def _format_domain_display_name(domain: str) -> str:
