@@ -2300,6 +2300,81 @@ async def mark_verification_succeeded(
         return False
 
 
+async def mark_verification_no_verdict(
+    *,
+    verify_id: str,
+    worker_id: str,
+    status: str,
+    reason: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Terminal "no verdict, and here is why" transition.
+
+    The four states exist so a reader can tell "we never checked" from "we
+    checked and it was fine" — but a constant nothing can write is not storable,
+    and until this function existed the vocabulary had no producer at all.
+
+    `reason` is REQUIRED and non-empty. The whole point of these states is that
+    the row explains itself; one written without a reason reproduces the silence
+    the states were added to remove, one column over. It is stored inside
+    evidence_jsonb rather than in a new column so this needs no migration.
+
+    Guarded on worker ownership exactly like the other terminal transitions, and
+    reachable ONLY from `claimed`: a worker took the row and learned it could not
+    produce a verdict. A row still `pending` has not been attempted, so nothing
+    yet knows it has no verdict — that is a different fact, and giving it this
+    state here would be a claim we cannot support.
+    """
+    await ensure_audit_evidence_tables()
+    if status not in VERIFICATION_NO_VERDICT:
+        # Refuse rather than coerce: silently writing `succeeded` for a caller
+        # that meant `unparseable` is precisely the pass-by-absence this whole
+        # item removes.
+        logger.warning(
+            "mark_verification_no_verdict refused status=%r for verify=%s "
+            "(expected one of %s)",
+            status, verify_id, sorted(VERIFICATION_NO_VERDICT),
+        )
+        return False
+    if not (reason or "").strip():
+        logger.warning(
+            "mark_verification_no_verdict refused an empty reason for "
+            "verify=%s status=%s", verify_id, status,
+        )
+        return False
+
+    now = _now_utc()
+    payload: Dict[str, Any] = dict(evidence_jsonb or {})
+    payload["no_verdict_reason"] = reason.strip()[:500]
+    payload["no_verdict_status"] = status
+    values: Dict[str, Any] = {
+        "status": status,
+        "completed_at": now,
+        "last_checked_at": now,
+        "evidence_jsonb": payload,
+    }
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
+            )
+            .values(**values)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_no_verdict failed for verify=%s status=%s: %s",
+            verify_id, status, str(exc)[:200],
+        )
+        return False
+
+
 async def mark_verification_blocked(
     *,
     verify_id: str,

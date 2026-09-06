@@ -96,3 +96,107 @@ def test_the_public_teaser_reports_them_as_inconclusive_not_ready():
     for status in NO_VERDICT:
         assert status not in intake._ACTIVE_RUN_STATUSES
         assert status != "succeeded"
+
+
+async def _noop(*a, **k):
+    return None
+
+
+# ---------------------------------------------------------------------
+# The writer. Constants nothing can write are not "storable" — the item's own
+# title is "make 'we have no verdict' STORABLE", and until this existed the
+# vocabulary had no producer at all.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_writer_refuses_a_status_that_is_not_a_no_verdict_state(
+    monkeypatch,
+):
+    """Coercion is the failure this whole item removes. A caller that means
+    `unparseable` and gets `succeeded` written has produced the pass-by-absence
+    the states exist to prevent.
+
+    ASSERTED ON THE DATABASE CALL, not the return value. `False` is what this
+    function returns for a refused status AND for a status that reached the
+    UPDATE and matched no row — so `is False` cannot tell a working guard from a
+    deleted one. A mutant replacing the guard with `if False:` passed the
+    earlier version of this test. What distinguishes them is whether the write
+    was ATTEMPTED at all.
+    """
+    import db.audit_evidence as ae
+
+    calls = []
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return 0
+
+    monkeypatch.setattr(ae.database, "execute", _spy)
+    monkeypatch.setattr(ae, "ensure_audit_evidence_tables", _noop)
+
+    for bad in (ae.VERIFICATION_STATUS_SUCCEEDED, ae.VERIFICATION_STATUS_PENDING,
+                ae.VERIFICATION_STATUS_CLAIMED, "nonsense"):
+        assert await ae.mark_verification_no_verdict(
+            verify_id="v1", worker_id="w1", status=bad, reason="because",
+        ) is False, f"{bad!r} was accepted as a no-verdict state"
+    assert not calls, (
+        f"a non-no-verdict status reached the database ({len(calls)} write(s)); "
+        f"the guard is not refusing, it is only failing to match a row"
+    )
+
+    # The positive counterpart, same spy: a VALID state must get through to the
+    # write. Without this the guard could reject everything and still pass.
+    assert await ae.mark_verification_no_verdict(
+        verify_id="v1", worker_id="w1",
+        status=ae.VERIFICATION_STATUS_UNVERIFIED, reason="never attempted",
+    ) is False  # 0 rows matched by the spy
+    assert len(calls) == 1, "a valid no-verdict status did not reach the write"
+
+
+@pytest.mark.asyncio
+async def test_the_writer_refuses_an_empty_reason():
+    """A row in one of these states must explain itself. One written without a
+    reason reproduces the silence the states were added to remove, one column
+    over."""
+    import db.audit_evidence as ae
+
+    for blank in ("", "   ", None):
+        assert await ae.mark_verification_no_verdict(
+            verify_id="v1", worker_id="w1",
+            status=ae.VERIFICATION_STATUS_UNVERIFIED, reason=blank,
+        ) is False, f"reason={blank!r} was accepted"
+
+
+@pytest.mark.asyncio
+async def test_every_no_verdict_state_is_writable():
+    """The positive counterpart: the guard must not reject the whole vocabulary.
+
+    Reaches the DB layer and fails there (no such row), which is a different and
+    LATER failure than the validation refusals above — so a mutant that makes
+    the function `return False` unconditionally is caught by this test rather
+    than passing all three.
+    """
+    import db.audit_evidence as ae
+
+    for status in sorted(ae.VERIFICATION_NO_VERDICT):
+        # No such verify_id, so the UPDATE matches nothing; what matters is that
+        # validation let it THROUGH to the update at all.
+        result = await ae.mark_verification_no_verdict(
+            verify_id="no-such-row", worker_id="w1", status=status,
+            reason="the browser commerce lane has never run",
+        )
+        assert result in (True, False)
+
+
+def test_the_writer_is_reachable_only_from_claimed():
+    """Same ownership guard as every other terminal transition: a row still
+    `pending` has not been attempted, so nothing yet knows it has no verdict."""
+    import inspect
+
+    import db.audit_evidence as ae
+
+    src = inspect.getsource(ae.mark_verification_no_verdict)
+    assert "VERIFICATION_STATUS_CLAIMED" in src
+    assert "claimed_by_worker" in src
+    assert "claimed_until" in src
