@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from db.database import database
 from services.merchant_store_service import get_primary_store
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import normalize_myshopify_domain
 from services.shopify_integration_verify import register_webhooks_best_effort, verify_shopify_integration
 from utils.auth import get_current_employee
 
@@ -130,7 +131,12 @@ async def ops_resubscribe_shopify_webhooks(
     if not store_info or (store_info.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="Primary store is not Shopify")
 
-    shop_domain = store_info.get("domain") or ""
+    # Pinned before the resolve, which POSTs client credentials to {domain}/admin/oauth/access_token.
+    shop_domain = normalize_myshopify_domain(store_info.get("domain")) or ""
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400, detail="Stored Shopify domain is not a *.myshopify.com host"
+        )
     access_token, _ = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store_info.get("api_key_raw") or store_info.get("api_key"),
@@ -212,7 +218,9 @@ async def ops_resubscribe_all_shopify_webhooks(
     for row in rows or []:
         store = dict(row)
         merchant_id = store.get("merchant_id")
-        shop_domain = (store.get("domain") or "").strip()
+        # One unpinnable row must not abort the sweep -- it is recorded and skipped, so the
+        # remaining stores are still resubscribed.
+        shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
         store_id = str(store.get("store_id") or "").strip() or None
         summary: Dict[str, Any] = {
             "merchant_id": merchant_id,
@@ -222,6 +230,12 @@ async def ops_resubscribe_all_shopify_webhooks(
             "failed": [],
             "error": None,
         }
+        if not shop_domain:
+            # Recorded with its OWN reason rather than falling through to "missing_credentials",
+            # which would send an operator looking for a token problem that is not there.
+            summary["error"] = "domain_not_a_myshopify_host"
+            results.append(summary)
+            continue
         try:
             access_token, _meta = await resolve_shopify_admin_access_token(
                 shop_domain=shop_domain,
@@ -272,7 +286,7 @@ async def ops_sync_shopify_returns(
     if not store_info or (store_info.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="Primary store is not Shopify")
 
-    shop_domain = store_info.get("domain") or ""
+    shop_domain = normalize_myshopify_domain(store_info.get("domain")) or ""
     access_token = store_info.get("api_key") or ""
     if not shop_domain or not access_token:
         raise HTTPException(status_code=400, detail="Missing Shopify credentials")
