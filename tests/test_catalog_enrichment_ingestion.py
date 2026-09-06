@@ -1146,7 +1146,7 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
         _re.sub(r"--.*$", "", line) for line in arm.splitlines()
     )
 
-    assert "currency = CASE WHEN :currency_known" in update_arm
+    assert "currency = EXCLUDED.currency" in update_arm
     # market is a DIFFERENT AXIS and this lane does not own it -- see services/storefront_currency.py
     assert "market" not in update_arm
 
@@ -1158,7 +1158,7 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
         _re.sub(r"--.*$", "", line)
         for line in _SEED_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
     )
-    assert "price_currency = CASE WHEN :currency_known" in seed_arm
+    assert "price_currency = EXCLUDED.price_currency" in seed_arm
     assert "market" not in seed_arm
 
     # THE THIRD ARM, because the first version of this test checked two of three and stopped.
@@ -1171,7 +1171,7 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
         _re.sub(r"--.*$", "", line)
         for line in _SKU_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
     )
-    assert "currency = CASE WHEN :currency_known" in sku_arm
+    assert "currency = EXCLUDED.currency" in sku_arm
 
     # DERIVED, not hand-listed. The previous version iterated a 3-tuple I wrote out myself --
     # which restates the very enumeration risk it claims to close, and is how "two arms" was
@@ -1195,8 +1195,18 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
             for line in sql.split("DO UPDATE SET", 1)[1].splitlines()
         )
         checked.append(attr)
-        assert _re.search(r"(price_)?currency = CASE WHEN :currency_known", arm), (
-            f"{attr} can overwrite a KNOWN currency with an unknown one"
+        assert _re.search(r"(price_)?currency = EXCLUDED", arm), (
+            f"{attr} cannot correct a stale currency on re-ingest"
+        )
+        # AND the tail must stay free of binds. A per-row condition cannot live here:
+        # `split_upsert_sql` suffixes the VALUES binds per row while this tail is SHARED, so a
+        # bind here breaks every multi-row upsert -- including one written only inside a COMMENT,
+        # which is indistinguishable from a real one and is exactly how this was discovered.
+        from services.catalog_enrichment_agent.bulk_writer import split_upsert_sql
+
+        _, _, tail = split_upsert_sql(sql)
+        assert _re.findall(r":(\w+)", tail) == [], (
+            f"{attr}'s conflict tail carries a bind; multi-row upserts will break"
         )
     assert set(checked) == {"_SKU_UPSERT_SQL", "_OFFER_UPSERT_SQL", "_SEED_UPSERT_SQL"}, checked
 
@@ -1237,3 +1247,122 @@ def test_an_unknown_currency_never_overwrites_one_we_already_proved():
     assert learned["offers"][0]["offer_id"] == unknown["offers"][0]["offer_id"]
     assert learned["sku"]["sku_key"] == unknown["sku"]["sku_key"]
     assert learned["seeds"][0]["id"] == unknown["seeds"][0]["id"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_currency_does_not_overwrite_the_stored_one():
+    """The GUARD's behaviour, not just the flag it keys on.
+
+    The previous version of this test asserted `currency_known` on the row dicts and stopped --
+    which pins the input to the guard and nothing the guard does. Drive
+    `_preserve_known_currency` against a database double instead: a row that admits it did not
+    learn a currency must come out carrying what the table already holds.
+    """
+    from services.catalog_enrichment_agent.apply import _preserve_known_currency
+
+    class _DB:
+        def __init__(self, stored):
+            self.stored = stored
+            self.queries = 0
+
+        async def fetch_all(self, sql, params):
+            self.queries += 1
+            return [{"offer_id": k, "currency": v} for k, v in self.stored.items()
+                    if k in set(params["keys"])]
+
+    db = _DB({"offer:a": "SGD"})
+
+    rows = [
+        {"offer_id": "offer:a", "currency": "USD", "currency_known": False},   # fetch failed
+        {"offer_id": "offer:b", "currency": "USD", "currency_known": False},   # never seen before
+        {"offer_id": "offer:c", "currency": "USD", "currency_known": True},    # genuinely USD
+    ]
+    preserved = await _preserve_known_currency(
+        db, rows, table="catalog_offers", key_column="offer_id",
+        key_field="offer_id", currency_field="currency",
+    )
+
+    assert preserved == 1
+    assert rows[0]["currency"] == "SGD", "a proved currency must survive a flaky run"
+    assert rows[1]["currency"] == "USD", "no stored row: the USD insert default is right"
+    assert rows[2]["currency"] == "USD", "a KNOWN currency must still be written through"
+
+
+@pytest.mark.asyncio
+async def test_the_currency_guard_never_fails_an_ingest():
+    """Best-effort by construction. A read that raises must leave the rows exactly as they were --
+    which is what happened before the guard existed -- rather than taking down the whole ingest."""
+    from services.catalog_enrichment_agent.apply import _preserve_known_currency
+
+    class _Broken:
+        async def fetch_all(self, sql, params):
+            raise RuntimeError("connection reset")
+
+    rows = [{"offer_id": "offer:a", "currency": "USD", "currency_known": False}]
+
+    preserved = await _preserve_known_currency(
+        _Broken(), rows, table="catalog_offers", key_column="offer_id",
+        key_field="offer_id", currency_field="currency",
+    )
+
+    assert preserved == 0
+    assert rows[0]["currency"] == "USD"
+
+
+@pytest.mark.asyncio
+async def test_the_guard_does_not_read_when_every_row_knows_its_currency():
+    """The common path must cost nothing. Every successful ingest has `currency_known` on every
+    row, and issuing a SELECT per batch for them would be pure overhead on the hot path."""
+    from services.catalog_enrichment_agent.apply import _preserve_known_currency
+
+    class _DB:
+        def __init__(self):
+            self.queries = 0
+
+        async def fetch_all(self, sql, params):
+            self.queries += 1
+            return []
+
+    db = _DB()
+    rows = [{"offer_id": "offer:a", "currency": "SGD", "currency_known": True}]
+
+    assert await _preserve_known_currency(
+        db, rows, table="catalog_offers", key_column="offer_id",
+        key_field="offer_id", currency_field="currency",
+    ) == 0
+    assert db.queries == 0, "no read should happen when nothing is unknown"
+
+
+def test_apply_ingest_plan_runs_the_currency_guard_for_every_table_it_writes():
+    """THE SEAM. The guard can be perfect and simply never called -- deleting its call before the
+    SKU write left the whole suite green, the same shape as the eighth currency site and the
+    locale-threading that survived two earlier rounds.
+
+    SOURCE-LEVEL, deliberately, following the precedent at
+    tests/test_w2_retailer_seller_model.py:280. Driving `apply_ingest_plan` against a double
+    reaches the real database on paths this assertion does not care about, and the fake needed to
+    get past them would be large enough to invent behaviour of its own -- which is its own failure
+    mode. What matters here is only that each write is preceded by a guard for ITS table.
+
+    The set is derived from the source, so a fourth currency-bearing table added later fails here
+    rather than being silently unguarded.
+    """
+    import inspect
+    import re as _re
+
+    import services.catalog_enrichment_agent.apply as apply_mod
+
+    src = inspect.getsource(apply_mod.apply_ingest_plan)
+    guarded = set(_re.findall(r'_preserve_known_currency\(\s*\n?\s*database,[^)]*?table="(\w+)"', src, _re.S))
+
+    assert guarded == {"catalog_skus", "catalog_offers", "external_product_seeds"}, guarded
+
+    # and each guard must come BEFORE the write it protects, not after it
+    for table, write_marker in (
+        ("catalog_skus", "_SKU_UPSERT_SQL"),
+        ("catalog_offers", "_OFFER_UPSERT_SQL"),
+        ("external_product_seeds", "_SEED_UPSERT_SQL"),
+    ):
+        guard_at = src.index(f'table="{table}"')
+        write_at = src.index(write_marker)
+        assert guard_at < write_at, f"the {table} guard runs after its write"
