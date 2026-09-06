@@ -126,38 +126,6 @@ _SKU_UPSERT_SQL = """
                        CAST(:ingredient_ids AS jsonb),
                        CAST(:sku_payload AS jsonb), :readiness_tier)
                     ON CONFLICT (sku_key) DO UPDATE SET
-                      -- THE THIRD ARM. `catalog_skus.currency` is not internal bookkeeping:
-                      -- `agent_pdp_view_assembler` SELECTs it and emits it as
-                      -- `variants[].currency` in the served payload. `derive_sku_key` is stable,
-                      -- so without this a re-ingested SGD storefront serves one payload that
-                      -- CONTRADICTS ITSELF -- product-level SGD from catalog_offers beside every
-                      -- variant stamped USD from here. Before this change both sites wrote the
-                      -- literal "USD" and at least agreed; correcting one and not the other is
-                      -- the "worse than the uniform wrongness it replaced" failure again, for
-                      -- the third time in this branch.
-                      -- Unconditional ON PURPOSE, and the guard lives in Python. A per-row
-                      -- condition CANNOT live here: `bulk_writer.split_upsert_sql` suffixes the
-                      -- VALUES binds per row (currency__0, currency__1 -- written WITHOUT the
-                      -- leading colon, because a bind-shaped token in a comment is
-                      -- indistinguishable from a real bind) while the ON CONFLICT tail is
-                      -- SHARED and unsuffixed, so a per-row CASE WHEN bind
-                      -- breaks multi-row upserts (28 bulk tests -- and note a bind-shaped
-                      -- token in THIS comment breaks them too, which is why none appears
-                      -- here). `_preserve_known_currency`
-                      -- below rewrites the row before it gets here instead.
-                      --
-                      -- WHY A GUARD IS NEEDED AT ALL. `_currency_of`
-                      -- collapses "we could not learn it" into the positive claim "USD", so an
-                      -- UNCONDITIONAL `EXCLUDED.currency` let ONE flaky /meta.json fetch revert a
-                      -- whole brand's catalogue from SGD to USD on re-ingest -- prices unchanged,
-                      -- no log, and `has_offer_priced_for_region_sql` puts the mispriced product
-                      -- back on the US surface. The locale is fetched once per BRAND and every
-                      -- failure is swallowed, so it is ordinary network flakiness, not a rare
-                      -- case, and it oscillates run to run. Same shape as the COALESCE guards on
-                      -- gtin/content_key/seller_ref above: a NULL re-derivation never blanks a
-                      -- captured value. USD stays right for the INSERT; never for an UPDATE that
-                      -- would replace a currency we once proved.
-                      currency = EXCLUDED.currency,
                       source_domain = EXCLUDED.source_domain,
                       barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,
@@ -190,17 +158,6 @@ _OFFER_UPSERT_SQL = """
                       estimated_best_price = EXCLUDED.estimated_best_price,
                       price_confidence = EXCLUDED.price_confidence,
                       source_domain = EXCLUDED.source_domain,
-                      -- CURRENCY IS UPDATED. `derive_offer_id` is stable, so re-ingesting an
-                      -- already-indexed storefront takes this arm -- and without this line a
-                      -- store whose currency we have only just learned keeps the USD the first
-                      -- ingest guessed. `has_offer_priced_for_region_sql` tests CURRENCY, so a
-                      -- stale USD here keeps a Singapore offer on the US surface: the fix would
-                      -- reach new offer_ids only. `market` is deliberately NOT updated here --
-                      -- it is a different axis (see services/storefront_currency.py) and this
-                      -- lane does not own it.
-                      -- Same guard as the SKU arm: an unknown currency must not overwrite a
-                      -- known one. See the note there.
-                      currency = EXCLUDED.currency,
                       offer_payload = EXCLUDED.offer_payload,
                       updated_at = NOW()
                     """
@@ -223,16 +180,6 @@ _SEED_UPSERT_SQL = """
                   canonical_url = EXCLUDED.canonical_url,
                   image_url = EXCLUDED.image_url,
                   price_amount = EXCLUDED.price_amount,
-                  -- PRICE_CURRENCY IS UPDATED, and this is a DE-INDEXING guard, not tidiness.
-                  -- `derive_seed_id` is stable, so re-ingesting an already-indexed storefront
-                  -- takes this arm and refreshes `seed_data` (whose nested variants now carry the
-                  -- real currency) while this column would keep the USD the first ingest guessed.
-                  -- `external_seed_audit.detect_price_currency_mismatch` compares exactly those
-                  -- two, `price_currency_mismatch` is a BLOCKER anomaly, and a blocked seed makes
-                  -- `_build_external_seed_product` return None -- so every already-indexed
-                  -- non-USD storefront would DROP OFF the agent surface on its next ingest.
-                  -- Same guard as the SKU arm. See the note there.
-                  price_currency = EXCLUDED.price_currency,
                   status = EXCLUDED.status,
                   availability = EXCLUDED.availability,
                   seed_data = EXCLUDED.seed_data,
@@ -547,72 +494,6 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
     return plan
 
 
-async def _preserve_known_currency(
-    database,
-    rows: List[Dict[str, Any]],
-    *,
-    table: str,
-    key_column: str,
-    key_field: str,
-    currency_field: str,
-) -> int:
-    """Stop an UNKNOWN currency overwriting one we already proved.
-
-    `_currency_of` collapses "we could not learn it" into the positive claim "USD" before the row
-    is built, and the ON CONFLICT arms are unconditional -- so one flaky /meta.json fetch reverts a
-    whole brand from SGD to USD on re-ingest, prices unchanged, no log, and
-    `has_offer_priced_for_region_sql` puts the mispriced product back on the US surface. The
-    locale is fetched once per BRAND and every failure is swallowed, so this is ordinary network
-    flakiness, not a rare case.
-
-    THE GUARD CANNOT LIVE IN THE SQL. `bulk_writer.split_upsert_sql` suffixes the VALUES binds per
-    row while the ON CONFLICT tail is SHARED and unsuffixed, so a per-row `CASE WHEN
-    :currency_known` breaks every multi-row upsert. So it happens here: for rows that admit they
-    did not learn a currency, read what the row already has and keep it.
-
-    Rows that DID learn one are untouched -- correcting a stale currency on re-ingest is the whole
-    point of the arms being unconditional. A row with no existing record is untouched too: the USD
-    default is right for an INSERT, and is what every pre-existing row already assumes.
-
-    Best-effort by design: a failed read leaves the row as-is (USD), which is exactly what happened
-    before this function existed. It must never be the reason an ingest fails.
-    """
-    unknown = [r for r in rows if not r.get("currency_known")]
-    if not unknown:
-        return 0
-    keys = [r.get(key_field) for r in unknown if r.get(key_field)]
-    if not keys:
-        return 0
-    try:
-        existing = await database.fetch_all(
-            f"SELECT {key_column}, {currency_field} FROM {table} "
-            f"WHERE {key_column} = ANY(:keys)",
-            {"keys": list(keys)},
-        )
-    except Exception as exc:  # noqa: BLE001 - never fail an ingest on the guard
-        logger.warning(
-            "currency preservation read failed for %s (%d row(s)) — leaving the default: %s",
-            table, len(unknown), exc,
-        )
-        return 0
-    known = {
-        row[key_column]: row[currency_field]
-        for row in (dict(r) for r in existing or [])
-        if row.get(currency_field)
-    }
-    preserved = 0
-    for row in unknown:
-        prior = known.get(row.get(key_field))
-        if prior and prior != row.get(currency_field):
-            logger.info(
-                "keeping the stored %s=%s on %s (this run could not read the storefront's currency)",
-                currency_field, prior, row.get(key_field),
-            )
-            row[currency_field] = prior
-            preserved += 1
-    return preserved
-
-
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -689,12 +570,6 @@ async def apply_ingest_plan(
 
     async with database.transaction():
         # 3. catalog_skus — INSERT one synthetic 'canonical' SKU per PDP.
-        # Ahead of the write: an unknown currency must not replace a proved one. See
-        # `_preserve_known_currency` for why this cannot be a condition in the SQL.
-        counts["currency_preserved_skus"] = await _preserve_known_currency(
-            database, skus, table="catalog_skus", key_column="sku_key",
-            key_field="sku_key", currency_field="currency",
-        )
         for sku in skus:
             try:
                 await database.execute(_SKU_UPSERT_SQL, sku)
@@ -708,10 +583,6 @@ async def apply_ingest_plan(
             counts["offers_skipped"] = sum(skip_reasons.values())
 
         # 4. catalog_offers — INSERT one row per validated retailer offer.
-        counts["currency_preserved_offers"] = await _preserve_known_currency(
-            database, accepted_offers, table="catalog_offers", key_column="offer_id",
-            key_field="offer_id", currency_field="currency",
-        )
         for offer in accepted_offers:
             try:
                 await database.execute(_OFFER_UPSERT_SQL, offer)
@@ -721,10 +592,6 @@ async def apply_ingest_plan(
                 logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
 
     # 5. external_product_seeds — audit + legacy compatibility.
-    counts["currency_preserved_seeds"] = await _preserve_known_currency(
-        database, seeds, table="external_product_seeds", key_column="id",
-        key_field="id", currency_field="price_currency",
-    )
     for seed in seeds:
         try:
             # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY

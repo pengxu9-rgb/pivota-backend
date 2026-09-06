@@ -1127,242 +1127,36 @@ def test_every_offer_row_the_builder_makes_supplies_every_bind():
         assert not missing, f"offer row is missing binds the SQL requires: {missing}"
 
 
-def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
-    """`derive_offer_id` is stable, so re-ingesting an already-indexed store takes the ON CONFLICT
-    arm. Without `currency = EXCLUDED.currency` there, a store whose real currency we have only
-    just learned keeps the USD the first ingest guessed -- and since
-    `has_offer_priced_for_region_sql` tests CURRENCY, that stale row stays on the US surface. The
-    fix would then reach brand-new offer_ids only, which is the half-migration this change exists
-    to end."""
-    from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL
+def test_every_row_this_lane_builds_binds_against_the_real_upsert_SQL():
+    """THE INVARIANT THAT WOULD HAVE CAUGHT A SILENT TOTAL WRITE OUTAGE.
 
-    import re as _re
+    An earlier version of this branch added a `currency_known` key to every row so a SQL guard
+    could read it. Production `databases.Database.execute` does `text(sql).bindparams(**values)`,
+    which RAISES on a key the statement does not define -- and every write sits inside
+    `except Exception: logger.exception(...)`. So the plan reported 4 skus / 4 offers / 1 seed and
+    the counts came back 0 / 0 / 0: pdps and merchants landed, every child row was silently
+    dropped, on the default ingest path.
 
-    # COMMENTS STRIPPED FIRST. The arm explains in prose why `market` is excluded, so a naive
-    # substring check matches the comment and asserts nothing about the statement -- it failed
-    # for exactly that reason before this line existed.
-    arm = _OFFER_UPSERT_SQL.split("DO UPDATE SET", 1)[1]
-    update_arm = "\n".join(
-        _re.sub(r"--.*$", "", line) for line in arm.splitlines()
-    )
-
-    assert "currency = EXCLUDED.currency" in update_arm
-    # market is a DIFFERENT AXIS and this lane does not own it -- see services/storefront_currency.py
-    assert "market" not in update_arm
-
-    # The SEED upsert too. Missing `price_currency` there is not cosmetic: it de-indexes every
-    # already-indexed non-USD storefront on its next ingest (see the test below).
-    from services.catalog_enrichment_agent.apply import _SEED_UPSERT_SQL
-
-    seed_arm = "\n".join(
-        _re.sub(r"--.*$", "", line)
-        for line in _SEED_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
-    )
-    assert "price_currency = EXCLUDED.price_currency" in seed_arm
-    assert "market" not in seed_arm
-
-    # THE THIRD ARM, because the first version of this test checked two of three and stopped.
-    # `catalog_skus.currency` is SELECTed by `agent_pdp_view_assembler` and served as
-    # `variants[].currency`, so a stale one makes the payload contradict itself: product-level
-    # SGD from catalog_offers beside variants stamped USD from here.
-    from services.catalog_enrichment_agent.apply import _SKU_UPSERT_SQL
-
-    sku_arm = "\n".join(
-        _re.sub(r"--.*$", "", line)
-        for line in _SKU_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
-    )
-    assert "currency = EXCLUDED.currency" in sku_arm
-
-    # DERIVED, not hand-listed. The previous version iterated a 3-tuple I wrote out myself --
-    # which restates the very enumeration risk it claims to close, and is how "two arms" was
-    # declared complete when there were three. This walks apply.py for every upsert that BINDS a
-    # currency and requires each to guard it, so a fourth one added later is covered by
-    # construction rather than by my remembering.
-    import services.catalog_enrichment_agent.apply as _apply
-
-    checked = []
-    for attr in dir(_apply):
-        if not attr.endswith("_UPSERT_SQL"):
-            continue
-        sql = getattr(_apply, attr)
-        if not isinstance(sql, str) or "DO UPDATE SET" not in sql:
-            continue
-        binds = set(_re.findall(r":(\w+)", sql.split("DO UPDATE SET", 1)[0]))
-        if not ({"currency", "price_currency"} & binds):
-            continue          # this upsert does not carry a currency at all
-        arm = "\n".join(
-            _re.sub(r"--.*$", "", line)
-            for line in sql.split("DO UPDATE SET", 1)[1].splitlines()
-        )
-        checked.append(attr)
-        assert _re.search(r"(price_)?currency = EXCLUDED", arm), (
-            f"{attr} cannot correct a stale currency on re-ingest"
-        )
-        # AND the tail must stay free of binds. A per-row condition cannot live here:
-        # `split_upsert_sql` suffixes the VALUES binds per row while this tail is SHARED, so a
-        # bind here breaks every multi-row upsert -- including one written only inside a COMMENT,
-        # which is indistinguishable from a real one and is exactly how this was discovered.
-        from services.catalog_enrichment_agent.bulk_writer import split_upsert_sql
-
-        _, _, tail = split_upsert_sql(sql)
-        assert _re.findall(r":(\w+)", tail) == [], (
-            f"{attr}'s conflict tail carries a bind; multi-row upserts will break"
-        )
-    assert set(checked) == {"_SKU_UPSERT_SQL", "_OFFER_UPSERT_SQL", "_SEED_UPSERT_SQL"}, checked
-
-
-def test_an_unknown_currency_never_overwrites_one_we_already_proved():
-    """The re-ingest hazard, which the unconditional arm created.
-
-    `records_for_brand` fetches /meta.json ONCE PER BRAND and `_gated_fetch` swallows every
-    failure, so a single timeout makes the whole catalogue's records currency-less --
-    and `_currency_of` turns that honest "unknown" into the positive claim "USD" before the row
-    reaches the upsert. With an unconditional `currency = EXCLUDED.currency` that reverted every
-    row of an SGD storefront to USD while the prices stayed SGD, with no log and no anomaly, and
-    `has_offer_priced_for_region_sql` put the mispriced product straight back on the US surface.
-
-    The flag is what the SQL guard keys on, so it is asserted on EVERY row type the lane writes a
-    currency into -- offers, canonical SKU, variant SKUs and seeds -- not just the one.
+    The whole suite stayed green through it, because every test drives a double that never binds.
+    This asserts the one property those doubles cannot: a row this lane builds must carry no key
+    the statement it is executed against does not define.
     """
-    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
-
-    learned = ingest_validated_record(_sgd_record())
-    unknown = ingest_validated_record(_sgd_record(currency=None))
-
-    assert learned["offers"][0]["currency_known"] is True
-    assert learned["sku"]["currency_known"] is True
-    assert {v["currency_known"] for v in learned["variant_skus"]} == {True}
-    assert {s["currency_known"] for s in learned["seeds"]} == {True}
-
-    # The unknown run still INSERTS as USD -- a row must carry something, and that is what every
-    # pre-existing row already assumes -- but it must announce that it did not know.
-    assert unknown["offers"][0]["currency"] == "USD"
-    assert unknown["offers"][0]["currency_known"] is False
-    assert unknown["sku"]["currency_known"] is False
-    assert {v["currency_known"] for v in unknown["variant_skus"]} == {False}
-    assert {s["currency_known"] for s in unknown["seeds"]} == {False}
-
-    # And the ids are stable across the two runs, which is WHY the guard is needed: the flaky run
-    # lands on the ON CONFLICT arm of the good run's rows.
-    assert learned["offers"][0]["offer_id"] == unknown["offers"][0]["offer_id"]
-    assert learned["sku"]["sku_key"] == unknown["sku"]["sku_key"]
-    assert learned["seeds"][0]["id"] == unknown["seeds"][0]["id"]
-
-
-@pytest.mark.asyncio
-async def test_an_unknown_currency_does_not_overwrite_the_stored_one():
-    """The GUARD's behaviour, not just the flag it keys on.
-
-    The previous version of this test asserted `currency_known` on the row dicts and stopped --
-    which pins the input to the guard and nothing the guard does. Drive
-    `_preserve_known_currency` against a database double instead: a row that admits it did not
-    learn a currency must come out carrying what the table already holds.
-    """
-    from services.catalog_enrichment_agent.apply import _preserve_known_currency
-
-    class _DB:
-        def __init__(self, stored):
-            self.stored = stored
-            self.queries = 0
-
-        async def fetch_all(self, sql, params):
-            self.queries += 1
-            return [{"offer_id": k, "currency": v} for k, v in self.stored.items()
-                    if k in set(params["keys"])]
-
-    db = _DB({"offer:a": "SGD"})
-
-    rows = [
-        {"offer_id": "offer:a", "currency": "USD", "currency_known": False},   # fetch failed
-        {"offer_id": "offer:b", "currency": "USD", "currency_known": False},   # never seen before
-        {"offer_id": "offer:c", "currency": "USD", "currency_known": True},    # genuinely USD
-    ]
-    preserved = await _preserve_known_currency(
-        db, rows, table="catalog_offers", key_column="offer_id",
-        key_field="offer_id", currency_field="currency",
-    )
-
-    assert preserved == 1
-    assert rows[0]["currency"] == "SGD", "a proved currency must survive a flaky run"
-    assert rows[1]["currency"] == "USD", "no stored row: the USD insert default is right"
-    assert rows[2]["currency"] == "USD", "a KNOWN currency must still be written through"
-
-
-@pytest.mark.asyncio
-async def test_the_currency_guard_never_fails_an_ingest():
-    """Best-effort by construction. A read that raises must leave the rows exactly as they were --
-    which is what happened before the guard existed -- rather than taking down the whole ingest."""
-    from services.catalog_enrichment_agent.apply import _preserve_known_currency
-
-    class _Broken:
-        async def fetch_all(self, sql, params):
-            raise RuntimeError("connection reset")
-
-    rows = [{"offer_id": "offer:a", "currency": "USD", "currency_known": False}]
-
-    preserved = await _preserve_known_currency(
-        _Broken(), rows, table="catalog_offers", key_column="offer_id",
-        key_field="offer_id", currency_field="currency",
-    )
-
-    assert preserved == 0
-    assert rows[0]["currency"] == "USD"
-
-
-@pytest.mark.asyncio
-async def test_the_guard_does_not_read_when_every_row_knows_its_currency():
-    """The common path must cost nothing. Every successful ingest has `currency_known` on every
-    row, and issuing a SELECT per batch for them would be pure overhead on the hot path."""
-    from services.catalog_enrichment_agent.apply import _preserve_known_currency
-
-    class _DB:
-        def __init__(self):
-            self.queries = 0
-
-        async def fetch_all(self, sql, params):
-            self.queries += 1
-            return []
-
-    db = _DB()
-    rows = [{"offer_id": "offer:a", "currency": "SGD", "currency_known": True}]
-
-    assert await _preserve_known_currency(
-        db, rows, table="catalog_offers", key_column="offer_id",
-        key_field="offer_id", currency_field="currency",
-    ) == 0
-    assert db.queries == 0, "no read should happen when nothing is unknown"
-
-
-def test_apply_ingest_plan_runs_the_currency_guard_for_every_table_it_writes():
-    """THE SEAM. The guard can be perfect and simply never called -- deleting its call before the
-    SKU write left the whole suite green, the same shape as the eighth currency site and the
-    locale-threading that survived two earlier rounds.
-
-    SOURCE-LEVEL, deliberately, following the precedent at
-    tests/test_w2_retailer_seller_model.py:280. Driving `apply_ingest_plan` against a double
-    reaches the real database on paths this assertion does not care about, and the fake needed to
-    get past them would be large enough to invent behaviour of its own -- which is its own failure
-    mode. What matters here is only that each write is preceded by a guard for ITS table.
-
-    The set is derived from the source, so a fourth currency-bearing table added later fails here
-    rather than being silently unguarded.
-    """
-    import inspect
-    import re as _re
+    from sqlalchemy import text
 
     import services.catalog_enrichment_agent.apply as apply_mod
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
 
-    src = inspect.getsource(apply_mod.apply_ingest_plan)
-    guarded = set(_re.findall(r'_preserve_known_currency\(\s*\n?\s*database,[^)]*?table="(\w+)"', src, _re.S))
+    out = ingest_validated_record(_sgd_record())
 
-    assert guarded == {"catalog_skus", "catalog_offers", "external_product_seeds"}, guarded
-
-    # and each guard must come BEFORE the write it protects, not after it
-    for table, write_marker in (
-        ("catalog_skus", "_SKU_UPSERT_SQL"),
-        ("catalog_offers", "_OFFER_UPSERT_SQL"),
-        ("external_product_seeds", "_SEED_UPSERT_SQL"),
+    for label, sql, rows in (
+        ("sku", apply_mod._SKU_UPSERT_SQL, [out["sku"]]),
+        ("variant_skus", apply_mod._SKU_UPSERT_SQL, out["variant_skus"]),
+        ("offers", apply_mod._OFFER_UPSERT_SQL, out["offers"]),
+        ("seeds", apply_mod._SEED_UPSERT_SQL, out["seeds"]),
     ):
-        guard_at = src.index(f'table="{table}"')
-        write_at = src.index(write_marker)
-        assert guard_at < write_at, f"the {table} guard runs after its write"
+        for row in rows:
+            params = {k: v for k, v in row.items() if k != "_ensure_only"}
+            try:
+                text(sql).bindparams(**params)
+            except Exception as exc:  # noqa: BLE001 - the failure IS the assertion
+                raise AssertionError(f"{label} row will not bind: {exc}") from exc
