@@ -3061,19 +3061,32 @@ async def _process_shopify_webhook_event(
                 from db.database import database
 
                 canon_domain = _canonicalize_shop_domain(shop_domain)
-                if canon_domain:
-                    await database.execute(
-                        """
-                        UPDATE merchant_stores
-                        SET status = 'disconnected',
-                            api_key = NULL,
-                            last_sync = NOW()
-                        WHERE merchant_id = :merchant_id
-                          AND platform = 'shopify'
-                          AND lower(domain) = :domain
-                        """,
-                        {"merchant_id": merchant_id, "domain": canon_domain},
+                if not canon_domain:
+                    # Refuse to act on an uninstall whose shop we cannot name. The store UPDATE
+                    # is domain-scoped, but the merchant_onboarding one is keyed on merchant_id
+                    # ALONE -- so an uninstall we could not attribute still cleared that
+                    # merchant's MCP token and delisted them from public recall. Reachable only
+                    # by an allowlisted shop now that the allowlist no longer short-circuits on
+                    # a falsy canonical host, but a destructive branch must not depend on a
+                    # caller's guard for its safety.
+                    logger.warning(
+                        "Shopify app/uninstalled ignored: shop domain not canonicalisable merchant=%s",
+                        merchant_id,
                     )
+                    return {"status": "ignored", "topic": topic, "reason": "unidentifiable_shop"}
+
+                await database.execute(
+                    """
+                    UPDATE merchant_stores
+                    SET status = 'disconnected',
+                        api_key = NULL,
+                        last_sync = NOW()
+                    WHERE merchant_id = :merchant_id
+                      AND platform = 'shopify'
+                      AND lower(domain) = :domain
+                    """,
+                    {"merchant_id": merchant_id, "domain": canon_domain},
+                )
                 await database.execute(
                     """
                     UPDATE merchant_onboarding
@@ -3087,7 +3100,7 @@ async def _process_shopify_webhook_event(
                     event_type="shopify_app_uninstalled",
                     order_id=f"shopify_app_uninstalled_{merchant_id}",
                     merchant_id=merchant_id,
-                    metadata={"shop_domain": canon_domain or shop_domain},
+                    metadata={"shop_domain": canon_domain},
                 )
                 # Public recall gates on catalog_merchants.status, which nothing
                 # used to write — so an uninstalled merchant kept serving on
@@ -3779,7 +3792,18 @@ async def handle_shopify_webhook(
                     got_canon,
                 )
                 raise HTTPException(status_code=400, detail="No Shopify store connected")
-            if got_canon and got_canon not in allowed_domains:
+            # `not got_canon or ...`, NOT `got_canon and ...`.
+            #
+            # The 401 above tests the RAW header; this tests the CANONICALISED one, and several
+            # non-empty headers canonicalise to None -- "/", "://", "?", "#", " ", "\t",
+            # "//victim.myshopify.com". Each of those cleared the 401 and then SKIPPED this check
+            # entirely, because a falsy got_canon short-circuits the `and`. This allowlist is the
+            # only binding between the merchant_id in the URL path and the shop the payload came
+            # from (the HMAC covers the body alone), so skipping it let any app-secret-signed body
+            # be replayed into any merchant's path -- including app/uninstalled, which clears that
+            # merchant's stored token and delists them. A header we cannot canonicalise is not a
+            # header that matches; it is one we cannot check, and it must be refused.
+            if not got_canon or got_canon not in allowed_domains:
                 record_shopify_webhook(result="error", reason="shop_domain_mismatch", topic=topic)
                 logger.error(
                     "Shopify webhook shop_domain mismatch merchant=%s allowed=%s got=%s topic=%s",

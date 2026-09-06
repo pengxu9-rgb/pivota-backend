@@ -246,3 +246,67 @@ def test_allowlist_still_matches_a_non_canonical_store():
     for host in ("shop.brand-example.com", "checkout.example.co.uk", "legacy-store.example"):
         assert wr._canonicalize_shop_domain(host) == host
         assert wr._canonicalize_shop_domain(f"https://{host}/") == host
+
+
+# --------------------------------------------------------------------------------------
+# 4. The allowlist short-circuit, found by review of this PR.
+#
+# The 401 above the check tests the RAW header; the 403 tests the CANONICALISED one, and it was
+# spelled `if got_canon and got_canon not in allowed_domains`. Several NON-EMPTY headers canonicalise
+# to None, so they cleared the 401 and then skipped the 403 entirely. That allowlist is the only
+# binding between the merchant_id in the URL path and the shop a payload came from -- the HMAC
+# covers the body alone -- so an app-secret-signed body could be replayed into any merchant's path.
+#
+# Pre-existing, not introduced here. Pinned in this PR because this PR is what certifies these
+# comparison sites as correct, and a test that blesses a site is how its defect survives the next
+# audit.
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "header",
+    ["/", "://", "https:///", "//victim.myshopify.com", "?", "#", " ", "\t", "https://#@evil.example"],
+)
+def test_a_header_that_canonicalises_to_nothing_is_refused_not_skipped(header):
+    """These are all NON-EMPTY, so the missing-header 401 does not cover them, and they all
+    canonicalise to None. The mismatch check must treat 'cannot canonicalise' as 'does not match'."""
+    assert wr._canonicalize_shop_domain(header) is None
+    assert header, "an empty header would be caught by the 401 instead; that is a different case"
+
+    # The predicate as it is now written, applied to the same inputs the route applies it to.
+    allowed = {"victim.myshopify.com"}
+    got_canon = wr._canonicalize_shop_domain(header)
+    refused = (not got_canon) or (got_canon not in allowed)
+    assert refused, "a header we cannot canonicalise reached the handler as if it matched"
+
+
+def test_a_matching_header_is_still_admitted():
+    """Positive counterpart: the fix must not refuse the shop that legitimately matches."""
+    allowed = {"victim.myshopify.com"}
+    got_canon = wr._canonicalize_shop_domain("VICTIM.myshopify.com")
+    refused = (not got_canon) or (got_canon not in allowed)
+    assert not refused
+
+
+def test_the_route_source_does_not_short_circuit_on_a_falsy_canonical_host():
+    """Pins the SPELLING, because the bug is a spelling: `got_canon and ...` skips the check for a
+    falsy value, `not got_canon or ...` refuses it. The behavioural test above cannot see which
+    form the route uses, and driving the full webhook path needs a valid HMAC over a signed body."""
+    import inspect
+
+    src = inspect.getsource(wr.handle_shopify_webhook)
+    assert "if not got_canon or got_canon not in allowed_domains:" in src
+    assert "if got_canon and got_canon not in allowed_domains:" not in src
+
+
+def test_an_uninstall_we_cannot_attribute_does_not_wipe_credentials():
+    """The store UPDATE is domain-scoped; the merchant_onboarding one is keyed on merchant_id alone.
+    An uninstall whose shop cannot be named must touch neither."""
+    import inspect
+
+    src = inspect.getsource(wr._process_shopify_webhook_event)
+    guard = src.index("if not canon_domain:")
+    onboarding = src.index("UPDATE merchant_onboarding")
+    early_return = src.index('"reason": "unidentifiable_shop"')
+    assert guard < early_return < onboarding, (
+        "the merchant_onboarding wipe must sit behind the unidentifiable-shop return"
+    )
