@@ -1303,10 +1303,18 @@ async def start_agent_webhook_retry_worker() -> None:
 
 # How long a shutdown may wait for the retry worker to finish its current iteration.
 #
-# SMALL, AND IT HAS TO BE BOUNDED AT ALL. `stop_event` is only checked at the TOP of
-# `_retry_worker_loop`, so setting it does not interrupt an iteration in progress — and an
-# iteration is `process_due_retries(limit=20)`, up to twenty sequential deliveries each with a
-# 10.0s HTTP timeout. A bare `await` on that task is therefore an await of up to ~200s.
+# SMALL, AND IT IS NOW THE FALLBACK RATHER THAN THE ONLY BOUND — but it must stay.
+#
+# `process_due_retries` checks the stop event BETWEEN deliveries, so the ordinary case is that
+# the loop notices and returns on its own well inside this window; the wait below then just
+# collects it. What this still covers is the stop that arrives DURING a delivery: `retry_delivery`
+# ends in an HTTP call with a 10.0s timeout and nothing interrupts it, so without this bound one
+# in-flight request is one full 10s — the entire Cloud Run grace — before the pool is closed.
+#
+# (Until the between-deliveries check existed, the event was only read at the TOP of
+# `_retry_worker_loop`, so this bound was covering a whole batch: up to twenty sequential
+# deliveries, ~200s. That is the shape this comment used to describe, and it is fixed — do not
+# read the improvement as a reason to drop the bound.)
 #
 # That used to be masked by accident: `database.disconnect()` ran BEFORE this, so the next
 # `database.*` call in the loop raised "DatabaseBackend is not running" and the remaining rows

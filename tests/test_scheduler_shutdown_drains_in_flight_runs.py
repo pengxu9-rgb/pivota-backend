@@ -199,10 +199,12 @@ async def test_the_disconnect_still_happens_if_the_drain_is_cancelled(monkeypatc
 async def test_stopping_a_retry_worker_is_bounded(module, stopper):
     """NOTHING BOUNDED SHUTDOWN'S WALL CLOCK, which is how this got in.
 
-    `stop_event` is only checked at the TOP of `_retry_worker_loop`, so setting it does not
-    interrupt an iteration — and an iteration is `process_due_retries(limit=20)`, up to twenty
-    sequential deliveries each with a 10s HTTP timeout. A bare `await` on that task is an await
-    of up to ~200s.
+    `retry_delivery` ends in an HTTP call with a 10s timeout and nothing interrupts it, so a
+    bare `await` on the worker task is unbounded by anything the worker itself does. (When this
+    was written the event was only read at the TOP of `_retry_worker_loop`, so the exposure was
+    a whole batch — twenty sequential deliveries, ~200s. `process_due_retries` now checks it
+    between deliveries, which makes the clean exit the common case and leaves this bound
+    covering the stop that lands mid-delivery.)
 
     It was masked by accident: `database.disconnect()` ran BEFORE it, so the loop's next DB call
     raised and the remaining rows failed instantly. Reordering the lifespan so the scheduler

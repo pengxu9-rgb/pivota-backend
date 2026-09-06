@@ -25,8 +25,19 @@ import pytest
 MODULES = ["services.agent_webhook_service", "services.merchant_webhook_service"]
 
 
-def _rows(n):
-    return [{"agent_id": f"a{i}", "merchant_id": f"m{i}", "delivery_id": f"d{i}"} for i in range(n)]
+def _rows(mod, n):
+    """Stub rows carrying ONLY the id column this module's query really returns.
+
+    Handing every row both `agent_id` and `merchant_id` defeats the entire point of running
+    these cases against both services: a mutation audit changed the merchant copy to read
+    `row["agent_id"]` and all eight tests stayed green. In production `fetch_all` on
+    `merchant_webhook_deliveries` returns no `agent_id`, so that KeyError lands in the
+    `except Exception` and every merchant retry fails forever, logged as "Failed to process
+    merchant webhook retry" — with no test signal. Two independent copies of one function is
+    exactly the structure that invites that, and the parametrisation exists to catch it.
+    """
+    key = "agent_id" if "agent" in mod.__name__ else "merchant_id"
+    return [{key: f"x{i}", "delivery_id": f"d{i}"} for i in range(n)]
 
 
 @pytest.fixture(params=MODULES)
@@ -46,7 +57,7 @@ def svc(request, monkeypatch):
 
 def _arm(mod, monkeypatch, n, delivered):
     async def fetch_all(*a, **k):
-        return _rows(n)
+        return _rows(mod, n)
 
     async def retry_delivery(*a, **k):
         delivered.append(a)
@@ -84,6 +95,15 @@ async def test_it_stops_partway_and_reports_what_it_did(svc, monkeypatch):
     processed = await svc.process_due_retries(limit=20, should_stop=should_stop)
     assert processed == 3, f"expected 3 deliveries before the stop, got {processed}"
     assert len(delivered) == 3
+    # IT MUST LEAVE THE LOOP, not merely skip the rest. `break` -> `continue` delivers the
+    # same rows in the same time and is invisible to the assertions above — but it re-runs
+    # the check, and the INFO line, once per REMAINING row: up to twenty log lines per
+    # shutdown on a worker that restarts 15-34 times a day, which is the exact noise the
+    # code comment claims to avoid. Four calls = three False then one True.
+    assert calls["n"] == 4, (
+        f"the stop predicate ran {calls['n']} times for 3 deliveries; it should stop asking "
+        "once it has been told to stop"
+    )
 
 
 @pytest.mark.asyncio
@@ -105,7 +125,7 @@ async def test_the_worker_loop_actually_passes_its_stop_event(svc, monkeypatch):
     started = asyncio.Event()
 
     async def fetch_all(*a, **k):
-        return _rows(20)
+        return _rows(svc, 20)
 
     async def retry_delivery(*a, **k):
         delivered.append(a)
@@ -118,7 +138,20 @@ async def test_the_worker_loop_actually_passes_its_stop_event(svc, monkeypatch):
 
     stop = asyncio.Event()
     task = asyncio.get_running_loop().create_task(svc._retry_worker_loop(stop))
-    await asyncio.wait_for(started.wait(), timeout=5)
+    try:
+        # THE LIVENESS GATE, and the reason this test is not vacuous: if the loop never calls
+        # process_due_retries — because `database.is_connected` is false, say — nothing
+        # delivers, nothing sets this, and the test must fail HERE rather than later observing
+        # "the loop exited and delivered fewer than 20 rows", which would be true for a loop
+        # that did nothing at all. It used to fail as a bare TimeoutError with no explanation.
+        await asyncio.wait_for(started.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        task.cancel()
+        pytest.fail(
+            "the loop never reached a delivery, so this case proves nothing about the stop "
+            "check. Something upstream (the is_connected guard, the fetch stub) stopped it "
+            "before process_due_retries ran."
+        )
     stop.set()
     try:
         await asyncio.wait_for(task, timeout=5)
