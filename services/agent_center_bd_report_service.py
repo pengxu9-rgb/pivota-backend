@@ -5308,6 +5308,9 @@ def _query_class_coverage(probe_runs: Any) -> Dict[str, int]:
 # PIVOTA-Agent/docs/ai_readiness_query_axes_build_plan.md).
 
 
+_DESTINATION_CLAIM_CAP = 10
+
+
 def _destination_claims(probe_runs: Any, brand: Optional[str]) -> List[Dict[str, Any]]:
     """P0 item 8 (§14) — official-store claims made in the ANSWER PROSE.
 
@@ -5327,6 +5330,7 @@ def _destination_claims(probe_runs: Any, brand: Optional[str]) -> List[Dict[str,
     Each claim keeps the sentence, the query that produced it and the provider,
     so the merchant-facing evidence can be checked against the run.
     """
+    from services.audit_invariants import _MACHINE_TEXT_MARKERS
     from services.destination_claim import extract_destination_claims
 
     out: List[Dict[str, Any]] = []
@@ -5334,7 +5338,23 @@ def _destination_claims(probe_runs: Any, brand: Optional[str]) -> List[Dict[str,
     for run in _flatten_probe_runs(probe_runs):
         if not isinstance(run, dict):
             continue
-        text = _run_text(run)
+        # NEWLINE-JOINED, not space-joined. `_run_text` exists for `in`
+        # containment tests, where a spurious sentence boundary is harmless.
+        # Grammatical parsing is a different job: joined with a space, a `raw`
+        # ending mid-sentence and an excerpt beginning mid-sentence compose a
+        # sentence present in NEITHER source — "…official website is" +
+        # "sephora.com carries…" fabricates a claim. `_sentences` treats \n as
+        # a hard break, so this cannot happen.
+        parsed = run.get("parsed") if isinstance(run.get("parsed"), dict) else {}
+        text = "\n".join(
+            str(x) for x in (
+                run.get("raw"),
+                run.get("evidence_excerpt"),
+                parsed.get("evidence_excerpt"),
+                parsed.get("evidence_text"),
+                parsed.get("answer"),
+            ) if x
+        )
         if not text:
             continue
         meta = run.get("axis_metadata") if isinstance(run.get("axis_metadata"), dict) else {}
@@ -5343,13 +5363,28 @@ def _destination_claims(probe_runs: Any, brand: Optional[str]) -> List[Dict[str,
             if key in seen:
                 continue
             seen.add(key)
+            excerpt = str(claim.get("excerpt") or "")
+            # THE EXCERPT IS MERCHANT-RENDERABLE COPY and leaves the building on
+            # the unauthenticated share link (per_sku_reports is allowlisted
+            # wholesale there). `run["raw"]` is the fenced JSON envelope
+            # whenever a parse failed — a documented production shape — so an
+            # unsanitised excerpt puts a raw LLM envelope in front of a
+            # merchant and trips audit_invariants' own
+            # RAW_LLM_ENVELOPE_IN_COPY. Drop the claim rather than ship it:
+            # a claim we cannot quote cleanly is one we cannot ask anyone to
+            # check.
+            low = excerpt.lower()
+            if any(marker.lower() in low for marker, _ in _MACHINE_TEXT_MARKERS):
+                continue
             out.append({
                 **claim,
                 "query": str(run.get("query") or "")[:300],
                 "axis": str(meta.get("axis") or "") or None,
                 "provider": run.get("_provider"),
             })
-    return out
+    # Capped like every sibling builder in this file. The per-SKU list was
+    # unbounded, and "a few hundred bytes" rests on an N nothing bounded.
+    return out[:_DESTINATION_CLAIM_CAP]
 
 
 def _citation_by_intent(per_prompt: Any) -> Dict[str, Dict[str, Any]]:

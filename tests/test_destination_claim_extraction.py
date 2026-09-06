@@ -447,18 +447,18 @@ def test_the_builder_survives_junk_runs():
         assert _destination_claims(junk, "Judydoll") == []
 
 
-def test_the_per_sku_report_actually_carries_the_claims():
-    """The delivery path, pinned.
+def test_the_per_sku_report_passes_the_REAL_probe_runs():
+    """The delivery path, pinned on the ARGUMENT and not just the callee.
 
-    Every test above either calls `_destination_claims` directly or hands the
-    findings layer a hand-built report. None of them notices if
-    `build_per_sku_report` stops ATTACHING the claims — a mutant replacing the
-    value with `[]` passed the whole file. That is the same "which branch
-    actually runs" gap that has bitten this workstream repeatedly.
+    The first version of this test walked the AST for a `destination_claims`
+    key whose value was a `_destination_claims(...)` call, and checked the
+    function NAME only. Changing the first argument to `None` — every SKU ships
+    an empty claim list, feature dead — passed all 41 tests. Swapping
+    `probe_runs` for `raw_probe_runs` (which would reintroduce internal
+    competitor probes) passed too.
 
-    Asserted by reading the returned dict literal, because the real function is
-    async and DB-backed: the key must be present AND its value must come from
-    `_destination_claims`, not a constant.
+    So this asserts what is actually passed: the merchant-visible
+    `probe_runs`, and the brand.
     """
     import ast
     import inspect
@@ -466,20 +466,196 @@ def test_the_per_sku_report_actually_carries_the_claims():
     from services import agent_center_bd_report_service as svc
 
     tree = ast.parse(inspect.getsource(svc.build_per_sku_report))
-    found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values):
-            if isinstance(key, ast.Constant) and key.value == "destination_claims":
-                found.append(value)
-
-    assert found, "build_per_sku_report no longer returns destination_claims"
     calls = [
-        v for v in found
-        if isinstance(v, ast.Call) and getattr(v.func, "id", "") == "_destination_claims"
+        v for node in ast.walk(tree) if isinstance(node, ast.Dict)
+        for k, v in zip(node.keys, node.values)
+        if isinstance(k, ast.Constant) and k.value == "destination_claims"
+        and isinstance(v, ast.Call)
+        and getattr(v.func, "id", "") == "_destination_claims"
     ]
-    assert calls, (
-        "destination_claims is present but is not built by _destination_claims "
-        "— a constant here silently ships an empty claim list"
+    assert calls, "build_per_sku_report no longer calls _destination_claims"
+
+    first = calls[0].args[0] if calls[0].args else None
+    assert isinstance(first, ast.Name), (
+        "the probe runs argument is not a plain name — a constant or None here "
+        "ships an empty claim list for every SKU"
     )
+    assert first.id == "probe_runs", (
+        f"claims are extracted from {first.id!r}. It must be `probe_runs` — the "
+        f"MERCHANT-VISIBLE set. `raw_probe_runs` includes internal competitor "
+        f"comparison probes, whose answers would be attributed to this merchant."
+    )
+
+
+def test_the_builder_uses_the_merchant_visible_runs_not_the_raw_ones():
+    """The competitor-leak guard, exercised rather than asserted about.
+
+    An internal comparison probe's answer can name a COMPETITOR's official
+    site. If the builder read the raw set, that becomes a high-severity finding
+    telling this merchant AI named someone else's domain as their store.
+    """
+    from services.agent_center_bd_report_service import _destination_claims
+
+    competitor_probe = [{
+        "provider": "gemini",
+        "raw_runs": [{
+            "query": "compare Judydoll with Joocyee",
+            "raw": "Joocyee's official website is joocyeebeauty.com.",
+        }],
+    }]
+
+    # Extracted with THIS merchant's brand, the competitor's claim must not bind.
+    assert _destination_claims(competitor_probe, "Judydoll") == []
+
+
+# =====================================================================
+# Third review, 2026-09-06. Three P0s, all reproduced before fixing.
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "merchant_domain",
+    ["anua.com", "https://anua.com", "https://anua.com/", "www.anua.com",
+     "HTTPS://WWW.ANUA.COM/collections/all"],
+)
+def test_the_merchants_own_domain_is_never_reported_whatever_shape_it_is_in(
+    merchant_domain,
+):
+    """P0: `merchant_domain` is the raw onboarding `store_url`, and that column
+    holds BOTH shapes — the onboarding route writes it unnormalized and
+    branches on whether it starts with http.
+
+    Unnormalized, it never string-matched a normalized claimed host, so a
+    CORRECT claim naming the merchant's own apex was reported to them as a
+    foreign store. A bare `www.` prefix was enough. Every test before this one
+    hardcoded the single already-normalized shape that happened to work.
+    """
+    from services.audit_evidence_builder import extract_findings
+
+    claims = extract_destination_claims(
+        "Anua's official website is anua.com.", brand="Anua",
+    )
+    report = {
+        "merchant_domain": merchant_domain,
+        "brand_rollup": {
+            "dimensions": {},
+            "run_facts": {"identity": {"brand": "Anua"}},
+        },
+        "per_sku_reports": [{"content_key": "c", "destination_claims": claims}],
+    }
+
+    assert not [
+        f for f in extract_findings(report)
+        if f["finding_type"] == "ai_named_an_unverified_official_store"
+    ], f"the merchant's own domain was reported as foreign for {merchant_domain!r}"
+
+
+def test_a_raw_llm_envelope_never_becomes_merchant_copy():
+    """P0: the excerpt is merchant-renderable AND leaves the building on the
+    unauthenticated share link (per_sku_reports is allowlisted wholesale
+    there). `run["raw"]` IS the fenced JSON envelope whenever a parse failed —
+    a documented production shape — so an unsanitised excerpt puts a raw LLM
+    envelope in front of a merchant and trips this repo's own
+    RAW_LLM_ENVELOPE_IN_COPY invariant.
+    """
+    from services.agent_center_bd_report_service import _destination_claims
+    from services.audit_invariants import _MACHINE_TEXT_MARKERS
+
+    probe_runs = [{
+        "provider": "gemini",
+        "raw_runs": [{
+            "query": "official website",
+            "raw": (
+                '{"product_visible": true, "evidence_excerpt": "The official '
+                'website for Judydoll is judydoll.shop.", '
+                '"grounding_sources": []}'
+            ),
+        }],
+    }]
+
+    for claim in _destination_claims(probe_runs, "Judydoll"):
+        excerpt = str(claim.get("excerpt") or "").lower()
+        for marker, code in _MACHINE_TEXT_MARKERS:
+            assert marker.lower() not in excerpt, (
+                f"{code}: machine text {marker!r} reached a merchant-facing "
+                f"excerpt: {excerpt[:120]!r}"
+            )
+
+
+def test_an_unbound_hit_does_not_shadow_the_bound_claim():
+    """P0: dedupe keyed on host ALONE let an unbound pattern-3 match earlier in
+    the answer consume the host, dropping the brand-bound claim behind it —
+    the only kind that becomes evidence. An answer that leads with an
+    "Official site: x" header and restates it in prose is the common shape,
+    and it lost the finding entirely. Order-dependent and silent.
+    """
+    leading_header = (
+        "Judydoll is a Chinese cosmetics brand. "
+        "Official site: judydoll.shop. "
+        "Judydoll's official website is judydoll.shop and it ships worldwide."
+    )
+
+    claims = extract_destination_claims(leading_header, brand="Judydoll")
+    away = claims_pointing_away([
+        {**c, "matches_verified": False} for c in claims
+    ])
+
+    assert away, "the bound claim was shadowed by the unbound one"
+    assert away[0]["claimed_host"] == "judydoll.shop"
+
+
+@pytest.mark.parametrize(
+    "text, brand",
+    [
+        ("In Korea, Anua's official store is oliveyoung.co.kr.", "Anua"),
+        ("Judydoll's official store is judydoll.tmall.com.", "Judydoll"),
+        ("Judydoll's official shop is shopee.sg.", "Judydoll"),
+    ],
+)
+def test_marketplace_and_retailer_stores_are_not_claims(text, brand):
+    """Removing the word `retailer` was LEXICAL, not semantic: `store` and
+    `shop` carry the same meaning and still fired. An authorized retailer or a
+    marketplace flagship IS an official store — it is not the official
+    WEBSITE, which is what §14 is about and what all three motivating engine
+    quotes actually say."""
+    claims = extract_destination_claims(
+        text, verified_official_hosts=["anua.com", "judydoll.com"], brand=brand,
+    )
+    assert claims_pointing_away(claims) == []
+
+
+def test_a_split_answer_cannot_fabricate_a_claim_across_the_join():
+    """`_run_text` joins raw + excerpt with a SPACE for containment tests. Used
+    for grammatical parsing, a raw ending mid-sentence and an excerpt beginning
+    mid-sentence compose a sentence present in neither source."""
+    from services.agent_center_bd_report_service import _destination_claims
+
+    probe_runs = [{
+        "provider": "gemini",
+        "raw_runs": [{
+            "query": "where to buy",
+            "raw": "Anua is widely stocked. Anua's official website is",
+            "evidence_excerpt": (
+                "sephora.com carries a wide range of Anua products."
+            ),
+        }],
+    }]
+
+    assert [c["claimed_host"] for c in _destination_claims(probe_runs, "Anua")] == []
+
+
+@pytest.mark.parametrize(
+    "text, brand, host",
+    [
+        ("L'Oreal's official website is loreal.com.", "L'Oreal", "loreal.com"),
+        ("d'Alba's official website is dalba.co.kr.", "d'Alba", "dalba.co.kr"),
+    ],
+)
+def test_brands_with_internal_apostrophes_still_bind(text, brand, host):
+    """Excluding apostrophes from the brand class captured "Oreal" out of
+    "L'Oreal's" and silently stopped binding. These are false NEGATIVES, which
+    is the safe direction, but they are real brands in this corpus."""
+    claims = extract_destination_claims(
+        text, verified_official_hosts=["other.com"], brand=brand,
+    )
+    assert [c["claimed_host"] for c in claims_pointing_away(claims)] == [host]

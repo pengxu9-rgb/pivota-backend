@@ -660,10 +660,20 @@ def _known_official_hosts(brand_report: Dict[str, Any]) -> List[str]:
     subdomains. `us.brand.com` is the merchant; `brand.shop` is a claim to
     check.
     """
+    from services.brand_claim_service import normalize_host
+
     md = brand_report.get("merchant_domain")
     if not isinstance(md, str) or not md.strip():
         return []
-    return [md.strip()]
+    # NORMALIZED, because `merchant_domain` is the raw onboarding `store_url`
+    # and that column holds both shapes — merchant_onboarding_routes writes it
+    # unnormalized and branches on whether it starts with http. Comparing a raw
+    # "https://www.anua.com/collections/all" against a normalized claimed host
+    # never matches, so the merchant's OWN apex got reported to them as a
+    # foreign store. A bare `www.` prefix was enough. Every other consumer of
+    # this field normalizes it; this one did not.
+    own = normalize_host(md)
+    return [own] if own else []
 
 
 def _host_is_merchants_own(host: str, official: List[str]) -> bool:
@@ -842,8 +852,10 @@ def extract_findings(
                 ),
             })
 
-    # §14 reads authority_map, which BOTH report shapes carry, so this sits
-    # outside the modern/legacy split rather than inside either branch.
+    # §14 reads `per_sku_reports`, which ONLY the per-SKU shape carries — a
+    # legacy `aggregate`/`per_product` report produces no destination claims.
+    # It sits outside the modern/legacy branch because the claims are extracted
+    # at report-build time, not derived from either aggregate block here.
     out.extend(_findings_from_destination_claims(brand_report))
 
     aggregate = brand_report.get("aggregate") or {}

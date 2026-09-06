@@ -36,12 +36,24 @@ from services.brand_claim_service import is_valid_public_hostname, normalize_hos
 
 # The relationship words that make a sentence a CLAIM rather than a mention.
 #
-# "official retailer" is DELIBERATELY ABSENT, and was present in the first cut,
-# contradicting the paragraph above. "ANUKO's official retailer is
-# oliveyoung.com" is a correct, desirable and very common sentence in this
-# vertical; reporting it as "AI named a store you do not own" is precisely the
-# false alarm this module is built to avoid.
-_RELATIONSHIP = r"(?:official\s+(?:web\s?site|site|store|shop|online\s+store))"
+# WEBSITE / SITE ONLY. The first cut included `retailer`, contradicting the
+# paragraph above; removing that one word turned out to be lexical rather than
+# semantic, because `store` and `shop` carry the same meaning and still fired:
+#
+#   "In Korea, Anua's official store is oliveyoung.co.kr."     (authorized retailer)
+#   "Judydoll's official store is judydoll.tmall.com."         (marketplace flagship)
+#   "Judydoll's official shop is shopee.sg."                   (marketplace flagship)
+#
+# All three are correct, desirable sentences in this vertical, and all three
+# would have been reported to the merchant at HIGH severity as a store they do
+# not own. An authorized retailer or a marketplace flagship IS an official
+# store; it is not the brand's official WEBSITE, which is the thing §14 is
+# about and the phrasing all three motivating engine quotes actually use.
+#
+# The cost is recall on a genuine "official store" hallucination phrased without
+# the word "website". That is the right trade: a missed claim is a gap, a false
+# one is an accusation.
+_RELATIONSHIP = r"(?:official\s+(?:web\s?site|site))"
 
 # A host as it appears in prose. Validated against is_valid_public_hostname
 # afterwards — this pattern alone matches "5.0", which was reported to a
@@ -64,7 +76,13 @@ _BRAND = r"(?P<brand>(?:[A-Za-z0-9&'’\-]+(?:\s+|$)){1,3}?)"
 # brand group swallows the "'s" that the pattern then expects to match, and
 # "Joocyee's official website is joocyeebeauty.com" — a real engine claim, and
 # one of this module's three motivating examples — silently stops matching.
-_BRAND_POSS = r"(?P<brand>(?:[A-Za-z0-9&\-]+\s+){0,2}[A-Za-z0-9&\-]+)"
+# Internal apostrophes are part of the NAME (L'Oreal, d'Alba); the trailing
+# one is the possessive the pattern matches separately. Excluding them outright
+# captured "Oreal" from "L'Oreal's" and silently lost the brand.
+_BRAND_POSS = (
+    r"(?P<brand>(?:[A-Za-z0-9&\-]+(?:['’][A-Za-z0-9&\-]+)*\s+){0,2}"
+    r"[A-Za-z0-9&\-]+(?:['’][A-Za-z0-9&\-]+)*)"
+)
 
 # Hedges and negations. A sentence that questions or denies the relationship is
 # not an assertion of it, and reporting "It is unclear whether X is official" as
@@ -161,9 +179,17 @@ def extract_destination_claims(
                     # three words earlier.
                     if not _tokens_match(brand_norm, _norm(claimed_brand)):
                         continue
-                if host in seen:
+                # KEYED ON (host, brand_bound), not host alone. An unbound
+                # pattern-3 hit earlier in the same answer would otherwise
+                # consume the host, and the brand-BOUND claim behind it — the
+                # only kind that becomes evidence — was silently dropped. An
+                # answer that leads with "Official website: x.com" and restates
+                # it in prose below is the common shape, and it lost the
+                # finding entirely. Order-dependent and silent.
+                key = (host, brand_bound)
+                if key in seen:
                     continue
-                seen.add(host)
+                seen.add(key)
                 out.append({
                     "claim_kind": CLAIM_OFFICIAL_STORE,
                     "claimed_host": host,
@@ -197,10 +223,21 @@ def _is_own_host(host: str, own: Iterable[str]) -> bool:
 
 
 def _norm(value: str) -> str:
-    """Casefold and strip punctuation that differs between a brand record and
-    an engine's prose (possessives, accents are left alone deliberately —
-    see the note in _tokens_match)."""
-    return re.sub(r"[^\w\s]", " ", str(value or "")).casefold().strip()
+    """Casefold for token comparison.
+
+    Apostrophes are DELETED rather than replaced with a space, so "L'Oreal"
+    normalises to one token ("loreal") and matches the captured "L'Oreal".
+    Splitting on them produced "l oreal" against a captured "oreal" and the
+    brand silently stopped binding. Remaining punctuation becomes a separator.
+
+    KNOWN GAP: a brand whose NAME ends in a possessive ("Kiehl's",
+    "Paula's Choice") still fails to bind, because the pattern consumes that
+    apostrophe-s as the grammatical possessive. Those are false NEGATIVES —
+    a missed claim, not an accusation — and fixing them needs the brand record,
+    not a wider regex.
+    """
+    v = str(value or "").replace("'", "").replace("\u2019", "")
+    return re.sub(r"[^\w\s]", " ", v).casefold().strip()
 
 
 def _tokens_match(brand: str, claimed: str) -> bool:

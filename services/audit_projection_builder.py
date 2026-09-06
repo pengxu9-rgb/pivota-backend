@@ -412,14 +412,14 @@ _PRODUCIBLE_FINDING_TYPES = frozenset({
     # It is listed here so `_stage_is_measurable` still sees a producer behind
     # the stage it belongs to; it just never appears in a merchant stage list.
     "pivota_serving_not_ready",
-    # Meta: about the RUN, not the merchant. Producible, and handled specially
-    # below — they must never let ANY stage claim an all-clear, and they must
-    # never appear in a stage's findings either.
     # §14 — an AI answer named an official store that is not one of the
     # merchant's own hosts. GET CITED: the answer cited them and then sent
     # the buyer somewhere else, which is a destination failure, not a
     # selection one.
     "ai_named_an_unverified_official_store",
+    # Meta: about the RUN, not the merchant. Producible, and handled specially
+    # below — they must never let ANY stage claim an all-clear, and they must
+    # never appear in a stage's findings either.
     "report_shape_unreadable",
     "no_dimension_was_scored",
 })
