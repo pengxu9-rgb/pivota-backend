@@ -135,7 +135,20 @@ _SKU_UPSERT_SQL = """
                       -- literal "USD" and at least agreed; correcting one and not the other is
                       -- the "worse than the uniform wrongness it replaced" failure again, for
                       -- the third time in this branch.
-                      currency = EXCLUDED.currency,
+                      -- AN UNKNOWN CURRENCY MUST NOT OVERWRITE A KNOWN ONE. `_currency_of`
+                      -- collapses "we could not learn it" into the positive claim "USD", so an
+                      -- UNCONDITIONAL `EXCLUDED.currency` let ONE flaky /meta.json fetch revert a
+                      -- whole brand's catalogue from SGD to USD on re-ingest -- prices unchanged,
+                      -- no log, and `has_offer_priced_for_region_sql` puts the mispriced product
+                      -- back on the US surface. The locale is fetched once per BRAND and every
+                      -- failure is swallowed, so it is ordinary network flakiness, not a rare
+                      -- case, and it oscillates run to run. Same shape as the COALESCE guards on
+                      -- gtin/content_key/seller_ref above: a NULL re-derivation never blanks a
+                      -- captured value. USD stays right for the INSERT; never for an UPDATE that
+                      -- would replace a currency we once proved.
+                      currency = CASE WHEN :currency_known
+                                      THEN EXCLUDED.currency
+                                      ELSE catalog_skus.currency END,
                       source_domain = EXCLUDED.source_domain,
                       barcode = EXCLUDED.barcode,
                       title = EXCLUDED.title,
@@ -176,7 +189,11 @@ _OFFER_UPSERT_SQL = """
                       -- reach new offer_ids only. `market` is deliberately NOT updated here --
                       -- it is a different axis (see services/storefront_currency.py) and this
                       -- lane does not own it.
-                      currency = EXCLUDED.currency,
+                      -- Same guard as the SKU arm: an unknown currency must not overwrite a
+                      -- known one. See the note there.
+                      currency = CASE WHEN :currency_known
+                                      THEN EXCLUDED.currency
+                                      ELSE catalog_offers.currency END,
                       offer_payload = EXCLUDED.offer_payload,
                       updated_at = NOW()
                     """
@@ -207,7 +224,10 @@ _SEED_UPSERT_SQL = """
                   -- two, `price_currency_mismatch` is a BLOCKER anomaly, and a blocked seed makes
                   -- `_build_external_seed_product` return None -- so every already-indexed
                   -- non-USD storefront would DROP OFF the agent surface on its next ingest.
-                  price_currency = EXCLUDED.price_currency,
+                  -- Same guard as the SKU arm. See the note there.
+                  price_currency = CASE WHEN :currency_known
+                                        THEN EXCLUDED.price_currency
+                                        ELSE external_product_seeds.price_currency END,
                   status = EXCLUDED.status,
                   availability = EXCLUDED.availability,
                   seed_data = EXCLUDED.seed_data,

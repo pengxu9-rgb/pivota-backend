@@ -945,8 +945,9 @@ _SGD_VARIANTS = [
 
 def _sgd_record(**extras):
     extras.setdefault("variants", _SGD_VARIANTS)
+    extras.setdefault("currency", "SGD")      # override with currency=None for the unknown case
     return _record(brand="JUNGSAEMMOOL", product_name="LIP-PRESSION Glowy Tint",
-                   source_domain="jsmbeauty.sg", currency="SGD", market="SG", **extras)
+                   source_domain="jsmbeauty.sg", **extras)
 
 
 def test_a_storefronts_own_currency_reaches_every_row_it_prices():
@@ -1145,7 +1146,7 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
         _re.sub(r"--.*$", "", line) for line in arm.splitlines()
     )
 
-    assert "currency = EXCLUDED.currency" in update_arm
+    assert "currency = CASE WHEN :currency_known" in update_arm
     # market is a DIFFERENT AXIS and this lane does not own it -- see services/storefront_currency.py
     assert "market" not in update_arm
 
@@ -1157,7 +1158,7 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
         _re.sub(r"--.*$", "", line)
         for line in _SEED_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
     )
-    assert "price_currency = EXCLUDED.price_currency" in seed_arm
+    assert "price_currency = CASE WHEN :currency_known" in seed_arm
     assert "market" not in seed_arm
 
     # THE THIRD ARM, because the first version of this test checked two of three and stopped.
@@ -1170,9 +1171,69 @@ def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
         _re.sub(r"--.*$", "", line)
         for line in _SKU_UPSERT_SQL.split("DO UPDATE SET", 1)[1].splitlines()
     )
-    assert "currency = EXCLUDED.currency" in sku_arm
+    assert "currency = CASE WHEN :currency_known" in sku_arm
 
-    # ALL THREE, asserted together: every table this lane writes a currency into must be able to
-    # correct it on re-ingest, or the tables disagree with each other.
-    for name, arm in (("offer", update_arm), ("seed", seed_arm), ("sku", sku_arm)):
-        assert _re.search(r"(price_)?currency = EXCLUDED", arm), f"{name} arm cannot correct currency"
+    # DERIVED, not hand-listed. The previous version iterated a 3-tuple I wrote out myself --
+    # which restates the very enumeration risk it claims to close, and is how "two arms" was
+    # declared complete when there were three. This walks apply.py for every upsert that BINDS a
+    # currency and requires each to guard it, so a fourth one added later is covered by
+    # construction rather than by my remembering.
+    import services.catalog_enrichment_agent.apply as _apply
+
+    checked = []
+    for attr in dir(_apply):
+        if not attr.endswith("_UPSERT_SQL"):
+            continue
+        sql = getattr(_apply, attr)
+        if not isinstance(sql, str) or "DO UPDATE SET" not in sql:
+            continue
+        binds = set(_re.findall(r":(\w+)", sql.split("DO UPDATE SET", 1)[0]))
+        if not ({"currency", "price_currency"} & binds):
+            continue          # this upsert does not carry a currency at all
+        arm = "\n".join(
+            _re.sub(r"--.*$", "", line)
+            for line in sql.split("DO UPDATE SET", 1)[1].splitlines()
+        )
+        checked.append(attr)
+        assert _re.search(r"(price_)?currency = CASE WHEN :currency_known", arm), (
+            f"{attr} can overwrite a KNOWN currency with an unknown one"
+        )
+    assert set(checked) == {"_SKU_UPSERT_SQL", "_OFFER_UPSERT_SQL", "_SEED_UPSERT_SQL"}, checked
+
+
+def test_an_unknown_currency_never_overwrites_one_we_already_proved():
+    """The re-ingest hazard, which the unconditional arm created.
+
+    `records_for_brand` fetches /meta.json ONCE PER BRAND and `_gated_fetch` swallows every
+    failure, so a single timeout makes the whole catalogue's records currency-less --
+    and `_currency_of` turns that honest "unknown" into the positive claim "USD" before the row
+    reaches the upsert. With an unconditional `currency = EXCLUDED.currency` that reverted every
+    row of an SGD storefront to USD while the prices stayed SGD, with no log and no anomaly, and
+    `has_offer_priced_for_region_sql` put the mispriced product straight back on the US surface.
+
+    The flag is what the SQL guard keys on, so it is asserted on EVERY row type the lane writes a
+    currency into -- offers, canonical SKU, variant SKUs and seeds -- not just the one.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    learned = ingest_validated_record(_sgd_record())
+    unknown = ingest_validated_record(_sgd_record(currency=None))
+
+    assert learned["offers"][0]["currency_known"] is True
+    assert learned["sku"]["currency_known"] is True
+    assert {v["currency_known"] for v in learned["variant_skus"]} == {True}
+    assert {s["currency_known"] for s in learned["seeds"]} == {True}
+
+    # The unknown run still INSERTS as USD -- a row must carry something, and that is what every
+    # pre-existing row already assumes -- but it must announce that it did not know.
+    assert unknown["offers"][0]["currency"] == "USD"
+    assert unknown["offers"][0]["currency_known"] is False
+    assert unknown["sku"]["currency_known"] is False
+    assert {v["currency_known"] for v in unknown["variant_skus"]} == {False}
+    assert {s["currency_known"] for s in unknown["seeds"]} == {False}
+
+    # And the ids are stable across the two runs, which is WHY the guard is needed: the flaky run
+    # lands on the ON CONFLICT arm of the good run's rows.
+    assert learned["offers"][0]["offer_id"] == unknown["offers"][0]["offer_id"]
+    assert learned["sku"]["sku_key"] == unknown["sku"]["sku_key"]
+    assert learned["seeds"][0]["id"] == unknown["seeds"][0]["id"]

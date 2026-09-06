@@ -286,6 +286,7 @@ def _build_variant_sku_inserts(
             "barcode": str(v.get("barcode") or "").strip() or None,
             "title": shade or pdp_payload["product_name"],
             "currency": _currency_of(pdp_payload),
+            "currency_known": _currency_is_known(pdp_payload),
             "image_url": str(v.get("image_url") or "").strip() or None,
             "visible_attributes": json.dumps({"shade": shade} if shade else {}),
             "visible_option_labels": json.dumps(labels),
@@ -518,6 +519,25 @@ DEFAULT_CURRENCY = "USD"
 _ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
 
 
+def _currency_is_known(pdp_payload: Dict[str, Any]) -> bool:
+    """Did this record actually LEARN a currency, or is `_currency_of` about to guess USD?
+
+    The distinction has to survive into the SQL, because `_currency_of` collapses "we could not
+    find out" into the positive claim "USD" -- and an unconditional
+    `currency = EXCLUDED.currency` then lets one flaky /meta.json fetch OVERWRITE a correct SGD
+    row with USD on re-ingest. `records_for_brand` fetches the locale once per BRAND and
+    `_gated_fetch` swallows every failure, so a single timeout reverts a whole catalogue while the
+    prices stay SGD, and `has_offer_priced_for_region_sql` puts the mispriced product straight
+    back on the US surface. No log, no anomaly -- it just oscillates run to run.
+
+    USD stays the right answer for an INSERT (a row must have something, and unknown-means-USD is
+    what every pre-existing row already assumes). It is never the right answer for an UPDATE that
+    would replace a currency we once proved.
+    """
+    raw = str((pdp_payload or {}).get("currency") or "").strip().upper()
+    return bool(_ISO_CURRENCY.match(raw))
+
+
 def _currency_of(pdp_payload: Dict[str, Any]) -> str:
     """The record's own currency, or USD.
 
@@ -631,6 +651,7 @@ def _build_seed_inserts(
             "image_url": offer.get("image_url") or None,
             "price_amount": price,
             "price_currency": _currency_of(pdp_payload),
+            "currency_known": _currency_is_known(pdp_payload),
             "destination_url": destination_url,
             "canonical_url": canonical_url or None,
             "domain": _domain_of(canonical_url or destination_url),
@@ -737,6 +758,7 @@ def _build_sku_insert(
         "barcode": strong_identifier.value if strong_identifier else None,
         "title": pdp_payload["product_name"],
         "currency": _currency_of(pdp_payload),
+        "currency_known": _currency_is_known(pdp_payload),
         "image_url": image_url or None,
         "visible_attributes": json.dumps({}),
         "visible_option_labels": json.dumps([]),
@@ -790,6 +812,7 @@ def _build_offer_inserts(
     offers: List[Dict[str, Any]],
     source_domain: Optional[str] = None,
     currency: str = DEFAULT_CURRENCY,
+    currency_known: bool = False,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
@@ -828,6 +851,7 @@ def _build_offer_inserts(
             "availability": availability,
             "inventory_quantity": 999 if offer.get("in_stock") else 0,
             "currency": currency,
+            "currency_known": currency_known,
             "list_price": price_value,
             "merchant_effective_price": price_value,
             "estimated_best_price": price_value,
@@ -943,6 +967,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Resolved HERE because this builder is the one consumer without the pdp payload in
         # scope; passing the payload just to read one field would widen its interface.
         currency=_currency_of(pdp_payload),
+        currency_known=_currency_is_known(pdp_payload),
     )
     # Real variants ride beside the canonical SKU: one SKU + one offer each,
     # priced and stocked per variant, at the brand-direct destination.
@@ -970,6 +995,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 # USD variant offer keeps the whole product on the US surface, now serving SGD
                 # amounts labelled USD. Measured on a 3-shade SGD line: offers {SGD: 1, USD: 3}.
                 currency=_currency_of(pdp_payload),
+                currency_known=_currency_is_known(pdp_payload),
             ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],
