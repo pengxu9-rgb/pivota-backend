@@ -783,6 +783,29 @@ def _pivota_messages(log):
     return [r.getMessage() for r in log.records]
 
 
+def test_the_leak_check_can_actually_see_a_record_below_WARNING(pivota_log):
+    """A HARNESS SELF-CHECK, because the leak guard's precondition is one silent edit away.
+
+    The guard below only detects an INFO-level leak if this fixture CAPTURES at INFO or lower.
+    Measured: reverting `lg.setLevel(logging.DEBUG)` to `logging.WARNING` -- which is literally
+    what that line said before this test existed -- leaves all 78 tests green while the INFO leak
+    survives again. A guard whose enabling condition nothing asserts is a guard that can be
+    disarmed by an edit that looks like tidying.
+
+    So: prove the capture reaches below WARNING, rather than assuming it.
+    """
+    import logging
+
+    logging.getLogger("pivota").debug("harness self-check: DEBUG is visible")
+    logging.getLogger("pivota").info("harness self-check: INFO is visible")
+
+    seen = _pivota_messages(pivota_log)
+    assert any("DEBUG is visible" in m for m in seen), "capture is above DEBUG; the leak guard is blind"
+    assert any("INFO is visible" in m for m in seen), "capture is above INFO; production's own level"
+    # And the WARNING-scoped helper must NOT see them -- the two helpers are different on purpose.
+    assert not any("is visible" in m for m in _pivota_warnings(pivota_log))
+
+
 def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(pivota_log):
     """The quiet failure here is NOT a status code, and NOT a corrupted cap.
 
@@ -828,9 +851,14 @@ def test_a_normal_snapshot_logs_nothing(pivota_log):
     """The negative counterpart: a warning on every healthy mint is a warning nobody reads."""
     from routes.agent_cards import _dump_snapshot
 
-    _dump_snapshot({"quote_snapshot": {"totals": [], "currency": "USD"}}, {"max_minor": 7500})
+    _dump_snapshot({"quote_snapshot": {"totals": [{"amount": 500}], "currency": "USD"}},
+                   {"max_minor": 7500})
 
-    assert _pivota_warnings(pivota_log) == []
+    # EVERY record, not just WARNING. The name says "logs nothing" and this is the COMMON path,
+    # where `base` carries the merchant's real `totals` -- so a leak here matters more than on
+    # the fallback, and asserting only over warnings would be the same narrower-than-its-name
+    # shape this file has now produced three times.
+    assert _pivota_messages(pivota_log) == []
 
 
 def test_the_two_identical_502s_are_distinguishable_in_the_LOG(pivota_log):
