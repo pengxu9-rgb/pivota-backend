@@ -239,6 +239,45 @@ def test_a_refunded_order_emits_one_full_amount_refund():
     assert refund.refund_id == f"{ORDER_ID}:refund"
 
 
+def test_the_SAME_refund_seen_with_and_without_a_psp_refund_id_is_ONE_row():
+    """The mutant this kills: keying the refund on `stripeDetails.refundId`.
+
+    That field is present for a Stripe order and absent for a PayPal one — and it
+    is also absent from the first observation of a Stripe refund whose
+    `stripeDetails` has not been populated yet. An order observed once without it
+    and once with it would then land on TWO different keys, and the funnel SUMS
+    refund rows: one refund would read as two.
+
+    Asserting `refund_id` alone is not enough, because `refund_id` is a separate
+    field from the entity the EVENT ID is derived from. It is the event id that
+    decides whether the ledger collapses the two observations.
+    """
+    without = _by_type(
+        _map(
+            _order(
+                status="refunded",
+                refundedOn="2026-09-03T10:00:00.000Z",
+                stripeDetails={"chargeId": "ch_1"},
+            )
+        )
+    )["refund.succeeded"]
+    with_id = _by_type(
+        _map(
+            _order(
+                status="refunded",
+                refundedOn="2026-09-03T10:00:00.000Z",
+                stripeDetails={"chargeId": "ch_1", "refundId": "re_1"},
+            )
+        )
+    )["refund.succeeded"]
+
+    assert without.event_id == with_id.event_id
+    assert without.refund_id == with_id.refund_id == f"{ORDER_ID}:refund"
+    # The PSP id still rides along as a diagnostic on the observation that had it.
+    assert with_id.metadata["native_psp_refund_id"] == "re_1"
+    assert "native_psp_refund_id" not in without.metadata
+
+
 def test_a_lost_dispute_is_money_out_under_the_SAME_key_as_a_refund():
     """The two statuses are mutually exclusive at any instant, but an order can
     MOVE between them across observations. Two keys would then record the same
@@ -252,7 +291,9 @@ def test_a_lost_dispute_is_money_out_under_the_SAME_key_as_a_refund():
             _order(
                 status="dispute-lost",
                 disputedOn="2026-09-04T10:00:00.000Z",
-                stripeDetails={"disputeId": "dp_1"},
+                # A different PSP shape from the refunded observation above, so
+                # this compares the KEY rather than two identical inputs.
+                stripeDetails={"disputeId": "dp_1", "refundId": "re_9"},
             )
         )
     )["refund.succeeded"]
