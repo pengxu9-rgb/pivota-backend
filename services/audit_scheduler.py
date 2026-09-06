@@ -1264,7 +1264,13 @@ async def restart_scheduler() -> dict:
 # seconds to fail its recording write. If that ordering is ever reverted, this budget argument
 # stops holding and so does the drain.
 # Set SCHEDULER_DRAIN_SECONDS=0 to restore the previous cancel-immediately behaviour.
-_DRAIN_DEFAULT_SECONDS = 5.0
+# 3s, not 5. The drain now runs BEFORE `database.disconnect()`, so it and the pool close share
+# one grace budget of roughly 10s -- 5s was half of it for a benefit that is almost entirely
+# realised in the first second. The jobs this helps are the short ticks (an indexed query on an
+# idle queue) which land in milliseconds; the ones that would use the full budget are the long
+# drainers, and an audit run that "routinely runs >15 min" is not going to land in 5s either.
+# So the extra 2s buys almost nothing and spends a fifth of the shutdown window.
+_DRAIN_DEFAULT_SECONDS = 3.0
 # An absolute ceiling on what the env var may ask for. Not a tuning limit — a blast-radius
 # bound: the whole argument above is that overrunning the platform's grace loses
 # `database.disconnect()`, so a value that does that is never what anyone meant. Chosen

@@ -139,21 +139,21 @@ def test_the_shipped_default_is_sane():
 @pytest.mark.parametrize(
     "raw, expected, why",
     [
-        (None, 5.0, "unset is the ordinary case"),
-        ("", 5.0, "an empty value is not a request for zero"),
+        (None, 3.0, "unset is the ordinary case"),
+        ("", 3.0, "an empty value is not a request for zero"),
         ("2.5", 2.5, "a sane value is honoured"),
         ("0", 0.0, "zero is the documented opt-out"),
         ("-1", 0.0, "negative means off, not a negative timeout"),
         ("3600", 8.0, "clamped: past the ceiling loses database.disconnect()"),
-        ("5s", 5.0, "A TYPO MUST NOT RAISE - see the docstring; it used to"),
-        ("abc", 5.0, "nor any other non-number"),
+        ("5s", 3.0, "A TYPO MUST NOT RAISE - see the docstring; it used to"),
+        ("abc", 3.0, "nor any other non-number"),
         # NON-FINITE: `float()` accepts all three, and neither `<= 0` nor `> ceiling` can
         # reject nan (both comparisons are False), so it would reach asyncio.wait as a nan
         # timeout - which never fires. Shutdown hangs until the platform kills the container.
-        ("nan", 5.0, "nan slips BOTH numeric guards and hangs asyncio.wait"),
-        ("NaN", 5.0, "and float() is case-insensitive about it"),
-        ("inf", 5.0, "infinite is not a timeout"),
-        ("1e400", 5.0, "overflows to inf on the way in"),
+        ("nan", 3.0, "nan slips BOTH numeric guards and hangs asyncio.wait"),
+        ("NaN", 3.0, "and float() is case-insensitive about it"),
+        ("inf", 3.0, "infinite is not a timeout"),
+        ("1e400", 3.0, "overflows to inf on the way in"),
     ],
 )
 def test_the_env_var_can_never_break_the_import(monkeypatch, raw, expected, why):
