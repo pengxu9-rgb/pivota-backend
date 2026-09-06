@@ -850,3 +850,43 @@ async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_pr
 
     assert len(recs) >= 2, "two products in, so the per-product count is meaningful"
     assert calls == ["jsmbeauty.sg"], f"locale fetched {len(calls)} times for one brand"
+
+
+@pytest.mark.parametrize(
+    "status,ctype,label",
+    [
+        (404, "application/json", "a 404 body"),
+        (500, "application/json", "an error page"),
+        (200, "text/html", "an HTML soft-404"),
+        (200, "", "a response with no content-type"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, status, ctype, label):
+    """Both gates matter and neither was pinned. Storefronts that are not Shopify commonly answer
+    /meta.json with a 200 HTML soft-404, and `resp.json()` on that either raises or -- worse --
+    parses embedded JSON. Refuse on the status AND on the content-type, so the caller keeps its
+    default instead of inheriting a currency from someone's error page."""
+    import httpx
+
+    class _Resp:
+        status_code = status
+        headers = {"content-type": ctype}
+
+        def json(self):
+            return {"currency": "XXX", "country": "ZZ"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    _silence_politeness(monkeypatch)
+
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "market": None}, label

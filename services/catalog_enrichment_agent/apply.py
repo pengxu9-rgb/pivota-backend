@@ -140,13 +140,13 @@ _OFFER_UPSERT_SQL = """
                     INSERT INTO catalog_offers
                       (offer_id, sku_key, product_key, merchant_id,
                        catalog_track, truth_tier, readiness_tier, offer_mode,
-                       channel, availability, inventory_quantity, currency,
+                       channel, availability, inventory_quantity, currency, market,
                        list_price, merchant_effective_price, estimated_best_price,
                        price_confidence, source_system, source_ref, source_domain, offer_payload)
                     VALUES
                       (:offer_id, :sku_key, :product_key, :merchant_id,
                        :catalog_track, :truth_tier, :readiness_tier, :offer_mode,
-                       :channel, :availability, :inventory_quantity, :currency,
+                       :channel, :availability, :inventory_quantity, :currency, :market,
                        :list_price, :merchant_effective_price, :estimated_best_price,
                        :price_confidence, :source_system, :source_ref, :source_domain,
                        CAST(:offer_payload AS jsonb))
@@ -158,6 +158,7 @@ _OFFER_UPSERT_SQL = """
                       estimated_best_price = EXCLUDED.estimated_best_price,
                       price_confidence = EXCLUDED.price_confidence,
                       source_domain = EXCLUDED.source_domain,
+                      market = EXCLUDED.market,
                       offer_payload = EXCLUDED.offer_payload,
                       updated_at = NOW()
                     """

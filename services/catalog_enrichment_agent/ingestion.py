@@ -797,6 +797,7 @@ def _build_offer_inserts(
     offers: List[Dict[str, Any]],
     source_domain: Optional[str] = None,
     currency: str = DEFAULT_CURRENCY,
+    market: str = DEFAULT_MARKET,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
@@ -835,6 +836,13 @@ def _build_offer_inserts(
             "availability": availability,
             "inventory_quantity": 999 if offer.get("in_stock") else 0,
             "currency": currency,
+            # WRITTEN, not left to the column's `server_default 'US'`. Two reasons, both real:
+            # `catalog_invariant_checks._run_market_currency_disagreement` compares this against
+            # REGION_PRICING_CURRENCY[market], so a correctly-stamped SGD offer sitting on the
+            # default 'US' is a counted violation; and `backfill_offer_market_currency.py`, the
+            # only tool that repairs this column, guards on `currency = 'USD'` -- so a row we
+            # stamp SGD while leaving market 'US' can never be corrected by it.
+            "market": market,
             "list_price": price_value,
             "merchant_effective_price": price_value,
             "estimated_best_price": price_value,
@@ -950,6 +958,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Resolved HERE because this builder is the one consumer without the pdp payload in
         # scope; passing the payload just to read one field would widen its interface.
         currency=_currency_of(pdp_payload),
+        market=_market_of(pdp_payload),
     )
     # Real variants ride beside the canonical SKU: one SKU + one offer each,
     # priced and stocked per variant, at the brand-direct destination.
@@ -970,6 +979,14 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 sku_key=vsku["sku_key"],
                 offers=[dict(primary, price=v.get("price"), in_stock=bool(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
+                # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
+                # created an eighth CALL that silently took the default -- so a shade line landed
+                # canonical=SGD beside variants=USD. Worse than the uniform wrongness it replaced:
+                # `_HAS_US_OFFER_EXISTS` is an EXISTS over catalog_offers by PRODUCT_KEY, so one
+                # USD variant offer keeps the whole product on the US surface, now serving SGD
+                # amounts labelled USD. Measured on a 3-shade SGD line: offers {SGD: 1, USD: 3}.
+                currency=_currency_of(pdp_payload),
+                market=_market_of(pdp_payload),
             ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],

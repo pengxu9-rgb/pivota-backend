@@ -923,7 +923,20 @@ def _seed_variant_currencies(out):
     return found
 
 
+# THREE REAL VARIANTS, deliberately. The first draft of this fixture had none, so it never
+# entered the real-variant branch -- and the eighth currency site (the variant `_build_offer_inserts`
+# call) went unnoticed while a ten-mutant pass reported all-clear. A shade line is also the SHAPE
+# that matters: `_HAS_US_OFFER_EXISTS` is an EXISTS over catalog_offers by PRODUCT_KEY, so a
+# single USD-stamped variant offer keeps the whole product on the US surface.
+_SGD_VARIANTS = [
+    {"variant_id": "v1", "title": "Early Peach", "price": 30.0, "in_stock": True},
+    {"variant_id": "v2", "title": "Rose Beige", "price": 30.0, "in_stock": True},
+    {"variant_id": "v3", "title": "Coral", "price": 30.0, "in_stock": True},
+]
+
+
 def _sgd_record(**extras):
+    extras.setdefault("variants", _SGD_VARIANTS)
     return _record(brand="JUNGSAEMMOOL", product_name="LIP-PRESSION Glowy Tint",
                    source_domain="jsmbeauty.sg", currency="SGD", market="SG", **extras)
 
@@ -939,7 +952,11 @@ def test_a_storefronts_own_currency_reaches_every_row_it_prices():
 
     out = ingest_validated_record(_sgd_record())
 
+    # EVERY offer, canonical AND per-variant. Asserting a set means one USD straggler fails,
+    # which is exactly the shape the eighth site produced: {SGD: 1, USD: 3}.
+    assert len(out["offers"]) >= 4, "the fixture must produce variant offers, not just canonical"
     assert {o["currency"] for o in out["offers"]} == {"SGD"}
+    assert {o["market"] for o in out["offers"]} == {"SG"}
     assert out["sku"]["currency"] == "SGD"
     assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
     assert {s["market"] for s in out["seeds"]} == {"SG"}
@@ -972,6 +989,7 @@ def test_a_record_with_no_currency_is_still_USD_and_US():
     out = ingest_validated_record(_record())
 
     assert {o["currency"] for o in out["offers"]} == {"USD"}
+    assert {o["market"] for o in out["offers"]} == {"US"}
     assert out["sku"]["currency"] == "USD"
     assert {s["price_currency"] for s in out["seeds"]} == {"USD"}
     assert {s["market"] for s in out["seeds"]} == {"US"}
