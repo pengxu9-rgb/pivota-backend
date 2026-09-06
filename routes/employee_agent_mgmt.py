@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 from db.database import database
 import uuid
 import secrets
@@ -122,7 +122,7 @@ async def get_all_agents(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all agents (Employee only) with metrics filtered by date_range"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -229,7 +229,7 @@ async def get_agent_details(
     current_user: dict = Depends(get_current_user)
 ):
     """Get detailed agent information (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -357,7 +357,7 @@ async def get_agent_calls(
     current_user: dict = Depends(get_current_user)
 ):
     """Get agent API call logs"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -411,7 +411,7 @@ async def create_agent(
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new agent (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -476,7 +476,7 @@ async def employee_update_agent_tier(
     current_user: dict = Depends(get_current_user)
 ):
     """Employee portal endpoint to switch agent tier between basic/premium."""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     try:
@@ -531,7 +531,7 @@ async def reset_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Reset agent's API key (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -576,7 +576,7 @@ async def deactivate_agent(
     current_user: dict = Depends(get_current_user)
 ):
     """Deactivate an agent (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -619,7 +619,7 @@ async def activate_agent(
     current_user: dict = Depends(get_current_user)
 ):
     """Activate an agent (Employee only)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -663,7 +663,7 @@ async def get_agent_api_keys(
     current_user: dict = Depends(get_current_user)
 ):
     """List all API keys for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -705,7 +705,7 @@ async def create_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Generate a new API key for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -774,7 +774,7 @@ async def revoke_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Revoke an API key"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -808,7 +808,7 @@ async def rotate_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Rotate an API key (generate new key, mark old as rotated)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -878,7 +878,7 @@ async def get_agent_protocols(
     current_user: dict = Depends(get_current_user)
 ):
     """List all supported protocols for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -917,7 +917,7 @@ async def add_agent_protocol(
     current_user: dict = Depends(get_current_user)
 ):
     """Add a supported protocol for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -977,7 +977,7 @@ async def update_agent_protocol_status(
     current_user: dict = Depends(get_current_user)
 ):
     """Update protocol status (active/deprecated/disabled)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     if status not in ["active", "deprecated", "disabled"]:
@@ -1015,7 +1015,7 @@ async def get_agent_performance(
     current_user: dict = Depends(get_current_user)
 ):
     """Get aggregated performance stats for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1102,7 +1102,7 @@ async def get_agent_metrics_history(
     current_user: dict = Depends(get_current_user)
 ):
     """Get agent metrics history from agent_metrics table"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1139,7 +1139,7 @@ async def get_agent_alerts(
     current_user: dict = Depends(get_current_user)
 ):
     """Get alerts for an agent"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1180,7 +1180,7 @@ async def resolve_agent_alert(
     current_user: dict = Depends(get_current_user)
 ):
     """Resolve an alert"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1212,7 +1212,7 @@ async def get_all_alerts(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all alerts across all agents"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1267,7 +1267,7 @@ async def get_agent_health_score(
     current_user: dict = Depends(get_current_user)
 ):
     """Calculate agent health score (0-100)"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

@@ -35,6 +35,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
+from services.llm_fence import PRODUCT_DATA_FENCE
 from services.llm_io import parse_llm_object
 from services.promo_terms import is_promo_term
 from services.sku_sidewalk import ATTRIBUTE_CLASSES, _iter_product_sources
@@ -264,8 +265,21 @@ Return STRICT JSON: {"attributes": [{"class_name": "...", "value": "plain buyer 
 "span": "exact verbatim substring from TEXT"}, ...]}. No prose, no markdown."""
 
 
+def sanitize_source_text(source_text: str) -> str:
+    """The page copy as the model will read it. The groundedness guard must check
+    spans against THIS string, not the raw copy: sanitizing removes invisible
+    characters and folds lookalike forms, so a span the model quotes faithfully
+    from the fenced text can fail to be a substring of the raw text."""
+    return PRODUCT_DATA_FENCE.sanitize_text(source_text)
+
+
 def build_extraction_prompt(source_text: str) -> tuple[str, str]:
-    return _EXTRACTION_SYSTEM_PROMPT, f"TEXT:\n{source_text}"
+    # Sanitizing is idempotent, so a caller that already sanitized (to share the
+    # string with the guard) gets the same bytes back. No cap here: the lane has
+    # none today and the guard bounds what the output can claim.
+    fenced = PRODUCT_DATA_FENCE.fence_text(source_text, max_chars=None)
+    system = f"{_EXTRACTION_SYSTEM_PROMPT}\n\n{PRODUCT_DATA_FENCE.notice}"
+    return system, f"TEXT:\n{fenced}"
 
 
 def _parse_attributes(raw_text: str) -> List[Mapping[str, Any]]:
@@ -342,6 +356,8 @@ async def extract_attributes(
     malformed model response, or a transport error (honest under-fill — never a
     fabricated attribute)."""
     text = source_text if source_text is not None else build_source_text(product)
+    # One sanitized string feeds both the prompt and the guard below.
+    text = sanitize_source_text(text)
     if not text.strip():
         return []
     system, user = build_extraction_prompt(text)

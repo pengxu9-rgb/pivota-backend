@@ -29,7 +29,7 @@ from pydantic import BaseModel
 
 from db import agent_identity_issuers as store
 from db.agent_identity_issuers import IssuerValidationError
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 router = APIRouter(tags=["agent-identity-issuers"])
 internal_router = APIRouter(prefix="/agent/internal", tags=["agent-internal-auth"])
@@ -46,7 +46,7 @@ class IssuerRegistrationBody(BaseModel):
 
 def _require_owner_or_admin(current_user: Dict[str, Any], agent_id: str) -> None:
     user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized to manage identity issuers for this agent")
 
 

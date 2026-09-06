@@ -15,13 +15,10 @@ SKU_OPT_OVERLAY_V1_ENABLED = os.getenv("SKU_OPT_OVERLAY_V1", "false").strip().lo
     "on",
 }
 
-# Modules a merchant may self-approve via the LLM-reviewed auto-publish path.
-# v1: 'copy' only (low-risk, machine-publishable). Widen deliberately.
-MERCHANT_SELF_APPROVE_MODULES = {"copy"}
-
 from db.database import database
 from services.pdp_governance_service import (
     DEFAULT_MARKET,
+    LLM_ONLY_PUBLISH_MODULES,
     REVIEW_ACTOR_GPT55,
     create_merchant_contribution,
     ensure_pdp_governance_tables,
@@ -29,8 +26,21 @@ from services.pdp_governance_service import (
     parse_product_key,
     review_module_version,
 )
+
+# Modules a merchant may self-approve via the LLM-reviewed auto-publish path.
+# v1: 'copy' only (low-risk, machine-publishable). Widen deliberately.
+#
+# This is now an ALIAS for the one shared definition of "what may an LLM-only
+# review publish" (services/pdp_governance_service.LLM_ONLY_PUBLISH_MODULES),
+# which the employee gpt55-review route reads too. Same value as before; the
+# point is that the two LLM-only lanes can no longer drift apart.
+MERCHANT_SELF_APPROVE_MODULES = LLM_ONLY_PUBLISH_MODULES
 from services.pdp_copy_review import generate_copy_review_rubric
 from utils.auth import get_current_user
+from services.merchant_write_guardrails import (
+    GuardrailViolation,
+    guardrail_block_message,
+)
 
 
 router = APIRouter(prefix="/merchant/pdps", tags=["merchant-pdp-governance"])
@@ -53,6 +63,17 @@ def _merchant_id(current_user: Dict[str, Any]) -> str:
 
 
 def _map_error(exc: Exception) -> HTTPException:
+    # A guardrail refusal is an operator-readable 422, never a 500 traceback:
+    # the write was refused on purpose and the caller needs the reasons.
+    if isinstance(exc, GuardrailViolation):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "MERCHANT_WRITE_GUARDRAIL",
+                "message": guardrail_block_message(exc.violations),
+                "violations": exc.violations,
+            },
+        )
     message = str(exc)
     if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)

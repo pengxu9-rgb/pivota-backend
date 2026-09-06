@@ -64,8 +64,15 @@ async def _run(args: argparse.Namespace) -> int:
             category_path=b.get("category_path") or args.category or "",
             brand=b.get("brand"),
             max_products=args.max_products,
+            base_listings_only=args.base_listings_only,
         )
         print(f"  {b['domain']}: {len(recs)} products")
+        fold = getattr(records_for_brand, "last_fold_report", None) if args.base_listings_only else None
+        if fold:
+            print(
+                f"    folded {fold['shades']} shade listing(s) into {fold['bases']} base row(s); "
+                f"{fold['stubs_replaced']} placeholder stub variant(s) replaced by their shades"
+            )
         all_records.extend(recs)
 
     if not all_records:
@@ -105,6 +112,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--category", help="category_path (default/override for rows without one)")
     p.add_argument("--brand", help="brand name override (single --domain mode)")
     p.add_argument("--max-products", type=int, default=500, help="cap products per brand")
+    p.add_argument(
+        "--fold-shades", "--base-listings-only",
+        dest="base_listings_only",
+        action="store_true",
+        help=(
+            "fold single-variant '<base> - <shade>' listings into the base listing's variants "
+            "(maccosmetics.com publishes one product per shade; as-is that mints one PDP per shade). "
+            "The base keeps one PDP; each shade becomes a SKU + offer of it."
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")
     args = p.parse_args(argv)
     return asyncio.run(_run(args))

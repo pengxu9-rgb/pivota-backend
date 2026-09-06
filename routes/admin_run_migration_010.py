@@ -6,7 +6,7 @@ from typing import Dict, Any
 import os
 
 from db.database import database
-from utils.auth import get_current_employee
+from utils.auth import ADMIN_ROLES, get_current_employee
 
 router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"])
 
@@ -26,7 +26,7 @@ async def run_migration_010(
     - psp_performance_metrics: Aggregated PSP performance data
     """
     # Verify admin access
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:
@@ -180,7 +180,7 @@ async def rollback_migration_010(
     WARNING: This will delete all payment routing data!
     """
     # Verify admin access
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:

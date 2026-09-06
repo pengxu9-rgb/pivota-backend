@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from services.pdp_governance_service import (
     DEFAULT_MARKET,
+    LLM_ONLY_PUBLISH_MODULES,
     REVIEW_ACTOR_GPT55,
     REVIEW_ACTOR_HUMAN,
     audit_pdp_identity_groups,
@@ -31,6 +32,10 @@ from services.pdp_governance_service import (
     upload_pdp_gallery_image,
 )
 from utils.auth import get_current_employee
+from services.merchant_write_guardrails import (
+    GuardrailViolation,
+    guardrail_block_message,
+)
 
 
 router = APIRouter(prefix="/employee/pdps", tags=["employee-pdp-governance"])
@@ -127,6 +132,17 @@ def _employee_role(current_user: Dict[str, Any]) -> str:
 
 
 def _map_error(exc: Exception) -> HTTPException:
+    # A guardrail refusal is an operator-readable 422, never a 500 traceback:
+    # the write was refused on purpose and the caller needs the reasons.
+    if isinstance(exc, GuardrailViolation):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "MERCHANT_WRITE_GUARDRAIL",
+                "message": guardrail_block_message(exc.violations),
+                "violations": exc.violations,
+            },
+        )
     message = str(exc)
     if message in {"PDP_NOT_FOUND", "PDP_MODULE_VERSION_NOT_FOUND", "EXTERNAL_SEED_NOT_FOUND", "PDP_GALLERY_ASSET_NOT_FOUND", "PDP_REVIEW_TASK_NOT_FOUND", "PDP_IDENTITY_CANDIDATE_NOT_FOUND", "PDP_PRODUCT_GROUP_MEMBER_NOT_FOUND"}:
         return HTTPException(status_code=404, detail=message)
@@ -536,6 +552,25 @@ async def run_gpt55_review(
     body: ModuleVersionRequest,
     current_user: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    """Run the LLM-only GPT-5.5 gate over a staged module; a pass auto-publishes.
+
+    This lane has NO human-actor RBAC behind it. review_module_version() gates
+    on allowed_pdp_review_actions only inside `if actor_type ==
+    REVIEW_ACTOR_HUMAN`, and we call it with REVIEW_ACTOR_GPT55 and no
+    actor_role -- so the caller's role (admin, employee, or outsourced; see
+    get_current_employee) is never consulted and every module in
+    MACHINE_PUBLISH_MODULES was auto-publishable from an employee token,
+    `offers` and `identity` included.
+
+    The module fence is therefore the whole authorization for this route, and it
+    runs HERE, before the service call, so a refused module writes nothing at
+    all. It is the same shared set the merchant self-approve twin reads
+    (routes/merchant_pdp.py -- "Merchants are NOT direct publish authorities;
+    the gate is"). Employees who need to publish a fenced-off module still can,
+    through /review and /publish, where their role IS checked.
+    """
+    if module_key not in LLM_ONLY_PUBLISH_MODULES:
+        raise HTTPException(status_code=400, detail="MODULE_NOT_LLM_REVIEWABLE")
     try:
         return await review_module_version(
             pdp_id=pdp_id,

@@ -1554,6 +1554,9 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         "outreach_moves": 0,
         "pitch_targets": 0,
         "top_actions": 0,
+        # Number of catalogue gaps found, so the locked panel can say "6 gaps"
+        # instead of rendering as an empty section.
+        "selection_gap": 0,
     }
     teaser_headline = None
 
@@ -1590,10 +1593,30 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
     # The sideways-wedge recommendation ("where you can win") lives in three
     # places: the top-level key, brand_rollup, and the raw brand_report. The
     # top-level usually aliases brand_rollup's object, so strip every home.
-    wcw_homes = [shaped, shaped.get("brand_rollup"), shaped.get("brand_report")]
-    rollup_in_report = (shaped.get("brand_report") or {}).get("brand_rollup")
-    if isinstance(rollup_in_report, dict):
-        wcw_homes.append(rollup_in_report)
+    # `brand_report` is _shape_url_audit_response's envelope key; `report_jsonb`
+    # is the RAW ROW key, which is what audit_runs_routes serves. This helper
+    # now runs on both shapes, so it has to walk both — stripping only the
+    # envelope form left the whole paid layer intact inside report_jsonb.
+    wcw_homes = [
+        shaped,
+        shaped.get("brand_rollup"),
+        shaped.get("brand_report"),
+        shaped.get("report_jsonb"),
+    ]
+    for container_key in ("brand_report", "report_jsonb"):
+        nested = (shaped.get(container_key) or {})
+        if isinstance(nested, dict):
+            rollup_in_report = nested.get("brand_rollup")
+            if isinstance(rollup_in_report, dict):
+                wcw_homes.append(rollup_in_report)
+            narrative_in_report = nested.get("merchant_narrative")
+            if isinstance(narrative_in_report, dict):
+                _actions = narrative_in_report.get("prioritized_actions")
+                if isinstance(_actions, list) and _actions:
+                    counts["prioritized_actions"] = max(
+                        counts["prioritized_actions"], len(_actions)
+                    )
+                    narrative_in_report["prioritized_actions"] = []
     for home in wcw_homes:
         if isinstance(home, dict) and home.get("where_you_can_win") is not None:
             home["where_you_can_win"] = None
@@ -1602,12 +1625,39 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         # "what to do" layer when present.
         if isinstance(home, dict) and home.get("winning_products_not_carried") is not None:
             home["winning_products_not_carried"] = None
+        # C1 selection gap: the merchant's own catalogue joined against the
+        # queries it loses ("you sell X and you are absent from query Y").
+        # Same paid layer as where_you_can_win, and strictly more actionable.
+        # It reached the wire before this lock because brand_rollup is served
+        # wholesale and no inner-key allowlist filters it.
+        if isinstance(home, dict):
+            _sg = home.get("selection_gap")
+            if _sg is not None:
+                if isinstance(_sg, dict):
+                    # The section's OWN lost_queries, not len(gaps): a shape
+                    # with no matched products but a populated
+                    # lost_queries_without_product is routine (build_selection_
+                    # gap sets available=True for it), and counting only gaps
+                    # would stamp "0" — the empty-panel render this count
+                    # exists to prevent.
+                    _sg_counts = _sg.get("counts")
+                    if isinstance(_sg_counts, dict):
+                        _n = _sg_counts.get("lost_queries")
+                    else:
+                        _n = None
+                    if not isinstance(_n, int):
+                        _n = len(_sg.get("gaps") or []) + len(
+                            _sg.get("lost_queries_without_product") or []
+                        )
+                    counts["selection_gap"] = max(counts["selection_gap"], _n)
+                home["selection_gap"] = None
 
     # brand_report is the raw report dict — its narrative/per-SKU branches are
     # aliases (already stripped above), but the full win_plan is its own tree.
-    brand_report = shaped.get("brand_report")
-    if isinstance(brand_report, dict) and brand_report.get("win_plan") is not None:
-        brand_report["win_plan"] = None
+    for container_key in ("brand_report", "report_jsonb"):
+        container = shaped.get(container_key)
+        if isinstance(container, dict) and container.get("win_plan") is not None:
+            container["win_plan"] = None
 
     summary = shaped.get("report_summary")
     if isinstance(summary, dict):
@@ -1634,6 +1684,20 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         for key in _LOCKED_PER_SKU_ACTION_KEYS:
             if sku.get(key) is not None:
                 sku[key] = None
+
+    # The revenue_recovery projection (C2) carries actions under
+    # stages[].actions — a shape that did not exist when this helper was
+    # written, and one audit_runs_routes serves. Findings stay: they are the
+    # "what's wrong" layer, which is free.
+    for stage in shaped.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        stage_actions = stage.get("actions")
+        if isinstance(stage_actions, list) and stage_actions:
+            counts["prioritized_actions"] = max(
+                counts["prioritized_actions"], len(stage_actions)
+            )
+            stage["actions"] = []
 
     shaped["actions_locked"] = True
     shaped["locked_counts"] = counts
@@ -1714,6 +1778,13 @@ def _shape_url_audit_response(row: Dict[str, Any]) -> Dict[str, Any]:
             brand_rollup.get("where_you_can_win")
             or report.get("where_you_can_win")
         ),
+        # C1 selection gap. Lifted out of brand_rollup so the portal reads one
+        # documented key rather than reaching into the rollup; the rollup keeps
+        # its copy, and the free-tier strip nulls BOTH homes. No report-level
+        # fallback: the only writer is brand_rollup["selection_gap"], so a
+        # `or report.get(...)` arm would be an uncovered defensive default that
+        # reads as a delivering line.
+        "selection_gap": brand_rollup.get("selection_gap"),
         "suggested_prompts": report.get("suggested_prompts"),
         # Merchant's own test prompts ("Your prompts"), probed once brand-level.
         "custom_prompts": report.get("custom_prompts") or [],
@@ -2591,6 +2662,7 @@ _SHARE_ALLOWED_TOP_KEYS = (
     "brand_rollup",
     "authority_map",
     "where_you_can_win",
+    "selection_gap",
     "suggested_prompts",
     "where_youre_losing",
     "merchant_narrative",
@@ -3499,7 +3571,7 @@ async def list_merchant_tasks(
 
 
 class _TaskStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(pending|in_progress|done|failed)$")
+    status: str = Field(..., pattern="^(pending|in_progress|done|failed|ready_for_retest|verifying|verified|regressed)$")
     assigned_to_human: Optional[str] = Field(None, max_length=200)
     evidence: Optional[Dict[str, Any]] = None
 

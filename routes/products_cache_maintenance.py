@@ -1,13 +1,23 @@
 """
 Products cache maintenance endpoints (deduplication/compaction)
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from utils.auth import require_admin_or_key
 from pydantic import BaseModel
 from db.database import database
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/admin/products", tags=["admin-products-maintenance"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# POST /admin/products/compact/{merchant_id} anonymously DELETEd
+# products_cache rows for any merchant.
+router = APIRouter(prefix="/admin/products", tags=["admin-products-maintenance"], dependencies=[Depends(require_admin_or_key)])
 
 class CompactResult(BaseModel):
     merchant_id: str

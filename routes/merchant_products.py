@@ -1102,13 +1102,18 @@ async def publish_store_pdp(
             "message": "No enrichment copy to publish for this product yet.",
         }
 
+    from services.merchant_write_guardrails import ACTOR_HUMAN
     from services.shopify_content_writeback import publish_content_to_store
 
+    # ACTOR_HUMAN because this route is reached only by an authenticated merchant
+    # asking for the publish themselves (the role check above). The host states who is
+    # asking; nothing the model produced is consulted for it.
     return await publish_content_to_store(
         merchant_id=merchant_id,
         platform=platform,
         platform_product_id=platform_product_id,
         enrichment=enrichment,
+        actor_kind=ACTOR_HUMAN,
     )
 
 

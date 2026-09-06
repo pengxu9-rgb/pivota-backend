@@ -49,6 +49,8 @@ DDL = """
 DROP TABLE IF EXISTS product_quality_snapshot;
 CREATE TABLE product_quality_snapshot (
   id serial primary key,
+  merchant_id text,
+  platform text,
   snapshot_date timestamp,
   details json
 );
@@ -81,23 +83,41 @@ def _engine():
     return create_engine(url.replace("postgresql://", "postgresql+psycopg2://", 1))
 
 
-def _seed(conn, *, rows: int, summary_score: float, description_score: float = 100.0):
-    conn.execute(text("DELETE FROM product_quality_snapshot"))
+def _seed(
+    conn,
+    *,
+    rows: int,
+    summary_score: float,
+    description_score: float = 100.0,
+    attributes_score: float = 100.0,
+    platform: str = "external_seed",
+    merchant: str | None = None,
+    days_ago: int = 0,
+    reset: bool = True,
+):
+    """`days_ago` > 30 puts the rows OUTSIDE the check's recent window, which is
+    how a test gives a lane HISTORY for a component without also giving it a
+    recent non-zero row (that would simply make the component alive)."""
+    if reset:
+        conn.execute(text("DELETE FROM product_quality_snapshot"))
     for _ in range(rows):
         details = {
             "components": [
                 {"name": "title", "score": 100.0},
                 {"name": "description", "score": description_score},
                 {"name": "summary", "score": summary_score},
+                {"name": "attributes", "score": attributes_score},
                 {"name": "price", "score": 100.0},
             ]
         }
         conn.execute(
             text(
-                "INSERT INTO product_quality_snapshot (snapshot_date, details) "
-                "VALUES (NOW(), CAST(:d AS json))"
+                "INSERT INTO product_quality_snapshot "
+                "(merchant_id, platform, snapshot_date, details) "
+                "VALUES (:m, :p, NOW() - make_interval(days => :d), CAST(:dt AS json))"
             ),
-            {"d": json.dumps(details)},
+            {"m": merchant or f"merch_{platform}", "p": platform, "d": int(days_ago),
+             "dt": json.dumps(details)},
         )
 
 
@@ -115,17 +135,209 @@ def test_canary_sql_executes_on_postgres():
 
 
 def test_canary_fires_on_a_dead_component():
+    """A lane that USED TO score `summary` and now scores it zero on 250
+    recent rows: that is the defect this check exists for."""
     chk = _check("dead_quality_component")
     _assert_throwaway_database()
     eng = _engine()
     with eng.begin() as conn:
         conn.execute(text(DDL))
         _seed(conn, rows=250, summary_score=0.0)
+        _seed(conn, rows=1, summary_score=80.0, days_ago=60, reset=False)  # history
         count = conn.execute(text(chk["count_sql"])).scalar()
         names = [r[0] for r in conn.execute(text(chk["sample_sql"])).fetchall()]
     eng.dispose()
     assert count == 1, f"expected the dead component to be counted, got {count}"
-    assert names == ["summary"]
+    assert names == ["external_seed:summary"]
+
+
+def test_a_lane_that_never_produced_the_component_is_not_a_dead_component():
+    """The 2026-09-01 false alarm. Merchant-sync payloads carry no seed data and
+    no size/usage keys, so `attributes` is structurally zero for them; that is
+    a scorer-design question, not an outage. No history in the lane => silent."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=250, summary_score=100.0, attributes_score=0.0, platform="wix")
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 0
+
+
+def test_another_lanes_history_does_not_make_this_lanes_zero_a_death():
+    """History is PER LANE. The seed lane scoring `attributes` on thousands of
+    rows says nothing about whether Wix ever could — and the window is per
+    lane too, so a chatty lane cannot push a quiet lane's rows out of it and
+    then be judged on the quiet lane's behalf."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=250, summary_score=100.0, attributes_score=0.0, platform="wix")
+        _seed(conn, rows=300, summary_score=100.0, attributes_score=100.0,
+              platform="external_seed", reset=False)
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 0
+
+
+def test_one_chatty_merchant_cannot_convict_its_lane():
+    """The window is per (platform, merchant), not per platform. A Wix store
+    rescored 2,500 times with `summary` at zero must not read as "wix:summary
+    is dead" while another Wix merchant is scoring it 90 right now — and that
+    healthier merchant's rows are exactly what would otherwise satisfy the
+    history EXISTS. Healthy rows go in FIRST (lower ids), chatty rows on top."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=300, summary_score=90.0, platform="wix", merchant="wix_healthy")
+        _seed(conn, rows=2500, summary_score=0.0, platform="wix", merchant="wix_chatty",
+              reset=False)
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 0
+
+
+def test_a_lane_dead_across_every_merchant_is_still_caught():
+    """The verdict grain is the LANE: two merchants both at zero on a component
+    the lane used to produce is the outage, and each contributes to the >=200
+    floor."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=1, summary_score=80.0, platform="wix", merchant="wix_a", days_ago=60)
+        _seed(conn, rows=120, summary_score=0.0, platform="wix", merchant="wix_a", reset=False)
+        _seed(conn, rows=120, summary_score=0.0, platform="wix", merchant="wix_b", reset=False)
+        count = conn.execute(text(chk["count_sql"])).scalar()
+        names = [r[0] for r in conn.execute(text(chk["sample_sql"])).fetchall()]
+    eng.dispose()
+    assert count == 1
+    assert names == ["wix:summary"]
+
+
+def test_malformed_historical_details_cannot_cost_the_check_its_verdict():
+    """The history EXISTS reads the platform's whole history, so one old row
+    with a non-numeric score or a non-array `components` used to raise — and a
+    check that raises reports {"error": ...} instead of a verdict, the failure
+    mode #2007 exists to stop. Such rows must count as nothing, not as an
+    exception."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=1, summary_score=80.0, days_ago=60)
+        _seed(conn, rows=250, summary_score=0.0, reset=False)
+        for bad in (
+            {"components": [{"name": "summary", "score": "n/a"}]},
+            {"components": [{"name": "summary", "score": True}]},
+            {"components": {"summary": 1}},
+            "just a string",
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO product_quality_snapshot "
+                    "(merchant_id, platform, snapshot_date, details) "
+                    "VALUES ('merch_external_seed', 'external_seed', "
+                    "NOW() - INTERVAL '200 days', CAST(:dt AS json))"
+                ),
+                {"dt": json.dumps(bad)},
+            )
+        count = conn.execute(text(chk["count_sql"])).scalar()
+        names = [r[0] for r in conn.execute(text(chk["sample_sql"])).fetchall()]
+    eng.dispose()
+    # The malformed rows are neither evidence of life ("n/a" is not > 0) nor a
+    # crash: the genuinely dead component is still reported.
+    assert count == 1
+    assert names == ["external_seed:summary"]
+
+
+def test_malformed_history_alone_is_not_evidence_of_life():
+    """The counterpart: with NO genuine non-zero row, malformed history must
+    not satisfy the EXISTS either — `"n/a"` and `true` are 0, not > 0."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=250, summary_score=0.0)
+        for bad in (
+            {"components": [{"name": "summary", "score": "n/a"}]},
+            {"components": [{"name": "summary", "score": True}]},
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO product_quality_snapshot "
+                    "(merchant_id, platform, snapshot_date, details) "
+                    "VALUES ('merch_external_seed', 'external_seed', "
+                    "NOW() - INTERVAL '200 days', CAST(:dt AS json))"
+                ),
+                {"dt": json.dumps(bad)},
+            )
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 0
+
+
+def test_a_lone_store_has_slack_above_the_floor():
+    """Cap must exceed floor. A single-merchant lane whose component appears in
+    225 of its 250 recent rows is dead (history says it used to score); with a
+    200-row per-merchant window only 175 of those rows were visible and the
+    lane went silent. ORDER IS THE TEST: the 25 component-less rows are the
+    NEWEST, so a 200-row window holds 25 + 175 and misses the floor, while a
+    1,000-row window holds all 225. Inserted the other way round the window's
+    200 newest rows all carry the component and the cap mutant survives."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        _seed(conn, rows=1, summary_score=80.0, platform="wix", days_ago=60)
+        _seed(conn, rows=225, summary_score=0.0, platform="wix", reset=False)
+        # ...then 25 rows WITHOUT the component at all, newest of all.
+        for _ in range(25):
+            conn.execute(
+                text(
+                    "INSERT INTO product_quality_snapshot "
+                    "(merchant_id, platform, snapshot_date, details) "
+                    "VALUES ('merch_wix', 'wix', NOW(), CAST(:dt AS json))"
+                ),
+                {"dt": json.dumps({"components": [{"name": "title", "score": 100.0}]})},
+            )
+        count = conn.execute(text(chk["count_sql"])).scalar()
+    eng.dispose()
+    assert count == 1
+
+
+def test_the_window_is_per_lane_not_global():
+    """A lane with history that goes dead is still caught even when another
+    lane out-writes it by an order of magnitude — the failure mode of the
+    first version was that the global LIMIT 2000 became one lane's rows."""
+    chk = _check("dead_quality_component")
+    _assert_throwaway_database()
+    eng = _engine()
+    with eng.begin() as conn:
+        conn.execute(text(DDL))
+        # ORDER IS THE TEST. The dead lane's rows go in FIRST (lower ids), then
+        # the chatty lane writes 2,100 rows on top. A global "most recent 2,000"
+        # window now contains only Wix rows and never sees the dead lane; a
+        # per-lane window still does. Inserted the other way round the dead
+        # rows sit inside the global window too and the mutant survives.
+        _seed(conn, rows=1, summary_score=80.0, platform="external_seed", days_ago=60)
+        _seed(conn, rows=250, summary_score=0.0, platform="external_seed", reset=False)
+        _seed(conn, rows=2100, summary_score=100.0, attributes_score=0.0, platform="wix", reset=False)
+        count = conn.execute(text(chk["count_sql"])).scalar()
+        names = [r[0] for r in conn.execute(text(chk["sample_sql"])).fetchall()]
+    eng.dispose()
+    assert count == 1
+    assert names == ["external_seed:summary"]
 
 
 def test_canary_is_silent_when_every_component_is_alive():
@@ -146,13 +358,20 @@ def test_small_samples_cannot_manufacture_a_violation():
 
     The >=200 floor exists so that two rows scoring zero on a component do not
     trip an alarm whose default threshold is 0.
+
+    The lane is given HISTORY on purpose: without it the history EXISTS
+    filters the five rows out for an unrelated reason and this test is green
+    whatever the floor is (a `HAVING count(*) >= 1` mutant survived it at one
+    point). With history, only the floor stands between five zeros and an
+    alarm.
     """
     chk = _check("dead_quality_component")
     _assert_throwaway_database()
     eng = _engine()
     with eng.begin() as conn:
         conn.execute(text(DDL))
-        _seed(conn, rows=5, summary_score=0.0)
+        _seed(conn, rows=1, summary_score=80.0, days_ago=60)
+        _seed(conn, rows=5, summary_score=0.0, reset=False)
         count = conn.execute(text(chk["count_sql"])).scalar()
     eng.dispose()
     assert count == 0
@@ -183,6 +402,7 @@ async def test_sample_rows_carry_subject_key_through_the_production_reader():
     with eng.begin() as conn:
         conn.execute(text(DDL))
         _seed(conn, rows=250, summary_score=0.0)
+        _seed(conn, rows=1, summary_score=80.0, days_ago=60, reset=False)  # history
     eng.dispose()
 
     db = Database(DATABASE_URL.replace("postgres://", "postgresql://", 1))
@@ -192,4 +412,4 @@ async def test_sample_rows_carry_subject_key_through_the_production_reader():
         names = [r[SAMPLE_KEY_COLUMN] for r in rows]
     finally:
         await db.disconnect()
-    assert names == ["summary"]
+    assert names == ["external_seed:summary"]

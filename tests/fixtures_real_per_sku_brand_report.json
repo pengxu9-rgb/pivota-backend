@@ -1,0 +1,114 @@
+{
+  "audit_run_id": "REDACTED-RUN-ID",
+  "brand_rollup": {
+    "citation_by_intent": {
+      "category_head": {
+        "cited": 5,
+        "rate": 0.625,
+        "skus": 3,
+        "total": 8
+      },
+      "constraint": {
+        "cited": 5,
+        "rate": 0.714,
+        "skus": 2,
+        "total": 7
+      },
+      "navigational": {
+        "cited": 3,
+        "rate": 0.5,
+        "skus": 3,
+        "total": 6
+      },
+      "problem_jtbd": {
+        "cited": 9,
+        "rate": 0.9,
+        "skus": 3,
+        "total": 10
+      },
+      "trust": {
+        "cited": 7,
+        "rate": 1.0,
+        "skus": 3,
+        "total": 7
+      }
+    },
+    "dimensions": {
+      "citation": {
+        "above_count": 2,
+        "band": "partial",
+        "band_label": "Needs work",
+        "dimension_label": "Citation",
+        "meaning": "AI mentions this product occasionally, but rarely as the answer.",
+        "median": 48,
+        "p25": 42,
+        "p75": 50,
+        "question": "Does AI actually recommend you?",
+        "total_count": 3
+      },
+      "content_richness": {
+        "above_count": 2,
+        "band": "blocked",
+        "band_label": "Not yet visible",
+        "dimension_label": "Content",
+        "meaning": "The listing is too thin for AI to describe this product.",
+        "median": 23,
+        "p25": 20,
+        "p75": 23,
+        "question": "Does the listing answer what shoppers ask?",
+        "total_count": 3
+      },
+      "identity": {
+        "above_count": 3,
+        "band": "blocked",
+        "band_label": "Not yet visible",
+        "dimension_label": "Identity",
+        "meaning": "AI can't reliably tell which product this is.",
+        "median": 16,
+        "p25": 16,
+        "p75": 16,
+        "question": "Can AI tell exactly which product this is?",
+        "total_count": 3
+      },
+      "routability": {
+        "above_count": 3,
+        "band": "blocked",
+        "band_label": "Not yet visible",
+        "dimension_label": "Routability",
+        "meaning": "AI has no buyable offer to route a shopper to.",
+        "median": 6,
+        "p25": 6,
+        "p75": 6,
+        "question": "Can AI hand a shopper a buyable offer?",
+        "total_count": 3
+      }
+    },
+    "merchant_type": "brand",
+    "prompt_mix": {
+      "branded": 13,
+      "branded_axes": [
+        "navigational",
+        "trust"
+      ],
+      "branded_share": 0.342,
+      "by_axis": {
+        "category_head": 8,
+        "constraint": 7,
+        "navigational": 6,
+        "problem_jtbd": 10,
+        "trust": 7
+      },
+      "cap_share": 0.3,
+      "floor": 2,
+      "total": 38,
+      "unbranded": 25,
+      "unbranded_share": 0.658
+    },
+    "prompt_mix_note": "Prompt mix rebalanced (#1521): product/brand-naming (branded) prompts are capped at a minority share so the audit measures unbranded discovery demand, not just ~100% branded recall. Citation/visibility scores are NOT directly comparable across a prompt_mix_version change \u2014 a lower branded share mechanically lowers the cited rate. Compare deltas only within the same prompt_mix_version.",
+    "prompt_mix_version": 3,
+    "skus_audited": 3
+  },
+  "brand_state": "scored",
+  "brand_verdict_label": "PARTIAL",
+  "coverage_profile": "explicit"
+}

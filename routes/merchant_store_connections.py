@@ -7,8 +7,16 @@ from services.shopify_access_token_service import (
     exchange_shopify_client_credentials_token,
     resolve_shopify_admin_access_token,
 )
-from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
+from services.wix_connection import (
+    WixConnectionValidationError,
+    find_wix_stores_by_instance_id,
+    is_wix_instance_id,
+    merge_wix_credential,
+    validate_wix_catalog_access,
+)
 from services.store_lifecycle_service import sync_catalog_merchant_status
+from services.shopify_domain import canonicalize_shop_domain, normalize_myshopify_domain
+from services.bigcommerce_event_adapter import SUPPORTED_BIGCOMMERCE_SCOPES
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError
@@ -29,7 +37,14 @@ from urllib.parse import quote, urlparse, urlencode
 
 from db.database import IS_POSTGRES, database
 from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
-from utils.auth import get_current_user, hash_password, verify_password as verify_bcrypt_password
+from utils.auth import (
+    MERCHANT_OR_ADMIN_ROLES,
+    MERCHANT_OR_EMPLOYEE_STAFF_ROLES,
+    can_access_merchant,
+    get_current_user,
+    hash_password,
+    verify_password as verify_bcrypt_password,
+)
 from config.settings import settings
 from config.settings import resolve_public_api_base_url
 from services.merchant_web_collector_service import (
@@ -51,6 +66,14 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "orders/updated",
     "orders/paid",
     "orders/cancelled",
+    # Refunds. services/shopify_commerce_event_adapter.py maps refunds/create
+    # into the canonical ledger (refund.created, and refund.succeeded per
+    # successful refund transaction), and routes/webhook_routes.py reconciles
+    # it operationally. Until 2026-09-04 no install path registered it, so
+    # Shopify refunds reached the ledger only for merchants who had run the
+    # verify flow. Every topic the adapter maps must be registered here;
+    # tests/test_shopify_refund_webhook_subscription.py pins that.
+    "refunds/create",
     "fulfillments/create",
     "fulfillments/update",
     "orders/fulfilled",
@@ -116,27 +139,14 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
         return None
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    candidate = raw if "://" in raw else f"https://{raw}"
-    try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").strip().lower()
-        return host or None
-    except Exception:
-        return raw.lower()
-
-
 def _validate_myshopify_domain(value: str) -> str:
-    shop = (_canonicalize_shop_domain(value) or "").strip().lower()
-    if not shop:
+    # The one place a 400 is the right answer: the caller's own input. Everywhere else the value is
+    # re-checked with normalize_myshopify_domain and FALLS BACK, because failing a merchant's
+    # install over an unexpected upstream response would be worse than the thing being prevented.
+    if not (canonicalize_shop_domain(value) or "").strip():
         raise HTTPException(status_code=400, detail="shop is required")
-    # Basic guard: allow only the canonical myshopify domain during OAuth.
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", shop):
+    shop = normalize_myshopify_domain(value)
+    if not shop:
         raise HTTPException(status_code=400, detail="shop must be a *.myshopify.com domain")
     return shop
 
@@ -742,13 +752,13 @@ async def shopify_oauth_start(
     Start Shopify OAuth install.
     Requires a Pivota JWT (merchant/employee/admin).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
 
     shop_domain = _validate_myshopify_domain(shop)
@@ -995,7 +1005,13 @@ async def _shopify_oauth_callback_impl(request: Request):
     if not isinstance(shop_info, dict):
         raise HTTPException(status_code=400, detail="Invalid Shopify shop response")
 
-    canonical_myshopify_domain = (shop_info.get("myshopify_domain") or shop_domain).strip().lower()
+    # `shop_domain` is already validated; `myshopify_domain` is whatever the upstream response
+    # carried, and it — not the validated input — is what gets PERSISTED and later turned back into
+    # an Admin API URL by this repo and by the gateway. Re-check it, and fall back to the validated
+    # input rather than failing the install.
+    canonical_myshopify_domain = (
+        normalize_myshopify_domain(shop_info.get("myshopify_domain")) or shop_domain
+    )
     shop_name = (shop_info.get("name") or canonical_myshopify_domain).strip()
     if stored_shop_domain and stored_shop_domain not in {canonical_myshopify_domain, shop_domain}:
         raise HTTPException(status_code=400, detail="OAuth shop mismatch (reason=shop_domain_mismatch)")
@@ -1265,20 +1281,29 @@ async def shopify_token_diagnostic(
     """
     Diagnostic: verify Shopify token validity and required scopes without leaking secrets.
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only access your own merchant")
 
     store = await get_primary_store(target_merchant_id)
     if not store or (store.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-    shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
+    # Same stored column, same Admin API URLs, same guard as verify_shopify_integration. This route
+    # is the sharper of the two: it returns the upstream status codes in a 200 body, so an unpinned
+    # host here is a read-back SSRF oracle rather than a blind one.
+    raw_domain = (store.get("domain") or store.get("shop_domain") or "")
+    shop_domain = normalize_myshopify_domain(raw_domain) or ""
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
     access_token, token_meta = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store.get("api_key_raw") or store.get("api_key"),
@@ -1368,6 +1393,15 @@ class ConnectWixRequest(BaseModel):
     site_id: str
     api_key: str
     store_name: Optional[str] = None
+    # The id of the Pivota app INSTANCE on this Wix site. Wix webhooks are an
+    # app-level extension delivered to one static URL for every site that
+    # installed the app, and the delivery names its site only by `instanceId`
+    # (https://dev.wix.com/docs/build-apps/develop-your-app/api-integrations/events-and-webhooks/about-webhooks.md),
+    # so routes/wix_webhooks.py cannot resolve a store without it. Nothing
+    # persisted it before this: the API-key connect below never knew it, and
+    # the OAuth path is still a 501 stub. Optional, because catalog sync works
+    # without it — a store that omits it simply receives no telemetry.
+    instance_id: Optional[str] = None
 
 
 @router.get("/wix/oauth/start")
@@ -1383,7 +1417,15 @@ async def wix_oauth_start_stub(
       {"access_token": "<bearer token>", "site_id": "<wix site id>"}
     in merchant_stores.api_key.
     """
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
+    # The one site in this module that had no role gate at all -- only the
+    # merchant comparison -- so an agent or a buyer reached the body. The body
+    # is an unconditional 501, so nothing was exposed; it is gated here for the
+    # same reason the rest of the file is spelled one way: the next person to
+    # implement this stub inherits the guard instead of having to notice its
+    # absence. Non-merchant, non-staff callers now get 403 rather than 501.
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
     raise HTTPException(
         status_code=501,
@@ -1451,6 +1493,48 @@ def _woocommerce_webhook_callback_url(store_id: str) -> str:
     if len(callback_url) > 2048:
         raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
     return callback_url
+
+
+def _bigcommerce_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("BIGCOMMERCE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure BIGCOMMERCE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/bigcommerce/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
+def _bigcommerce_credentials(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value or not value.startswith("{"):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
 
 
 def _woocommerce_credentials(raw: object) -> dict:
@@ -1553,6 +1637,7 @@ async def _woocommerce_webhook_install_lock(store_id: str):
 
 
 _WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+_BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
 
 
 class ConnectBigCommerceRequest(BaseModel):
@@ -1595,12 +1680,9 @@ async def merchant_connect_custom_store(
     current_user: dict = Depends(get_current_user),
 ):
     """Create a credential-free store scope for custom/headless telemetry."""
-    if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if (
-        current_user.get("role") == "merchant"
-        and str(current_user.get("merchant_id") or "") != str(request.merchant_id)
-    ):
+    if not can_access_merchant(current_user, request.merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
 
     try:
@@ -1747,19 +1829,23 @@ async def merchant_connect_shopify(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Shopify store"""
-    # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # If merchant role, verify they can only connect their own store
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
-        # Validate shop domain and credentials
-        if not request.shop_domain or not request.shop_domain.strip():
-            raise HTTPException(status_code=400, detail="Shop domain is required")
+        # Validate shop domain and credentials.
+        #
+        # This used to check only that the string was non-empty, while the comment claimed to
+        # validate it. Everything below builds a URL from it and sends CREDENTIALS there: the
+        # client-credentials token exchange, and `GET https://<host>/admin/api/.../shop.json` with
+        # an Admin token. An authenticated merchant could therefore point this repo's egress at any
+        # host or port and read the outcome from the status echoed back in the 400 detail. The
+        # shape check is also a PRECONDITION for the myshopify_domain re-check further down, whose
+        # fallback is this value — falling back to an unvalidated host would defeat it.
+        shop_domain = _validate_myshopify_domain(request.shop_domain)
 
         provided_access_token = (request.access_token or "").strip()
         provided_client_id = (request.client_id or "").strip()
@@ -1780,7 +1866,7 @@ async def merchant_connect_shopify(
         exchanged_expires_in: Optional[int] = None
         if not effective_access_token:
             exchanged_token, exchanged_expires_in, exchange_error = await exchange_shopify_client_credentials_token(
-                shop_domain=request.shop_domain,
+                shop_domain=shop_domain,
                 client_id=provided_client_id,
                 client_secret=provided_client_secret,
             )
@@ -1792,7 +1878,7 @@ async def merchant_connect_shopify(
             effective_access_token = exchanged_token
 
         # Test Shopify API connection
-        test_url = f"https://{request.shop_domain}/admin/api/2025-10/shop.json"
+        test_url = f"https://{shop_domain}/admin/api/2025-10/shop.json"
         headers = {"X-Shopify-Access-Token": effective_access_token}
         
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1810,7 +1896,9 @@ async def merchant_connect_shopify(
             raise HTTPException(status_code=400, detail="Invalid Shopify response")
         
         shop_info = shop_data["shop"]
-        canonical_myshopify_domain = (shop_info.get("myshopify_domain") or request.shop_domain or "").strip().lower()
+        canonical_myshopify_domain = (
+            normalize_myshopify_domain(shop_info.get("myshopify_domain")) or shop_domain
+        )
         logger.info(f"✅ Shopify credentials verified for {canonical_myshopify_domain}")
 
         # Storefront token strategy:
@@ -1829,7 +1917,7 @@ async def merchant_connect_shopify(
                AND (domain = :domain_input OR domain = :domain_canonical)""",
             {
                 "merchant_id": request.merchant_id,
-                "domain_input": request.shop_domain,
+                "domain_input": shop_domain,
                 "domain_canonical": canonical_myshopify_domain,
             },
         )
@@ -2120,10 +2208,10 @@ async def merchant_verify_shopify_integration(
     - capability probes (Shopify Payments / Returns)
     Persists a snapshot to pcs_merchant_capabilities when available.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != request.merchant_id:
+    if not can_access_merchant(current_user, request.merchant_id):
         raise HTTPException(status_code=403, detail="Can only verify your own store")
 
     if not request.callback_base_url or not request.callback_base_url.strip():
@@ -2155,14 +2243,14 @@ async def list_shopify_webhook_events(
     Read-only debug: list latest ingested Shopify webhook events for a merchant.
     Does NOT return payload_json (to avoid leaking PII).
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = merchant_id or current_user.get("merchant_id")
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only access your own merchant")
 
     safe_limit = max(1, min(int(limit or 20), 200))
@@ -2216,14 +2304,14 @@ async def merchant_sync_shopify_products(
     Sync Shopify products for a merchant.
     Mirrors /merchant/integrations/shopify/sync so legacy front-ends keep working.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = request.merchant_id or current_user.get("merchant_id")
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only sync your own store")
 
     store_row = await database.fetch_one(
@@ -2250,6 +2338,17 @@ async def merchant_sync_shopify_products(
             detail=f"Store is {store.get('status')}. Please reconnect your store."
         )
 
+    # Pinned here -- before the credential lookup and outside the try below, so the refusal costs no
+    # further work and is not reshaped by that block's broad handler. Both uses downstream build a
+    # URL from this: the token refresh POSTs client credentials to {domain}/admin/oauth/access_token,
+    # and fetch_products reads from the same host.
+    sync_shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
+    if not sync_shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
+
     # Call Shopify adapter directly
     try:
         import json
@@ -2263,7 +2362,7 @@ async def merchant_sync_shopify_products(
         )
         api_key_raw = cred_row["api_key"] if cred_row else None
         access_token, token_meta = await resolve_shopify_admin_access_token(
-            shop_domain=store.get("domain"),
+            shop_domain=sync_shop_domain,
             api_key_raw=api_key_raw,
             store_id=str(store.get("store_id") or "").strip() or None,
         )
@@ -2288,7 +2387,7 @@ async def merchant_sync_shopify_products(
 
         while pages_fetched < max_pages:
             products, next_page, error = await ShopifyProductAdapter.fetch_products(
-                shop_domain=store["domain"],
+                shop_domain=sync_shop_domain,
                 access_token=access_token,
                 merchant_id=target_merchant_id,
                 limit=250,
@@ -2395,16 +2494,47 @@ async def merchant_connect_wix(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Wix store"""
-    # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # If merchant role, verify they can only connect their own store
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
+        instance_id = str(request.instance_id or "").strip()
+        if instance_id:
+            # Shape-checked with the SAME predicate the receiver uses, so an
+            # id the receiver could never resolve is refused at the door
+            # rather than persisted and silently ignored — and so nothing
+            # carrying a SQL LIKE wildcard reaches the lookup below.
+            if not is_wix_instance_id(instance_id):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "WIX_INSTANCE_ID_INVALID",
+                        "message": "instance_id must be a Wix app instance id (8-64 chars, letters, digits and '-').",
+                    },
+                )
+            # `merchant_stores` has no uniqueness on the instance id, and
+            # `POST /webhooks/wix` resolves a store by nothing else. Without
+            # this check merchant B could type merchant A's instance id and
+            # start receiving A's signed order and refund events. First claim
+            # wins; the second is a 409.
+            claimed = await find_wix_stores_by_instance_id(database, instance_id)
+            foreign = [
+                row
+                for row in claimed
+                if str(row.get("merchant_id") or "") != str(request.merchant_id)
+            ]
+            if foreign:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "WIX_INSTANCE_ID_ALREADY_CLAIMED",
+                        "message": "That Wix app instance is already connected to another merchant.",
+                    },
+                )
+
         try:
             validation = await validate_wix_catalog_access(request.site_id, request.api_key)
         except WixConnectionValidationError as exc:
@@ -2417,28 +2547,49 @@ async def merchant_connect_wix(
         api_key = validation["api_key"]
 
         logger.info("Wix credentials verified for merchant=%s", request.merchant_id)
-        
+
         # Check if store already exists
         existing_store = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = 'wix' AND domain = :site_id""",
             {"merchant_id": request.merchant_id, "site_id": site_id}
         )
-        
+
         if existing_store:
+            # `merge_wix_credential`, not a bare write: a reconnect that does
+            # not re-supply `instance_id` must not erase the one already
+            # stored, or the merchant's telemetry goes dark at their next
+            # credential rotation with no error anywhere. A store that never
+            # had a blob and is not opting into telemetry still gets the bare
+            # key, byte-identical to before.
+            stored_credential = merge_wix_credential(
+                dict(existing_store).get("api_key"),
+                api_key=api_key,
+                site_id=site_id,
+                instance_id=instance_id,
+            )
             # Update existing store
             await database.execute(
-                """UPDATE merchant_stores 
+                """UPDATE merchant_stores
                    SET api_key = :token, status = 'active', connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "token": api_key}
+                {"store_id": existing_store["store_id"], "token": stored_credential}
             )
             store_id = existing_store["store_id"]
         else:
+            # Nothing stored yet: an instance id makes it the JSON blob every
+            # Wix reader in this repo already understands
+            # (`normalize_wix_api_key`, `extract_wix_site_id`,
+            # `adapters/wix_adapter.py::extract_wix_order_credentials` all read
+            # `api_key`/`site_id`/`instance_id` out of one); without one it is
+            # the bare key, exactly as before.
+            stored_credential = merge_wix_credential(
+                None, api_key=api_key, site_id=site_id, instance_id=instance_id
+            )
             # Insert new store
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
-                """INSERT INTO merchant_stores 
+                """INSERT INTO merchant_stores
                    (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                    VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)""",
                 {
@@ -2446,7 +2597,7 @@ async def merchant_connect_wix(
                     "merchant_id": request.merchant_id,
                     "site_id": site_id,
                     "name": request.store_name or f"Wix Store {site_id[:8]}",
-                    "token": api_key
+                    "token": stored_credential
                 }
             )
         
@@ -2475,12 +2626,11 @@ async def merchant_connect_woocommerce(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their WooCommerce store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_url or not request.consumer_key or not request.consumer_secret:
@@ -2575,7 +2725,7 @@ async def ensure_woocommerce_webhooks(
     store_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    if current_user.get("role") not in {"merchant", "employee", "admin", "super_admin"}:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     store = await database.fetch_one(
         """
@@ -2590,10 +2740,9 @@ async def ensure_woocommerce_webhooks(
     if not store:
         raise HTTPException(status_code=404, detail="Connected WooCommerce store not found")
     store = dict(store)
-    if (
-        current_user.get("role") == "merchant"
-        and current_user.get("merchant_id") != str(store.get("merchant_id") or "")
-    ):
+    # The owning merchant is a property of the ROW here: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
         raise HTTPException(status_code=403, detail="Can only manage your own store")
 
     credentials = _woocommerce_credentials(store.get("api_key"))
@@ -2643,12 +2792,11 @@ async def merchant_connect_bigcommerce(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their BigCommerce store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_hash or not request.access_token:
@@ -2722,9 +2870,14 @@ async def merchant_connect_bigcommerce(
         return {
             "status": "success",
             "message": "BigCommerce store connected successfully",
-            "store_id": store_id
+            "store_id": store_id,
+            "webhook_path": f"/webhooks/bigcommerce/{store_id}",
+            "webhook_subscription_path": (
+                f"/integrations/bigcommerce/{store_id}/webhooks/ensure"
+            ),
+            "required_webhook_scopes": list(SUPPORTED_BIGCOMMERCE_SCOPES),
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -2734,18 +2887,129 @@ async def merchant_connect_bigcommerce(
         raise HTTPException(status_code=500, detail=f"Failed to connect BigCommerce: {str(e)}")
 
 
+@router.post("/bigcommerce/{store_id}/webhooks/ensure")
+async def ensure_bigcommerce_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Register (or re-sync) the BigCommerce hooks that feed the ledger.
+
+    BigCommerce does not sign deliveries, so the receiver's credential is a
+    per-store random secret carried in a header the hook itself declares. It is
+    minted here on first use, persisted into the store's credential JSON, and
+    NEVER returned: the response says which scopes and callback were installed,
+    nothing more.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'bigcommerce'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected BigCommerce store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    credentials = _bigcommerce_credentials(store.get("api_key"))
+    store_hash = str(credentials.get("store_hash") or "").strip()
+    access_token = str(credentials.get("access_token") or "").strip()
+    if not store_hash or not access_token:
+        raise HTTPException(status_code=409, detail="BigCommerce API credentials are incomplete")
+
+    webhook_secret = str(credentials.get("webhook_secret") or "").strip()
+    minted_secret = not webhook_secret
+    if minted_secret:
+        webhook_secret = secrets.token_urlsafe(32)
+
+    from services.bigcommerce_webhook_subscriptions import (
+        BigCommerceWebhookSubscriptionError,
+        ensure_bigcommerce_subscriptions,
+    )
+
+    callback_url = _bigcommerce_webhook_callback_url(store_id)
+    if minted_secret:
+        # Persist BEFORE registering: a hook that carries a secret the
+        # receiver does not know would 401 every delivery.
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET api_key = :api_key
+            WHERE store_id = :store_id
+            """,
+            {
+                "store_id": store_id,
+                "api_key": json.dumps(
+                    {**credentials, "webhook_secret": webhook_secret},
+                    separators=(",", ":"),
+                ),
+            },
+        )
+
+        # Two first-time calls can race: each mints its own secret and the
+        # last UPDATE wins. Hooks must carry the secret the RECEIVER holds, so
+        # re-read the row and register with whatever actually persisted; the
+        # loser's minted value is discarded, never registered.
+        persisted = await database.fetch_one(
+            "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+            {"store_id": store_id},
+        )
+        persisted_secret = str(
+            _bigcommerce_credentials(dict(persisted).get("api_key") if persisted else None)
+            .get("webhook_secret")
+            or ""
+        ).strip()
+        if not persisted_secret:
+            raise HTTPException(
+                status_code=503, detail="BigCommerce webhook secret could not be persisted"
+            )
+        webhook_secret = persisted_secret
+    try:
+        async with asyncio.timeout(90.0):
+            async with _BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY:
+                result = await ensure_bigcommerce_subscriptions(
+                    store_hash=store_hash,
+                    access_token=access_token,
+                    client_id=credentials.get("client_id"),
+                    callback_url=callback_url,
+                    secret=webhook_secret,
+                    scopes=SUPPORTED_BIGCOMMERCE_SCOPES,
+                )
+    except BigCommerceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="BigCommerce webhook management request failed",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="BigCommerce webhook installation timed out",
+        ) from exc
+    return {"status": "success", "store_id": store_id, **result}
+
+
 @router.post("/prestashop/connect")
 async def merchant_connect_prestashop(
     request: ConnectPrestaShopRequest,
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their PrestaShop store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_url or not request.api_key:
@@ -2771,25 +3035,50 @@ async def merchant_connect_prestashop(
         
         logger.info(f"✅ PrestaShop credentials verified for {request.store_url}")
         
-        # Check if store already exists
+        # Check if store already exists. `api_key` is SELECTed too, not just
+        # `store_id`: that cell is a credential BLOB once telemetry has been
+        # provisioned -- `{"api_key": ..., "webhook_secret": ...}` -- and the
+        # telemetry secret is the only copy Pivota has (the merchant holds the
+        # other, pasted into the module).
         existing_store = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = 'prestashop' AND domain = :domain""",
             {"merchant_id": request.merchant_id, "domain": request.store_url}
         )
-        
+
         if existing_store:
-            # Update existing store
+            # Update existing store. READ-MODIFY-WRITE, not an overwrite: this
+            # UPDATE used to put the bare Webservice key over the whole cell,
+            # which destroyed the `webhook_secret`
+            # `ensure_prestashop_telemetry` had minted. After that the receiver
+            # answered every signed module delivery with 401, and the module --
+            # which cannot tell a rotated secret from an outage -- burned its
+            # 20-attempt budget and dropped the events. Reconnecting a shop is
+            # a routine thing to do; silently disarming its telemetry is not.
+            existing_store = dict(existing_store)
+            preserved = _prestashop_credentials(existing_store.get("api_key"))
+            preserved.pop("api_key", None)
+            stored_api_key = (
+                json.dumps({"api_key": request.api_key, **preserved}, separators=(",", ":"))
+                if preserved
+                # Nothing to preserve: keep the plain-string shape this column
+                # has always had for a store with no telemetry, so the generic
+                # `parse_api_key` readers see exactly what they see today.
+                else request.api_key
+            )
             await database.execute(
-                """UPDATE merchant_stores 
+                """UPDATE merchant_stores
                    SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
                        connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "api_key": request.api_key}
+                {"store_id": existing_store["store_id"], "api_key": stored_api_key}
             )
             store_id = existing_store["store_id"]
         else:
-            # Insert new store
+            # Insert new store. No telemetry secret can exist for a store row
+            # that does not exist yet, so the bare key is written as-is;
+            # `ensure_prestashop_telemetry` migrates the cell to the blob shape
+            # the first time it mints.
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
                 """INSERT INTO merchant_stores 
@@ -2819,20 +3108,213 @@ async def merchant_connect_prestashop(
         raise HTTPException(status_code=500, detail=f"Failed to connect PrestaShop: {str(e)}")
 
 
+class EnsurePrestaShopTelemetryRequest(BaseModel):
+    """Body of the PrestaShop telemetry provisioning call.
+
+    `rotate` is the only knob: it mints a NEW secret and returns it once,
+    which is what a merchant does after the old one leaked or after moving
+    the shop.
+    """
+
+    rotate: bool = False
+
+
+def _prestashop_credentials(raw: object) -> dict:
+    """The credential JSON in `merchant_stores.api_key`.
+
+    `merchant_connect_prestashop` persists the BARE Webservice key (a plain
+    string, not JSON), so a store connected before telemetry existed is
+    migrated here to `{"api_key": "<the bare key>"}` rather than having its
+    key destroyed by the secret write.
+    """
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    if not value.startswith("{"):
+        return {"api_key": value}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"api_key": value}
+    return dict(parsed) if isinstance(parsed, dict) else {"api_key": value}
+
+
+def _prestashop_telemetry_endpoint(store_id: str) -> str:
+    return (
+        f"{resolve_public_api_base_url().rstrip('/')}"
+        f"/webhooks/prestashop/{quote(store_id, safe='')}"
+    )
+
+
+@router.post("/prestashop/{store_id}/telemetry/ensure")
+async def ensure_prestashop_telemetry(
+    store_id: str,
+    request: EnsurePrestaShopTelemetryRequest = Body(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Mint the shared secret the PrestaShop module signs its batches with.
+
+    PrestaShop is the one platform where the secret has to reach a HUMAN:
+    there is no OAuth handshake and no webhook API to register a callback
+    through, so the merchant pastes this value into the module's configuration
+    page. That forces a different lifecycle from `ensure_bigcommerce_webhooks`,
+    which never returns its secret because the server installs the hooks
+    itself:
+
+    * the call that MINTS the secret returns it, exactly once;
+    * every later call returns `secret_provisioned: true` and no secret;
+    * `{"rotate": true}` mints a replacement and returns that one once.
+
+    A merchant who loses the value rotates; there is no read-back path, and
+    the secret is never logged.
+
+    Because the secret LEAVES the system here, the two paths that return one
+    (the first mint and a rotation) are held to `MERCHANT_OR_ADMIN_ROLES`, not
+    to the whole staff tier `can_access_merchant` waves through: every employee
+    role could otherwise mint a per-store signing credential for any merchant,
+    or rotate a live one and silently sever a shop's telemetry until a human
+    re-pastes it. The wider staff tier still reaches the read-only answer
+    (`secret_provisioned: true/false`). Every call is logged with the actor,
+    the target and what it did -- never the value.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'prestashop'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected PrestaShop store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    rotate = bool(request.rotate) if request is not None else False
+    credentials = _prestashop_credentials(store.get("api_key"))
+    existing_secret = str(credentials.get("webhook_secret") or "").strip()
+    endpoint = _prestashop_telemetry_endpoint(store_id)
+
+    def _audit(action: str) -> None:
+        """One line per call: who, which store, what happened.
+
+        This route mints, rotates and hands out a per-store SIGNING credential
+        and staff roles can reach any merchant's store, so a call that leaves
+        no trace is an untraceable credential event. The secret itself is
+        never an argument here -- `secret_provisioned` is a boolean.
+        """
+        logger.info(
+            "prestashop_telemetry_ensure action=%s store_id=%s store_merchant_id=%s "
+            "actor_role=%s actor_user_id=%s actor_merchant_id=%s rotate_requested=%s "
+            "secret_was_provisioned=%s",
+            action,
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            current_user.get("merchant_id") or "-",
+            rotate,
+            bool(existing_secret),
+        )
+
+    # The secret-RETURNING paths are owner-or-admin only. Reading the state is
+    # not: an employee troubleshooting a shop may still ask whether it is
+    # provisioned, they just cannot cause a value to be handed out, and cannot
+    # rotate one -- a rotation is a silent telemetry outage for the shop until
+    # a human re-pastes the new value into the module.
+    if (rotate or not existing_secret) and current_user.get("role") not in MERCHANT_OR_ADMIN_ROLES:
+        _audit("denied_rotate" if rotate else "denied_mint")
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the merchant or an admin may mint or rotate the "
+                "PrestaShop telemetry secret"
+            ),
+        )
+
+    if existing_secret and not rotate:
+        # The secret exists and this call did not mint it, so it is not ours to
+        # hand out again. Rotation is the only way back to a readable value.
+        _audit("noop")
+        return {
+            "status": "success",
+            "store_id": store_id,
+            "endpoint": endpoint,
+            "shop_url": store.get("domain"),
+            "secret_provisioned": True,
+        }
+
+    minted = secrets.token_urlsafe(32)
+    await database.execute(
+        """
+        UPDATE merchant_stores
+        SET api_key = :api_key
+        WHERE store_id = :store_id
+        """,
+        {
+            "store_id": store_id,
+            "api_key": json.dumps(
+                {**credentials, "webhook_secret": minted}, separators=(",", ":")
+            ),
+        },
+    )
+    # Two first-time calls (or two rotations) can race and the last UPDATE
+    # wins. The merchant must paste the secret the RECEIVER will hold, so
+    # re-read the row and return whatever actually persisted; the loser's
+    # minted value is discarded, never shown. `databases`+asyncpg reports no
+    # rowcount from an UPDATE, so the re-read is also the only proof the write
+    # landed at all.
+    persisted = await database.fetch_one(
+        "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+        {"store_id": store_id},
+    )
+    persisted_secret = str(
+        _prestashop_credentials(dict(persisted).get("api_key") if persisted else None)
+        .get("webhook_secret")
+        or ""
+    ).strip()
+    if not persisted_secret:
+        _audit("mint_failed")
+        raise HTTPException(
+            status_code=503, detail="PrestaShop telemetry secret could not be persisted"
+        )
+    _audit("rotated" if existing_secret else "minted")
+    return {
+        "status": "success",
+        "store_id": store_id,
+        "endpoint": endpoint,
+        "shop_url": store.get("domain"),
+        # The ONE response that carries it. Nothing logs this value.
+        "secret": persisted_secret,
+        "secret_provisioned": True,
+        "rotated": bool(existing_secret),
+    }
+
+
+
 @router.post("/stores/support-email")
 async def merchant_update_store_support_email(
     request: UpdateStoreSupportEmailRequest,
     current_user: dict = Depends(get_current_user),
 ):
     """Allow merchant to set a support email for review invitations."""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = request.merchant_id or current_user.get("merchant_id")
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only update your own store")
 
     support_email = (request.support_email or "").strip() or None
@@ -2881,13 +3363,13 @@ async def merchant_get_store_support_email(
     current_user: dict = Depends(get_current_user),
 ):
     """Get the current (and effective) support email used for review invitations."""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only view your own store")
 
     # Backward compatibility: column may not exist on some deployments.

@@ -369,6 +369,221 @@ async def ensure_required_schema_light() -> None:
                 # first authorization 500s inside Reap's 1.6s budget, which Reap
                 # renders as a declined card — not a silent wrong answer.
                 pass
+            # mig 212: the recovery key — the join the Prove stage rests on.
+            # Early and wrapped for the same reason as mig 210 below: this
+            # branch is ONE try, and an unguarded CREATE INDEX further down
+            # abandons everything after it on a partial database.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_tasks
+                          ADD COLUMN IF NOT EXISTS recovery_key TEXT NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS recovery_key VARCHAR(40) NULL;
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 215: collector token registry. Early and wrapped like its
+            # siblings: the issue routes INSERT into these tables, so a deploy
+            # that skips db/migrations/ would fail every token provisioning
+            # until they exist. Both tables here, both in the migration.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_tokens (
+                            jti VARCHAR(64) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            store_id VARCHAR(128) NOT NULL,
+                            token_type VARCHAR(32) NOT NULL,
+                            token_version INTEGER NOT NULL,
+                            store_token_version INTEGER NOT NULL,
+                            allowed_origins JSONB NULL,
+                            issued_at TIMESTAMPTZ NOT NULL,
+                            expires_at TIMESTAMPTZ NOT NULL,
+                            revoked_at TIMESTAMPTZ NULL,
+                            revoked_reason VARCHAR(64) NULL,
+                            superseded_by VARCHAR(64) NULL,
+                            issued_by VARCHAR(128) NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_store "
+                        "ON merchant_collector_tokens (merchant_id, store_id);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_merchant_collector_tokens_expiring "
+                        "ON merchant_collector_tokens (expires_at) WHERE revoked_at IS NULL;"
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS merchant_collector_token_policy (
+                            store_id VARCHAR(128) PRIMARY KEY,
+                            merchant_id VARCHAR(50) NOT NULL,
+                            min_token_version INTEGER NOT NULL DEFAULT 1,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 213: trust provenance on the commerce ledger. Early and
+            # wrapped like mig 212: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until these columns exist. Four columns in
+            # the migration, four here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS write_path VARCHAR(48) NULL,
+                          ADD COLUMN IF NOT EXISTS authority VARCHAR(16) NULL,
+                          ADD COLUMN IF NOT EXISTS agent_identity_confidence VARCHAR(24) NULL,
+                          ADD COLUMN IF NOT EXISTS synthetic BOOLEAN NOT NULL DEFAULT FALSE;
+                        """
+                    )
+                )
+                # The mig-214 partial index is deliberately absent here: it
+                # rolls out CONCURRENTLY, which this guard's transaction
+                # cannot do, and nothing on the write path needs it.
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 216: the canonical order_ref. Early and wrapped like mig 213
+            # for the same reason: the SQLAlchemy INSERT names every modeled
+            # column, so a deploy that skips db/migrations/ would fail every
+            # canonical event write until BOTH columns exist. Two columns in
+            # the migration, two here; and unlike mig 214's index this one is
+            # built normally (order_ref is new and all-NULL, so there is
+            # nothing to scan), so the guard carries it too.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interactions
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS commerce_interaction_events
+                          ADD COLUMN IF NOT EXISTS order_ref VARCHAR(160) NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interactions_order_ref "
+                        "ON commerce_interactions (order_ref);"
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_commerce_interaction_events_order_ref "
+                        "ON commerce_interaction_events (order_ref);"
+                    )
+                )
+                # The stitch rests on this one: without it two authorities can
+                # both insert an interaction for the same canonical order and
+                # neither insert raises.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_commerce_interactions_order_ref_unique "
+                        "ON commerce_interactions (merchant_id, COALESCE(store_id, ''), order_ref) "
+                        "WHERE order_ref IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Best-effort like every sibling; must not starve what follows.
+                pass
+            # mig 210: anonymous audit runs. Position and wrapping are BOTH
+            # load-bearing, and neither alone is enough — measured, not assumed.
+            #
+            # Sitting at the end of the chain, this block NEVER RAN on a
+            # partial database: `CREATE INDEX ... ON commerce_interactions`
+            # ~1600 lines below has no IF EXISTS guard on its table, raises
+            # UndefinedTable, and abandons every statement after it. Reproduced
+            # 2026-09-03 on a database holding only merchant_audit_runs —
+            # merchant_id stayed NOT NULL and merchant_claimed_at was never
+            # added, i.e. the one deploy shape this self-heal exists for.
+            # Wrapping alone would not have fixed it: the abort happens
+            # UPSTREAM, so the block has to move too. Same answer the mig-207
+            # block above reaches, for the same reason.
+            #
+            # Both halves must be here. A deploy that skips db/migrations/
+            # would otherwise leave merchant_id NOT NULL with the column
+            # present, and every anonymous insert would fail. The
+            # schema-guard-coverage gate only inspects ADD COLUMN, so the
+            # DROP NOT NULL is carried deliberately, and the partial index
+            # with it — three statements in the migration, three here.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_audit_runs
+                          ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        """
+                        ALTER TABLE IF EXISTS merchant_audit_runs
+                          ALTER COLUMN merchant_id DROP NOT NULL;
+                        """
+                    )
+                )
+                await database.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_merchant_audit_runs_unclaimed "
+                        "ON merchant_audit_runs (requested_at DESC) "
+                        "WHERE merchant_id IS NULL;"
+                    )
+                )
+                # mig 211 (#2020): one unclaimed funnel run per domain. NOT
+                # CONCURRENTLY here — this path runs inside the guard's own
+                # transaction, where CONCURRENTLY is illegal. On a database
+                # that reaches this code the table is small or the index
+                # already exists; the migration carries the CONCURRENTLY form
+                # for the hot production table.
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_funnel_run_one_per_domain ON merchant_audit_runs "
+                        "((partial_result_jsonb->'funnel'->>'domain')) "
+                        "WHERE merchant_id IS NULL "
+                        "AND subject_type = 'public_funnel';"
+                    )
+                )
+            except Exception:
+                # Best-effort, like every sibling. Failing here is fail-CLOSED
+                # (anonymous inserts error); it must not starve what follows.
+                pass
             # Universal commerce collector references (migration 204). Railway
             # fast-mode skips migrations, while SQLAlchemy SELECTs materialize
             # every modeled column; self-heal before the first event arrives.

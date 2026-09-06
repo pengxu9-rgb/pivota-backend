@@ -11,7 +11,7 @@ import json
 
 from db.database import database
 from services.payment_routing_service import PaymentRoutingService
-from utils.auth import get_current_employee
+from utils.auth import ADMIN_ROLES, get_current_employee
 
 # Initialize router
 router = APIRouter(
@@ -555,7 +555,7 @@ async def set_agent_override_permission(
     """
     try:
         # Check if employee is admin
-        if current_user.get("role") != "admin":
+        if current_user.get("role") not in ADMIN_ROLES:
             raise HTTPException(status_code=403, detail="Only admin employees can manage override permissions")
         
         result = await database.execute(

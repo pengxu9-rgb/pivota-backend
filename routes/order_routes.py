@@ -53,6 +53,7 @@ from services.merchant_capability_gate import (
     capability_gate_permits_order_create,
 )
 from services.commerce_attribution_service import (
+    PIVOTA_ORDER_ID_NOTE_ATTR,
     PVT_CLICK_ID,
     PVT_PRODUCT_ID,
     PVT_PROMPT_CLUSTER,
@@ -2305,8 +2306,16 @@ def _build_shopify_discount_order_annotations(
     order_id: str,
     pricing_quote_meta: Dict[str, Any],
 ) -> Tuple[List[str], List[Dict[str, str]]]:
+    # The Pivota order id is stamped on EVERY written-back order, quote or no
+    # quote. It is what lets the Shopify orders/* webhook recognise this order
+    # as Pivota-originated from its own body and emit the same canonical
+    # `pivota:<order id>` order_ref the Stripe bridge does — without it, the
+    # same purchase counts its GMV twice, once per namespace. It used to be
+    # built only alongside discount annotations, so a plain order carried no
+    # marker at all.
+    order_marker = [{"name": PIVOTA_ORDER_ID_NOTE_ATTR, "value": str(order_id)}]
     if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
-        return [], []
+        return [], order_marker
 
     tags: List[str] = []
     note_attributes: List[Dict[str, str]] = []
@@ -2332,7 +2341,7 @@ def _build_shopify_discount_order_annotations(
         note_attributes.append({"name": "pivota_payment_offer_evidence_hash", "value": payment_offer_hash})
 
     # Keep a stable cross-system join key even if the quote id is absent on a legacy row.
-    note_attributes.append({"name": "pivota_order_id", "value": str(order_id)})
+    note_attributes.extend(order_marker)
     return tags, note_attributes
 
 
@@ -5683,6 +5692,14 @@ async def create_woocommerce_order(order_id: str) -> bool:
                     "payment_method": "pivota_external",
                     "payment_method_title": "Pivota External Payment",
                     "customer_note": f"Pivota Order ID: {order_id}",
+                    # Machine-readable twin of the customer_note above: the
+                    # WooCommerce webhook adapter reads it to emit the same
+                    # canonical `pivota:<order id>` order_ref the Stripe bridge
+                    # does, instead of a second `woocommerce:<native id>`
+                    # identity for the same purchase.
+                    "meta_data": [
+                        {"key": PIVOTA_ORDER_ID_NOTE_ATTR, "value": str(order_id)}
+                    ],
                     "billing": billing_address,
                     "shipping": shipping_address,
                     "line_items": line_items,

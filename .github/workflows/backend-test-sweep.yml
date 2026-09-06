@@ -51,10 +51,18 @@ on:
       - 'config/**'
       - 'mvp/**'
       - 'adapters/**'
+      # The Shopify Web Pixel mapper is JavaScript and is not imported by the
+      # Python sweep. Watch integration-only changes so its Node contract test
+      # cannot be skipped when the runtime mapper changes.
+      - 'integrations/**'
       - 'jobs/**'
       - 'middleware/**'
       - 'core/**'
       - 'catalog/**'
+      # The commerce-agents adapter's tests run in this file's
+      # commerce-agents-adapter job; without this line a change to the adapter
+      # or its tests would skip that job entirely.
+      - 'integrations/commerce-agents/**'
       # dashboard/ and orchestrator/ matched NO filter, and two of the tests in
       # tests/test_operations_authz_and_jwt_secret_enforcement.py exist to guard
       # exactly those two files — the orchestrator's publisher call signatures
@@ -125,6 +133,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run Shopify Web Pixel mapper contract
+        run: node --test tests/shopify_web_pixel_mapper.node.test.mjs
 
       - name: Install dependencies
         run: |
@@ -279,7 +293,17 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys, math, collections, xml.etree.ElementTree as ET
-          FLOOR = 12000
+          # 2026-09-05: 14,973 executed on main; the 13,600 floor had grown 1,373
+          # of slack (cap 14,960) and the cap tripped, as designed — on the
+          # push-to-main run, where it is fatal, after passing advisory on the
+          # PR that carried the tests. Re-floated into the window the assert
+          # printed (13,612..14,973), at the same ~97%-of-measured the last
+          # re-float used: ~470 tests of deletion headroom, cap 16,470.
+          #
+          # 2026-09-03: 14,027 executed on main; the 12,000 floor had grown 2,027
+          # of slack (cap 13,200) and the cap tripped, as designed. Re-floated
+          # into the window the assert printed (12,752..14,027).
+          FLOOR = 14500
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
@@ -338,7 +362,9 @@ jobs:
           # not a floor" failure this file documents above, reproduced by the
           # un-quarantine itself. 120 leaves 13 for a legitimate deletion while
           # still noticing the file leaving; cap(120) = 270 stays clear of 133.
-          SUBTREES = {'tests.services': 1600, 'readiness.tests': 120}
+          # tests.services: 1,852 executed on 2026-09-03 against a 1,600 floor
+          # (cap 1,760); re-floated into its window (1,684..1,852).
+          SUBTREES = {'tests.services': 1800, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
@@ -428,9 +454,14 @@ jobs:
 
   # NEW TEST FILES MUST LAND INSIDE THE SWEPT TREES.
   #
-  # The sweep covers `tests/**` and `readiness/tests/**`, so the realistic way to
-  # create a new invisible test is to put it somewhere else. Cheap insurance
-  # against the exact habit that produced the 92%.
+  # The sweep covers `tests/**` and `readiness/tests/**`, and the
+  # commerce-agents-adapter job below covers `integrations/commerce-agents/tests/`,
+  # so the realistic way to create a new invisible test is to put it somewhere
+  # else. Cheap insurance against the exact habit that produced the 92%. A tree
+  # is listed as swept here ONLY while a job in this file runs it; the adapter
+  # tree went red on main on 2026-09-03 for exactly that reason (its tests
+  # needed packages the sweep does not install), and the job is the remedy, not
+  # an exemption.
   #
   # ⚠️ IT KEYS ON CONTENT, NOT FILENAME — and the first version did not, which is
   # why it was RED on its own branch. Two pre-existing files start with `test_`
@@ -458,7 +489,7 @@ jobs:
         run: |
           python - <<'PY'
           import subprocess, sys, os, re
-          SWEPT = ('tests/', 'readiness/tests/')
+          SWEPT = ('tests/', 'readiness/tests/', 'integrations/commerce-agents/tests/')
           COLLECTABLE = re.compile(r'^\s*(async\s+)?def\s+test_|^\s*class\s+Test', re.M)
 
           tracked = subprocess.run(['git', 'ls-files', '*.py'],
@@ -486,4 +517,51 @@ jobs:
           skipped = len(candidates) - len(stray)
           print(f"clean — {len(candidates)} test_*.py outside swept trees, "
                 f"{skipped} of them define no tests (production modules / manual helpers)")
+          PY
+
+  # integrations/commerce-agents/tests/ is swept by THIS job, not by `sweep`.
+  # Those tests import the blueprint's packages (shopping_agent, commerce_common),
+  # which are not on PyPI and not in requirements.txt, so the sweep cannot
+  # collect them; they went red on main on 2026-09-03 as "collectable tests
+  # outside the swept trees". The packages are installed here from the blueprint
+  # repo at a pinned commit, and an executed-count floor keeps a green job that
+  # ran nothing from counting as coverage.
+  commerce-agents-adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # anthropics/commerce-agents, "building commerce agents using claude",
+      # 2026-08-31. Bump deliberately: the adapter is written against this
+      # commit's StorefrontBackend contract.
+      COMMERCE_AGENTS_REF: fd4d59224ab96b43c6dc6888207c67b3bd5a24cf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the blueprint's packages at the pinned commit
+        run: |
+          git clone --quiet https://github.com/anthropics/commerce-agents.git "$RUNNER_TEMP/commerce-agents"
+          git -C "$RUNNER_TEMP/commerce-agents" checkout --quiet "$COMMERCE_AGENTS_REF"
+          python -m pip install --upgrade pip
+          pip install -e "$RUNNER_TEMP/commerce-agents/commerce-common" \
+                      -e "$RUNNER_TEMP/commerce-agents/shopping-agent/core" \
+                      pytest pytest-asyncio httpx
+      - name: Run the adapter tests
+        working-directory: integrations/commerce-agents
+        env:
+          PYTHONPATH: .:tests
+        run: |
+          set -o pipefail
+          python -m pytest -q -p no:cacheprovider --junitxml=adapter.xml
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse('adapter.xml').getroot()
+          suite = root if root.tag == 'testsuite' else root.find('testsuite')
+          ran = int(suite.get('tests', 0)) - int(suite.get('skipped', 0))
+          FLOOR = 20  # 24 measured on 2026-09-03
+          print(f"adapter tests executed={ran} floor={FLOOR}")
+          if ran < FLOOR:
+              sys.exit(f"::error::only {ran} adapter tests executed against a floor of {FLOOR} "
+                       "— a green job that ran nothing is the failure this floor exists for")
           PY

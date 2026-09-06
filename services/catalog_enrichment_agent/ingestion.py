@@ -197,10 +197,96 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         # catalog_products columns on purpose — INCI lives in the beauty tables.
         "raw_inci": (str(pdp.get("raw_inci")).strip() or None) if pdp.get("raw_inci") else None,
         "inci_source": str(pdp.get("inci_source") or "").strip() or None,
+        # Real variants when the record carries them (the curated Shopify feed
+        # emits one entry per sellable variant on multi-variant products, and a
+        # folded shade line arrives this way). Each becomes a SKU + offer beside
+        # the canonical SKU — see _build_variant_sku_inserts.
+        "variants": [v for v in (pdp.get("variants") or []) if isinstance(v, dict)],
     }
     if not payload["brand"] or not payload["product_name"]:
         return {}
     return payload
+
+
+VARIANT_SKU_INFIX = "::v:"
+# The serving lane renders at most 30 variants (routes/agent_api.py); this bounds
+# what a pathological feed can put in one seed_data row. MAC's widest line carries
+# 82 shades — catalog_skus keeps every one of them, which is the authority.
+MAX_SEED_VARIANTS = 100
+
+
+# catalog_skus.sku_key is VARCHAR(255) and product_key alone can reach 214 chars
+# (derive_product_key: 'ext:' + canonical[:200] + '::' + 8 hex), so the variant
+# suffix has to fit in what is left rather than assume the 11 chars '::canonical'
+# always did. A token that would overflow is hashed, which keeps the key stable
+# across re-runs (the whole point of deriving it from the merchant's variant id).
+_SKU_KEY_MAX = 255
+
+
+def derive_variant_sku_key(product_key: str, variant_id: str) -> str:
+    """One SKU per real variant, keyed on the merchant's own variant id so
+    re-runs UPSERT; distinct from the canonical '::canonical' SKU."""
+    token = _normalize_token(str(variant_id)).replace(" ", "-")[:60] or "v"
+    budget = _SKU_KEY_MAX - len(product_key) - len(VARIANT_SKU_INFIX)
+    if budget < len(token):
+        digest = hashlib.sha1(str(variant_id).encode("utf-8")).hexdigest()[:16]
+        token = digest if budget >= len(digest) else digest[: max(budget, 0)]
+    return f"{product_key}{VARIANT_SKU_INFIX}{token}"
+
+
+def _build_variant_sku_inserts(
+    *,
+    product_key: str,
+    pdp_payload: Dict[str, Any],
+    seller: Dict[str, str],
+    canonical_url: Optional[str],
+) -> List[Dict[str, Any]]:
+    """One catalog_skus row per real variant, in the shape merchant sync writes
+    for a shade: title = shade name, visible_option_labels = ['shade_<name>']
+    (the label prefix catalog_sync_service's shade extractor keys on), the
+    variant's own sku / barcode / image. Nothing when the record has fewer
+    than two variants — the canonical SKU already represents the product."""
+    variants = pdp_payload.get("variants") or []
+    if len(variants) < 2:
+        return []
+    rows: List[Dict[str, Any]] = []
+    seen: set = set()
+    for v in variants:
+        vid = str(v.get("variant_id") or "").strip()
+        if not vid:
+            continue
+        sku_key = derive_variant_sku_key(product_key, vid)
+        if sku_key in seen:
+            continue
+        seen.add(sku_key)
+        shade = str(v.get("title") or "").strip()
+        shade_token = _normalize_token(shade).replace(" ", "_").strip("_")
+        labels = [f"shade_{shade_token}"] if shade_token else []
+        rows.append({
+            "sku_key": sku_key,
+            "product_key": product_key,
+            "merchant_id": seller["merchant_id"],
+            "platform": SYNTHETIC_PLATFORM,
+            "source_product_id": canonical_product_name(pdp_payload["brand"], pdp_payload["product_name"]),
+            "source_variant_id": vid[:128],
+            "source_domain": pdp_payload.get("source_domain") or None,
+            "sku": str(v.get("sku") or "").strip() or None,
+            "barcode": str(v.get("barcode") or "").strip() or None,
+            "title": shade or pdp_payload["product_name"],
+            "currency": "USD",
+            "image_url": str(v.get("image_url") or "").strip() or None,
+            "visible_attributes": json.dumps({"shade": shade} if shade else {}),
+            "visible_option_labels": json.dumps(labels),
+            "ingredient_ids": json.dumps([]),
+            "sku_payload": json.dumps({
+                "agent_version": AGENT_VERSION,
+                "variant_id": vid,
+                "source_handle": v.get("source_handle"),
+                "canonical_url": canonical_url,
+            }),
+            "readiness_tier": OFFER_READINESS_TIER,
+        })
+    return rows
 
 
 def _coerce_rating_value(value: Any) -> Optional[float]:
@@ -464,6 +550,53 @@ def _build_seed_inserts(
             "availability": availability,
             "in_stock": in_stock,
         }
+        # REAL variants when the record carries them. Every external-seed lane
+        # builds its variant list from seed_data['variants'], NOT from
+        # catalog_skus — the deployed PDP reads this column directly with its own
+        # SQL, and the backend's search and checkout builders read it through
+        # `_seed_variants`. So a folded shade line whose shades exist as SKUs
+        # still served a single synthetic "canonical" variant and the shade
+        # identity was invisible on the PDP (measured on MAC 2026-09-05: 1,869
+        # shade SKUs in the catalog, one variant on the page).
+        #
+        # Keys are the ones that builder reads: variant_id / title / price_amount
+        # / price_currency / availability / image_url, plus sku for display.
+        # Cart prefill is unaffected: `sole_stamped_variant_id` reads
+        # seed_data['snapshot']['variants'], which this lane never writes, so it
+        # declines here exactly as it did before.
+        seed_variants = [synthetic_variant]
+        real_variants = pdp_payload.get("variants") or []
+        if len(real_variants) >= 2:
+            built: List[Dict[str, Any]] = []
+            for v in real_variants[:MAX_SEED_VARIANTS]:
+                vid = str(v.get("variant_id") or "").strip()
+                if not vid:
+                    continue
+                v_in_stock = bool(v.get("in_stock"))
+                shade = str(v.get("title") or "").strip()
+                image_url = str(v.get("image_url") or "").strip() or None
+                built.append({
+                    "variant_id": vid,
+                    "id": vid,
+                    "sku": str(v.get("sku") or "").strip() or None,
+                    "barcode": str(v.get("barcode") or "").strip() or None,
+                    "title": shade or pdp_payload["product_name"],
+                    "currency": "USD",
+                    "price_currency": "USD",
+                    "price_amount": v.get("price"),
+                    "price": v.get("price"),
+                    "availability": "in_stock" if v_in_stock else "out_of_stock",
+                    "in_stock": v_in_stock,
+                    "image_url": image_url,
+                    "options": _seed_variant_options(
+                        shade,
+                        v.get("option_name"),
+                        pdp_payload["product_name"],
+                    ),
+                })
+            if built:
+                _drop_options_that_do_not_distinguish(built)
+                seed_variants = built
         rows.append({
             "id": seed_id,
             "external_product_id": external_product_id,
@@ -489,11 +622,109 @@ def _build_seed_inserts(
                 "availability": availability,
                 "validated_at": offer.get("validated_at"),
                 "agent_version": AGENT_VERSION,
-                "variants": [synthetic_variant],
+                "variants": seed_variants,
                 "image_urls": [offer.get("image_url")] if offer.get("image_url") else [],
             }),
         })
     return rows
+
+
+_PLACEHOLDER_SHADE_VALUES = {
+    "default",
+    "default title",
+    "title",
+    "variant",
+    "single item",
+    "one size",
+    "n/a",
+}
+
+
+def _seed_variant_options(
+    shade: str, option_name: Any, product_name: str
+) -> List[Dict[str, str]]:
+    """The name/value pair that makes a seed variant a labelled CHOICE.
+
+    WHAT THIS BUYS. The renderer already exposed the variant LIST — a variant
+    with a non-placeholder title was enough for that. What it would not do
+    without a named axis is render the SELECTOR: `variantHasDisplayableChoice`
+    reads `options` first and an explicit `display_label` second, so #2073's real
+    MAC shades arrived as an unlabelled list with no way to pick one (measured on
+    the deployed gateway 2026-09-05). Real variant identity was necessary and not
+    sufficient.
+
+    A pair is emitted only for a value that names something, on an axis we were
+    TOLD about. The mapper's fallback title is the product name, and
+    "Default Title" is what a shop with no axis returns; either would render as a
+    selector entry naming no choice. An absent `option_name` is not a shade
+    signal either — `_build_seed_inserts` runs on any record with two or more
+    variants, including hand-validated JSONL for a lane that never folded
+    anything, and guessing "Shade" there published a volume axis as
+    "Shade: 30 ml". Only the fold knows the axis, and it always names it.
+    """
+    value = (shade or "").strip()
+    if not value:
+        return []
+    if value.lower() in _PLACEHOLDER_SHADE_VALUES:
+        return []
+    if value.lower() == (product_name or "").strip().lower():
+        return []
+    name = str(option_name or "").strip()
+    if not name:
+        return []
+    return [{"name": name, "value": value}]
+
+
+def _drop_options_that_do_not_distinguish(variants: List[Dict[str, Any]]) -> None:
+    """A product's variants carry ONE axis, every variant labelled, all labels
+    distinct — or no variant is labelled at all.
+
+    Three ways a partial labelling makes the page worse than the bare list it
+    replaces, all measured against the deployed renderer:
+
+    LABELS ON SOME. The renderer shows a picker as soon as ONE variant is
+    displayable, and lists only the displayable ones. A base whose own variants
+    sit on an axis the renderer does not recognise, with shades folded in beside
+    them, rendered a picker offering 1 of 3 purchasable variants — the other two
+    titled "Default". Before this lane wrote any options that product showed
+    nothing, so a partial labelling is a regression, not a partial win.
+
+    TWO AXES. The renderer accepts a colour axis only on a product its own
+    keyword gate reads as cosmetic, and drops the option otherwise — so on a
+    mixed product whose gate is closed it keeps "Size", drops the shades, and
+    manufactures the partial picker above downstream of us whatever we write.
+    When that gate is OPEN it renders both axes correctly (measured: a foundation
+    with Size and Shade renders 4/4), so this rule is deliberately CONSERVATIVE
+    rather than forced: we cannot see the gate from here, and a product served as
+    the bare list it was before is a worse outcome than a correct two-axis picker
+    but a better one than a picker missing half its variants. Revisit if the gate
+    ever becomes visible to this side.
+
+    THE SAME LABEL TWICE. `option1` is only the first axis, so a gloss sold
+    Full/Pink and Full/Sample yields two variants both labelled "Size: Full" —
+    a picker whose entries cannot be told apart.
+
+    All-or-nothing is the point rather than a shortcut: dropping just the
+    offending labels lands back in the first case. A product that loses its
+    labels is served exactly as it was before this lane named any axis.
+
+    LIMIT OF THIS RULE. It reasons about LABELS, and the renderer additionally
+    demands per-variant visual evidence on a colour axis — so a product whose
+    variants are labelled but partly imageless can still render a partial picker,
+    and nothing here can see that. In this lane variant images fall back to the
+    product image, so it does not arise today.
+    """
+    labelled = [v for v in variants if v.get("options")]
+    if not labelled:
+        return
+
+    axes = {o.get("name") for v in labelled for o in v["options"]}
+    keys = {tuple((o.get("name"), o.get("value")) for o in v["options"]) for v in labelled}
+    if len(labelled) == len(variants) and len(keys) == len(labelled) and len(axes) == 1:
+        return
+
+    for v in variants:
+        v["options"] = []
 
 
 def derive_seed_id(product_key: str, destination_url: str) -> str:
@@ -782,6 +1013,26 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         offers=offers,
         source_domain=pdp_row.get("source_domain"),
     )
+    # Real variants ride beside the canonical SKU: one SKU + one offer each,
+    # priced and stocked per variant, at the brand-direct destination.
+    variant_sku_rows = _build_variant_sku_inserts(
+        product_key=pdp_row["product_key"],
+        pdp_payload=pdp_payload,
+        seller=seller,
+        canonical_url=pdp_row.get("canonical_url"),
+    )
+    variant_offer_rows: List[Dict[str, Any]] = []
+    if variant_sku_rows and offers:
+        primary = offers[0]
+        by_vid = {str(v.get("variant_id") or ""): v for v in (pdp_payload.get("variants") or [])}
+        for vsku in variant_sku_rows:
+            v = by_vid.get(str(vsku["source_variant_id"])) or {}
+            variant_offer_rows.extend(_build_offer_inserts(
+                product_key=pdp_row["product_key"],
+                sku_key=vsku["sku_key"],
+                offers=[dict(primary, price=v.get("price"), in_stock=bool(v.get("in_stock")))],
+                source_domain=pdp_row.get("source_domain"),
+            ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],
         pdp_payload=pdp_payload,
@@ -795,8 +1046,9 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
     return {
         "pdp": pdp_row,
         "sku": sku_row,
+        "variant_skus": variant_sku_rows,
         "merchants": merchant_rows,
-        "offers": offer_rows,
+        "offers": offer_rows + variant_offer_rows,
         "seeds": seed_rows,
         "inci": inci_row,
         "audit_reasons": _identifier_audit_reasons(
@@ -861,6 +1113,7 @@ def ingest_validated_jsonl(
             continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
+        sku_rows.extend(result.get("variant_skus") or [])
         merchant_rows.extend(result["merchants"])
         offer_rows.extend(result["offers"])
         seed_rows.extend(result["seeds"])

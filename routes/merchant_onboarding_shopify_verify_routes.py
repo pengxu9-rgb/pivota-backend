@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from db.database import database
 from services.shopify_integration_verify import verify_shopify_integration
-from utils.auth import can_access_merchant, get_current_user
+from utils.auth import MERCHANT_OR_EMPLOYEE_STAFF_ROLES, can_access_merchant, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -77,16 +77,22 @@ async def merchant_onboarding_verify_shopify(
     Merchant-facing onboarding facade for Shopify integration verify.
     Delegates to the canonical verify service but returns a redacted report (no raw bodies/error payloads).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Can only verify your own merchant")
 
-    report = await verify_shopify_integration(
-        merchant_id=merchant_id,
-        callback_base_url=request.callback_base_url,
-        api_version=request.api_version or "2025-10",
-    )
+    try:
+        report = await verify_shopify_integration(
+            merchant_id=merchant_id,
+            callback_base_url=request.callback_base_url,
+            api_version=request.api_version or "2025-10",
+        )
+    except ValueError as exc:
+        # Without this the deliberately-worded refusal below reaches the generic handler as a bare
+        # 500 with no detail — on exactly the misconfigured merchant an operator is here to debug.
+        # Matches how /integrations/shopify/verify already maps it.
+        raise HTTPException(status_code=400, detail=str(exc))
 
     redacted = {
         "run_id": report.get("run_id"),
@@ -111,7 +117,7 @@ async def merchant_get_latest_shopify_capability_report(
     """
     Merchant-facing read-only: return the latest stored capability snapshot (redacted).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Not authorized for merchant")

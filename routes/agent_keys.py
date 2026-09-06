@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from db.database import database
 from db.agents import is_redacted_agent_api_key
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 router = APIRouter(prefix="/agents", tags=["agent-keys"])
 
@@ -75,7 +75,7 @@ async def get_agent_api_keys(
     try:
         # Verify the agent owns this resource or is admin
         user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
+        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             raise HTTPException(status_code=403, detail="Not authorized to view these API keys")
         
         # Check if api_keys table exists, if not create it
@@ -196,7 +196,7 @@ async def create_agent_api_key(
     try:
         # Verify the agent owns this resource or is admin
         user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
+        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             raise HTTPException(status_code=403, detail="Not authorized to create API keys for this agent")
         
         # Ensure table exists
@@ -260,7 +260,7 @@ async def revoke_agent_api_key(
     try:
         # Verify the agent owns this resource or is admin
         user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
+        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             raise HTTPException(status_code=403, detail="Not authorized to revoke this API key")
         
         # Update key status
@@ -296,7 +296,7 @@ async def reset_agent_api_key(
     try:
         # Verify the agent owns this resource or is admin
         user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in ["admin", "employee"]:
+        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
             raise HTTPException(status_code=403, detail="Not authorized to reset this API key")
 
         # Generate a standards-compliant external key:

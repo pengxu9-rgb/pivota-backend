@@ -109,21 +109,39 @@ def test_verifier_taxonomy_has_all_registered_verifiers():
     assert len(VALID_VERIFIERS) == 9
 
 
-def test_audience_taxonomy_has_all_5_projections():
-    """The 5-audience projection layer documented in the
-    implementation plan."""
+def test_audience_taxonomy_is_exactly_the_seven_projections():
+    """The 5-audience layer from the implementation plan, plus C2's two.
+
+    The exact-set assertion is the point: this frozenset is a permission
+    boundary, and a new audience appearing in it without a deliberate edit
+    here is a new shape someone can read. Note which list each one is on —
+    PUBLIC_ALLOWED_AUDIENCES is the unauthenticated surface.
+    """
     from db.audit_evidence import (
         VALID_AUDIENCES,
+        MERCHANT_ALLOWED_AUDIENCES, PUBLIC_ALLOWED_AUDIENCES,
         AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
         AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
         AUDIENCE_FRONTEND_AGENT_FEED,
+        AUDIENCE_REVENUE_RECOVERY, AUDIENCE_PUBLIC_ANONYMOUS,
     )
     assert VALID_AUDIENCES == {
         AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
         AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
         AUDIENCE_FRONTEND_AGENT_FEED,
+        AUDIENCE_REVENUE_RECOVERY, AUDIENCE_PUBLIC_ANONYMOUS,
     }
-    assert len(VALID_AUDIENCES) == 5
+    assert len(VALID_AUDIENCES) == 7
+    # Who may read what: merchants get two, anonymous readers get exactly one,
+    # and the four internal audiences are on neither list.
+    assert MERCHANT_ALLOWED_AUDIENCES == {
+        AUDIENCE_MERCHANT, AUDIENCE_REVENUE_RECOVERY,
+    }
+    assert PUBLIC_ALLOWED_AUDIENCES == {AUDIENCE_PUBLIC_ANONYMOUS}
+    assert not (MERCHANT_ALLOWED_AUDIENCES | PUBLIC_ALLOWED_AUDIENCES) & {
+        AUDIENCE_EMPLOYEE_BD, AUDIENCE_INTERNAL_OPS,
+        AUDIENCE_PIVOTA_PDP_FEED, AUDIENCE_FRONTEND_AGENT_FEED,
+    }
 
 
 # =====================================================================

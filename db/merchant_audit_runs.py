@@ -34,11 +34,12 @@ import asyncio
 import json
 import logging
 import os
+import json as _json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from db._jsonb_safe import _json_safe
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 
 def _decode_jsonb_field(value: Any) -> Optional[Dict[str, Any]]:
@@ -98,6 +99,7 @@ def _provider_scores_from_report(report_jsonb: Any) -> Optional[Dict[str, int]]:
 from sqlalchemy import (
     ARRAY,
     Column,
+    select as sa_select,
     DateTime,
     Integer,
     Index,
@@ -117,7 +119,15 @@ merchant_audit_runs = Table(
     "merchant_audit_runs",
     metadata,
     Column("run_id", UUID(as_uuid=False), primary_key=True),
-    Column("merchant_id", Text, nullable=False),
+    # NULL until a merchant claims the run. An anonymous run is created by
+    # the public funnel before anyone has registered; conversion claims the
+    # SAME row (never a copy) via claim_audit_run_for_merchant.
+    #
+    # Read safety: nothing grants on a NULL owner. Every ownership check
+    # compares `row.get("merchant_id") != merchant_id` against an id from
+    # get_current_merchant, which raises 401 on a falsy claim and so can
+    # never itself be None — so None != "<real id>" rejects.
+    Column("merchant_id", Text, nullable=True),
     Column("requested_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("status", Text, nullable=False),
@@ -131,6 +141,7 @@ merchant_audit_runs = Table(
     # product_key resolution basis (migration 158).
     Column("content_keys", ARRAY(Text), nullable=True),
     Column("content_key_basis", JSONB, nullable=True),
+    Column("merchant_claimed_at", DateTime(timezone=True), nullable=True),
     Column("report_jsonb", JSONB, nullable=True),
     Column("error_message", Text, nullable=True),
     # P2.1: async lifecycle columns (migration 083). See
@@ -214,7 +225,7 @@ _DDL_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS merchant_audit_runs (
       run_id                        UUID PRIMARY KEY,
-      merchant_id                   TEXT NOT NULL,
+      merchant_id                   TEXT NULL,
       requested_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       completed_at                  TIMESTAMPTZ NULL,
       status                        TEXT NOT NULL,
@@ -262,6 +273,19 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS claimed_by_worker TEXT;",
     "ALTER TABLE merchant_audit_runs "
     "ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;",
+    # C3 (migration 210): anonymous runs. The CREATE TABLE above still
+    # declares merchant_id NOT NULL for fresh databases built from this
+    # backstop, so the constraint has to be dropped explicitly for any
+    # database that already has the table. DROP NOT NULL is idempotent on
+    # Postgres and fails-and-skips on SQLite, where create_all builds the
+    # table from the model (already nullable) instead.
+    "ALTER TABLE merchant_audit_runs "
+    "ALTER COLUMN merchant_id DROP NOT NULL;",
+    "ALTER TABLE merchant_audit_runs "
+    "ADD COLUMN IF NOT EXISTS merchant_claimed_at TIMESTAMPTZ;",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_unclaimed "
+    "ON merchant_audit_runs (requested_at DESC) "
+    "WHERE merchant_id IS NULL;",
     "CREATE INDEX IF NOT EXISTS idx_merchant_audit_runs_worker_pull "
     "ON merchant_audit_runs (stage, claimed_until, requested_at) "
     "WHERE stage IN ('queued', 'discovering', 'probing', 'scoring', "
@@ -303,9 +327,295 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+SUBJECT_TYPE_PUBLIC_FUNNEL = "public_funnel"
+
+# Where an anonymous funnel run records the domain it is about. NOT a column:
+# merchant_audit_runs has no domain field, and adding one for a lane that may
+# not survive contact with real traffic is the wrong trade. partial_result_jsonb
+# already carries lane-specific payload for the URL wedge.
+_FUNNEL_DOMAIN_PATH = ("funnel", "domain")
+
+
+def funnel_domain_of(row: Mapping[str, Any]) -> Optional[str]:
+    """The domain an anonymous funnel run is about, or None."""
+    partial = row.get("partial_result_jsonb")
+    if isinstance(partial, str):
+        try:
+            partial = _json.loads(partial)
+        except Exception:  # noqa: BLE001
+            return None
+    if not isinstance(partial, Mapping):
+        return None
+    node: Any = partial
+    for key in _FUNNEL_DOMAIN_PATH:
+        if not isinstance(node, Mapping):
+            return None
+        node = node.get(key)
+    if not isinstance(node, str):
+        return None
+    # Re-normalize on READ. This value is echoed to anonymous callers and is
+    # the authorization key the claim gate compares against, so it must not be
+    # trusted just because it came out of our own column. The only writer
+    # normalizes on the way in; this makes the read side independently safe.
+    from routes.store_audit_public_intake import normalize_store_domain
+    return normalize_store_domain(node)
+
+
+async def record_anonymous_funnel_run(*, domain: str) -> Optional[str]:
+    """Start an UNOWNED run for a public-funnel visitor. Returns the run_id.
+
+    Deliberately NOT queued for the worker: `stage` keeps its 'completed'
+    server default, so claim_next_pending_run never picks it up. An
+    unauthenticated endpoint must not be able to spend model credits, which is
+    the whole reason the public tier is deterministic.
+    """
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return None
+    await ensure_merchant_audit_runs_table()
+    run_id = str(uuid.uuid4())
+    try:
+        await database.execute(
+            merchant_audit_runs.insert().values(
+                run_id=run_id,
+                merchant_id=None,
+                requested_at=_now_utc(),
+                status="succeeded",
+                subject_type=SUBJECT_TYPE_PUBLIC_FUNNEL,
+                product_keys=[],
+                partial_result_jsonb=_json_safe(
+                    {"funnel": {"domain": normalized}}
+                ),
+            )
+        )
+        return run_id
+    except Exception as exc:  # noqa: BLE001
+        # #2020: a concurrent request may have won the race for this domain.
+        # idx_funnel_run_one_per_domain (migration 211) turns that into a
+        # unique violation instead of a second row, so re-read the winner's
+        # run rather than reporting failure — the caller wants A run for this
+        # domain, not specifically the one it tried to insert.
+        #
+        # Re-reading on ANY error, not just a unique violation: the driver's
+        # exception types differ across backends, and the question this asks
+        # ("is there an unclaimed run for this domain now?") is the right one
+        # either way. If there is none, the original failure stands.
+        try:
+            winner = await find_unclaimed_funnel_run_for_domain(
+                domain=normalized, since=_now_utc() - timedelta(days=1),
+            )
+        except Exception:  # noqa: BLE001
+            winner = None
+        if winner and winner.get("run_id"):
+            logger.info(
+                "record_anonymous_funnel_run: lost the race for domain=%s, "
+                "reusing the winning run", normalized,
+            )
+            return str(winner["run_id"])
+        logger.warning(
+            "record_anonymous_funnel_run failed for domain=%s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+
+
+async def list_claimed_funnel_runs_for_merchant(
+    *, merchant_id: str, limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """The funnel checks this merchant claimed, newest claim first.
+
+    A SEPARATE read on purpose. recent_runs_for_merchant deliberately excludes
+    this lane because it feeds the history list, the visibility trend and the
+    tasks lookup, and a funnel run has no scores and no report_jsonb — folding
+    it in there would put an empty row in a trend line. A protocol check is a
+    different artifact from a GEO audit, so it gets its own surface rather than
+    being smuggled into one that means something else.
+
+    Returns the row fields only; the caller joins the deterministic evidence.
+    """
+    if not merchant_id:
+        return []
+    await ensure_merchant_audit_runs_table()
+    try:
+        # Explicit columns, not select(). A select() over the full Table breaks
+        # against any environment whose merchant_audit_runs is missing a
+        # modeled column, and this function swallows — so the merchant would be
+        # told they have NO claimed checks, which is a wrong answer wearing the
+        # shape of a right one. Naming what it reads makes that impossible.
+        rows = await database.fetch_all(
+            sa_select(
+                merchant_audit_runs.c.run_id,
+                merchant_audit_runs.c.merchant_id,
+                merchant_audit_runs.c.requested_at,
+                merchant_audit_runs.c.merchant_claimed_at,
+                merchant_audit_runs.c.partial_result_jsonb,
+            )
+            .where(
+                merchant_audit_runs.c.merchant_id == merchant_id,
+                merchant_audit_runs.c.subject_type == SUBJECT_TYPE_PUBLIC_FUNNEL,
+                merchant_audit_runs.c.merchant_claimed_at.isnot(None),
+            )
+            .order_by(merchant_audit_runs.c.merchant_claimed_at.desc())
+            .limit(max(1, int(limit)))
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_claimed_funnel_runs_for_merchant failed for merchant_id=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in rows or []]
+
+
+async def find_unclaimed_funnel_run_for_domain(
+    *, domain: str, since: datetime, limit: int = 2000,
+) -> Optional[Dict[str, Any]]:
+    """The freshest unclaimed funnel run for a domain, or None.
+
+    Matching happens in PYTHON, not SQL: the domain lives inside
+    partial_result_jsonb and `->>` is Postgres-only, while this module is
+    exercised on SQLite too.
+
+    THE BOUND MUST EXCEED WHAT THE WINDOW CAN HOLD. The candidate set is
+    subject_type + unclaimed + a time window, newest first. If `limit` is
+    smaller than the number of unclaimed runs inside `since`, an older run
+    for the domain falls off the end and the caller mints a DUPLICATE
+    instead of reusing — silently, and worse the busier the funnel gets. At
+    the intake route's daily cap this bound covers well over the 24h reuse
+    window it is called with.
+    """
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return None
+    await ensure_merchant_audit_runs_table()
+    try:
+        # Named columns, not select(): this reads a table whose other columns
+        # (ARRAY, JSONB) are dialect-specific, and the lookup needs three.
+        rows = await database.fetch_all(
+            sa_select(
+                merchant_audit_runs.c.run_id,
+                merchant_audit_runs.c.merchant_id,
+                merchant_audit_runs.c.partial_result_jsonb,
+                merchant_audit_runs.c.requested_at,
+            )
+            .where(
+                merchant_audit_runs.c.subject_type == SUBJECT_TYPE_PUBLIC_FUNNEL,
+            )
+            .where(merchant_audit_runs.c.merchant_id.is_(None))
+            .where(merchant_audit_runs.c.requested_at >= since)
+            .order_by(merchant_audit_runs.c.requested_at.desc())
+            .limit(int(limit)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "find_unclaimed_funnel_run_for_domain failed for domain=%s: %s",
+            normalized, str(exc)[:200],
+        )
+        return None
+    for row in rows or []:
+        d = dict(row)
+        if funnel_domain_of(d) == normalized:
+            # asyncpg hands a UUID column back as uuid.UUID; SQLite hands back
+            # a str. Normalize here so callers cannot compare the two shapes
+            # and silently never match on one dialect.
+            if d.get("run_id") is not None:
+                d["run_id"] = str(d["run_id"])
+            return d
+    return None
+
+
+# What a route's last_audit_run_id points AT. Tri-state on purpose:
+# fetch_audit_run_by_id() swallows every error and returns None, which is
+# indistinguishable from "no such row" — and those two need OPPOSITE answers.
+# A missing row is this lane's own synthetic placeholder (safe to replace); a
+# failed lookup means we do not know, and guessing wrong repoints a live
+# merchant's route.
+RUN_POINTER_ABSENT = "absent"
+RUN_POINTER_FUNNEL = "funnel"
+RUN_POINTER_OTHER = "other"
+RUN_POINTER_UNKNOWN = "unknown"
+
+
+async def classify_run_pointer(*, run_id: str) -> str:
+    """Classify what a run id refers to, failing CLOSED.
+
+    Returns RUN_POINTER_UNKNOWN when the lookup itself fails, so callers can
+    decline to act rather than treat a database hiccup as "nothing there".
+    Deliberately selects ONLY the two columns it needs: a select() over the
+    full Table breaks against any environment whose merchant_audit_runs is
+    missing a modeled column, and that failure would otherwise read as absent.
+    """
+    if not run_id:
+        return RUN_POINTER_ABSENT
+    await ensure_merchant_audit_runs_table()
+    try:
+        row = await database.fetch_one(
+            "SELECT subject_type, merchant_id FROM merchant_audit_runs "
+            "WHERE run_id = :r",
+            {"r": str(run_id)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "classify_run_pointer failed for run_id=%s: %s",
+            run_id, str(exc)[:200],
+        )
+        return RUN_POINTER_UNKNOWN
+    if row is None:
+        return RUN_POINTER_ABSENT
+    d = dict(row)
+    if str(d.get("subject_type") or "") == SUBJECT_TYPE_PUBLIC_FUNNEL:
+        return RUN_POINTER_FUNNEL
+    return RUN_POINTER_OTHER
+
+
+async def claim_audit_run_for_merchant(
+    *,
+    run_id: str,
+    merchant_id: str,
+) -> bool:
+    """Claim ONE unclaimed run for a merchant. Returns True iff this call
+    is the one that claimed it.
+
+    Claim-by-one-UPDATE, the pattern `claim_prospects_for_merchant` already
+    uses: the guard lives in the WHERE clause, so two concurrent claims can
+    never both succeed and the row is never duplicated. A run that already
+    has an owner is NOT re-claimable — `merchant_id IS NULL` is what makes
+    this a claim rather than a takeover.
+    """
+    if not run_id or not merchant_id:
+        return False
+    owner = str(merchant_id).strip()
+    if not owner:
+        return False
+    await ensure_merchant_audit_runs_table()
+    try:
+        # Plain UPDATE ... RETURNING rather than the data-modifying CTE the
+        # prospect_products claim uses: the CTE form is Postgres-only, and
+        # this statement is exercised on SQLite too. The guard is unchanged —
+        # it lives in the WHERE clause either way.
+        rows = await database.fetch_all(
+            """
+            UPDATE merchant_audit_runs
+               SET merchant_id = :merchant_id,
+                   merchant_claimed_at = :now
+             WHERE run_id = :run_id
+               AND merchant_id IS NULL
+            RETURNING run_id
+            """,
+            {"run_id": str(run_id), "merchant_id": owner, "now": _now_utc()},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "claim_audit_run_for_merchant failed for run_id=%s merchant=%s: %s",
+            run_id, owner, str(exc)[:200],
+        )
+        return False
+    return len(rows or []) > 0
+
+
 async def record_audit_run_started(
     *,
-    merchant_id: str,
+    merchant_id: Optional[str],
     product_keys: List[str],
     subject_type: str = "merchant",
 ) -> Optional[str]:
@@ -316,14 +626,20 @@ async def record_audit_run_started(
 
     `subject_type` marks the run kind (e.g. "merchant_url" for the free
     URL-audit wedge) so callers can count a specific kind of run.
+
+    C3: `merchant_id` may be None for a run started by the public funnel
+    before anyone has registered. An empty string is normalized to None so
+    a falsy caller id can never write "" and make the row look claimed to
+    a `merchant_id IS NULL` guard.
     """
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
+    owner = str(merchant_id).strip() if merchant_id is not None else ""
     try:
         await database.execute(
             merchant_audit_runs.insert().values(
                 run_id=run_id,
-                merchant_id=merchant_id,
+                merchant_id=owner or None,
                 requested_at=_now_utc(),
                 status="running",
                 subject_type=subject_type,
@@ -445,6 +761,13 @@ async def count_runs_in_window(
             select(func.count())
             .select_from(merchant_audit_runs)
             .where(
+                # A funnel run is not a merchant-requested audit, so it must
+                # not consume their rate-limit budget. Once claimed it carries
+                # their merchant_id, and without this a visitor's own probe of
+                # their storefront would spend the allowance they get AFTER
+                # registering.
+                merchant_audit_runs.c.subject_type
+                != SUBJECT_TYPE_PUBLIC_FUNNEL,
                 merchant_audit_runs.c.merchant_id == merchant_id,
                 merchant_audit_runs.c.requested_at >= cutoff,
             )
@@ -474,7 +797,12 @@ async def audit_status_counts_in_window(*, window_seconds: int) -> Dict[str, int
         )
         rows = await database.fetch_all(
             "SELECT status, COUNT(*) AS n FROM merchant_audit_runs "
-            "WHERE requested_at >= :cutoff GROUP BY status",
+            "WHERE requested_at >= :cutoff "
+            # The funnel lane writes terminal rows that never move through the
+            # worker's stages; counting them skews the operational picture of
+            # the lane this metric exists to watch.
+            "AND subject_type <> 'public_funnel' "
+            "GROUP BY status",
             {"cutoff": cutoff},
         )
         return {str(r["status"]): int(r["n"] or 0) for r in rows or []}
@@ -658,7 +986,14 @@ async def count_runs_for_merchant_by_subject(
         row = await database.fetch_one(
             select(func.count())
             .select_from(merchant_audit_runs)
-            .where(*conditions)
+            .where(
+                # A funnel run is not a merchant-requested audit, so it must
+                # not consume their rate-limit budget. Once claimed it carries
+                # their merchant_id, and without this a visitor's own probe of
+                # their storefront would spend the allowance they get AFTER
+                # registering.
+                merchant_audit_runs.c.subject_type
+                != SUBJECT_TYPE_PUBLIC_FUNNEL,*conditions)
         )
         if row is None:
             return 0
@@ -712,6 +1047,14 @@ async def recent_runs_for_merchant(
         )
         if subject_type:
             query = query.where(merchant_audit_runs.c.subject_type == subject_type)
+        else:
+            # Unscoped means "this merchant's audits". A claimed funnel run is
+            # a public-lane artifact with no report_jsonb, and it reaches the
+            # history list, the trend inputs and the tasks lookup through this
+            # function — naming it explicitly beats every caller remembering.
+            query = query.where(
+                merchant_audit_runs.c.subject_type != SUBJECT_TYPE_PUBLIC_FUNNEL
+            )
         rows = await database.fetch_all(
             query.order_by(merchant_audit_runs.c.requested_at.desc()).limit(limit)
         )
@@ -826,7 +1169,7 @@ async def enqueue_audit_run(
 
 async def enqueue_audit_run_with_replay(
     *,
-    merchant_id: str,
+    merchant_id: Optional[str],
     product_keys: List[str],
     subject_type: str = "merchant",
     idempotency_key: Optional[str] = None,
@@ -849,6 +1192,31 @@ async def enqueue_audit_run_with_replay(
     an active stage). The DB-level uniqueness closes the check-then-
     insert race that the route-layer find_in_flight could not.
     """
+    # C3: same "" -> NULL normalization as record_audit_run_started, so this
+    # path cannot mint the other orphan class — a row that is unowned AND
+    # permanently unclaimable, because `merchant_id IS NULL` never matches "".
+    owner = str(merchant_id).strip() if merchant_id is not None else ""
+    merchant_id = owner or None
+
+    # An idempotency key is MEANINGLESS without an owner, and silently
+    # proceeding would be worse than refusing: Postgres unique indexes are
+    # NULLS DISTINCT, so uniq_merchant_audit_runs_active_idempotency_key
+    # (merchant_id, idempotency_key) does not constrain NULL-owner rows at
+    # all — measured on PG 15: three inserts of the same key all landed,
+    # where a real owner deduped to one. ON CONFLICT DO NOTHING never fires,
+    # and the docstring's "the DB-level uniqueness closes the check-then-
+    # insert race" stops being true for exactly this row class.
+    #
+    # Unreachable today (services/idempotency.py raises on a falsy id, so no
+    # such key can be derived), and this keeps it that way rather than
+    # leaving an unauthenticated, cost-bearing insert path one wiring slice
+    # from silently duplicating runs.
+    if idempotency_key and not merchant_id:
+        raise ValueError(
+            "merchant_id is required to use an idempotency key: the unique "
+            "index is NULLS DISTINCT and would not dedupe an unowned run"
+        )
+
     await ensure_merchant_audit_runs_table()
     run_id = str(uuid.uuid4())
     now = _now_utc()

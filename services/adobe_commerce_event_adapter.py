@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
 
 
@@ -240,6 +241,7 @@ def map_adobe_commerce_io_event(
                 buyer_id=_text(entity.get("customer_id")),
                 payment_id=payment_id,
                 order_id=order_id,
+                order_ref=build_order_ref("magento", order_id),
                 refund_id=refund_id,
                 trace_id=trace_id,
                 amount_cents=_amount_cents(amount, currency),

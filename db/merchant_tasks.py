@@ -18,12 +18,14 @@ Read helpers live in services/task_queue_service.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 
 from sqlalchemy import (
+    select as sa_select,
     Column,
     DateTime,
     Index,
@@ -48,7 +50,24 @@ VALID_STATUSES = frozenset({
     # task. Preserved in the table for audit-trail visibility;
     # default list views exclude them like 'dismissed'.
     "superseded",
+    # C4 — the verification lifecycle. "done" means the merchant says they
+    # changed something; none of these mean that, and that distinction is the
+    # whole point of the Prove stage:
+    #   ready_for_retest  the fix is in place and awaiting a same-basis replay
+    #   verifying         a replay is in flight
+    #   verified          the replay showed the gap closed — the ONLY status
+    #                     that means the fix worked
+    #   regressed         it closed and re-opened; actionable again, so
+    #                     deliberately NOT terminal
+    "ready_for_retest", "verifying", "verified", "regressed",
 })
+
+# Statuses that stop a task being actionable and stamp completed_at. `verified`
+# joins them because there is nothing left to do; `regressed` deliberately does
+# NOT — a gap that re-opened needs working again, and marking it complete would
+# hide exactly the case the Prove stage exists to surface. `ready_for_retest`
+# and `verifying` are in-flight, not finished.
+TERMINAL_STATUSES = frozenset({"done", "dismissed", "failed", "verified"})
 
 VALID_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
 
@@ -59,6 +78,12 @@ merchant_tasks = Table(
     Column("task_id", UUID(as_uuid=False), primary_key=True),
     Column("merchant_id", Text, nullable=False),
     Column("parent_audit_run_id", UUID(as_uuid=False), nullable=True),
+    # The stable handle for this recovery action, derived by recovery_key_for
+    # from the same canonical identity dedupe uses. Nullable: every task
+    # written before this column existed has none, and backfilling is a
+    # separate decision — an absent key means "not attributable", which is
+    # honest, where a wrong key would be worse than none.
+    Column("recovery_key", Text, nullable=True),
     Column("source_executor_run_id", UUID(as_uuid=False), nullable=True),
     Column("parent_task_id", UUID(as_uuid=False), nullable=True),
     Column("lever", Text, nullable=True),
@@ -200,6 +225,16 @@ async def record_task_created(
                 lever=lever,
                 severity=severity,
                 title=title[:500],
+                # Derived HERE rather than asked of every caller: the key must
+                # come from one rule, and a caller that computed its own would
+                # be free to disagree. Evidence carries the host and product,
+                # which with the lever is the whole gap identity.
+                recovery_key=recovery_key_for(
+                    merchant_id=merchant_id,
+                    lever=lever,
+                    target_host=(evidence or {}).get("target_host"),
+                    product_key=(evidence or {}).get("product_key"),
+                ),
                 body=body,
                 status="pending",
                 assigned_to_agent=assigned_to_agent,
@@ -229,8 +264,7 @@ async def update_task_status(
     """Move a task to a new status. Returns True on success.
 
     Validates `status` against VALID_STATUSES — invalid → no-op +
-    WARN. When status is terminal ('done', 'dismissed', 'failed'),
-    sets completed_at."""
+    WARN. When status is terminal (see TERMINAL_STATUSES) sets completed_at."""
     if not task_id:
         return False
     if status not in VALID_STATUSES:
@@ -239,7 +273,7 @@ async def update_task_status(
     await ensure_merchant_tasks_table()
     now = _now_utc()
     values: Dict[str, Any] = {"status": status, "updated_at": now}
-    if status in ("done", "dismissed", "failed"):
+    if status in TERMINAL_STATUSES:
         values["completed_at"] = now
     if assigned_to_human is not None:
         values["assigned_to_human"] = assigned_to_human
@@ -366,7 +400,15 @@ async def list_tasks_for_merchant(
         # (Q-P0-2 — stale tasks from prior audits should not clutter
         # the live queue). `dismissed`, `done`, `failed` remain
         # excluded by default too.
-        status_filter = ["pending", "in_progress"]
+        # The OPEN queue: everything not finished. The verification states are
+        # in-flight, not done — omitting them would make a task vanish from the
+        # merchant's queue the moment it became ready to prove, and `regressed`
+        # is actionable again by definition. Leaving them out is how a task
+        # ends up open forever with nothing showing it.
+        status_filter = [
+            "pending", "in_progress",
+            "ready_for_retest", "verifying", "regressed",
+        ]
     # Validate each entry; silently drop unknowns.
     status_filter = [s for s in status_filter if s in VALID_STATUSES]
 
@@ -631,6 +673,201 @@ def _dedup_base_title(title: str) -> str:
     return t.lower()
 
 
+def canonical_action_identity(
+    *,
+    lever: Optional[str],
+    title: Optional[str],
+    target_host: Optional[str] = None,
+    product_key: Optional[str] = None,
+) -> tuple:
+    """The identity that makes two actions THE SAME action across audit runs.
+
+    Extracted from dedupe_pending_tasks, which has always used it to collapse
+    duplicates, and now shared with the recovery key so the two cannot drift.
+    That sharing is the point: a recovery key that disagreed with the dedupe
+    rule would split one merchant's fix into two keys, or merge two fixes into
+    one, and either way the Prove stage would attribute an outcome to the
+    wrong thing.
+
+    Brand-level levers collapse across products — one account-wide action, not
+    N per-SKU copies — which is why product_key drops out and the per-product
+    title suffix is stripped.
+    """
+    lv = (lever or "").lower()
+    host = str(target_host or "").lower()
+    if lv in _BRAND_LEVEL_LEVERS:
+        return (lv, _dedup_base_title(title or ""), host, "")
+    return (
+        lv,
+        (title or "").strip().lower(),
+        host,
+        str(product_key or "").lower(),
+    )
+
+
+def recovery_identity(
+    *,
+    lever: Optional[str],
+    target_host: Optional[str] = None,
+    product_key: Optional[str] = None,
+) -> tuple:
+    """What makes two actions THE SAME GAP across audit runs.
+
+    DELIBERATELY EXCLUDES THE TITLE, which is what the first cut got wrong.
+    Titles are rendered per run and splice in run-variable data — counts
+    ("Reach out to 3 matched creators", "4 content brief(s) drafted"), a
+    competitor the model named this time, a ranked host, a product label
+    truncated at 48 characters. Hashing one produced a NEW key at every audit,
+    so a fix shipped in week 1 and an order in week 3 could never match and the
+    join silently returned nothing. task_queue_service already tolerates this
+    "title drift" by skipping links rather than trusting titles.
+
+    What is stable is the gap: which lever, on whose host, for which product.
+    Two actions sharing all three ARE the same recovery to a merchant, which
+    is exactly the granularity an attributed order needs.
+
+    NOT the same function as canonical_action_identity, and not merged with
+    it. That one answers "is this the same TASK ROW" for list-time dedupe and
+    must keep using the title, or it would collapse genuinely distinct tasks.
+    This answers "is this the same GAP". Different questions, different rules —
+    pretending otherwise is what produced a key nobody could rely on.
+    """
+    return (
+        (lever or "").strip().lower(),
+        str(target_host or "").strip().lower(),
+        str(product_key or "").strip().lower(),
+    )
+
+
+def recovery_key_for(
+    *,
+    merchant_id: str,
+    lever: Optional[str],
+    target_host: Optional[str] = None,
+    product_key: Optional[str] = None,
+) -> str:
+    """A stable, opaque handle for ONE merchant's ONE recovery gap.
+
+    This is the join commerce_interactions never had: that table records a
+    complete agent loop — prompt, click, cart, order — with no reference to
+    the finding or action that preceded it, so a conversion could be observed
+    and never attributed.
+
+    DERIVED, NOT RANDOM, so it survives a re-audit: the same gap found again
+    next week yields the same key, which is what lets "this fix worked" span
+    the weeks between shipping a change and an order landing.
+
+    Merchant-scoped so two merchants with identical gaps never collide, and
+    hashed because the key rides on a published link and must not carry the
+    merchant id, the host, the product, or what we advised.
+    """
+    identity = recovery_identity(
+        lever=lever, target_host=target_host, product_key=product_key,
+    )
+    material = "\x1f".join([str(merchant_id or "").strip().lower(), *identity])
+    return "rk_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+async def list_open_recovery_tasks(*, merchant_id: str) -> List[Dict[str, Any]]:
+    """This merchant's OPEN tasks that carry a recovery key. ONE query.
+
+    Split from the matcher so a caller resolving many destinations — the offer
+    resolve path walks every matched variant — fetches once and matches in
+    memory, instead of issuing a query per variant on an agent-facing path.
+
+    ONLY OPEN TASKS. A verified or dismissed task is finished, and stamping its
+    key onto a fresh link would keep crediting a closed fix for orders it had
+    nothing to do with: attribution that is wrong is worse than absent.
+    """
+    if not merchant_id:
+        return []
+    try:
+        # ensure_merchant_tasks_table runs 9 DDL statements under a module
+        # lock, and INSIDE the try on purpose: outside it, a persistently
+        # failing DDL (permissions, lock wait) would re-run all nine behind
+        # one lock on EVERY offers.resolve — a wedge on the agent path, from
+        # a read that is only ever a nice-to-have.
+        await ensure_merchant_tasks_table()
+        rows = await database.fetch_all(
+            sa_select(
+                merchant_tasks.c.recovery_key,
+                merchant_tasks.c.evidence_jsonb,
+            )
+            .where(
+                merchant_tasks.c.merchant_id == merchant_id,
+                merchant_tasks.c.recovery_key.isnot(None),
+                merchant_tasks.c.status.notin_(sorted(TERMINAL_STATUSES)),
+                merchant_tasks.c.status != "superseded",
+            )
+            .order_by(merchant_tasks.c.updated_at.desc())
+            .limit(50)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "list_open_recovery_tasks failed for %s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in rows or []]
+
+
+def match_recovery_key(
+    open_tasks: Optional[List[Dict[str, Any]]],
+    *,
+    product_key: Optional[str] = None,
+    target_host: Optional[str] = None,
+) -> Optional[str]:
+    """Which open task, if any, describes this destination. PURE.
+
+    A product match is the stronger claim and wins; a host-only match is
+    accepted only when the caller had no product to offer, so a brand-level
+    task never steals attribution from a per-product one.
+    """
+    want_product = str(product_key or "").strip().lower()
+    want_host = str(target_host or "").strip().lower()
+    if not want_product and not want_host:
+        return None
+    host_match: Optional[str] = None
+    for row in open_tasks or []:
+        ev = (row or {}).get("evidence_jsonb") or {}
+        if not isinstance(ev, Mapping):
+            continue
+        key = str((row or {}).get("recovery_key") or "") or None
+        if not key:
+            continue
+        if want_product and str(ev.get("product_key") or "").strip().lower() == want_product:
+            return key
+        if (
+            not want_product
+            and want_host
+            and str(ev.get("target_host") or "").strip().lower() == want_host
+            and host_match is None
+        ):
+            host_match = key
+    return host_match
+
+
+async def active_recovery_key_for_destination(
+    *,
+    merchant_id: str,
+    product_key: Optional[str] = None,
+    target_host: Optional[str] = None,
+) -> Optional[str]:
+    """One-shot convenience: fetch + match for a SINGLE destination.
+
+    Callers resolving many destinations should use list_open_recovery_tasks
+    once and match_recovery_key per destination instead — this issues a query
+    every call, which is a query per variant inside a loop.
+    """
+    if not merchant_id or (not product_key and not target_host):
+        return None
+    return match_recovery_key(
+        await list_open_recovery_tasks(merchant_id=merchant_id),
+        product_key=product_key,
+        target_host=target_host,
+    )
+
+
 async def dedupe_pending_tasks(*, merchant_id: str) -> int:
     """Lazy, idempotent backlog cleanup (page-usability Step 1): collapse
     duplicate PENDING tasks that share a canonical identity
@@ -668,20 +905,14 @@ async def dedupe_pending_tasks(*, merchant_id: str) -> int:
     groups: Dict[tuple, List[Dict[str, Any]]] = {}
     for t in rows:
         ev = t.get("evidence") or {}
-        lever = (t.get("lever") or "").lower()
-        host = str(ev.get("target_host") or "").lower()
-        if lever in _BRAND_LEVEL_LEVERS:
-            # Account-wide action: collapse across products — drop product_key and
-            # the per-product title suffix so N per-SKU copies become one.
-            key = (lever, _dedup_base_title(t.get("title") or ""), host, "")
-        else:
-            # Per-product action: full identity, kept one-per-product.
-            key = (
-                lever,
-                (t.get("title") or "").strip().lower(),
-                host,
-                str(ev.get("product_key") or "").lower(),
-            )
+        # The SAME function recovery_key_for derives from. Two copies of this
+        # rule would let a fix's key and its dedupe identity disagree.
+        key = canonical_action_identity(
+            lever=t.get("lever"),
+            title=t.get("title"),
+            target_host=ev.get("target_host"),
+            product_key=ev.get("product_key"),
+        )
         groups.setdefault(key, []).append(t)
 
     superseded = 0

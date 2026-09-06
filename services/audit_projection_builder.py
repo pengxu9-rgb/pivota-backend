@@ -46,7 +46,12 @@ logger = logging.getLogger(__name__)
 
 # Bump when the projection shape changes in a way that callers
 # would notice. Semantic versioning style: major.minor.
-_BUILDER_VERSION = "1.0.0"
+# 1.1.0: the revenue_recovery headline stopped being a bare score, the
+# rollup shape became readable, and meta-findings stopped reaching merchant
+# surfaces. Cached `report_projections` rows built at 1.0.0 still hold the
+# NO_FINDINGS all-clear and the bare headline_score, so they must be
+# re-rendered rather than served — the version is what lets a reader tell.
+_BUILDER_VERSION = "1.1.0"
 
 
 # Audience constants (mirror db.audit_evidence values; kept as
@@ -57,11 +62,15 @@ AUDIENCE_MERCHANT = "merchant"
 AUDIENCE_INTERNAL_OPS = "internal_ops"
 AUDIENCE_PIVOTA_PDP_FEED = "pivota_pdp_feed"
 AUDIENCE_FRONTEND_AGENT_FEED = "frontend_agent_feed"
+AUDIENCE_REVENUE_RECOVERY = "revenue_recovery"
+AUDIENCE_PUBLIC_ANONYMOUS = "public_anonymous"
 
 VALID_AUDIENCES = frozenset({
     AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
     AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
     AUDIENCE_FRONTEND_AGENT_FEED,
+    AUDIENCE_REVENUE_RECOVERY,
+    AUDIENCE_PUBLIC_ANONYMOUS,
 })
 
 
@@ -132,7 +141,7 @@ def build_merchant_projection(
       - Re-order actions by severity (critical first) then phase
     """
     visible_findings = [
-        f for f in findings if f.get("severity") in (
+        f for f in _without_meta_findings(findings) if f.get("severity") in (
             "critical", "high", "medium",
         )
     ]
@@ -317,7 +326,9 @@ def build_frontend_agent_feed_projection(
                 "claim_payload": f.get("payload_jsonb"),
                 "confidence": f.get("confidence"),
             }
-            for f in findings
+            # Meta-findings are not claims about the brand, and this feed is
+            # built for external agents to ingest as fact.
+            for f in _without_meta_findings(findings)
         ],
         "supporting_evidence": [
             {
@@ -335,12 +346,432 @@ def build_frontend_agent_feed_projection(
 # =====================================================================
 
 
+
+# =====================================================================
+# C2: revenue_recovery + public_anonymous
+# =====================================================================
+
+# Evidence types produced WITHOUT a model call AND actually written by
+# something today. An ALLOWLIST, for the same reason _SHARE_ALLOWED_TOP_KEYS
+# is one: a denylist on an unauthenticated surface ships every future type by
+# default, and the share view already leaked registry pitch emails that way.
+#
+# ONLY TYPES WITH A LIVE WRITER. An earlier cut also allowlisted
+# commerce_integration_authorization, commerce_return_policy and
+# commerce_after_sales_review — none of which any code writes. Pre-approving a
+# payload shape that does not exist is the same failure one level up: whoever
+# implements it later will not know their payload became public. Two of those
+# names are where crawled third-party prose would land, and
+# commerce_integration_authorization's shape (see
+# services/commerce_capability_resolver.py) carries authorization_scope, i.e.
+# a merchant's commercial relationship with Pivota. Adding a type here means
+# reading its writer first.
+#
+# Excluded, each for a reason: grounding_chunk and competitor_mention are model
+# output whose excerpts are third-party prose; url_match is derived from
+# grounding; missing_signal cannot be told from its model-derived twin by type
+# alone; industry_stat is static copy, not a fact about this store.
+_DETERMINISTIC_EVIDENCE_TYPES = frozenset({
+    "acceptance_signal",
+    "commerce_platform",
+    "commerce_checkout_route",
+    "commerce_cartability",
+})
+
+# evidence_items.evidence_level is a COLUMN, and these are its only values
+# (db/audit_evidence.py). Note "detected" here means "observed indirectly",
+# NOT a boolean — it is a strength enum, and the weaker of the two.
+_EVIDENCE_LEVELS = frozenset({"detected", "tested"})
+
+_STAGE_GET_SELECTED = "get_selected"
+_STAGE_GET_CITED = "get_cited"
+_STAGE_CONVERT_SALES = "convert_sales"
+_STAGES = (_STAGE_GET_SELECTED, _STAGE_GET_CITED, _STAGE_CONVERT_SALES)
+
+# The finding types a producer can actually emit. services/audit_evidence_
+# builder.py::extract_findings is the ONLY writer of readiness_findings, and
+# these four are everything it can produce. Keeping the list explicit is what
+# lets a stage say "nothing can be measured here yet" instead of "all clear".
+_PRODUCIBLE_FINDING_TYPES = frozenset({
+    # Legacy `aggregate`/`per_product` shape.
+    "merchant_visible_via_retailers_only",
+    "category_visibility_low",
+    "first_party_pdp_indexing_gap",
+    "integration_state_incomplete",
+    # The shape production actually writes (`brand_rollup.dimensions`). Absent
+    # from this set, a stage whose only producer is the rollup would report
+    # NO_FINDINGS — "checked, fine" — because _stage_is_measurable would say
+    # nothing can produce for it. That is the same false all-clear from the
+    # other direction.
+    "product_identity_unresolvable",
+    "category_citation_weak",
+    "content_too_thin_to_cite",
+    # routability. Producible, but it is emitted at `low` severity because
+    # every one of its buckets reads PIVOTA'S catalog and serving state, not a
+    # model's answer — see _PIVOTA_INTERNAL_DIMENSIONS in the evidence builder.
+    # It is listed here so `_stage_is_measurable` still sees a producer behind
+    # the stage it belongs to; it just never appears in a merchant stage list.
+    "pivota_serving_not_ready",
+    # Meta: about the RUN, not the merchant. Producible, and handled specially
+    # below — they must never let ANY stage claim an all-clear, and they must
+    # never appear in a stage's findings either.
+    "report_shape_unreadable",
+    "no_dimension_was_scored",
+})
+
+# The finding that says we could not read the report at all. It is not evidence
+# about the merchant; it is evidence about us.
+_UNREADABLE_FINDING = "report_shape_unreadable"
+_NO_DIMENSION_SCORED_FINDING = "no_dimension_was_scored"
+
+# Findings that describe THIS RUN, not this merchant. They exist so a projection
+# cannot mistake "I could not read this" for "nothing is wrong" — that is their
+# whole job — but they are not defects the merchant has, and every surface that
+# lists or COUNTS findings was treating them as if they were:
+#
+#   - merchant `findings_summary` rendered "The findings extractor did not
+#     recognise this report's shape" to the store owner as a high-severity
+#     finding about their store;
+#   - public_anonymous `locked.findings` counted it, so the paywall teaser
+#     advertised "1 finding waiting" for a run in which nothing was read;
+#   - frontend_agent_feed published it as a claim at confidence 85, for
+#     external agents to ingest as a fact about the brand.
+#
+# They stay in the revenue_recovery stage logic, which is the one place whose
+# job is to act on them.
+_META_FINDING_TYPES = frozenset({
+    _UNREADABLE_FINDING, _NO_DIMENSION_SCORED_FINDING,
+})
+
+
+def _is_meta_finding(finding: Optional[Dict[str, Any]]) -> bool:
+    return str(
+        (finding or {}).get("finding_type") or "",
+    ).strip().lower() in _META_FINDING_TYPES
+
+
+def _without_meta_findings(
+    findings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [f for f in (findings or []) if not _is_meta_finding(f)]
+
+_STAGE_FOR_FINDING_TYPE = {
+    # Not chosen for the category's queries at all.
+    "category_visibility_low": _STAGE_GET_SELECTED,
+    # Pivota plumbing incomplete — blocks everything downstream of selection.
+    "integration_state_incomplete": _STAGE_GET_SELECTED,
+    # Something is cited for this brand, but it is not the merchant.
+    "merchant_visible_via_retailers_only": _STAGE_GET_CITED,
+    # The merchant's own page cannot be cited because it is not indexable.
+    "first_party_pdp_indexing_gap": _STAGE_GET_CITED,
+
+    # Rollup dimensions, mapped by what the dimension MEANS, not by where the
+    # default would drop them. Unmapped types fall to GET SELECTED, so leaving
+    # these out silently filed every citation problem under selection.
+    #   identity — an agent cannot tell which product this is, so it is never
+    #   the one chosen.
+    "product_identity_unresolvable": _STAGE_GET_SELECTED,
+    #   content richness — too thin to be picked out of a category.
+    "content_too_thin_to_cite": _STAGE_GET_SELECTED,
+    #   citation — mentioned, but rarely as the answer.
+    "category_citation_weak": _STAGE_GET_CITED,
+    #   routability — kept in get_cited for stage-measurability accounting
+    #   only. It is emitted at `low`, so it never reaches a merchant stage
+    #   list. It was previously emitted at high as "destination_unroutable —
+    #   AI has no buyable offer to route a shopper to", which told the merchant
+    #   their AI visibility had failed when what was measured was our own
+    #   un-ingested catalog. NOT convert_sales either: that stage means a real
+    #   purchase path was exercised, and only the browser commerce lane can say
+    #   that. Filing it there would make a stage that has never run look
+    #   measured.
+    "pivota_serving_not_ready": _STAGE_GET_CITED,
+}
+
+
+def _stage_for(finding_type: Optional[str]) -> str:
+    """Unmapped findings land in GET SELECTED — the leading stage, and the one
+    the measured evidence says the leak is actually in."""
+    return _STAGE_FOR_FINDING_TYPE.get(
+        str(finding_type or "").strip().lower(), _STAGE_GET_SELECTED,
+    )
+
+
+# A stage with no producer behind it cannot report "no findings" — that reads
+# as an all-clear for something never measured. convert_sales is the obvious
+# case (the browser commerce lane has never produced a production
+# observation); get_cited is the one an earlier cut got wrong, mapping it to
+# four finding types no producer emits and letting it report NO_FINDINGS
+# forever.
+_STAGE_UNVERIFIED_REASON = {
+    _STAGE_CONVERT_SALES: (
+        "No production observation exists for this stage yet: the browser "
+        "commerce lane has never run against a live store."
+    ),
+}
+
+
+def _stage_is_measurable(stage: str) -> bool:
+    """True iff some producible finding type routes to this stage."""
+    if stage in _STAGE_UNVERIFIED_REASON:
+        return False
+    return any(
+        _stage_for(ft) == stage for ft in _PRODUCIBLE_FINDING_TYPES
+    )
+
+
+_HEADLINE_FINDING = "brand_headline_distribution"
+
+
+def _headline_distribution(
+    findings: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The headline, as a distribution the report actually measured.
+
+    Reads the `brand_headline_distribution` finding the evidence builder copies
+    verbatim out of the rollup, so the headline and the stage detail cannot
+    disagree — they were read from the same rows in the same pass.
+
+    WHAT IT DELIBERATELY DOES NOT DO. It computes no average across dimensions
+    and emits no single number: collapsing bands into one figure is the stage
+    score Rule 1 removes, and the run that prompted this showed why — identity
+    16 and citation 48 average to something that describes neither.
+
+    A run with no such finding gets `unavailable_reason`, NOT an empty
+    distribution that reads like a clean sheet. That confusion is the whole
+    reason this file was touched.
+    """
+    payload: Dict[str, Any] = {}
+    for finding in findings or []:
+        if str((finding or {}).get("finding_type") or "").strip().lower() == (
+            _HEADLINE_FINDING
+        ):
+            # READ THE SHAPE THE WRITER PRODUCES. This projection is fed by
+            # `list_findings_for_run`, which returns raw `readiness_findings`
+            # ROWS — the column is `payload_jsonb`, and under the `databases`
+            # driver it can arrive as a JSON STRING. `payload` is the
+            # EXTRACTOR's key, which only ever appears in-process.
+            #
+            # Reading `payload` alone shipped a headline that was empty on
+            # every real run: verified against production run
+            # 0d56bf71-d63b-4103-9520-e0abf66bb57e, whose revenue_recovery
+            # projection rendered `dimensions: []` while the run's own
+            # brand_headline_distribution finding held all four dimensions.
+            # The tests missed it because they piped extract_findings() output
+            # straight in, so they only ever exercised the in-process shape.
+            payload = (
+                coerce_jsonb_to_dict(finding.get("payload_jsonb"))
+                or finding.get("payload")
+                or {}
+            )
+            break
+
+    dims = payload.get("dimensions")
+    if not isinstance(dims, list) or not dims:
+        return {
+            "kind": "distribution",
+            "dimensions": [],
+            "prompt_split": None,
+            "unavailable_reason": (
+                "This run produced no per-dimension distribution. That is a "
+                "missing measurement, not a score of zero and not a pass."
+            ),
+        }
+
+    split = payload.get("prompt_split")
+    out: Dict[str, Any] = {
+        "kind": "distribution",
+        "dimensions": dims,
+        "dimensions_considered": payload.get("dimensions_considered"),
+        "skus_audited": payload.get("skus_audited"),
+        "prompt_split": split,
+        "note": (
+            "Per-dimension distribution with n. Not a composite score: "
+            "averaging these describes no dimension."
+        ),
+    }
+    if split is None:
+        # Absent must read as absent. Without this the caller sees a null and
+        # is free to assume branded and unbranded performed alike.
+        out["prompt_split_unavailable_reason"] = (
+            "This report did not carry the intent-axis citation counts the "
+            "branded/unbranded split is computed from. Not parity — unknown."
+        )
+    return out
+
+
+def build_revenue_recovery_projection(
+    *,
+    evidence: List[Dict[str, Any]],
+    findings: List[Dict[str, Any]],
+    actions: List[Dict[str, Any]],
+    audit_run_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The merchant's recovery funnel: three stages, GET SELECTED leading.
+
+    Same data the merchant projection may show, arranged as the funnel. A
+    stage reports NO_FINDINGS only when something could have put a finding
+    there and did not; a stage with no producer behind it reports UNVERIFIED
+    with the reason, because a false all-clear is worse than an honest gap.
+    """
+    row = audit_run_row or {}
+    stages: Dict[str, Dict[str, Any]] = {
+        name: {"stage": name, "findings": [], "actions": []}
+        for name in _STAGES
+    }
+
+    # parent_finding_id is the ONLY link between an action and a finding —
+    # action_plan_items has no finding_type column, so routing actions by one
+    # silently put every action in the default stage.
+    stage_by_finding_id: Dict[str, str] = {}
+    for f in findings:
+        stage = _stage_for(f.get("finding_type"))
+        fid = f.get("finding_id")
+        if fid is not None:
+            stage_by_finding_id[str(fid)] = stage
+        if f.get("severity") not in ("critical", "high", "medium"):
+            continue
+        if _is_meta_finding(f):
+            # It is evidence about US, not about the merchant. Appending it
+            # produced a stage that was UNVERIFIED *and* carried a finding —
+            # the exact contradiction the invariant test forbids. Its effect on
+            # this projection is the UNVERIFIED status below, nothing more.
+            continue
+        stages[stage]["findings"].append({
+            "type": f.get("finding_type"),
+            "severity": f.get("severity"),
+            "summary": f.get("short_summary"),
+        })
+
+    for a in sorted(actions, key=_severity_phase_sort_key):
+        parent = a.get("parent_finding_id")
+        stage = stage_by_finding_id.get(
+            str(parent) if parent is not None else "", _STAGE_GET_SELECTED,
+        )
+        stages[stage]["actions"].append(_action_for_merchant(a))
+
+    unreadable = any(_is_meta_finding(f) for f in (findings or []))
+    for name in _STAGES:
+        if not _stage_is_measurable(name):
+            stages[name]["status"] = "UNVERIFIED"
+            stages[name]["unverified_reason"] = _STAGE_UNVERIFIED_REASON.get(
+                name,
+                "Nothing that runs today can produce a finding for this "
+                "stage, so its absence is not an all-clear.",
+            )
+        elif unreadable:
+            # We could not read the report. NOTHING about this merchant was
+            # established, so no stage may claim an all-clear — including the
+            # stages this particular finding did not land in.
+            stages[name]["status"] = "UNVERIFIED"
+            stages[name]["unverified_reason"] = (
+                "This audit established nothing for this stage — its report "
+                "was either unreadable or scored no dimension at all. Absence "
+                "here is not an all-clear."
+            )
+        else:
+            stages[name]["status"] = (
+                "MEASURED" if stages[name]["findings"] else "NO_FINDINGS"
+            )
+
+    return {
+        "audience": AUDIENCE_REVENUE_RECOVERY,
+        "builder_version": _BUILDER_VERSION,
+        "audit_run_id": row.get("run_id"),
+        # NOT a headline score. `visibility_score_avg` sat here as a bare
+        # integer with no n and no interval, which Rule 1 forbids outright — "no
+        # stage scores. Distributions only. A 'CAPTURE INTENT 41%' implies a
+        # formula. Ours moves 5.6x on denominator choice." The §6 definition of
+        # done asks this surface for a split "with `n` beside it", so a
+        # distribution carrying its own counts is what belongs here.
+        "headline": _headline_distribution(findings),
+        "stages": [stages[name] for name in _STAGES],
+    }
+
+
+def build_public_anonymous_projection(
+    *,
+    evidence: List[Dict[str, Any]],
+    findings: List[Dict[str, Any]],
+    actions: List[Dict[str, Any]],
+    audit_run_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The ONLY projection an unauthenticated visitor may read.
+
+    Deterministic tier only. Everything here is computable without a model
+    call, so nothing in it can be a fabricated claim about a store whose owner
+    has not asked us for anything.
+
+    PRESENCE IS THE CLAIM. A signal appears iff evidence of that type exists
+    for this run, carrying the strength we recorded. There is deliberately no
+    `detected: false` — no writer records one, so emitting it would state that
+    a store lacks an agent checkout when the truth is that we never observed
+    one. That is the same fabrication `convert_sales` is marked UNVERIFIED to
+    avoid, and an earlier cut of this builder made it for every real store by
+    reading `detected` and `evidence_level` out of payload_jsonb, where
+    neither has ever lived (evidence_level is a COLUMN).
+
+    What it deliberately does NOT carry:
+      * merchant_id / any owner identity — the run may be unclaimed, and a
+        claimed one must not become publicly attributable by being read here.
+      * visibility / attribution scores — model-derived, and a headline number
+        on an unregistered store is the fabrication risk in its purest form.
+      * a severity histogram. Counts by severity look like metadata and are
+        not: extract_findings assigns each severity by a fixed threshold on
+        the very scores above (avg_attribution < 30, avg_category < 20/40,
+        phase_0_complete is False), so the histogram is an invertible encoding
+        of them — and a `critical` would disclose that a merchant's Pivota
+        onboarding is incomplete. Totals only.
+      * finding summaries and action content — that is the paid layer.
+      * evidence payloads — those carry endpoint URLs and probe ids. Being
+        allowed to report a signal is not being allowed to republish it.
+    """
+    row = audit_run_row or {}
+    signals: List[Dict[str, Any]] = []
+    for e in evidence:
+        etype = str(e.get("evidence_type") or "")
+        if etype not in _DETERMINISTIC_EVIDENCE_TYPES:
+            continue
+        # The COLUMN, coerced to its documented enum. Anything else becomes
+        # None rather than passing an unreviewed value to an anonymous reader.
+        level = e.get("evidence_level")
+        # isinstance FIRST: `x in frozenset` raises TypeError on an unhashable
+        # value, and a dict in this column would take the whole projection
+        # down (the builder loop swallows it as projections_failed, so all
+        # seven silently vanish for that run).
+        if not isinstance(level, str) or level not in _EVIDENCE_LEVELS:
+            level = None
+        signals.append({"signal": etype, "evidence_level": level})
+
+    return {
+        "audience": AUDIENCE_PUBLIC_ANONYMOUS,
+        "builder_version": _BUILDER_VERSION,
+        "audit_run_id": row.get("run_id"),
+        # Says out loud what tier this is, so the absence of GEO numbers cannot
+        # be misread as a store that scored zero.
+        "deterministic_only": True,
+        "observed_signals": signals,
+        # How much is waiting, never what it says, and never how severe.
+        "locked": {
+            # Meta-findings excluded: a teaser saying "1 finding waiting" for a
+            # run whose only finding is "I could not read this report" sells
+            # something that does not exist.
+            "findings": len(_without_meta_findings(findings)),
+            "actions": len(actions),
+        },
+        # An unclaimed run is claimable; a claimed one is not, and saying so
+        # is what lets the page render "this is yours" vs "sign in".
+        "claimable": bool(row) and not row.get("merchant_id"),
+    }
+
+
 _BUILDERS = {
     AUDIENCE_EMPLOYEE_BD: build_employee_bd_projection,
     AUDIENCE_MERCHANT: build_merchant_projection,
     AUDIENCE_INTERNAL_OPS: build_internal_ops_projection,
     AUDIENCE_PIVOTA_PDP_FEED: build_pivota_pdp_feed_projection,
     AUDIENCE_FRONTEND_AGENT_FEED: build_frontend_agent_feed_projection,
+    AUDIENCE_REVENUE_RECOVERY: build_revenue_recovery_projection,
+    AUDIENCE_PUBLIC_ANONYMOUS: build_public_anonymous_projection,
 }
 
 
@@ -368,7 +799,10 @@ def build_projection(
 async def build_and_persist_all_projections(
     *, audit_run_id: str,
 ) -> Dict[str, int]:
-    """Load canonical data + build + upsert all 5 projections.
+    """Load canonical data + build + upsert every PERSISTED projection.
+
+    Six of the seven audiences: public_anonymous is built on demand instead —
+    see the loop below.
     Called at audit-completion time (the audit_run_worker hooks
     this in P4.5 wiring follow-up). Returns count summary."""
     from db.audit_evidence import (
@@ -398,7 +832,14 @@ async def build_and_persist_all_projections(
         audit_row.get("merchant_id") if audit_row else None
     )
 
-    for audience in VALID_AUDIENCES:
+    # public_anonymous is deliberately NOT persisted here. This runs for every
+    # audit run, including a paying merchant's, and would leave the table
+    # pre-populated with a public projection row per run — carrying that
+    # merchant_id in its own column, cheaply scannable by
+    # idx_report_projections_merchant_audience. The public lane builds it on
+    # demand for the unclaimed funnel runs that are its only subject, so
+    # storing one for every merchant run creates exposure and buys nothing.
+    for audience in sorted(VALID_AUDIENCES - {AUDIENCE_PUBLIC_ANONYMOUS}):
         try:
             payload = build_projection(
                 audience=audience,

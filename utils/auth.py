@@ -203,7 +203,7 @@ async def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)
     Raises:
         HTTPException: If user is not an admin
     """
-    if current_user.get("role") not in ["admin", "super_admin"]:
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -286,7 +286,7 @@ async def get_current_admin(current_user: Dict[str, Any] = Depends(get_current_u
     Alias for require_admin (backward compatibility)
     Require admin or super_admin role
     """
-    if current_user.get("role") not in ["admin", "super_admin"]:
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -314,7 +314,7 @@ async def get_current_employee(current_user: Dict[str, Any] = Depends(get_curren
             detail="Employee access required"
         )
 
-    if current_user.get("role") not in ["super_admin", "admin", "employee", "outsourced"]:
+    if current_user.get("role") not in EMPLOYEE_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Employee access required"
@@ -335,6 +335,76 @@ async def get_current_employee(current_user: Dict[str, Any] = Depends(get_curren
 
 EMPLOYEE_ROLES = ["super_admin", "admin", "employee", "outsourced"]
 ADMIN_ROLES = ["super_admin", "admin"]
+
+# Staff-only employee-portal surfaces: everything in EMPLOYEE_ROLES except
+# `outsourced`. Route guards used to spell this inline as ["employee", "admin"],
+# which silently omitted `super_admin` -- the MOST privileged role, and one that
+# `/auth/signin` happily issues (see routes.auth.EMPLOYEE_AUTH_ROLES). A
+# super_admin could therefore sign into the employee portal and then be 403'd by
+# 73 of the staff-only pages behind it (88 guards in total, once the
+# merchant-inclusive variant below is counted). Guard against that spelling
+# drift with this constant rather than another literal; `outsourced` stays out
+# deliberately, so contractor access keeps whatever narrower scope each route
+# already gave it.
+EMPLOYEE_STAFF_ROLES = ["super_admin", "admin", "employee"]
+
+# Same set, plus merchants -- for surfaces a merchant reaches for their own data
+# and staff reach for anyone's. Was spelled ["merchant", "employee", "admin"],
+# and carried the identical super_admin omission.
+#
+# "for their own data" is a description of the SURFACE, not a guarantee this
+# constant provides. Membership here says only who may ATTEMPT the route; it
+# admits every merchant, not the owning one. Any handler that then reads a
+# merchant_id/store_id OUT OF THE REQUEST must pair this with
+# can_access_merchant() -- otherwise merchant_A reaches merchant_B's row with a
+# perfectly valid token. That pairing was missing on five routes shipped to
+# prod (setup-psp overwrote another merchant's PSP credentials; the Wix
+# connect/test/sync/sync-status routes hijacked and read another merchant's
+# store), which is why this note exists. See
+# routes/merchant_onboarding_shopify_verify_routes.py for the shape.
+MERCHANT_OR_EMPLOYEE_STAFF_ROLES = ["merchant"] + EMPLOYEE_STAFF_ROLES
+
+# Same set, plus agents -- for surfaces an agent reaches for their OWN record
+# and staff reach for anyone's. The caller still has to prove ownership
+# separately with can_access_agent(); this only decides who may attempt the
+# route at all. "Separately" is load-bearing and was not happening on
+# GET /agents/{agent_id}, which let any agent read any other agent's
+# owner_email, webhook_url, allowed_merchants and quotas. Redacting a secret
+# from the response is not an ownership check.
+AGENT_OR_EMPLOYEE_STAFF_ROLES = ["agent"] + EMPLOYEE_STAFF_ROLES
+
+# Same idea, but over the FULL employee set -- for surfaces `outsourced` staff
+# already reach. can_access_agent() grants every EMPLOYEE_ROLES member blanket
+# agent access, so a gate spelled with the STAFF variant would refuse
+# `outsourced` a list its own ownership helper says it may read. Use this where
+# the route is a roster read that outsourced staff have today (GET /agents/),
+# and the STAFF variant where the narrower contractor scope is deliberate.
+#
+# The ownership rule is identical: this decides who may ATTEMPT the route.
+# can_access_agent() decides WHOSE records come back -- and on a LIST route
+# "whose" is a WHERE clause, not a 403. GET /agents/ had neither: it depended on
+# get_current_user alone and selected every column of every row, which made the
+# ownership check added to GET /agents/{agent_id} a no-op -- the same
+# owner_email, webhook_url, allowed_merchants, metadata and quotas were one
+# request away on the sibling route.
+AGENT_OR_EMPLOYEE_ROLES = ["agent"] + EMPLOYEE_ROLES
+
+# The same two "own data OR staff" shapes, but WITHOUT `employee` -- for guards
+# that were spelled ["merchant", "admin"] / ("agent", "admin") and so never
+# admitted staff in the first place. They exist because the STAFF variants
+# above are the wrong repair for those: swapping ["merchant", "admin"] for
+# MERCHANT_OR_EMPLOYEE_STAFF_ROLES would newly hand every `employee` another
+# tenant's orders and PSP telemetry. Adding `super_admin` corrects an
+# omission; adding `employee` is a grant, and a grant needs its own review.
+#
+# These spellings are why a second sweep was needed after #2031: that ratchet
+# only flags a container holding BOTH `employee` and `admin`, so a two-element
+# ["merchant", "admin"] slipped through it in 7 places, and ("agent", "admin")
+# in 2 more -- including routes/protocol_routes.py, which refused `super_admin`
+# the protocol list for an agent whose protocols it could enable two routes
+# down.
+MERCHANT_OR_ADMIN_ROLES = ["merchant"] + ADMIN_ROLES
+AGENT_OR_ADMIN_ROLES = ["agent"] + ADMIN_ROLES
 
 # Permission guarding /api/operations/* (merchant & agent onboarding, approval,
 # verification, API-key issuance, audit log). A named permission, not a role
@@ -435,7 +505,18 @@ def can_access_merchant(user_info: Dict[str, Any], merchant_id: str) -> bool:
         True if user can access merchant data
     """
     role = user_info.get("role", "")
-    
+
+    # A falsy target is never an answerable question, and both branches below
+    # answered YES to it. `routes/auth.py` mints merchant tokens with an
+    # Optional merchant_id, so a `merchant` token can carry merchant_id=None --
+    # and `None == None` is True, handing that caller a target it proved
+    # nothing about. The agent branch reaches its "no scoping claims means all
+    # merchants" fallback and returns True for the same target. Every caller
+    # today rejects an empty merchant_id before asking (they 400), so this
+    # guards the next one rather than closing a live path.
+    if not merchant_id:
+        return False
+
     # Employees can access all merchants
     if role in EMPLOYEE_ROLES:
         return True

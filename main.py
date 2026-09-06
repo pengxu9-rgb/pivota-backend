@@ -38,6 +38,7 @@ import db.pcs_tables  # noqa: F401  (register PCS v0.1 tables/constraints in met
 import db.id_bridge  # noqa: F401  (register id_bridge table in metadata)
 import db.canonical_commerce  # noqa: F401  (register canonical commerce tables in metadata)
 import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
+import db.merchant_collector_tokens  # noqa: F401  (register collector token registry tables in metadata)
 import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
 import db.merchant_commerce_readiness  # noqa: F401  (register merchant commerce readiness state in metadata)
 import db.surface_listing_registry  # noqa: F401  (register surface listing registry tables in metadata)
@@ -364,7 +365,9 @@ from routes.agent_shop_gateway import router as agent_shop_gateway_router
 from routes.agent_internal_auth import router as agent_internal_auth_router
 from routes.store_audit_probe_internal import router as store_audit_probe_internal_router
 from routes.store_audit_commerce_probe_internal import router as store_audit_commerce_probe_internal_router
+from routes.store_audit_ops import router as store_audit_ops_router
 from routes.store_audit_public_intake import router as store_audit_public_intake_router
+from routes.store_audit_public_intake import claim_router as store_audit_claim_router
 from routes.agent_internal_products import router as agent_internal_products_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
@@ -380,8 +383,11 @@ from routes.magento_integration import router as magento_integration_router
 from routes.adobe_commerce_events import router as adobe_commerce_events_router
 from routes.cafe24_webhooks import router as cafe24_webhooks_router
 from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
+from routes.bigcommerce_webhooks import router as bigcommerce_webhooks_router
+from routes.wix_webhooks import router as wix_webhooks_router
 from routes.sfcc_integration import router as sfcc_integration_router
 from routes.sfcc_events import router as sfcc_events_router
+from routes.prestashop_webhooks import router as prestashop_webhooks_router
 from routes.shopline_integrations import router as shopline_integrations_router
 from routes.shopline_family_webhooks import router as shopline_family_webhooks_router
 from routes.ap2_agent_registration import router as ap2_agent_registration_router
@@ -1294,8 +1300,11 @@ app.include_router(magento_integration_router)  # Magento/Adobe Commerce native 
 app.include_router(adobe_commerce_events_router)  # Signed Adobe I/O order/payment/refund events
 app.include_router(cafe24_webhooks_router)  # Cafe24 Data Bridge + order lifecycle events
 app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order lifecycle events
+app.include_router(bigcommerce_webhooks_router)  # Header-authenticated BigCommerce order lifecycle events
+app.include_router(wix_webhooks_router)  # JWT-verified Wix eCom order + transaction events (static, app-level)
 app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
 app.include_router(sfcc_events_router)  # Signed SFCC cartridge order/cart/payment events
+app.include_router(prestashop_webhooks_router)  # Signed PrestaShop module order/refund events (no native webhooks)
 app.include_router(shopline_integrations_router)  # SHOPLINE / Shoplazza native REST catalog adapters
 app.include_router(shopline_family_webhooks_router)  # Signed SHOPLINE / Shoplazza order lifecycle events
 app.include_router(ap2_agent_registration_router)  # AP2 agent signing-key ADMIN backfill (#1442) — pilot provisioning (ADR-012 carve-out)
@@ -1346,7 +1355,9 @@ app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
 app.include_router(store_audit_commerce_probe_internal_router)  # Store Audit commerce receipt/capability (flag + key gated)
+app.include_router(store_audit_ops_router)  # Admin-only Store Audit lane diagnostics (no caller SQL; redacted)
 app.include_router(store_audit_public_intake_router)  # Public store-audit intake/teaser for the marketing funnel (flag gated, UCP lane only)
+app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents

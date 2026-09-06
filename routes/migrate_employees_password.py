@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 import logging
 
 router = APIRouter(prefix="/admin/migrate", tags=["admin-migrate"])
@@ -11,7 +11,11 @@ async def migrate_employees_add_password(
     current_user: dict = Depends(get_current_user)
 ):
     """Add password column to employees table"""
-    if current_user["role"] not in ["admin", "superadmin"]:
+    # Was ["admin", "superadmin"] -- "superadmin" is not a role this system can
+    # mint (canonical spelling is `super_admin`, see utils.auth.ADMIN_ROLES and
+    # routes.auth._validate_role_value), so that arm never matched and a real
+    # super_admin was denied. `admin` keeps the access it already had.
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:

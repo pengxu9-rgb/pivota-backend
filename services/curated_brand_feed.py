@@ -21,7 +21,7 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -32,6 +32,94 @@ logger = logging.getLogger("curated_brand_feed")
 
 _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
+# Lowest variant price (in the store's currency) that counts as a real offer. Across
+# the four Meitu-US feeds measured 2026-09-05 (2,108 products) exactly one variant sat
+# in (0, 1.00): the $0.01 stila promo described at the variant pick below. Nothing legitimate in a beauty D2C feed is
+# priced under a dollar; a floor this low cannot drop a real product.
+MIN_SELLABLE_PRICE = 1.0
+
+# The axis a variant varies on, named the way the shop names it. Shopify reports
+# a product's axes in `options`, and `option1` is a value on the FIRST of them.
+# A shop with no axis at all reports the placeholder "Title" / "Default Title",
+# which names nothing.
+# "Color", NOT "Shade", and the difference is not cosmetic. The renderer treats
+# the two names ASYMMETRICALLY when its own keyword gate does not read the
+# product as cosmetic: `shade|tone|hue|undertone` falls through to
+# NON_DISPLAYABLE, while `color|colour` falls through to a working `color` axis
+# (both still divert a volume-looking value to a volume axis first). Measured
+# across the folded bases of the six cached brand feeds, this literal alone is
+# the difference between 48 and 75 of 79 products rendering a selector — the
+# axis we invent should be the one the consumer accepts.
+_DEFAULT_SHADE_OPTION_NAME = "Color"
+_PLACEHOLDER_OPTION_NAMES = {"title", "option", "variant", "selection", "default title"}
+_SHADE_AXIS_NAMES = {"shade", "color", "colour", "tone", "hue"}
+
+
+def _base_option_name(product: Dict[str, Any]) -> str:
+    """The shop's own name for the product's FIRST option axis, "" if it names none."""
+    # Shopify `/products.json` emits `options` as a list of dicts, and it is the
+    # only writer that reaches here — the string-shaped branches this used to
+    # carry were unfalsifiable by any input, so they are gone rather than left
+    # as coverage nobody can earn.
+    options = product.get("options")
+    first = options[0] if isinstance(options, list) and options else None
+    name = str(first.get("name") or "").strip() if isinstance(first, dict) else ""
+    if name.lower() in _PLACEHOLDER_OPTION_NAMES:
+        return ""
+    return name
+
+
+_SIZE_LIKE_VALUE = re.compile(
+    r"""(?ix)
+    ^\s*(?:
+        [\d.,/]+\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz|floz|lb|ct|count|pc|pcs|pack|x)\b
+      | (?:x?\s*[\d.,]+\s*(?:ml|g|oz))
+      | (?:travel|mini|deluxe|jumbo|full|full\s*size|trial|sample|refill)\s*(?:size)?
+      | (?:small|medium|large|x-?large|xs|s|m|l|xl|xxl|one\s*size)
+    )\s*$
+    """
+)
+
+
+def _looks_like_a_size(value: str) -> bool:
+    """A quantity, a pack, or a garment/format size — never a colour."""
+    return bool(_SIZE_LIKE_VALUE.match(value or ""))
+
+
+def _variant_option_name(variant: Dict[str, Any], base_option_name: str) -> str:
+    """The axis THIS variant varies on — per variant, because a folded product's
+    variant list is not homogeneous.
+
+    `fold_shade_listings` appends variants taken from OTHER products (the
+    per-shade listings) onto a base that keeps its own `options`. On a base whose
+    real axis is Size — a foundation sold in 30ml and 50ml — naming every variant
+    from `options[0]` published the shades as "Size: NC15". That is not just an
+    ugly label: the renderer only demands a swatch when the axis reads as a
+    shade, so a mislabelled shade also rendered without one.
+
+    A folded-in variant is on the shade axis BY CONSTRUCTION, whatever the base
+    calls its own. The base's own variants really are on the base's axis, so they
+    keep it — and "" when the shop names no axis, because a guess would be a
+    label the merchant never wrote.
+    """
+    # PRESENCE, not truthiness. The fold stamps this key with the handle it took
+    # the variant from, and a shade row with an empty handle stores "" — which a
+    # truthiness test reads as "not folded", handing that shade the base's own
+    # axis and reproducing the mislabel this function exists to prevent.
+    if FOLDED_FROM_KEY in variant:
+        if base_option_name.strip().lower() in _SHADE_AXIS_NAMES:
+            return base_option_name
+        # The fold collapses listings that differ by a TITLE SUFFIX, and a suffix
+        # is not always a shade: "Fix+ - 3.4 fl oz" and "Blot Powder - Medium"
+        # fold exactly like "Retro Matte Lipstick - Ruby Woo". Inventing a colour
+        # axis over a quantity publishes "Color: 3.4 fl oz". When the shop has not
+        # named an axis we can trust and the value reads as a size, decline —
+        # naming nothing is the honest answer, and by the product-level rule the
+        # whole product then serves as the bare list it was before.
+        if _looks_like_a_size(str(variant.get("option1") or variant.get("title") or "")):
+            return ""
+        return _DEFAULT_SHADE_OPTION_NAME
+    return base_option_name
 
 
 def _clean_domain(domain: str) -> str:
@@ -514,6 +602,7 @@ def shopify_product_to_record(
     domain: str,
     category_path: str,
     brand_override: Optional[str] = None,
+    emit_variants: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -531,21 +620,89 @@ def shopify_product_to_record(
         return None
     variants = product.get("variants")
     variants = variants if isinstance(variants, list) else []
-    # Pick the first sellable (positive-price) variant. Gift-with-purchase and other
-    # $0/unpriced items have no purchasable offer — drop the product entirely so it
-    # never enters the commerce index (these were landing as junk PDPs/seeds, the
-    # offers_skipped noise seen onboarding kosas).
+    # Pick the first sellable variant — priced at or above MIN_SELLABLE_PRICE.
+    # Gift-with-purchase and other $0/unpriced items have no purchasable offer —
+    # drop the product entirely so it never enters the commerce index (these were
+    # landing as junk PDPs/seeds, the offers_skipped noise seen onboarding kosas).
+    # The floor exists because "positive" was not enough: stilacosmetics.com lists a
+    # "Free Travel … (TikTok Shop)" promo at $0.01, which cleared `p > 0`, ingested
+    # as a canonical anchor and served (measured 2026-09-05). A token price is a
+    # promo mechanic, not an offer.
     variant = None
     price = None
     for v in variants:
         p = _to_float((v or {}).get("price"))
-        if p is not None and p > 0:
+        if p is not None and p >= MIN_SELLABLE_PRICE:
             variant, price = v, p
             break
     if variant is None:
         return None
     image = _first(product.get("images")) or {}
-    barcode = str(variant.get("barcode") or "").strip() or None
+    if not str(image.get("src") or "").strip():
+        # No product-level image: a variant's own swatch is a real image of this
+        # product and is better than publishing a row the scorer counts as
+        # imageless. Only a fallback — a product image always wins.
+        for _v in variants:
+            _fi = _v.get("featured_image") if isinstance(_v, dict) else None
+            _src = (
+                str((_fi or {}).get("src") or "").strip() if isinstance(_fi, dict)
+                else str((_v or {}).get("image_src") or "").strip()
+            )
+            if _src:
+                image = {"src": _src}
+                break
+    # A FOLDED row is a product LINE, not one physical item: its variants are the
+    # shades, each with its own GTIN. Taking the first shade's barcode as the line's
+    # would publish (say) Ruby Woo's GTIN on "Retro Matte Lipstick", and GTIN is
+    # Tier-0a in identity resolution — it OUTRANKS brand+title, so a retailer's
+    # single-shade PDP carrying that GTIN would attach to the whole line. The stub
+    # the fold replaced carried no barcode; the line keeps none.
+    barcode = (
+        None if product.get(FOLDED_INTO_KEY)
+        else (str(variant.get("barcode") or "").strip() or None)
+    )
+    # Every sellable variant, when the product has more than one: the ingest
+    # writes one SKU + offer per entry beside the canonical SKU, so a folded
+    # shade line (see fold_shade_listings) keeps its purchasable SKUs. Single-
+    # variant products emit nothing here — the canonical SKU already is the row.
+    sellable = [
+        v for v in variants
+        if isinstance(v, dict) and (_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE
+    ]
+    pdp_variants: List[Dict[str, Any]] = []
+    # OPT-IN. Emitting variants writes one extra SKU + offer per variant downstream,
+    # which changes recall fan-out, offer aggregation and INCI attachment for EVERY
+    # row a caller ingests — so it fires only for the fold lane that asked for it.
+    # `records_for_brand(base_listings_only=True)` is the only caller that does.
+    if emit_variants and len(sellable) >= 1 and product.get(FOLDED_INTO_KEY):
+        seen_ids: set = set()
+        base_option_name = _base_option_name(product)
+        for i, v in enumerate(sellable):
+            vid = str(v.get("id") or v.get("variant_id") or f"{handle}:{i}").strip()
+            if vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+            # option1 is the merchant's own shade value and outranks a name derived
+            # from the title suffix; `featured_image` is where a real Shopify variant
+            # carries its swatch (`image_src` is set only by the fold).
+            featured = v.get("featured_image")
+            featured_src = str((featured or {}).get("src") or "").strip() if isinstance(featured, dict) else ""
+            pdp_variants.append({
+                "variant_id": vid,
+                "sku": str(v.get("sku") or "").strip() or None,
+                "barcode": str(v.get("barcode") or "").strip() or None,
+                "title": str(v.get("option1") or v.get("title") or "").strip() or None,
+                "option_name": _variant_option_name(v, base_option_name),
+                "price": _to_float(v.get("price")),
+                "in_stock": bool(v.get("available")),
+                "image_url": (
+                    featured_src
+                    or str(v.get("image_src") or "").strip()
+                    or str(image.get("src") or "").strip()
+                    or None
+                ),
+                "source_handle": str(v.get(FOLDED_FROM_KEY) or "").strip() or None,
+            })
     raw_tags = product.get("tags")
     tags = (
         raw_tags
@@ -579,6 +736,7 @@ def shopify_product_to_record(
             # on this lane (captured on the retailer-PDP lane instead).
             "rating_value": None,
             "rating_count": None,
+            "variants": pdp_variants,
         },
         "offers": [
             {
@@ -594,12 +752,211 @@ def shopify_product_to_record(
     }
 
 
+# Some storefronts (maccosmetics.com, measured 2026-09-04: 1,366 of a 1,500-product
+# sample) publish EVERY shade as its own single-variant product — "Retro Matte
+# Lipstick - Ruby Woo" beside the base "Retro Matte Lipstick". The Path-C plan keys
+# PDPs on (brand, title), so ingesting that feed as-is mints one PDP per shade:
+# ~1,900 near-duplicates for one brand.
+#
+# `fold_shade_listings` FOLDS those shade rows into the base listing's variants
+# instead of dropping them: the base keeps one PDP, and every shade becomes a
+# variant of it (title = shade name, its own sku / barcode / price / image), so
+# the purchasable SKUs survive. Measured on the MAC feed, every base row is
+# itself a single-variant PARENT STUB (variants[0].option1 == title, sku P2000_*):
+# that stub variant is replaced by the shades, never kept beside them. A base
+# that already carries real variants keeps them and gains the folded shades.
+#
+# Titles are compared through `normalize_title` (the same normaliser
+# `make_content_key` uses downstream), because the feed is not case- or
+# punctuation-stable across a line: stila lists "HUGE™ Extreme Lash Mascara" beside
+# "Huge™ Extreme Lash Mascara - Intense Black", and "Heaven's" beside "Heaven’s".
+# Shade names may themselves contain hyphens ("Lady-Be-Good", "Brick-O-La"), so
+# every " - " split point is tried, longest base first.
+_SHADE_SEP = " - "
+FOLDED_FROM_KEY = "_folded_from_handle"
+FOLDED_INTO_KEY = "_folded_shades"
+# A suffix that names a merchandising state, not a shade. tarte sells "<line> - <X>
+# charm" as separate $10 accessories and stila suffixes "- Last Chance"/"- Limited
+# Edition" onto whole palettes; folding those makes an accessory a "shade" of the
+# product it accessorises and destroys its own PDP. Measured 2026-09-05: 9 such
+# false folds across the five cached feeds, 0 legitimate shades excluded.
+_NON_SHADE_SUFFIX_RE = re.compile(
+    r"(?i)\b(charm|last chance|limited edition|refill|travel size|mini|set|kit|bundle|gift card|sample)\b"
+)
+# A shade of a product costs what the product costs. A folded row priced far from its
+# base is a different item wearing a similar name.
+_FOLD_PRICE_RATIO = 1.5
+
+
+def _shade_bases(title: str) -> List[str]:
+    """Every '<base>' a '<base> - <shade>' title could be split into, longest
+    base first, so 'Lip Pencil - Brick-O-La' yields ['Lip Pencil - Brick-O',
+    'Lip Pencil']. Only ' - ' (space-hyphen-space) is a separator."""
+    parts = title.split(_SHADE_SEP)
+    return [_SHADE_SEP.join(parts[:i]).strip() for i in range(len(parts) - 1, 0, -1)]
+
+
+def _image_srcs(product: Dict[str, Any]) -> List[str]:
+    """Every usable image URL on a Shopify product row, in feed order."""
+    out: List[str] = []
+    for img in (product or {}).get("images") or []:
+        src = str((img or {}).get("src") or "").strip() if isinstance(img, dict) else str(img or "").strip()
+        if src:
+            out.append(src)
+    return out
+
+
+def _first_price(product: Dict[str, Any]) -> Optional[float]:
+    for v in (product or {}).get("variants") or []:
+        p = _to_float((v or {}).get("price")) if isinstance(v, dict) else None
+        if p is not None and p > 0:
+            return p
+    return None
+
+
+def _fold_refused(base: Dict[str, Any], shade: Dict[str, Any], suffix: str) -> Optional[str]:
+    """Why this row must NOT be folded into that base, or None to fold."""
+    if _NON_SHADE_SUFFIX_RE.search(suffix or ""):
+        return "non_shade_suffix"
+    bp, sp = _first_price(base), _first_price(shade)
+    if bp and sp and (max(bp, sp) / min(bp, sp)) > _FOLD_PRICE_RATIO:
+        return "price_mismatch"
+    return None
+
+
+def _is_stub_variant(product: Dict[str, Any]) -> bool:
+    """A single placeholder variant that names no shade: its option/title is the
+    product's own title or Shopify's 'Default Title'. MAC's P2000_ parents are
+    this shape; a real single-shade product ('Ruby Woo' as option1) is not."""
+    variants = (product or {}).get("variants") or []
+    if len(variants) != 1:
+        return False
+    v = variants[0] or {}
+    title = str((product or {}).get("title") or "").strip()
+    label = str(v.get("option1") or v.get("title") or "").strip()
+    return label in ("", "Default Title", title)
+
+
+def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str, Any]], Dict[str, Any]]":
+    """Pure. Fold single-variant `<base> - <shade>` rows into the variants of
+    the base row (matched through normalize_title). Returns (products, report):
+    the base rows now carry the shades as variants (a stub placeholder variant
+    is replaced; real variants are kept and extended), the shade rows are
+    removed, order is otherwise preserved, and multi-variant rows are never
+    folded — a suffixed multi-variant title is a distinct line, not a shade.
+    `report` names what happened so the caller can print it: bases folded,
+    shade rows folded, stub variants replaced, and every folded handle by base."""
+    from services.catalog_identity import normalize_title
+
+    by_norm: Dict[str, Dict[str, Any]] = {}
+    for p in products:
+        key = normalize_title(str((p or {}).get("title") or ""))
+        if key and key not in by_norm:
+            by_norm[key] = p
+    folded_into: Dict[int, List[Dict[str, Any]]] = {}  # id(base) -> shade rows
+    shade_of: Dict[int, Dict[str, Any]] = {}            # id(shade row) -> base
+    refusals: List[Dict[str, str]] = []
+    for p in products:
+        title = str((p or {}).get("title") or "").strip()
+        variants = (p or {}).get("variants") or []
+        if len(variants) > 1:
+            continue
+        for base_title in _shade_bases(title):
+            base = by_norm.get(normalize_title(base_title)) if base_title else None
+            if base is None or base is p:
+                continue
+            suffix = title[len(base_title):].lstrip(" -").strip()
+            refused = _fold_refused(base, p, suffix)
+            if refused:
+                refusals.append({"handle": str(p.get("handle") or ""), "title": title, "reason": refused})
+                break
+            folded_into.setdefault(id(base), []).append(p)
+            shade_of[id(p)] = base
+            break
+    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
+                             "folded": {}, "refused": refusals}
+    out: List[Dict[str, Any]] = []
+    for p in products:
+        if id(p) in shade_of:
+            continue
+        shades = folded_into.get(id(p))
+        if not shades:
+            out.append(p)
+            continue
+        base_title = str(p.get("title") or "").strip()
+        base = dict(p)
+        own = [] if _is_stub_variant(p) else [
+            dict(v, title=str(v.get("title") or v.get("option1") or "").strip())
+            for v in (p.get("variants") or []) if isinstance(v, dict)
+        ]
+        if not own and (p.get("variants") or []):
+            report["stubs_replaced"] += 1
+        new_variants: List[Dict[str, Any]] = list(own)
+        handles: List[str] = []
+        for s in shades:
+            shade_title = str(s.get("title") or "").strip()
+            for bt in _shade_bases(shade_title):
+                if normalize_title(bt) == normalize_title(base_title):
+                    shade_name = shade_title[len(bt):].lstrip(" -").strip() or shade_title
+                    break
+            else:
+                shade_name = shade_title
+            sv = dict((s.get("variants") or [{}])[0] or {})
+            # The shade row's OWN option1 is the merchant's shade value and wins:
+            # stila's "Calligraphy Lip Stain - Last Chance Shade" carries
+            # option1 "Elizabeth (Pinky Nude)", and taking the title suffix minted a
+            # phantom second SKU for the same merchant code.
+            own_label = str(sv.get("option1") or "").strip()
+            if own_label and own_label.lower() not in ("default title",):
+                shade_name = own_label
+            sv["title"] = shade_name
+            sv["option1"] = shade_name
+            sv.setdefault("id", s.get("id"))
+            img = _first(s.get("images")) or {}
+            if img.get("src"):
+                sv["image_src"] = str(img.get("src"))
+            sv[FOLDED_FROM_KEY] = str(s.get("handle") or "")
+            new_variants.append(sv)
+            handles.append(str(s.get("handle") or ""))
+        base["variants"] = new_variants
+        base[FOLDED_INTO_KEY] = len(shades)
+        # A parent stub carries no images of its own — measured on maccosmetics.com
+        # 2026-09-05, 106 of 109 folded bases have an EMPTY `images` list while the
+        # shade rows carry the swatches. The product row is what the quality scorer
+        # reads (`_extract_main_image`), so a base left imageless forfeits the whole
+        # images component: MAC scored 66.7 against a 71.4 gate and every row was
+        # blocked `low_quality`. Adopt the folded shades' images when the base has
+        # none; a base with its own images keeps them untouched.
+        if not _image_srcs(p):
+            adopted: List[Dict[str, Any]] = []
+            seen_src: set = set()
+            for s in shades:
+                for src in _image_srcs(s):
+                    if src not in seen_src:
+                        seen_src.add(src)
+                        adopted.append({"src": src})
+            if adopted:
+                base["images"] = adopted
+                report["images_adopted"] += 1
+        report["bases"] += 1
+        report["shades"] += len(shades)
+        report["folded"][str(p.get("handle") or base_title)] = handles
+        out.append(base)
+    return out, report
+
+
+def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compatibility name for `fold_shade_listings`: same collapse, report dropped."""
+    return fold_shade_listings(products)[0]
+
+
 async def records_for_brand(
     *,
     domain: str,
     category_path: str,
     brand: Optional[str] = None,
     max_products: int = 500,
+    base_listings_only: bool = False,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
@@ -616,11 +973,15 @@ async def records_for_brand(
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
+    if base_listings_only:
+        products, fold_report = fold_shade_listings(products)
+        records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
     for p in products:
         rec = shopify_product_to_record(
-            p, domain=domain, category_path=category_path, brand_override=brand
+            p, domain=domain, category_path=category_path, brand_override=brand,
+            emit_variants=base_listings_only,
         )
         if not rec:
             continue

@@ -1,7 +1,7 @@
 """Admin endpoint to fix agent metrics display"""
 from fastapi import APIRouter, Depends, HTTPException, status
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 import logging
 from typing import Dict, Any
 
@@ -15,7 +15,7 @@ async def fix_agent_metrics(current_user: dict = Depends(get_current_user)):
     and ensuring data is properly calculated
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can execute this fix"
@@ -108,7 +108,7 @@ async def check_agent_metrics_status(current_user: dict = Depends(get_current_us
     Check the current status of agent metrics
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can check metrics status"
@@ -175,7 +175,12 @@ async def check_agent_metrics_status(current_user: dict = Depends(get_current_us
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from db.database import database
-from utils.auth import get_current_user
+# NOTE: this module's whole body appears TWICE; `router` is rebound here, so
+# main.py mounts THIS copy's routes and the ones above are dead. ADMIN_ROLES
+# is therefore imported on both sides -- the live guards below use it, and
+# relying on the dead copy's import to bind it would turn the obvious
+# de-duplication cleanup into a NameError on every admin route here.
+from utils.auth import ADMIN_ROLES, get_current_user
 import logging
 from typing import Dict, Any
 
@@ -189,7 +194,7 @@ async def fix_agent_metrics(current_user: dict = Depends(get_current_user)):
     and ensuring data is properly calculated
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can execute this fix"
@@ -282,7 +287,7 @@ async def check_agent_metrics_status(current_user: dict = Depends(get_current_us
     Check the current status of agent metrics
     """
     # Check if user is admin
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can check metrics status"

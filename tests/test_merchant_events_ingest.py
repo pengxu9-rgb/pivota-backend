@@ -85,7 +85,13 @@ def patched_route(monkeypatch):
             ],
         }
 
+    async def fake_stores(merchant_id):
+        # The merchant's active connected stores, as the route binds against.
+        assert merchant_id == MERCHANT_ID
+        return {"mall_123": "cafe24"}
+
     monkeypatch.setattr("db.merchant_onboarding.get_merchant_onboarding", fake_merchant)
+    monkeypatch.setattr("routes.merchant_events.connected_store_index", fake_stores)
     monkeypatch.setattr("routes.merchant_events.ingest_merchant_event_batch", fake_ingest)
     return calls
 
@@ -98,6 +104,8 @@ def test_signed_platform_neutral_batch_is_accepted_and_normalized(patched_route)
     assert len(patched_route) == 1
     call = patched_route[0]
     assert call["merchant_id"] == MERCHANT_ID
+    assert call["agent_identity_confidence"] == "merchant_asserted"
+    assert call["write_path"] == "merchant_hmac_batch"
     event = call["batch"].events[0]
     assert event.platform == "cafe24"
     assert event.currency == "USD"
@@ -217,7 +225,12 @@ async def test_ingest_maps_adapter_refs_and_idempotency_to_canonical_ledger(monk
 
     monkeypatch.setattr(service, "record_commerce_event", fake_record)
     batch = service.MerchantEventBatch.model_validate({"events": [_event()]})
-    result = await service.ingest_merchant_event_batch(merchant_id=MERCHANT_ID, batch=batch)
+    result = await service.ingest_merchant_event_batch(
+        merchant_id=MERCHANT_ID,
+        batch=batch,
+        agent_identity_confidence="merchant_asserted",
+        write_path="merchant_hmac_batch",
+    )
 
     assert result["accepted"] == 1
     assert result["duplicates"] == 0
@@ -232,6 +245,82 @@ async def test_ingest_maps_adapter_refs_and_idempotency_to_canonical_ledger(monk
     assert call["metadata"]["quantity"] == 2
     assert call["metadata"]["amount_cents"] == 2599
     assert call["metadata"]["currency"] == "USD"
+    assert call["metadata"]["agent_identity_confidence"] == "merchant_asserted"
+    assert call["actor_type"] == "merchant_adapter"
+    assert call["actor_id"] == MERCHANT_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "confidence,expected_actor_type,expected_actor_id",
+    [
+        ("browser_observed", "browser_collector", MERCHANT_ID),
+        ("merchant_asserted", "merchant_adapter", MERCHANT_ID),
+        ("platform_asserted", "platform_adapter", MERCHANT_ID),
+        ("verified", "external_agent", "chatgpt-agent"),
+        ("unknown", "store_adapter", MERCHANT_ID),
+    ],
+)
+async def test_ingest_keeps_claimed_agent_separate_from_authenticated_writer(
+    monkeypatch,
+    confidence,
+    expected_actor_type,
+    expected_actor_id,
+):
+    from services import merchant_event_ingest_service as service
+
+    calls = []
+
+    async def fake_record(**kwargs):
+        calls.append(kwargs)
+        return {"event_id": "evt_ledger", "interaction_id": "int_ledger", "duplicate": False}
+
+    monkeypatch.setattr(service, "record_commerce_event", fake_record)
+    # This test pins the writer/actor mapping for EVERY confidence tier,
+    # including `verified` and `unknown`, which no production write path may
+    # assert today (see test_commerce_ledger_write_path_authority). Bypass the
+    # pairing guard so the mapping itself stays covered.
+    monkeypatch.setattr(service, "resolve_ledger_authority", lambda _wp, _c: "merchant")
+    batch = service.MerchantEventBatch.model_validate({"events": [_event()]})
+
+    await service.ingest_merchant_event_batch(
+        merchant_id=MERCHANT_ID,
+        batch=batch,
+        agent_identity_confidence=confidence,
+        write_path="merchant_hmac_batch",
+    )
+
+    assert calls[0]["agent_id"] == "chatgpt-agent"
+    assert calls[0]["metadata"]["agent_identity_confidence"] == confidence
+    assert calls[0]["actor_type"] == expected_actor_type
+    assert calls[0]["actor_id"] == expected_actor_id
+
+
+@pytest.mark.asyncio
+async def test_ingest_without_agent_does_not_overwrite_stitched_identity_confidence(monkeypatch):
+    from services import merchant_event_ingest_service as service
+
+    calls = []
+
+    async def fake_record(**kwargs):
+        calls.append(kwargs)
+        return {"event_id": "evt_ledger", "interaction_id": "int_ledger", "duplicate": False}
+
+    monkeypatch.setattr(service, "record_commerce_event", fake_record)
+    batch = service.MerchantEventBatch.model_validate(
+        {"events": [_event(agent_id=None)]}
+    )
+
+    await service.ingest_merchant_event_batch(
+        merchant_id=MERCHANT_ID,
+        batch=batch,
+        agent_identity_confidence="platform_asserted",
+        write_path="cafe24_webhook",
+    )
+
+    assert "agent_identity_confidence" not in calls[0]["metadata"]
+    assert calls[0]["actor_type"] == "platform_adapter"
+    assert calls[0]["actor_id"] == MERCHANT_ID
 
 
 def test_universal_event_types_advance_interaction_status():
@@ -245,6 +334,24 @@ def test_universal_event_types_advance_interaction_status():
     assert _status_from_event("order.created", "paid") == "paid"
     assert _status_from_event("order.paid", "cancelled") == "cancelled"
     assert _status_from_event("payment.failed", "refunded") == "refunded"
+
+
+def test_only_verified_agent_identity_is_treated_as_authenticated():
+    from services.commerce_interaction_service import _authenticated_agent_id
+
+    for confidence in (
+        "browser_observed",
+        "merchant_asserted",
+        "platform_asserted",
+        "unknown",
+        None,
+    ):
+        assert _authenticated_agent_id(
+            {"agent_id": "claimed-agent", "agent_identity_confidence": confidence}
+        ) is None
+    assert _authenticated_agent_id(
+        {"agent_id": "verified-agent", "agent_identity_confidence": "verified"}
+    ) == "verified-agent"
 
 
 @pytest.mark.asyncio

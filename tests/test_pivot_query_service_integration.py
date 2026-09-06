@@ -1049,7 +1049,13 @@ async def test_fetch_canonical_search_rows_uses_candidate_cte_and_avoids_json_se
     )
 
     assert rows == []
-    assert "WITH candidate_skus AS" in observed["query"]
+    # The candidate CTE is now fed by `matched_skus` and capped per product
+    # (RECALL_MAX_SKUS_PER_PRODUCT) before the budget is spent; the outer join
+    # onto candidate_skus is unchanged.
+    assert "WITH matched_skus AS" in observed["query"]
+    assert "candidate_skus AS" in observed["query"]
+    assert "PARTITION BY ms.product_key" in observed["query"]
+    assert observed["params"]["per_product_sku_cap"] >= 1
     assert "JOIN catalog_offers o" in observed["query"]
     assert "ON o.sku_key = c.sku_key" in observed["query"]
     assert "CAST(s.visible_option_labels AS TEXT)" not in observed["query"]

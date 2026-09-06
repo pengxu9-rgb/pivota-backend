@@ -223,6 +223,14 @@ def test_agent_commerce_checkout_accepts_internal_trusted_api_key(
     )
 
     assert response.status_code == 200
+    # Every agent-commerce ledger write is stamped as the first-party verified
+    # issuer: get_agent_context authenticated the agent's own credential.
+    assert recorded, "the checkout must write to the ledger"
+    assert {call["write_path"] for call in recorded} == {"agent_commerce_api"}
+    assert {call["authority"] for call in recorded} == {"pivota"}
+    assert {call["agent_identity_confidence"] for call in recorded} == {"verified"}
+    assert all(call["metadata"]["agent_identity_confidence"] == "verified" for call in recorded)
+    assert all(call["metadata"]["agent_id"] == call["actor_id"] for call in recorded)
     assert response.json()["checkout_id"] == "ord_1"
     assert response.json()["payment_url"] == "https://checkout.example.com/ord_1"
     assert len(recorded) == 2

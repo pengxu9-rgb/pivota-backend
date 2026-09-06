@@ -20,9 +20,16 @@ that delta beside a `card_rail_outcomes` decline is how they become measurable.
 
 from __future__ import annotations
 
+import json as _json
+
 import pytest
 
-from services.agent_card_issuance import cap_for_quote, headroom_policy, quote_covers
+from services.agent_card_issuance import (
+    MerchantQuoteError,
+    cap_for_quote,
+    headroom_policy,
+    quote_covers,
+)
 
 
 def _quote(total_minor: int, **kw):
@@ -160,12 +167,21 @@ def test_a_malformed_policy_value_falls_back_to_the_default(monkeypatch, bad):
 
 class _FakeResp:
     status_code = 200
+    headers: "dict[str, str]" = {}
 
     def __init__(self, payload):
         self._payload = payload
 
-    def json(self):
+    def _body(self):
         return {"jsonrpc": "2.0", "id": "1", "result": {"structuredContent": self._payload}}
+
+    async def aiter_raw(self):
+        # `_read_bounded` rebuilds the body from streamed bytes, so this must be the real
+        # payload rather than a placeholder.
+        yield _json.dumps(self._body()).encode()
+
+    def json(self):
+        return self._body()
 
 
 class _FakeClient:
@@ -181,17 +197,45 @@ class _FakeClient:
     async def post(self, url, json=None):
         return _FakeResp(self._payload)
 
+    def stream(self, method, url, *, json=None, headers=None):
+        """The transport reads through `client.stream` now, so this double must model it.
+
+        It did not, and only the full sweep caught that: this file was outside the subset run
+        while iterating on merchant_ucp_checkout, so `AttributeError: no attribute 'stream'`
+        reached CI rather than the local run.
+        """
+        return _FakeStream(_FakeResp(self._payload))
+
+
+class _FakeStream:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
+
 
 async def _quote_from(monkeypatch, payload):
-    """Drive the REAL resolve_merchant_quote, faking only the HTTP transport."""
+    """Drive the REAL resolve_merchant_quote, faking only the HTTP transport.
+
+    The transport now lives in services/merchant_ucp_checkout.py, so the stubs go THERE — patching
+    `agent_card_issuance.resolves_only_public` would silently miss, because the call is resolved
+    in the other module's namespace. The profile env is required for the same reason the real
+    call needs it: without `meta["ucp-agent"]["profile"]` the merchant refuses outright.
+    """
     import httpx
 
     from services import agent_card_issuance as mod
+    from services import merchant_ucp_checkout as transport
 
+    monkeypatch.setenv("UCP_AGENT_PROFILE_URL", "https://ucp.pivota.cc/.well-known/ucp-agent")
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeClient(payload))
     # The SSRF guard is a live-DNS dependency, not the thing under test here, and it makes these
     # rows flaky. It keeps its own coverage in tests/test_agent_card_issuance.py.
-    monkeypatch.setattr(mod, "resolves_only_public", lambda domain: True)
+    monkeypatch.setattr(transport, "resolves_only_public", lambda domain: True)
     return await mod.resolve_merchant_quote("shop.example.com", "chk_1")
 
 
@@ -340,3 +384,506 @@ def test_the_totals_type_key_is_normalised(raw):
     a landed `"Fulfillment"` quote into an unlanded one earning full headroom."""
     covers = quote_covers({"totals": [{"type": raw, "amount": 500}]})
     assert covers["shipping"] is True or covers["tax"] is True
+
+
+@pytest.mark.parametrize(
+    "amount, why",
+    [
+        (1e400, "JSON 1e400 parses to inf; int(inf) is OverflowError"),
+        (float("nan"), "comparing a NaN raises InvalidOperation"),
+        ("NaN", "the string form parses to a Decimal NaN"),
+        ("sNaN", "signalling NaN"),
+        ("1e999999999", "finite, so is_finite passes — only the multiply overflows"),
+        ("Infinity", "spelled out"),
+    ],
+)
+def test_a_non_finite_merchant_amount_is_refused_not_an_arithmetic_error(amount, why):
+    """A merchant controls this number. Every one of these raised an ArithmeticError that neither
+    `to_minor_units` nor the route (which catches only MerchantQuoteError) translates — an
+    unhandled 500 at card issuance. Same class as the `int(inf)` fixed for CALLER input in
+    merchant_ucp_checkout.build_line_items; this is the MERCHANT-input half."""
+    from services.agent_card_issuance import to_minor_units
+
+    try:
+        assert to_minor_units(amount, "USD") is None, why
+    except Exception as exc:  # noqa: BLE001
+        import pytest as _pt
+
+        _pt.fail(f"{why}: raised {type(exc).__name__}")
+
+
+def test_a_finite_amount_still_converts():
+    """The positive counterpart — refusing everything would pass the test above."""
+    from services.agent_card_issuance import to_minor_units
+
+    assert to_minor_units("12.34", "USD") == 1234
+    assert to_minor_units("0.005", "USD") == 1, "ROUND_CEILING, because this is a cap"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+async def test_a_non_finite_amount_anywhere_in_the_quote_is_a_502_not_a_500(monkeypatch, bad):
+    """`json.loads` accepts bare `NaN`/`Infinity`, so a merchant `tax: NaN` beside a VALID total
+    survives quoting. Adding `allow_nan=False` at the route turned the DB-insert 500 into a
+    json-dumps 500 one line earlier — the raise is caught by nothing there. The refusal has to
+    happen where MerchantQuoteError is the contract."""
+    payload = _json.loads(
+        '{"currency":"USD","status":"ready_for_complete","totals":['
+        '{"type":"total","amount":2317},{"type":"fulfillment","amount":500},'
+        f'{{"type":"tax","amount":{bad}}}]}}'
+    )
+    with pytest.raises(MerchantQuoteError) as excinfo:
+        await _quote_from(monkeypatch, payload)
+    assert "non-finite" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_of_a_finite_quote_still_serialises(monkeypatch):
+    """The positive counterpart — refusing every snapshot would pass the test above."""
+    quote = await _quote_from(
+        monkeypatch,
+        _json.loads('{"currency":"USD","status":"ready_for_complete","totals":['
+                    '{"type":"total","amount":2317},{"type":"tax","amount":217}]}'),
+    )
+    assert _json.dumps(quote["quote_snapshot"], allow_nan=False)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "NaN", "inf", "-inf"])
+def test_a_non_finite_tax_does_not_read_as_a_quoted_amount(bad):
+    """The eighth escape, and it mints a bad card rather than raising: NaN/inf read as "the
+    merchant DID quote tax", which strips headroom and caps at the quote — so the card declines
+    the moment real tax lands. That is the decline direction this function exists to prevent."""
+    from services.agent_card_issuance import _is_quoted_amount
+
+    assert _is_quoted_amount(bad) is False, f"{bad!r} is not a quoted amount"
+    assert _is_quoted_amount({"amount": bad}) is False
+
+
+def test_a_finite_tax_still_reads_as_quoted():
+    from services.agent_card_issuance import _is_quoted_amount
+
+    assert _is_quoted_amount(217) is True
+    assert _is_quoted_amount("217") is True
+    assert _is_quoted_amount({"amount": "217"}) is True
+
+
+def test_a_huge_exponent_is_refused_in_constant_time():
+    """The hazard on `int(minor)` is COST, not exception class. `Decimal("9e999997")` is finite,
+    and `d * 100` lands at exponent 999999 — still inside Emax — so `decimal.Overflow` never
+    fires and `int()` materialises a million-digit integer. Measured 19.1 SECONDS, from 8 bytes
+    of merchant input, blocking the event loop because this function is sync on an async path.
+    The `is_finite` and `ArithmeticError` guards both pass it straight through."""
+    import time
+
+    from services.agent_card_issuance import to_minor_units
+
+    for probe in ("9e999997", "1e999998", "9" * 300000):
+        started = time.monotonic()
+        assert to_minor_units(probe, "USD") is None, probe
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, f"{probe[:12]!r} took {elapsed:.2f}s — the big int was built"
+
+
+def test_an_ordinary_large_amount_still_converts():
+    """The positive counterpart: an 18-digit bound must not refuse real money. _MAX_CAP_MINOR is
+    10**15, so the largest legitimate cap is three orders of magnitude inside it."""
+    from services.agent_card_issuance import to_minor_units
+
+    assert to_minor_units("10000000000000.00", "USD") == 1000000000000000
+    assert to_minor_units("12.34", "USD") == 1234
+
+
+def test_a_deeply_nested_amount_is_bounded_not_walked_to_a_RecursionError():
+    """`_is_quoted_amount` follows `amount`/`value` into merchant-authored JSON, one Python frame
+    per level. Whether that is reachable depends entirely on the runtime.
+
+    On the PINNED runtime (runtime.txt: python-3.11) this is NOT a live 500. C and Python
+    recursion share one budget there and `resp.json()` runs STRICTLY DEEPER than this walk, so
+    the parser always exhausts first: measured end to end with the bound reverted, the cliff is
+    a return below it and a clean 502 above, with no depth producing a 500. The exact integer is
+    a property of the measuring harness, not of the route -- it lands near 965 through the app
+    and a few frames higher when the service is driven directly -- so it is deliberately not
+    asserted here. The earlier claim of a 500 came from a probe that added a frame PER LEVEL; a
+    deeper stack adds a CONSTANT, which shifts parser and walk equally and preserves their order.
+
+    It is load-bearing on 3.12+, where the budgets are separate -- measured on 3.12.8,
+    `json.loads` accepts 9997 levels while this walk still stops at ~996, so the parser stops
+    gating. RecursionError is a RuntimeError, which no `except (TypeError, ValueError)` on this
+    path catches. This test pins the bound so that upgrade is not a 500.
+
+    The bound answers False, which reads as "the merchant did NOT quote tax" and ADDS headroom.
+    That is the direction `_is_quoted_amount`'s docstring exists to protect: reading an unquoted
+    tax as quoted strips headroom and mints a card that declines when real tax lands.
+    """
+    depth = 994
+    nested = 1
+    for _ in range(depth):
+        nested = {"amount": nested}
+
+    covers = quote_covers({"currency": "USD", "total_amount": 2317, "tax": nested,
+                           "total_shipping": {"amount": {"value": 400}}})
+
+    assert covers["tax"] is False
+    # POSITIVE counterpart, and it must enter the RECURSIVE branch. The first draft asserted
+    # `shipping is False` against a fixture with no shipping key -- true with the bound, without
+    # it, and for an empty dict. The second used a bare int, which never recurses at all. A
+    # legitimately NESTED shipping amount alongside the hostile tax is what proves the bounded
+    # walk still RESOLVES real nesting instead of only proving it stops.
+    assert covers["shipping"] is True
+
+
+# Deeper than the C encoder's limit on EVERY runtime we may run on. 2000 was enough on 3.11
+# (limit 993) but `json.dumps` SUCCEEDS at 2000 on 3.12.8 (limit 9997), so both guard tests
+# below would have started failing on exactly the upgrade their guards are justified against.
+_DEEPER_THAN_ANY_ENCODER = 12_000
+
+
+def test_the_guard_depth_constant_actually_exceeds_the_encoder():
+    """A RATCHET for the constant above, which otherwise has none.
+
+    Setting it back to 2_000 -- the exact regression that made both dump-guard tests
+    green-but-dead on 3.12 -- leaves the whole suite passing on the pinned 3.11, because 2_000
+    trips the encoder THERE. So the numeric floor has to be asserted against the highest limit
+    any runtime we may move to imposes (9997 on 3.12.8), not merely against this one.
+
+    The second assertion is the property the constant actually needs, checked against whatever
+    interpreter is running: at this depth the encoder must genuinely refuse. Together they catch
+    both a value lowered below a future runtime's limit and a runtime whose limit outgrows it.
+    """
+    assert _DEEPER_THAN_ANY_ENCODER > 9997, "must exceed the 3.12.8 encoder limit, not just 3.11's"
+
+    deep = 1
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = {"amount": deep}
+
+    with pytest.raises(RecursionError):
+        _json.dumps(deep)
+
+
+def test_the_snapshot_dump_refuses_deep_merchant_json_instead_of_500ing():
+    """Bounding the walk alone would have MOVED this 500, not removed it.
+
+    `_is_quoted_amount` is not the only thing that recurses over merchant `totals`: the audit
+    snapshot is `json.dumps`ed twice on the same request, once in `resolve_merchant_quote` and
+    once in the route. Both sites carried `except (ValueError, TypeError)` for `allow_nan`, and
+    RecursionError is a RuntimeError -- so with the walk bounded, the identical input simply
+    surfaced from `json.dumps` a few lines later instead. Measured before this guard: an
+    uncaught RecursionError at agent_card_issuance.py, in our own source.
+
+    NEITHER site is reachable in production, on either runtime: `json.dumps` and `json.loads`
+    are the same C encoder on one shared limit (993/993 on 3.11, 9997/9997 on 3.12.8) and
+    `resp.json()` parses strictly deeper, so the parser always refuses first. An earlier version
+    of this docstring said these guards were "reachable on 3.12+, exactly like the walk" -- that
+    was the claim measurement withdrew, and it survived here after being deleted from both
+    sources. The 3.12 argument holds only for the pure-Python walk (~996 vs 9997).
+
+    That is precisely why this drives the helper directly: an unreachable guard is invisible to
+    every end-to-end fixture, so nothing else notices if it is deleted.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep = 1
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = {"amount": deep}
+    quote = {"quote_snapshot": {"totals": deep}}
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot(quote, {"max_minor": 7500})
+
+    # 502, not 422: the error middleware rewrites every 422 leaving the app into a 400
+    # INVALID_REQUEST whose `message` is a generic "Request validation failed". It does copy the
+    # detail through to `body["detail"]`, but the STATUS and the MESSAGE an agent reads both say
+    # the caller's request was invalid -- because the MERCHANT nested its reply.
+    assert excinfo.value.status_code == 502
+    assert "nested beyond the readable depth" in str(excinfo.value.detail)
+
+
+def test_the_snapshot_dump_still_serialises_a_normal_quote():
+    """The positive counterpart: the guard must not swallow ordinary snapshots."""
+    from routes.agent_cards import _dump_snapshot
+
+    out = _dump_snapshot(
+        {"quote_snapshot": {"totals": [{"type": "tax", "amount": 500}], "currency": "USD"}},
+        {"max_minor": 7500},
+    )
+
+    assert _json.loads(out)["totals"] == [{"type": "tax", "amount": 500}]
+    assert _json.loads(out)["headroom"] == {"max_minor": 7500}
+
+
+@pytest.mark.parametrize("depth,expected", [(1, True), (2, True), (8, True), (9, False)])
+def test_the_amount_nesting_bound_is_pinned_at_its_actual_value(depth, expected):
+    """`_MAX_AMOUNT_NESTING = 1` passed the entire agent-card suite; only 0 failed, and via a
+    pre-existing test. So the constant's value was unpinned and its comment ("a real quote nests
+    once or twice; 8 is far past that") was an unverified claim -- a mutant lowering 8 to 1 or 2
+    survived. This pins both ends: legitimate nesting up to the bound still reads as a quoted
+    amount, and one level past it does not."""
+    from services.agent_card_issuance import _MAX_AMOUNT_NESTING, _is_quoted_amount
+
+    assert _MAX_AMOUNT_NESTING == 8
+
+    nested = 500
+    for _ in range(depth):
+        nested = {"amount": nested}
+
+    assert _is_quoted_amount(nested) is expected
+
+
+@pytest.mark.asyncio
+async def test_resolve_merchant_quote_refuses_a_dump_that_recurses(monkeypatch):
+    """The SIBLING half of the dump guard, which no test covered: deleting
+    `resolve_merchant_quote`'s `except RecursionError` left the whole suite green (14,580
+    passed). Only the route helper was pinned, while the commit claimed both were.
+
+    Driven by patching `get_checkout`, because the guard is unreachable over the wire on both
+    runtimes -- `resp.json()` parses strictly deeper than this dump and refuses first. That is
+    exactly why it needs a direct test: an unreachable guard is invisible to every end-to-end
+    fixture, so nothing else would notice if it were deleted.
+    """
+    import services.merchant_ucp_checkout as muc
+    from services.agent_card_issuance import MerchantQuoteError, resolve_merchant_quote
+
+    deep = 5
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = {"amount": deep}
+
+    async def fake_get_checkout(domain, checkout_id):
+        return {"currency": "USD", "total_amount": 2317, "status": "ready_for_complete",
+                "totals": deep}
+
+    monkeypatch.setattr(muc, "get_checkout", fake_get_checkout)
+
+    with pytest.raises(MerchantQuoteError) as excinfo:
+        await resolve_merchant_quote("example.com", "chk_1")
+
+    assert "nested beyond the readable depth" in str(excinfo.value)
+
+
+def test_the_snapshot_dump_refuses_a_non_finite_amount_it_calls_itself_a_belt_for():
+    """`_dump_snapshot` calls `allow_nan=False` "the BELT", then caught only RecursionError.
+
+    So the belt itself was uncaught: `allow_nan=False` raises ValueError, which is a 500 one
+    exception type over from the one that had just been guarded. Unreachable through the route
+    today -- `resolve_merchant_quote` dumps the same `totals` first and `to_minor_units` refuses
+    a non-finite `picked` -- which is exactly why it needs a direct test: dropping the clause
+    leaves every end-to-end fixture green.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    quote = {"quote_snapshot": {"totals": [{"type": "tax", "amount": float("nan")}]}}
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot(quote, {"max_minor": 7500})
+
+    assert excinfo.value.status_code == 502
+    assert "unserialisable" in str(excinfo.value.detail)
+
+
+def test_the_dump_guard_does_not_swallow_our_own_errors_from_the_snapshot_builder(monkeypatch):
+    """Pins that the catch covers the ENCODER only, not the snapshot builder.
+
+    `MerchantQuoteError` and `MerchantUcpError` are both ValueError SUBCLASSES, so
+    `except (ValueError, TypeError)` around `_snapshot_with_headroom(...)` would report any of
+    OUR failures there to the agent as "the merchant sent an unserialisable amount" -- a 502
+    blaming a third party for our bug. Demonstrated before the builder was hoisted out of the
+    try: dropping `_snapshot_with_headroom`'s non-dict guard turned `{**None}` into
+    `502 merchant quote carried an unserialisable amount`; hoisted, the same TypeError surfaces
+    as a loud 500 that reads as ours. merchant_ucp_checkout.py already carries this exact
+    warning about the same subclass overlap.
+
+    This pins it without needing that second mutation: an error raised by the builder must
+    travel, not be relabelled.
+    """
+    import routes.agent_cards as mod
+    from services.agent_card_issuance import MerchantQuoteError
+
+    def boom(quote, cap):
+        raise MerchantQuoteError("our own failure, not the merchant's")
+
+    monkeypatch.setattr(mod, "_snapshot_with_headroom", boom)
+
+    with pytest.raises(MerchantQuoteError):
+        mod._dump_snapshot({"quote_snapshot": {}}, {"max_minor": 7500})
+
+
+def test_a_deep_non_dict_snapshot_is_a_502_not_an_uncaught_recursion():
+    """The regression the hoist itself introduced, caught by review and pinned here.
+
+    `_snapshot_with_headroom`'s non-dict fallback does `repr(base)[:200]`, and `repr()` recurses.
+    Hoisting the builder out of the encoder's `try` -- which is what stops our own ValueErrors
+    being relabelled as the merchant's -- took that recursion out of cover with it. Measured: a
+    12,000-deep non-dict `quote_snapshot` answered 502 before the hoist and an uncaught 500
+    after, i.e. the hardening opened the hole it was hardening.
+
+    Dead today (`resolve_merchant_quote` only ever emits a dict), which is exactly why it needs a
+    direct test: it is the "older cached shape, hand-built dict, future refactor" the builder's
+    own docstring anticipates, and nothing end-to-end would notice.
+    """
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep = []
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep = [deep]
+
+    with pytest.raises(HTTPException) as excinfo:
+        _dump_snapshot({"quote_snapshot": deep}, {"max_minor": 7500})
+
+    assert excinfo.value.status_code == 502
+    assert "nested beyond the readable depth" in str(excinfo.value.detail)
+
+
+@pytest.fixture
+def pivota_log(caplog):
+    """Capture the `pivota` logger, which does NOT propagate.
+
+    `utils.logger` sets `propagate = False` and attaches its own stdout handler, so caplog --
+    which installs a handler on the ROOT logger -- sees none of these records. A test written the
+    usual way collects an empty list and every `assert not any(...)` in it passes for free. The
+    first draft of these tests did exactly that and failed loudly only because they also assert a
+    POSITIVE line; attach the handler to the real logger instead.
+    """
+    import logging
+
+    lg = logging.getLogger("pivota")
+    lg.addHandler(caplog.handler)
+    prev = lg.level
+    # DEBUG, not WARNING. A leak check that only captures WARNING cannot see a value logged at
+    # INFO -- and `utils/logger.py` runs this logger at INFO in production, so such a line would
+    # reach the real sink while the test stayed green. Capture everything; the helpers below
+    # decide what each assertion looks at.
+    lg.setLevel(logging.DEBUG)
+    try:
+        yield caplog
+    finally:
+        lg.removeHandler(caplog.handler)
+        lg.setLevel(prev)
+
+
+def _pivota_warnings(log):
+    """WARNING and above -- for asserting WHICH line fired."""
+    import logging
+
+    return [r.getMessage() for r in log.records if r.levelno >= logging.WARNING]
+
+
+def _pivota_messages(log):
+    """EVERY captured record, any level -- for asserting what must never be logged AT ALL.
+
+    A leak assertion scoped to one level is a guard narrower than its own claim: measured, both
+    `logger.info(..., base)` and `logger.error(..., base)` alongside the type passed all 78 tests
+    while `_pivota_warnings` filtered on `levelname == "WARNING"`. "Never reaches the sink" has to
+    mean never, at any level.
+    """
+    return [r.getMessage() for r in log.records]
+
+
+def test_the_leak_check_can_actually_see_a_record_below_WARNING(pivota_log):
+    """A HARNESS SELF-CHECK, because the leak guard's precondition is one silent edit away.
+
+    The guard below only detects an INFO-level leak if this fixture CAPTURES at INFO or lower.
+    Measured: reverting `lg.setLevel(logging.DEBUG)` to `logging.WARNING` -- which is literally
+    what that line said before this test existed -- leaves all 78 tests green while the INFO leak
+    survives again. A guard whose enabling condition nothing asserts is a guard that can be
+    disarmed by an edit that looks like tidying.
+
+    So: prove the capture reaches below WARNING, rather than assuming it.
+    """
+    import logging
+
+    logging.getLogger("pivota").debug("harness self-check: DEBUG is visible")
+    logging.getLogger("pivota").info("harness self-check: INFO is visible")
+
+    seen = _pivota_messages(pivota_log)
+    assert any("DEBUG is visible" in m for m in seen), "capture is above DEBUG; the leak guard is blind"
+    assert any("INFO is visible" in m for m in seen), "capture is above INFO; production's own level"
+    # And the WARNING-scoped helper must NOT see them -- the two helpers are different on purpose.
+    assert not any("is visible" in m for m in _pivota_warnings(pivota_log))
+
+
+def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(pivota_log):
+    """The quiet failure here is NOT a status code, and NOT a corrupted cap.
+
+    A non-dict `quote_snapshot` does not fail the request. Measured: it renders to
+    `{"unexpected_snapshot_shape": "None"}`, serialises cleanly, and the mint returns 200. Every
+    cause of that branch is ours -- a stale cached shape, a hand-built dict, a refactor -- so
+    nothing external will ever report it, and without this line it reaches production silently.
+
+    Two corrections are baked in here, because both directions have been got wrong once.
+    The review that asked for this framed it as a 502 under EXTERNAL_SERVICE_ERROR; that is true
+    only of the DEEP non-dict case, the rarer one. Then the first draft of this test overcorrected
+    to "a live card with no provenance", which overstates it: `quote_total_minor`,
+    `amount_cap_minor` and `currency` are separate columns, `headroom` survives in the degraded
+    snapshot, and `cap_for_quote` never reads `quote_snapshot` -- so no cap is wrong and nothing
+    declines. What is lost is the merchant's raw payload, the evidence behind the numbers.
+    """
+    from routes.agent_cards import _dump_snapshot
+
+    out = _dump_snapshot({"quote_snapshot": None}, {"max_minor": 7500})
+
+    assert _json.loads(out)["unexpected_snapshot_shape"] == "None", "the mint SUCCEEDS"
+    assert any("was not a dict" in m and "NoneType" in m for m in _pivota_warnings(pivota_log))
+
+    # THE VALUE MUST NEVER REACH THE SINK -- `base` is unbounded and partly merchant-derived, and
+    # this is a card-issuance path. Driven with a SENTINEL rather than by inspecting the `None`
+    # case, because the first draft asserted the absence of `unexpected_snapshot_shape": "` from
+    # the log message -- a substring that exists only in the JSON dump and can therefore never
+    # appear in any line this function emits. It was an assertion incapable of failing, under a
+    # comment claiming this exact property was pinned. Measured: a mutant ADDING `value=%r`
+    # alongside the type passed all 78 tests in this file.
+    pivota_log.clear()
+    _dump_snapshot({"quote_snapshot": "SENTINEL_MERCHANT_CONTENT"}, {"max_minor": 7500})
+    assert any("was not a dict" in m and "str" in m for m in _pivota_warnings(pivota_log)), \
+        "the type IS logged"
+    # EVERY level, not just WARNING -- see `_pivota_messages`. Scoping this to WARNING let an
+    # INFO- or ERROR-level leak through, which is the same defect one notch milder as the
+    # assertion this replaced: a guard narrower than the sentence above it.
+    assert not any("SENTINEL_MERCHANT_CONTENT" in m for m in _pivota_messages(pivota_log)), \
+        "the value is NOT logged at ANY level"
+
+
+def test_a_normal_snapshot_logs_nothing(pivota_log):
+    """The negative counterpart: a warning on every healthy mint is a warning nobody reads."""
+    from routes.agent_cards import _dump_snapshot
+
+    _dump_snapshot({"quote_snapshot": {"totals": [{"amount": 500}], "currency": "USD"}},
+                   {"max_minor": 7500})
+
+    # EVERY record, not just WARNING. The name says "logs nothing" and this is the COMMON path,
+    # where `base` carries the merchant's real `totals` -- so a leak here matters more than on
+    # the fallback, and asserting only over warnings would be the same narrower-than-its-name
+    # shape this file has now produced three times.
+    assert _pivota_messages(pivota_log) == []
+
+
+def test_the_two_identical_502s_are_distinguishable_in_the_LOG(pivota_log):
+    """Both depth guards raise byte-identical detail, so the response cannot say which fired --
+    but they mean different things: the snapshot builder's own `repr()` recursing, versus the
+    encoder walking merchant `totals`. The log is the only place that distinction survives."""
+    from fastapi import HTTPException
+
+    from routes.agent_cards import _dump_snapshot
+
+    deep_list = []
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep_list = [deep_list]
+    deep_dict = 1
+    for _ in range(_DEEPER_THAN_ANY_ENCODER):
+        deep_dict = {"amount": deep_dict}
+
+    with pytest.raises(HTTPException):
+        _dump_snapshot({"quote_snapshot": deep_list}, {"max_minor": 7500})
+    builder = _pivota_warnings(pivota_log)
+    pivota_log.clear()
+    with pytest.raises(HTTPException):
+        _dump_snapshot({"quote_snapshot": {"totals": deep_dict}}, {"max_minor": 7500})
+    encoder = _pivota_warnings(pivota_log)
+
+    assert any("snapshot builder recursed" in m for m in builder)
+    assert any("nested beyond the encoder" in m for m in encoder)
+    assert not any("snapshot builder recursed" in m for m in encoder), "must not be the same line"

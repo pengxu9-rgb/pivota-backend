@@ -3,7 +3,7 @@ Missing Employee Portal Endpoints
 Only includes endpoints that don't exist elsewhere
 """
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 from db.database import database
 
 router = APIRouter()
@@ -17,7 +17,7 @@ async def get_payment_analytics(
     current_user: dict = Depends(get_current_user)
 ):
     """Get payment success analytics"""
-    if current_user["role"] not in ["employee", "admin"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:

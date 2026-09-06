@@ -14,7 +14,7 @@ import secrets
 from urllib.parse import urlparse
 from pydantic import BaseModel
 from config.settings import resolve_public_api_base_url
-from utils.auth import get_current_user
+from utils.auth import MERCHANT_OR_ADMIN_ROLES, get_current_user
 from db.database import database
 from db.merchant_onboarding import merchant_onboarding
 from db.merchant_portal_preferences import (
@@ -841,7 +841,7 @@ async def get_merchant_psps(
     current_user: dict = Depends(get_current_user)
 ):
     """Get merchant's connected PSPs."""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     psps = []
@@ -917,7 +917,7 @@ async def get_merchant_orders(
     current_user: dict = Depends(get_current_user)
 ):
     """Get merchant's orders from real database"""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
@@ -1008,7 +1008,7 @@ async def get_merchant_analytics(
 ):
     """Get merchant analytics from real data"""
     try:
-        if current_user["role"] not in ["merchant", "admin"]:
+        if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
             raise HTTPException(status_code=403, detail="Not authorized")
 
         # Get analytics from real orders
@@ -1425,7 +1425,7 @@ async def test_psp_connection(
     current_user: dict = Depends(get_current_user)
 ):
     """Test PSP connection with real API call"""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Get PSP details from database

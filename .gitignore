@@ -59,3 +59,8 @@ next-env.d.ts
 infra/gcp/env.*.yaml
 infra/gcp/secrets.*.list
 infra/gcp/*.local.*
+
+# One-off operational reports from scripts/backfill_stale_pdp_overlays.py. They name
+# production pdp_ids and overlay ids and are read once by the operator between the dry
+# run and the apply; nothing downstream reads them, so they must not reach main.
+reports/pdp_overlay_backfill/
