@@ -398,3 +398,40 @@ async def test_a_testmode_order_reaches_neither_ingress(tmp_path, monkeypatch):
         assert await _events(test_database) == []
     finally:
         await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_refund_row_in_another_currency_does_not_reduce_this_delta(
+    tmp_path, monkeypatch
+):
+    """Subtraction is only meaningful inside ONE unit.
+
+    A refund already recorded for this order in EUR is a different quantity,
+    not a smaller one. Without the currency narrowing on the baseline read, a
+    3000 EUR row would be subtracted from a 2500 USD cumulative total, the delta
+    would go negative, and the USD refund would be silently dropped as
+    `refund_not_new` — real money, invisible, with a 2xx on the delivery.
+    """
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sq-refund-currency")
+    try:
+        in_euros = _order(
+            modified=_iso(_NOW - timedelta(hours=8)),
+            grandTotal={"value": "50.00", "currency": "EUR"},
+            refundedTotal={"value": "30.00", "currency": "EUR"},
+        )
+        assert _deliver(_webhook_client(monkeypatch, in_euros)).status_code == 200
+
+        in_dollars = _refunded("25.00", _NOW - timedelta(hours=3))
+        delivered = _deliver(
+            _webhook_client(monkeypatch, in_dollars), notification_id="n-2"
+        )
+        assert delivered.status_code == 200, delivered.text
+        assert delivered.json()["accepted"] == 1, delivered.text
+
+        refunds = await _events(test_database, "refund.succeeded")
+        by_currency = {row["payload"]["currency"]: row["payload"] for row in refunds}
+        assert by_currency["EUR"]["amount_cents"] == 3000
+        # The full USD total, because nothing had been recorded in USD yet.
+        assert by_currency["USD"]["amount_cents"] == 2500
+    finally:
+        await test_database.disconnect()
