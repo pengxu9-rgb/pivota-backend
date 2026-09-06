@@ -46,8 +46,7 @@ import asyncio
 import os
 import re
 import sys
-from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -132,7 +131,7 @@ async def _reconnect() -> None:
     raise RuntimeError("could not re-establish DB connection")
 
 
-async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
+async def _load_body_map(domain: str, max_products: int) -> Tuple[Dict[str, str], bool]:
     # fetch_shopify_products swallows errors into [] — a transient network
     # failure would silently mark a whole domain "not_in_feed" (4 domains, 292
     # rows on the first prod run). It also returns a PARTIAL list when
@@ -150,11 +149,22 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
             shape = "empty" if not products else f"suspiciously page-aligned ({len(products)})"
             print(f"  ({domain}: {shape} feed on attempt {attempt} — retrying)")
             await asyncio.sleep(10 * attempt)
-    return {
+    # RETURN THE TRUNCATION FACT. This is the only place that knows whether the feed terminated
+    # cleanly; the caller cannot re-derive it from the map, because the map is keyed on handle and
+    # so shrinks on any duplicate or blank one -- a capped feed with a single repeated handle
+    # (routine when a catalog mutates across 250-item page boundaries) looks under the cap. And a
+    # partial from a mid-feed pagination death, which the retry above can only heuristically spot,
+    # leaves the map far BELOW the cap while covering a fraction of the storefront.
+    truncated = bool(products) and (
+        len(products) >= max_products
+        or (len(products) % 250 == 0 and len(products) < max_products)
+    )
+    body_map = {
         str(p.get("handle") or "").strip(): body_html_to_text(p.get("body_html"))
         for p in products
         if isinstance(p, dict) and p.get("handle")
     }
+    return body_map, truncated
 
 
 def _norm_copy(value: str) -> str:
@@ -173,7 +183,11 @@ async def _load_shop_blurb(domain: str, attempts: int = 3) -> Optional[str]:
     """
     for attempt in range(1, attempts + 1):
         blurb = await fetch_shop_description(domain)
-        if blurb:
+        # LONG ENOUGH TO BE A BLURB. glossier.com's homepage description is "Glossier" -- 8
+        # characters. Accepting it would arm mechanism 1 in name only (no candidate over the
+        # 50-char floor can ever equal it) while simultaneously switching OFF the fail-closed
+        # refusal below, so singletons on that domain would pass with nothing checking them.
+        if blurb and len(blurb) >= MIN_DESC_LEN:
             return blurb
         if attempt < attempts:
             await asyncio.sleep(0.5 * attempt)
@@ -196,9 +210,16 @@ def _is_title_echo(value: str, title: Optional[str]) -> bool:
     long enough to clear the 50-char floor (2 of 3 accepted values on that storefront; 34 chars
     saved a third by accident). Auto-published as brand-official copy.
 
-    THE THRESHOLD IS A MARGIN, NOT A TUNING. Measured remainders: observed echoes leave 5-15
-    characters once the title is removed, observed genuine copy leaves 76-101. 30 sits in that gap
-    with room on both sides, and is deliberately NOT raised to catch every template I can imagine
+    THE THRESHOLD IS A MARGIN, NOT A TUNING, AND NOT A BOUND. Measured 2026-09-06: the rule fired
+    on 1 of 35 real candidates and that one was the true positive it was built for; 0 false
+    rejects among 18 genuine values, only 2 of which even contained their own title. Observed
+    echoes leave 5-15 characters once the title is removed and observed genuine copy leaves 76-101,
+    so 30 sits in a wide gap -- but 76 is a floor of a 7-storefront SAMPLE, not a guarantee. A real
+    80-character jsmbeauty.sg title ("BeginS by JUNGSAEMMOOL Blue Hydrangea Hyaluronic Acid
+    Moisturizing Plumping Mist") inside a 108-character description leaves 26 and IS refused: long
+    product names are where this rule costs real copy, and the direction is safe (the row stays
+    blocked and routes to LLM enrichment) rather than free. It is deliberately NOT raised to catch
+    every template I can imagine
     -- a longer SEO scaffold such as "Buy {title} online at {brand} {country}" leaves 36 and is
     MISSED. That family was not observed in the 2026-09-06 sweep, and fitting the number to a case
     I invented rather than measured is how the previous version of this guard went wrong. Raising
@@ -270,7 +291,9 @@ def drop_shared_boilerplate(
     seen: Dict[str, set] = {}
     for pk, v in candidates.items():
         seen.setdefault(_norm_copy(v), set()).add(handles.get(pk, pk))
-    blurb = _norm_copy(shop_blurb)
+    # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
+    # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
+    blurb = _norm_copy(shop_blurb) if len(shop_blurb or "") >= MIN_DESC_LEN else ""
 
     kept = {}
     for pk, v in candidates.items():
@@ -368,7 +391,7 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
 
     for domain in sorted(by_domain):
         drows = by_domain[domain]
-        body_map = await _load_body_map(domain, max_products)
+        body_map, feed_truncated = await _load_body_map(domain, max_products)
         filled = no_body = not_in_feed = from_pdp = boilerplate = 0
 
         # PASS 1 — DECIDE, writing nothing. Body copy could be written as it is resolved, but PDP
@@ -383,10 +406,11 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
         # as two, and the string that survived the split was a shared one. Rather than write a
         # verdict that depends on the cut, refuse the fallback for this domain and say so.
         domain_pdp_fallback = pdp_fallback
-        if pdp_fallback and len(body_map) >= max_products:
-            print(f"  WARN {domain}: feed hit the --max-products cap ({max_products}) — the "
-                  f"boilerplate census would cover only part of the storefront, so the PDP "
-                  f"fallback is skipped here. Re-run with a higher --max-products.")
+        if pdp_fallback and feed_truncated:
+            print(f"  WARN {domain}: the storefront feed did not terminate cleanly (cap "
+                  f"--max-products={max_products}) — the boilerplate census would cover only part "
+                  f"of the storefront, so the PDP fallback is skipped here. Re-run with a higher "
+                  f"--max-products.")
             domain_pdp_fallback = False
         for r in drows:
             body = body_map.get(r["_handle"])

@@ -157,8 +157,13 @@ def test_real_per_product_copy_survives_alongside_the_boilerplate():
 
 
 def test_a_lone_candidate_is_kept_when_it_is_not_the_shop_blurb():
-    """A single candidate carries NO repetition signal. Dropping it would make the guard depend on
-    batch size -- the same row kept in a 2-row run and dropped in a 1-row run."""
+    """A single candidate carries no repetition signal, so mechanism 1 alone decides it -- and
+    that is why the blurb fetch is worth its one request per domain.
+
+    The earlier rationale here ("dropping it would make the guard depend on batch size") is now
+    contradicted by the code: when the blurb is UNAVAILABLE a singleton IS dropped. This case
+    passes only because a real blurb is supplied, which is exactly the distinction being pinned.
+    """
     real = "A watery lip tint that layers into a vivid stain without drying the lips out."
     assert bf.drop_shared_boilerplate({"pk1": real}, _BLURB) == {"pk1": real}
 
@@ -231,18 +236,20 @@ class _FakeDB:
         pass
 
 
-def _row(pk, ck, handle):
+def _row(pk, ck, handle, title="Artist Eye Palette Core Mood"):
+    # A REAL title, not "t": `_is_title_echo` is fed this on the delivery path, and a degenerate
+    # one-character title can never demonstrate the mechanism it is supposed to exercise.
     return {
         "product_key": pk, "content_key": ck,
         "canonical_url": f"https://jsmbeauty.sg/products/{handle}",
-        "source_domain": "jsmbeauty.sg", "title": "t", "image_url": "i",
+        "source_domain": "jsmbeauty.sg", "title": title, "image_url": "i",
         "description": "tiny", "category_path": None, "tags": None, "demographic": None,
         "use_case_tags": None, "lifestyle_tags": None, "pdp_scope": None,
         "source_system": "catalog_enrichment_agent_v1", "pdp_lifecycle_stage": "draft",
     }
 
 
-def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=_BLURB):
+def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=_BLURB, truncated=False):
     """Drive run() against stubs, recording what each content_key was refreshed AS."""
     db = _FakeDB(rows)
     refreshed = {}
@@ -252,7 +259,7 @@ def _harness(monkeypatch, rows, *, body_map, pdp=None, blurb=_BLURB):
         pass
 
     async def _load(domain, max_products):
-        return dict(body_map)
+        return dict(body_map), truncated
 
     async def _pdp(domain, handle, **k):
         fetched.append((domain, handle))
@@ -385,16 +392,61 @@ def test_a_truncated_feed_skips_the_fallback_rather_than_judging_half_a_storefro
     """NON-DETERMINISM, proven on real data: the same 24 jsmbeauty.sg candidates kept 13 as one
     batch and 15 as two, and the string that survived the split was a shared one. The census votes
     on whatever it is handed, so a storefront sliced by --max-products gets a verdict that depends
-    on the cut -- in the direction that WRITES."""
+    on the cut -- in the direction that WRITES.
+
+    DRIVES THE REAL `_load_body_map`, because the first version of this guard compared
+    `len(body_map) >= max_products` and a single DUPLICATE HANDLE in a capped feed slipped under
+    it: the map is keyed on handle, so it shrinks below the cap while the feed was still cut. That
+    is routine when a catalog mutates across 250-item page boundaries. The loader now reports the
+    truncation itself.
+    """
+    feed = [{"handle": f"h{i}", "body_html": "<p>tiny</p>"} for i in range(4)]
+    feed.append({"handle": "h0", "body_html": "<p>tiny</p>"})   # the duplicate that hid the cut
+
+    async def _feed(domain, max_products=None, **k):
+        return feed[:max_products]
+
+    monkeypatch.setattr(bf, "fetch_shopify_products", _feed)
+    body_map, truncated = asyncio.run(bf._load_body_map("jsmbeauty.sg", 4))
+    assert len(body_map) == 4 and len(body_map) < 5
+    assert truncated is True, "a capped feed with a repeated handle is still a partial storefront"
+
+    # ...and a feed that ends on its own is not flagged.
+    _, untruncated = asyncio.run(bf._load_body_map("jsmbeauty.sg", 800))
+    assert untruncated is False
+
+
+def test_a_pagination_death_is_truncation_even_though_it_is_UNDER_the_cap(monkeypatch):
+    """The second truncation shape, and the one a cap comparison cannot see. `_load_body_map`'s own
+    comment says the feed "returns a PARTIAL list when pagination dies mid-feed, which looks like
+    an exact multiple of the 250-item page size" -- that partial is far BELOW --max-products, so a
+    census over it covers a fraction of the storefront while every cap check stays silent."""
+    feed = [{"handle": f"h{i}", "body_html": "<p>x</p>"} for i in range(250)]
+
+    async def _feed(domain, max_products=None, **k):
+        return feed[:max_products]
+
+    monkeypatch.setattr(bf, "fetch_shopify_products", _feed)
+    # `_load_body_map` retries a page-aligned feed 3x with 10s/20s sleeps -- by design, and the
+    # reason this test would otherwise take 30 seconds.
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(bf.asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))
+    body_map, truncated = asyncio.run(bf._load_body_map("jsmbeauty.sg", 800))
+
+    assert len(body_map) == 250 < 800, "well under the cap"
+    assert truncated is True, "a page-aligned feed is a suspected mid-feed pagination death"
+
+
+def test_a_truncated_feed_is_not_crawled_at_all(monkeypatch):
+    """Skipping the census must also skip the requests it would have needed."""
     rows = [_row("pk1", "ck1", "h1"), _row("pk2", "ck2", "h2")]
     db, _, fetched = _harness(
         monkeypatch, rows,
         body_map={"h1": "tiny", "h2": "tiny"},
         pdp={"h1": _LONG_META, "h2": _LONG_META + " Distinct."},
-        blurb=_BLURB,
+        truncated=True,
     )
 
-    # body_map has 2 entries and the cap is 2 -- indistinguishable from a truncated feed.
     assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=2,
                               pdp_fallback=True)) == 0
 
@@ -465,3 +517,100 @@ def test_the_title_echo_threshold_keeps_its_margin_on_both_sides():
     # The knowingly-missed family, asserted as MISSED so the gap is visible, not forgotten.
     assert bf._is_title_echo(f"Buy {title} online at JUNGSAEMMOOL Singapore", title) is False
     assert bf._is_title_echo("Anything at all", None) is False, "no title means no signal"
+
+
+def test_a_title_echo_is_refused_ON_THE_DELIVERY_PATH(monkeypatch):
+    """MECHANISM 3, driven through run() rather than through the pure function.
+
+    Round 3 blocked because deleting the shop-blurb call AT THE CALL SITE left the suite green
+    while the pure function stayed well tested. That was fixed for mechanism 1 -- and mechanism 3
+    then shipped with the identical gap: changing `titles=` to `{}` at the call site survived
+    226/226, and the value below (measured live on kyliecosmetics.com 2026-09-06) went to serving
+    as a `published` brand-official description.
+    """
+    echo = "Kylie Cosmetics - Glossy Pink Makeup Bag + Deluxe Samples"
+    rows = [_row("pk1", "ck1", "h1", title="Glossy Pink Makeup Bag + Deluxe Samples")]
+    db, refreshed, _ = _harness(
+        monkeypatch, rows, body_map={"h1": "tiny"}, pdp={"h1": echo})
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    assert db.updates == [], "a brand+title echo was written as brand-official product copy"
+    assert refreshed == {}
+    assert echo not in " ".join(str(u) for u in db.updates)
+
+
+def test_ONE_product_behind_two_rows_is_still_filled_ON_THE_DELIVERY_PATH(monkeypatch):
+    """MECHANISM 2's identity unit, driven through run(). `handles={}` at the call site survived
+    the whole suite while the pure function was tested -- and it fails CLOSED (both rows dropped as
+    'shared' when it is one product twice), so nothing else would have shown it either."""
+    rows = [_row("pk1", "ck1", "same-handle"), _row("pk2", "ck2", "same-handle")]
+    db, _, _ = _harness(
+        monkeypatch, rows, body_map={"same-handle": "tiny"}, pdp={"same-handle": _LONG_META})
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    written = sorted(u["product_key"] for u in db.updates)
+    assert written == ["pk1", "pk2"], \
+        f"one product behind two rows was mistaken for shared boilerplate: {written}"
+
+
+def test_an_unavailable_blurb_is_COUNTED_and_announced(monkeypatch):
+    """`blurb_unavailable` is what tells an operator that a whole domain was refused for a reason
+    other than 'nothing to fill'. The `boilerplate` counter got an assertion in the same commit
+    that added this one and left it unasserted."""
+    rows = [_row("pk1", "ck1", "h1")]
+    _harness(monkeypatch, rows, body_map={"h1": "tiny"}, pdp={"h1": _LONG_META}, blurb=None)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+
+    assert asyncio.run(bf.run(apply=True, domains_filter=[], max_products=10,
+                              pdp_fallback=True)) == 0
+
+    done = [ln for ln in printed if ln.startswith("[done]")]
+    assert done and "'blurb_unavailable': 1" in done[0], done
+    assert any("shop blurb unavailable" in ln for ln in printed), "the refusal must be announced"
+
+
+def test_a_blurb_too_short_to_clear_the_floor_counts_as_NO_blurb(monkeypatch):
+    """MEASURED: glossier.com's homepage description is "Glossier" -- 8 characters. Accepting it
+    arms mechanism 1 in name only, since no candidate over the 50-char floor can ever equal it,
+    AND switches off the fail-closed refusal -- so singletons pass with nothing checking them.
+    That is the hole this guard exists to close, reached through a different door."""
+    real = "A watery lip tint that layers into a vivid stain without drying the lips out."
+    assert bf.drop_shared_boilerplate({"a": real}, "Glossier") == {}, \
+        "an 8-char site name must not count as an armed blurb comparison"
+    assert bf.drop_shared_boilerplate({"a": real}, _BLURB) == {"a": real}
+
+    async def _short(domain, **k):
+        return "Glossier"
+
+    monkeypatch.setattr(bf, "fetch_shop_description", _short)
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(bf.asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))
+    assert asyncio.run(bf._load_shop_blurb("glossier.com")) is None
+
+
+def test_the_title_echo_threshold_is_pinned_at_its_boundary():
+    """PINS THE NUMBER. The previous version of this test claimed to and did not: 30 -> 29 and
+    30 -> 31 both survived it, so it pinned a wide band. These two assertions straddle the
+    boundary exactly, and also kill `<` -> `<=`."""
+    title = "Glossy Pink Makeup Bag"
+
+    def value_leaving(n: int) -> str:
+        return f"{title} " + ("a" * n)
+
+    # LITERALS, not `bf._ECHO_REMAINDER_MIN - 1`. Deriving the boundary from the constant makes
+    # the test move WITH it: 30 -> 29 and 30 -> 31 both survived that version too.
+    assert bf._ECHO_REMAINDER_MIN == 30, "the measured margin; move it deliberately, with data"
+    assert bf._is_title_echo(value_leaving(29), title) is True
+    assert bf._is_title_echo(value_leaving(30), title) is False
+
+
+def test_a_value_that_does_not_contain_the_title_is_never_an_echo():
+    """The `t not in v` precondition, untested until now. Without it the rule would measure the
+    length of copy that has nothing to do with the title and refuse short genuine descriptions."""
+    assert bf._is_title_echo("A watery lip tint with a glassy finish.", "Totally Different") is False
+    assert bf._is_title_echo("", "Some Title") is False
