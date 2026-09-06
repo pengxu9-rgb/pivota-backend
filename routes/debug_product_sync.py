@@ -1,15 +1,23 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from db.database import database
 from adapters.product_adapters import WixProductAdapter
 from services.wix_connection import extract_wix_site_id, normalize_wix_api_key
+from utils.auth import require_admin
 import logging
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 logger = logging.getLogger(__name__)
 
 @router.post("/test-wix-sync/{merchant_id}")
-async def debug_wix_sync(merchant_id: str):
-    """Debug Wix product sync"""
+async def debug_wix_sync(merchant_id: str, current_user: dict = Depends(require_admin)):
+    """Debug Wix product sync
+
+    SECURITY: admin-gated. This was the byte-twin of GET /debug/test-shopify/{merchant_id}, mounted
+    one line above it and with the same defect: no auth dependency, a caller-supplied merchant_id
+    selecting any merchant's row, and that merchant's stored Wix API key spent to fetch their
+    products. It was the worse of the pair, because its handler returned traceback.format_exc() to
+    the caller. Gating one of an adjacent pair and leaving the other mounted is not a fix.
+    """
     try:
         # Get store from merchant_stores
         store_query = """
@@ -58,12 +66,12 @@ async def debug_wix_sync(merchant_id: str):
         }
         
     except Exception as e:
-        import traceback
+        # The traceback is LOGGED, not returned. It carried module paths, local state and, on a DB
+        # error, connection detail straight to the caller.
+        logger.exception("debug_wix_sync failed merchant=%s", merchant_id)
         return {
             "status": "error",
-            "error": str(e),
             "error_type": type(e).__name__,
-            "traceback": traceback.format_exc()
         }
 
 

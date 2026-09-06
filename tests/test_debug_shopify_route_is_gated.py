@@ -109,14 +109,35 @@ def _store_row(domain: str):
 # 1. The missing dependency.
 # --------------------------------------------------------------------------------------
 
-def test_an_unauthenticated_caller_is_refused(client, listener, monkeypatch):
-    """The defect exactly as it stood: no header at all, and the handler ran."""
+def test_an_unauthenticated_caller_is_refused(client, monkeypatch):
+    """The defect exactly as it stood: no header at all, and the handler ran.
+
+    The property asserted is that the CREDENTIAL IS NEVER RESOLVED -- not `listener.count == 0`,
+    which an earlier version of this test used and which could not fail here: the stored domain was
+    a real myshopify host, so nothing pointed at the listener and the counter stayed 0 whatever the
+    handler did. Under a no-auth mutant that assertion passed while the handler ran to completion
+    and returned 200. Pointing the row at the listener instead would not help either, because the
+    host pin refuses it before any dial.
+
+    httpx is stubbed for a second reason: without it, this test made a REAL request to
+    victim.myshopify.com whenever the gate regressed. A test whose failure mode is a live call to an
+    attacker-nameable host is the wrong place to leave transport unmocked."""
+    resolved = []
+
+    async def _fake_resolve(**kwargs):
+        resolved.append(kwargs)
+        return "shpat_VICTIM_TOKEN_SENTINEL", {}
+
+    async def _must_not_dial(self, url, *a, **k):  # noqa: ANN001
+        raise AssertionError(f"an unauthenticated request reached the network: {url}")
+
     monkeypatch.setattr(dbg.database, "fetch_one", _store_row("victim.myshopify.com"), raising=False)
+    monkeypatch.setattr(dbg, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
+    monkeypatch.setattr("httpx.AsyncClient.get", _must_not_dial, raising=True)
 
     resp = client.get(f"/debug/test-shopify/{MERCHANT}")
 
-    # No packet, whatever the status: an unauthenticated request must not spend the token.
-    assert listener.count == 0
+    assert resolved == [], "an unauthenticated request caused a merchant credential to be resolved"
     assert resp.status_code in (401, 403), (
         f"unauthenticated caller reached the handler and got {resp.status_code}"
     )
@@ -157,11 +178,13 @@ def test_an_admin_caller_still_reaches_the_handler(client, monkeypatch):
     monkeypatch.setattr(dbg, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
     monkeypatch.setattr("httpx.AsyncClient.get", _fake_get, raising=True)
 
-    resp = client.get(f"/debug/test-shopify/{MERCHANT}", headers=_token("admin"))
+    for role in ("admin", "super_admin"):
+        seen.clear()
+        resp = client.get(f"/debug/test-shopify/{MERCHANT}", headers=_token(role))
 
-    assert resp.status_code == 200, resp.text
-    assert seen == ["https://victim.myshopify.com/admin/api/2025-10/products.json"]
-    assert resp.json()["product_count"] == 3
+        assert resp.status_code == 200, f"{role}: {resp.text}"
+        assert seen == ["https://victim.myshopify.com/admin/api/2025-10/products.json"]
+        assert resp.json()["product_count"] == 3
 
 
 # --------------------------------------------------------------------------------------
@@ -218,3 +241,85 @@ def test_an_unexpected_error_does_not_echo_its_message(client, monkeypatch):
     body = str(resp.json())
     assert "10.0.0.9" not in body
     assert "secret detail" not in body
+
+
+# --------------------------------------------------------------------------------------
+# 4. The adjacent twin, found by review of this PR.
+#
+# POST /debug/test-wix-sync/{merchant_id} was mounted ONE LINE ABOVE the Shopify route in main.py
+# with the identical defect, and was the worse of the pair: it returned traceback.format_exc() to
+# the caller. Gating one and leaving the other is not a fix.
+# --------------------------------------------------------------------------------------
+
+def test_the_wix_debug_twin_is_also_gated(client, monkeypatch):
+    import routes.debug_product_sync as wix
+
+    fetched = []
+
+    async def _fetch_one(query, values=None):
+        fetched.append(values)
+        return {"platform": "wix", "domain": "victim.example", "api_key": "wix_key", "status": "active"}
+
+    monkeypatch.setattr(wix.database, "fetch_one", _fetch_one, raising=False)
+
+    resp = client.post(f"/debug/test-wix-sync/{MERCHANT}")
+
+    assert fetched == [], "an unauthenticated request read a merchant's Wix credentials"
+    assert resp.status_code in (401, 403)
+
+
+def test_the_wix_debug_twin_does_not_return_a_traceback(client, monkeypatch):
+    """Its handler caught every exception and returned traceback.format_exc() -- module paths,
+    local state, and on a DB error the connection detail -- straight to the caller."""
+    import routes.debug_product_sync as wix
+
+    async def _boom(query, values=None):
+        raise RuntimeError("connection to server at 10.0.0.9 port 5432 failed: secret detail")
+
+    monkeypatch.setattr(wix.database, "fetch_one", _boom, raising=False)
+
+    resp = client.post(f"/debug/test-wix-sync/{MERCHANT}", headers=_token("admin"))
+
+    body = str(resp.json())
+    assert "traceback" not in body.lower()
+    assert "10.0.0.9" not in body
+    assert "secret detail" not in body
+
+
+# --------------------------------------------------------------------------------------
+# 5. The non-200 branch, which had no coverage at all.
+# --------------------------------------------------------------------------------------
+
+def test_a_non_200_upstream_echoes_only_shopifys_own_body(client, monkeypatch):
+    """This branch returns `response.text[:500]`. It is KEPT: the route is admin-gated and the host
+    is now pinned, so that body is Shopify's own error and is the point of a debug endpoint. Pinned
+    with a test because it was previously uncovered, and because the reasoning only holds while
+    BOTH of those conditions do -- if either is ever relaxed, this becomes an echo of an
+    attacker-chosen server's response."""
+    class _Resp:
+        status_code = 401
+        text = '{"errors":"[API] Invalid API key or access token"}'
+
+        @staticmethod
+        def json():
+            return {}
+
+    async def _fake_get(self, url, *a, **k):  # noqa: ANN001
+        return _Resp()
+
+    async def _fake_resolve(**_kwargs):
+        return "shpat_VICTIM_TOKEN_SENTINEL", {}
+
+    monkeypatch.setattr(dbg.database, "fetch_one", _store_row("victim.myshopify.com"), raising=False)
+    monkeypatch.setattr(dbg, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
+    monkeypatch.setattr("httpx.AsyncClient.get", _fake_get, raising=True)
+
+    resp = client.get(f"/debug/test-shopify/{MERCHANT}", headers=_token("admin"))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["api_response_code"] == 401
+    assert "Invalid API key" in body["error"]
+    # The token itself must never come back, whatever the upstream said.
+    assert "shpat_" not in str(body)
