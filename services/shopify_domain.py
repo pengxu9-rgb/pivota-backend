@@ -31,24 +31,39 @@ Several credential-sending sites are still unpinned. This list is what a later s
 keeping it accurate matters in BOTH directions — a fixed file left on it wastes the next reader's
 time, and a missing one is how a site survives the sweep entirely:
 
+ADMIN-API HOSTS still unpinned (each reads `merchant_stores.domain` raw and puts it in an Admin API
+URL with a live per-shop token). The CREDENTIAL-EXCHANGE leg of every one of these is already closed
+by the chokepoint pin in `services/shopify_access_token_service.py`; what remains is each one's own
+request:
+
+  * `services/shopify_storefront_pricing_service.py` — the sharpest: it MINTS a new Storefront
+    access token at `POST /admin/api/{v}/storefront_access_tokens.json` based on what that host
+    answers, and persists it to the store row
+  * `services/shopify_pricing_service.py`, `services/merchant_order_sync_drain.py`,
+    `services/store_lifecycle_service.py` (an hourly cron over EVERY active store),
+    `services/shopify_content_writeback.py`, `services/shopify_transactions_service.py`
   * `services/shopify_products_sync.py` — reached from the `products/*` webhook background task
-  * `jobs/catalog_import_worker.py`, `routes/agent_products.py`,
-    `routes/merchant_api_extensions.py`
-  * `readiness/service.py` — its ORDER and TRANSACTION senders only; its returns calls are covered
-    by the helper pin below
-  * `services/shopify_transactions_service.py`, and the inline-httpx tail in
+  * `jobs/catalog_import_worker.py`
+  * `routes/product_routes.py`, `routes/merchant_events.py`, `routes/universal_product_sync.py`,
+    `routes/agent_products.py`, `routes/merchant_api_extensions.py`,
     `routes/admin_debug_shopify_token.py`, `routes/manage_integrations.py`, `routes/order_routes.py`
+  * `readiness/service.py` — its ORDER and TRANSACTION senders
 
 Came OFF this list once pinned: `routes/ops_shopify_integration_routes.py` (all four
-network-touching routes), and the whole RETURNS family — `routes/merchant_risk_api.py`,
-`routes/agent_commerce.py` and `readiness/service.py`'s returns calls — closed by pinning
-`sync_shopify_returns_best_effort` and `probe_shopify_return_eligibility_best_effort` themselves.
+network-touching routes) and the RETURNS family — `routes/merchant_risk_api.py`,
+`routes/agent_commerce.py`, and `readiness/service.py`'s returns calls.
 
-That returns pin REFUSES BY RETURNING `{"ok": False}`, not by raising, because
-`readiness/service.py:1200` and `routes/agent_commerce.py:511` call those helpers with no exception
-handling — a raise there converts a recoverable miss into an unhandled 500. Any further helper pin
-in this sweep has to answer the same question about its own callers before choosing a refusal
-channel.
+A PREVIOUS VERSION OF THIS LIST WAS WRONG IN THE DANGEROUS DIRECTION. It described readiness's
+returns calls as "covered by the helper pin", which removed a LIVE leak from the next reader's view:
+`readiness/service.py:1147` reached the credential exchange with a raw host one await before those
+helpers refused. A missing entry is how a site survives the sweep entirely, so prefer listing a file
+twice to dropping it once.
+
+TWO REFUSAL CHANNELS, and the choice is not stylistic. `exchange_shopify_client_credentials_token`
+and the two returns helpers all refuse BY RETURNING their existing failure shape, because their
+callers have no exception handling — a raise converts a recoverable miss into an unhandled 500.
+`register_webhooks_best_effort` raises, because all five of its callers wrap it. Ask what the
+callers do with a failure BEFORE choosing, for every remaining pin in this sweep.
 """
 
 from __future__ import annotations

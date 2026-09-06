@@ -4,11 +4,20 @@
 functions this module exports to other modules, and both took a `shop_domain` argument straight from
 `merchant_stores.domain` with a live Admin token beside it. Four callers:
 
-  * `readiness/service.py:1200`      — raw column
-  * `routes/agent_commerce.py:511`   — raw column AND the raw `api_key` column as the token, then
-                                       hands the same raw host to the eligibility probe at :521
-  * `routes/merchant_risk_api.py`    — raw column, same shape
+  * `readiness/service.py:1200` (sync) and `:1346` (probe) — FIVE call sites, not four. Both are
+    fed by `_resolve_shopify_return_context`, which passes the raw host to
+    `resolve_shopify_admin_access_token` one await EARLIER; that resolver POSTs the app's
+    client_id + client_secret, which mint tokens for every shop the app is installed on. Pinning
+    only these helpers left the stronger credential exposed on this path — see the chokepoint pin
+    in `services/shopify_access_token_service.py` and the local pin at `readiness/service.py:1147`.
+  * `routes/agent_commerce.py:511` — raw column AND the raw `api_key` column as the token, then the
+    same raw host to the eligibility probe at :521
+  * `routes/merchant_risk_api.py`  — raw column, same shape
   * `routes/ops_shopify_integration_routes.py` — pinned at the call site in #2086
+
+Only TWO of them pass the raw `api_key` column as the token (`agent_commerce`, `merchant_risk_api`);
+`readiness` passes a RESOLVED token. An earlier draft of this file said three, and lumping readiness
+in with the raw-token callers is exactly what erased the resolver hop from view.
 
 PINNED AT THE HELPER, not at the four callers. #2086 argued for exactly this and then applied it to
 one helper and not this one, which is why the merchant_risk_api and agent_commerce twins stayed open
@@ -199,18 +208,35 @@ async def test_probe_refuses_a_hostile_host_without_dialling(listener, host_tpl)
     assert host not in str(result)
 
 
-async def test_probe_still_runs_for_a_real_shop(monkeypatch):
+@pytest.mark.parametrize(
+    "given",
+    [
+        "cosrx-renewal.myshopify.com",
+        # Non-canonical forms must be NORMALISED, not refused...
+        "HTTPS://CosRx-Renewal.MyShopify.Com/admin",
+        # ...and a port must not survive into the request. A mutant that validated the host but
+        # dropped `shop_domain = pinned` passed all 16 tests before this parametrisation existed:
+        # the NAME cleared the pin, and the raw host-with-port was what reached the Admin client
+        # with a live token. The sync half had this test; the probe did not.
+        "cosrx-renewal.myshopify.com:51285",
+    ],
+)
+async def test_probe_still_runs_for_a_real_shop_and_normalises_the_host(monkeypatch, given):
+    seen: List[str] = []
+
     async def _fake_introspect(*, shop_domain, access_token, api_version, type_name):
+        seen.append(shop_domain)
         return ["returns", "returnableFulfillments"]
 
     async def _fake_graphql(*, shop_domain, access_token, query, variables=None, api_version=None, **k):
+        seen.append(shop_domain)
         return {"order": {"id": "gid://shopify/Order/123"}}
 
     monkeypatch.setattr(rs, "_introspect_type_fields", _fake_introspect, raising=True)
     monkeypatch.setattr(rs, "shopify_admin_graphql", _fake_graphql, raising=True)
 
     result = await rs.probe_shopify_return_eligibility_best_effort(
-        shop_domain="cosrx-renewal.myshopify.com",
+        shop_domain=given,
         access_token=TOKEN,
         api_version="2025-10",
         shopify_order_id="123",
@@ -218,6 +244,10 @@ async def test_probe_still_runs_for_a_real_shop(monkeypatch):
 
     assert result["ok"] is True
     assert result["shopify_order_id"] == "123"
+    assert seen, "the validated host never reached the Admin client"
+    # The HOST THAT ARRIVED is the contract -- "did not raise" cannot distinguish a normalised host
+    # from the raw one.
+    assert set(seen) == {"cosrx-renewal.myshopify.com"}
 
 
 # --------------------------------------------------------------------------------------
@@ -260,3 +290,143 @@ def test_every_external_caller_goes_through_a_pinned_entry_point():
         assert body.index("normalize_myshopify_domain(shop_domain)") < body.index("await "), (
             f"{pinned} awaits something before it pins its host"
         )
+
+
+# --------------------------------------------------------------------------------------
+# 4. The chokepoint, and the readiness path that reached it with a raw host.
+#
+# Found by review: pinning the two returns helpers was decorative on the readiness path, because
+# `_resolve_shopify_return_context` hands the raw host to `resolve_shopify_admin_access_token` one
+# await EARLIER, and that POSTs the app's client_id + client_secret -- credentials that mint tokens
+# for EVERY shop the app is installed on, not just this one. Proven at a socket before the fix.
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("host_tpl", HOSTILE)
+async def test_the_credential_exchange_itself_refuses_a_non_myshopify_host(listener, host_tpl):
+    """The chokepoint. This is the only place in the repo that POSTs client_id + client_secret, and
+    it is reached from ~27 call sites, so pinning it closes the credential-exchange leg everywhere
+    at once rather than per caller. httpx is left REAL: nothing sits between this and the socket."""
+    from services.shopify_access_token_service import exchange_shopify_client_credentials_token
+
+    host = host_tpl.format(port=listener.port)
+
+    token, expires_in, error = await exchange_shopify_client_credentials_token(
+        shop_domain=host, client_id="cid", client_secret="csec",
+    )
+
+    assert listener.count == 0, "the client-credentials exchange dialled the host it was handed"
+    assert token is None
+    assert error == "shop_domain_not_myshopify"
+
+
+async def test_the_credential_exchange_refuses_by_returning_not_raising(listener):
+    """Its callers read the reason out of meta["refresh_error"] and carry on with the token they
+    already had. A raise here would surface at ~27 sites, most of which have no handler."""
+    from services.shopify_access_token_service import exchange_shopify_client_credentials_token
+
+    try:
+        token, _expires, error = await exchange_shopify_client_credentials_token(
+            shop_domain=f"127.0.0.1:{listener.port}", client_id="cid", client_secret="csec",
+        )
+    except BaseException as exc:  # noqa: BLE001
+        pytest.fail(f"the chokepoint pin raised instead of returning: {exc!r}")
+
+    assert (token, error) == (None, "shop_domain_not_myshopify")
+    assert listener.count == 0
+
+
+async def test_the_credential_exchange_still_runs_for_a_real_shop(monkeypatch):
+    """Positive counterpart: a refusal-everything chokepoint would silently stop every token
+    refresh in the codebase, which no other test here would notice."""
+    from services import shopify_access_token_service as sats
+
+    seen = []
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"access_token": "shpat_NEW", "expires_in": 3600}
+
+    async def _fake_post(self, url, *a, **k):  # noqa: ANN001
+        seen.append(url)
+        return _Resp()
+
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post, raising=True)
+
+    token, _expires, error = await sats.exchange_shopify_client_credentials_token(
+        shop_domain="HTTPS://CosRx-Renewal.MyShopify.Com/admin", client_id="cid", client_secret="csec",
+    )
+
+    assert error is None
+    assert token == "shpat_NEW"
+    # Normalised, not merely accepted.
+    assert seen == ["https://cosrx-renewal.myshopify.com/admin/oauth/access_token"]
+
+
+def test_a_refused_probe_is_audible_in_the_eligibility_summary():
+    """The refusal shape omits every key the summary's warnings are derived from, so before this the
+    surface answered "checked, found nothing" -- no warnings at all -- on a merchant whose returns
+    were broken precisely because we never reached Shopify. That is the shape #2074 was merged to
+    stop, and an operator hits this endpoint to find out WHY returns are broken."""
+    import inspect
+    import readiness.service as rsvc
+
+    body = inspect.getsource(rsvc._build_return_eligibility_summary)
+    assert 'platform_probe.get("ok") is False' in body, (
+        "a refused probe produces no warning, so the summary reports a clean bill of health"
+    )
+    assert "shopify_return_probe_refused" in body
+
+
+async def test_readiness_refuses_a_non_myshopify_store_before_building_a_context(monkeypatch):
+    """The readiness local pin, which the chokepoint alone does NOT make observable.
+
+    With only the chokepoint pinned, a hostile stored domain still flows into the returned context
+    whenever `shopify_cfg` carries a fallback access_token: the resolver refuses, the fallback token
+    fills in, and the raw host is handed onward to the returns helpers. Those helpers then refuse --
+    so there is no leak either way -- but the operator gets an opaque `ok: False` from deep in the
+    sync instead of this surface's own CHECKOUT_RETURN_SYNC_UNAVAILABLE, which
+    routes/readiness_internal.py maps to a 409 naming the missing piece.
+
+    That fallback-token case is the only one that distinguishes the two, which is why it is the one
+    tested: without it the mutant that unpins readiness passes every other test in this file."""
+    import readiness.service as rsvc
+
+    class _Checkout:
+        merchant_id = "m1"
+        order_id = "o1"
+        # The builder reads this before anything else; an empty payload takes its own early branch.
+        session_payload = {"merchant_alpha_mode": "real_merchant_alpha"}
+
+    class _Journal:
+        async def get_checkout_session(self, checkout_id):
+            return _Checkout()
+
+    async def _order(_order_id):
+        return {"id": "o1", "merchant_id": "m1", "shopify_order_id": "123"}
+
+    async def _primary(_merchant_id):
+        return {"store_id": "s1", "platform": "shopify", "domain": "evil.example",
+                "api_key": "shpat_X", "api_key_raw": "shpat_X"}
+
+    async def _cfg(_merchant_id):
+        # A fallback token IS present -- the case that separates the local pin from the chokepoint.
+        return {"access_token": "shpat_FALLBACK", "api_version": "2025-10"}
+
+    monkeypatch.setattr(rsvc, "get_default_journal", lambda: _Journal(), raising=True)
+    monkeypatch.setattr(rsvc, "get_order", _order, raising=True)
+    monkeypatch.setattr(rsvc, "get_primary_store", _primary, raising=True)
+    monkeypatch.setattr(rsvc, "_get_shopify_config_for_merchant", _cfg, raising=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        await rsvc._resolve_shopify_return_context("m1", "c1")
+
+    detail = excinfo.value.args[0]
+    assert detail["code"] == "CHECKOUT_RETURN_SYNC_UNAVAILABLE"
+    # The refusal names WHICH half was missing, and it is the host -- not the token, which was there.
+    assert detail["shop_domain_present"] is False
+    assert detail["access_token_present"] is True
+    assert "evil.example" not in str(detail)
