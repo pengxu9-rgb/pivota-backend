@@ -908,7 +908,21 @@ async def shutdown_event():
         await stop_scheduler()
     except Exception:
         pass
-    await database.disconnect()
+    finally:
+        # `finally`, not a bare next statement: stop_scheduler now contains an await (the
+        # shutdown drain), so a CancelledError landing inside it would propagate past an
+        # `except Exception` and skip the disconnect entirely. Cancellation still propagates
+        # -- swallowing it would break cancellation semantics -- but the pool is closed first.
+        #
+        # GUARDED, because the reorder made THIS the disconnect that actually runs. It is
+        # asyncpg's Pool.close(); if it raises, the exception escapes app_lifespan's own
+        # `finally` and `await shutdown()` never runs, which uvicorn reports as a failed
+        # lifespan shutdown. Previously the guarded copy in shutdown() ran first and this one
+        # hit databases' idempotent no-op path, so the raise had nowhere to go.
+        try:
+            await database.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error closing the database pool during shutdown: %s", exc)
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
 dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -2112,8 +2126,25 @@ async def app_lifespan(_app: FastAPI):
         # shutdown()/shutdown_event() entirely (review round 20).
         with suppress(asyncio.CancelledError, Exception):
             await reconnect_supervisor
-        await shutdown()
+        # ORDER IS LOAD-BEARING, and it was the wrong way round.
+        #
+        # `shutdown()` is `database.disconnect()`, which closes the asyncpg pool.
+        # `shutdown_event()` stops the webhook workers and the audit scheduler. Running the
+        # disconnect FIRST meant every still-running scheduler job was cut off from the pool
+        # while it was being asked to stop: `PostgresConnection.acquire` asserts
+        # "DatabaseBackend is not running", so a run that had already made its external call
+        # (settlement, refund) then FAILED ITS RECORDING WRITE rather than completing. Worse,
+        # once audit_scheduler grew a shutdown drain, that run got seconds of extra life in
+        # which to do it, and could reach its own end and be booked `ok` — a silent
+        # half-completed run on the money path, where the old behaviour was a prompt cancel.
+        #
+        # Stopping the producers before tearing down the resource they use is the right order
+        # regardless of the drain, and it also removes a pre-existing hazard: asyncpg's
+        # `Pool.close()` waits for every holder to be released (it only warns at 60s), and it
+        # was being called while every scheduler job still held connections and had not been
+        # told to stop.
         await shutdown_event()
+        await shutdown()
 
 
 app.router.lifespan_context = app_lifespan

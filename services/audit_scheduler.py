@@ -64,7 +64,9 @@ force a run with POST /admin/scheduler/jobs/{id}/run-now.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import os
 from typing import Optional
 
@@ -1248,19 +1250,171 @@ async def restart_scheduler() -> dict:
     return scheduler_diagnostics()
 
 
-async def stop_scheduler() -> None:
-    """Graceful shutdown of the scheduler. Called from
-    main.shutdown_event. Best-effort."""
-    global _SCHEDULER
-    if _SCHEDULER is None:
+# How long shutdown may wait for in-flight runs before cancelling them.
+#
+# SMALL ON PURPOSE, and the ceiling is not ours to choose: Cloud Run sends SIGTERM and then
+# kills the container, and uvicorn is started with no --timeout-graceful-shutdown, so it waits
+# on this lifespan indefinitely. Overrun the platform's grace and the process is SIGKILLed
+# MID-DRAIN, before `database.disconnect()` has run -- losing the connection teardown to save a
+# job is a strictly worse trade than cancelling the job.
+#
+# That sentence is only true because main.app_lifespan now calls shutdown_event() BEFORE
+# shutdown(); when it was the other way round the pool was already closed by the time this
+# ran, so the drain could not let a DB-touching job finish at all -- it just gave it a few
+# seconds to fail its recording write. If that ordering is ever reverted, this budget argument
+# stops holding and so does the drain.
+# Set SCHEDULER_DRAIN_SECONDS=0 to restore the previous cancel-immediately behaviour.
+# 3s, not 5. The drain now runs BEFORE `database.disconnect()`, so it and the pool close share
+# one grace budget of roughly 10s -- 5s was half of it for a benefit that is almost entirely
+# realised in the first second. The jobs this helps are the short ticks (an indexed query on an
+# idle queue) which land in milliseconds; the ones that would use the full budget are the long
+# drainers, and an audit run that "routinely runs >15 min" is not going to land in 5s either.
+# So the extra 2s buys almost nothing and spends a fifth of the shutdown window.
+_DRAIN_DEFAULT_SECONDS = 3.0
+# An absolute ceiling on what the env var may ask for. Not a tuning limit — a blast-radius
+# bound: the whole argument above is that overrunning the platform's grace loses
+# `database.disconnect()`, so a value that does that is never what anyone meant. Chosen
+# against Cloud Run's documented ~10s SIGTERM grace, leaving room for the rest of
+# main.shutdown_event. A larger request is honoured up to here and says so.
+_DRAIN_MAX_SECONDS = 8.0
+
+
+def _read_drain_seconds() -> float:
+    """SCHEDULER_DRAIN_SECONDS, parsed so a typo cannot cost more than the drain.
+
+    THIS FUNCTION EXISTS BECAUSE THE ONE-LINER IT REPLACED WAS A LANDMINE. It was
+    `float(os.getenv(...))` evaluated at IMPORT, so `SCHEDULER_DRAIN_SECONDS=5s` raised
+    ValueError while this module was being imported — and main.py:891 imports it inside
+    `except Exception`, which turns that into "audit_scheduler boot failed (continuing
+    degraded ... no worker will drain them)". A typo in a shutdown-timing knob would have
+    silently disabled EVERY cron and drainer on the worker. That is not a proportionate
+    consequence, so nothing here may raise.
+    """
+    raw = (os.getenv("SCHEDULER_DRAIN_SECONDS") or "").strip()
+    if not raw:
+        return _DRAIN_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a number - using the "
+            "default %.1fs. Set 0 to disable the shutdown drain.", raw, _DRAIN_DEFAULT_SECONDS,
+        )
+        return _DRAIN_DEFAULT_SECONDS
+    # NON-FINITE FIRST, because the comparisons below cannot reject them: `nan <= 0` is
+    # False AND `nan > _DRAIN_MAX_SECONDS` is False, so a value of `nan` would fall straight
+    # through both guards and reach `asyncio.wait(timeout=nan)`, which never fires — shutdown
+    # hangs until the platform kills the container. `inf` is caught by the ceiling below, but
+    # is rejected here too so the reason in the log is the true one.
+    if not math.isfinite(value):
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%r is not a finite number - using the "
+            "default %.1fs.", raw, _DRAIN_DEFAULT_SECONDS,
+        )
+        return _DRAIN_DEFAULT_SECONDS
+    if value <= 0:
+        return 0.0          # explicit opt-out
+    if value > _DRAIN_MAX_SECONDS:
+        logger.warning(
+            "audit_scheduler: SCHEDULER_DRAIN_SECONDS=%s exceeds the %.1fs ceiling and would "
+            "risk the container being killed mid-shutdown, losing database.disconnect(). "
+            "Using %.1fs.", raw, _DRAIN_MAX_SECONDS, _DRAIN_MAX_SECONDS,
+        )
+        return _DRAIN_MAX_SECONDS
+    return value
+
+
+_DRAIN_SECONDS = _read_drain_seconds()
+
+
+async def _drain_running_jobs(seconds: float) -> None:
+    """Wait, briefly, for in-flight scheduler runs to finish. Never raises."""
+    if seconds <= 0:
         return
     try:
-        # AsyncIOScheduler.shutdown(wait=False) cancels in-flight
-        # jobs immediately. We prefer wait=True so a re-audit in
-        # progress completes — but capped at 30s so deploys aren't
-        # blocked by a hanging job.
-        _SCHEDULER.shutdown(wait=False)
+        from services.scheduler_job_runner import active_tasks
+        tasks = active_tasks()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_scheduler: could not read in-flight runs: %s", exc)
+        return
+    if not tasks:
+        return
+    # WARNING, not info: this process ships no logging config, so the root logger sits at
+    # WARNING and every logger.info is dropped. A drain that only logged at info would be
+    # invisible in exactly the situation someone is reading logs to understand.
+    logger.warning("audit_scheduler: draining %d in-flight run(s), up to %.1fs", len(tasks), seconds)
+    try:
+        _done, pending = await asyncio.wait(tasks, timeout=seconds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit_scheduler: drain failed, cancelling instead: %s", exc)
+        return
+    if pending:
+        logger.warning(
+            "audit_scheduler: %d run(s) still going after %.1fs - cancelling them",
+            len(pending), seconds,
+        )
+
+
+async def stop_scheduler() -> None:
+    """Shut the scheduler down, letting in-flight runs finish first if they can.
+
+    WHY THIS IS NOT JUST `shutdown(wait=True)`, which is what this function used to claim
+    it wanted. For an AsyncIOScheduler the `wait` argument IS A NO-OP. APScheduler 3.11's
+    AsyncIOExecutor.shutdown says so in its own body -- "there is no way to honor wait=True
+    without converting this method into a coroutine method" -- and then cancels every pending
+    future regardless of the flag. So `wait=True` and `wait=False` are byte-identical here,
+    and the old comment ("we prefer wait=True ... capped at 30s") described behaviour that
+    could not exist: `shutdown()` takes no timeout either. Flipping the flag would have
+    turned a visible mismatch into an invisible one.
+
+    Draining therefore has to be done BY US, before handing control to APScheduler, and the
+    runner already tracks the real asyncio.Tasks so no private state is touched.
+
+    WHY IT IS WORTH DOING AT ALL. Since 2026-09-06 the worker is rolled on every push to main
+    (15-34 merges/day), so this path now runs constantly rather than at a human's pace. Every
+    cancelled in-flight run takes `run_isolated`'s wrapper-cancelled branch, which adopts it
+    as a ZOMBIE: an ERROR log naming the #1754 wedge class, plus a terminated DB connection.
+    Those are the right responses to a run that would not unwind; they are noise for an
+    ordinary redeploy, and repeated dozens of times a day they teach people to ignore an
+    error that elsewhere means something is genuinely stuck. THAT is the benefit, and it is
+    the idle and short ticks that supply it.
+
+    What this does NOT promise: that a tick with real work will land. `payment_reconcile_tick`
+    is 50 orders x (PSP verify + finalize + Shopify order); `merchant_order_sync_worker_tick`
+    is 20 jobs x 2 Shopify calls at 10s timeouts. Neither finishes in 3s, and neither was ever
+    going to — they are cancelled at the cap exactly as before. Read this as "settlement runs
+    are now safe from redeploys" and it will mislead you.
+
+    Best-effort throughout: nothing here may raise, and nothing may hang.
+    """
+    global _SCHEDULER
+    sched = _SCHEDULER
+    if sched is None:
+        return
+    try:
+        # PAUSE FIRST. Without it the timer keeps firing during the drain and we would be
+        # waiting on a set of runs that grows while we wait.
+        try:
+            sched.pause()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: pause before drain failed: %s", exc)
+        await _drain_running_jobs(_DRAIN_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.warning("audit_scheduler: stop error: %s", exc)
     finally:
+        # SHUTDOWN GOES IN THE `finally`, and this is not tidiness. The drain introduced an
+        # await into a function that used to be entirely synchronous, so a CancelledError can
+        # now land in the middle of it — and CancelledError is not an Exception, so it would
+        # sail past the handler above, SKIP the shutdown, and still hit `_SCHEDULER = None`
+        # below. That leaves APScheduler RUNNING with its timer armed and no reference left to
+        # stop it, while shutdown_event's own `finally` closes the pool underneath it.
+        # Measured, not theorised: `sched.calls == ['pause']` with `_SCHEDULER is None`.
+        #
+        # main.py:911's `finally: await database.disconnect()` was added in the same review
+        # round on exactly this premise; this is the same premise applied one level down.
+        try:
+            # Whatever is still running is cancelled here, exactly as before.
+            sched.shutdown(wait=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: shutdown error: %s", exc)
         _SCHEDULER = None

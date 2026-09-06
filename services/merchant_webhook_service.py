@@ -931,13 +931,41 @@ async def start_merchant_webhook_retry_worker() -> None:
     _retry_worker_task = spawn_isolated(_retry_worker_loop(_retry_worker_stop), name="merchant_webhook_retry_worker")
 
 
+# How long a shutdown may wait for the retry worker to finish its current iteration.
+#
+# SMALL, AND IT HAS TO BE BOUNDED AT ALL. `stop_event` is only checked at the TOP of
+# `_retry_worker_loop`, so setting it does not interrupt an iteration in progress — and an
+# iteration is `process_due_retries(limit=20)`, up to twenty sequential deliveries each with a
+# 10.0s HTTP timeout. A bare `await` on that task is therefore an await of up to ~200s.
+#
+# That used to be masked by accident: `database.disconnect()` ran BEFORE this, so the next
+# `database.*` call in the loop raised "DatabaseBackend is not running" and the remaining rows
+# failed in microseconds. Reordering the lifespan so the scheduler drains while the pool is
+# still open (which it must, or drained jobs cannot write) removed that accidental bound and
+# left a ~200s await in front of the disconnect, on `web` as well as `worker`. Found in review.
+#
+# There is nothing to lose by cutting a retry short: it is a RETRY, it stays due, and the next
+# instance picks it up. `asyncio.wait_for` cancels the task on timeout, so this is a real bound
+# and not just a log line.
+_STOP_TIMEOUT_SECONDS = 1.0
+
+
 async def stop_merchant_webhook_retry_worker() -> None:
     global _retry_worker_task, _retry_worker_stop
     if _retry_worker_stop is not None:
         _retry_worker_stop.set()
-    if _retry_worker_task is not None:
+    task = _retry_worker_task
+    if task is not None:
         try:
-            await _retry_worker_task
+            await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            # wait_for has already cancelled it; say so rather than letting a shutdown that
+            # cut work short look like a clean one.
+            logger.warning(
+                "%s: retry worker did not stop within %.1fs and was cancelled mid-iteration; "
+                "any unfinished retries stay due and the next instance will pick them up.",
+                __name__, _STOP_TIMEOUT_SECONDS,
+            )
         except Exception:
             pass
     _retry_worker_task = None

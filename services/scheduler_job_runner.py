@@ -425,6 +425,26 @@ def cancel_running(job_id: str) -> int:
     return n
 
 
+def active_tasks() -> set:
+    """Every in-flight run task, across all jobs.
+
+    For `audit_scheduler.stop_scheduler`, which drains these briefly before shutting the
+    scheduler down. ZOMBIES ARE DELIBERATELY EXCLUDED: a zombie is a run that already
+    missed its deadline and refused to unwind, so waiting on one would burn the whole
+    drain budget on the single task least likely to finish — and it has already been
+    accounted for, logged, and had its DB connection terminated.
+
+    NOT excluded, and worth knowing: a run that has passed its deadline and is inside its
+    cancel-grace window is still in `active` (run_isolated pops it only in `_finish`), so
+    the drain can spend some of its budget on a task that is already being abandoned. It is
+    bounded by the drain timeout, so this costs time and never correctness.
+    """
+    out = set()
+    for st in _REGISTRY.values():
+        out.update(t for t in st.active if not t.done())
+    return out
+
+
 def registry_snapshot(*, include_error_text: bool = False) -> Dict[str, Dict[str, Any]]:
     return {jid: st.snapshot(include_error_text=include_error_text) for jid, st in sorted(_REGISTRY.items())}
 
