@@ -168,25 +168,137 @@ async def test_the_writer_refuses_an_empty_reason():
         ) is False, f"reason={blank!r} was accepted"
 
 
+def _params(call) -> dict:
+    """The bound parameters of the UPDATE the writer actually issued."""
+    stmt = call[0]
+    return dict(stmt.compile().params)
+
+
 @pytest.mark.asyncio
-async def test_every_no_verdict_state_is_writable():
+async def test_every_no_verdict_state_reaches_the_write(monkeypatch):
     """The positive counterpart: the guard must not reject the whole vocabulary.
 
-    Reaches the DB layer and fails there (no such row), which is a different and
-    LATER failure than the validation refusals above — so a mutant that makes
-    the function `return False` unconditionally is caught by this test rather
-    than passing all three.
+    ASSERTS THE WRITE WAS ISSUED, not the return value. The earlier version
+    asserted `result in (True, False)` — which `bool` satisfies on every path,
+    so it could not fail at all, and its docstring claimed it caught a
+    `return False` mutant. It did not: inserting `return False` as the first
+    statement left this test green.
     """
     import db.audit_evidence as ae
 
+    calls = []
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return 1
+
+    monkeypatch.setattr(ae.database, "execute", _spy)
+    monkeypatch.setattr(ae, "ensure_audit_evidence_tables", _noop)
+
     for status in sorted(ae.VERIFICATION_NO_VERDICT):
-        # No such verify_id, so the UPDATE matches nothing; what matters is that
-        # validation let it THROUGH to the update at all.
-        result = await ae.mark_verification_no_verdict(
-            verify_id="no-such-row", worker_id="w1", status=status,
+        assert await ae.mark_verification_no_verdict(
+            verify_id="v1", worker_id="w1", status=status,
             reason="the browser commerce lane has never run",
-        )
-        assert result in (True, False)
+        ) is True, f"{status!r} did not reach the write"
+    assert len(calls) == len(ae.VERIFICATION_NO_VERDICT)
+
+
+@pytest.mark.asyncio
+async def test_the_reason_is_actually_stored(monkeypatch):
+    """The feature is "make the reason STORABLE", and nothing asserted the
+    reason was written.
+
+    Proven vacuous: replacing the whole VALUES clause with `{"status": status}`
+    — dropping the reason, both timestamps and evidence_jsonb — left all 21
+    tests green. A test suite for "we store the reason" must fail when the
+    reason is not stored.
+    """
+    import db.audit_evidence as ae
+
+    calls = []
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return 1
+
+    monkeypatch.setattr(ae.database, "execute", _spy)
+    monkeypatch.setattr(ae, "ensure_audit_evidence_tables", _noop)
+
+    await ae.mark_verification_no_verdict(
+        verify_id="v1", worker_id="w1",
+        status=ae.VERIFICATION_STATUS_UNVERIFIED,
+        reason="the browser commerce lane has never run",
+    )
+
+    params = _params(calls[0])
+    assert params.get("status") == ae.VERIFICATION_STATUS_UNVERIFIED
+    # In error_message, where the live ops rollup groups on it — a reason
+    # hidden only in JSONB shows there as NULL.
+    assert params.get("error_message") == (
+        "the browser commerce lane has never run"
+    )
+    assert params.get("completed_at") is not None
+    assert params.get("last_checked_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_a_caller_supplied_evidence_payload_is_kept_and_annotated(
+    monkeypatch,
+):
+    """And when the caller HAS evidence, the reason joins it rather than
+    replacing it."""
+    import db.audit_evidence as ae
+
+    calls = []
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return 1
+
+    monkeypatch.setattr(ae.database, "execute", _spy)
+    monkeypatch.setattr(ae, "ensure_audit_evidence_tables", _noop)
+
+    await ae.mark_verification_no_verdict(
+        verify_id="v1", worker_id="w1",
+        status=ae.VERIFICATION_STATUS_UNPARSEABLE,
+        reason="could not parse the answer",
+        evidence_jsonb={"raw_prefix": "<<<not json>>>"},
+    )
+
+    payload = _params(calls[0]).get("evidence_jsonb") or {}
+    assert payload.get("raw_prefix") == "<<<not json>>>", (
+        "the caller's evidence was dropped"
+    )
+    assert payload.get("no_verdict_reason") == "could not parse the answer"
+
+
+@pytest.mark.asyncio
+async def test_no_payload_means_the_column_is_left_alone(monkeypatch):
+    """The divergence a review caught: every sibling terminal transition OMITS
+    evidence_jsonb when the caller passes none. Writing it unconditionally
+    REPLACES the column, so a row carrying partial verifier output would lose
+    it. Latent today (nothing writes it pre-terminal) and one line to prevent.
+    """
+    import db.audit_evidence as ae
+
+    calls = []
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return 1
+
+    monkeypatch.setattr(ae.database, "execute", _spy)
+    monkeypatch.setattr(ae, "ensure_audit_evidence_tables", _noop)
+
+    await ae.mark_verification_no_verdict(
+        verify_id="v1", worker_id="w1",
+        status=ae.VERIFICATION_STATUS_SKIPPED, reason="out of scope",
+    )
+
+    assert "evidence_jsonb" not in _params(calls[0]), (
+        "the column was written with no caller payload, which REPLACES "
+        "whatever the row already had"
+    )
 
 
 def test_the_writer_is_reachable_only_from_claimed():

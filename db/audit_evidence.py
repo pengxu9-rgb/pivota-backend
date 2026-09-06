@@ -238,7 +238,8 @@ VERIFICATION_STATUS_UNPARSEABLE = "unparseable"
 
 # The states that mean "no verdict, and here is why" — as opposed to
 # `succeeded`, which is a verdict. A projection must never read any of these as
-# a pass, and `read_as_pass` has no member here on purpose.
+# a pass. There is deliberately no "treat as success" set for these to be
+# a member of — the absence IS the contract.
 VERIFICATION_NO_VERDICT = frozenset({
     VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
     VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
@@ -2344,15 +2345,28 @@ async def mark_verification_no_verdict(
         return False
 
     now = _now_utc()
-    payload: Dict[str, Any] = dict(evidence_jsonb or {})
-    payload["no_verdict_reason"] = reason.strip()[:500]
-    payload["no_verdict_status"] = status
+    clean_reason = reason.strip()[:2000]
     values: Dict[str, Any] = {
         "status": status,
         "completed_at": now,
         "last_checked_at": now,
-        "evidence_jsonb": payload,
+        # The reason goes in error_message, NOT only in evidence_jsonb: the live
+        # ops rollup (scripts/diagnose_store_audit_lane.py) groups by
+        # (status, error_message), so a reason hidden in JSONB shows there as
+        # NULL — invisible on the one surface an operator actually reads.
+        # Truncated at 2000 to match every other free-text field in this module.
+        "error_message": clean_reason,
     }
+    if evidence_jsonb is not None:
+        # Written ONLY when the caller supplies one, exactly like
+        # mark_verification_succeeded and _blocked. Building a payload
+        # unconditionally would REPLACE the column, so a row that had partial
+        # verifier output would lose it — the one semantic where this writer
+        # diverged from all three siblings, and it diverged toward data loss.
+        values["evidence_jsonb"] = _json_safe({
+            **evidence_jsonb,
+            "no_verdict_reason": clean_reason,
+        })
     try:
         result = await database.execute(
             verification_runs.update()
