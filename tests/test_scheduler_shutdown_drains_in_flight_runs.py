@@ -121,7 +121,20 @@ async def test_a_long_run_does_not_hold_shutdown_open(runner, monkeypatch):
     sched = _FakeScheduler()
     mod = await _install(sched, monkeypatch, drain=0.15)
     started = asyncio.get_running_loop().time()
-    await mod.stop_scheduler()
+    # wait_for, NOT a bare await plus an elapsed-time assertion. Measured while mutating:
+    # dropping the drain's own `timeout=` makes stop_scheduler never return, so a bare await
+    # HANGS here instead of failing — and a hang is not a test result, it is a CI job burning
+    # its whole timeout with nothing to read afterwards. The cap under test is 0.15s; 5s is
+    # far outside it and still finite.
+    try:
+        await asyncio.wait_for(mod.stop_scheduler(), timeout=5.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+        pytest.fail(
+            "stop_scheduler never returned: the drain is unbounded, so a long-running job "
+            "holds the lifespan open until Cloud Run SIGKILLs the container mid-shutdown "
+            "and `database.disconnect()` never runs."
+        )
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 2.0, f"shutdown was held open for {elapsed:.1f}s by a long-running job"
