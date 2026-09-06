@@ -207,6 +207,76 @@ Subscriptions are installed idempotently through
 `store/order/created`, `store/order/updated`, `store/order/statusUpdated`, and
 `store/order/refund/created`.
 
+## Squarespace native bridge (webhook + reconciliation sweep)
+
+Squarespace is the first platform here where **the telemetry path depends on
+which credential the merchant connected**. Webhook subscriptions are an OAuth
+(Developer Platform) surface; a per-site Developer API key reaches the Orders
+API and nothing else. So:
+
+* an **OAuth**-connected site gets `POST /webhooks/squarespace/{store_id}`
+  (`write_path=squarespace_webhook`) *and* the sweep;
+* an **API-key** site gets the sweep alone
+  (`write_path=squarespace_reconciliation`), which is therefore not a safety net
+  but its only telemetry. `POST /integrations/squarespace/{store_id}/webhooks/ensure`
+  answers **409 `oauth_required`** for such a store rather than faking a
+  provisioning.
+
+Both write paths carry authority `platform` and may assert only
+`platform_asserted`. They must: an API-key store has no webhook path at all, and
+filing its orders below an identical OAuth store's would make a merchant's
+standing depend on which credential they pasted.
+
+**The delivery is thin** (`{id, topic, websiteId, subscriptionId, data:
+{orderId}}`), so the receiver fetches the order and answers 503 on a failed
+fetch — Squarespace retries a non-2xx. The subscription secret belongs to a
+SUBSCRIPTION, not to a site, so the body's `websiteId` is bound to the
+`website_id` recorded at connect, exactly as BigCommerce binds `producer`.
+
+**One order, one row, whichever ingress saw it.** Event ids are derived from the
+order id and the event type, never from the notification id, so a webhook
+observation and a later sweep observation of the same order collapse. Without
+that, an OAuth store — which has both paths armed and whose sweep re-reads every
+delivered order — would count every purchase twice.
+
+**`order.paid` comes from the order's existence.** The Orders API carries no
+payment status at all; an order is there because a checkout was paid. It is
+anchored at `createdOn`, since the payment caused the order. `testmode` orders
+are ignored entirely rather than mapped without money: recording one would be
+fabricated GMV under a key that can never be reused.
+
+**Refunds are a cumulative delta, and the baseline spans BOTH write paths.**
+`refundedTotal` is one money field with no per-refund records anywhere in the
+API, so the Shoplazza arithmetic applies verbatim: the ingress reads
+`recorded_refund_amount_cents` and the pure mapper emits
+`cumulative - previously` under `<order id>:<cumulative cents>`, with
+`native_amount_semantics=cumulative_refund_total_delta`. What is new is that the
+read is passed a SEQUENCE of write paths — `("squarespace_webhook",
+"squarespace_reconciliation")`. Scoped to one path, the sweep would read 0 for
+an order the webhook already recorded and emit the whole cumulative total under
+a second key the funnel SUMS: 1000 + 2500 = 3500 against a true cumulative of
+2500. `recorded_refund_amount_cents` still compiles a bare string to
+`write_path = $n`, so Shoplazza's behaviour and its Postgres gate are unchanged.
+The read and the write run under `order_money_read_modify_write_lock` (scope
+`squarespace_refund`), taken only when the order actually reports refunded
+money.
+
+**The sweep's cursor** is the high-water mark of `modifiedOn` seen, kept in the
+store's credential blob. It starts each window one overlap earlier, never moves
+backwards, and is **not advanced when the page cap truncated the run** — the
+orders list has no documented ordering, so a truncated run may have left orders
+behind whose `modifiedOn` is below the maximum it saw.
+
+**Nothing schedules the sweep.** CI deploys no Cloud Run job for the lane and
+the APScheduler lane runs on a service that is not auto-deployed, so the sweep
+ships as an authenticated route
+(`POST /integrations/squarespace/{store_id}/reconcile`) and a script
+(`scripts/sweep_squarespace_orders.py`, dry run by default). That gap is
+documented rather than papered over.
+
+`docs/SQUARESPACE_TELEMETRY.md` carries the full flow, the field-by-field
+verified/assumed table (20 rows), and the residual gaps.
+
 ## Wix native webhook bridge
 
 `POST /webhooks/wix` is the first **static** native bridge with no store id in
@@ -570,7 +640,7 @@ or whether a row is a probe.
 
 | Column | Values | Set by |
 | --- | --- | --- |
-| `write_path` | batch ingress: `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `shopline_webhook`, `shoplazza_webhook`, `sfcc_cartridge`, `adobe_io_events`, `stripe_webhook`; first-party writers: `agent_commerce_api`, `surface_click_attribution`, `commerce_attribution_edge`, `surface_listing_registry` | the route or service that verified the request |
+| `write_path` | batch ingress: `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `bigcommerce_webhook`, `wix_webhook`, `shopline_webhook`, `shoplazza_webhook`, `squarespace_webhook`, `squarespace_reconciliation`, `sfcc_cartridge`, `prestashop_module`, `adobe_io_events`, `stripe_webhook`; first-party writers: `agent_commerce_api`, `surface_click_attribution`, `commerce_attribution_edge`, `surface_listing_registry` | the route or service that verified the request |
 | `authority` | `observational` (browser), `merchant` (HMAC collector), `platform` (native signed webhook, reconciliation replay), `psp` (Stripe bridge), `pivota` (first-party checkout, attribution, and listing facts) | derived from `write_path` on the server |
 | `agent_identity_confidence` | `unknown` < `browser_observed` < `merchant_asserted` < `platform_asserted` < `verified` | fixed per `write_path`; a mismatched pair is refused |
 | `synthetic` | boolean, default false | `true` when the batch says `"synthetic": true` or the event surface is `ops_canary` |

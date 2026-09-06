@@ -1017,25 +1017,50 @@ def _payload_mapping(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _write_path_scope(value: Any) -> List[str]:
+    """One write path, or the several that speak for ONE authority.
+
+    A bare string keeps the historical single-path behaviour. A sequence is
+    accepted for a platform observed through more than one ingress — Squarespace
+    is seen by both its webhook receiver and its reconciliation sweep, and both
+    read the SAME cumulative ``refundedTotal``. Reading only one of them would
+    make the other re-record money that is already in the ledger under a
+    different key, which the funnel then SUMS.
+    """
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        values = [str(item) for item in value]
+    else:
+        values = []
+    scope: List[str] = []
+    for item in values:
+        normalized = item.strip()
+        if normalized and normalized not in scope:
+            scope.append(normalized)
+    return scope
+
+
 async def recorded_refund_amount_cents(
     *,
     merchant_id: str,
     store_id: Optional[str],
     order_ref: str,
-    write_path: str,
+    write_path: Any,
     currency: Optional[str] = None,
 ) -> int:
-    """Minor units this write path has ALREADY recorded as refunded for one order.
+    """Minor units this authority has ALREADY recorded as refunded for one order.
 
-    The caller is a receiver whose platform reports a CUMULATIVE refund total
-    and no per-refund identity (Shoplazza), so the only way it can tell new
-    money from money it has already counted is to subtract this.
+    The caller is a receiver or sweep whose platform reports a CUMULATIVE refund
+    total and no per-refund identity (Shoplazza, Squarespace), so the only way
+    it can tell new money from money it has already counted is to subtract this.
 
-    Scoped to one ``write_path`` on purpose: a PSP mirror of the same refund is
-    a different authority with its own native ids, and subtracting it from a
-    platform total would make the platform's next partial refund disappear.
-    Synthetic (probe) rows are excluded for the same reason — a canary must not
-    be able to suppress real money.
+    ``write_path`` is one path, or a sequence of the paths that speak for the
+    SAME authority about the same orders. Scoped that way on purpose: a PSP
+    mirror of the same refund is a different authority with its own native ids,
+    and subtracting it from a platform total would make the platform's next
+    partial refund disappear. Synthetic (probe) rows are excluded for the same
+    reason — a canary must not be able to suppress real money.
 
     ``currency`` narrows it further when supplied, matched case-insensitively
     against the recorded row's own ``payload.currency``. Subtraction is only
@@ -1049,13 +1074,23 @@ async def recorded_refund_amount_cents(
     and numeric typing differ between Postgres and SQLite; one order's refund rows
     are a handful, and the filter is an indexed ``order_ref`` lookup.
     """
-    if not merchant_id or not order_ref or not write_path:
+    write_paths = _write_path_scope(write_path)
+    if not merchant_id or not order_ref or not write_paths:
         return 0
     wanted_currency = str(currency or "").strip().upper() or None
     conditions = [
         commerce_interaction_events.c.merchant_id == merchant_id,
         commerce_interaction_events.c.event_type == "refund.succeeded",
-        commerce_interaction_events.c.write_path == write_path,
+        # A single path keeps compiling to `=` rather than `IN (...)`: that is
+        # the statement shape the Postgres dialect gate has PREPAREd since this
+        # read existed, and a nullable `store_id` bind next to `synthetic IS
+        # FALSE` is exactly the shape that has produced IndeterminateDatatypeError
+        # in this repo before.
+        (
+            commerce_interaction_events.c.write_path == write_paths[0]
+            if len(write_paths) == 1
+            else commerce_interaction_events.c.write_path.in_(write_paths)
+        ),
         commerce_interaction_events.c.order_ref == order_ref,
         commerce_interaction_events.c.synthetic.is_(False),
     ]
