@@ -128,6 +128,31 @@ fi
 #               with a different ASGI app, so it needs no image of its own)
 : "${IMAGE_NAME:=backend}"
 : "${ENV_PREFIX:=}"
+# ── SHAPE OVERRIDES, and why the other services need them ──────────────────────────────────────
+# The constants at the top of this file are WEB'S shape - specifically web's connection budget,
+# recomputed on 2026-08-29 (max-instances 20 -> 10, concurrency 80 -> 20) after two pool-exhaustion
+# outages. Every service deployed through this script silently adopts them, and for a service that
+# is NOT web that is not a tuning choice, it is an unreviewed capacity change riding along inside
+# an image roll.
+#
+# MEASURED 2026-09-05: prod `proof-issuer` is running concurrency 80 / maxScale 20, because it was
+# last deployed on 08-27 and has been frozen at the pre-08-29 constants ever since. Running the
+# runbook command in prod-deploy-drift.yml's footer today would cut it to concurrency 20 /
+# maxScale 10 - 1600 request slots down to 200, eightfold, as a side effect of shipping a commit.
+# That was survivable while every deploy was a human typing the command and watching it; it is not
+# something an automatic push-triggered deploy may do on its own.
+#
+# So a caller may pin what the service already has, and the deploy becomes what it claims to be:
+# an image roll. This mirrors MIN_INSTANCES/MAX_INSTANCES, which already existed for this reason.
+# NOT defaulted from the live service: reading the shape back and re-applying it would make this
+# script incapable of ever CORRECTING a hand-edit, which is the drift the preserve-mode pool guard
+# below exists to catch. The intent stays in the file; overriding it stays explicit.
+: "${CPU_LIMIT:=}"
+: "${MEMORY_LIMIT:=}"
+: "${CONCURRENCY_LIMIT:=}"
+[ -z "$CONCURRENCY_LIMIT" ] || case "$CONCURRENCY_LIMIT" in
+  ''|*[!0-9]*) echo "CONCURRENCY_LIMIT must be a positive integer (got '$CONCURRENCY_LIMIT')" >&2; exit 2 ;;
+esac
 # A prefix TYPO fails closed on the -f check below. A prefix OMISSION does not: it silently hands
 # another service the backend's entire env file and secret list. Require them to agree.
 case "$SERVICE" in
@@ -429,7 +454,8 @@ probe_health(){ # url -> echoes the status code
   --network default --subnet default --vpc-egress "$VPC_EGRESS" \
   ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} \
   ${CMD_ARGS[@]+"${CMD_ARGS[@]}"} \
-  --port 8080 --cpu "$CPU" --memory "$MEM" --concurrency "$CONCURRENCY" --timeout 300 \
+  --port 8080 --cpu "${CPU_LIMIT:-$CPU}" --memory "${MEMORY_LIMIT:-$MEM}" \
+  --concurrency "${CONCURRENCY_LIMIT:-$CONCURRENCY}" --timeout 300 \
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \

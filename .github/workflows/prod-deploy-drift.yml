@@ -1,4 +1,4 @@
-# Does production actually run what `main` says it runs?
+# Does production actually run what `main` says it runs? All three services, not just `web`.
 #
 # Before the 2026-08-22 cutover, a merge to main auto-deployed to Railway prod, so "merged"
 # and "shipped" were the same event. Between the cutover and 2026-08-26 they were not: GCP
@@ -14,6 +14,27 @@
 # it is now the independent check on that pipeline - a deploy workflow that silently fails,
 # skips, or is dropped by GitHub re-creates exactly the gap it was built to close, and this is
 # the only thing that would say so. It does not deploy; it only says out loud when live != main.
+#
+# ── AND IT NOW WATCHES ALL THREE SERVICES ──────────────────────────────────────────────────────
+# Until 2026-09-05 this job asked exactly one question - what does api.pivota.cc/health say - and
+# api.pivota.cc is `web`. So `worker` and `proof-issuer` were not merely deployed by hand, they
+# were UNWATCHED, and the alarm's silence about them read exactly like the silence about a `web`
+# that was fine. Measured the day this changed:
+#
+#   worker         94 commits behind `web`, for a month. It is the service that runs every
+#                  APScheduler tick and every queue drainer, so a month of scheduler-lane merges -
+#                  #2074 and #2077 among them - were dark while this job reported green.
+#   proof-issuer   184 commits and 9 days behind, and nobody had said so anywhere.
+#
+# Both now deploy from deploy-prod.yml. That is the fix; THIS is what makes the fix observable,
+# and the distinction matters: an auto-deploy that silently fails, skips or is dropped rebuilds
+# the identical gap, and a pipeline is not allowed to be its own only witness.
+#
+# HOW EACH IS READ, and why they differ. `web` is still read by curling the PUBLIC health endpoint:
+# that traverses DNS, the load balancer and the traffic split, so it answers "what are users
+# actually reaching", which describing the service cannot. `worker` (--ingress internal) and
+# `proof-issuer` answer no probe from here, so they are read from the Cloud Run admin API - the
+# image tag on the serving revision. That is a weaker signal, and it is named as such below.
 name: prod deploy drift
 
 on:
@@ -37,6 +58,11 @@ on:
 
 permissions:
   contents: read
+  # `worker` is --ingress internal and answers no public probe, and `proof-issuer` sits behind
+  # a URL nothing publishes. Both are read through the Cloud Run admin API instead, which needs
+  # the OIDC token WIF exchanges. NOT a route into the VPC and NOT a database credential - see
+  # tests/test_no_scheduled_workflow_reaches_cloud_sql.py for the thing this must never become.
+  id-token: write
 
 env:
   # How long production may lag main before this job goes red. Long enough that a normal
@@ -78,113 +104,189 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
+      - uses: google-github-actions/auth@v2
+        with:
+          # Identifiers, not secrets - the same pair deploy-prod.yml uses. Neither grants anything
+          # without a GitHub-signed OIDC token asserting this repository and refs/heads/main.
+          # This job only ever calls `run services describe`; it deploys nothing.
+          workload_identity_provider: projects/371394967380/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: sa-github-deploy@pivota-shared.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Compare live production against this commit
         run: |
           set -uo pipefail
           MAIN_SHA="$(git rev-parse HEAD)"
-          echo "main:      $MAIN_SHA"
+          echo "main: $MAIN_SHA"
+          echo
 
-          # api.pivota.cc resolves to the GCP load balancer. If DNS ever moves back, this
-          # reads whatever is actually serving users - which is the question being asked.
-          LIVE_JSON="$(curl -fsS --max-time 25 https://api.pivota.cc/health || true)"
-          if [ -z "$LIVE_JSON" ]; then
-            echo "::error::could not reach https://api.pivota.cc/health - production health is unknown"
-            exit 1
-          fi
-
-          LIVE_SHA="$(printf '%s' "$LIVE_JSON" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("version") or {}).get("full_sha",""))')"
-          echo "live prod: ${LIVE_SHA:-<absent>}"
-
-          if [ -z "$LIVE_SHA" ]; then
-            echo "::error::/health returned no version.full_sha - cannot verify what production runs"
-            exit 1
-          fi
-
-          if [ "$LIVE_SHA" = "$MAIN_SHA" ]; then
-            echo "production is running main"
-            exit 0
-          fi
-
-          # Not every commit needs a deploy. Docs, runbooks, the infra scripts and this workflow
-          # never enter the container image, so a gap made only of those is not a production
-          # problem - and failing on it would train everyone to ignore this job. That matters:
-          # an alarm that cries wolf is worse than no alarm, because it launders a real one.
+          # Every service that ships from THIS repository's backend image. The gateway is absent
+          # deliberately: it builds from PIVOTA-Agent, so its commits are not in this history and
+          # every question below would be unanswerable for it.
           #
-          # Anything NOT in this list is treated as runtime-affecting, so the default is to
-          # alarm. A new top-level directory is a deploy until someone says otherwise.
-          if git cat-file -e "$LIVE_SHA" 2>/dev/null; then
-            RUNTIME_CHANGED="$(git diff --name-only "$LIVE_SHA..HEAD" \
-              | grep -vE '^(docs/|infra/|\.github/|scripts/|tests/|README|CHANGELOG)' \
-              | grep -vE '\.md$' || true)"
-            if [ -z "$RUNTIME_CHANGED" ]; then
-              echo "production is $(git rev-list --count "$LIVE_SHA..HEAD") commit(s) behind main,"
-              echo "but none of them touch code the container runs:"
-              git diff --name-only "$LIVE_SHA..HEAD" | sed 's/^/  /'
-              echo "no deploy needed."
-              exit 0
+          # ADDING A SERVICE HERE IS THE WHOLE MAINTENANCE STORY. A new Cloud Run service that runs
+          # this image and is not in this list is exactly the `worker` situation again - deployed
+          # somehow, watched by nothing.
+          SERVICES="web worker proof-issuer"
+          DRIFTED=""
+
+          # ── HOW EACH SERVICE'S LIVE COMMIT IS READ ─────────────────────────────────────────────
+          # web: the PUBLIC health endpoint, because that traverses DNS, the load balancer and the
+          # traffic split, and so answers "what are users actually reaching". Describing the
+          # service cannot answer that - it reports the spec, which is upstream of every one of
+          # those hops. If DNS ever moves, this still reads whatever is really serving.
+          live_sha_web(){
+            local json sha
+            json="$(curl -fsS --max-time 25 https://api.pivota.cc/health || true)"
+            [ -n "$json" ] || { echo "::error::could not reach https://api.pivota.cc/health - production health is unknown" >&2; return 1; }
+            sha="$(printf '%s' "$json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("version") or {}).get("full_sha",""))' 2>/dev/null)"
+            [ -n "$sha" ] || { echo "::error::/health returned no version.full_sha - cannot verify what web runs" >&2; return 1; }
+            printf '%s' "$sha"
+          }
+
+          # worker and proof-issuer: the image tag on the serving revision, via the Cloud Run admin
+          # API. Neither can be probed from a GitHub runner - worker is `--ingress internal`, and
+          # Google's front end answers 404 before the request reaches the app even with a valid
+          # identity token.
+          #
+          # SAY WHAT THIS SIGNAL IS WORTH. An image tag is the CONFIGURATION, not a running
+          # process: it cannot see a revision that boots and does nothing, which for the worker is
+          # a real and silent failure mode (a scheduler that raised on boot still serves 200). The
+          # deploy-time check for that lives in deploy_worker.sh, which probes /__scheduler_health
+          # from inside the VPC. What this job answers is narrower and is the question it was
+          # built for: is the deployed commit the one main says it should be.
+          live_sha_image(){
+            local svc="$1" image
+            image="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 \
+              --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)"
+            [ -n "$image" ] || { echo "::error::could not describe Cloud Run service '$svc' - what it runs is unknown" >&2; return 1; }
+            printf '%s' "${image##*:}"
+          }
+
+          # ── THE CLASSIFICATION, UNCHANGED IN SUBSTANCE, NOW APPLIED PER SERVICE ────────────────
+          # classify <service> <live_sha> -> 0 in sync (or forgiven), 1 drifted
+          classify(){
+            local svc="$1" live="$2" runtime landed age behind rt_list c
+
+            if [ "$live" = "$MAIN_SHA" ]; then
+              echo "  $svc: running main"
+              return 0
             fi
-            echo "runtime-affecting files not in production:"
-            printf '%s\n' "$RUNTIME_CHANGED" | sed 's/^/  /'
-          else
-            echo "::warning::$LIVE_SHA is not in this repository at all. With full history that"
-            echo "means production runs a build from a commit that was force-pushed away, or from"
-            echo "another repo. Treating as runtime drift."
-          fi
 
-          # A merge that landed seconds ago is a PENDING DEPLOY, not drift. Deploys here are
-          # deliberately manual, so every merge of runtime code is guaranteed to make this job red
-          # instantly - before any human could possibly have deployed it. Measured over one day:
-          # all 13 scheduled runs passed and the only failure was the push-triggered one. That is
-          # not an alarm, it is a notification on every merge, and it trains people to ignore the
-          # job - which then launders the real drift it exists to catch.
-          #
-          # So: alarm only once the gap has PERSISTED past a window long enough to deploy in.
-          #
-          # Measure when the code LANDED ON MAIN, not when it was written. Commit timestamps are
-          # wrong for this: a branch developed over two hours and then merged has commits that look
-          # two hours stale the instant they arrive, so a commit-time window would fire on exactly
-          # the merges it is meant to forgive. Walking --first-parent gives the merge that put the
-          # change on main, whose committer date IS the moment production fell behind.
-          #
-          # Anchored to files whose CONTENT still differs, not to files a commit happened to touch.
-          # main carries commits whose content is already deployed (a branch squash-merged and then
-          # merged again re-introduces them); those must not count as undeployed code.
-          #
-          # The window applies ONLY to "behind". A DIVERGED production means someone deployed
-          # something that is not on main, which is never a pending deploy and is never delayed.
-          if git merge-base --is-ancestor "$LIVE_SHA" HEAD 2>/dev/null; then
-            RT_LIST="$(mktemp)"; printf '%s\n' "$RUNTIME_CHANGED" > "$RT_LIST"
-            LANDED=""
-            for c in $(git rev-list --reverse --first-parent "$LIVE_SHA..HEAD"); do
-              if git diff --name-only "$c^" "$c" 2>/dev/null | grep -qFxf "$RT_LIST"; then
-                LANDED="$(git show -s --format=%ct "$c")"; break
+            # Not every commit needs a deploy. Docs, runbooks, the infra scripts and this workflow
+            # never enter the container image, so a gap made only of those is not a production
+            # problem - and failing on it would train everyone to ignore this job. That matters:
+            # an alarm that cries wolf is worse than no alarm, because it launders a real one.
+            #
+            # Anything NOT in this list is treated as runtime-affecting, so the default is to
+            # alarm. A new top-level directory is a deploy until someone says otherwise.
+            if git cat-file -e "$live" 2>/dev/null; then
+              runtime="$(git diff --name-only "$live..HEAD" \
+                | grep -vE '^(docs/|infra/|\.github/|scripts/|tests/|README|CHANGELOG)' \
+                | grep -vE '\.md$' || true)"
+              if [ -z "$runtime" ]; then
+                echo "  $svc: $(git rev-list --count "$live..HEAD") commit(s) behind main, none touching code the container runs - no deploy needed"
+                return 0
               fi
-            done
-            rm -f "$RT_LIST"
-            if [ -n "$LANDED" ]; then
-              AGE_MIN=$(( ( $(date -u +%s) - LANDED ) / 60 ))
-              if [ "$AGE_MIN" -lt "$GRACE_MINUTES" ]; then
-                echo "::notice::undeployed runtime code landed on main ${AGE_MIN}m ago, inside the ${GRACE_MINUTES}m deploy window - not alarming yet. A later scheduled run will."
-                exit 0
-              fi
-              echo "this gap has been on main for ${AGE_MIN} minutes (window is ${GRACE_MINUTES})."
+            else
+              echo "::warning::$svc runs $live, which is not in this repository at all. With full"
+              echo "history that means a build from a commit that was force-pushed away, or from"
+              echo "another repo. Treating as runtime drift."
+              runtime=""
             fi
-            BEHIND="$(git rev-list --count "$LIVE_SHA..HEAD" 2>/dev/null || echo '?')"
-            echo "::error::production is $BEHIND commit(s) BEHIND main and will stay there until someone deploys."
-            echo "commits not in production:"
-            git log --oneline "$LIVE_SHA..HEAD" | sed 's/^/  /'
-          else
-            echo "::error::production runs $LIVE_SHA, which is NOT an ancestor of main - the two have diverged."
-          fi
 
+            # A merge that landed seconds ago is a PENDING DEPLOY, not drift. Every merge of
+            # runtime code would otherwise make this job red instantly, before any deploy could
+            # possibly have finished - which is a notification on every merge, not an alarm, and
+            # it trains people to ignore the job that then launders the real drift.
+            #
+            # Measure when the code LANDED ON MAIN, not when it was written. Commit timestamps are
+            # wrong for this: a branch developed over two hours and then merged has commits that
+            # look two hours stale the instant they arrive. Walking --first-parent gives the merge
+            # that put the change on main, whose committer date IS the moment this service fell
+            # behind.
+            #
+            # Anchored to files whose CONTENT still differs, not to files a commit happened to
+            # touch: main carries commits whose content is already deployed (a branch squash-merged
+            # and then merged again re-introduces them), and those must not count as undeployed.
+            #
+            # The window applies ONLY to "behind". A DIVERGED service means someone deployed
+            # something that is not on main, which is never a pending deploy and is never delayed.
+            if [ -n "$runtime" ] && git merge-base --is-ancestor "$live" HEAD 2>/dev/null; then
+              rt_list="$(mktemp)"; printf '%s\n' "$runtime" > "$rt_list"
+              landed=""
+              for c in $(git rev-list --reverse --first-parent "$live..HEAD"); do
+                if git diff --name-only "$c^" "$c" 2>/dev/null | grep -qFxf "$rt_list"; then
+                  landed="$(git show -s --format=%ct "$c")"; break
+                fi
+              done
+              rm -f "$rt_list"
+              if [ -n "$landed" ]; then
+                age=$(( ( $(date -u +%s) - landed ) / 60 ))
+                if [ "$age" -lt "$GRACE_MINUTES" ]; then
+                  echo "  $svc: undeployed runtime code landed ${age}m ago, inside the ${GRACE_MINUTES}m window - not alarming yet. A later scheduled run will."
+                  return 0
+                fi
+              fi
+            fi
+
+            if git merge-base --is-ancestor "$live" HEAD 2>/dev/null; then
+              behind="$(git rev-list --count "$live..HEAD" 2>/dev/null || echo '?')"
+              echo "::error::$svc is $behind commit(s) BEHIND main and will stay there until someone deploys."
+              echo "  runtime-affecting files not in $svc:"
+              printf '%s\n' "$runtime" | sed 's/^/    /'
+              echo "  commits not in $svc:"
+              git log --oneline "$live..HEAD" | sed 's/^/    /'
+            else
+              echo "::error::$svc runs $live, which is NOT an ancestor of main - the two have diverged."
+            fi
+            return 1
+          }
+
+          # ── RUN ALL THREE, THEN REPORT ────────────────────────────────────────────────────────
+          # Every service is evaluated even after one fails. A loop that exited on the first drift
+          # would report `worker` and never mention `proof-issuer`, and the operator would fix one,
+          # re-run, and find the next - which is how a two-service gap gets discovered one service
+          # at a time over two days.
+          UNREADABLE=0
+          for svc in $SERVICES; do
+            case "$svc" in
+              web) LIVE="$(live_sha_web)" || { UNREADABLE=1; continue; } ;;
+              *)   LIVE="$(live_sha_image "$svc")" || { UNREADABLE=1; continue; } ;;
+            esac
+            echo "$svc: $LIVE"
+            classify "$svc" "$LIVE" || DRIFTED="$DRIFTED $svc"
+            echo
+          done
+
+          # An unreadable service is NOT a passing one. Whatever it runs is unknown, and this job's
+          # entire job is to refuse to let "unknown" read as "fine".
+          [ "$UNREADABLE" = 0 ] || { echo "::error::at least one service could not be read - see above"; exit 1; }
+          [ -n "$DRIFTED" ] || { echo "all services are running main"; exit 0; }
+
+          echo "::error::drifted:$DRIFTED"
           cat <<'EOF'
-          To ship main to production:
+
+          To ship main to production, prefer the pipeline - deploy-prod.yml deploys all three on
+          every push to main, and the `deploy prod` workflow can be re-dispatched for any merged
+          SHA. Reach for these only when that pipeline is the thing that is broken:
+
             gcloud builds submit --config infra/gcp/cloudbuild.backend.yaml --project pivota-shared \
               --substitutions=COMMIT_SHA=<sha> .
-            infra/gcp/deploy_backend.sh prod <sha>
-            SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
-              RUN_COMMAND=python RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
-              infra/gcp/deploy_backend.sh prod <sha>
-            WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <sha> <gateway-sha>
+
+            web           infra/gcp/deploy_backend.sh prod <sha>
+            worker        infra/gcp/deploy_worker.sh prod <sha>
+            proof-issuer  SERVICE=proof-issuer IMAGE_NAME=backend ENV_PREFIX=proofissuer \
+                            RUN_COMMAND=python \
+                            RUN_ARGS="-m,uvicorn,proof_issuer_main:app,--host,0.0.0.0,--port,8080" \
+                            CONFIG=preserve CPU_LIMIT=2 MEMORY_LIMIT=4Gi CONCURRENCY_LIMIT=80 \
+                            MIN_INSTANCES=2 MAX_INSTANCES=20 \
+                            infra/gcp/deploy_backend.sh prod <sha>
+
+          The shape pins on proof-issuer are not optional: deploy_backend.sh's own constants are
+          WEB's connection budget, and an unpinned roll cuts proof-issuer from concurrency 80 /
+          maxScale 20 to 20 / 10 as a side effect. Scheduler triggers and Cloud Run Jobs are a
+          separate concern - that is still setup_scheduler.sh.
           EOF
           exit 1

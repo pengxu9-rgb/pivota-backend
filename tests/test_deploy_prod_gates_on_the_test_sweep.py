@@ -39,6 +39,14 @@ DEPLOY = WORKFLOWS / "deploy-prod.yml"
 GATE_JOB = "test-gate"
 DEPLOY_JOB = "deploy"
 
+# EVERY job that puts code into production, not just `web`'s. Added 2026-09-05 with the
+# worker and proof-issuer jobs: a second deploying job that does not `needs:` the gate
+# reopens the 2026-09-03 finding one service over, and a ratchet written around the single
+# name `deploy` would not have noticed. Discovered rather than listed — see
+# test_every_deploying_job_is_covered_by_this_module, which fails if a job deploys
+# something and is not in here.
+DEPLOY_JOBS = ("deploy", "deploy-worker", "deploy-proof-issuer")
+
 # The workflow FILES whose `name:` the gate must require. The names themselves are
 # never written here — they are read out of those files, so renaming a workflow
 # without updating the gate's list fails this module instead of quietly turning the
@@ -131,24 +139,98 @@ def _required_names() -> list[str]:
 # ── structure ──────────────────────────────────────────────────────────────────
 
 
-def test_the_deploy_job_waits_for_the_gate():
+@pytest.mark.parametrize("job", DEPLOY_JOBS)
+def test_the_deploy_job_waits_for_the_gate(job):
     jobs = _jobs()
-    assert DEPLOY_JOB in jobs, f"{DEPLOY.name} no longer has a `{DEPLOY_JOB}` job"
-    needs = jobs[DEPLOY_JOB].get("needs")
+    assert job in jobs, f"{DEPLOY.name} no longer has a `{job}` job"
+    needs = jobs[job].get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     assert GATE_JOB in needs, (
-        f"the `{DEPLOY_JOB}` job does not `needs: [{GATE_JOB}]`, so it runs "
+        f"the `{job}` job does not `needs: [{GATE_JOB}]`, so it runs "
         "regardless of whether the tests passed. Measured 2026-09-03: three "
         "production deploys off a red Backend Test Sweep."
     )
 
 
-def test_nothing_lets_the_deploy_outvote_the_gate():
+@pytest.mark.parametrize("job", DEPLOY_JOBS)
+def test_nothing_lets_the_deploy_outvote_the_gate(job):
     """A `needs:` plus `if: always()` is a gate with the wires cut."""
-    condition = str(_jobs()[DEPLOY_JOB].get("if") or "")
+    condition = str(_jobs()[job].get("if") or "")
     assert "always(" not in condition.replace(" ", ""), (
-        f"the `{DEPLOY_JOB}` job carries `{condition}` — `always()` makes it run "
+        f"the `{job}` job carries `{condition}` — `always()` makes it run "
         "even when the gate it needs failed, which is not a gate."
+    )
+
+
+def test_every_deploying_job_is_covered_by_this_module():
+    """DEPLOY_JOBS must not fall behind the workflow.
+
+    A new job that ships a service and is not in that tuple is untested by every case
+    above — and it would look fine, because the parametrisation would simply not mention
+    it. Detect deploying jobs by what they RUN rather than by name: the gap this closes
+    was created by adding services, and the next one will be too."""
+    marks = ("deploy_backend.sh", "deploy_worker.sh", "run deploy", "builds submit")
+    for name, job in _jobs().items():
+        body = yaml.dump(job)
+        if any(m in body for m in marks):
+            assert name in DEPLOY_JOBS, (
+                f"job `{name}` deploys something but is not in DEPLOY_JOBS, so nothing "
+                "here checks that it waits for the test gate."
+            )
+
+
+@pytest.mark.parametrize("job", [j for j in DEPLOY_JOBS if j != "deploy"])
+def test_the_other_services_wait_for_web(job):
+    """web first, deliberately. All three run the same image against the same database, so
+    a commit is half-shipped between them either way; ordering them behind `web` means the
+    lag always points the same direction — the direction the drift alarm names and a human
+    reads first. The reverse (a worker running a commit `web` failed to take) is the same
+    drift with nothing accustomed to reading it."""
+    needs = _jobs()[job].get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
+    assert DEPLOY_JOB in needs, (
+        f"`{job}` does not `needs: [{DEPLOY_JOB}]`. It would then race web's deploy and "
+        "could put a commit on the worker that never reached the public API."
+    )
+
+
+def test_the_worker_is_not_deployed_through_deploy_backend_sh():
+    """deploy_backend.sh would be wrong here in three independent ways, and two of them
+    fail silently — see the header of infra/gcp/deploy_worker.sh. The one that matters
+    most: it ships every revision `--tag c-<sha> --no-traffic`, and a 0%-traffic revision
+    with minScale 1 keeps an instance ALIVE. A worker instance drains queues from its app
+    lifespan, not from requests, so the candidate window would run two drainers and
+    double-fire every APScheduler tick, including the settlement lanes."""
+    body = yaml.dump(_jobs()["deploy-worker"])
+    assert "deploy_worker.sh" in body, "the worker job must use infra/gcp/deploy_worker.sh"
+    assert "deploy_backend.sh" not in body, (
+        "the worker job invokes deploy_backend.sh, which applies web's shape "
+        "(min-instances 2 on a service whose whole design is exactly one process) and "
+        "runs a tagged candidate revision alongside the live one."
+    )
+
+
+def test_the_proof_issuer_deploy_pins_the_shape_it_is_not_allowed_to_change():
+    """deploy_backend.sh's constants are WEB's connection budget, recomputed 2026-08-29
+    (concurrency 80 -> 20, max-instances 20 -> 10) after two pool-exhaustion outages.
+    proof-issuer has run concurrency 80 / maxScale 20 since 08-27 because it has not been
+    deployed since. An unpinned automatic roll would cut it from 1600 request slots to
+    200 as a side effect of shipping a commit — an unreviewed capacity change nobody asked
+    this workflow to make."""
+    body = yaml.dump(_jobs()["deploy-proof-issuer"])
+    for pin in ("CPU_LIMIT=", "MEMORY_LIMIT=", "CONCURRENCY_LIMIT=",
+                "MIN_INSTANCES=", "MAX_INSTANCES="):
+        assert pin in body, (
+            f"the proof-issuer job does not pin {pin!r}, so it adopts web's shape "
+            "constants and silently reshapes the service on every push to main."
+        )
+    # The entrypoint override is load-bearing for a different reason: deploy_backend.sh
+    # passes RUN_COMMAND/RUN_ARGS unconditionally once either is set, and proof_issuer_main
+    # also serves /health — so omitting them boots the WRONG application behind a health
+    # check that answers 200 either way, and the candidate gate promotes it.
+    assert "proof_issuer_main:app" in body, (
+        "the proof-issuer job does not override the entrypoint, so it would deploy the "
+        "main backend app onto this service behind a /health that cannot tell them apart."
     )
 
 
@@ -164,16 +246,20 @@ def test_the_gate_requires_the_sweep_and_the_dialect_gate_by_their_exact_names()
         )
 
 
-def test_the_gate_resolves_the_same_sha_the_deploy_ships():
-    """A gate that checks one commit while the handler ships another is decoration."""
+@pytest.mark.parametrize("job", DEPLOY_JOBS)
+def test_the_gate_resolves_the_same_sha_the_deploy_ships(job):
+    """A gate that checks one commit while the handler ships another is decoration — and
+    with three handlers, one of them resolving a different expression would put a
+    DIFFERENT commit on that service than on the other two, which is drift manufactured by
+    the pipeline itself."""
     jobs = _jobs()
     gate_sha = (jobs[GATE_JOB].get("env") or {}).get("GATE_SHA")
-    deploy_sha = (jobs[DEPLOY_JOB].get("env") or {}).get("SHA")
+    deploy_sha = (jobs[job].get("env") or {}).get("SHA")
     assert gate_sha and deploy_sha, "both jobs must resolve a SHA through `env:`"
     assert gate_sha == deploy_sha, (
         "the gate and the deploy resolve DIFFERENT expressions:\n"
         f"  {GATE_JOB}.env.GATE_SHA = {gate_sha}\n"
-        f"  {DEPLOY_JOB}.env.SHA    = {deploy_sha}\n"
+        f"  {job}.env.SHA    = {deploy_sha}\n"
         "so the commit whose tests were checked is not the commit that ships."
     )
 
