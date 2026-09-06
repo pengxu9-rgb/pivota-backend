@@ -1338,10 +1338,21 @@ async def record_audit_basis(
         # so a domain added between two runs moves the headline number with no
         # change in the world. `dead` rows are excluded here for the same reason
         # the report excludes them — the set recorded must be the set used.
+        # `declared` EXCLUDED, and only `declared`. The comment above
+        # says "the set recorded must be the set used", and `declared` rows are
+        # stored but deliberately NOT used — they do not widen the set that
+        # decides first_party. Recording them would write a false claim about
+        # which domains a run measured into an INSERT-ONLY basis row, and,
+        # because official_domains is a COMPARABILITY key, would make that run
+        # non-comparable with every prior one while moving no number.
+        from db.merchant_official_domains import SOURCE_DECLARED
+
         domains = [
             row.get("domain")
             for row in (await list_official_domains(str(merchant_id)))
-            if row.get("domain") and not is_excluded(row.get("liveness_status"))
+            if row.get("domain")
+            and not is_excluded(row.get("liveness_status"))
+            and str(row.get("source") or "") != SOURCE_DECLARED
         ]
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning(

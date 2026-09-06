@@ -134,7 +134,7 @@ merchant_official_domains = Table(
         name="ck_merchant_official_domains_domain",
     ),
     CheckConstraint(
-        "source IN ('asserted', 'verified', 'inferred')",
+        "source IN ('asserted', 'verified', 'inferred', 'declared')",
         name="ck_merchant_official_domains_source",
     ),
     CheckConstraint(
@@ -188,7 +188,7 @@ _DDL_STATEMENTS = [
             AND domain NOT LIKE 'www.%'
           ),
         CONSTRAINT ck_merchant_official_domains_source
-          CHECK (source IN ('asserted', 'verified', 'inferred')),
+          CHECK (source IN ('asserted', 'verified', 'inferred', 'declared')),
         CONSTRAINT ck_merchant_official_domains_verification
           CHECK (
             verification_status IS NULL
@@ -333,10 +333,19 @@ SELECT merchant_id, domain, source, verification_status,
 # Stalest first, and NEVER-CHECKED first of all. The ordering is written as an
 # explicit `IS NULL DESC` rather than relying on NULL ordering, because the two
 # engines disagree: Postgres sorts NULLS LAST on ASC, SQLite sorts them first.
+# `declared` rows are EXCLUDED from the sweep. Every other source is either
+# proof-gated (asserted/verified) or catalog-derived (inferred); a declaration
+# is the only path that puts a fully merchant-chosen host into an outbound
+# GET. probe_host_liveness follows redirects and is gated only by
+# is_valid_public_hostname, which checks SHAPE and does not resolve — so
+# sweeping declarations would hand any merchant a blind liveness oracle for
+# internal hosts, and let one merchant's declarations starve the global due
+# queue. A declaration earns liveness checks when a claim proves it.
 DUE_FOR_LIVENESS_SQL = """
 SELECT merchant_id, domain, source, liveness_status, last_checked_at
   FROM merchant_official_domains
  WHERE (last_checked_at IS NULL OR last_checked_at < :cutoff)
+   AND source <> 'declared'
  ORDER BY (last_checked_at IS NULL) DESC, last_checked_at ASC
  LIMIT :limit
 """
@@ -346,6 +355,7 @@ SELECT merchant_id, domain, source, liveness_status, last_checked_at
   FROM merchant_official_domains
  WHERE merchant_id = :merchant_id
    AND (last_checked_at IS NULL OR last_checked_at < :cutoff)
+   AND source <> 'declared'
  ORDER BY (last_checked_at IS NULL) DESC, last_checked_at ASC
  LIMIT :limit
 """
@@ -507,6 +517,42 @@ async def list_verified_domains(merchant_id: str) -> List[str]:
     return [str(r["domain"] or "").strip().lower() for r in rows or [] if r["domain"]]
 
 
+PROVEN_BY_OTHER_SQL = """
+SELECT 1
+  FROM merchant_official_domains
+ WHERE domain = :domain
+   AND merchant_id <> :merchant_id
+   AND source IN ('verified', 'asserted')
+   AND (liveness_status IS NULL OR liveness_status <> 'dead')
+ LIMIT 1
+"""
+
+
+async def domain_is_proven_by_other_merchant(
+    domain: str, merchant_id: str,
+) -> bool:
+    """True when ANOTHER merchant has PROVEN control of this domain.
+
+    Wider than `resolve_verified_merchant_for_domain`, which requires
+    `verified` — bound to the brand identity. `asserted` also means control was
+    proven, it is simply unbound, and a proof is a proof for the purpose of
+    refusing somebody else's UNPROVEN declaration. Checking only `verified`
+    left a gap.
+
+    RAISES on a database error rather than returning False: the caller treats
+    an unanswerable ownership question as a refusal, and swallowing it here
+    would turn "we could not check" into "nobody owns it".
+    """
+    await ensure_merchant_official_domains_table()
+    host = (domain or "").strip().lower()
+    if not host or not merchant_id:
+        return False
+    row = await database.fetch_one(
+        PROVEN_BY_OTHER_SQL, {"domain": host, "merchant_id": str(merchant_id)},
+    )
+    return row is not None
+
+
 async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
     """Every stored row for the merchant — including `dead` ones, which the
     caller filters. Returning them lets a report say WHY a host it once counted
@@ -606,6 +652,7 @@ def is_excluded(liveness_status: Optional[str]) -> bool:
 __all__: Sequence[str] = (
     "EXCLUDING_LIVENESS",
     "SOURCE_DECLARED",
+    "domain_is_proven_by_other_merchant",
     "LIVENESS_DEAD",
     "LIVENESS_LIVE",
     "LIVENESS_UNCHECKED",

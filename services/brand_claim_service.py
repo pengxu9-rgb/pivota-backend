@@ -401,6 +401,12 @@ DECLARE_OK = "declared"
 DECLARE_INVALID_HOST = "invalid_hostname"
 DECLARE_TAKEN = "claimed_by_another_merchant"
 DECLARE_ALREADY_PROVEN = "already_proven"
+DECLARE_NOT_REGISTRABLE = "not_a_registrable_domain"
+DECLARE_TOO_MANY = "too_many_declarations"
+
+# A merchant with more than this many unproven declarations is not filling in a
+# second storefront, and each row is a free write that later readers must skip.
+_MAX_DECLARED_PER_MERCHANT = 20
 
 
 async def declare_official_domain(
@@ -434,6 +440,11 @@ async def declare_official_domain(
     host = normalize_host(domain)
     if not merchant_id or not is_valid_public_hostname(host):
         return {"status": DECLARE_INVALID_HOST, "domain": host or None}
+    # A public suffix or shared platform host is not a domain anyone owns.
+    # `myshopify.com` is not a merchant's storefront — one tenant of it is — and
+    # this module already keeps the list for exactly this class of widening.
+    if not _is_registrable_base(host) or host in _PUBLIC_SUFFIXES:
+        return {"status": DECLARE_NOT_REGISTRABLE, "domain": host}
 
     owner = None
     try:
@@ -443,6 +454,21 @@ async def declare_official_domain(
                        host, exc_info=True)
         return {"status": DECLARE_TAKEN, "domain": host}
     if owner and str(owner) != str(merchant_id):
+        return {"status": DECLARE_TAKEN, "domain": host}
+    # `resolve_verified_merchant_for_domain` only finds `verified` owners, but
+    # `asserted` ALSO means control was proven — it just is not bound to the
+    # brand. Both are proof, so both must block someone else's unproven
+    # declaration; checking only `verified` left a gap this guard's own
+    # description did not admit to.
+    try:
+        proven_elsewhere = await mod.domain_is_proven_by_other_merchant(
+            host, merchant_id,
+        )
+    except Exception:  # noqa: BLE001 — fails CLOSED, like the lookup above
+        logger.warning("declare_official_domain proof lookup failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_TAKEN, "domain": host}
+    if proven_elsewhere:
         return {"status": DECLARE_TAKEN, "domain": host}
 
     # Already proven for THIS merchant: declaring adds nothing and must not
@@ -454,6 +480,14 @@ async def declare_official_domain(
         }
     except Exception:  # noqa: BLE001
         existing = {}
+    declared_count = sum(
+        1 for r in existing.values()
+        if str(r.get("source") or "") == mod.SOURCE_DECLARED
+    )
+    if host not in existing and declared_count >= _MAX_DECLARED_PER_MERCHANT:
+        return {"status": DECLARE_TOO_MANY, "domain": host,
+                "declared_count": declared_count}
+
     row = existing.get(host)
     if row and str(row.get("source") or "") in mod.OFFICIAL_SOURCES:
         return {"status": DECLARE_ALREADY_PROVEN, "domain": host,
