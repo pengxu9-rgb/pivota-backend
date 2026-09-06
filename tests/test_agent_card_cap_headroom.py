@@ -753,7 +753,11 @@ def pivota_log(caplog):
     lg = logging.getLogger("pivota")
     lg.addHandler(caplog.handler)
     prev = lg.level
-    lg.setLevel(logging.WARNING)
+    # DEBUG, not WARNING. A leak check that only captures WARNING cannot see a value logged at
+    # INFO -- and `utils/logger.py` runs this logger at INFO in production, so such a line would
+    # reach the real sink while the test stayed green. Capture everything; the helpers below
+    # decide what each assertion looks at.
+    lg.setLevel(logging.DEBUG)
     try:
         yield caplog
     finally:
@@ -762,7 +766,21 @@ def pivota_log(caplog):
 
 
 def _pivota_warnings(log):
-    return [r.getMessage() for r in log.records if r.levelname == "WARNING"]
+    """WARNING and above -- for asserting WHICH line fired."""
+    import logging
+
+    return [r.getMessage() for r in log.records if r.levelno >= logging.WARNING]
+
+
+def _pivota_messages(log):
+    """EVERY captured record, any level -- for asserting what must never be logged AT ALL.
+
+    A leak assertion scoped to one level is a guard narrower than its own claim: measured, both
+    `logger.info(..., base)` and `logger.error(..., base)` alongside the type passed all 78 tests
+    while `_pivota_warnings` filtered on `levelname == "WARNING"`. "Never reaches the sink" has to
+    mean never, at any level.
+    """
+    return [r.getMessage() for r in log.records]
 
 
 def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(pivota_log):
@@ -797,9 +815,13 @@ def test_an_unexpected_snapshot_shape_is_logged_because_the_card_still_mints(piv
     # alongside the type passed all 78 tests in this file.
     pivota_log.clear()
     _dump_snapshot({"quote_snapshot": "SENTINEL_MERCHANT_CONTENT"}, {"max_minor": 7500})
-    warnings = _pivota_warnings(pivota_log)
-    assert any("was not a dict" in m and "str" in m for m in warnings), "the type IS logged"
-    assert not any("SENTINEL_MERCHANT_CONTENT" in m for m in warnings), "the value is NOT"
+    assert any("was not a dict" in m and "str" in m for m in _pivota_warnings(pivota_log)), \
+        "the type IS logged"
+    # EVERY level, not just WARNING -- see `_pivota_messages`. Scoping this to WARNING let an
+    # INFO- or ERROR-level leak through, which is the same defect one notch milder as the
+    # assertion this replaced: a guard narrower than the sentence above it.
+    assert not any("SENTINEL_MERCHANT_CONTENT" in m for m in _pivota_messages(pivota_log)), \
+        "the value is NOT logged at ANY level"
 
 
 def test_a_normal_snapshot_logs_nothing(pivota_log):
