@@ -73,7 +73,12 @@ def test_the_wait_argument_is_a_no_op_for_this_scheduler():
     import inspect
     from apscheduler.executors.asyncio import AsyncIOExecutor
 
-    src = inspect.getsource(AsyncIOExecutor.shutdown)
+    try:
+        src = inspect.getsource(AsyncIOExecutor.shutdown)
+    except (OSError, TypeError) as exc:
+        # A source-less install (zipped egg, stripped wheel) is not a design regression, and
+        # this tripwire must not become the reason a build is red for an unrelated reason.
+        pytest.skip(f"apscheduler source unavailable, cannot check the tripwire: {exc}")
     assert "no way to honor wait=True" in src and "f.cancel()" in src, (
         "AsyncIOExecutor.shutdown no longer ignores `wait` and cancels unconditionally.\n"
         "stop_scheduler drains by hand BECAUSE of that behaviour; re-derive the design.\n"

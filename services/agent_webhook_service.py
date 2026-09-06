@@ -9,7 +9,7 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -1224,7 +1224,26 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
     }
 
 
-async def process_due_retries(limit: int = 20) -> int:
+async def process_due_retries(
+    limit: int = 20,
+    *,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> int:
+    """Deliver every retry that is due, oldest first.
+
+    `should_stop` IS CHECKED BETWEEN DELIVERIES, and that is what makes shutdown bounded.
+    Without it the only stop check was at the top of `_retry_worker_loop`, so a shutdown
+    arriving mid-batch still had to sit through the rest of it: up to `limit` sequential
+    deliveries at DELIVERY_TIMEOUT_SECONDS each, which at the default is ~200s. That was
+    survivable only because `database.disconnect()` used to run first and blow the remaining
+    rows up; once the lifespan was reordered so the scheduler could drain against a live pool,
+    the accidental bound was gone and the real one had to be written down. Its stop is now also
+    wrapped in `asyncio.wait_for`, but cancelling a delivery mid-flight is the fallback -
+    stopping cleanly between them is the intent.
+
+    Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
+    `next_retry_at` unchanged, so the next instance picks it up on its next poll.
+    """
     await ensure_agent_webhook_tables()
     rows = await database.fetch_all(
         """
@@ -1240,6 +1259,15 @@ async def process_due_retries(limit: int = 20) -> int:
     )
     processed = 0
     for row in rows:
+        if should_stop is not None and should_stop():
+            # `info`, not `warning`: with the stop check in place this is the ORDINARY
+            # shutdown path and the worker restarts 15-34 times a day. A warning per restart
+            # is the kind of noise that teaches people to skim the log.
+            logger.info(
+                "%s webhook retry worker stopping: %d delivered, %d left due for the next "
+                "instance.", "agent", processed, len(rows) - processed,
+            )
+            break
         try:
             await retry_delivery(str(row["agent_id"]), str(row["delivery_id"]))
             processed += 1
@@ -1252,7 +1280,7 @@ async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             if getattr(database, "is_connected", False):
-                await process_due_retries(limit=20)
+                await process_due_retries(limit=20, should_stop=stop_event.is_set)
         except Exception as exc:
             logger.warning("Agent webhook retry worker iteration failed: %s", exc)
         try:
