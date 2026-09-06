@@ -54,4 +54,40 @@
             </attribute-group>
         </group-definitions>
     </custom-type>
+    <custom-type type-id="PivotaTelemetrySweepCursor">
+        <display-name xml:lang="x-default">Pivota Telemetry Sweep Cursor</display-name>
+        <description xml:lang="x-default">Where the settlement sweep last reached. One row per site, key "settlement".</description>
+        <staging-mode>no-staging</staging-mode>
+        <storage-scope>site</storage-scope>
+        <key-definition attribute-id="ID">
+            <display-name xml:lang="x-default">Cursor ID</display-name>
+            <type>string</type>
+            <min-length>1</min-length>
+            <field-length>64</field-length>
+        </key-definition>
+        <attribute-definitions>
+            <attribute-definition attribute-id="cursorAt">
+                <display-name xml:lang="x-default">Orders modified at or after this instant are swept</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+            <attribute-definition attribute-id="updatedAt">
+                <display-name xml:lang="x-default">Last sweep run</display-name>
+                <type>datetime</type>
+                <localizable-flag>false</localizable-flag>
+                <mandatory-flag>false</mandatory-flag>
+                <externally-managed-flag>false</externally-managed-flag>
+            </attribute-definition>
+        </attribute-definitions>
+        <group-definitions>
+            <attribute-group group-id="pivotaTelemetrySweepCursor">
+                <display-name xml:lang="x-default">Pivota Telemetry Sweep Cursor</display-name>
+                <attribute attribute-id="ID"/>
+                <attribute attribute-id="cursorAt"/>
+                <attribute attribute-id="updatedAt"/>
+            </attribute-group>
+        </group-definitions>
+    </custom-type>
 </metadata>
