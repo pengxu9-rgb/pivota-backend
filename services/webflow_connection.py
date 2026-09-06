@@ -162,12 +162,6 @@ def webflow_read_tokens(credentials: Dict[str, Any]) -> List[str]:
     return tokens
 
 
-def webflow_request_token(credentials: Dict[str, Any]) -> str:
-    """The FIRST token to read the Data API with, or "" when there is none."""
-    tokens = webflow_read_tokens(credentials)
-    return tokens[0] if tokens else ""
-
-
 def mint_url_secret() -> str:
     return secrets.token_urlsafe(URL_SECRET_BYTES)
 

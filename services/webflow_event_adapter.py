@@ -67,15 +67,6 @@ STATUS_FULFILLED = "fulfilled"
 STATUS_DISPUTED = "disputed"
 STATUS_DISPUTE_LOST = "dispute-lost"
 STATUS_REFUNDED = "refunded"
-WEBFLOW_ORDER_STATUSES = (
-    STATUS_PENDING,
-    STATUS_UNFULFILLED,
-    STATUS_FULFILLED,
-    STATUS_DISPUTED,
-    STATUS_DISPUTE_LOST,
-    STATUS_REFUNDED,
-)
-
 # A `pending` order is one whose payment has not been accepted yet (the
 # documented case is a PayPal payment awaiting capture). It is NOT paid, so it
 # gets `order.created` and no money event; a later `ecomm_order_changed`, or the
@@ -243,11 +234,6 @@ def webflow_order_id(order: Any) -> Optional[str]:
     if not isinstance(order, dict):
         return None
     return _text(order.get("orderId")) or _text(order.get("id"))
-
-
-def webflow_order_ref(order: Any) -> Optional[str]:
-    order_id = webflow_order_id(order)
-    return build_order_ref(PLATFORM, order_id) if order_id else None
 
 
 def webflow_order_status(order: Any) -> str:
