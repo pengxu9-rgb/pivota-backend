@@ -899,3 +899,118 @@ def test_seed_variants_are_bounded():
     ]
     variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
     assert len(variants) == ing.MAX_SEED_VARIANTS
+
+
+# -- currency / market passthrough ------------------------------------------------------------
+# Every currency in ingestion.py was the literal "USD" in seven places and nothing read one off
+# the record, so a Singapore storefront pricing in SGD was ingested as USD. Measured 2026-09-06
+# on jsmbeauty.sg: 170 offers, all USD, against a storefront whose /meta.json says SGD/SG and
+# whose LIP-PRESSION Glowy Tint is SGD 30.00.
+
+
+
+def _seed_variant_currencies(out):
+    """Currencies on the variants nested inside every seed's `seed_data`."""
+    import json as _json
+
+    found = set()
+    for seed in out["seeds"]:
+        data = seed.get("seed_data")
+        if isinstance(data, str):
+            data = _json.loads(data)
+        for v in (data or {}).get("variants") or []:
+            found.add(v.get("currency"))
+    return found
+
+
+def _sgd_record(**extras):
+    return _record(brand="JUNGSAEMMOOL", product_name="LIP-PRESSION Glowy Tint",
+                   source_domain="jsmbeauty.sg", currency="SGD", market="SG", **extras)
+
+
+def test_a_storefronts_own_currency_reaches_every_row_it_prices():
+    """The whole point: offers, SKUs and seeds must all carry the record's currency.
+
+    Asserted across ALL THREE collections rather than one, because they are built by three
+    different functions -- `_build_offer_inserts` does not even receive the pdp payload -- and a
+    fix that reached only the one under test would look complete.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record())
+
+    assert {o["currency"] for o in out["offers"]} == {"SGD"}
+    assert out["sku"]["currency"] == "SGD"
+    assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
+    assert {s["market"] for s in out["seeds"]} == {"SG"}
+    # The seed's NESTED variant list, which is a separate site from every row above and was the
+    # one replacement no assertion reached: reverting it alone to a literal "USD" left the whole
+    # file green. This is what the serving lane renders, so it is not an internal detail.
+    assert _seed_variant_currencies(out) == {"SGD"}
+
+
+def test_the_pdp_payload_whitelist_does_not_drop_currency_and_market():
+    """`_build_pdp_payload` is a WHITELIST -- a field absent from its dict literal is dropped no
+    matter what the record carried. The first draft of this change threaded currency through the
+    crawler and every consumer and was still a COMPLETE no-op, because these two keys were not in
+    that literal. This pins the seam itself, so the passthrough cannot be silently severed while
+    every consumer keeps reading a field that never arrives."""
+    from services.catalog_enrichment_agent.ingestion import _build_pdp_payload
+
+    payload = _build_pdp_payload(_sgd_record())
+
+    assert payload["currency"] == "SGD"
+    assert payload["market"] == "SG"
+
+
+def test_a_record_with_no_currency_is_still_USD_and_US():
+    """The POSITIVE counterpart and the backward-compatibility guarantee: every record built
+    before this change carries no currency and must land exactly as it did. Verified against the
+    live lane too -- flowerbeauty.com and maccosmetics.com both report USD/US."""
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_record())
+
+    assert {o["currency"] for o in out["offers"]} == {"USD"}
+    assert out["sku"]["currency"] == "USD"
+    assert {s["price_currency"] for s in out["seeds"]} == {"USD"}
+    assert {s["market"] for s in out["seeds"]} == {"US"}
+    assert _seed_variant_currencies(out) == {"USD"}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "  ", "sgd dollars", "S", "SGDX", "$", "12", None, 5, ["SGD"], {"c": "SGD"}, "SG D",
+     "USD DROP TABLE catalog_offers", "US" + chr(0) + "D"],
+)
+def test_a_merchant_supplied_currency_that_is_not_ISO_falls_back_to_USD(bad):
+    """`/meta.json` is MERCHANT-CONTROLLED and its value lands in a currency column that is a
+    join key for price comparison. Anything that is not ISO-4217 alpha-3 is refused rather than
+    written through -- including an embedded NUL, which Postgres rejects with 22P05, and a
+    non-string, which would otherwise reach `.upper()`."""
+    from services.catalog_enrichment_agent.ingestion import _currency_of
+
+    assert _currency_of({"currency": bad}) == "USD"
+
+
+@pytest.mark.parametrize("good,expected", [("sgd", "SGD"), ("SGD", "SGD"), (" jpy ", "JPY")])
+def test_a_valid_currency_is_normalised_and_kept(good, expected):
+    """The counterpart to the refusal test: a real code must survive, case- and
+    space-insensitively -- a refusal test alone passes for a function that returns USD
+    unconditionally."""
+    from services.catalog_enrichment_agent.ingestion import _currency_of
+
+    assert _currency_of({"currency": good}) == expected
+
+
+def test_market_prefers_the_record_over_the_callers_default():
+    """`_build_seed_inserts(market="US")` is a parameter NO caller has ever passed, so every seed
+    row said US regardless of where the storefront sells. The record must win when it knows, and
+    the caller's default must still apply when it does not."""
+    from services.catalog_enrichment_agent.ingestion import _market_of
+
+    assert _market_of({"market": "SG"}, "US") == "SG"
+    assert _market_of({"market": "sg"}, "US") == "SG"
+    assert _market_of({}, "US") == "US"
+    assert _market_of({"market": "SGP"}, "US") == "US"      # alpha-3 is not alpha-2
+    assert _market_of({"market": None}, "JP") == "JP"

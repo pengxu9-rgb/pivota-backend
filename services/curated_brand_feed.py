@@ -45,6 +45,63 @@ def _clean_domain(domain: str) -> str:
     return d.split("/")[0]
 
 
+_ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
+_ISO_COUNTRY = re.compile(r"^[A-Z]{2}$")
+
+
+async def fetch_shopify_shop_locale(
+    domain: str,
+    *,
+    timeout_s: float = 10.0,
+) -> Dict[str, Optional[str]]:
+    """Read a Shopify storefront's own currency and country from `/meta.json`.
+
+    `/products.json` carries prices but NEVER the currency they are in, so every record this
+    module built was currency-less and the ingest lane stamped USD on all of them. Measured
+    2026-09-06: jsmbeauty.sg prices its LIP-PRESSION Glowy Tint at 3000 minor = SGD 30.00, and
+    ingesting it through that lane wrote USD 30.
+
+    `/meta.json` is the storefront's own answer (`{"currency": "SGD", "country": "SG", ...}`),
+    served by the same Shopify surface as products.json. Verified on 7 storefronts: the 5
+    Singapore doors return SGD/SG, and flowerbeauty.com + maccosmetics.com return USD/US — so
+    reading it is a NO-OP for every brand already indexed.
+
+    MERCHANT-CONTROLLED, so both values are shape-validated before they are believed: ISO-4217
+    alpha-3 and ISO-3166 alpha-2, uppercased. Anything else -> None, and the caller falls back to
+    its own default rather than writing a merchant's free text into a currency column (VARCHAR(8)
+    upstream, and a currency is a join key for price comparison). Best-effort throughout: a
+    non-Shopify host, a 404, or a non-JSON body returns {} and the caller keeps its default.
+    """
+    host = _clean_domain(domain)
+    if not host:
+        return {"currency": None, "market": None}
+    url = f"https://{host}/meta.json"
+    timeout = httpx.Timeout(timeout_s, connect=5.0)
+    headers = {"User-Agent": _UA, "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+            resp = await client.get(url)
+            crawl_politeness.note_response(
+                url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            )
+            if resp.status_code != 200:
+                return {"currency": None, "market": None}
+            if "application/json" not in (resp.headers.get("content-type") or ""):
+                return {"currency": None, "market": None}
+            body = resp.json()
+    except Exception:
+        return {"currency": None, "market": None}
+    if not isinstance(body, dict):
+        return {"currency": None, "market": None}
+    cur = str(body.get("currency") or "").strip().upper()
+    mkt = str(body.get("country") or "").strip().upper()
+    return {
+        "currency": cur if _ISO_CURRENCY.match(cur) else None,
+        "market": mkt if _ISO_COUNTRY.match(mkt) else None,
+    }
+
+
 async def fetch_shopify_products(
     domain: str,
     *,
@@ -520,6 +577,8 @@ def shopify_product_to_record(
     category_path: str,
     brand_override: Optional[str] = None,
     emit_variants: bool = False,
+    currency: Optional[str] = None,
+    market: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -651,6 +710,11 @@ def shopify_product_to_record(
             # on this lane (captured on the retailer-PDP lane instead).
             "rating_value": None,
             "rating_count": None,
+            # The STOREFRONT's own currency/market, from /meta.json. Omitted (None) rather than
+            # defaulted here: the ingest lane owns the fallback, so a record that never learned
+            # its currency is indistinguishable from one that did and is genuinely USD.
+            "currency": currency,
+            "market": market,
             "variants": pdp_variants,
         },
         "offers": [
@@ -888,6 +952,9 @@ async def records_for_brand(
     Additive — body_html INCI stays the first try and is never overwritten here;
     the fetch is capped, delayed, and best-effort (a miss leaves raw_inci None)."""
     products = await fetch_shopify_products(domain, max_products=max_products)
+    # ONCE per brand, not per product: it is one storefront-wide setting and a per-product fetch
+    # would multiply outbound requests by the catalogue size against a single host.
+    locale = await fetch_shopify_shop_locale(domain)
     if base_listings_only:
         products, fold_report = fold_shade_listings(products)
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
@@ -897,6 +964,7 @@ async def records_for_brand(
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand,
             emit_variants=base_listings_only,
+            currency=locale.get("currency"), market=locale.get("market"),
         )
         if not rec:
             continue

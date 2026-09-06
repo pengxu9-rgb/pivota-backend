@@ -694,3 +694,159 @@ async def test_records_for_brand_enrich_skips_when_body_html_has_inci(monkeypatc
     recs = await cbf.records_for_brand(domain="cosrx.com", category_path="x", brand="COSRX",
                                        enrich_missing_inci=True, pdp_delay_s=0.0)
     assert recs[0]["pdp"]["raw_inci"].startswith("Water, Glycerin")
+
+
+
+def _silence_politeness(monkeypatch):
+    """Neutralise the shared crawl politeness gate for a unit test.
+
+    It issues its own robots.txt GET through whatever httpx client is installed, so a stubbed
+    client answers robots.txt with the meta.json body and the function under test never gets its
+    turn. Stubbed rather than worked around so these tests fail for meta.json reasons only.
+    """
+    async def _before(*a, **kw):
+        return None
+
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _before)
+    monkeypatch.setattr(cbf.crawl_politeness, "note_response", lambda *a, **kw: None)
+
+
+
+# -- storefront currency / market ---------------------------------------------------------------
+
+
+def test_the_record_carries_the_storefronts_currency_and_market():
+    """`/products.json` carries prices but never the currency they are in, so every record this
+    module produced was currency-less and the ingest lane stamped USD on all of them. Measured
+    2026-09-06 on jsmbeauty.sg: 170 offers, all USD, against a storefront whose /meta.json says
+    SGD/SG and whose LIP-PRESSION Glowy Tint is SGD 30.00."""
+    rec = shopify_product_to_record(_product(), domain="jsmbeauty.sg",
+                                    category_path="beauty/makeup/lip",
+                                    currency="SGD", market="SG")
+
+    assert rec["pdp"]["currency"] == "SGD"
+    assert rec["pdp"]["market"] == "SG"
+
+
+def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
+    """None, NOT a USD default. The ingest lane owns the fallback, and defaulting here would make
+    a storefront we failed to read indistinguishable from one that genuinely sells in USD --
+    which is the difference between a known fact and a guess in a currency column."""
+    rec = shopify_product_to_record(_product(), domain="x.com", category_path="x")
+
+    assert rec["pdp"]["currency"] is None
+    assert rec["pdp"]["market"] is None
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD", "market": "SG"}),
+        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD", "market": "SG"}),
+        ({"currency": "USD", "country": "US"}, {"currency": "USD", "market": "US"}),
+        # merchant-controlled: anything not ISO-shaped is refused, not written through
+        ({"currency": "dollars", "country": "SG"}, {"currency": None, "market": "SG"}),
+        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD", "market": None}),
+        ({"currency": 5, "country": None}, {"currency": None, "market": None}),
+        ({}, {"currency": None, "market": None}),
+        ([], {"currency": None, "market": None}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, expected):
+    """The value lands in a currency column that is a join key for price comparison, and it comes
+    from the merchant. Shape-check it at the door."""
+    import httpx
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return body
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+    # The politeness gate fetches robots.txt through this same client, so without stubbing it the
+    # stub answers robots.txt with JSON and the function under test never runs. It has its own
+    # tests; this one is about the meta.json contract.
+    _silence_politeness(monkeypatch)
+    assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == expected
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypatch):
+    """A non-Shopify host, a 404 or a hung socket must not fail the whole brand's ingest -- the
+    caller keeps its default and the crawl proceeds."""
+    import httpx
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
+    _silence_politeness(monkeypatch)
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "market": None}
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch):
+    """THE SEAM. `fetch_shopify_shop_locale` can be perfect and `shopify_product_to_record` can
+    stamp perfectly, and the feature is still dead in production if the caller never passes one
+    to the other. Deleting that one argument left both unit files green -- the same shape as the
+    whitelist drop on the ingest side, where every consumer read a field nobody ever set.
+
+    Stubs both fetches so this asserts the WIRING and nothing else.
+    """
+    async def _products(domain, **kw):
+        return [_product()]
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD", "market": "SG"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup/lip")
+
+    assert recs, "the stub returned a product, so a record must come back"
+    assert {r["pdp"]["currency"] for r in recs} == {"SGD"}
+    assert {r["pdp"]["market"] for r in recs} == {"SG"}
+
+
+@pytest.mark.asyncio
+async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_product(monkeypatch):
+    """It is one storefront-wide setting. A per-product fetch would multiply outbound requests by
+    the catalogue size against a single host -- 170 extra requests for jsmbeauty.sg alone -- which
+    is exactly the shape the shared politeness gate exists to prevent."""
+    calls = []
+
+    async def _products(domain, **kw):
+        return [_product(), _product(handle="second", title="Second Product")]
+
+    async def _locale(domain, **kw):
+        calls.append(domain)
+        return {"currency": "SGD", "market": "SG"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(domain="jsmbeauty.sg", category_path="beauty/makeup/lip")
+
+    assert len(recs) >= 2, "two products in, so the per-product count is meaningful"
+    assert calls == ["jsmbeauty.sg"], f"locale fetched {len(calls)} times for one brand"
