@@ -101,6 +101,29 @@ async def declare_official_domain(
             status_code=422,
             detail="domain must be a valid public hostname",
         )
+    if status == svc.DECLARE_NOT_REGISTRABLE:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "that is a public suffix or shared platform host, not a "
+                "domain a single merchant owns"
+            ),
+        )
+    if status == svc.DECLARE_TOO_MANY:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "too many unverified declarations; verify the existing ones "
+                "before adding more"
+            ),
+        )
+    if status == svc.DECLARE_WRITE_FAILED:
+        # 500, and explicitly NOT 422: the hostname was fine, the write was
+        # not. Answering 422 here is how a missing migration presented as
+        # "domain must be a valid public hostname".
+        raise HTTPException(
+            status_code=500, detail="could not record the declaration",
+        )
     if status == svc.DECLARE_TAKEN:
         # 409, not 403: the caller is authenticated and allowed here; the
         # DOMAIN is the thing in conflict. Deliberately does not say which

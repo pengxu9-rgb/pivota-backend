@@ -248,6 +248,35 @@ def test_every_valid_source_is_permitted_by_the_CHECK_constraint():
         f"found {len(checks)}"
     )
 
+    # THE MIGRATIONS TOO. The docstring above says the constraint lives in
+    # three places, and this test read only one file — so reverting the
+    # migration's list, or DELETING the migration outright, left the suite
+    # green while a DEPLOYED table would reject every declared write. That is
+    # the original blocker's exact shape, one layer out.
+    migrations = sorted(
+        (Path(m.__file__).resolve().parents[1] / "db" / "migrations").glob("*.sql")
+    )
+    constrained = [
+        f for f in migrations
+        if re.search(r"ck_merchant_official_domains_source", f.read_text("utf-8"))
+    ]
+    assert constrained, (
+        "no migration defines ck_merchant_official_domains_source — a table "
+        "created before this PR keeps the old constraint and rejects every "
+        "declared write"
+    )
+    # The LAST migration touching it is the one a deployed table ends up with.
+    final = constrained[-1].read_text("utf-8")
+    final_clauses = re.findall(r"source IN \(([^)]*)\)", final)
+    assert final_clauses, f"{constrained[-1].name} names the constraint but sets no list"
+    permitted = {v.strip().strip("'\"") for v in final_clauses[-1].split(",")}
+    missing = m.VALID_SOURCES - permitted
+    assert not missing, (
+        f"{constrained[-1].name} rejects {sorted(missing)}; a deployed table "
+        f"would refuse those writes and upsert_official_domain swallows the "
+        f"violation"
+    )
+
     for clause in checks:
         permitted = {v.strip().strip("'\"") for v in clause.split(",")}
         missing = m.VALID_SOURCES - permitted
@@ -465,3 +494,168 @@ async def test_declarations_are_capped_per_merchant(monkeypatch):
 
     assert out["status"] == svc.DECLARE_TOO_MANY
     assert not wrote
+
+
+# ---------------------------------------------------------------------
+# Fifth review: two of the previous round's fixes were wrong the same way
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_declaring_a_host_inference_already_produces_is_refused(monkeypatch):
+    """THE DEFECT BOTH EARLIER FIXES SHARED.
+
+    The set a run USES is (stored rows in OFFICIAL_SOURCES) UNION (inferred),
+    which no filter on the `source` column alone can express. The upsert does
+    `source = excluded.source`, so declaring an INFERRED host flipped its row to
+    `declared`, and then:
+
+      - the liveness sweep's `source <> 'declared'` skipped it FOREVER while the
+        inferred branch kept counting it official — a host that can never be
+        measured dead, which is the `us.judydoll.com` overstatement this table
+        exists to remove; and
+      - the audit basis stopped recording a host the run demonstrably used.
+
+    Refusing the declaration makes `declared` rows and the used set disjoint by
+    construction, instead of patching each consumer.
+    """
+    async def _none(_domain):
+        return None
+
+    async def _not_proven(_domain, _mid):
+        return False
+
+    async def _stored(_mid):
+        return [{"domain": "us.brand.com", "source": mod.SOURCE_INFERRED,
+                 "verification_status": None, "liveness_status": "unchecked"}]
+
+    async def _inferred(_mid):
+        return {"us.brand.com"}
+
+    wrote = []
+
+    async def _upsert(**kw):
+        wrote.append(kw)
+        return True
+
+    monkeypatch.setattr(mod, "resolve_verified_merchant_for_domain", _none)
+    monkeypatch.setattr(mod, "domain_is_proven_by_other_merchant", _not_proven)
+    monkeypatch.setattr(mod, "list_official_domains", _stored)
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
+    monkeypatch.setattr(mod, "upsert_official_domain", _upsert)
+
+    out = await svc.declare_official_domain("m1", "us.brand.com")
+
+    assert out["status"] == svc.DECLARE_ALREADY_KNOWN
+    assert not wrote, (
+        "an inferred row was flipped to `declared`, which removes it from the "
+        "liveness sweep forever while it stays counted official"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_owned_set_load_fails_closed(monkeypatch):
+    async def _none(_domain):
+        return None
+
+    async def _not_proven(_domain, _mid):
+        return False
+
+    async def _stored(_mid):
+        return []
+
+    async def _boom(_mid):
+        raise RuntimeError("db down")
+
+    wrote = []
+
+    async def _upsert(**kw):
+        wrote.append(kw)
+        return True
+
+    monkeypatch.setattr(mod, "resolve_verified_merchant_for_domain", _none)
+    monkeypatch.setattr(mod, "domain_is_proven_by_other_merchant", _not_proven)
+    monkeypatch.setattr(mod, "list_official_domains", _stored)
+    monkeypatch.setattr(svc, "merchant_owned_domains", _boom)
+    monkeypatch.setattr(mod, "upsert_official_domain", _upsert)
+
+    out = await svc.declare_official_domain("m1", "new.com")
+
+    assert out["status"] == svc.DECLARE_TAKEN
+    assert not wrote
+
+
+@pytest.mark.asyncio
+async def test_a_write_failure_does_not_blame_the_hostname(monkeypatch):
+    """`upsert_official_domain` is best-effort and returns False on a swallowed
+    DB error, so ok=False means OUR failure. Reporting it as
+    "domain must be a valid public hostname" is how the missing migration
+    presented to merchants."""
+    async def _none(_domain):
+        return None
+
+    async def _not_proven(_domain, _mid):
+        return False
+
+    async def _stored(_mid):
+        return []
+
+    async def _owned(_mid):
+        return set()
+
+    async def _fails(**kw):
+        return False
+
+    monkeypatch.setattr(mod, "resolve_verified_merchant_for_domain", _none)
+    monkeypatch.setattr(mod, "domain_is_proven_by_other_merchant", _not_proven)
+    monkeypatch.setattr(mod, "list_official_domains", _stored)
+    monkeypatch.setattr(svc, "merchant_owned_domains", _owned)
+    monkeypatch.setattr(mod, "upsert_official_domain", _fails)
+
+    out = await svc.declare_official_domain("m1", "perfectly-fine.com")
+
+    assert out["status"] == svc.DECLARE_WRITE_FAILED
+    assert out["status"] != svc.DECLARE_INVALID_HOST
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source", [mod.SOURCE_VERIFIED, mod.SOURCE_ASSERTED],
+)
+async def test_the_proof_lookup_SQL_covers_both_proven_sources(source):
+    """Runs the REAL query. The sibling test above monkeypatches
+    `domain_is_proven_by_other_merchant`, which is the function the fix lives
+    in — so narrowing its SQL back to `source IN ('verified')`, undoing the
+    asserted-gap fix, left the whole suite green. A guard whose only test
+    replaces it with a stub protects nothing.
+    """
+    from db.database import database
+    from db import merchant_official_domains as m
+
+    domain = f"proof-{source}.example.com"
+    await database.connect()
+    try:
+        await m.ensure_merchant_official_domains_table()
+        assert await m.upsert_official_domain(
+            merchant_id="owner-merchant", domain=domain, source=source,
+            verification_status=m.VERIFICATION_VERIFIED,
+        )
+        assert await m.domain_is_proven_by_other_merchant(
+            domain, "someone-else",
+        ) is True, (
+            f"a domain another merchant proved via {source!r} was not reported "
+            f"as taken — both sources mean control was proven"
+        )
+        # And the owner is not blocked by their own proof.
+        assert await m.domain_is_proven_by_other_merchant(
+            domain, "owner-merchant",
+        ) is False
+    finally:
+        try:
+            await database.execute(
+                "DELETE FROM merchant_official_domains "
+                "WHERE merchant_id = :m", {"m": "owner-merchant"},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        await database.disconnect()

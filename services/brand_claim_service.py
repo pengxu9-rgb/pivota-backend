@@ -403,6 +403,8 @@ DECLARE_TAKEN = "claimed_by_another_merchant"
 DECLARE_ALREADY_PROVEN = "already_proven"
 DECLARE_NOT_REGISTRABLE = "not_a_registrable_domain"
 DECLARE_TOO_MANY = "too_many_declarations"
+DECLARE_ALREADY_KNOWN = "already_in_your_official_set"
+DECLARE_WRITE_FAILED = "write_failed"
 
 # A merchant with more than this many unproven declarations is not filling in a
 # second storefront, and each row is a free write that later readers must skip.
@@ -443,7 +445,7 @@ async def declare_official_domain(
     # A public suffix or shared platform host is not a domain anyone owns.
     # `myshopify.com` is not a merchant's storefront — one tenant of it is — and
     # this module already keeps the list for exactly this class of widening.
-    if not _is_registrable_base(host) or host in _PUBLIC_SUFFIXES:
+    if not _is_registrable_base(host):
         return {"status": DECLARE_NOT_REGISTRABLE, "domain": host}
 
     owner = None
@@ -480,18 +482,49 @@ async def declare_official_domain(
         }
     except Exception:  # noqa: BLE001
         existing = {}
-    declared_count = sum(
-        1 for r in existing.values()
-        if str(r.get("source") or "") == mod.SOURCE_DECLARED
-    )
-    if host not in existing and declared_count >= _MAX_DECLARED_PER_MERCHANT:
-        return {"status": DECLARE_TOO_MANY, "domain": host,
-                "declared_count": declared_count}
-
     row = existing.get(host)
     if row and str(row.get("source") or "") in mod.OFFICIAL_SOURCES:
         return {"status": DECLARE_ALREADY_PROVEN, "domain": host,
                 "source": row.get("source")}
+
+    # ALREADY IN THE OFFICIAL SET — including by INFERENCE — so there is
+    # nothing to declare, and declaring would actively damage it.
+    #
+    # This is the invariant made true by construction rather than patched at
+    # each consumer. The set a run USES is
+    #     (stored rows whose source is in OFFICIAL_SOURCES) UNION (inferred)
+    # which no filter on the `source` column alone can express. Two earlier
+    # fixes tried and both were wrong in the same way: the upsert does
+    # `source = excluded.source`, so declaring an INFERRED host flipped its row
+    # to `declared`, and then
+    #   - the liveness sweep's `source <> 'declared'` skipped it forever, while
+    #     the inferred branch kept counting it official — a host that can never
+    #     be measured dead, which is the us.judydoll.com overstatement this
+    #     table exists to remove; and
+    #   - the audit basis stopped recording a host the run demonstrably used.
+    #
+    # A declaration can therefore only ever create a genuinely NEW host, and
+    # `declared` rows and the used set stay disjoint by construction.
+    try:
+        already = await merchant_owned_domains(str(merchant_id))
+    except Exception:  # noqa: BLE001 — fails CLOSED like the lookups above
+        logger.warning("declare_official_domain owned-set load failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_TAKEN, "domain": host}
+    if host in already:
+        return {"status": DECLARE_ALREADY_KNOWN, "domain": host}
+
+    # Counted AFTER the already-known checks, so it bounds only rows a
+    # declaration can actually create. Keyed on the whole stored set rather
+    # than `host not in existing`, which skipped the cap for any host that had
+    # a row of any source — the same lever as the flip above.
+    declared_count = sum(
+        1 for r in existing.values()
+        if str(r.get("source") or "") == mod.SOURCE_DECLARED
+    )
+    if declared_count >= _MAX_DECLARED_PER_MERCHANT:
+        return {"status": DECLARE_TOO_MANY, "domain": host,
+                "declared_count": declared_count}
 
     ok = False
     try:
@@ -508,10 +541,16 @@ async def declare_official_domain(
     except Exception:  # noqa: BLE001
         logger.warning("declare_official_domain write failed for %s/%s",
                        merchant_id, host, exc_info=True)
-        return {"status": DECLARE_INVALID_HOST, "domain": host}
+        return {"status": DECLARE_WRITE_FAILED, "domain": host}
 
     return {
-        "status": DECLARE_OK if ok else DECLARE_INVALID_HOST,
+        # A FAILED WRITE IS NOT A BAD HOSTNAME. Returning INVALID_HOST here is
+        # how the missing migration presented as "domain must be a valid public
+        # hostname": the feature could not store anything and told the merchant
+        # their own valid domain was the problem. `upsert_official_domain` is
+        # best-effort and returns False on a swallowed DB error, so ok=False
+        # means OUR failure, not theirs.
+        "status": DECLARE_OK if ok else DECLARE_WRITE_FAILED,
         "domain": host,
         "source": mod.SOURCE_DECLARED,
         "counts_toward_official_set": False,
