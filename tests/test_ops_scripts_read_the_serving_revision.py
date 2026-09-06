@@ -120,6 +120,29 @@ def test_an_unreadable_service_fails_rather_than_answering(tmp_path):
     assert "REFUSED" in out, f"an undescribable service produced an answer: {out}"
 
 
+def test_two_revisions_both_claiming_all_traffic_are_refused(tmp_path):
+    """The input only the `len(live) == 1` clause can catch.
+
+    A 50/50 split is rejected by the `percent == 100` FILTER alone — neither entry qualifies —
+    so it cannot exercise the clause beside it, and relaxing that to `if not live` survived a
+    mutation audit. Two entries both claiming 100 is an inconsistent traffic block, and it is
+    the shape that separates the two guards. Two guards that both close a door pin neither.
+    """
+    binn = _stub_gcloud(tmp_path)
+    both = (binn / "gcloud").read_text().replace('"percent":0,"tag":"c-x"', '"percent":100')
+    (binn / "gcloud").write_text(both)
+    script = f'''
+set -euo pipefail
+GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
+. "{GCP / '_serving_revision.sh'}"
+serving_image worker && echo UNEXPECTED_SUCCESS || echo REFUSED
+'''
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert "REFUSED" in done.stdout + done.stderr, (
+        f"two revisions both at 100% produced a single answer: {done.stdout}{done.stderr}"
+    )
+
+
 def test_split_traffic_is_refused(tmp_path):
     """Two revisions sharing traffic have no single answer, and a lingering 0%-traffic candidate
     is exactly the half-finished state these scripts must not paper over."""
