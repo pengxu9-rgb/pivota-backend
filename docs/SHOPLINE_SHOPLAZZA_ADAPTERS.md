@@ -63,7 +63,11 @@ the **order**, so the receiver sees only what the order says about refunds.
 ASSUMED, and not verified anywhere: that `total_refund_price` never decreases
 in normal operation, and that the platform serialises it consistently across
 API versions. Both are handled defensively rather than trusted — a total that
-does not exceed what we already recorded emits nothing.
+does not exceed what we already recorded emits nothing. That defence has a
+cost worth stating plainly: after a **downward correction** (25.00 corrected to
+20.00, which we ignore), the next genuine refund up to 30.00 emits a delta of
+5.00 rather than 10.00. The running total still lands on 30.00, so aggregate
+refunded GMV is right; only that one per-event delta is short.
 
 ### What we record
 
@@ -94,6 +98,19 @@ already recorded for that order**:
   answer we want for it. A refund with no `currency` is rejected for the same
   reason: an uncounted amount would still consume the order's key.
 
+The read is scoped to the delivery's **currency** as well, matched
+case-insensitively against the recorded row's own `payload.currency`.
+Subtracting is only meaningful inside one unit: a row in another currency is a
+different quantity, and letting it into the baseline would under-record real
+money or suppress the delivery outright as `refund_not_new`.
+
+`refund_total_absent` is also **logged at WARNING** by the receiver (store id,
+order ref, topic). Both ignore reasons answer 2xx and the ingress metric labels
+every ignore identically, so a merchant whose deliveries stopped carrying
+`total_refund_price` — the platform breaking its own contract — would otherwise
+show zero refunded GMV with nothing to alert on. `refund_not_new` stays quiet:
+it is ordinary expected traffic and would drown the real signal.
+
 ### Concurrency
 
 The read and the write are a read-modify-write, so two deliveries for one order
@@ -101,11 +118,32 @@ that interleave would both compute their delta against the same stale baseline.
 On Postgres both run inside ONE transaction holding
 `pg_advisory_xact_lock(hashtext('shoplazza_refund|<merchant>|<store>|<order_ref>'))`
 (`order_money_read_modify_write_lock`), so the second delivery reads only after
-the first has committed. SQLite has no advisory locks and the helper is a no-op
-there; that is tests and local development only. Even unserialised, the
-deterministic `<order>:<cumulative>` key means a raced pair collapses into one
-row rather than double-counting — the failure mode is understating a refund by
-one delta, never inflating it.
+the first has committed.
+
+**That lock is required, not an optimisation.** The deterministic
+`<order>:<cumulative>` key only collapses a raced pair carrying the SAME
+cumulative total. Two partial refunds moments apart carry DIFFERENT totals: a
+raced 10.00 and 25.00 both read a baseline of 0 and emit `<order>:1000` for
+1000 and `<order>:2500` for 2500 — two distinct keys, nothing to dedupe, and
+the funnel sums them to 3500 against a true cumulative of 2500. The
+unserialised failure mode is a 40% **inflation** of refunded GMV, not an
+understatement. SQLite has no advisory locks and the helper is a no-op there,
+which is tolerable only because SQLite is tests and local development and never
+carries real money; `tests/test_shoplazza_refund_ledger_end_to_end.py` pins that
+3500 so the hazard is documented rather than rediscovered, and the Postgres
+gate proves the lock actually excludes a second backend.
+
+### Transition from the pre-2026-09-05 rows
+
+Shoplazza refund rows already in prod carry `amount_cents = None`, no
+`refund_id`, and an event id keyed on the delivery id. They are **excluded from
+the read** — a `None` amount contributes nothing to the sum — so the first
+post-deploy delivery for such an order computes its delta against a baseline of
+0 and emits the whole cumulative total as one delta. That is correct: none of
+that money has ever been counted. The old rows contribute nothing to refunded
+GMV (their amount is null) and do not inflate the `refunded` stage set either:
+that stage is a set of interaction ids, one per order, and the new row resolves
+to the same interaction as the old one.
 
 With `SHOPLINE_WEBHOOK_BASE_URL`, `SHOPLAZZA_WEBHOOK_BASE_URL`, or the shared
 `PUBLIC_BASE_URL` configured as an HTTPS public origin, authenticated merchants

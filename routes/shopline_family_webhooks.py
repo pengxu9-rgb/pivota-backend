@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -21,13 +22,18 @@ from services.shopline_family_event_adapter import (
     UnsupportedShoplineFamilyEvent,
     map_shopline_webhook,
     map_shoplazza_webhook,
+    shoplazza_order_currency,
     shoplazza_order_ref,
 )
 from services.shopline_family_webhook_auth import resolve_webhook_secret
 
 
+logger = logging.getLogger("shopline_family_webhooks")
 router = APIRouter(prefix="/webhooks", tags=["SHOPLINE and Shoplazza Webhooks"])
 MAX_SHOPLINE_FAMILY_WEBHOOK_BYTES = 1_000_000
+# The one ignore reason that means the PLATFORM broke its contract rather than
+# that we have seen this money already. See `_map_and_record`.
+REFUND_TOTAL_ABSENT = "refund_total_absent"
 
 
 def _credentials(raw: Any) -> Dict[str, Any]:
@@ -144,6 +150,9 @@ async def _receive(
             store_id=store_id,
             order_ref=refund_order_ref,
             write_path="shoplazza_webhook",
+            # Subtracting is only meaningful within one unit; a row in another
+            # currency is a different quantity, not a smaller one.
+            currency=shoplazza_order_currency(payload),
         )
         return await _map_and_record(
             platform=platform,
@@ -152,6 +161,7 @@ async def _receive(
             payload=payload,
             topic=topic,
             delivery_id=delivery_id,
+            order_ref=refund_order_ref,
             previously_recorded_refund_cents=previously_recorded,
         )
 
@@ -164,6 +174,7 @@ async def _map_and_record(
     payload: Dict[str, Any],
     topic: Optional[str],
     delivery_id: Optional[str],
+    order_ref: Optional[str] = None,
     **mapper_kwargs: Any,
 ):
     try:
@@ -183,7 +194,27 @@ async def _map_and_record(
                 **mapper_kwargs,
             )
     except UnsupportedShoplineFamilyEvent as exc:
-        return {"status": "ignored", "platform": platform, "reason": str(exc)}
+        reason = str(exc)
+        if reason.startswith(REFUND_TOTAL_ABSENT):
+            # A refund topic with no `total_refund_price` is the platform
+            # breaking its own contract, and it is otherwise SILENT: the
+            # delivery answers 2xx `ignored`, and the ingress metric labels
+            # every ignore identically, so a merchant whose deliveries stopped
+            # carrying the total would simply show zero refunded GMV with
+            # nothing to alert on. Log it here rather than widening
+            # telemetry_ingress's label set. `refund_not_new` — the ordinary
+            # redelivery and downward-correction case — stays quiet, because it
+            # is expected traffic and would drown this out.
+            logger.warning(
+                "%s refund delivery carries no total_refund_price; "
+                "no refund amount can be recorded "
+                "(store_id=%s order_ref=%s topic=%s)",
+                platform,
+                store_id,
+                order_ref or "-",
+                str(topic or "").strip() or "-",
+            )
+        return {"status": "ignored", "platform": platform, "reason": reason}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     result = await ingest_merchant_event_batch(

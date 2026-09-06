@@ -336,6 +336,21 @@ def shoplazza_order_ref(payload: Any) -> Optional[str]:
     return build_order_ref("shoplazza", _text(order.get("id") or order.get("order_id")))
 
 
+def shoplazza_order_currency(payload: Any) -> Optional[str]:
+    """The delivery's order currency, upper-cased, or None.
+
+    The receiver needs this alongside the order ref, for the same reason: the
+    "already recorded" figure it subtracts is only comparable to this
+    delivery's cumulative total if both are in the same unit. Like
+    ``shoplazza_order_ref`` this cannot fail the delivery — a refund with no
+    currency is rejected 422 by the mapper itself.
+    """
+    if not isinstance(payload, dict):
+        return None
+    currency = _text(_unwrap(payload, "order").get("currency"))
+    return currency.upper() if currency else None
+
+
 def _shoplazza_refund_batch(
     order: Dict[str, Any],
     *,
@@ -362,7 +377,11 @@ def _shoplazza_refund_batch(
 
     The key is ``<order id>:<cumulative cents>``, which is deterministic: a
     redelivery of the SAME cumulative total lands on the same key and dedupes
-    on the ledger's first-write-wins even if it raced the read.
+    on the ledger's first-write-wins even if it raced the read. That is the
+    only race the key protects against — two DIFFERENT totals racing produce
+    two different keys and INFLATE the order's refunded total, which is why the
+    receiver's ``order_money_read_modify_write_lock`` is required rather than
+    an optimisation.
     """
     currency = _text(order.get("currency"))
     if not currency:

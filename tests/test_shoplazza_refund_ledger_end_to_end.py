@@ -15,10 +15,12 @@ under test here.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -142,9 +144,8 @@ async def _sqlite_ledger(tmp_path, monkeypatch, name: str):
     return test_database
 
 
-def _client(monkeypatch):
+def _app(monkeypatch):
     from fastapi import FastAPI
-    from fastapi.testclient import TestClient
 
     from routes import shopline_family_webhooks as route
 
@@ -160,25 +161,42 @@ def _client(monkeypatch):
     monkeypatch.setattr(route, "database", FakeStores())
     app = FastAPI()
     app.include_router(route.router)
-    return TestClient(app)
+    return app
 
 
-def _post(client, order, *, topic, delivery_id):
+def _client(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    return TestClient(_app(monkeypatch))
+
+
+def _signed_request(order, *, topic, delivery_id):
     raw = json.dumps({"order": order}, separators=(",", ":")).encode("utf-8")
     signature = base64.b64encode(
         hmac.new(APP_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()
     ).decode("ascii")
-    return client.post(
-        PATH,
-        content=raw,
-        headers={
-            "X-Shoplazza-Hmac-Sha256": signature,
-            "X-Shoplazza-Topic": topic,
-            "X-Shoplazza-Deduplication-ID": delivery_id,
-            "X-Shoplazza-Shop-Domain": DOMAIN,
-            "Content-Type": "application/json",
-        },
-    )
+    return raw, {
+        "X-Shoplazza-Hmac-Sha256": signature,
+        "X-Shoplazza-Topic": topic,
+        "X-Shoplazza-Deduplication-ID": delivery_id,
+        "X-Shoplazza-Shop-Domain": DOMAIN,
+        "Content-Type": "application/json",
+    }
+
+
+def _post(client, order, *, topic, delivery_id):
+    raw, headers = _signed_request(order, topic=topic, delivery_id=delivery_id)
+    return client.post(PATH, content=raw, headers=headers)
+
+
+async def _apost(client, order, *, topic, delivery_id):
+    """The same signed delivery, awaited in THIS event loop.
+
+    The race below needs two deliveries genuinely in flight at once, which
+    `TestClient` cannot express: it drives the app through a portal and blocks.
+    """
+    raw, headers = _signed_request(order, topic=topic, delivery_id=delivery_id)
+    return await client.post(PATH, content=raw, headers=headers)
 
 
 async def _refund_rows(test_database):
@@ -408,5 +426,304 @@ async def test_the_ledger_read_is_scoped_to_this_store_and_write_path(
             )
             == 0
         )
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_raced_pair_of_different_totals_inflates_the_refunded_gmv(
+    tmp_path, monkeypatch
+):
+    """The failure mode `order_money_read_modify_write_lock` exists to prevent.
+
+    This test DOCUMENTS a hazard, it does not accept one. The behaviour pinned
+    below is wrong, and the Postgres advisory lock is what makes it
+    unreachable in production; the assertions exist so that anyone who is
+    tempted to call that lock an optimisation, or to run this write path on an
+    engine without advisory locks, can see the number it produces.
+
+    The original claim in this PR was that an unserialised pair "collapses to
+    one row, understating rather than inflating". That is only true of a pair
+    carrying the SAME cumulative total, which lands on one deterministic key.
+    Two partial refunds moments apart carry DIFFERENT totals: below, 10.00 and
+    25.00 both read a baseline of 0 and emit `<order>:1000` for 1000 and
+    `<order>:2500` for 2500. Those are two distinct keys, nothing dedupes them,
+    and the funnel sums them to 3500 — against a true cumulative of 2500, a 40%
+    INFLATION of refunded GMV.
+
+    The lock is a no-op here because `_sqlite_ledger` sets `IS_POSTGRES` False,
+    which is exactly what the helper does on any engine without advisory locks.
+    """
+    import httpx
+
+    from services import merchant_commerce_event_funnel_service as funnel_service
+    from routes import shopline_family_webhooks as route
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sz-refund-race")
+    try:
+        app = _app(monkeypatch)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # The order (and its interaction row) exists before the race, so
+            # what races is only the refund read-modify-write.
+            paid = await _apost(
+                client, _order(), topic="orders/paid", delivery_id="delivery-paid"
+            )
+            assert paid.status_code == 200, paid.text
+
+            baselines = []
+            both_have_read = asyncio.Event()
+            real_read = route.recorded_refund_amount_cents
+
+            async def racing_read(**kwargs):
+                """Hold each delivery at the point the real lock would block it."""
+                value = await real_read(**kwargs)
+                baselines.append(value)
+                if len(baselines) == 2:
+                    both_have_read.set()
+                await asyncio.wait_for(both_have_read.wait(), timeout=10)
+                return value
+
+            monkeypatch.setattr(route, "recorded_refund_amount_cents", racing_read)
+
+            first, second = await asyncio.gather(
+                _apost(
+                    client,
+                    _refund_order("10.00", REFUND_ONE_AT),
+                    topic="orders/partially_refunded",
+                    delivery_id="delivery-refund-1",
+                ),
+                _apost(
+                    client,
+                    _refund_order("25.00", REFUND_TWO_AT),
+                    topic="orders/partially_refunded",
+                    delivery_id="delivery-refund-2",
+                ),
+            )
+
+        # Both deliveries really did read the same stale baseline; without this
+        # the rest of the test would pass for the ordinary sequential reason.
+        assert baselines == [0, 0]
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert {first.json()["status"], second.json()["status"]} == {"recorded"}
+
+        rows = await _refund_rows(test_database)
+        # Two DISTINCT keys, so first-write-wins has nothing to collapse.
+        assert [row["payload"]["amount_cents"] for row in rows] == [1000, 2500]
+        assert sorted(row["payload"]["refund_id"] for row in rows) == [
+            f"{ORDER_ID}:1000",
+            f"{ORDER_ID}:2500",
+        ]
+
+        result = await funnel_service.get_merchant_commerce_event_funnel(
+            merchant_id=MERCHANT_ID,
+            group_by="store",
+        )
+        summary = result.payload["summary"]
+        # The platform's true cumulative refund is 2500. This is 3500.
+        assert summary["refunded_amount_cents_by_currency"] == {"USD": 3500}
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_synthetic_refund_row_does_not_reduce_the_next_delta(
+    tmp_path, monkeypatch
+):
+    """A probe must never be able to suppress real money.
+
+    `recorded_refund_amount_cents` excludes `synthetic` rows. Without that
+    filter, one canary refund written under this write path for a real order
+    becomes a baseline the platform's next cumulative total has to exceed — and
+    a canary large enough makes every subsequent real refund of that order
+    `refund_not_new`, i.e. silently uncounted for good.
+    """
+    from services.merchant_event_ingest_service import ingest_merchant_event_batch
+    from services.shopline_family_event_adapter import map_shoplazza_webhook
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sz-refund-synthetic")
+    try:
+        client = _client(monkeypatch)
+        _post(client, _order(), topic="orders/paid", delivery_id="delivery-paid")
+
+        # A canary refund of 50.00 for the SAME order, same write path.
+        canary = map_shoplazza_webhook(
+            {"order": _refund_order("50.00", REFUND_ONE_AT)},
+            topic="orders/partially_refunded",
+            delivery_id="delivery-canary",
+            store_id=STORE_ID,
+            previously_recorded_refund_cents=0,
+        )
+        canary_result = await ingest_merchant_event_batch(
+            merchant_id=MERCHANT_ID,
+            batch=canary,
+            agent_identity_confidence="platform_asserted",
+            write_path="shoplazza_webhook",
+            synthetic=True,
+        )
+        assert canary_result["accepted"] == 1
+
+        # The row is really MARKED synthetic — otherwise the exclusion below
+        # would be trivially satisfied and this test would prove nothing.
+        rows = await _refund_rows(test_database)
+        assert len(rows) == 1
+        assert bool(rows[0]["synthetic"]) is True
+        assert rows[0]["payload"]["amount_cents"] == 5000
+        assert rows[0]["write_path"] == "shoplazza_webhook"
+        assert rows[0]["order_ref"] == f"shoplazza:{ORDER_ID}"
+
+        # A real 10.00 refund now. If the canary counted, previously would be
+        # 5000 and this delivery would be ignored as `refund_not_new`.
+        real = _post(
+            client,
+            _refund_order("10.00", REFUND_TWO_AT),
+            topic="orders/partially_refunded",
+            delivery_id="delivery-refund-1",
+        )
+        assert real.status_code == 200, real.text
+        assert real.json()["status"] == "recorded"
+        assert real.json()["accepted"] == 1
+
+        recorded = [row for row in await _refund_rows(test_database) if not row["synthetic"]]
+        assert [row["payload"]["amount_cents"] for row in recorded] == [1000]
+        assert [row["payload"]["refund_id"] for row in recorded] == [f"{ORDER_ID}:1000"]
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_prior_refund_in_another_currency_does_not_reduce_the_delta(
+    tmp_path, monkeypatch
+):
+    """Subtraction is only meaningful inside one currency.
+
+    3000 minor units of EUR are not 3000 minor units of USD. If a row in
+    another currency were allowed into the baseline, this order's first USD
+    refund would be ignored as `refund_not_new` and never counted at all.
+    """
+    from services.commerce_interaction_service import recorded_refund_amount_cents
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sz-refund-currency")
+    try:
+        client = _client(monkeypatch)
+        _post(client, _order(), topic="orders/paid", delivery_id="delivery-paid")
+
+        eur = _post(
+            client,
+            _order(
+                updated_at=REFUND_ONE_AT,
+                currency="EUR",
+                financial_status="partially_refunded",
+                total_refund_price="30.00",
+            ),
+            topic="orders/partially_refunded",
+            delivery_id="delivery-refund-eur",
+        )
+        assert eur.status_code == 200, eur.text
+        assert eur.json()["status"] == "recorded"
+
+        usd = _post(
+            client,
+            _refund_order("10.00", REFUND_TWO_AT),
+            topic="orders/partially_refunded",
+            delivery_id="delivery-refund-usd",
+        )
+        assert usd.status_code == 200, usd.text
+        assert usd.json()["status"] == "recorded", usd.text
+        assert usd.json()["accepted"] == 1
+
+        rows = await _refund_rows(test_database)
+        assert [(row["payload"]["currency"], row["payload"]["amount_cents"]) for row in rows] == [
+            ("USD", 1000),
+            ("EUR", 3000),
+        ]
+
+        scope = dict(
+            merchant_id=MERCHANT_ID,
+            store_id=STORE_ID,
+            order_ref=f"shoplazza:{ORDER_ID}",
+            write_path="shoplazza_webhook",
+        )
+        # The read itself, directly: each currency sees only its own rows, and
+        # the match is case-insensitive because the caller passes whatever the
+        # delivery said.
+        assert await recorded_refund_amount_cents(**scope, currency="USD") == 1000
+        assert await recorded_refund_amount_cents(**scope, currency="usd") == 1000
+        assert await recorded_refund_amount_cents(**scope, currency="EUR") == 3000
+        assert await recorded_refund_amount_cents(**scope, currency="JPY") == 0
+        # No currency asked for is still every row, which is what makes the
+        # filter above a real narrowing rather than a no-op.
+        assert await recorded_refund_amount_cents(**scope) == 4000
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_refund_delivery_with_no_total_logs_but_a_redelivery_stays_quiet(
+    tmp_path, monkeypatch, caplog
+):
+    """`refund_total_absent` is a platform contract break and must be audible.
+
+    Both ignore reasons answer 2xx with `{"status": "ignored"}`, and the
+    ingress metric labels every ignore identically (`outcome="ignored"`, no
+    reason dimension). So a merchant whose deliveries stopped carrying
+    `total_refund_price` would show zero refunded GMV with nothing at all to
+    alert on. `refund_not_new` is ordinary expected traffic — every redelivery
+    and every downward correction — and must stay quiet or it would drown the
+    real signal.
+    """
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sz-refund-log")
+    try:
+        client = _client(monkeypatch)
+        _post(client, _order(), topic="orders/paid", delivery_id="delivery-paid")
+
+        with caplog.at_level(logging.WARNING, logger="shopline_family_webhooks"):
+            caplog.clear()
+            absent = _post(
+                client,
+                _order(updated_at=REFUND_ONE_AT, financial_status="refunding"),
+                topic="orders/partially_refunded",
+                delivery_id="delivery-refund-no-total",
+            )
+            assert absent.status_code == 200, absent.text
+            assert absent.json()["status"] == "ignored"
+            assert "refund_total_absent" in absent.json()["reason"]
+
+            warnings = [
+                record
+                for record in caplog.records
+                if record.name == "shopline_family_webhooks"
+                and record.levelno == logging.WARNING
+            ]
+            assert len(warnings) == 1
+            message = warnings[0].getMessage()
+            assert "total_refund_price" in message
+            assert f"store_id={STORE_ID}" in message
+            assert f"order_ref=shoplazza:{ORDER_ID}" in message
+            assert "topic=orders/partially_refunded" in message
+
+            # And the quiet case: a real refund, then the same total again.
+            caplog.clear()
+            recorded = _post(
+                client,
+                _refund_order("10.00", REFUND_ONE_AT),
+                topic="orders/partially_refunded",
+                delivery_id="delivery-refund-1",
+            )
+            assert recorded.json()["status"] == "recorded"
+            replay = _post(
+                client,
+                _refund_order("10.00", REFUND_ONE_AT),
+                topic="orders/partially_refunded",
+                delivery_id="delivery-refund-1-retry",
+            )
+            assert replay.json()["status"] == "ignored"
+            assert "refund_not_new" in replay.json()["reason"]
+            assert [
+                record
+                for record in caplog.records
+                if record.name == "shopline_family_webhooks"
+            ] == []
     finally:
         await test_database.disconnect()
