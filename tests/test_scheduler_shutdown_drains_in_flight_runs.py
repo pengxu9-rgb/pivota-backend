@@ -25,8 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
+from pathlib import Path
 
 import pytest
+
+REPO = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -77,6 +81,38 @@ def test_the_wait_argument_is_a_no_op_for_this_scheduler():
     )
 
 
+def test_a_hostile_env_var_cannot_break_the_IMPORT(tmp_path):
+    """THE ONE THAT ALREADY SHIPPED, and the parametrisation below does not hold it.
+
+    Those cases call `_read_drain_seconds()` on an ALREADY-IMPORTED module, so they prove the
+    parser is right and prove nothing about import. The bug was that
+    `_DRAIN_SECONDS = float(os.getenv(...))` ran AT import: reinstating that exact line keeps
+    every one of those cases green, because by the time they run the module is loaded. And
+    main.py imports this module inside `except Exception`, so an import-time raise reads as
+    "audit_scheduler boot failed (continuing degraded ... no worker will drain them)" — a typo
+    in a shutdown knob silently disabling every cron on the worker.
+
+    A subprocess is the only honest way to test an import.
+    """
+    import subprocess as _sp
+    import sys as _sys
+
+    for hostile in ("5s", "abc", "nan", "1e400", "-", " "):
+        done = _sp.run(
+            [_sys.executable, "-c",
+             "import services.audit_scheduler as m; print(m._DRAIN_SECONDS)"],
+            cwd=str(REPO), capture_output=True, text=True, timeout=120,
+            env={**os.environ, "SCHEDULER_DRAIN_SECONDS": hostile},
+        )
+        assert done.returncode == 0, (
+            f"importing services.audit_scheduler with SCHEDULER_DRAIN_SECONDS={hostile!r} "
+            f"FAILED. main.py swallows that into 'continuing degraded' and the worker boots "
+            f"with no scheduler at all.\n{done.stderr[-1500:]}"
+        )
+        value = float(done.stdout.strip().splitlines()[-1])
+        assert 0 < value <= 8.0, f"{hostile!r} produced a drain of {value}s"
+
+
 # ── the ordering the drain depends on ─────────────────────────────────────────────────
 
 
@@ -108,16 +144,42 @@ def test_the_scheduler_is_stopped_before_the_database_is_disconnected():
     )
 
 
-def test_the_disconnect_still_happens_if_the_drain_is_cancelled():
-    """`stop_scheduler` now contains an await, so a CancelledError can land inside it. An
-    `except Exception` does not catch that, so without a `finally` the disconnect would be
-    skipped entirely and the pool left open."""
-    import inspect
+@pytest.mark.asyncio
+async def test_the_disconnect_still_happens_if_the_drain_is_cancelled(monkeypatch):
+    """`stop_scheduler` now contains an await, so a CancelledError can land inside it — an
+    `except Exception` does not catch that, and without a `finally` the pool is left open.
+
+    ASSERTED BY CANCELLING IT, not by looking for the word "finally". The source check this
+    replaces (`"finally:" in src and index("finally:") < index("disconnect")`) was satisfied by
+    ANY earlier try/finally: a mutation audit wrapped the two webhook stops in `try/finally:
+    pass`, reverted the disconnect to a bare statement, and every case still passed with the
+    fix entirely gone."""
     import main as main_mod
 
-    src = inspect.getsource(main_mod.shutdown_event)
-    assert "finally:" in src and src.index("finally:") < src.index("database.disconnect()"), (
-        f"shutdown_event does not guarantee the disconnect after stop_scheduler:\n{src}"
+    disconnected = []
+
+    async def _noop():
+        return None
+
+    async def _slow_stop():
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(main_mod, "stop_agent_webhook_retry_worker", _noop)
+    monkeypatch.setattr(main_mod, "stop_merchant_webhook_retry_worker", _noop)
+    monkeypatch.setattr(main_mod.database, "disconnect",
+                        lambda: disconnected.append(True) or _noop())
+    import services.audit_scheduler as sched_mod
+    monkeypatch.setattr(sched_mod, "stop_scheduler", _slow_stop)
+
+    task = asyncio.get_running_loop().create_task(main_mod.shutdown_event())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert disconnected, (
+        "shutdown_event was cancelled mid-drain and never closed the pool. Cancellation must "
+        "still propagate, but the disconnect has to happen on the way out."
     )
 
 
@@ -318,10 +380,13 @@ async def test_every_in_flight_run_is_waited_on_not_just_the_first(runner, monke
         await asyncio.sleep(delay)
         landed.append(n)
 
-    st = runner._state("multi", 30.0)
+    # TWO SEPARATE JOBS, not two tasks under one JobRunState. `active_tasks()` loops over
+    # every entry in _REGISTRY, and putting both tasks in one state pins ALL_COMPLETED while
+    # leaving that loop untested — a mutant that iterated only the FIRST job survived. A real
+    # worker has ~40 registered jobs.
     for n, delay in (("fast", 0.02), ("slow", 0.12)):
         t = runner.spawn_isolated(work(n, delay), name=f"job:{n}")
-        st.active[t] = 0.0
+        runner._state(f"job-{n}", 30.0).active[t] = 0.0
 
     mod = await _install(_FakeScheduler(), monkeypatch, drain=5.0)
     await mod.stop_scheduler()

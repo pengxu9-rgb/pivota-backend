@@ -1376,9 +1376,14 @@ async def stop_scheduler() -> None:
     as a ZOMBIE: an ERROR log naming the #1754 wedge class, plus a terminated DB connection.
     Those are the right responses to a run that would not unwind; they are noise for an
     ordinary redeploy, and repeated dozens of times a day they teach people to ignore an
-    error that elsewhere means something is genuinely stuck. Letting short runs land also
-    matters for the settlement and refund lanes, where being cancelled mid-call is the
-    hazard, not the tidy-up.
+    error that elsewhere means something is genuinely stuck. THAT is the benefit, and it is
+    the idle and short ticks that supply it.
+
+    What this does NOT promise: that a tick with real work will land. `payment_reconcile_tick`
+    is 50 orders x (PSP verify + finalize + Shopify order); `merchant_order_sync_worker_tick`
+    is 20 jobs x 2 Shopify calls at 10s timeouts. Neither finishes in 3s, and neither was ever
+    going to — they are cancelled at the cap exactly as before. Read this as "settlement runs
+    are now safe from redeploys" and it will mislead you.
 
     Best-effort throughout: nothing here may raise, and nothing may hang.
     """
@@ -1394,9 +1399,22 @@ async def stop_scheduler() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("audit_scheduler: pause before drain failed: %s", exc)
         await _drain_running_jobs(_DRAIN_SECONDS)
-        # Whatever is still running is cancelled here, exactly as before.
-        sched.shutdown(wait=False)
     except Exception as exc:  # noqa: BLE001
         logger.warning("audit_scheduler: stop error: %s", exc)
     finally:
+        # SHUTDOWN GOES IN THE `finally`, and this is not tidiness. The drain introduced an
+        # await into a function that used to be entirely synchronous, so a CancelledError can
+        # now land in the middle of it — and CancelledError is not an Exception, so it would
+        # sail past the handler above, SKIP the shutdown, and still hit `_SCHEDULER = None`
+        # below. That leaves APScheduler RUNNING with its timer armed and no reference left to
+        # stop it, while shutdown_event's own `finally` closes the pool underneath it.
+        # Measured, not theorised: `sched.calls == ['pause']` with `_SCHEDULER is None`.
+        #
+        # main.py:911's `finally: await database.disconnect()` was added in the same review
+        # round on exactly this premise; this is the same premise applied one level down.
+        try:
+            # Whatever is still running is cancelled here, exactly as before.
+            sched.shutdown(wait=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("audit_scheduler: shutdown error: %s", exc)
         _SCHEDULER = None

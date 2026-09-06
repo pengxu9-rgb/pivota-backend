@@ -913,7 +913,16 @@ async def shutdown_event():
         # shutdown drain), so a CancelledError landing inside it would propagate past an
         # `except Exception` and skip the disconnect entirely. Cancellation still propagates
         # -- swallowing it would break cancellation semantics -- but the pool is closed first.
-        await database.disconnect()
+        #
+        # GUARDED, because the reorder made THIS the disconnect that actually runs. It is
+        # asyncpg's Pool.close(); if it raises, the exception escapes app_lifespan's own
+        # `finally` and `await shutdown()` never runs, which uvicorn reports as a failed
+        # lifespan shutdown. Previously the guarded copy in shutdown() ran first and this one
+        # hit databases' idempotent no-op path, so the raise had nowhere to go.
+        try:
+            await database.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error closing the database pool during shutdown: %s", exc)
 
 # CORS middleware - configurable allow list (supports Railway ALLOWED_ORIGINS env)
 dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
