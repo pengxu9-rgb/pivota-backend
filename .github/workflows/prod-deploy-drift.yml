@@ -145,7 +145,7 @@ jobs:
             printf '%s' "$sha"
           }
 
-          # worker and proof-issuer: the image on the revision that is actually SERVING, via the
+          # worker and proof-issuer: the commit DECLARED BY the revision that is actually SERVING,
           # Cloud Run admin API. Neither can be probed from a GitHub runner - worker is
           # `--ingress internal`, and Google's front end answers 404 before the request reaches
           # the app even with a valid identity token.
@@ -158,7 +158,7 @@ jobs:
           # revision still serving. Read from `spec.template`, this job would then report the new
           # sha and go green for a deploy that FAILED, and keep doing so - an alarm quietly
           # certifying the success of the exact event it exists to catch. Resolve the 100%-traffic
-          # revision and read ITS image instead. Found in review, 2026-09-05.
+          # revision and read ITS declared commit instead. Found in review, 2026-09-05.
           #
           # A SPLIT traffic state has no single answer, so it is refused rather than guessed at.
           # That is not hypothetical tidiness: a 0%-traffic candidate left behind by a
@@ -171,27 +171,44 @@ jobs:
           # from inside the VPC. What this job answers is narrower and is the question it was
           # built for: is the commit that is SERVING the one main says it should be.
           live_sha_image(){
-            local svc="$1" rev image tag
+            local svc="$1" rev sha
             rev="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 --format=json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); live=[t["revisionName"] for t in (d.get("status",{}).get("traffic") or []) if t.get("percent")==100 and t.get("revisionName")]; print(live[0] if len(live)==1 else "")' 2>/dev/null || true)"
             if [ -z "$rev" ]; then
               echo "::error::could not resolve a single 100%-traffic revision for '$svc' - the service is" >&2
               echo "::error::either undescribable or its traffic is split. What it serves is unknown." >&2
               return 1
             fi
-            image="$(gcloud run revisions describe "$rev" --project pivota-prod --region us-west1 --format='value(spec.containers[0].image)' 2>/dev/null || true)"
-            [ -n "$image" ] || { echo "::error::could not describe revision '$rev' of '$svc' - what it runs is unknown" >&2; return 1; }
-            tag="${image##*:}"
-            # The tag is about to be handed to `git cat-file` / `git merge-base` as a REVISION
-            # EXPRESSION, so ANY string git can resolve would be accepted as "the live commit".
-            # A moving tag is the realistic way that happens - an image tagged `latest`, or `main`,
-            # resolves against this checkout and the job reports "running main" having compared
-            # production to itself. Demand a full sha, the same check deploy-prod.yml applies to
-            # its dispatch input. A digest ref (`...@sha256:<64hex>`) is refused too: 64, not 40.
-            case "$tag" in
-              ""|*[!0-9a-f]*) echo "::error::'$svc' serves image tag '$tag', which is not a commit sha - refusing to read it as one" >&2; return 1 ;;
+            # PIVOTA_COMMIT_SHA ON THAT REVISION, not its image reference. MEASURED against prod
+            # 2026-09-05: Cloud Run resolves the tag when it creates a revision, so
+            # `spec.containers[0].image` on a REVISION is `...backend@sha256:<64 hex>` - a digest,
+            # never the sha-shaped tag the deploy pushed. Reading it and demanding 40 hex
+            # characters would have refused on every run for both services, turning this alarm
+            # permanently red - which is the crying-wolf failure this file argues at length
+            # against elsewhere, arrived at by way of a correctness fix.
+            #
+            # PIVOTA_COMMIT_SHA is the right answer and not merely a workaround: it is the value
+            # the service DECLARES about itself, the one deploy_worker.sh and deploy_backend.sh
+            # both restamp, and the very same variable that reaches `web`'s /health as
+            # version.full_sha. So all three services end up answering one question through one
+            # value, rather than two services answering a similar question through a different field.
+            sha="$(gcloud run revisions describe "$rev" --project pivota-prod --region us-west1 --format=json 2>/dev/null | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["containers"][0]; print(next((e.get("value","") for e in (c.get("env") or []) if e.get("name")=="PIVOTA_COMMIT_SHA"), ""))' 2>/dev/null || true)"
+            if [ -z "$sha" ]; then
+              echo "::error::revision '$rev' of '$svc' declares no PIVOTA_COMMIT_SHA, so what commit" >&2
+              echo "::error::it runs is unknown. Nothing in Cloud Run injects that variable - the deploy" >&2
+              echo "::error::sets it - so its absence means the revision was created by something that" >&2
+              echo "::error::does not stamp it, and the service cannot be checked against main." >&2
+              return 1
+            fi
+            # It is about to be handed to `git cat-file` / `git merge-base` as a REVISION
+            # EXPRESSION, so ANY string git can resolve would be accepted as "the live commit" -
+            # a value of `HEAD` or `main` would make the job compare production to itself and
+            # report success. Demand a full sha, the same check deploy-prod.yml applies to its
+            # dispatch input.
+            case "$sha" in
+              *[!0-9a-f]*) echo "::error::'$svc' declares PIVOTA_COMMIT_SHA='$sha', which is not a commit sha - refusing to read it as one" >&2; return 1 ;;
             esac
-            [ "${#tag}" = 40 ] || { echo "::error::'$svc' serves image tag '$tag' (${#tag} chars, want 40) - refusing to read it as a commit" >&2; return 1; }
-            printf '%s' "$tag"
+            [ "${#sha}" = 40 ] || { echo "::error::'$svc' declares PIVOTA_COMMIT_SHA='$sha' (${#sha} chars, want 40) - refusing to read it as a commit" >&2; return 1; }
+            printf '%s' "$sha"
           }
 
           # ── THE CLASSIFICATION, UNCHANGED IN SUBSTANCE, NOW APPLIED PER SERVICE ────────────────

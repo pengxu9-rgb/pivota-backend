@@ -137,8 +137,15 @@ def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
         else:
             traffic = f'{{"revisionName":"{live_rev}","percent":100}}'
         svc_cases.append(f'    {svc}) echo \'{{"status":{{"traffic":[{traffic}]}}}}\' ;;')
-        rev_cases.append(f'    {live_rev}) echo "us-west1-docker.pkg.dev/p/p/backend:{serving}" ;;')
-        rev_cases.append(f'    {cand_rev}) echo "us-west1-docker.pkg.dev/p/p/backend:{template}" ;;')
+        # A REVISION carries a DIGEST image plus the commit the deploy stamped on it. Modelling
+        # a sha-shaped image TAG here — which no revision ever has — is what let an earlier fix
+        # look correct while it would in fact have refused on every real run, permanently
+        # reddening the alarm. Measured against prod 2026-09-05.
+        for rev_name, val in ((live_rev, serving), (cand_rev, template)):
+            env = f'{{"name":"PIVOTA_COMMIT_SHA","value":"{val}"}}' if val else ""
+            rev_cases.append(
+                f'    {rev_name}) echo \'{{"spec":{{"containers":[{{"image":"us-west1-docker.pkg.dev/p/p/backend@sha256:'
+                + "d" * 64 + f'","env":[{env}]}}]}}}}\' ;;')
 
     gcloud = binn / "gcloud"
     gcloud.write_text(
@@ -343,6 +350,20 @@ def test_an_image_tag_that_is_not_a_commit_sha_is_refused(tmp_path, tag):
     head = _commit(root, "services/app.py", "v1\n", age_minutes=600)
     code, out = _run_drift(tmp_path, root, web=head, images={"worker": tag, "proof-issuer": head})
     assert code != 0, f"image tag {tag!r} was read as a commit and the job went green:\n{out}"
+    assert "worker" in out
+
+
+def test_a_revision_that_declares_no_commit_is_refused(tmp_path):
+    """Nothing in Cloud Run injects PIVOTA_COMMIT_SHA — the deploy scripts set it. Its absence
+    means the revision was created by something that does not stamp it, so what commit it runs
+    is genuinely unknown, and unknown must not read as fine. This is also the guard that keeps
+    the alarm honest about its own mechanism: an empty value would otherwise be compared
+    against main as a revision expression."""
+    root = _repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    code, out = _run_drift(tmp_path, root, web=head, images={"worker": "", "proof-issuer": head})
+    assert code != 0, f"a revision declaring no commit must be refused:\n{out}"
     assert "worker" in out
 
 
