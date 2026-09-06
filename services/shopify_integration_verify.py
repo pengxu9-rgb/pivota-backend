@@ -108,6 +108,15 @@ async def register_webhooks_best_effort(
     Best-effort REST webhook registration.
     Shopify REST create is not strictly idempotent; we treat 201 as created and 422(address taken) as already exists.
     """
+    # Pinned HERE, at the helper, so every caller is covered rather than each remembering.
+    # verify_shopify_integration already pins before calling in; the two ops routes did not, and one
+    # of them sweeps every active store, so a single bad row was exercised by a routine ops action.
+    # Unlike the caller-side canonicalisation this replaces, a port cannot survive this.
+    pinned = normalize_myshopify_domain(shop_domain)
+    if not pinned:
+        raise ValueError("shop domain is not a *.myshopify.com host")
+    shop_domain = pinned
+
     url = WEBHOOKS_CREATE_REST.format(shop_domain=shop_domain, api_version=api_version)
     headers = {"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"}
 
