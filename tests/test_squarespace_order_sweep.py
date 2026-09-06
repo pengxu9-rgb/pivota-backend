@@ -526,3 +526,75 @@ async def test_the_oauth_token_is_preferred_for_the_list_read(monkeypatch):
     # Squarespace answers 400 to a request with no User-Agent; it is required,
     # not a courtesy.
     assert captured["User-Agent"]
+
+
+# ---- the fetch layer's own guard -------------------------------------------
+#
+# The sweep passes `modified_after=None` on every page after the first, so the
+# fetch layer's own exclusivity check never sees the conflicting pair through
+# that caller — an upstream guard makes a downstream one untestable. These
+# drive `fetch_squarespace_order_page` directly so the second guard is
+# independently killable, which matters because it is the one that decides what
+# actually goes on the wire.
+
+
+async def test_the_fetch_layer_sends_the_cursor_alone_even_if_handed_bounds():
+    from services.squarespace_order_fetch import fetch_squarespace_order_page
+
+    client = _FakeClient([_page([])])
+
+    await fetch_squarespace_order_page(
+        access_token="t",
+        modified_after=_iso(NOW - timedelta(days=1)),
+        modified_before=_iso(NOW),
+        cursor="cur-2",
+        client=client,
+    )
+
+    assert client.requests[0]["params"] == {"cursor": "cur-2"}
+
+
+async def test_the_fetch_layer_refuses_a_half_specified_window():
+    """`modifiedAfter` and `modifiedBefore` are a pair. One without the other
+    is rejected by Squarespace, and a silently-dropped bound would turn a
+    30-minute window into the whole of history."""
+    from services.squarespace_order_fetch import (
+        SquarespaceOrderFetchError,
+        fetch_squarespace_order_page,
+    )
+
+    for after, before in (
+        (_iso(NOW - timedelta(days=1)), None),
+        (None, _iso(NOW)),
+        (None, None),
+    ):
+        with pytest.raises(SquarespaceOrderFetchError):
+            await fetch_squarespace_order_page(
+                access_token="t",
+                modified_after=after,
+                modified_before=before,
+                client=_FakeClient([_page([])]),
+            )
+
+
+async def test_the_fetch_layer_stops_when_no_next_cursor_is_returned():
+    """The continuation signal is the CURSOR, not `hasNextPage`: the cursor is
+    what the next request needs, and gating on the boolean alone would truncate
+    a sweep if the envelope stopped sending that flag."""
+    from services.squarespace_order_fetch import fetch_squarespace_order_page
+
+    page = await fetch_squarespace_order_page(
+        access_token="t",
+        modified_after=_iso(NOW - timedelta(days=1)),
+        modified_before=_iso(NOW),
+        client=_FakeClient([{"result": [], "pagination": {"hasNextPage": True}}]),
+    )
+    assert page.next_cursor is None
+
+    page = await fetch_squarespace_order_page(
+        access_token="t",
+        modified_after=_iso(NOW - timedelta(days=1)),
+        modified_before=_iso(NOW),
+        client=_FakeClient([{"result": [], "pagination": {"nextPageCursor": "c"}}]),
+    )
+    assert page.next_cursor == "c"
