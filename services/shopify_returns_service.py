@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from services.shopify_domain import normalize_myshopify_domain
 from services.shopify_graphql_client import shopify_admin_graphql
 from services.shopify_graphql_client import ShopifyGraphQLError
 from services.return_records_service import upsert_shopify_return_record_best_effort
@@ -271,6 +272,21 @@ async def probe_shopify_return_eligibility_best_effort(
     shopify_order_id: str,
     returns_first: int = 5,
 ) -> Dict[str, Any]:
+    # Same pin, same reason, same refuse-by-returning contract as sync_shopify_returns_best_effort
+    # below. routes/agent_commerce.py hands this the raw column immediately after the sync call, so
+    # pinning only the sync would have left the sibling open in the same handler.
+    pinned = normalize_myshopify_domain(shop_domain)
+    if not pinned:
+        logger.warning(
+            "Shopify return-eligibility probe refused: stored domain is not a *.myshopify.com host"
+        )
+        return {
+            "ok": False,
+            "reason": "domain_not_a_myshopify_host",
+            "shopify_order_id": str(shopify_order_id or "").strip(),
+        }
+    shop_domain = pinned
+
     versions_to_try: List[str] = []
     try:
         versions_to_try = [str(api_version).strip()] if api_version else []
@@ -419,7 +435,34 @@ async def sync_shopify_returns_best_effort(
     """
     Best-effort pull of latest returns via Admin GraphQL and upsert into return_records.
     Useful when webhooks aren't available/enabled yet.
+
+    The host is pinned HERE rather than at each caller. Four callers pass a domain read straight out
+    of merchant_stores -- readiness/service.py, routes/agent_commerce.py, routes/merchant_risk_api.py
+    and routes/ops_shopify_integration_routes.py -- and three of them passed the RAW column together
+    with the raw api_key column as the token, so every Admin GraphQL call below went to whatever
+    host that row named, carrying a live credential.
+
+    IT REFUSES BY RETURNING, NOT BY RAISING, and that is not a stylistic choice: readiness and
+    agent_commerce call this with no exception handling at all, so a raise would turn a recoverable
+    miss into an unhandled 500. `{"ok": False}` is the shape this module already uses for failure.
     """
+    pinned = normalize_myshopify_domain(shop_domain)
+    if not pinned:
+        # The domain is deliberately not echoed: it is untrusted text, and merchant_id names the row.
+        logger.warning(
+            "Shopify returns sync refused: stored domain is not a *.myshopify.com host merchant=%s",
+            merchant_id,
+        )
+        return {
+            "ok": False,
+            "reason": "domain_not_a_myshopify_host",
+            "fetched": 0,
+            "upserted": 0,
+            "graphql_attempts": None,
+            "attempted_api_versions": [],
+        }
+    shop_domain = pinned
+
     graphql_attempts: List[Dict[str, Any]] = []
     graphql_orders_fallback_attempts: List[Dict[str, Any]] = []
     versions_to_try: List[str] = []

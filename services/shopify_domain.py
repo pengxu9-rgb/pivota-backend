@@ -31,22 +31,24 @@ Several credential-sending sites are still unpinned. This list is what a later s
 keeping it accurate matters in BOTH directions — a fixed file left on it wastes the next reader's
 time, and a missing one is how a site survives the sweep entirely:
 
-  * `services/shopify_products_sync.py`, `readiness/service.py`, `jobs/catalog_import_worker.py`,
-    `routes/agent_products.py`, `routes/merchant_api_extensions.py`
-  * `routes/merchant_risk_api.py` and `routes/agent_commerce.py` — both pass a RAW
-    `merchant_stores.domain` and the raw `api_key` column into `sync_shopify_returns_best_effort`,
-    which is a byte-twin of the `/returns/sync` pinned in `ops_shopify_integration_routes.py`.
-    `agent_commerce.py` separately hands the raw host to
-    `probe_shopify_return_eligibility_best_effort`.
+  * `services/shopify_products_sync.py` — reached from the `products/*` webhook background task
+  * `jobs/catalog_import_worker.py`, `routes/agent_products.py`,
+    `routes/merchant_api_extensions.py`
+  * `readiness/service.py` — its ORDER and TRANSACTION senders only; its returns calls are covered
+    by the helper pin below
+  * `services/shopify_transactions_service.py`, and the inline-httpx tail in
+    `routes/admin_debug_shopify_token.py`, `routes/manage_integrations.py`, `routes/order_routes.py`
 
-`routes/ops_shopify_integration_routes.py` came OFF this list when its four network-touching routes
-were pinned.
+Came OFF this list once pinned: `routes/ops_shopify_integration_routes.py` (all four
+network-touching routes), and the whole RETURNS family — `routes/merchant_risk_api.py`,
+`routes/agent_commerce.py` and `readiness/service.py`'s returns calls — closed by pinning
+`sync_shopify_returns_best_effort` and `probe_shopify_return_eligibility_best_effort` themselves.
 
-The right fix for the returns family is the helper, not its callers — but
-`sync_shopify_returns_best_effort` cannot simply raise: `readiness/service.py:1200` and
-`routes/agent_commerce.py:511` call it with no exception handling, so a raise there turns a
-recoverable miss into a 500. It needs to refuse in its own best-effort return shape, which is why it
-is a separate change rather than a line in this one.
+That returns pin REFUSES BY RETURNING `{"ok": False}`, not by raising, because
+`readiness/service.py:1200` and `routes/agent_commerce.py:511` call those helpers with no exception
+handling — a raise there converts a recoverable miss into an unhandled 500. Any further helper pin
+in this sweep has to answer the same question about its own callers before choosing a refusal
+channel.
 """
 
 from __future__ import annotations
