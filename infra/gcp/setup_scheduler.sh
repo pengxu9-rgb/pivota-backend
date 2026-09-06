@@ -249,6 +249,23 @@ print("true" if flag and secret else "false")
   require_service_account "$COMMERCE_CRAWL_SA"
   require_service_account "$COMMERCE_SELECTOR_SA"
   require_service_account "$COMMERCE_SCHEDULER_SA"
+  # The browser image is built SEPARATELY from the gateway, and only for some shas — so
+  # `store-audit-browser:$GATEWAY_TAG` frequently does not exist for the tag being reconciled.
+  # Cloud Run pins a DIGEST at job-creation time, so the live job keeps running happily on a
+  # tag that has since been deleted; `run jobs update` re-resolves the tag and dies:
+  #
+  #   ERROR: (gcloud.run.jobs.update) Image '…/store-audit-browser:<gateway-sha>' not found.
+  #
+  # Observed 2026-08-27: only 4 tags exist in that repo, the live job references a fifth, and
+  # the reconcile died here — at the SEVENTEENTH block, after mutating sixteen. Checked in the
+  # preflight instead, with the other Store Audit validation, so an absent image is a refusal
+  # BEFORE anything is touched rather than a half-applied run.
+  have "$GCLOUD" artifacts docker images describe "$BROWSER_AUDIT_IMAGE" \
+    || { echo "store-audit-browser image not found for this gateway tag: $BROWSER_AUDIT_IMAGE" >&2
+         echo "  build it for <gateway-sha>, or re-run with a GATEWAY_TAG that has one. Existing tags:" >&2
+         "$GCLOUD" artifacts docker tags list "$REGION-docker.pkg.dev/pivota-shared/pivota/store-audit-browser" \
+           --format='value(tag)' 2>/dev/null | sed 's/^/    /' >&2
+         exit 2; }
 fi
 
 # ---------------------------------------------------------------- 1. the single-instance worker
