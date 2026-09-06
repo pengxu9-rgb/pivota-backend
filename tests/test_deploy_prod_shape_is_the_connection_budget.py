@@ -225,9 +225,16 @@ def test_an_override_reaches_the_deploy_when_it_is_given(tmp_path: Path) -> None
     """The counterpart, and the reason the test above is not vacuous: the mechanism has to
     actually work, or `web` is 'safe' only because the flags do nothing and proof-issuer is
     being silently reshaped after all."""
+    # EVERY VALUE HERE MUST DIFFER FROM THE PROD CONSTANT IT OVERRIDES, or the case cannot
+    # tell a plumbed flag from an unplumbed one. Measured: with CPU_LIMIT=2 against the prod
+    # constant CPU=2, deleting the override entirely still produced `--cpu 2` and this test
+    # passed. prod is MIN=2 MAX=10 CPU=2 MEM=4Gi CONCURRENCY=20, so none of these may repeat
+    # those. They are deliberately NOT proof-issuer's real values — that is the job of
+    # test_the_proof_issuer_deploy_pins_the_shape_it_is_not_allowed_to_change; this case is
+    # only asking whether an override reaches gcloud at all.
     argv = _deploy_argv(tmp_path, "prod", {
-        "CONCURRENCY_LIMIT": "80", "MAX_INSTANCES": "20",
-        "CPU_LIMIT": "2", "MEMORY_LIMIT": "4Gi",
+        "CONCURRENCY_LIMIT": "80", "MAX_INSTANCES": "20", "MIN_INSTANCES": "3",
+        "CPU_LIMIT": "4", "MEMORY_LIMIT": "8Gi",
         # The preserve-mode pool guard multiplies the LIVE pool by the maxScale this deploy
         # would apply, and the shim reports a live pool. 20 instances trips the default
         # budget, which is correct behaviour and not what this case is measuring.
@@ -236,8 +243,8 @@ def test_an_override_reaches_the_deploy_when_it_is_given(tmp_path: Path) -> None
     # ALL of them. Asserting only two left --cpu and --memory unplumbed-and-unnoticed; they
     # are harmless today only because proof-issuer's values coincide with web's constants,
     # which the workflow's own comment calls a coincidence. Found by a mutation audit.
-    for flag, want in (("--concurrency", "80"), ("--max-instances", "20"), ("--cpu", "2"),
-                       ("--memory", "4Gi"), ("--min-instances", "2")):
+    for flag, want in (("--concurrency", "80"), ("--max-instances", "20"), ("--cpu", "4"),
+                       ("--memory", "8Gi"), ("--min-instances", "3")):
         assert _flag(argv, flag) == want, (
             f"the override for {flag} did not reach the deploy (got {_flag(argv, flag)!r}, "
             f"want {want!r}): {argv}"
