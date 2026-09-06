@@ -346,6 +346,9 @@ _TELEMETRY_ROUTE_FILES = {
     Path("routes/squarespace_webhooks.py"): {
         "receive_squarespace_webhook": ("squarespace_webhook", "platform")
     },
+    Path("routes/webflow_webhooks.py"): {
+        "receive_webflow_webhook": ("webflow_webhook", "platform")
+    },
     Path("routes/shopline_family_webhooks.py"): {
         "receive_shopline_webhook": ("shopline_webhook", "platform"),
         "receive_shoplazza_webhook": ("shoplazza_webhook", "platform"),

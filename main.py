@@ -386,6 +386,7 @@ from routes.woocommerce_webhooks import router as woocommerce_webhooks_router
 from routes.bigcommerce_webhooks import router as bigcommerce_webhooks_router
 from routes.wix_webhooks import router as wix_webhooks_router
 from routes.squarespace_webhooks import router as squarespace_webhooks_router
+from routes.webflow_webhooks import router as webflow_webhooks_router
 from routes.sfcc_integration import router as sfcc_integration_router
 from routes.sfcc_events import router as sfcc_events_router
 from routes.prestashop_webhooks import router as prestashop_webhooks_router
@@ -1318,6 +1319,7 @@ app.include_router(woocommerce_webhooks_router)  # Signed WooCommerce order life
 app.include_router(bigcommerce_webhooks_router)  # Header-authenticated BigCommerce order lifecycle events
 app.include_router(wix_webhooks_router)  # JWT-verified Wix eCom order + transaction events (static, app-level)
 app.include_router(squarespace_webhooks_router)  # HMAC-signed Squarespace order notifications (OAuth-connected sites only)
+app.include_router(webflow_webhooks_router)  # Webflow Ecommerce order triggers, authenticated by a per-store URL secret (+ signature when an OAuth app is configured)
 app.include_router(sfcc_integration_router)  # Salesforce B2C Commerce SCAPI catalog adapter
 app.include_router(sfcc_events_router)  # Signed SFCC cartridge order/cart/payment events
 app.include_router(prestashop_webhooks_router)  # Signed PrestaShop module order/refund events (no native webhooks)

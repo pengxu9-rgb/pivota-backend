@@ -29,6 +29,46 @@ _SENSITIVE_QUERY_KEYS = {
 }
 
 
+# Routes whose URL *PATH* carries a shared secret, as `(prefix, segments_to_keep)`.
+#
+# Query-string redaction above is not enough for these: a receiver that cannot
+# rely on the platform signing its deliveries authenticates them with a secret
+# baked into the path itself, and this middleware logs `path` verbatim on EVERY
+# request — so without this the credential lands in the INFO line of every
+# delivery and in the WARNING line of every refusal.
+#
+# `segments_to_keep` counts the path segments AFTER the prefix that are safe to
+# keep (for `/webhooks/webflow/{store_id}/{url_secret}` that is 1: the store id,
+# which is already in every other log line this repo writes). Everything past
+# them becomes `[REDACTED]`. A future path-secret route registers its prefix
+# here rather than growing a second redaction rule somewhere else.
+_PATH_SECRET_PREFIXES = (
+    ("/webhooks/webflow", 1),
+)
+
+
+def redact_path(path: str) -> str:
+    """A request path safe to log: trailing path-secret segments removed.
+
+    Anchored with `startswith(prefix + "/")` rather than a substring test, so a
+    route that merely CONTAINS one of these prefixes is untouched, and a path
+    shorter than the prefix's kept segments is returned unchanged rather than
+    reshaped into something that never existed.
+    """
+    raw = str(path or "")
+    for prefix, keep in _PATH_SECRET_PREFIXES:
+        if raw == prefix or raw.startswith(prefix + "/"):
+            rest = raw[len(prefix):].strip("/")
+            if not rest:
+                return raw
+            segments = rest.split("/")
+            if len(segments) <= keep:
+                return raw
+            hidden = ["[REDACTED]"] * (len(segments) - keep)
+            return "/".join([prefix, *segments[:keep], *hidden])
+    return raw
+
+
 def _sha256_16(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
@@ -106,7 +146,7 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
                 "timestamp": datetime.utcnow().isoformat(),
                 "request_id": request_id,
                 "method": request.method,
-                "path": request.url.path,
+                "path": redact_path(request.url.path),
                 "query_params": _redact_query_params(dict(request.query_params)) if request.query_params else None,
                 "status_code": status_code,
                 "duration_ms": duration_ms,
@@ -171,7 +211,7 @@ class RequestResponseLoggingMiddleware(BaseHTTPMiddleware):
             "timestamp": datetime.utcnow().isoformat(),
             "type": "request",
             "method": request.method,
-            "path": request.url.path,
+            "path": redact_path(request.url.path),
             "headers": headers,
         }
         

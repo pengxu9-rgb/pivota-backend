@@ -298,6 +298,137 @@ is **no OAuth refresh path**: reads fall back from a short-lived OAuth token to
 the per-site API key on 401, so a store holding both keeps working and a store
 holding only a token goes dark until it is reconnected.
 
+## Webflow native bridge (webhook + reconciliation sweep)
+
+Webflow is the first platform here where **the platform signs only SOME of its
+own deliveries**. A webhook created by an OAuth App is signed with that App's
+client secret; one created with a Site API token — how a merchant connects a
+single site without Pivota shipping a Webflow app — is delivered UNSIGNED. So the
+receiver has two layers:
+
+* **always**, a 256-bit per-store secret minted at provisioning and embedded in
+  the webhook URL path (`POST /webhooks/webflow/{store_id}/{url_secret}`),
+  compared constant-time AS BYTES (encoded with `surrogatepass`) — Starlette
+  decodes path segments as text, `hmac.compare_digest` raises on non-ASCII, and
+  a plain UTF-8 encode raises on the lone surrogate `json.loads` will happily
+  produce from a body, so either would otherwise be a 500. The secret is a PATH
+  segment, so `middleware/structured_logging.py::redact_path` keeps it out of the
+  access log — but nothing here can keep it out of an upstream load balancer's
+  request log, which is the honest reason to configure `WEBFLOW_CLIENT_SECRET`
+  wherever an OAuth app exists;
+* **when `WEBFLOW_CLIENT_SECRET` is configured**, the `x-webflow-signature`
+  header, verified as HMAC-SHA256 over `"{timestamp}:{raw body}"` inside a
+  5-minute skew window. Absent that env var the layer is skipped, and the doc
+  says so rather than implying a signature nobody is checking.
+
+Both write paths (`webflow_webhook`, `webflow_reconciliation`) carry authority
+`platform` and may assert only `platform_asserted`. They must: a store whose
+`webhooks/ensure` has not been run has only the sweep, and filing its orders
+below an identical provisioned store's would make a merchant's standing depend on
+whether somebody clicked provision.
+
+**MONEY IS ALREADY IN MINOR UNITS.** A Webflow money object is
+`{"unit": "USD", "value": 5898, "string": "$58.98"}` — the currency is `unit`,
+and `value` is an integer number of cents. `services/webflow_event_adapter.py`
+therefore does NO conversion, and there is no zero-decimal-currency table. That
+last part is an ASSUMPTION rather than a consequence (row 22): it holds only if
+Webflow states JPY/KRW/VND in those currencies' own minor units rather than in
+hundredths, which no order this repo has seen proves. The mapper logs a WARNING
+on the first order per process per zero-decimal currency so the first one is
+visible rather than 100x inflated in silence. A `value` it cannot read as whole
+minor units
+(a decimal string, a fractional float, a negative) is a LOUD
+`WebflowMoneyFormatError`: a silent skip under-counts, but a misread over-counts
+by 100x, and only one of those is visible in a total.
+
+**REFUNDS ARE FULL-ORDER ONLY, so this bridge has no money lock at all.**
+Shoplazza and Squarespace hold `order_money_read_modify_write_lock` because their
+refund figure is cumulative and the amount to record is a delta against what
+Pivota already stored — a read-modify-write, and a raced pair inflates refunded
+GMV. Webflow has one refund per order for the whole `customerPaid`, so two
+concurrent observations emit the IDENTICAL row under one deterministic key and
+first-write-wins collapses them. `tests/test_webflow_ledger.py` asserts the lock
+and the baseline read are absent, so adopting the delta machinery (if partial
+refunds ever ship) is a deliberate change rather than a drift.
+
+`dispute-lost` is mapped as `refund.succeeded` for the full amount under the SAME
+key as an ordinary refund, `<orderId>:refund`. The statuses are mutually exclusive
+at any instant but an order can MOVE between them, and two keys would record the
+same money out twice — the funnel sums refund rows. `disputed` (funds held) emits
+no money event: recording one and never correcting it if the dispute is WON would
+invent a refund. And the PSP's `stripeDetails.refundId` is METADATA, never the
+key: it is present for Stripe and absent for PayPal, so keying on it would give
+one refund two rows across observations that disagree about whether it is there.
+
+A `refunded`/`dispute-lost` order whose `customerPaid` is absent or `0` records
+`order.created` anyway and reports the missing refund as the named reason
+`refund_amount_unreadable` (counted as `refunds_unreadable`, logged at WARNING).
+Raising there dropped the whole batch, which 422'd the receiver — and Webflow
+retries a 422 into the same 422, so the order never landed at all.
+
+**Webflow has no cancelled state and none is invented.** `pending` is the unpaid
+state, so it emits `order.created` alone and a later `ecomm_order_changed` (or
+the sweep) adds `order.paid` beside the same created row.
+
+**THE ORDERS LIST HAS NO MODIFIED-SINCE FILTER AND NO DOCUMENTED ORDERING.**
+`GET /v2/sites/{id}/orders` takes `status`, `offset`, `limit` and nothing else, so
+the sweep is a resumable offset walk in three lanes: unfiltered anchored on
+`acceptedOn`, `status=refunded` anchored on `refundedOn`, and `status=dispute-lost`
+anchored on the dispute timestamps. The money-out lanes exist because
+`acceptedOn` never moves, so a refund of a year-old order would sit below any
+cursor the orders lane had passed. A lane whose status filter Webflow rejects
+fails ALONE and is reported.
+
+The early stop rests on the list arriving newest-first, which Webflow does not
+document — so it is **armed only by a previous COMPLETE pass that observed
+non-increasing anchors**, and disarmed by any observed violation. Checking only
+within the run is not enough: a run whose first page happened to be entirely below
+the threshold would stop there having seen a clean two-row prefix and never reach
+the out-of-order row below it. A truncated pass cannot arm it either — a violation
+is proof, "no violation" is only proof when the whole list was read.
+
+And it applies to the unfiltered lane ALONE: the money-out lanes anchor on
+timestamps the list is not sorted by, so judging them reported a violation on
+nearly every store every run and buried the one signal that matters. They are
+never armed and never judged, walking their short filtered list in full.
+`ordering_applicable`, `ordering_verified` and `early_stop_armed` are reported per
+lane per run.
+
+A lane stopped by the page cap does not advance its cursor and records the OFFSET
+it reached; the next run RESUMES there rather than re-reading the same prefix
+forever. Resuming is safe in the direction that matters under either plausible
+ordering: newest-first it re-reads (deterministic ids dedupe), oldest-first it is
+exact.
+
+Each run also proves its credential names **this store's own site** (one
+`GET /v2/sites/{site_id}`) before listing anything, and the order fetch URL
+carries that site id, so an order belonging to another site cannot be read
+through this store's credential even if a delivery names one.
+
+**Provisioning writes the secret BEFORE it registers the URL that carries it.**
+A crash between the two leaves a stored secret and no webhook — harmless ON FIRST
+PROVISIONING, fixed by re-running. The opposite order would leave Webflow
+delivering to a URL whose secret was never stored, and the receiver would 401
+every one forever. A ROTATION inverts that: the store already had a working
+webhook, so a failed registration leaves the live one on the old secret while the
+new one is stored, and every delivery 401s — the route therefore restores the
+superseded secret when a rotation's registration fails. Webhooks are created
+before stale ones are deleted, and "stale" means a URL that STARTS WITH one of
+OUR OWN prefixes for this store — anchored, not a substring test, because the
+answer to a match is DELETE and another integration's redirector could contain
+our URL.
+
+**Nothing schedules the sweep.** CI deploys no Cloud Run job for the lane and the
+APScheduler lane runs on a service that is not auto-deployed, so it ships as an
+authenticated route (`POST /integrations/webflow/{store_id}/reconcile`) and a
+script (`scripts/sweep_webflow_orders.py`, dry run by default). That gap is
+documented rather than papered over, and it matters more here than elsewhere
+because Webflow webhooks are best-effort.
+
+`docs/WEBFLOW_TELEMETRY.md` carries the full flow, the 22-row verified/assumed
+table — including the two load-bearing rows: that money `value` is minor units,
+and that refunds are full-order only — and the residual gaps.
+
 ## Wix native webhook bridge
 
 `POST /webhooks/wix` is the first **static** native bridge with no store id in
@@ -661,7 +792,7 @@ or whether a row is a probe.
 
 | Column | Values | Set by |
 | --- | --- | --- |
-| `write_path` | batch ingress: `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `bigcommerce_webhook`, `wix_webhook`, `shopline_webhook`, `shoplazza_webhook`, `squarespace_webhook`, `squarespace_reconciliation`, `sfcc_cartridge`, `prestashop_module`, `adobe_io_events`, `stripe_webhook`; first-party writers: `agent_commerce_api`, `surface_click_attribution`, `commerce_attribution_edge`, `surface_listing_registry` | the route or service that verified the request |
+| `write_path` | batch ingress: `merchant_hmac_batch`, `universal_web_collector`, `shopify_web_pixel`, `shopify_webhook`, `cafe24_webhook`, `cafe24_reconciliation`, `woocommerce_webhook`, `bigcommerce_webhook`, `wix_webhook`, `shopline_webhook`, `shoplazza_webhook`, `squarespace_webhook`, `squarespace_reconciliation`, `webflow_webhook`, `webflow_reconciliation`, `sfcc_cartridge`, `prestashop_module`, `adobe_io_events`, `stripe_webhook`; first-party writers: `agent_commerce_api`, `surface_click_attribution`, `commerce_attribution_edge`, `surface_listing_registry` | the route or service that verified the request |
 | `authority` | `observational` (browser), `merchant` (HMAC collector), `platform` (native signed webhook, reconciliation replay), `psp` (Stripe bridge), `pivota` (first-party checkout, attribution, and listing facts) | derived from `write_path` on the server |
 | `agent_identity_confidence` | `unknown` < `browser_observed` < `merchant_asserted` < `platform_asserted` < `verified` | fixed per `write_path`; a mismatched pair is refused |
 | `synthetic` | boolean, default false | `true` when the batch says `"synthetic": true` or the event surface is `ops_canary` |
