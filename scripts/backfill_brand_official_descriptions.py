@@ -21,9 +21,11 @@ left untouched and reported — they stay draft honestly.
 such a row: the product's own PDP meta description. Measured on jsmbeauty.sg
 2026-09-06, 158 of 232 products publish under 50 chars of body_html text while
 their PDPs carry 150-340 chars. It costs one merchant-host request per
-already-skipped row, which is why it is not the default, and it refuses the
-theme's store blurb (see description_from_pdp_html). Rows filled this way are
-recorded under REFRESH_SOURCE_PDP_META, not the body_html source. Anything still
+already-skipped row (plus one per domain for the shop blurb), which is why it is
+not the default. Meta copy that is storefront-wide boilerplate rather than this
+product's description -- the theme's shop blurb, an app vendor's operational text
+-- is dropped by drop_shared_boilerplate and those rows stay blocked. Rows filled
+this way are recorded under REFRESH_SOURCE_PDP_META, not the body_html source. Anything still
 empty after that routes to the LLM enrichment lane, as before.
 
 Dry-run (default): report per-domain fill/skip counts, write nothing.
@@ -42,8 +44,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
-from typing import Any, Dict, List
+from collections import Counter
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -56,6 +60,7 @@ from services.catalog_enrichment_agent.bulk_writer import is_transport_error  # 
 from services.curated_brand_feed import (  # noqa: E402
     body_html_to_text,
     fetch_pdp_description,
+    fetch_shop_description,
     fetch_shopify_products,
 )
 from services.pdp_lifecycle import compute_lifecycle_stage  # noqa: E402
@@ -152,6 +157,51 @@ async def _load_body_map(domain: str, max_products: int) -> Dict[str, str]:
     }
 
 
+def _norm_copy(value: str) -> str:
+    """Compare copy the way a reader would: case- and whitespace-insensitively."""
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def drop_shared_boilerplate(
+    candidates: Dict[str, str], shop_blurb: Optional[str] = None
+) -> Dict[str, str]:
+    """Keep only the PDP meta descriptions that are about ONE product. Pure; no I/O.
+
+    WHY A WHOLE-DOMAIN DECISION. Body copy from /products.json is per-product by construction.
+    PDP meta copy is not: two different mechanisms put the same string on many PDPs at once, and
+    neither is detectable in a single page's markup.
+
+      1. THE SHOP BLURB. A theme renders og:description as
+         `page_description | default: shop.description`, so a product with no SEO description
+         serves the storefront's own blurb. Caught by exact comparison against
+         `fetch_shop_description`.
+      2. APP-VENDOR TEXT. Apps write operational strings into the name tag —
+         "This product is used for the app BOGOS.io ... Please do not delete/edit it". 231
+         characters, comfortably over the floor, and on 5 of 5 sampled jsmbeauty.sg products.
+         No shop-blurb comparison can catch it; repetition can.
+
+    So the rule is repetition itself: a value that is byte-identical (modulo case and
+    whitespace) to ANOTHER product's on the same storefront is not that product's description,
+    whatever produced it. Measured over 59 accepted values on 10 storefronts 2026-09-06, 19
+    (32%) were shared with a sibling.
+
+    Dropping is the SAFE direction. A rejected row keeps its existing description and stays
+    blocked — exactly where it was — and routes to the LLM enrichment lane, whereas a false
+    ACCEPT auto-publishes boilerplate as brand-official copy (`is_published_ready`). A genuine
+    description shared verbatim by two products is a false reject we take knowingly.
+
+    A single candidate for a domain has no repetition signal; only the shop-blurb comparison
+    guards it, which is why that fetch is worth its one request.
+    """
+    counts = Counter(_norm_copy(v) for v in candidates.values())
+    blurb = _norm_copy(shop_blurb)
+    return {
+        pk: v
+        for pk, v in candidates.items()
+        if counts[_norm_copy(v)] == 1 and not (blurb and _norm_copy(v) == blurb)
+    }
+
+
 async def resolve_description(
     body: str,
     domain: str,
@@ -224,13 +274,23 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
           f"across {len(by_domain)} domain(s)  (apply={apply})")
 
     totals = {"filled": 0, "published": 0, "validated": 0, "no_body": 0, "from_pdp": 0,
-              "not_in_feed": 0, "update_failed": 0, "refresh_failed": 0}
-    touched_cks: List[str] = []
+              "not_in_feed": 0, "boilerplate": 0, "update_failed": 0, "refresh_failed": 0}
+    # content_key -> did ANY row behind it come from PDP meta. A flat list cannot carry this:
+    # the refresh runs in its own loop below, and an earlier version read a LEAKED `r` from the
+    # fill loop there, stamping every key with the last row of the last domain's provenance.
+    touched_cks: Dict[str, bool] = {}
 
     for domain in sorted(by_domain):
         drows = by_domain[domain]
         body_map = await _load_body_map(domain, max_products)
-        filled = no_body = not_in_feed = from_pdp = 0
+        filled = no_body = not_in_feed = from_pdp = boilerplate = 0
+
+        # PASS 1 — DECIDE, writing nothing. Body copy could be written as it is resolved, but PDP
+        # meta copy cannot: whether a value is this product's description or storefront-wide
+        # boilerplate is only answerable once every candidate for the domain is in hand
+        # (drop_shared_boilerplate). So both take the same two-pass route.
+        resolved: Dict[str, str] = {}    # product_key -> body copy
+        candidates: Dict[str, str] = {}  # product_key -> PDP meta copy, still suspect
         for r in drows:
             body = body_map.get(r["_handle"])
             if body is None:
@@ -242,8 +302,22 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
             if body is None:
                 no_body += 1
                 continue
+            (candidates if from_pdp_row else resolved)[str(r["product_key"])] = body
+
+        if candidates:
+            kept = drop_shared_boilerplate(candidates, await fetch_shop_description(domain))
+            boilerplate = len(candidates) - len(kept)
+            totals["boilerplate"] += boilerplate
+            candidates = kept
+
+        # PASS 2 — WRITE.
+        for r in drows:
+            pk = str(r["product_key"])
+            from_pdp_row = pk in candidates
+            body = candidates.get(pk) if from_pdp_row else resolved.get(pk)
+            if body is None:
+                continue
             if from_pdp_row:
-                r["_from_pdp"] = True
                 from_pdp += 1
             new_row = {**r, "description": body}
             new_stage = compute_lifecycle_stage(new_row)
@@ -258,7 +332,11 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
                             "product_key": r["product_key"],
                         })
                         if r.get("content_key"):
-                            touched_cks.append(str(r["content_key"]))
+                            ck_w = str(r["content_key"])
+                            # Several product_keys can share one content_key. If ANY contributing
+                            # row was filled from PDP meta, the view's copy may be meta copy, so
+                            # the marker has to say so — OR, never overwrite.
+                            touched_cks[ck_w] = touched_cks.get(ck_w, False) or from_pdp_row
                         break
                     except Exception as exc:  # noqa: BLE001 — heal a poisoned
                         # connection and retry once; a bad row must not abort
@@ -276,17 +354,17 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
         totals["not_in_feed"] += not_in_feed
         print(f"  {domain:22s} rows={len(drows):4d} feed={len(body_map):4d} "
               f"fill={filled:4d} empty_body={no_body:3d} not_in_feed={not_in_feed:3d} "
-              f"from_pdp={from_pdp:3d}")
+              f"from_pdp={from_pdp:3d} boilerplate={boilerplate:3d}")
 
     if apply and touched_cks:
-        distinct = sorted(set(touched_cks))
+        distinct = sorted(touched_cks)
         print(f"[view] refreshing {len(distinct)} content_key view(s) ...")
         for ck in distinct:
             for attempt in (1, 2):
                 try:
                     await refresh_agent_pdp_view_for_content_key(
                         ck,
-                        refresh_source=(REFRESH_SOURCE_PDP_META if r.get("_from_pdp")
+                        refresh_source=(REFRESH_SOURCE_PDP_META if touched_cks[ck]
                                        else REFRESH_SOURCE),
                     )
                     break

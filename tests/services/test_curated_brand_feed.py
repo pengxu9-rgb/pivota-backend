@@ -1286,6 +1286,11 @@ def test_the_per_product_name_tag_wins_over_the_theme_generated_og_one():
     The og tag is frequently theme-generated; `name="description"` is the per-product SEO field a
     merchant fills. Measured live on kyliecosmetics.com: og carried the STORE blurb while name
     carried the product's own line, so preferring og took the strictly worse string on a real page.
+
+    This asserts the PREFERENCE only. The name value here is a thin brand+title echo, and calling
+    it good copy would over-claim -- but it is at least about this product, where the og value is
+    about the shop. Storefront-wide strings that reach the name tag (an app vendor's operational
+    text, say) are dropped downstream by repetition, not here.
     """
     from services.curated_brand_feed import description_from_pdp_html
 
@@ -1296,18 +1301,20 @@ def test_the_per_product_name_tag_wins_over_the_theme_generated_og_one():
     assert description_from_pdp_html(page) == "Kylie Cosmetics - Glossy Pink Makeup Bag + Samples"
 
 
-def test_a_present_but_EMPTY_name_tag_means_og_is_the_shops_blurb_not_the_products():
-    """THE BOILERPLATE GUARD, and the reason this is not merely "stays blocked".
+def test_the_parser_does_NOT_try_to_recognise_the_shops_blurb_by_itself():
+    """The boilerplate decision is NOT a property of one page, and an earlier version of this
+    file asserted that it was.
 
-    When a Shopify product has no SEO description the theme substitutes the SHOP description into
-    og: 135 characters of "Discover JUNGSAEMMOOL, the epitome of Korean makeup..." with zero
-    product information, comfortably over the 50-char floor, identical across every such product.
-    Measured on jsmbeauty.sg: 5 of a 30-product sample received that exact string. And because
-    `is_published_ready` auto-publishes this lane's rows, it would not merely unblock them -- it
-    would enter serving as brand-official PRODUCT copy.
+    That version keyed on a PRESENT-BUT-EMPTY `name="description"`, because on jsmbeauty.sg every
+    boilerplate page carried one. It is a THEME detail, not the substitution mechanism: Dawn-family
+    themes wrap the name tag in `{% if page_description %}` and OMIT it, so a 60-PDP sweep across
+    10 storefronts (2026-09-06) found the shop blurb served under an ABSENT name tag 9 times
+    (cosrx.com, mixsoon.us, medicube.us) and under a present-but-empty one 0 times outside the one
+    storefront the rule came from. The guard fired only where it was born.
 
-    The tell is exact on that storefront: every boilerplate page carries a present-but-empty
-    `name="description"` and no legitimate page does.
+    So the parser now reports what the page says, and `drop_shared_boilerplate` decides — with the
+    whole domain and the shop's own blurb in hand. Here that means the og value comes back, and it
+    is the CALLER's job to throw it away.
     """
     from services.curated_brand_feed import description_from_pdp_html
 
@@ -1316,12 +1323,14 @@ def test_a_present_but_EMPTY_name_tag_means_og_is_the_shops_blurb_not_the_produc
       <meta property="og:description" content="Discover JUNGSAEMMOOL, the epitome of Korean
       makeup and cosmetic products, blending artistry with skincare for every day.">
     """
-    assert description_from_pdp_html(page) is None
+    out = description_from_pdp_html(page)
+    assert out is not None and out.startswith("Discover JUNGSAEMMOOL")
 
 
 def test_an_ABSENT_name_tag_is_not_the_same_signal_as_an_empty_one():
-    """Present-but-empty is the tell; absent is no signal at all. Conflating them would throw
-    away legitimate copy on any theme that simply does not emit a name tag."""
+    """A theme that emits no name tag at all is the COMMON case (Dawn-family), not a special one,
+    and its og value is read normally. Whether that value is this product's copy or the shop's
+    blurb is settled downstream by comparison, not here."""
     from services.curated_brand_feed import description_from_pdp_html
 
     page = '<meta property="og:description" content="A lip tint with a watery glow and vivid colour.">'
