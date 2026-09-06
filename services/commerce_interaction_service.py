@@ -999,6 +999,134 @@ async def record_commerce_event_best_effort(
         }
 
 
+def _payload_mapping(value: Any) -> Dict[str, Any]:
+    """The ``payload`` column as a dict, whichever dialect handed it over.
+
+    On SQLite the JSON column is deserialized for us; on Postgres a `jsonb`
+    read can arrive as the raw JSON text depending on the driver's codec, and
+    silently reading `.get` off a string would make every refund total zero.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def recorded_refund_amount_cents(
+    *,
+    merchant_id: str,
+    store_id: Optional[str],
+    order_ref: str,
+    write_path: str,
+    currency: Optional[str] = None,
+) -> int:
+    """Minor units this write path has ALREADY recorded as refunded for one order.
+
+    The caller is a receiver whose platform reports a CUMULATIVE refund total
+    and no per-refund identity (Shoplazza), so the only way it can tell new
+    money from money it has already counted is to subtract this.
+
+    Scoped to one ``write_path`` on purpose: a PSP mirror of the same refund is
+    a different authority with its own native ids, and subtracting it from a
+    platform total would make the platform's next partial refund disappear.
+    Synthetic (probe) rows are excluded for the same reason — a canary must not
+    be able to suppress real money.
+
+    ``currency`` narrows it further when supplied, matched case-insensitively
+    against the recorded row's own ``payload.currency``. Subtraction is only
+    meaningful between two figures in the SAME unit: a row recorded in another
+    currency is a different quantity, and letting it reduce this delivery's
+    delta would silently under-record real money (or, if it exceeded the
+    incoming total, suppress the delivery outright as ``refund_not_new``).
+
+    The sum is taken in Python over the matching rows, not in SQL. ``amount_cents``
+    and ``currency`` live inside the ``payload`` JSON column, whose JSON accessors
+    and numeric typing differ between Postgres and SQLite; one order's refund rows
+    are a handful, and the filter is an indexed ``order_ref`` lookup.
+    """
+    if not merchant_id or not order_ref or not write_path:
+        return 0
+    wanted_currency = str(currency or "").strip().upper() or None
+    conditions = [
+        commerce_interaction_events.c.merchant_id == merchant_id,
+        commerce_interaction_events.c.event_type == "refund.succeeded",
+        commerce_interaction_events.c.write_path == write_path,
+        commerce_interaction_events.c.order_ref == order_ref,
+        commerce_interaction_events.c.synthetic.is_(False),
+    ]
+    conditions.append(
+        commerce_interaction_events.c.store_id == store_id
+        if store_id
+        else commerce_interaction_events.c.store_id.is_(None)
+    )
+    rows = await database.fetch_all(
+        select(commerce_interaction_events.c.payload).where(and_(*conditions))
+    )
+    total = 0
+    for row in rows:
+        payload = _payload_mapping(dict(row).get("payload"))
+        if wanted_currency is not None:
+            row_currency = str(payload.get("currency") or "").strip().upper()
+            if row_currency != wanted_currency:
+                continue
+        amount = payload.get("amount_cents")
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            total += amount
+    return total
+
+
+@asynccontextmanager
+async def order_money_read_modify_write_lock(
+    *,
+    merchant_id: str,
+    store_id: Optional[str],
+    order_ref: str,
+    scope: str,
+):
+    """Serialize a read-then-write money computation for ONE order.
+
+    A receiver that derives an amount by subtracting what it already recorded
+    is doing a read-modify-write. Two deliveries for the same order that
+    interleave both read the same "already recorded" figure, so the second
+    delta is computed against a stale baseline.
+
+    This lock is REQUIRED, not an optimization. The deterministic
+    ``<order>:<cumulative>`` key only collapses a raced pair that carries the
+    SAME cumulative total. A raced pair carrying DIFFERENT totals — the normal
+    shape of two partial refunds moments apart — both read a baseline of, say,
+    0 and emit ``<order>:1000`` for 1000 and ``<order>:2500`` for 2500. Those
+    are two distinct keys, nothing dedupes them, and the funnel SUMS them to
+    3500 against a true cumulative of 2500: a 40% INFLATION of refunded GMV,
+    not an understatement. ``tests/test_shoplazza_refund_ledger_end_to_end.py``
+    pins that arithmetic with the lock forced to a no-op.
+
+    On Postgres the read AND the ledger write run inside one transaction that
+    holds ``pg_advisory_xact_lock``, so the second delivery reads only after the
+    first has committed and the inflation cannot happen. SQLite has no advisory
+    locks, so this is a plain no-op there and a concurrent pair can still
+    interleave — which is tolerable only because SQLite is tests and local
+    development, never a write path carrying real money.
+    """
+    if not IS_POSTGRES:
+        yield
+        return
+    async with database.transaction():
+        await database.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+            {"lock_key": f"{scope}|{merchant_id}|{store_id or ''}|{order_ref}"},
+        )
+        yield
+
+
 async def find_interaction_by_checkout_id(
     checkout_id: str,
     *,

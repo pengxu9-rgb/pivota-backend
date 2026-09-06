@@ -87,6 +87,85 @@ timestamp in the order payload, so `occurred_at` is the order's modification
 time, and `refunds[].reason` is merchant free text that is never copied into
 canonical metadata.
 
+## Shoplazza cumulative refund bridge
+
+Shoplazza has no refund webhook resource: `orders/partially_refunded` and
+`orders/refunded` both deliver the ORDER, and the order carries no `refunds[]`
+array, no refund record id, and no per-refund timestamp. Its only
+non-deprecated refund magnitude is `total_refund_price`, "Total refund amount
+that has been successfully processed" — CUMULATIVE across every refund of that
+order. (`refund_price`, "amount of the most recent refund request", is marked
+deprecated by the platform, is a request rather than a settlement, and has no
+identity to dedupe on. It is never read. Per-refund records with ids do exist,
+but only behind `GET /openapi/2026-01/orders/refund_records`, which no webhook
+carries and which would cost an authenticated call inside a 5-second budget.)
+
+Until 2026-09-05 both topics therefore produced a `refund.succeeded` with
+`amount_cents=None`, no `refund_id`, and an event id keyed on the delivery id,
+with the cumulative total parked in metadata — so Shoplazza contributed zero to
+`refunded_amount_cents_by_currency`.
+
+`routes/shopline_family_webhooks.py` now closes that by subtracting. Before
+mapping a refund topic it reads
+`services.commerce_interaction_service.recorded_refund_amount_cents` — the sum
+of `amount_cents` over the `refund.succeeded` rows this write path has already
+written for `(merchant, store, order_ref)`, synthetic rows excluded — and
+passes it to the mapper as `previously_recorded_refund_cents`. The mapper stays
+pure: it emits `amount_cents = cumulative - previously` under
+`refund_id = <order id>:<cumulative cents>`, with the event id derived from
+that key rather than from the delivery id, and
+`native_amount_semantics=cumulative_refund_total_delta` alongside the
+`native_cumulative_refund_total` it has always kept. Two partial refunds of one
+order become two keys the funnel sums; a redelivery of the same total is one
+key the ledger dedupes.
+
+A delta of zero or less emits nothing (`ignored`, `refund_not_new`): the ledger
+dedupes first-write-wins on the key, so a zero-amount row under
+`<order>:<total>` would permanently shadow the real refund — the same hazard
+PrestaShop's zero-basis credit slips avoid. A delivery with no
+`total_refund_price` is likewise `ignored` (`refund_total_absent`), and that one
+is **logged at WARNING** by the receiver with store id, order ref and topic:
+both ignore reasons answer 2xx and the ingress metric labels every ignore
+identically, so a merchant whose deliveries stopped carrying the total would
+otherwise show zero refunded GMV with nothing to alert on. `refund_not_new` —
+ordinary redelivery traffic — stays quiet. A total that is present but
+unreadable or negative, or a refund with no `currency`, is **rejected** 422,
+because a malformed money claim should be loud and Shoplazza retries only 5xx.
+
+The read is also scoped to the delivery's currency (case-insensitive against
+the stored `payload.currency`): subtraction is only meaningful inside one unit.
+
+ASSUMED, and handled defensively rather than trusted: that `total_refund_price`
+never decreases. After a downward correction (25.00 corrected to 20.00, which
+we ignore) the next genuine refund up to 30.00 emits a delta of 5.00 rather
+than 10.00; the running total still lands on 30.00, so aggregate refunded GMV
+is right and only that one per-event delta is short.
+
+The read and the write are a read-modify-write. On Postgres they run inside one
+transaction holding `pg_advisory_xact_lock` on the order key
+(`order_money_read_modify_write_lock`), so concurrent deliveries for one order
+serialise. **That lock is required, not an optimisation.** The deterministic
+key only collapses a raced pair carrying the SAME cumulative total; a raced
+10.00 and 25.00 both read a baseline of 0 and emit two distinct keys for 1000
+and 2500, which the funnel sums to 3500 against a true cumulative of 2500. The
+unserialised failure mode is a 40% INFLATION of refunded GMV, not an
+understatement, and the helper is a no-op on SQLite — tolerable only because
+SQLite is tests and local development.
+`tests/test_shoplazza_refund_ledger_end_to_end.py` pins the 3500 so the hazard
+is documented rather than rediscovered, and the Postgres gate drives the real
+route and proves the lock excludes a second backend.
+
+TRANSITION. Shoplazza refund rows written before 2026-09-05 carry
+`amount_cents = None`, no `refund_id`, and an event id keyed on the delivery id.
+A null amount contributes nothing to the sum, so they are excluded from the
+read and the first post-deploy delivery for such an order emits the whole
+cumulative total as one delta — correct, because none of that money was ever
+counted. They contribute nothing to `refunded_amount_cents_by_currency` and do
+not inflate the `refunded` stage set, which is a set of interaction ids that
+the new row shares with the old.
+`docs/SHOPLINE_SHOPLAZZA_ADAPTERS.md` carries the field-by-field
+verified/assumed table.
+
 ## BigCommerce native webhook bridge
 
 `POST /webhooks/bigcommerce/{store_id}` differs from every other native bridge in

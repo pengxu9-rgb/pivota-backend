@@ -188,9 +188,14 @@ def test_shoplazza_paid_and_refund_events_are_wrapper_tolerant_and_safe():
         store_id="store-sz",
     ).events[0]
     assert refunded.event_type == "refund.succeeded"
-    assert refunded.amount_cents is None
+    # First observation of the cumulative total: nothing recorded yet, so the
+    # whole of it is new money. The key is the order id and the CUMULATIVE
+    # figure, never the delivery id.
+    assert refunded.amount_cents == 1000
+    assert refunded.refund_id == "sz-order-1:1000"
+    assert refunded.order_ref == "shoplazza:sz-order-1"
     assert refunded.metadata["native_cumulative_refund_total"] == "10.00"
-    assert refunded.metadata["native_amount_semantics"] == "cumulative_refund_total"
+    assert refunded.metadata["native_amount_semantics"] == "cumulative_refund_total_delta"
     serialized = refunded.model_dump_json()
     assert "private@example.com" not in serialized
     assert "merchant@example.com" not in serialized

@@ -4,24 +4,36 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from db.database import database
+from services.commerce_interaction_service import (
+    order_money_read_modify_write_lock,
+    recorded_refund_amount_cents,
+)
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
 from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 from services.shopline_family_event_adapter import (
+    SHOPLAZZA_REFUND_TOPICS,
     UnsupportedShoplineFamilyEvent,
     map_shopline_webhook,
     map_shoplazza_webhook,
+    shoplazza_order_currency,
+    shoplazza_order_ref,
 )
 from services.shopline_family_webhook_auth import resolve_webhook_secret
 
 
+logger = logging.getLogger("shopline_family_webhooks")
 router = APIRouter(prefix="/webhooks", tags=["SHOPLINE and Shoplazza Webhooks"])
 MAX_SHOPLINE_FAMILY_WEBHOOK_BYTES = 1_000_000
+# The one ignore reason that means the PLATFORM broke its contract rather than
+# that we have seen this money already. See `_map_and_record`.
+REFUND_TOTAL_ABSENT = "refund_total_absent"
 
 
 def _credentials(raw: Any) -> Dict[str, Any]:
@@ -106,20 +118,107 @@ async def _receive(
         raise HTTPException(status_code=400, detail=f"Invalid {platform} webhook JSON") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail=f"{platform} webhook body must be an object")
-    try:
-        mapper = map_shopline_webhook if platform == "shopline" else map_shoplazza_webhook
-        batch = mapper(
-            payload,
-            topic=str(topic or ""),
-            delivery_id=delivery_id,
+    merchant_id = str(store["merchant_id"])
+    # Shoplazza's refund deliveries carry only a CUMULATIVE `total_refund_price`
+    # and no per-refund identity, so the new money in one delivery is that total
+    # minus what this write path has already recorded for the order. The read
+    # belongs here, not in the mapper: the mapper stays pure, and the read and
+    # the write it feeds are held under one lock.
+    refund_order_ref = (
+        shoplazza_order_ref(payload)
+        if platform == "shoplazza"
+        and str(topic or "").strip().lower() in SHOPLAZZA_REFUND_TOPICS
+        else None
+    )
+    if refund_order_ref is None:
+        return await _map_and_record(
+            platform=platform,
+            merchant_id=merchant_id,
             store_id=store_id,
+            payload=payload,
+            topic=topic,
+            delivery_id=delivery_id,
         )
+    async with order_money_read_modify_write_lock(
+        merchant_id=merchant_id,
+        store_id=store_id,
+        order_ref=refund_order_ref,
+        scope="shoplazza_refund",
+    ):
+        previously_recorded = await recorded_refund_amount_cents(
+            merchant_id=merchant_id,
+            store_id=store_id,
+            order_ref=refund_order_ref,
+            write_path="shoplazza_webhook",
+            # Subtracting is only meaningful within one unit; a row in another
+            # currency is a different quantity, not a smaller one.
+            currency=shoplazza_order_currency(payload),
+        )
+        return await _map_and_record(
+            platform=platform,
+            merchant_id=merchant_id,
+            store_id=store_id,
+            payload=payload,
+            topic=topic,
+            delivery_id=delivery_id,
+            order_ref=refund_order_ref,
+            previously_recorded_refund_cents=previously_recorded,
+        )
+
+
+async def _map_and_record(
+    *,
+    platform: str,
+    merchant_id: str,
+    store_id: str,
+    payload: Dict[str, Any],
+    topic: Optional[str],
+    delivery_id: Optional[str],
+    order_ref: Optional[str] = None,
+    **mapper_kwargs: Any,
+):
+    try:
+        if platform == "shopline":
+            batch = map_shopline_webhook(
+                payload,
+                topic=str(topic or ""),
+                delivery_id=delivery_id,
+                store_id=store_id,
+            )
+        else:
+            batch = map_shoplazza_webhook(
+                payload,
+                topic=str(topic or ""),
+                delivery_id=delivery_id,
+                store_id=store_id,
+                **mapper_kwargs,
+            )
     except UnsupportedShoplineFamilyEvent as exc:
-        return {"status": "ignored", "platform": platform, "reason": str(exc)}
+        reason = str(exc)
+        if reason.startswith(REFUND_TOTAL_ABSENT):
+            # A refund topic with no `total_refund_price` is the platform
+            # breaking its own contract, and it is otherwise SILENT: the
+            # delivery answers 2xx `ignored`, and the ingress metric labels
+            # every ignore identically, so a merchant whose deliveries stopped
+            # carrying the total would simply show zero refunded GMV with
+            # nothing to alert on. Log it here rather than widening
+            # telemetry_ingress's label set. `refund_not_new` — the ordinary
+            # redelivery and downward-correction case — stays quiet, because it
+            # is expected traffic and would drown this out.
+            logger.warning(
+                "%s refund delivery carries no total_refund_price; "
+                "no refund amount can be recorded "
+                "(store_id=%s order_ref=%s topic=%s)",
+                platform,
+                store_id,
+                order_ref or "-",
+                str(topic or "").strip() or "-",
+            )
+        return {"status": "ignored", "platform": platform, "reason": reason}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     result = await ingest_merchant_event_batch(
-        merchant_id=str(store["merchant_id"]),
+        merchant_id=merchant_id,
         batch=batch,
         agent_identity_confidence="platform_asserted",
         write_path="shopline_webhook" if platform == "shopline" else "shoplazza_webhook",

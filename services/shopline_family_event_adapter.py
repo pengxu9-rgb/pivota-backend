@@ -15,15 +15,14 @@ from services.merchant_event_ingest_service import MerchantCommerceEvent, Mercha
 SUPPORTED_SHOPLINE_TOPICS = frozenset(
     {"orders/create", "orders/paid", "orders/cancelled", "refunds/create"}
 )
+SHOPLAZZA_REFUND_TOPICS = frozenset({"orders/partially_refunded", "orders/refunded"})
 SUPPORTED_SHOPLAZZA_TOPICS = frozenset(
     {
         "orders/create",
         "orders/paid",
         "orders/cancelled",
-        "orders/partially_refunded",
-        "orders/refunded",
     }
-)
+) | SHOPLAZZA_REFUND_TOPICS
 # MerchantCommerceEvent.click_id is capped at 64 characters including `clk_`.
 _CLICK_ID_RE = re.compile(r"^clk_[A-Za-z0-9_-]{6,60}$")
 ZERO_DECIMAL_CURRENCIES = frozenset(
@@ -323,12 +322,145 @@ def map_shopline_webhook(
     )
 
 
+def shoplazza_order_ref(payload: Any) -> Optional[str]:
+    """The canonical ``shoplazza:<native id>`` a delivery is about, or None.
+
+    The receiver needs this BEFORE mapping a refund topic, because the refund
+    amount is derived from what it has already recorded for that order. Reading
+    it costs one dict lookup and cannot fail the delivery: everything this
+    returns None for is still rejected (or accepted) by the mapper itself.
+    """
+    if not isinstance(payload, dict):
+        return None
+    order = _unwrap(payload, "order")
+    return build_order_ref("shoplazza", _text(order.get("id") or order.get("order_id")))
+
+
+def shoplazza_order_currency(payload: Any) -> Optional[str]:
+    """The delivery's order currency, upper-cased, or None.
+
+    The receiver needs this alongside the order ref, for the same reason: the
+    "already recorded" figure it subtracts is only comparable to this
+    delivery's cumulative total if both are in the same unit. Like
+    ``shoplazza_order_ref`` this cannot fail the delivery — a refund with no
+    currency is rejected 422 by the mapper itself.
+    """
+    if not isinstance(payload, dict):
+        return None
+    currency = _text(_unwrap(payload, "order").get("currency"))
+    return currency.upper() if currency else None
+
+
+def _shoplazza_refund_batch(
+    order: Dict[str, Any],
+    *,
+    topic: str,
+    delivery_id: Optional[str],
+    store_id: str,
+    order_id: str,
+    trace_id: str,
+    previously_recorded_refund_cents: Optional[int],
+) -> MerchantEventBatch:
+    """One refund.succeeded carrying the NEW money in a cumulative total.
+
+    Shoplazza's refund deliveries are the order resource. The order carries no
+    ``refunds[]`` array and no per-refund identity of any kind — the only
+    non-deprecated refund magnitude on it is ``total_refund_price``, "Total
+    refund amount that has been successfully processed", which is CUMULATIVE
+    (see docs/SHOPLINE_SHOPLAZZA_ADAPTERS.md for the field-by-field evidence).
+
+    So the delta against what this write path already recorded for the order is
+    the only per-delivery refund amount that exists, and the receiver — not
+    this mapper — supplies the "already recorded" figure. Keeping the mapper
+    pure keeps it testable and keeps the ledger read in one place that can hold
+    a lock around it.
+
+    The key is ``<order id>:<cumulative cents>``, which is deterministic: a
+    redelivery of the SAME cumulative total lands on the same key and dedupes
+    on the ledger's first-write-wins even if it raced the read. That is the
+    only race the key protects against — two DIFFERENT totals racing produce
+    two different keys and INFLATE the order's refunded total, which is why the
+    receiver's ``order_money_read_modify_write_lock`` is required rather than
+    an optimisation.
+    """
+    currency = _text(order.get("currency"))
+    if not currency:
+        # An amount with no currency is not a refund the funnel can count, and
+        # it would still consume this order's key. Refuse loudly instead.
+        raise ValueError("Shoplazza refund webhook is missing the order currency")
+    order_ref = build_order_ref("shoplazza", order_id)
+    if not order_ref:
+        raise ValueError("Shoplazza refund webhook has no usable order reference")
+    raw_cumulative = order.get("total_refund_price")
+    if raw_cumulative in (None, ""):
+        # Absence of the field is not a malformed claim: nothing says money
+        # moved, so there is nothing to record and nothing to page about.
+        raise UnsupportedShoplineFamilyEvent(
+            "refund_total_absent: Shoplazza refund webhook carries no total_refund_price"
+        )
+    cumulative_cents = _amount_cents(raw_cumulative, currency)
+    if cumulative_cents is None:
+        # Present but unreadable (or negative) IS a malformed money claim.
+        raise ValueError(
+            "Shoplazza total_refund_price is not a non-negative amount: "
+            f"{raw_cumulative!r}"
+        )
+    previously = int(previously_recorded_refund_cents or 0)
+    if previously < 0:
+        raise ValueError("previously_recorded_refund_cents must not be negative")
+    delta = cumulative_cents - previously
+    if delta <= 0:
+        # A redelivery, an out-of-order delivery, or a merchant-side correction
+        # downwards. Emitting a zero here would permanently shadow the real
+        # refund under this key, so it is ignored rather than written.
+        raise UnsupportedShoplineFamilyEvent(
+            "refund_not_new: cumulative total_refund_price of "
+            f"{cumulative_cents} does not exceed the {previously} already recorded "
+            f"for {order_ref}"
+        )
+    refund_id = f"{order_id}:{cumulative_cents}"
+    metadata = _order_metadata(order, topic, delivery_id)
+    metadata["native_cumulative_refund_total"] = raw_cumulative
+    # amount_cents is the DELTA of that cumulative total, not the total.
+    metadata["native_amount_semantics"] = "cumulative_refund_total_delta"
+    customer = _dict(order.get("customer"))
+    return MerchantEventBatch(
+        events=[
+            MerchantCommerceEvent(
+                event_id=_event_id("shoplazza", store_id, "refund.succeeded", refund_id),
+                event_type="refund.succeeded",
+                # The order payload carries no per-refund timestamp, so the
+                # order's own modification time is the closest anchor.
+                occurred_at=_occurred_at(order.get("updated_at"), order.get("created_at")),
+                platform="shoplazza",
+                source="shoplazza_webhook",
+                store_id=store_id,
+                buyer_id=_text(customer.get("id")),
+                click_id=_click_id(
+                    order.get("landing_site"),
+                    order.get("last_landing_url"),
+                    order.get("checkout_url"),
+                ),
+                payment_id=_first_payment_id(order),
+                order_id=order_id,
+                order_ref=order_ref,
+                refund_id=refund_id,
+                trace_id=trace_id,
+                amount_cents=delta,
+                currency=currency.upper(),
+                metadata=metadata,
+            )
+        ]
+    )
+
+
 def map_shoplazza_webhook(
     payload: Dict[str, Any],
     *,
     topic: str,
     delivery_id: Optional[str],
     store_id: str,
+    previously_recorded_refund_cents: Optional[int] = None,
 ) -> MerchantEventBatch:
     normalized_topic = str(topic or "").strip().lower()
     if normalized_topic not in SUPPORTED_SHOPLAZZA_TOPICS:
@@ -342,34 +474,35 @@ def map_shoplazza_webhook(
     if not order_id:
         raise ValueError("Shoplazza order webhook is missing order id")
 
+    trace_id = _text(delivery_id) or _payload_fingerprint(payload)
+    if normalized_topic in SHOPLAZZA_REFUND_TOPICS:
+        return _shoplazza_refund_batch(
+            order,
+            topic=normalized_topic,
+            delivery_id=delivery_id,
+            store_id=store_id,
+            order_id=order_id,
+            trace_id=trace_id,
+            previously_recorded_refund_cents=previously_recorded_refund_cents,
+        )
+
     event_type = {
         "orders/create": "order.created",
         "orders/paid": "order.paid",
         "orders/cancelled": "order.cancelled",
-        "orders/partially_refunded": "refund.succeeded",
-        "orders/refunded": "refund.succeeded",
     }[normalized_topic]
-    trace_id = _text(delivery_id) or _payload_fingerprint(payload)
     customer = _dict(order.get("customer"))
-    refund_event = event_type == "refund.succeeded"
-    amount = None if refund_event else (
+    amount = (
         order.get("real_total_paid")
         or order.get("total_paid")
         or order.get("total_price")
     )
     currency = _text(order.get("currency"))
     metadata = _order_metadata(order, normalized_topic, delivery_id)
-    if refund_event and order.get("total_refund_price") not in (None, ""):
-        # This field is cumulative. Preserve it as a labelled fact rather than
-        # putting it in amount_cents, where multiple partial-refund events could
-        # be incorrectly summed as incremental refunds.
-        metadata["native_cumulative_refund_total"] = order.get("total_refund_price")
-        metadata["native_amount_semantics"] = "cumulative_refund_total"
-    entity_id = trace_id if refund_event else order_id
     return MerchantEventBatch(
         events=[
             MerchantCommerceEvent(
-                event_id=_event_id("shoplazza", store_id, event_type, entity_id),
+                event_id=_event_id("shoplazza", store_id, event_type, order_id),
                 event_type=event_type,
                 occurred_at=_occurred_at(
                     order.get("canceled_at") if event_type == "order.cancelled" else None,
