@@ -589,3 +589,82 @@ def test_the_builder_version_moved_so_cached_projections_are_re_rendered():
     from services import audit_projection_builder as b
 
     assert b._BUILDER_VERSION != "1.0.0"
+
+
+# ---------------------------------------------------------------------
+# The shape the WRITER produces. Everything above pipes extract_findings()
+# straight into the projection, which is the in-process shape and NOT what
+# production passes.
+# ---------------------------------------------------------------------
+
+
+def _as_db_rows(findings, *, jsonb_as_text: bool = False):
+    """Re-shape extractor output the way `list_findings_for_run` returns it.
+
+    That function does `dict(r)` over raw `readiness_findings` rows, so the
+    payload arrives under the COLUMN name `payload_jsonb` — and under the
+    `databases` driver it can arrive as a JSON string rather than a dict.
+    """
+    rows = []
+    for f in findings:
+        row = {k: v for k, v in f.items() if k != "payload"}
+        payload = f.get("payload") or {}
+        row["payload_jsonb"] = (
+            json.dumps(payload) if jsonb_as_text else payload
+        )
+        rows.append(row)
+    return rows
+
+
+@pytest.mark.parametrize("jsonb_as_text", [False, True])
+def test_the_headline_reads_the_row_shape_the_db_returns(
+    real_report, jsonb_as_text,
+):
+    """The regression, caught only in production.
+
+    `_headline_distribution` read `finding["payload"]` — the EXTRACTOR's key.
+    `list_findings_for_run` returns database rows whose column is
+    `payload_jsonb`, so on every real run the lookup missed and the headline
+    rendered `dimensions: []`. Verified against production run
+    0d56bf71-d63b-4103-9520-e0abf66bb57e: builder_version 1.1.0, stages
+    correctly MEASURED, and an EMPTY headline — while that same run's
+    brand_headline_distribution finding carried all four dimensions.
+
+    Parametrised over the JSON-string form because the `databases` driver can
+    return jsonb as text; every other reader in this module goes through
+    coerce_jsonb_to_dict for exactly that reason.
+    """
+    rows = _as_db_rows(extract_findings(real_report), jsonb_as_text=jsonb_as_text)
+    assert "payload" not in rows[0], "fixture still carries the extractor key"
+
+    head = _project(rows)["headline"]
+
+    assert head["dimensions"], (
+        "the headline is empty for the row shape production actually passes"
+    )
+    assert head["dimensions_considered"] == 4
+    assert head.get("unavailable_reason") is None
+    for dim in head["dimensions"]:
+        assert dim["n"] is not None
+    assert head["prompt_split"] is not None
+    assert head["prompt_split"]["branded"]["answered"] > 0
+
+
+def test_the_stage_lists_survive_the_row_shape_too(real_report):
+    """The stages read finding_type/severity/short_summary, which are real
+    columns, so they worked in production while the headline did not. Pin that
+    they keep working — a future payload change must not quietly take them."""
+    rows = _as_db_rows(extract_findings(real_report))
+
+    by_stage = {
+        s["stage"]: {f["type"] for f in s["findings"]}
+        for s in _project(rows)["stages"]
+    }
+
+    assert "content_too_thin_to_cite" in by_stage["get_selected"]
+    assert "category_citation_weak" in by_stage["get_cited"]
+    assert not by_stage["convert_sales"]
+    # routability stays out of the merchant's problem list in this shape too.
+    assert all(
+        "pivota_serving_not_ready" not in types for types in by_stage.values()
+    )
