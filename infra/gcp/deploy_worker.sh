@@ -235,9 +235,23 @@ PROBE_JOB="verify-worker-$$-$RANDOM"
 # the "new code under the old commit" state the restamp exists to prevent. An earlier version
 # guarded this with `if sha and ...`, so an empty string skipped the comparison entirely and the
 # probe exited 0 having verified nothing about the commit. Caught in review, 2026-09-05.
+# AN IDENTITY TOKEN IS REQUIRED, and its absence is what broke the first real run of this
+# script (2026-09-06, run 34012321564): every request came back 403 and the deploy rolled
+# itself back. The reasoning that put it there was "deploy_backend.sh probes without a token
+# and that is proven in this VPC" - true, and irrelevant: deploy_backend.sh probes `web`, which
+# is deployed --allow-unauthenticated. The worker is --ingress internal AND not publicly
+# invokable, so Google's front end rejects an unauthenticated request before the app sees it.
+# Being inside the VPC satisfies INGRESS; it does not satisfy IAM.
+#
+# The token comes from the metadata server, audience-scoped to the service URL.
 PROBE_PY="import json,urllib.request,sys
-d=json.load(urllib.request.urlopen('$WORKER_URL/__scheduler_health',timeout=25))
-b=json.load(urllib.request.urlopen('$WORKER_URL/__build',timeout=25))
+def _get(u, tok):
+    r=urllib.request.Request(u); r.add_header('Authorization','Bearer '+tok); return json.load(urllib.request.urlopen(r,timeout=25))
+_t=urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=$WORKER_URL')
+_t.add_header('Metadata-Flavor','Google')
+tok=urllib.request.urlopen(_t,timeout=25).read().decode()
+d=_get('$WORKER_URL/__scheduler_health',tok)
+b=_get('$WORKER_URL/__build',tok)
 sha=str(b.get('full_sha') or b.get('commit_sha') or '')
 print('PROBE state='+str(d.get('state_name'))+' fireable='+str(d.get('fireable_job_count'))+' worker_enabled='+str(d.get('worker_enabled'))+' boot_error='+str(d.get('boot_error'))+' sha='+sha)
 ok = d.get('state_name')=='RUNNING' and not d.get('boot_error') and (d.get('fireable_job_count') or 0)>0
@@ -268,12 +282,52 @@ if [ "$create_rc" != 0 ]; then
   exit 1
 fi
 PROBE_ERR="$(mktemp)"; _TMPFILES="$_TMPFILES $PROBE_ERR"
+PROBE_LOG="$(mktemp)"; _TMPFILES="$_TMPFILES $PROBE_LOG"
 "$GCLOUD" run jobs execute "$PROBE_JOB" --region "$REGION" --project "$PROJECT" --wait --quiet \
   >/dev/null 2>"$PROBE_ERR" || probe_rc=$?
+# Pull the probe's own output BEFORE deleting the job. Unlike deploy_backend.sh, this is not used
+# to decide success - the exit code already did that - only to classify a FAILURE as "the app said
+# no" versus "we never reached the app". A scrape that comes back empty leaves PROBE_REACHED_APP=1,
+# i.e. the conservative reading that the verdict was real.
+if [ "$probe_rc" != 0 ]; then
+  for _i in 1 2 3; do
+    "$GCLOUD" logging read "resource.labels.job_name=\"$PROBE_JOB\"" --project "$PROJECT" \
+      --limit 30 --format='value(textPayload)' >"$PROBE_LOG" 2>/dev/null || true
+    [ -s "$PROBE_LOG" ] && break
+    sleep 5
+  done
+fi
 # Best-effort cleanup, never fatal: a leaked probe JOB costs nothing (jobs hold no instances, which
 # is why this pattern is safe here and a tagged candidate REVISION is not).
 "$GCLOUD" run jobs delete "$PROBE_JOB" --region "$REGION" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
 
+# WAS THE VERDICT ABOUT THE WORKER, OR ABOUT OUR ABILITY TO ASK?
+#
+# The first real run of this script rolled production back on a 403 - an answer about IAM, not
+# about the scheduler - and because PREV_IMAGE is re-read every run, repeating that on each push
+# to main is an image FLAP: deploy, fail to ask, roll back, deploy again next merge. A rollback
+# is a production change and must rest on evidence about production.
+#
+# So a probe that could not COMPLETE leaves the new image in place and fails loudly: the deploy
+# is unverified, which is not a pass, but it is also not grounds to move production twice on no
+# information. Only a probe that ran and returned a verdict rolls back. Same distinction the
+# drift alarm draws between its own plumbing failing and production being unverifiable.
+PROBE_REACHED_APP=1
+if [ "$probe_rc" != 0 ] && grep -qiE 'HTTP Error (401|403)|URLError|metadata.google.internal|Forbidden' "$PROBE_LOG" 2>/dev/null; then
+  PROBE_REACHED_APP=0
+fi
+if [ "$probe_rc" != 0 ] && [ "$PROBE_REACHED_APP" = 0 ]; then
+  echo "::error::could not ASK the worker whether it is healthy on $TAG - the probe never got an" >&2
+  echo "answer from the application (auth, IAM or networking), so there is no evidence about the" >&2
+  echo "scheduler either way. The new image is LEFT IN PLACE deliberately: rolling production back" >&2
+  echo "on a question we failed to ask would move it twice on no information, and repeating that" >&2
+  echo "every merge is an image flap." >&2
+  echo "This deploy is UNVERIFIED. Check it by hand, and check that sa-worker can invoke the" >&2
+  echo "service (it needs roles/run.invoker on it):" >&2
+  echo "  gcloud run services get-iam-policy worker --region $REGION --project $PROJECT" >&2
+  echo "  gcloud logging read 'resource.labels.job_name=\"$PROBE_JOB\"' --project $PROJECT --limit 20" >&2
+  exit 1
+fi
 if [ "$probe_rc" != 0 ]; then
   echo "::error::the worker deployed but did not verify on $TAG." >&2
   echo "The probe asserts state_name=RUNNING, no boot_error, fireable_job_count>0, and that the" >&2
