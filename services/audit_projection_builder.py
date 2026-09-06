@@ -415,6 +415,11 @@ _PRODUCIBLE_FINDING_TYPES = frozenset({
     # Meta: about the RUN, not the merchant. Producible, and handled specially
     # below — they must never let ANY stage claim an all-clear, and they must
     # never appear in a stage's findings either.
+    # §14 — an AI answer named an official store that is not one of the
+    # merchant's own hosts. GET CITED: the answer cited them and then sent
+    # the buyer somewhere else, which is a destination failure, not a
+    # selection one.
+    "ai_named_an_unverified_official_store",
     "report_shape_unreadable",
     "no_dimension_was_scored",
 })
@@ -485,6 +490,7 @@ _STAGE_FOR_FINDING_TYPE = {
     #   that. Filing it there would make a stage that has never run look
     #   measured.
     "pivota_serving_not_ready": _STAGE_GET_CITED,
+    "ai_named_an_unverified_official_store": _STAGE_GET_CITED,
 }
 
 

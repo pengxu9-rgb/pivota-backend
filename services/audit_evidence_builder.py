@@ -634,6 +634,113 @@ def _findings_from_brand_rollup(
     return out
 
 
+FINDING_UNVERIFIED_OFFICIAL_STORE = "ai_named_an_unverified_official_store"
+
+
+def _known_official_hosts(brand_report: Dict[str, Any]) -> List[str]:
+    """The merchant's own hosts, as this REPORT can establish them.
+
+    Deliberately NOT called "verified": the verified set is item 5 and lives in
+    `merchant_official_domains`, which a pure function cannot read. This is the
+    report's own `merchant_domain` plus the hosts its classifier already marked
+    first-party. The basis is named in every finding built from it so nobody
+    downstream mistakes an inference for a verification.
+    """
+    hosts: List[str] = []
+    md = brand_report.get("merchant_domain")
+    if isinstance(md, str) and md.strip():
+        hosts.append(md.strip())
+    authority = brand_report.get("authority_map")
+    if isinstance(authority, dict):
+        for sku in (authority.get("skus") or []):
+            if not isinstance(sku, dict):
+                continue
+            for host in (sku.get("authority_hosts") or []):
+                if isinstance(host, dict) and host.get("first_party") \
+                        and isinstance(host.get("host"), str):
+                    hosts.append(host["host"])
+    return sorted(set(hosts))
+
+
+def _findings_from_destination_claims(
+    brand_report: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """P0 item 8 (§14) — "AI told your buyers your official store is <host>".
+
+    The highest-cost error an engine makes, and the one no host-frequency metric
+    can see: it is a RELATIONSHIP asserted in the answer's prose, not a citation.
+    Measured at 3.1% of brand-intent responses, on the single query where being
+    wrong costs the most.
+
+    Only claims pointing AWAY from the merchant's own hosts become findings. A
+    claim naming the right domain is correct behaviour, and an unknown verdict
+    (no host set available) is not evidence of anything — `claims_pointing_away`
+    drops both.
+    """
+    from services.destination_claim import (
+        claims_pointing_away, extract_destination_claims,
+    )
+
+    authority = brand_report.get("authority_map")
+    if not isinstance(authority, dict):
+        return []
+    official = _known_official_hosts(brand_report)
+    if not official:
+        # An EARLY-OUT, not the safety net — and the comment used to claim
+        # otherwise. Correctness here comes from `matches_verified`, which is
+        # None (not False) when no host set was supplied, and
+        # `claims_pointing_away` drops anything that is not explicitly False.
+        # A mutant deleting this line changes no output, which is how the
+        # over-claim was found. It stays because parsing every excerpt to
+        # produce nothing is wasted work, and it goes on saying only that.
+        return []
+
+    brand = None
+    facts = (brand_report.get("brand_rollup") or {}).get("run_facts")
+    if isinstance(facts, dict):
+        brand = (facts.get("identity") or {}).get("brand")
+
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for sku in (authority.get("skus") or []):
+        if not isinstance(sku, dict):
+            continue
+        for host in (sku.get("authority_hosts") or []):
+            if not isinstance(host, dict):
+                continue
+            claims = extract_destination_claims(
+                host.get("evidence_excerpt"),
+                verified_official_hosts=official,
+                brand=brand,
+            )
+            for claim in claims_pointing_away(claims):
+                key = claim["claimed_host"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "finding_type": FINDING_UNVERIFIED_OFFICIAL_STORE,
+                    "severity": "high",
+                    "payload": {
+                        "claimed_host": key,
+                        "excerpt": claim["excerpt"],
+                        "cited_on_host": host.get("host"),
+                        "brand_mentioned": claim.get("brand_mentioned"),
+                        # Name the basis. These are the report's own
+                        # merchant_domain + first-party hosts, NOT item 5's
+                        # verified set, and a reader must be able to tell.
+                        "compared_against": official,
+                        "comparison_basis": "report_merchant_domain_and_first_party",
+                    },
+                    "confidence": CONFIDENCE_FINDING_HIGH,
+                    "short_summary": (
+                        f"An AI answer told shoppers your official store is "
+                        f"{key}, which is not one of your known domains."
+                    ),
+                })
+    return out
+
+
 def extract_findings(
     brand_report: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -726,6 +833,10 @@ def extract_findings(
                     "all-clear."
                 ),
             })
+
+    # §14 reads authority_map, which BOTH report shapes carry, so this sits
+    # outside the modern/legacy split rather than inside either branch.
+    out.extend(_findings_from_destination_claims(brand_report))
 
     aggregate = brand_report.get("aggregate") or {}
     avg_vis = aggregate.get("avg_visibility")
