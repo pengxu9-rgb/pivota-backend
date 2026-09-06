@@ -218,10 +218,9 @@ async def ops_resubscribe_all_shopify_webhooks(
     for row in rows or []:
         store = dict(row)
         merchant_id = store.get("merchant_id")
-        # One unpinnable row must not abort the sweep -- it is recorded and skipped, so the
-        # remaining stores are still resubscribed.
-        shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
         store_id = str(store.get("store_id") or "").strip() or None
+        # Bound before the try so the except handler below can log it whatever happens.
+        shop_domain = ""
         summary: Dict[str, Any] = {
             "merchant_id": merchant_id,
             "shop_domain": shop_domain,
@@ -230,13 +229,21 @@ async def ops_resubscribe_all_shopify_webhooks(
             "failed": [],
             "error": None,
         }
-        if not shop_domain:
-            # Recorded with its OWN reason rather than falling through to "missing_credentials",
-            # which would send an operator looking for a token problem that is not there.
-            summary["error"] = "domain_not_a_myshopify_host"
-            results.append(summary)
-            continue
         try:
+            # Inside the try ON PURPOSE. One unpinnable row must not abort the sweep, and a guard
+            # placed above the try would do exactly that for any input it cannot handle -- the
+            # failure mode this loop exists to prevent.
+            shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
+            summary["shop_domain"] = shop_domain
+            if not shop_domain:
+                # Recorded with its OWN reason rather than falling through to
+                # "missing_credentials", which would send an operator looking for a token problem
+                # that is not there. store_id is carried because shop_domain is deliberately not
+                # echoed, and merchant_id alone does not name the offending row.
+                summary["error"] = "domain_not_a_myshopify_host"
+                summary["store_id"] = store_id
+                results.append(summary)
+                continue
             access_token, _meta = await resolve_shopify_admin_access_token(
                 shop_domain=shop_domain,
                 api_key_raw=store.get("api_key"),

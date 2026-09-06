@@ -225,20 +225,28 @@ def test_resubscribe_all_skips_a_bad_row_and_keeps_going(client, listener, monke
     abort the sweep and not silently look like a token problem."""
     good = _store("cosrx-renewal.myshopify.com")
     good["merchant_id"] = "merchant_good"
+    # A static token: _token_needs_refresh() is False, so the real resolver returns it immediately
+    # and this row sends no packet either.
+    good["api_key"] = "shpat_STATIC_TOKEN"
+    good["api_key_raw"] = "shpat_STATIC_TOKEN"
     bad = _store(f"127.0.0.1:{listener.port}")
     bad["merchant_id"] = "merchant_bad"
 
     async def _fetch_all(query, values=None):
         return [bad, good]
 
-    async def _fake_resolve(**_kwargs):
-        return "shpat_TEST_TOKEN_SENTINEL", {}
-
+    # The resolver is left REAL. Stubbing it made `listener.count == 0` below vacuous -- review
+    # moved the credential exchange ABOVE the pin check and all 11 tests still passed, while the
+    # sweep POSTed client_id/client_secret to the raw row's host for every unpinnable row. Only the
+    # error string carried a kill. With the real resolver, the bad row's host is the listener, so
+    # the socket assertion is what fails if the ordering is ever inverted again.
+    #
+    # The GOOD row must therefore not reach the resolver either, or it would dial a real shop from
+    # a unit test: its credentials blob is absent, so the resolver returns without a packet.
     async def _fake_register(**kwargs):
         return {"created": [{"topic": "orders/create"}], "already_exists": [], "failed": []}
 
     monkeypatch.setattr(ops.database, "fetch_all", _fetch_all, raising=False)
-    monkeypatch.setattr(ops, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
     monkeypatch.setattr(ops, "register_webhooks_best_effort", _fake_register, raising=True)
 
     resp = client.post(
