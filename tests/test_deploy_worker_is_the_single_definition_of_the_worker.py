@@ -37,7 +37,7 @@ PREV = "b" * 40
 
 
 def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bool = False,
-                 prev_image: str = PREV, describe_error: str = "") -> Path:
+                 prev_image: str = PREV, describe_error: str = "", probe_log: str = "") -> Path:
     """A `gcloud` that records every invocation and can fail on demand.
 
     Recording matters more than answering: the assertions below read the RECORDED argv of
@@ -78,6 +78,10 @@ if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
 fi
 if [ "$1" = run ] && [ "$2" = jobs ] && [ "$3" = execute ]; then
   {"exit 1" if probe_fails else "exit 0"}
+fi
+if [ "$1" = logging ]; then
+  printf '%s\\n' "{probe_log}"
+  exit 0
 fi
 exit 0
 """)
@@ -335,11 +339,21 @@ def _probe_program(tmp_path: Path) -> str:
 def test_the_probe_program_verdict(tmp_path, health, build, expect_ok, why):
     import http.server, json as _json, threading
 
+    seen = {"auth": []}
+
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = _json.dumps(health if "scheduler" in self.path else build).encode()
+            # The metadata server, which the probe must call BEFORE either endpoint — the worker
+            # is not publicly invokable, so an unauthenticated request never reaches the app.
+            if "computeMetadata" in self.path:
+                body = b"a-fake-identity-token"
+                ctype = "text/plain"
+            else:
+                seen["auth"].append(self.headers.get("Authorization"))
+                body = _json.dumps(health if "scheduler" in self.path else build).encode()
+                ctype = "application/json"
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -351,9 +365,9 @@ def test_the_probe_program_verdict(tmp_path, health, build, expect_ok, why):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         raw = _probe_program(tmp_path)
-        prog = raw.replace(
-            "https://worker-xyz.a.run.app", f"http://127.0.0.1:{srv.server_address[1]}"
-        )
+        local = f"http://127.0.0.1:{srv.server_address[1]}"
+        prog = raw.replace("https://worker-xyz.a.run.app", local).replace(
+            "http://metadata.google.internal", local)
         # If the stub's URL ever changes, this replace silently no-ops and the probe makes a
         # REAL outbound request to that hostname — a test that quietly stops testing, and
         # starts reaching the network from CI. Fail here instead.
@@ -364,6 +378,12 @@ def test_the_probe_program_verdict(tmp_path, health, build, expect_ok, why):
         done = subprocess.run(["python3", "-c", prog], capture_output=True, text=True, timeout=60)
     finally:
         srv.shutdown()
+    # The endpoints must have been called WITH the token, or the probe would 403 against the
+    # real worker exactly as it did in production on 2026-09-06.
+    if done.returncode == 0 or health.get("state_name"):
+        assert seen["auth"] and all(a and a.startswith("Bearer ") for a in seen["auth"]), (
+            f"the probe reached the endpoints without an Authorization header: {seen['auth']}"
+        )
     ok = done.returncode == 0
     assert ok == expect_ok, (
         f"probe returned rc={done.returncode} (ok={ok}), expected ok={expect_ok}.\n"
@@ -438,6 +458,53 @@ def test_the_documented_arming_command_still_reconciles(tmp_path):
     calls = (tmp_path / "calls.log").read_text() if (tmp_path / "calls.log").exists() else ""
     assert "run deploy worker" in calls, (
         f"the worker was never deployed by the arming command:\n{out[-2500:]}"
+    )
+
+
+def test_a_probe_that_never_reached_the_app_does_not_roll_production_back(tmp_path):
+    """MEASURED IN PRODUCTION, run 34012321564. The worker is --ingress internal AND not
+    publicly invokable, so the in-VPC probe got `HTTP Error 403: Forbidden` from Google's front
+    end — an answer about IAM, not about the scheduler — and this script rolled production back
+    on it. Because PREV_IMAGE is re-read every run, repeating that on each push to main is an
+    image FLAP: deploy, fail to ask, roll back, deploy again next merge.
+
+    A rollback is a production change and must rest on evidence about production. A question we
+    failed to ask is not evidence, so the new image stays and the job fails loudly instead."""
+    code, out, calls = _run(tmp_path, "prod", SHA, probe_fails=True,
+                            probe_log="urllib.error.HTTPError: HTTP Error 403: Forbidden")
+    assert code != 0, f"an unverified deploy is not a pass:\n{out}"
+    assert len(_deploys(calls)) == 1, (
+        "it rolled production back on a probe that never reached the application — that is the "
+        "flap this case exists to prevent"
+    )
+    assert "UNVERIFIED" in out and "run.invoker" in out, (
+        f"the operator must be told the deploy is unverified and pointed at the IAM cause:\n{out}"
+    )
+
+
+def test_a_probe_that_ran_and_said_unhealthy_still_rolls_back(tmp_path):
+    """The counterpart, and the reason the case above is not "never roll back". When the
+    application answers and the answer is bad, that IS evidence about production, and the
+    previous image goes back."""
+    code, out, calls = _run(tmp_path, "prod", SHA, probe_fails=True,
+                            probe_log="PROBE state=RUNNING fireable=0 worker_enabled=False boot_error=None")
+    assert code != 0
+    argvs = _deploy_argvs(tmp_path)
+    assert len(argvs) == 2, f"a real unhealthy verdict must roll back, got {len(argvs)} deploys"
+    assert _flag(argvs[1], "--image").endswith(f":{PREV}")
+
+
+def test_the_probe_authenticates(tmp_path):
+    """Being inside the VPC satisfies INGRESS; it does not satisfy IAM. Without a token every
+    request is rejected before the app sees it, which is exactly what happened on the first real
+    run. deploy_backend.sh gets away with no token only because `web` is
+    --allow-unauthenticated; the worker is not."""
+    prog = _probe_program(tmp_path)
+    assert "metadata.google.internal" in prog and "Metadata-Flavor" in prog, (
+        f"the probe fetches no identity token, so it will 403 against the worker:\n{prog}"
+    )
+    assert "Authorization" in prog and "Bearer" in prog, (
+        f"the probe fetches a token but never sends it:\n{prog}"
     )
 
 
