@@ -11,8 +11,13 @@ reach this mapper through the same signed outbox:
   ``Order.status`` becomes CANCELLED, or when a credit ``Invoice`` appears.
   It observes those states on a cursor and enqueues ``order.paid``,
   ``order.cancelled`` and ``refund.succeeded`` with a DETERMINISTIC
-  ``event_id`` (``order.paid:<orderNo>``, ``refund.succeeded:<invoiceNumber>``)
-  so a redelivery dedupes here rather than writing a second ledger row.
+  ``event_id`` (``order.paid:<orderNo>``,
+  ``refund.succeeded:<invoiceNumber>:<cumulative>``) so a redelivery dedupes
+  here rather than writing a second ledger row. A refund's amount is a DELTA
+  against that invoice's cumulative refunded figure, which is why its key
+  carries the cumulative total: a second partial refund on the same invoice
+  raises `Invoice.refundedAmount` instead of creating a second invoice, and
+  keyed on the invoice number alone it was permanently lost.
 
 Verification status of the SFCC API facts the cartridge relies on is recorded
 in ``docs/SFCC_TELEMETRY.md``.
@@ -77,6 +82,16 @@ _MONEY_EVENT_TYPES = frozenset({"order.paid", "payment.succeeded", "refund.succe
 # not from a capture. Naming the basis is what makes a divergence from the PSP's
 # figure diagnosable rather than invisible.
 _ORDER_PAID_AMOUNT_SEMANTICS = "order_total_gross"
+
+# A sweep `refund.succeeded` amount is the DIFFERENCE between the credit
+# invoice's cumulative `refundedAmount` and the last figure the cartridge
+# observed for that same invoice — never the invoice's own total. That is what
+# lets a second partial refund against ONE invoice land as a second row (its
+# `refund_id` is `<invoiceNumber>:<cumulative>`) and still sum to the invoice's
+# cumulative figure, because the funnel takes `max(amount)` per `refund_id` and
+# sums distinct `refund_id`s inside one authority. Reading a row's amount as the
+# invoice total would over-report; naming the basis is what stops that.
+_REFUND_AMOUNT_SEMANTICS = "invoice_cumulative_delta"
 
 
 class UnsupportedSFCCEvent(ValueError):
@@ -199,6 +214,8 @@ def map_sfcc_integration_event(
     }
     if native_type == "order.paid":
         metadata["native_amount_semantics"] = _ORDER_PAID_AMOUNT_SEMANTICS
+    elif native_type == "refund.succeeded":
+        metadata["native_amount_semantics"] = _REFUND_AMOUNT_SEMANTICS
     metadata = {key: value for key, value in metadata.items() if value not in (None, [], {})}
     canonical_type = _CANONICAL_TYPES[native_type]
     return MerchantCommerceEvent(

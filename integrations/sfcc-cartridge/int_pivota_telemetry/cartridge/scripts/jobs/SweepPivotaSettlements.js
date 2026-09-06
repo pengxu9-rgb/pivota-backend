@@ -29,13 +29,31 @@
  *      `pivotaRefundedInvoices`) written only AFTER a successful enqueue. This
  *      is what stops the sweep re-emitting on every tick.
  *   2. A DETERMINISTIC `event_id` per fact — `order.paid:<orderNo>`,
- *      `order.cancelled:<orderNo>`, `refund.succeeded:<invoiceNumber>`. The
- *      receiver hashes it into the canonical event key, and the ledger dedupes
- *      first-write-wins on that key. So an enqueue that succeeded while the
- *      marker write failed (or a marker that aged out of the capped refund set)
- *      costs a duplicate delivery, never a duplicate ledger row. The random
- *      UUID `Telemetry.buildEvent` mints for shopper hooks would NOT have that
- *      property, which is why these events override it.
+ *      `order.cancelled:<orderNo>`,
+ *      `refund.succeeded:<invoiceNumber>:<cumulative>`. The receiver hashes it
+ *      into the canonical event key, and the ledger dedupes first-write-wins on
+ *      that key. So an enqueue that succeeded while the marker write failed (or
+ *      a marker that aged out of the capped refund set) costs at most a
+ *      redundant delivery, never a duplicate ledger row — and while the row is
+ *      still in the local outbox it does not even cost that, because
+ *      `Telemetry.enqueue` treats an occupied outbox key as success rather than
+ *      raising on it. The random UUID `Telemetry.buildEvent` mints for shopper
+ *      hooks would NOT have the dedupe property, which is why these events
+ *      override it.
+ *
+ * Refunds are emitted as DELTAS, and that is the reason the refund key carries
+ * a cumulative figure rather than the invoice number alone. `Invoice.refundedAmount`
+ * is the money returned against that invoice SO FAR: a second partial refund
+ * against the same invoice RAISES it instead of creating a second invoice. Keyed
+ * on the invoice number alone, the second partial refund was permanently lost
+ * twice over — the once-only marker skipped it, and even without the marker the
+ * ledger deduped it against the first observation's key. So each tick compares
+ * the invoice's current cumulative figure with the last one this cartridge
+ * observed (stored in the marker) and enqueues the DIFFERENCE under a key
+ * qualified by the new cumulative total. The funnel takes `max(amount)` per
+ * `refund_id` and SUMS across distinct `refund_id`s inside one authority, so
+ * `10.00` then `15.00` reports `25.00` refunded, and a redelivery of either
+ * still dedupes.
  *
  * Emitting `order.paid` and NOT a per-capture `payment.succeeded` is a decision
  * taken against the funnel, not a shortcut. In
@@ -90,9 +108,21 @@ var MAX_MAX_FAILURE_LAG_HOURS = 168;
 // It is bounded so one catastrophic run cannot write an unbounded log line.
 var MAX_REPORTED_FAILURES = 50;
 var MAX_INVOICES_PER_ORDER = 50;
-// A set-of-string cannot grow without bound. An order with more credit
-// invoices than this loses its oldest markers; the deterministic refund event
-// id (the invoice number) is what keeps that from double-counting.
+// A set-of-string cannot grow without bound. Each marker is
+// `<invoiceNumber>:<last observed cumulative refunded amount>` and there is at
+// most ONE per invoice — a new observation REPLACES that invoice's marker
+// rather than appending — so this caps the number of refunded invoices per
+// order, not the number of observations.
+//
+// An order that exceeds it loses its oldest markers. A re-observation of a lost
+// marker at an UNCHANGED cumulative figure is harmless: the key is the same, so
+// the ledger dedupes it. A lost marker whose invoice is refunded again AFTER
+// the loss is the one residual — it reports the whole cumulative figure as the
+// delta and over-reports that invoice. `MAX_INVOICES_PER_ORDER` reads only the
+// first 50 invoices of an order per tick, so reaching 200 markers at all takes
+// an invoice collection whose membership changes between ticks. Both bounds and
+// what they leave behind are written down in docs/SFCC_TELEMETRY.md rather than
+// papered over.
 var MAX_REFUND_MARKERS = 200;
 
 var PAID_MARKER = 'pivotaPaidEmittedAt';
@@ -204,14 +234,75 @@ function refundMarkers(order) {
     return list;
 }
 
-function rememberRefund(order, markers, invoiceNumber) {
-    var next = markers.concat([invoiceNumber]);
+/**
+ * A refund marker is `<invoiceNumber>:<cumulative refunded amount>`, and it is
+ * also the event's `refund_id` — one string carrying both "which invoice" and
+ * "how far this cartridge has already reported it".
+ *
+ * The amount half is formatted to two decimals so the SAME observation always
+ * produces the SAME key: the key is what the ledger dedupes on, so `10.5` and
+ * `10.50` must not be two different refunds.
+ */
+function stableAmount(value) {
+    return Number(value).toFixed(2);
+}
+
+function refundKey(invoiceNumber, cumulative) {
+    return invoiceNumber + ':' + stableAmount(cumulative);
+}
+
+/**
+ * The highest cumulative refunded amount this cartridge has already reported
+ * for `invoiceNumber`, or 0 when it has reported none.
+ *
+ * Split on the LAST colon: an invoice number may contain one, the formatted
+ * amount never does. A marker in any other shape is ignored rather than
+ * guessed at — the invoice-number-only marker format the first revision of
+ * this job used never shipped (both revisions are in the same unreleased
+ * change), so there is no migration to do, and a marker this cannot parse
+ * would only cost a redundant re-observation.
+ */
+function observedCumulative(markers, invoiceNumber) {
+    var highest = 0;
+    for (var index = 0; index < markers.length; index += 1) {
+        var marker = markers[index];
+        var separator = marker.lastIndexOf(':');
+        if (separator === -1 || marker.slice(0, separator) !== invoiceNumber) {
+            continue;
+        }
+        var parsed = Number(marker.slice(separator + 1));
+        if (isFinite(parsed) && parsed > highest) {
+            highest = parsed;
+        }
+    }
+    return highest;
+}
+
+function markersWithout(markers, invoiceNumber) {
+    var kept = [];
+    for (var index = 0; index < markers.length; index += 1) {
+        var marker = markers[index];
+        var separator = marker.lastIndexOf(':');
+        if (separator !== -1 && marker.slice(0, separator) === invoiceNumber) {
+            continue;
+        }
+        kept.push(marker);
+    }
+    return kept;
+}
+
+function rememberRefund(order, markers, invoiceNumber, key) {
+    // One marker per invoice: the new cumulative figure supersedes the old one
+    // for that invoice, so the set grows with refunded INVOICES and not with
+    // observations of them.
+    var next = markersWithout(markers, invoiceNumber).concat([key]);
     if (next.length > MAX_REFUND_MARKERS) {
         next = next.slice(next.length - MAX_REFUND_MARKERS);
     }
     Transaction.wrap(function () {
         order.custom[REFUND_MARKER] = next;
     });
+    return next;
 }
 
 function markEmitted(order, attribute) {
@@ -221,15 +312,19 @@ function markEmitted(order, attribute) {
 }
 
 /**
- * The refunded amount of one invoice, or 0 when it is not a settled refund.
+ * The CUMULATIVE refunded amount of one invoice, or 0 when it is not a settled
+ * refund.
  *
- * `refundedAmount` is the money actually returned and is the primary reading;
- * it is trusted on its own, because a positive refunded amount IS the
- * settlement. Only the fallback — a credit-typed invoice whose money lives on
- * the (negative) grand total — additionally insists the invoice is PAID, since
- * a grand total alone says what the invoice is worth, not that it settled.
+ * `refundedAmount` is the money actually returned SO FAR and is the primary
+ * reading; it is trusted on its own, because a positive refunded amount IS the
+ * settlement. It is cumulative per INVOICE, not per refund — a second partial
+ * refund against the same invoice raises it — which is why `emitRefunds` sends
+ * the difference against the last figure it observed rather than this number.
+ * Only the fallback — a credit-typed invoice whose money lives on the
+ * (negative) grand total — additionally insists the invoice is PAID, since a
+ * grand total alone says what the invoice is worth, not that it settled.
  */
-function refundAmount(invoice) {
+function cumulativeRefundAmount(invoice) {
     var refunded = moneyValue(invoice && invoice.refundedAmount);
     if (refunded !== null && refunded > 0) {
         return refunded;
@@ -255,7 +350,8 @@ function refundAmount(invoice) {
  * `dw.order.Invoice` the accessor is `getInvoiceType()`, so the script-API
  * property is `invoiceType`; `type` is very likely `undefined` there. Reading
  * `type` alone therefore made this entire fallback dead code against a real
- * credit invoice — `refundAmount`'s grand-total path could never be reached,
+ * credit invoice — `cumulativeRefundAmount`'s grand-total path could never be
+ * reached,
  * and the "skipped, amount is not positive" WARN that a support engineer would
  * use to notice a mis-shaped credit invoice could never fire. `type` is kept as
  * the second reading because it costs nothing and a realm that does surface it
@@ -370,13 +466,38 @@ function emitRefunds(order, occurredAt, counts) {
     for (var index = 0; index < invoices.length; index += 1) {
         var invoice = invoices[index];
         var invoiceNumber = invoice && invoice.invoiceNumber ? String(invoice.invoiceNumber) : null;
-        if (!invoiceNumber || markers.indexOf(invoiceNumber) !== -1) {
+        if (!invoiceNumber) {
             continue;
         }
-        var amount = refundAmount(invoice);
-        if (!(amount > 0)) {
+        var cumulative = cumulativeRefundAmount(invoice);
+        var previous = observedCumulative(markers, invoiceNumber);
+        if (cumulative < previous) {
+            // Money does not un-refund. A cumulative figure that DROPPED is a
+            // reversal, a correction or a mis-read, and there is nothing safe
+            // to send: a negative amount is refused by the mapper, and
+            // re-sending the lower figure under a new key would ADD refunded
+            // money, because the funnel sums distinct refund ids inside one
+            // authority. Say so and leave the higher marker standing.
+            logger.warn(
+                'Pivota sweep skipped refund.succeeded for order {0} invoice {1}: the cumulative ' +
+                'refunded amount fell from {2} to {3}; nothing was emitted and the marker was kept',
+                order.orderNo,
+                invoiceNumber,
+                stableAmount(previous),
+                stableAmount(cumulative)
+            );
+            counts.skipped += 1;
+            continue;
+        }
+        var delta = cumulative - previous;
+        if (!(delta > 0)) {
+            if (previous > 0) {
+                // Nothing new since the last observation. This is the ordinary
+                // steady state on every tick after the first, so it is silent.
+                continue;
+            }
             // Not a settled refund (or a credit invoice whose amount is zero).
-            // A zero-amount refund.succeeded keyed on this invoice number would
+            // A zero-amount refund.succeeded keyed on this invoice would
             // permanently shadow the real figure, so nothing is enqueued and
             // nothing is marked.
             if (isCreditInvoice(invoice)) {
@@ -389,11 +510,16 @@ function emitRefunds(order, occurredAt, counts) {
             }
             continue;
         }
+        // The key carries the NEW cumulative total, so a second partial refund
+        // on the same invoice is a second ledger row rather than a duplicate of
+        // the first; the amount is the DELTA, so the two sum to the cumulative
+        // figure instead of double-counting the first partial.
+        var key = refundKey(invoiceNumber, cumulative);
         var enqueued = Telemetry.safeEnqueue('refund.succeeded', order, null, {
-            event_id: 'refund.succeeded:' + invoiceNumber,
+            event_id: 'refund.succeeded:' + key,
             occurred_at: occurredAt,
-            amount: String(amount),
-            refund_id: invoiceNumber,
+            amount: stableAmount(delta),
+            refund_id: key,
             status: invoice.status ? String(invoice.status) : null,
             items: false
         });
@@ -401,8 +527,7 @@ function emitRefunds(order, occurredAt, counts) {
             complete = false;
             continue;
         }
-        rememberRefund(order, markers, invoiceNumber);
-        markers = markers.concat([invoiceNumber]);
+        markers = rememberRefund(order, markers, invoiceNumber, key);
         counts.refunds += 1;
     }
     return complete;
@@ -456,6 +581,7 @@ function execute(parameters) {
     // that is exactly the run that most needs the bound.
     var newestSeen = null;
     var failures = [];
+    var abandonedOrders = [];
     var iterator = null;
     try {
         iterator = OrderMgr.searchOrders('lastModified >= {0}', 'lastModified asc', since);
@@ -529,24 +655,37 @@ function execute(parameters) {
     if (newestSeen && effective) {
         var lagBound = new Date(newestSeen.getTime() - maxFailureLagHours * 60 * 60 * 1000);
         if (effective.getTime() < lagBound.getTime()) {
-            var abandoned = [];
             for (var failureIndex = 0; failureIndex < failures.length; failureIndex += 1) {
                 var failure = failures[failureIndex];
                 if (!failure.at || failure.at.getTime() < lagBound.getTime()) {
-                    abandoned.push(failure.orderNo);
+                    abandonedOrders.push(failure.orderNo);
                 }
             }
-            logger.error(
-                'Pivota settlement sweep ABANDONED order(s) so the cursor could move past ' +
-                'them: {0}. They failed every attempt for longer than MaxFailureLagHours={1}h; ' +
-                'their settlement, cancellation and refund events were NEVER emitted and must ' +
-                'be replayed by hand. {2} order(s) failed this run in total; at most {3} order ' +
-                'numbers are listed here.',
-                abandoned.join(', ') || '(no order number was readable)',
-                maxFailureLagHours,
-                counts.failed,
-                MAX_REPORTED_FAILURES
-            );
+            if (abandonedOrders.length) {
+                logger.error(
+                    'Pivota settlement sweep ABANDONED order(s) so the cursor could move past ' +
+                    'them: {0}. They failed every attempt for longer than MaxFailureLagHours={1}h; ' +
+                    'their settlement, cancellation and refund events were NEVER emitted and must ' +
+                    'be replayed by hand. {2} order(s) failed this run in total; at most {3} order ' +
+                    'numbers are listed here.',
+                    abandonedOrders.join(', '),
+                    maxFailureLagHours,
+                    counts.failed,
+                    MAX_REPORTED_FAILURES
+                );
+            } else {
+                // The bound moved the cursor without any recorded failure being
+                // behind it, so NOTHING was abandoned. Claiming a permanent loss
+                // here would be false, and reporting ERROR would raise a Business
+                // Manager job-failure notification for a run that dropped nothing.
+                logger.warn(
+                    'Pivota settlement sweep advanced its cursor to the MaxFailureLagHours={0}h ' +
+                    'bound; no failing order was behind the bound, so nothing was abandoned. ' +
+                    '{1} order(s) failed this run and are still retried.',
+                    maxFailureLagHours,
+                    counts.failed
+                );
+            }
             effective = lagBound;
         }
     }
@@ -565,7 +704,18 @@ function execute(parameters) {
         ' cancelled=' + counts.cancelled +
         ' refunds=' + counts.refunds +
         ' skipped=' + counts.skipped +
-        ' failed=' + counts.failed;
+        ' failed=' + counts.failed +
+        ' abandoned=' + abandonedOrders.length;
+    if (abandonedOrders.length) {
+        // Settlement facts were permanently dropped. Business Manager notifies
+        // on a job step's non-OK status and on nothing else, so reporting OK
+        // here would leave the ERROR line above sitting unread in the realm's
+        // job log — which, per docs/SFCC_TELEMETRY.md, nothing on the Pivota
+        // side reads either. The step is declared `enforce-restart="false"` in
+        // metadata/jobs.xml, so the next scheduled tick still runs.
+        logger.info(message);
+        return new Status(Status.ERROR, 'ABANDONED', message);
+    }
     logger.info(message);
     return new Status(Status.OK, 'OK', message);
 }

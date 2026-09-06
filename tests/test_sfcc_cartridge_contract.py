@@ -5,6 +5,26 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 CARTRIDGE = ROOT / "integrations" / "sfcc-cartridge"
+SWEEP = (
+    CARTRIDGE / "int_pivota_telemetry/cartridge/scripts/jobs/SweepPivotaSettlements.js"
+)
+
+
+def _function_body(source: str, name: str) -> str:
+    """The whole text of one top-level function: from its `function` keyword to
+    the next top-level `function`.
+
+    Slicing a branch with `split("}", 1)` does NOT work on this file — the first
+    `}` inside `emitPaid`'s skip branch belongs to the `{0}` placeholder in the
+    log format string, so the slice ended before the branch body and every
+    `assert "..." not in slice` in it was vacuous. Cutting on the function
+    boundary first, and on the branch's own terminator second, is what makes
+    those assertions able to fail.
+    """
+    start = source.index("function %s(" % name)
+    rest = source[start:]
+    end = rest.find("\nfunction ")
+    return rest if end == -1 else rest[:end]
 
 
 def test_sfcc_cartridge_manifests_and_impex_are_parseable():
@@ -123,14 +143,14 @@ def test_sfcc_cartridge_never_registers_the_payment_implementation_hooks():
 
 
 def test_sfcc_settlement_sweep_keys_refunds_on_the_invoice_and_only_sends_positive_money():
-    sweep = (
-        CARTRIDGE
-        / "int_pivota_telemetry/cartridge/scripts/jobs/SweepPivotaSettlements.js"
-    ).read_text()
-    # Refunds are keyed on the credit invoice, never the order: two credit
-    # invoices on one order must stay two refund rows.
-    assert "'refund.succeeded:' + invoiceNumber" in sweep
-    assert "refund_id: invoiceNumber" in sweep
+    sweep = SWEEP.read_text()
+    # Refunds are keyed on the credit invoice AND the cumulative figure that
+    # invoice had reached, never on the order: two credit invoices on one order
+    # must stay two refund rows, and two partial refunds against ONE invoice
+    # must stay two rows as well.
+    assert "'refund.succeeded:' + key" in sweep
+    assert "refund_id: key," in sweep
+    assert "var key = refundKey(invoiceNumber, cumulative);" in sweep
     # …and `order.paid` / `order.cancelled` on the order, so a redelivery
     # dedupes in the ledger instead of writing a second row.
     assert "'order.paid:' + order.orderNo" in sweep
@@ -139,14 +159,43 @@ def test_sfcc_settlement_sweep_keys_refunds_on_the_invoice_and_only_sends_positi
     # Only a positive settled amount is enqueued. A zero-amount money event
     # under a native id is a permanent shadow, because the ledger dedupes
     # first-write-wins on the key derived from that id.
-    assert "if (!(amount > 0)) {" in sweep
+    assert "if (!(delta > 0)) {" in sweep
     assert "amount is not positive" in sweep
     assert "if (total === null || total <= 0) {" in sweep
     assert "no positive total gross price" in sweep
-    # The skip must not mark the order as emitted, or a corrected total could
-    # never be reported.
-    paid_skip = sweep.split("if (total === null || total <= 0) {", 1)[1].split("}", 1)[0]
+
+    # The zero-total skip must not mark the order as emitted, or a corrected
+    # total could never be reported. Slice the WHOLE function first, then the
+    # branch up to its own `return true;`.
+    paid = _function_body(sweep, "emitPaid")
+    assert "Telemetry.safeEnqueue('order.paid'" in paid
+    assert "function emitCancelled" not in paid, "the emitPaid slice ran past its end"
+    paid_skip = paid.split("if (total === null || total <= 0) {", 1)[1].split(
+        "return true;", 1
+    )[0]
+    # Positive counterparts: the slice really is the skip branch's body…
+    assert "no positive total gross price" in paid_skip
+    assert "counts.skipped += 1;" in paid_skip
+    # …so this can fail.
     assert "markEmitted" not in paid_skip
+
+    # Same for both refund skip branches: neither enqueues and neither marks.
+    refunds = _function_body(sweep, "emitRefunds")
+    assert "Telemetry.safeEnqueue('refund.succeeded'" in refunds
+    assert "function sweepOrder" not in refunds, "the emitRefunds slice ran past its end"
+    not_positive = refunds.split("if (!(delta > 0)) {", 1)[1].split(
+        "var key = refundKey(", 1
+    )[0]
+    assert "amount is not positive" in not_positive
+    assert "counts.skipped += 1;" in not_positive
+    assert "rememberRefund" not in not_positive
+    assert "safeEnqueue" not in not_positive
+    decreased = refunds.split("if (cumulative < previous) {", 1)[1].split(
+        "var delta =", 1
+    )[0]
+    assert "counts.skipped += 1;" in decreased
+    assert "rememberRefund" not in decreased
+    assert "safeEnqueue" not in decreased
 
     # An enqueue that failed must not be marked as delivered.
     assert "if (!enqueued) {" in sweep
@@ -160,6 +209,146 @@ def test_sfcc_settlement_sweep_keys_refunds_on_the_invoice_and_only_sends_positi
     # mean anything.
     assert "return true;" in telemetry
     assert "return false;" in telemetry
+
+
+def test_sfcc_settlement_sweep_marks_an_order_only_after_the_enqueue():
+    """Order matters, not just presence.
+
+    "Written only AFTER a successful enqueue" is the whole of once-only layer 1.
+    Marked FIRST, an enqueue that then failed would be recorded as delivered and
+    the fact lost for good — and every `markEmitted` / `rememberRefund`
+    assertion elsewhere in this file would still pass, because they only ask
+    whether the call exists. So the position is pinned.
+    """
+    sweep = SWEEP.read_text()
+    assert sweep.index("var enqueued = Telemetry.safeEnqueue('order.paid'") < sweep.index(
+        "markEmitted(order, PAID_MARKER);"
+    )
+    assert sweep.index(
+        "var enqueued = Telemetry.safeEnqueue('order.cancelled'"
+    ) < sweep.index("markEmitted(order, CANCELLED_MARKER);")
+    assert sweep.index("Telemetry.safeEnqueue('refund.succeeded'") < sweep.index(
+        "markers = rememberRefund(order, markers, invoiceNumber, key);"
+    )
+    # And each marker write is guarded by the enqueue's own return value.
+    assert sweep.count("if (!enqueued) {") == 3
+
+
+def test_sfcc_settlement_sweep_emits_refund_deltas_under_a_sequence_qualified_key():
+    """A SECOND partial refund against the SAME invoice must still land.
+
+    `Invoice.refundedAmount` is cumulative per invoice: a second partial refund
+    raises it rather than creating a second invoice. Keyed on the invoice number
+    alone the second refund was lost twice over — the once-only marker skipped
+    the invoice, and even with the marker gone the ledger deduped the event
+    against the first observation's key. So the marker stores the cumulative
+    figure that was reported, the amount sent is the DIFFERENCE, and the key
+    carries the new cumulative total.
+    """
+    sweep = SWEEP.read_text()
+    # The marker IS the refund id: `<invoiceNumber>:<cumulative>`.
+    assert "return invoiceNumber + ':' + stableAmount(cumulative);" in sweep
+    assert "return Number(value).toFixed(2);" in sweep
+    # The last reported cumulative figure is parsed back out of the marker,
+    # splitting on the LAST colon (an invoice number may contain one).
+    assert "var separator = marker.lastIndexOf(':');" in sweep
+    assert "function observedCumulative(markers, invoiceNumber)" in sweep
+    # The amount on the wire is the delta, never the cumulative figure.
+    assert "var delta = cumulative - previous;" in sweep
+    assert "amount: stableAmount(delta)," in sweep
+    assert "amount: stableAmount(cumulative)," not in sweep
+    # A cumulative figure that DROPPED is skipped loudly and never emitted:
+    # a negative amount is refused by the mapper, and re-sending the lower
+    # figure under a new key would ADD refunded money.
+    assert "if (cumulative < previous) {" in sweep
+    assert "refunded amount fell from {2} to {3}" in sweep
+    # One marker per invoice — a new observation replaces that invoice's marker
+    # instead of appending, so the capped set bounds refunded INVOICES per
+    # order rather than observations of them.
+    assert "function markersWithout(markers, invoiceNumber)" in sweep
+    assert "markersWithout(markers, invoiceNumber).concat([key])" in sweep
+    assert "MAX_REFUND_MARKERS = 200" in sweep
+
+    docs = (ROOT / "docs/SFCC_TELEMETRY.md").read_text()
+    readme = (CARTRIDGE / "README.md").read_text()
+    # The docs claimed the opposite before this change, in both files.
+    assert "frozen at first observation" not in docs
+    assert "frozen at first observation" not in readme
+    for text in (docs, readme):
+        assert "refund.succeeded:<invoiceNumber>:<cumulative>" in text
+        assert "delta" in text.lower()
+
+
+def test_sfcc_settlement_sweep_reports_an_abandonment_as_a_job_failure():
+    """`Status.OK` is invisible.
+
+    Business Manager fires a job notification on a step's non-OK status and on
+    nothing else, so a run that permanently dropped settlement facts must not
+    report OK — the ERROR line naming the orders would otherwise sit unread in
+    the merchant's own job log, which nothing on the Pivota side reads either.
+    """
+    sweep = SWEEP.read_text()
+    assert "return new Status(Status.ERROR, 'ABANDONED', message);" in sweep
+    assert "if (abandonedOrders.length) {" in sweep
+    assert "' abandoned=' + abandonedOrders.length" in sweep
+    # …and the ERROR log fires only when something really was abandoned. An
+    # empty list is not an abandonment and must not claim a permanent loss.
+    override = sweep.split("if (effective.getTime() < lagBound.getTime()) {", 1)[1]
+    guarded = override.split("if (abandonedOrders.length) {", 1)
+    assert len(guarded) == 2, "the ABANDONED log must be guarded by a non-empty list"
+    logged = guarded[1].split("} else {", 1)
+    assert len(logged) == 2, "the empty case needs its own, quieter branch"
+    assert "logger.error(" in logged[0]
+    assert "ABANDONED" in logged[0]
+    assert "logger.error(" not in logged[1].split("effective = lagBound;", 1)[0]
+    assert "nothing was abandoned" in logged[1]
+
+    # The status code is declared, or Business Manager shows an unknown code.
+    steptypes = json.loads(
+        (CARTRIDGE / "int_pivota_telemetry/steptypes.json").read_text()
+    )
+    sweep_step = next(
+        step
+        for step in steptypes["step-types"]["script-module-step"]
+        if step["@type-id"] == "custom.PivotaSettlementSweep"
+    )
+    codes = {status["@code"] for status in sweep_step["status-codes"]["status"]}
+    assert codes == {"OK", "ABANDONED", "ERROR"}
+
+    # A failing status must not stop the next tick: the step is not restarted.
+    jobs_text = (CARTRIDGE / "metadata/jobs.xml").read_text()
+    assert (
+        '<step step-id="PivotaSettlementSweep" type="custom.PivotaSettlementSweep" '
+        'enforce-restart="false">' in jobs_text
+    )
+    readme = (CARTRIDGE / "README.md").read_text()
+    assert 'enforce-restart="false"' in readme
+
+
+def test_sfcc_outbox_enqueue_treats_an_occupied_key_as_success():
+    """`createCustomObject` raises on a duplicate key.
+
+    The sweep's event ids are deterministic and the drain keeps an undelivered
+    row for up to seven days, so re-enqueuing an event that is still in the
+    outbox is the normal shape of a Pivota outage. Without a lookup first that
+    raise made `safeEnqueue` return false, the sweep counted the order failed,
+    held its cursor, and `MaxFailureLagHours` eventually abandoned it — during
+    the outage.
+    """
+    telemetry = (
+        CARTRIDGE / "int_pivota_telemetry/cartridge/scripts/pivota/Telemetry.js"
+    ).read_text()
+    assert "CustomObjectMgr.getCustomObject(OUTBOX_TYPE, key)" in telemetry
+    assert telemetry.index(
+        "CustomObjectMgr.getCustomObject(OUTBOX_TYPE, key)"
+    ) < telemetry.index("CustomObjectMgr.createCustomObject(OUTBOX_TYPE, key)")
+    # It is a SUCCESS, not a swallowed failure: nothing is thrown and nothing
+    # is written, and the outcome is logged at debug rather than error.
+    assert "existed = true;" in telemetry
+    assert "Logger.debug(" in telemetry
+    assert "already queued" in telemetry
+    docs = (ROOT / "docs/SFCC_TELEMETRY.md").read_text()
+    assert "occupied outbox key" in docs
 
 
 def test_sfcc_settlement_sweep_has_a_bounded_cursor_with_an_overlap_window():
@@ -250,7 +439,7 @@ def test_sfcc_settlement_sweep_bounds_the_failure_clamp_so_a_poison_order_cannot
     assert "logger.error(" in override_body
     assert "ABANDONED" in override_body
     # The log names the orders, so support can replay them by hand.
-    assert "abandoned.join(', ')" in override_body
+    assert "abandonedOrders.join(', ')" in override_body
     assert "failure.orderNo" in override_body
     assert "effective = lagBound;" in override_body
 

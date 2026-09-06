@@ -94,6 +94,10 @@
               "description": "The sweep completed; per-order failures are counted in the message and retried next run."
             },
             {
+              "@code": "ABANDONED",
+              "description": "The MaxFailureLagHours bound moved the cursor past order(s) that failed every attempt. Their settlement, cancellation and refund events were never emitted and must be replayed by hand; the order numbers are in the job log at ERROR. Reported as a step ERROR so Business Manager job notifications fire; the step is enforce-restart=\"false\", so the next scheduled run still proceeds."
+            },
+            {
               "@code": "ERROR",
               "description": "The cursor could not be read or the order search failed; nothing was swept."
             }

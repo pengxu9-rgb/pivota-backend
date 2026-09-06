@@ -118,15 +118,54 @@ cartridge's outbox deletes the batch rather than retrying forever.
 | `dw.ocapi.shop.order.payment_instrument.afterPOST` | `payment.authorized` / `payment.declined` | same | the **instrument** amount, never the order total (split tender) |
 | **sweep**, `paymentStatus == PAID` | `order.paid` | `order.paid` | `Order.totalGrossPrice` |
 | **sweep**, `status == CANCELLED` | `order.cancelled` | `order.cancelled` | none |
-| **sweep**, credit `Invoice` with a positive refund | `refund.succeeded` | `refund.succeeded` | that invoice's refunded amount |
-| **sweep**, any of the three with a non-positive amount | **nothing** — logged and skipped | — | — |
+| **sweep**, credit `Invoice` whose cumulative refunded amount ROSE | `refund.succeeded` | `refund.succeeded` | the **delta** since the last observation of that invoice |
+| **sweep**, any of the three with a non-positive amount (or a cumulative refund figure that fell) | **nothing** — logged and skipped | — | — |
 
 `order_ref` is always `salesforce_commerce_cloud:<orderNo>`.
 
-`refund.succeeded` is keyed on the **invoice number** and its amount is frozen
-at first observation, so a further partial refund later recorded against the
-**same** invoice is never re-emitted — only a new invoice produces a new refund
-row.
+### `refund.succeeded` is a DELTA, and its key says how far it counted
+
+`Invoice.refundedAmount` is **cumulative per invoice**: SFCC does not create a
+second invoice for a second partial refund against the same one, it raises that
+invoice's figure. Keyed on the invoice number alone — as the first revision of
+this sweep was — a second partial refund was lost **twice over**: the once-only
+marker skipped the invoice, and even with the marker gone the ledger deduped the
+new event against the first observation's key.
+
+So each tick compares the invoice's current cumulative figure against the last
+one this cartridge observed for it, and:
+
+* enqueues the **difference**, never the cumulative total, as the amount;
+* keys the event on `<invoiceNumber>:<the new cumulative total>`, which is also
+  its `refund_id`, so a second partial refund is a second ledger row and a
+  redelivery of either is still a duplicate;
+* stores that same string as the once-only marker, so the marker records both
+  *which* invoice and *how far* it has been reported;
+* skips — loudly, at WARN, emitting nothing — a cumulative figure that
+  **fell**. A negative amount is refused by the mapper anyway, and re-sending
+  the lower figure under a new key would *add* refunded money.
+
+The funnel is what makes the deltas add up: it takes `max(amount)` per
+`refund_id` and **sums across distinct `refund_id`s** inside one authority, so
+`10.00` then `15.00` on one invoice reports `25.00` refunded, once.
+`tests/test_sfcc_ledger_end_to_end.py` proves that through the real route and
+the real funnel, redelivery included.
+
+Each row carries `native_amount_semantics = invoice_cumulative_delta`, because a
+delta read as an invoice total would over-report exactly the invoice this
+scheme exists to handle.
+
+**Two bounds, and the residual each leaves.** Each tick reads at most the first
+**50 invoices** of an order, and the marker set holds at most one marker per
+invoice (a new observation replaces that invoice's marker) capped at **200**.
+
+* An order with more than 50 invoices has the rest ignored entirely — their
+  refunds are never reported. Nothing warns about it.
+* Because of that read cap the 200-marker cap is only reachable when the invoice
+  collection's membership changes across ticks. If a marker ever *is* evicted,
+  re-observing that invoice at an unchanged cumulative figure is free (same key,
+  deduped); an invoice refunded *again* after its marker was evicted reports its
+  whole cumulative figure as the delta and over-reports that invoice.
 
 ### Event keys, and why they are deterministic
 
@@ -139,34 +178,46 @@ the canonical event key:
 | --- | --- |
 | paid | `order.paid:<orderNo>` |
 | cancelled | `order.cancelled:<orderNo>` |
-| refund | `refund.succeeded:<invoiceNumber>` |
+| refund | `refund.succeeded:<invoiceNumber>:<cumulative>` |
 
-Two credit invoices on one order are therefore two rows, and a redelivery of
-either is a duplicate rather than a second row.
+Two credit invoices on one order are therefore two rows, two partial refunds
+against one invoice are also two rows, and a redelivery of any of them is a
+duplicate rather than a second row.
 
 ### Once-only, in two independent layers
 
 1. **Order custom attributes** — `pivotaPaidEmittedAt`,
-   `pivotaCancelledEmittedAt`, `pivotaRefundedInvoices` (a `set-of-string`,
-   capped at 200), shipped in
+   `pivotaCancelledEmittedAt`, `pivotaRefundedInvoices` (a `set-of-string` of
+   `<invoiceNumber>:<cumulative>` markers, one per invoice, capped at 200),
+   shipped in
    `integrations/sfcc-cartridge/metadata/meta/system-objecttype-extensions.xml`.
    Written only **after** a successful enqueue, so a failed enqueue is retried
    next tick instead of being recorded as delivered. This is what stops the
    outbox growing.
 2. **The deterministic event key above**, deduped first-write-wins by the
    ledger. This is what stops a *count* being wrong when layer 1 is lost — a
-   marker cleared in Business Manager, a restore, an invoice number aged out of
+   marker cleared in Business Manager, a restore, an invoice marker aged out of
    the capped set, or a marker write that failed after the enqueue succeeded.
 
 Neither layer alone is enough, and neither is a substitute for the other.
+
+A third thing follows from layer 2 and is easy to get wrong: because the ids are
+deterministic, an **occupied outbox key** is normal. `CustomObjectMgr.createCustomObject`
+*raises* on a duplicate key, and the drain keeps an undelivered row for up to
+seven days — so re-enqueuing an event that is still queued (a marker that did
+not stick, or the cursor's overlap window coming round) is the ordinary shape of
+a Pivota outage. `Telemetry.enqueue` therefore looks the key up first and treats
+an existing row as **success**, logged at debug. Without that, the re-enqueue
+threw, the sweep counted the order failed, held its cursor, and
+`MaxFailureLagHours` eventually abandoned it — during the outage.
 
 ### `order.paid`: what the amount and the time actually mean
 
 * The amount is **`Order.totalGrossPrice`**, the order total — not a capture,
   not `PARTPAID`, not the PSP's settled figure. The event carries
   `native_amount_semantics = order_total_gross` so a divergence from the PSP's
-  own number is diagnosable rather than invisible. (`order.paid` is the only
-  event that carries this key; a refund's amount is the invoice's own.)
+  own number is diagnosable rather than invisible. (`refund.succeeded` carries
+  the same key with `invoice_cumulative_delta`; no other SFCC event carries it.)
 * `occurred_at` is the order's **`lastModified`**. SFCC records no settlement
   instant anywhere, so this is the best time available; it equals the transition
   only when nothing touched the order afterwards. This is stated here rather
@@ -176,6 +227,24 @@ Neither layer alone is enough, and neither is a substitute for the other.
 * The amount is **frozen** at the first emission. The ledger dedupes
   first-write-wins on the event key, and that key is the order — so a later
   correction to `totalGrossPrice` does not update the recorded figure.
+
+### Two funnel consequences worth stating
+
+**A free (zero-total) order never reaches the paid stage.** `order.paid` is
+skipped when `totalGrossPrice` is not positive — the zero-amount rule below —
+so a 100%-discounted or zero-priced order stays at `order.created` in the funnel
+for good, even though SFCC may well mark it `PAID`. It is not a lost settlement;
+there is no money to report.
+
+**A paid-then-cancelled order keeps its paid GMV.** `order.cancelled` moves no
+money and carries none, and the funnel never subtracts on a cancellation — paid
+amounts are `max` per order and refunds are counted only from
+`refund.succeeded`. So an order that settled and was then cancelled still counts
+its full amount in `paid_amount_cents_by_currency` unless a credit `Invoice`
+appears for it. That is a pre-existing property of
+`merchant_commerce_event_funnel_service`, not new here; SFCC is simply the first
+platform where the sweep makes it reachable, because it is the first to report
+both facts.
 
 ### Why no per-capture `payment.succeeded`
 
@@ -256,6 +325,18 @@ silent stall — and it is logged at **ERROR** naming the order numbers (up to 5
 per run) so support can replay them by hand. A transient failure well inside the
 bound is still simply retried on the next tick.
 
+The step also **returns `Status(ERROR, 'ABANDONED')`** on such a run (the code is
+declared in `steptypes.json`, and the run's counts, including `abandoned=`, are
+in the status message). Business Manager fires a job notification on a non-OK
+step status and on nothing else, so reporting `OK` would leave that ERROR line
+sitting in the merchant's own job log, which — per *Not built* below — nothing
+on the Pivota side reads either. The step is declared `enforce-restart="false"`
+in `metadata/jobs.xml`, so the next scheduled tick still runs normally.
+
+If the bound moves the cursor while **no** recorded failure was actually behind
+it, nothing was abandoned: that run logs a WARN instead, claims no loss, and
+returns `OK`.
+
 Writing a once-only marker updates the order's `lastModified`, so an order the
 sweep just marked is re-examined on the following tick and then skipped without
 a write. That converges after one extra pass; it is not a loop.
@@ -267,8 +348,8 @@ payment instrument details, no authentication token, no product titles. The
 sweep's events carry no line items at all (`items: []`): an order's lines are
 not a refund's lines, and a settlement event does not need them. Metadata is
 `native_event_name`, `native_status`, `native_site_id`, `native_line_items` (on
-the shopper-hook events only), `native_amount_semantics` (on `order.paid` only)
-and `webhook_delivery_id` — all already in
+the shopper-hook events only), `native_amount_semantics` (on `order.paid` and
+`refund.succeeded`) and `webhook_delivery_id` — all already in
 `ALLOWED_MERCHANT_METADATA_KEYS`; **the allowlist was not widened.**
 
 ## SFCC facts: verified vs assumed
@@ -289,18 +370,22 @@ marked ASSUMED is a claim a merchant install will be the first thing to test.
 | `dw.value.Money` has `available` and `value` | VERIFIED — `dw.value.Money` |
 | `dw.order.hooks.PaymentHooks` defines `dw.order.payment.capture(invoice)` / `.refund(invoice)` as IMPLEMENTATION extension points resolved by cartridge-path order | VERIFIED — the reason this cartridge must not register on them |
 | `OrderMgr.searchOrders(query, sort, args…)` returns a `SeekableIterator` that must be `close()`d | VERIFIED — `dw.order.OrderMgr` |
-| `lastModified` is queryable in an `OrderMgr.searchOrders` query string, and `'lastModified asc'` is a valid sort | **ASSUMED** — stated in the programme brief; not re-verified against the search-attribute reference. If it is not queryable the sweep finds nothing and says `scanned=0`, which is a loud, safe failure |
+| `lastModified` is queryable in an `OrderMgr.searchOrders` query string, and `'lastModified asc'` is a valid sort | **ASSUMED** — stated in the programme brief; not re-verified against the search-attribute reference. If the attribute is not queryable the call **throws**: `searchOrders` is inside the guarded block, so the step logs `Pivota settlement sweep failed:` and returns `Status.ERROR` without advancing its cursor. Loud and safe, but it is a job failure, not a quiet `scanned=0` |
 | `Order.getInvoices()` returns a collection of `dw.order.Invoice` | **ASSUMED** — `Invoice` is an Order Management extension surface; the call is wrapped in `try/catch` and a realm without it logs one INFO line and reports no refunds |
 | `Invoice.invoiceNumber`, `Invoice.status`, `Invoice.grandTotal`, `Invoice.refundedAmount` | **ASSUMED** — same family. Absent members read as `undefined` and the invoice is skipped, never crash-emitted |
 | `Invoice.invoiceType` is the invoice's type property | **ASSUMED, and read FIRST** — the documented accessor is `getInvoiceType()`, so the script-API property is `invoiceType`. Not executed, hence assumed |
-| `Invoice.type` is *also* a readable type property | **ASSUMED FALSE / very likely `undefined`** — there is no `getType()` on `dw.order.Invoice`. It is read only as the SECOND choice, which costs nothing if it is absent. An earlier revision of this cartridge read `type` **alone**, which made the whole credit-invoice fallback dead code against a real credit invoice: `refundAmount`'s grand-total path was unreachable and the "skipped, amount is not positive" WARN could never fire |
+| `Invoice.type` is *also* a readable type property | **ASSUMED FALSE / very likely `undefined`** — there is no `getType()` on `dw.order.Invoice`. It is read only as the SECOND choice, which costs nothing if it is absent. An earlier revision of this cartridge read `type` **alone**, which made the whole credit-invoice fallback dead code against a real credit invoice: `cumulativeRefundAmount`'s grand-total path was unreachable and the "skipped, amount is not positive" WARN could never fire |
 | `Invoice.INVOICE_TYPE_CREDIT` exists as a constant with that exact name | **NOT RELIED ON.** The author could not confirm this spelling (the type constants may be `TYPE_RETURN` / `TYPE_APPEASEMENT` / `TYPE_RETURN_CASE`), and a mis-named constant reads as `undefined`, which would match no invoice and silently report zero refunds. So the sweep classifies by lowercase substring of `String(invoice.invoiceType \|\| invoice.type)` — `credit`, `return`, `appeasement` — and only as a FALLBACK: the primary rule is `refundedAmount > 0`, which needs no type at all |
 | `Invoice.status` string contains `paid` when the invoice settled | **ASSUMED** — matched case-insensitively, and only on the fallback path; `refundedAmount > 0` is trusted on its own |
 | A refund made in the PSP's own dashboard leaves no trace in SFCC | VERIFIED — SFCC learns of it only if an integration writes an invoice back. Documented gap, below |
 | Custom attributes on `Order` require `metadata/meta/system-objecttype-extensions.xml` and a `Transaction` to write | VERIFIED — standard SFCC |
 | Writing a custom attribute updates the object's `lastModified` | **ASSUMED** — the sweep is written to converge either way; if it does not, the order simply leaves the window sooner |
 | A `set-of-string` custom attribute reads back as a native `Array` | **ASSUMED** — the sweep accepts an `Array` *or* a `dw.util.Collection` rather than betting on one |
+| A `set-of-string` custom attribute can be WRITTEN as a native JS `Array` (`order.custom.pivotaRefundedInvoices = ['INV-1:10.00']`) | **ASSUMED** — the read side is defensive, the write side is not: it assigns a plain `Array`. If the platform demands a `dw.util.Collection` (or an `ArrayList`) instead, every refund-marker write throws inside its `Transaction`, `sweepOrder` counts the order failed, and the refunds are re-enqueued on every tick — deduped by the ledger, but the outbox never settles and `MaxFailureLagHours` eventually abandons the order. First thing to check on a merchant sandbox |
+| `String(enumValue)` on an `EnumValue` yields its VALUE, not its display value | **ASSUMED** — used only on `Invoice.status` in the credit-invoice fallback, which asks whether the lowercased text contains `paid` and not `not`. If it yields a localized display value instead, that fallback stops classifying and the invoice is skipped with the "amount is not positive" WARN; the primary `refundedAmount > 0` path does not read status at all. `Order.paymentStatus` / `Order.status` are compared on `.value` against `Order` constants, never on text, so they are unaffected |
 | `CustomObjectMgr.getCustomObject` / `createCustomObject` / `queryCustomObjects`, `Transaction.wrap`, `dw.system.Status`, `dw.system.Logger` | VERIFIED — already used by the shipped drain job |
+| `CustomObjectMgr.createCustomObject` raises when the key is already taken | VERIFIED — the reason `Telemetry.enqueue` looks the key up first and treats an existing row as success |
+| A job step's `Status` code other than `OK` is what Business Manager notifies on | **ASSUMED** — the basis for returning `Status(ERROR, 'ABANDONED')`; the notification itself is configured per job in Business Manager and cannot be asserted from here |
 | A job step's `parameters` reach `execute` as an object keyed by `@name` | VERIFIED — already relied on by `PivotaTelemetryDrain`'s `BatchSize` |
 
 ## Not built
@@ -322,8 +407,10 @@ funnel until it reaches `PAID`.
 **No receiver-side staleness signal.** Nothing on the Pivota side notices an
 SFCC store whose sweep stopped running, whose cursor is stuck, or whose job was
 never scheduled. The cartridge logs its counts (`scanned=… paid=… cancelled=…
-refunds=… skipped=… failed=…`) into the realm's own job log, where only the
-merchant can see them.
+refunds=… skipped=… failed=… abandoned=…`) into the realm's own job log, where
+only the merchant can see them. The one exception is an abandonment: that also
+makes the step report `Status(ERROR, 'ABANDONED')`, which Business Manager can
+notify the merchant on — still the merchant, not Pivota.
 
 **Nothing verifies the cartridge runs.** `tests/test_sfcc_cartridge_contract.py`
 is text matching over unexecuted JavaScript. The first real execution of

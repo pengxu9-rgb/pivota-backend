@@ -491,9 +491,59 @@ def test_sfcc_refund_is_keyed_on_the_invoice_so_two_credits_stay_two_events():
     assert first.event_id != second.event_id
     assert (first.amount_cents, second.amount_cents) == (1000, 500)
     assert first.order_id == second.order_id == "order-44"
-    # `order.paid` alone carries the semantics marker; a refund's amount is the
-    # invoice's own, not the order total.
-    assert "native_amount_semantics" not in first.metadata
+    # A refund's amount is neither the order total nor the invoice's cumulative
+    # figure: it is the DELTA that observation added. Reading a row as the
+    # invoice total would over-report an invoice refunded twice, so the basis is
+    # named on the row.
+    assert first.metadata["native_amount_semantics"] == "invoice_cumulative_delta"
+    assert first.metadata["native_amount_semantics"] != "order_total_gross"
+
+
+def test_sfcc_two_partial_refunds_on_one_invoice_stay_two_events():
+    """`Invoice.refundedAmount` is cumulative per INVOICE.
+
+    A second partial refund raises it instead of creating a second invoice, so
+    a `refund_id` of the bare invoice number made the second refund a duplicate
+    of the first and lost it for good. The sweep qualifies the id with the
+    cumulative total the invoice reached and sends the difference.
+    """
+    from services.sfcc_event_adapter import map_sfcc_integration_event
+
+    first = map_sfcc_integration_event(
+        _sweep_event(
+            "refund.succeeded",
+            event_id="refund.succeeded:INV-1:10.00",
+            refund_id="INV-1:10.00",
+            amount="10.00",
+        ),
+        store_id="store-sfcc",
+    )
+    second = map_sfcc_integration_event(
+        _sweep_event(
+            "refund.succeeded",
+            event_id="refund.succeeded:INV-1:25.00",
+            refund_id="INV-1:25.00",
+            amount="15.00",
+        ),
+        store_id="store-sfcc",
+    )
+
+    # Same invoice, two ledger rows — and the funnel sums distinct refund ids
+    # inside one authority, so the two deltas report the cumulative 25.00.
+    assert first.event_id != second.event_id
+    assert (first.refund_id, second.refund_id) == ("INV-1:10.00", "INV-1:25.00")
+    assert (first.amount_cents, second.amount_cents) == (1000, 1500)
+    # A redelivery of either is still the same key.
+    replay = map_sfcc_integration_event(
+        _sweep_event(
+            "refund.succeeded",
+            event_id="refund.succeeded:INV-1:25.00",
+            refund_id="INV-1:25.00",
+            amount="15.00",
+        ),
+        store_id="store-sfcc",
+    )
+    assert replay.event_id == second.event_id
 
 
 @pytest.mark.parametrize("event_type", ["order.paid", "payment.succeeded", "refund.succeeded"])

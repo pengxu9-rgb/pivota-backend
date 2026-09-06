@@ -12,7 +12,11 @@ on an id it derived itself. That makes two properties load-bearing here rather
 than incidental:
 
 * two credit invoices on one order must stay two refund rows (keyed on the
-  invoice number, never the order), and
+  invoice, never the order), and so must two partial refunds against ONE
+  invoice — `Invoice.refundedAmount` is cumulative per invoice, so the sweep
+  sends the DELTA under a key qualified by the cumulative total it reached, and
+  the funnel's `max(amount)` per `refund_id` then SUMS to the invoice's
+  cumulative figure; and
 * a redelivery — which a cursor with an overlap window makes routine, not
   exceptional — must dedupe instead of doubling the money.
 """
@@ -93,14 +97,20 @@ def _cancelled_event():
     )
 
 
-def _refund_event(invoice_number, amount, occurred_at):
+def _refund_event(refund_id, amount, occurred_at):
+    """One refund observation.
+
+    `refund_id` is what the sweep sends: `<invoiceNumber>:<the cumulative
+    refunded amount that invoice had reached>`. `amount` is the DELTA that
+    observation added, not the cumulative figure.
+    """
     return _sweep_event(
         "refund.succeeded",
-        event_id=f"refund.succeeded:{invoice_number}",
+        event_id=f"refund.succeeded:{refund_id}",
         occurred_at=occurred_at,
         amount=amount,
         status="PAID",
-        refund_id=invoice_number,
+        refund_id=refund_id,
     )
 
 
@@ -218,8 +228,8 @@ async def test_a_signed_sweep_batch_lands_paid_cancelled_and_two_refunds(
             client,
             [
                 _paid_event(),
-                _refund_event("INV-77", "10.50", REFUND_ONE_AT),
-                _refund_event("INV-78", "5.00", REFUND_TWO_AT),
+                _refund_event("INV-77:10.50", "10.50", REFUND_ONE_AT),
+                _refund_event("INV-78:5.00", "5.00", REFUND_TWO_AT),
                 _cancelled_event(),
             ],
             delivery_id="delivery-1",
@@ -268,10 +278,15 @@ async def test_a_signed_sweep_batch_lands_paid_cancelled_and_two_refunds(
         refunds = by_type["refund.succeeded"]
         assert len(refunds) == 2
         assert sorted(row["payload"]["refund_id"] for row in refunds) == [
-            "INV-77",
-            "INV-78",
+            "INV-77:10.50",
+            "INV-78:5.00",
         ]
         assert sorted(row["payload"]["amount_cents"] for row in refunds) == [500, 1050]
+        # A refund's amount is a delta against its invoice's cumulative figure,
+        # and the row says so — read as an invoice total it would over-report.
+        assert {row["payload"]["native_amount_semantics"] for row in refunds} == {
+            "invoice_cumulative_delta"
+        }
         # The ingress stamped the provenance, not the payload.
         assert {row["write_path"] for row in rows} == {"sfcc_cartridge"}
         assert {row["authority"] for row in rows} == {"platform"}
@@ -297,8 +312,8 @@ async def test_the_sweeps_overlap_window_redelivery_dedupes_instead_of_doubling(
         client = _client(monkeypatch)
         batch = [
             _paid_event(),
-            _refund_event("INV-77", "10.50", REFUND_ONE_AT),
-            _refund_event("INV-78", "5.00", REFUND_TWO_AT),
+            _refund_event("INV-77:10.50", "10.50", REFUND_ONE_AT),
+            _refund_event("INV-78:5.00", "5.00", REFUND_TWO_AT),
         ]
         first = _post(client, batch, delivery_id="delivery-1")
         assert first.json()["accepted"] == 3
@@ -326,9 +341,10 @@ async def test_a_zero_amount_refund_never_reaches_the_ledger_to_shadow_the_real_
     """The whole point of the positive-amount rule, end to end.
 
     Dedupe is first-write-wins on the event key, and for a refund that key is
-    the credit invoice number. A zero-amount `refund.succeeded` for INV-77 would
-    therefore make the real 10.50 unwritable FOREVER. It is rejected at the
-    mapper, so the later correct figure still lands.
+    the credit invoice and the cumulative figure it had reached. A zero-amount
+    `refund.succeeded` for INV-77 would therefore make the real 10.50 for that
+    same observation unwritable FOREVER. It is rejected at the mapper, so the
+    later correct figure still lands.
     """
     from sqlalchemy import select
 
@@ -339,7 +355,7 @@ async def test_a_zero_amount_refund_never_reaches_the_ledger_to_shadow_the_real_
         client = _client(monkeypatch)
         zero = _post(
             client,
-            [_refund_event("INV-77", "0.00", REFUND_ONE_AT)],
+            [_refund_event("INV-77:0.00", "0.00", REFUND_ONE_AT)],
             delivery_id="delivery-1",
         )
         assert zero.status_code == 200, zero.text
@@ -350,7 +366,7 @@ async def test_a_zero_amount_refund_never_reaches_the_ledger_to_shadow_the_real_
 
         real = _post(
             client,
-            [_refund_event("INV-77", "10.50", REFUND_ONE_AT)],
+            [_refund_event("INV-77:10.50", "10.50", REFUND_ONE_AT)],
             delivery_id="delivery-2",
         )
         assert real.json()["accepted"] == 1
@@ -360,6 +376,98 @@ async def test_a_zero_amount_refund_never_reaches_the_ledger_to_shadow_the_real_
         ]
         assert len(rows) == 1
         assert rows[0]["payload"]["amount_cents"] == 1050
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_second_partial_refund_on_one_invoice_lands_and_the_funnel_sums_it(
+    tmp_path, monkeypatch
+):
+    """The bug this scheme exists for.
+
+    SFCC does not create a second invoice for a second partial refund — it
+    raises the SAME invoice's cumulative `refundedAmount`. Keyed on the invoice
+    number alone, tick 2 was lost twice over: the once-only marker skipped the
+    invoice, and even with the marker gone the ledger deduped the event against
+    tick 1's key. So the sweep sends the DELTA under a key qualified by the new
+    cumulative total, and the funnel — `max(amount)` per `refund_id`, SUMMED
+    across distinct `refund_id`s inside one authority — reports the whole
+    cumulative figure.
+    """
+    from sqlalchemy import select
+
+    from db.commerce_interactions import commerce_interaction_events
+    from services import merchant_commerce_event_funnel_service as funnel_service
+
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sfcc-partials")
+    try:
+        client = _client(monkeypatch)
+        # Tick 1: the invoice has refunded 10.00 in total, none of it reported.
+        first = _post(
+            client,
+            [_paid_event(), _refund_event("INV-77:10.00", "10.00", REFUND_ONE_AT)],
+            delivery_id="delivery-1",
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["accepted"] == 2
+
+        # Tick 2: a second partial refund took the SAME invoice's cumulative
+        # figure to 25.00, so the sweep sends the 15.00 difference.
+        second = _post(
+            client,
+            [_refund_event("INV-77:25.00", "15.00", REFUND_TWO_AT)],
+            delivery_id="delivery-2",
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["accepted"] == 1
+
+        rows = [
+            dict(row)
+            for row in await test_database.fetch_all(select(commerce_interaction_events))
+        ]
+        refunds = [row for row in rows if row["event_type"] == "refund.succeeded"]
+        assert len(refunds) == 2
+        assert sorted(row["payload"]["amount_cents"] for row in refunds) == [1000, 1500]
+        assert sorted(row["payload"]["refund_id"] for row in refunds) == [
+            "INV-77:10.00",
+            "INV-77:25.00",
+        ]
+
+        result = await funnel_service.get_merchant_commerce_event_funnel(
+            merchant_id=MERCHANT_ID,
+            group_by="store",
+        )
+        summary = result.payload["summary"]
+        # 10.00 + 15.00 = the invoice's cumulative 25.00, counted once.
+        assert summary["refunded_amount_cents_by_currency"] == {"USD": 2500}
+        assert summary["event_type_breakdown"]["refund.succeeded"] == 2
+
+        # …and a redelivery of EITHER observation still dedupes: the cursor's
+        # overlap window makes that routine, not exceptional.
+        replay = _post(
+            client,
+            [
+                _refund_event("INV-77:10.00", "10.00", REFUND_ONE_AT),
+                _refund_event("INV-77:25.00", "15.00", REFUND_TWO_AT),
+            ],
+            delivery_id="delivery-3",
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["accepted"] == 0
+        assert all(event["duplicate"] for event in replay.json()["events"])
+        after = [
+            dict(row)
+            for row in await test_database.fetch_all(select(commerce_interaction_events))
+        ]
+        assert len([row for row in after if row["event_type"] == "refund.succeeded"]) == 2
+        replayed = await funnel_service.get_merchant_commerce_event_funnel(
+            merchant_id=MERCHANT_ID,
+            group_by="store",
+        )
+        assert replayed.payload["summary"]["refunded_amount_cents_by_currency"] == {
+            "USD": 2500
+        }
     finally:
         await test_database.disconnect()
 
@@ -377,8 +485,8 @@ async def test_the_funnel_counts_one_paid_order_and_sums_both_credit_invoices(
             client,
             [
                 _paid_event(),
-                _refund_event("INV-77", "10.50", REFUND_ONE_AT),
-                _refund_event("INV-78", "5.00", REFUND_TWO_AT),
+                _refund_event("INV-77:10.50", "10.50", REFUND_ONE_AT),
+                _refund_event("INV-78:5.00", "5.00", REFUND_TWO_AT),
             ],
             delivery_id="delivery-1",
         )

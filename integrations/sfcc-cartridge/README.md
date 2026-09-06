@@ -45,11 +45,18 @@ ordered `lastModified asc`, bounded by `MaxOrders`, and enqueues:
 | --- | --- | --- | --- |
 | `paymentStatus == PAID` | `order.paid` | `totalGrossPrice` | `order.paid:<orderNo>` |
 | `status == CANCELLED` | `order.cancelled` | none | `order.cancelled:<orderNo>` |
-| a credit `Invoice` with a positive refund | `refund.succeeded` | that invoice's refund | `refund.succeeded:<invoiceNumber>` |
+| a credit `Invoice` whose cumulative refund ROSE | `refund.succeeded` | the **delta** since the last observation | `refund.succeeded:<invoiceNumber>:<cumulative>` |
 
-`refund.succeeded` is keyed on the invoice number and its amount is frozen at
-first observation, so a further partial refund later recorded against the
-**same** invoice is not re-emitted — only a new invoice is.
+`Invoice.refundedAmount` is **cumulative per invoice** — SFCC does not create a
+second invoice for a second partial refund against the same one, it raises that
+invoice's figure. So the sweep sends the **difference** since the last figure it
+observed, under a key qualified by the new cumulative total, and stores that same
+string (`<invoiceNumber>:<cumulative>`) as the once-only marker. A second partial
+refund against one invoice is therefore a second ledger row rather than a lost
+fact, the two deltas sum to the invoice's cumulative figure in Pivota's funnel,
+and a redelivery of either still dedupes. A cumulative figure that **fell** is
+skipped with a WARN and never emitted: money does not un-refund, and re-sending
+a lower figure under a new key would add refunded money.
 
 `order.paid` carries the **order total**, not a capture, and its `occurred_at`
 is the order's **`lastModified`**, not the settlement instant — SFCC records no
@@ -75,7 +82,16 @@ capture would add rows and no money.
    it into the canonical event key and the ledger dedupes first-write-wins on
    that key. So a marker that is lost — cleared in Business Manager, restored
    from a backup, or aged out of the capped refund set — costs one redundant
-   delivery, never a double count.
+   delivery, never a double count. The refund set keeps one marker per invoice
+   (a new observation replaces that invoice's marker), so its 200 cap bounds
+   refunded invoices per order, not observations of them.
+
+Because those ids are deterministic, an outbox key can already be taken —
+`createCustomObject` raises on a duplicate, and an undelivered row lives in the
+outbox for up to seven days. `Telemetry.enqueue` therefore looks the key up
+first and treats an existing row as success: re-enqueuing an event that is still
+queued is the ordinary shape of a Pivota outage, and it must not be counted as
+a failed order.
 
 Writing a marker updates the order's `lastModified`, so an order the sweep has
 just marked is re-examined on the following run and then skipped without a
@@ -109,10 +125,18 @@ order a run observed the clamp may hold the cursor. Past that cap the failing
 orders are **abandoned** — their `order.paid`, `order.cancelled` and
 `refund.succeeded` events are never emitted and Pivota will never learn them —
 and the job logs an **ERROR naming the abandoned order numbers** (up to 50 per
-run) so they can be replayed by hand. Watch that ERROR: it is the only notice
-that settlement facts were dropped. Raise the parameter to give a flapping
-integration longer to recover; lower it to keep the cursor moving on a site
-where a stall matters more than a few orders.
+run) so they can be replayed by hand. The step also **fails** on such a run —
+`Status(ERROR, 'ABANDONED')`, with the counts in the message — because Business
+Manager notifies on a non-OK step status and on nothing else, and an ERROR log
+line nobody reads is not a notice. The step is declared `enforce-restart="false"`
+in `metadata/jobs.xml`, so a failed run does not block the next scheduled tick:
+the sweep carries straight on from its advanced cursor. If the bound moves the
+cursor while nothing was actually abandoned, the run logs a WARN and stays `OK`.
+
+Watch that ERROR: it is the only notice that settlement facts were dropped.
+Raise the parameter to give a flapping integration longer to recover; lower it
+to keep the cursor moving on a site where a stall matters more than a few
+orders.
 
 ### What the sweep must never do
 
