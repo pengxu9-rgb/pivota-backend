@@ -514,14 +514,25 @@ async def test_two_concurrent_merges_serialize_and_neither_write_is_lost():
         await _cleanup_store()
 
 
-async def test_a_second_merge_WAITS_for_the_first_rather_than_reading_past_it():
+async def test_a_second_merge_WAITS_and_READS_what_the_first_committed():
     """The mechanism behind the test above, asserted directly.
 
-    Without this, "neither write was lost" could hold by luck of scheduling on a
-    fast machine. What must be true is that a merge whose row is locked elsewhere
-    does not COMPLETE until the lock is released.
+    Two claims, and the second is the one that has teeth.
+
+    "It does not COMPLETE until the lock is released" is necessary but NOT
+    sufficient, and on its own it is satisfied without `FOR UPDATE` at all: a
+    plain `SELECT` never blocks under MVCC, but the merge's `UPDATE` queues on
+    the row lock either way, so the task stays pending under both. The
+    assertion below would pass against the very bug it is meant to catch.
+
+    What separates them is WHICH BLOB the merge read. With `FOR UPDATE` the
+    merge blocks at the SELECT and reads the holder's committed value, so its
+    result carries the holder's key. Without it the merge has already read the
+    pre-holder blob, and its write erases what the holder committed — so the
+    key is absent from the re-read. That is the lost update, made visible.
     """
     import asyncio
+    import json
 
     from db.database import database
     from services.webflow_connection import merge_webflow_credentials
@@ -532,12 +543,20 @@ async def test_a_second_merge_WAITS_for_the_first_rather_than_reading_past_it():
 
         async def _hold_the_row():
             async with database.transaction():
-                await database.fetch_one(
+                row = await database.fetch_one(
                     "SELECT api_key FROM merchant_stores"
                     " WHERE store_id = :store_id FOR UPDATE",
                     {"store_id": STORE_ID},
                 )
+                blob = json.loads(dict(row)["api_key"])
+                blob["webhook_ids"] = {"ecomm_new_order": "wh-written-by-the-holder"}
+                await database.execute(
+                    "UPDATE merchant_stores SET api_key = :api_key"
+                    " WHERE store_id = :store_id",
+                    {"store_id": STORE_ID, "api_key": json.dumps(blob)},
+                )
                 await released.wait()
+                # The transaction commits on exit, releasing the row.
 
         holder = asyncio.create_task(_hold_the_row())
         await asyncio.sleep(0.2)
@@ -556,7 +575,20 @@ async def test_a_second_merge_WAITS_for_the_first_rather_than_reading_past_it():
         released.set()
         await holder
         persisted = await asyncio.wait_for(merging, timeout=20)
+
         assert persisted["url_secret"] == "rotated"
+        assert persisted["webhook_ids"] == {
+            "ecomm_new_order": "wh-written-by-the-holder"
+        }, (
+            "the merge wrote a blob it had read BEFORE the holder committed, "
+            "erasing the holder's write — it queued on the UPDATE rather than "
+            "taking the row lock at the SELECT"
+        )
+        # And the row itself agrees, so this is not a property of the return
+        # value alone.
+        assert (await _stored_blob())["webhook_ids"] == {
+            "ecomm_new_order": "wh-written-by-the-holder"
+        }
     finally:
         await first.disconnect()
         await second.disconnect()

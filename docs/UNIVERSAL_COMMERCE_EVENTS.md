@@ -308,9 +308,14 @@ receiver has two layers:
 
 * **always**, a 256-bit per-store secret minted at provisioning and embedded in
   the webhook URL path (`POST /webhooks/webflow/{store_id}/{url_secret}`),
-  compared constant-time AS BYTES — Starlette decodes path segments as text and
-  `hmac.compare_digest` raises on non-ASCII, so a hostile URL would otherwise be
-  a 500;
+  compared constant-time AS BYTES (encoded with `surrogatepass`) — Starlette
+  decodes path segments as text, `hmac.compare_digest` raises on non-ASCII, and
+  a plain UTF-8 encode raises on the lone surrogate `json.loads` will happily
+  produce from a body, so either would otherwise be a 500. The secret is a PATH
+  segment, so `middleware/structured_logging.py::redact_path` keeps it out of the
+  access log — but nothing here can keep it out of an upstream load balancer's
+  request log, which is the honest reason to configure `WEBFLOW_CLIENT_SECRET`
+  wherever an OAuth app exists;
 * **when `WEBFLOW_CLIENT_SECRET` is configured**, the `x-webflow-signature`
   header, verified as HMAC-SHA256 over `"{timestamp}:{raw body}"` inside a
   5-minute skew window. Absent that env var the layer is skipped, and the doc
@@ -325,8 +330,13 @@ whether somebody clicked provision.
 **MONEY IS ALREADY IN MINOR UNITS.** A Webflow money object is
 `{"unit": "USD", "value": 5898, "string": "$58.98"}` — the currency is `unit`,
 and `value` is an integer number of cents. `services/webflow_event_adapter.py`
-therefore does NO conversion, and there is no zero-decimal-currency table because
-there is nothing to special-case. A `value` it cannot read as whole minor units
+therefore does NO conversion, and there is no zero-decimal-currency table. That
+last part is an ASSUMPTION rather than a consequence (row 22): it holds only if
+Webflow states JPY/KRW/VND in those currencies' own minor units rather than in
+hundredths, which no order this repo has seen proves. The mapper logs a WARNING
+on the first order per process per zero-decimal currency so the first one is
+visible rather than 100x inflated in silence. A `value` it cannot read as whole
+minor units
 (a decimal string, a fractional float, a negative) is a LOUD
 `WebflowMoneyFormatError`: a silent skip under-counts, but a misread over-counts
 by 100x, and only one of those is visible in a total.
@@ -350,6 +360,12 @@ invent a refund. And the PSP's `stripeDetails.refundId` is METADATA, never the
 key: it is present for Stripe and absent for PayPal, so keying on it would give
 one refund two rows across observations that disagree about whether it is there.
 
+A `refunded`/`dispute-lost` order whose `customerPaid` is absent or `0` records
+`order.created` anyway and reports the missing refund as the named reason
+`refund_amount_unreadable` (counted as `refunds_unreadable`, logged at WARNING).
+Raising there dropped the whole batch, which 422'd the receiver — and Webflow
+retries a 422 into the same 422, so the order never landed at all.
+
 **Webflow has no cancelled state and none is invented.** `pending` is the unpaid
 state, so it emits `order.created` alone and a later `ecomm_order_changed` (or
 the sweep) adds `order.paid` beside the same created row.
@@ -370,7 +386,13 @@ within the run is not enough: a run whose first page happened to be entirely bel
 the threshold would stop there having seen a clean two-row prefix and never reach
 the out-of-order row below it. A truncated pass cannot arm it either — a violation
 is proof, "no violation" is only proof when the whole list was read.
-`ordering_verified` and `early_stop_armed` are reported per lane per run.
+
+And it applies to the unfiltered lane ALONE: the money-out lanes anchor on
+timestamps the list is not sorted by, so judging them reported a violation on
+nearly every store every run and buried the one signal that matters. They are
+never armed and never judged, walking their short filtered list in full.
+`ordering_applicable`, `ordering_verified` and `early_stop_armed` are reported per
+lane per run.
 
 A lane stopped by the page cap does not advance its cursor and records the OFFSET
 it reached; the next run RESUMES there rather than re-reading the same prefix
@@ -384,11 +406,17 @@ carries that site id, so an order belonging to another site cannot be read
 through this store's credential even if a delivery names one.
 
 **Provisioning writes the secret BEFORE it registers the URL that carries it.**
-A crash between the two leaves a stored secret and no webhook — harmless, fixed by
-re-running. The opposite order would leave Webflow delivering to a URL whose
-secret was never stored, and the receiver would 401 every one forever. Webhooks
-are created before stale ones are deleted, and "stale" means one of OUR OWN older
-URLs for this store — never another integration's.
+A crash between the two leaves a stored secret and no webhook — harmless ON FIRST
+PROVISIONING, fixed by re-running. The opposite order would leave Webflow
+delivering to a URL whose secret was never stored, and the receiver would 401
+every one forever. A ROTATION inverts that: the store already had a working
+webhook, so a failed registration leaves the live one on the old secret while the
+new one is stored, and every delivery 401s — the route therefore restores the
+superseded secret when a rotation's registration fails. Webhooks are created
+before stale ones are deleted, and "stale" means a URL that STARTS WITH one of
+OUR OWN prefixes for this store — anchored, not a substring test, because the
+answer to a match is DELETE and another integration's redirector could contain
+our URL.
 
 **Nothing schedules the sweep.** CI deploys no Cloud Run job for the lane and the
 APScheduler lane runs on a service that is not auto-deployed, so it ships as an
@@ -397,7 +425,7 @@ script (`scripts/sweep_webflow_orders.py`, dry run by default). That gap is
 documented rather than papered over, and it matters more here than elsewhere
 because Webflow webhooks are best-effort.
 
-`docs/WEBFLOW_TELEMETRY.md` carries the full flow, the 21-row verified/assumed
+`docs/WEBFLOW_TELEMETRY.md` carries the full flow, the 22-row verified/assumed
 table — including the two load-bearing rows: that money `value` is minor units,
 and that refunds are full-order only — and the residual gaps.
 

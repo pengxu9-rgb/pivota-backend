@@ -147,10 +147,22 @@ def _bytes_equal(expected: str, supplied: str) -> bool:
     text — so a hostile URL segment or header would otherwise be a 500, which is
     a denial-of-service handle rather than a refusal. Encoding to UTF-8 first
     makes every input comparable and the answer always a bool.
+
+    `surrogatepass`, not plain UTF-8, and that error handler is load-bearing.
+    Plain `.encode("utf-8")` RAISES `UnicodeEncodeError` on a lone surrogate,
+    and a lone surrogate is not exotic: `json.loads` happily produces one from a
+    body containing `"\\ud800"`, which is exactly how the delivered `siteId`
+    reaches this compare. Without it, one escape sequence in a body turns a 401
+    into a 500 — the same denial-of-service handle the bytes compare exists to
+    close. `services/telemetry_ingress.py` encodes its client identity the same
+    way for the same reason.
     """
     if not expected or not supplied:
         return False
-    return hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+    return hmac.compare_digest(
+        expected.encode("utf-8", "surrogatepass"),
+        supplied.encode("utf-8", "surrogatepass"),
+    )
 
 
 def _webflow_client_secret() -> str:

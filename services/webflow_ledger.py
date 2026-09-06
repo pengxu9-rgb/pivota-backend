@@ -24,14 +24,18 @@ baseline to read, so there is nothing to serialise.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.merchant_event_ingest_service import ingest_merchant_event_batch
 from services.webflow_event_adapter import (
     UnsupportedWebflowEvent,
     map_webflow_order,
 )
+
+
+logger = logging.getLogger("webflow_ledger")
 
 
 WEBFLOW_WEBHOOK_WRITE_PATH = "webflow_webhook"
@@ -47,6 +51,12 @@ class WebflowIngestResult:
     duplicates: int = 0
     reason: Optional[str] = None
     events: List[Dict[str, Any]] = field(default_factory=list)
+    # Named parts of THIS order the mapper deliberately did not record while
+    # recording the rest — today only an unreadable refund amount. Distinct from
+    # `reason`, which describes an observation that produced nothing at all: a
+    # partially-mapped order is still `recorded`, and a caller that treated
+    # these as "nothing happened" would under-count real orders.
+    ignored_reasons: Tuple[str, ...] = ()
 
     def as_summary(self, **extra: Any) -> Dict[str, Any]:
         body: Dict[str, Any] = {
@@ -57,6 +67,8 @@ class WebflowIngestResult:
         }
         if self.reason:
             body["reason"] = self.reason
+        if self.ignored_reasons:
+            body["ignored_reasons"] = list(self.ignored_reasons)
         if self.events:
             body["events"] = self.events
         body.update(extra)
@@ -85,7 +97,7 @@ async def record_webflow_order(
     rather than an error: nothing went wrong.
     """
     try:
-        batch = map_webflow_order(
+        mapping = map_webflow_order(
             order,
             store_id=store_id,
             source=(
@@ -98,9 +110,19 @@ async def record_webflow_order(
         )
     except UnsupportedWebflowEvent as exc:
         return WebflowIngestResult(status="ignored", reason=str(exc))
+    for reason in mapping.ignored:
+        # WARNING, not silence: an order recorded WITHOUT its refund row
+        # under-reports money out, and the only tell is this line plus the
+        # sweep's counter.
+        logger.warning(
+            "webflow order partially mapped merchant_id=%s store_id=%s reason=%s",
+            merchant_id,
+            store_id,
+            reason,
+        )
     result = await ingest_merchant_event_batch(
         merchant_id=merchant_id,
-        batch=batch,
+        batch=mapping.batch,
         agent_identity_confidence="platform_asserted",
         # Spelled as literals here, not as the module constants above: every
         # production ingest must name its write path as a string constant so a
@@ -114,4 +136,5 @@ async def record_webflow_order(
         accepted=int(result.get("accepted") or 0),
         duplicates=int(result.get("duplicates") or 0),
         events=list(result.get("events") or []),
+        ignored_reasons=mapping.ignored,
     )

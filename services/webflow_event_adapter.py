@@ -43,13 +43,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
+from utils.money import ZERO_DECIMAL_CURRENCIES
 
+
+logger = logging.getLogger("webflow_event_adapter")
 
 PLATFORM = "webflow"
 
@@ -93,10 +98,51 @@ _TEST_ORDER_FLAGS = ("isTest", "isTestOrder", "testMode", "testmode")
 
 _MAX_LINE_ITEMS = 50
 
+# The one named reason `map_webflow_order` reports instead of raising. A
+# constant so the sweep's counter, the receiver's summary and the tests all name
+# the same string rather than three hand-copies of it.
+REFUND_AMOUNT_UNREADABLE = "refund_amount_unreadable"
+
 # A whole number, optionally signed, and nothing else. `"58.98"` must NOT match:
 # reading it as 58 cents (or as 5898) is the 100x error this module exists to
 # refuse rather than guess at.
 _INTEGER_TEXT = re.compile(r"^[+-]?\d+$")
+
+
+# Currencies with NO minor unit. `utils.money.to_minor_units` multiplies by 1
+# rather than 100 for these, which is the whole reason the set exists in this
+# repo — and it is the one place where "Webflow states amounts in minor units"
+# (assumption 10) is not self-evidently equivalent to "Webflow states amounts in
+# hundredths". If Webflow reports a ¥5,898 order as `value: 589800`, this bridge
+# files it as ¥589,800: a 100x over-count that nothing downstream can tell from
+# a real one, because there is no second source for the figure.
+#
+# So the FIRST such order per currency is made visible rather than assumed away.
+# Keyed on the currency, whose domain is this frozen 16-element set, so the
+# bookkeeping is bounded by construction rather than by a cap that has to be
+# maintained.
+_ZERO_DECIMAL_OBSERVED: set = set()
+
+
+def _warn_once_on_zero_decimal_currency(
+    *, store_id: str, currency: Optional[str], order_id: str, value: Optional[int]
+) -> None:
+    code = (currency or "").upper()
+    if code not in ZERO_DECIMAL_CURRENCIES or code in _ZERO_DECIMAL_OBSERVED:
+        return
+    _ZERO_DECIMAL_OBSERVED.add(code)
+    logger.warning(
+        "webflow_zero_decimal_currency_observed store_id=%s currency=%s "
+        "order_id=%s value=%s — this bridge records Webflow's `value` VERBATIM "
+        "as minor units. For a currency with no minor unit that is only correct "
+        "if Webflow does the same; if it reports hundredths, this order and "
+        "every one like it is 100x over-counted. Verify against the merchant's "
+        "own order total (assumption 22, docs/WEBFLOW_TELEMETRY.md).",
+        store_id or "-",
+        code,
+        order_id or "-",
+        value if value is not None else "-",
+    )
 
 
 class UnsupportedWebflowEvent(ValueError):
@@ -291,6 +337,23 @@ def _line_items(order: Dict[str, Any]) -> List[Dict[str, Any]]:
     return items
 
 
+@dataclass(frozen=True)
+class WebflowMapping:
+    """The events one observation produced, and what it deliberately did not.
+
+    ``ignored`` exists because "this order maps to nothing" and "this order maps
+    to everything except one event" are different outcomes and only one of them
+    may cost the batch. A ``refunded`` order whose money cannot be read used to
+    raise, which dropped ``order.created`` with it and 422'd every Webflow retry
+    of a delivery that carried a perfectly good order — so the order never
+    landed at all. Now the readable half lands and the unreadable half is a
+    NAMED reason a caller can count and log.
+    """
+
+    batch: MerchantEventBatch
+    ignored: Tuple[str, ...] = ()
+
+
 def map_webflow_order(
     order: Dict[str, Any],
     *,
@@ -298,7 +361,7 @@ def map_webflow_order(
     source: str,
     trigger_type: Optional[str] = None,
     trace_id: Optional[str] = None,
-) -> MerchantEventBatch:
+) -> WebflowMapping:
     """Canonical events for ONE fetched Webflow order.
 
     ``source`` names the observing ingress (``webflow_webhook`` or
@@ -308,7 +371,9 @@ def map_webflow_order(
 
     Raises :class:`UnsupportedWebflowEvent` when there is nothing to record, and
     ``ValueError`` (including :class:`WebflowMoneyFormatError`) when the order is
-    malformed.
+    malformed. A malformed MONEY VALUE is still fatal to the whole observation —
+    that is the 100x claim and it must never be half-recorded — but a refund
+    whose amount is merely ABSENT is reported through ``WebflowMapping.ignored``.
     """
     if not isinstance(order, dict):
         raise ValueError("Webflow order must be an object")
@@ -327,6 +392,9 @@ def map_webflow_order(
     status = webflow_order_status(order)
     currency = _currency_of(order.get("customerPaid"), order.get("netAmount"))
     paid_minor = _amount_minor_units(order.get("customerPaid"), field="customerPaid")
+    _warn_once_on_zero_decimal_currency(
+        store_id=store_id, currency=currency, order_id=order_id, value=paid_minor
+    )
     accepted_at = _occurred_at(order.get("acceptedOn"))
     stripe = order.get("stripeDetails")
     stripe = stripe if isinstance(stripe, dict) else {}
@@ -405,19 +473,34 @@ def map_webflow_order(
     # emitted — inventing one from `refunded` would file a refund as a
     # cancellation and count the same order twice in two different funnels.
 
+    ignored: List[str] = []
     if status in _REFUND_STATUSES:
-        events.append(
-            _refund_event(
-                order,
-                order_id=order_id,
-                status=status,
-                currency=currency,
-                paid_minor=paid_minor,
-                stripe=stripe,
-                build=_event,
+        if paid_minor is None or paid_minor <= 0 or not currency:
+            # NOT an exception. Raising here dropped `order.created` along with
+            # the refund, so a `refunded` order with an unreadable amount 422'd
+            # the receiver — and Webflow retries a 422 into the same 422 until
+            # it gives up, leaving the order absent from the ledger entirely
+            # rather than merely missing its refund row. The half that IS
+            # readable is recorded; the half that is not is named here so the
+            # sweep can count it and the receiver can report it.
+            ignored.append(
+                f"{REFUND_AMOUNT_UNREADABLE}: Webflow order {order_id} is "
+                f"{status} but carries no readable customerPaid amount and "
+                "currency, so no refund row was written"
             )
-        )
-    return MerchantEventBatch(events=events)
+        else:
+            events.append(
+                _refund_event(
+                    order,
+                    order_id=order_id,
+                    status=status,
+                    currency=currency,
+                    paid_minor=paid_minor,
+                    stripe=stripe,
+                    build=_event,
+                )
+            )
+    return WebflowMapping(batch=MerchantEventBatch(events=events), ignored=tuple(ignored))
 
 
 def _refund_event(
@@ -442,14 +525,10 @@ def _refund_event(
     Stripe order and absent for a PayPal one, and an order first observed
     without it and later with it would land on two different keys — two refund
     rows for one refund, which the funnel sums.
+
+    The caller has already established that the amount is readable and positive;
+    an unreadable one is `REFUND_AMOUNT_UNREADABLE`, reported rather than raised.
     """
-    if paid_minor is None or paid_minor <= 0 or not currency:
-        # A refunded order whose money cannot be read is not a "no event"
-        # outcome: it is a refund this bridge would silently omit. Loud.
-        raise ValueError(
-            f"Webflow order {order_id} is {status} but carries no readable "
-            "customerPaid amount and currency"
-        )
     dispute_lost = status == STATUS_DISPUTE_LOST
     return build(
         "refund.succeeded",

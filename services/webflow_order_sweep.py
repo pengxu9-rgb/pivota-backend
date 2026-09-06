@@ -23,19 +23,29 @@ So the sweep does three things instead of assuming one.
    `status` filter Webflow rejects fails ALONE and is reported; it does not take
    the other lanes down with it.
 
-2. **THE ORDERING CLAIM IS EARNED, NOT ASSUMED.** The early stop — end the pass
-   at the first page whose every order is at or below `cursor - overlap` — is
-   ARMED only by a previous COMPLETE pass that saw the anchor timestamps arrive
-   non-increasing, and it is disarmed the moment a run observes a violation.
-   Checking only within the current run would not be enough, and the gap is not
-   theoretical: a run whose first page happened to be entirely below the
-   threshold would stop there having seen a perfectly ordered two-row prefix,
-   and never reach the out-of-order row further down. So a lane with no verdict
-   (a store's first ever pass, or one after a violation) walks the whole list,
-   and that walk is what establishes the verdict. A truncated pass cannot
-   establish one: a violation is proof, but "no violation seen" is only proof
-   when the whole list was read. `ordering_verified` and `early_stop_armed` are
-   both reported per run, so the assumption is falsifiable from a real run
+2. **THE ORDERING CLAIM IS EARNED, NOT ASSUMED — AND ONLY WHERE IT APPLIES.**
+   The early stop — end the pass at the first page whose every order is at or
+   below `cursor - overlap` — is ARMED only by a previous COMPLETE pass that saw
+   the anchor timestamps arrive non-increasing, and it is disarmed the moment a
+   run observes a violation. Checking only within the current run would not be
+   enough, and the gap is not theoretical: a run whose first page happened to be
+   entirely below the threshold would stop there having seen a perfectly ordered
+   two-row prefix, and never reach the out-of-order row further down. So a lane
+   with no verdict (a store's first ever pass, or one after a violation) walks
+   the whole list, and that walk is what establishes the verdict. A truncated
+   pass cannot establish one: a violation is proof, but "no violation seen" is
+   only proof when the whole list was read.
+
+   The claim is about `acceptedOn`, which is what an offset walk of the list
+   arrives in — so it applies to the `orders` lane ALONE. The money-out lanes
+   anchor on `refundedOn` / the dispute timestamps, which have no relation to
+   the list's sequence, so their anchors arrive in essentially arbitrary order.
+   Judging them reported a "violation" on nearly every store every run, which
+   buried the one signal that matters. They are therefore never armed and never
+   judged: they walk their (short, filtered) list in full, bounded by the page
+   cap, and report `ordering_verified: null` rather than a false verdict.
+   `ordering_applicable`, `ordering_verified` and `early_stop_armed` are all
+   reported per lane per run, so the assumption is falsifiable from a real run
    rather than from the documentation.
 
 3. **TRUNCATION RESUMES, IT NEVER FREEZES.** A lane stopped by the page cap does
@@ -125,12 +135,30 @@ class _Lane:
     refund lanes anchor on their own timestamps and exist separately.
     """
 
-    __slots__ = ("name", "status", "anchor_fields")
+    __slots__ = ("name", "status", "anchor_fields", "anchor_is_list_order")
 
-    def __init__(self, name: str, status: Optional[str], anchor_fields: Tuple[str, ...]):
+    def __init__(
+        self,
+        name: str,
+        status: Optional[str],
+        anchor_fields: Tuple[str, ...],
+        *,
+        anchor_is_list_order: bool,
+    ):
         self.name = name
         self.status = status
         self.anchor_fields = anchor_fields
+        # Whether this lane's ANCHOR is the field the list is (assumed) ordered
+        # by. Only the `orders` lane's is: assumption 7 is about `acceptedOn`,
+        # which is what an offset walk of the unfiltered list arrives in. A
+        # refund lane anchored on `refundedOn` sees `acceptedOn` order, so its
+        # anchors arrive in essentially arbitrary sequence and an ordering check
+        # over them reports a "violation" on almost every store — a permanent
+        # false positive that buries a real `orders`-lane violation in the
+        # script's NOTE. So these lanes are not CHECKED and their early stop is
+        # never armed: they walk their (short, filtered) list in full, bounded
+        # by the page cap, and resume on truncation like any other lane.
+        self.anchor_is_list_order = bool(anchor_is_list_order)
 
     def anchor(self, order: Dict[str, Any]) -> Optional[datetime]:
         for field in self.anchor_fields:
@@ -141,12 +169,18 @@ class _Lane:
 
 
 WEBFLOW_SWEEP_LANES: Tuple[_Lane, ...] = (
-    _Lane("orders", None, ("acceptedOn",)),
-    _Lane("refunded", STATUS_REFUNDED, ("refundedOn", "acceptedOn")),
+    _Lane("orders", None, ("acceptedOn",), anchor_is_list_order=True),
+    _Lane(
+        "refunded",
+        STATUS_REFUNDED,
+        ("refundedOn", "acceptedOn"),
+        anchor_is_list_order=False,
+    ),
     _Lane(
         "dispute_lost",
         STATUS_DISPUTE_LOST,
         ("disputeUpdatedOn", "disputedOn", "acceptedOn"),
+        anchor_is_list_order=False,
     ),
 )
 
@@ -235,7 +269,17 @@ async def _sweep_lane(
     # further down that it exists to catch. A lane with no established verdict
     # (a store's first ever pass, or one after a violation) walks the whole list,
     # which is what establishes it.
-    early_stop_armed = bool(previous.get(_ORDERING_KEY)) and threshold is not None
+    #
+    # And only for a lane whose anchor IS the field the list arrives ordered by.
+    # For the money-out lanes it is not (see `_Lane.anchor_is_list_order`), so
+    # they are never armed and never judged: arming them on an ordering they do
+    # not have would let a stop skip the rest of the list, and judging them
+    # would report a violation on nearly every store.
+    early_stop_armed = (
+        lane.anchor_is_list_order
+        and bool(previous.get(_ORDERING_KEY))
+        and threshold is not None
+    )
     observed_violation = False
 
     stats: Dict[str, Any] = {
@@ -248,10 +292,20 @@ async def _sweep_lane(
         "duplicates": 0,
         "ignored": 0,
         "invalid": 0,
+        # Orders recorded WITHOUT their refund row because the amount could not
+        # be read. Its own counter, not `invalid`: the order itself landed.
+        "refunds_unreadable": 0,
         "skipped_already_recorded": 0,
         "test_orders_skipped": 0,
         "truncated": False,
-        "ordering_verified": bool(previous.get(_ORDERING_KEY)),
+        # `None`, not False, for a lane the ordering claim does not apply to. A
+        # False here would be read as "this store's list is out of order", which
+        # is a different and much more alarming statement than "this lane never
+        # rested on the list being ordered in the first place".
+        "ordering_applicable": lane.anchor_is_list_order,
+        "ordering_verified": (
+            bool(previous.get(_ORDERING_KEY)) if lane.anchor_is_list_order else None
+        ),
         "early_stop_armed": early_stop_armed,
         "cursor_before": _iso(previous_cursor) if previous_cursor else None,
     }
@@ -282,8 +336,14 @@ async def _sweep_lane(
                 # The ordering CLAIM, checked against what actually arrived. One
                 # violation disarms the early stop for the whole run: a lane
                 # that stops early on an unordered list skips everything after
-                # the stop, permanently.
-                if previous_anchor is not None and anchor > previous_anchor:
+                # the stop, permanently. Checked ONLY where the claim applies —
+                # a money-out lane's anchor is not the list's sort key, so its
+                # anchors arriving out of order says nothing about the list.
+                if (
+                    lane.anchor_is_list_order
+                    and previous_anchor is not None
+                    and anchor > previous_anchor
+                ):
                     observed_violation = True
                     early_stop_armed = False
                 previous_anchor = anchor
@@ -326,6 +386,11 @@ async def _sweep_lane(
             if result.status == "ignored":
                 stats["ignored"] += 1
                 continue
+            # A refunded order whose amount could not be read is recorded
+            # WITHOUT its refund row rather than dropped whole. Counted under
+            # its own name so "money out is under-reported for this store" is
+            # readable off a run instead of being invisible.
+            stats["refunds_unreadable"] += len(result.ignored_reasons)
             stats["accepted"] += result.accepted
             stats["duplicates"] += result.duplicates
 
@@ -367,13 +432,21 @@ async def _sweep_lane(
     # A violation is PROOF and lands immediately. "No violation" is only proof
     # when the whole list was read, so a truncated pass leaves the previous
     # verdict alone rather than promoting a clean prefix to a clean list.
-    if observed_violation:
-        next_state[_ORDERING_KEY] = False
-    elif complete:
-        next_state[_ORDERING_KEY] = True
+    if not lane.anchor_is_list_order:
+        # No verdict is recorded or kept for a lane that does not rest on the
+        # ordering. A stale True from an earlier build would silently re-arm an
+        # early stop this lane must never take, so it is REMOVED rather than
+        # left alone.
+        next_state.pop(_ORDERING_KEY, None)
+        stats["ordering_verified"] = None
     else:
-        next_state[_ORDERING_KEY] = bool(previous.get(_ORDERING_KEY))
-    stats["ordering_verified"] = next_state[_ORDERING_KEY]
+        if observed_violation:
+            next_state[_ORDERING_KEY] = False
+        elif complete:
+            next_state[_ORDERING_KEY] = True
+        else:
+            next_state[_ORDERING_KEY] = bool(previous.get(_ORDERING_KEY))
+        stats["ordering_verified"] = next_state[_ORDERING_KEY]
     stats["cursor_after"] = next_state.get(_CURSOR_KEY)
     stats["next_offset"] = next_state[_NEXT_OFFSET_KEY]
     stats["complete"] = complete
@@ -431,7 +504,11 @@ async def sweep_webflow_store(
     http = client or httpx.AsyncClient(
         timeout=WEBFLOW_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False
     )
-    next_state = dict(previous_state)
+    # ONLY the lanes this run actually walked. The final write merges these into
+    # whatever `reconciliation` holds AT WRITE TIME rather than persisting a
+    # subtree computed from a read that happened many network calls ago — see
+    # the comment on the write below.
+    lane_states: Dict[str, Dict[str, Any]] = {}
     try:
         await _verify_site(
             store_id=store_id, api_token=tokens[0], site_id=site_id, http=http
@@ -467,7 +544,7 @@ async def sweep_webflow_store(
                 )
                 continue
             stats["lanes"].append(lane_stats)
-            next_state[lane.name] = lane_state
+            lane_states[lane.name] = lane_state
     finally:
         if own_client:
             await http.aclose()
@@ -479,22 +556,54 @@ async def sweep_webflow_store(
         "duplicates",
         "ignored",
         "invalid",
+        "refunds_unreadable",
         "skipped_already_recorded",
         "test_orders_skipped",
     ):
         stats[key] = sum(int(lane.get(key) or 0) for lane in stats["lanes"])
     stats["truncated"] = any(lane.get("truncated") for lane in stats["lanes"])
-    stats["ordering_verified"] = all(
-        bool(lane.get("ordering_verified")) for lane in stats["lanes"]
+    # Aggregated over the lanes the claim APPLIES to, and `None` when this run
+    # walked none of them (`--lane refunded`). Folding a money-out lane in here
+    # made every store report `ordering_verified: false`, which is how a real
+    # violation on the `orders` lane went from a signal to noise.
+    judged = [lane for lane in stats["lanes"] if lane.get("ordering_applicable")]
+    stats["ordering_verified"] = (
+        all(bool(lane.get("ordering_verified")) for lane in judged) if judged else None
     )
+    stats["unordered_lanes"] = [
+        str(lane.get("lane"))
+        for lane in judged
+        if lane.get("ordering_verified") is False
+    ]
     if stats["lane_failures"]:
         stats["status"] = "partial_failure"
 
     if apply and stats["lanes"]:
-        next_state["last_run_at"] = _iso(moment)
-        next_state["overlap_minutes"] = int(overlap.total_seconds() // 60)
+
+        def _merge_reconciliation(blob: Dict[str, Any]) -> Dict[str, Any]:
+            """Merge THIS run's lanes into the CURRENT stored subtree.
+
+            The run reads `reconciliation` once at the top and then spends many
+            network calls walking Webflow. Persisting the subtree it computed
+            from that read would be a read-modify-write whose modify half is
+            unbounded I/O, and the row lock only covers the write — so a second
+            replica's cursors, written meanwhile, would be discarded wholesale.
+            Touching only the keys this run actually walked makes the lost
+            update impossible for every lane it did not run, and for the ones it
+            did the loss is benign in the one direction that matters: a cursor
+            that goes backwards causes a re-read, and re-reading is free because
+            the event ids are deterministic. It can never cause a skip.
+            """
+            current = blob.get(_STATE_KEY)
+            current = dict(current) if isinstance(current, dict) else {}
+            current.update(lane_states)
+            current["last_run_at"] = _iso(moment)
+            current["overlap_minutes"] = int(overlap.total_seconds() // 60)
+            blob[_STATE_KEY] = current
+            return blob
+
         await merge_webflow_credentials(
-            store_id=store_id, updates={_STATE_KEY: next_state}
+            store_id=store_id, mutate=_merge_reconciliation
         )
     return stats
 
@@ -556,6 +665,9 @@ async def sweep_all_webflow_stores(
         "duplicates": sum(int(item.get("duplicates") or 0) for item in stores),
         "ignored": sum(int(item.get("ignored") or 0) for item in stores),
         "invalid": sum(int(item.get("invalid") or 0) for item in stores),
+        "refunds_unreadable": sum(
+            int(item.get("refunds_unreadable") or 0) for item in stores
+        ),
         "skipped_already_recorded": sum(
             int(item.get("skipped_already_recorded") or 0) for item in stores
         ),

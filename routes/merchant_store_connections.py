@@ -1559,7 +1559,17 @@ def _webflow_webhook_endpoint(store_id: str, url_secret: str) -> tuple[str, str]
     The per-store secret is a PATH SEGMENT, not a header, because Webflow does
     not sign a webhook created with a Site API token — see
     routes/webflow_webhooks.py. That makes this URL a credential: it is never
-    logged and never returned to a caller.
+    returned to a caller, and every APPLICATION logger that would otherwise
+    write it redacts the trailing segment
+    (`middleware/structured_logging.py::redact_path`, which the access log and
+    the rate limiter's ceiling warning both go through).
+
+    It is NOT, however, absent from the world: a secret in a URL path is present
+    in every request log kept UPSTREAM of this process — the load balancer's, a
+    proxy's, an APM trace. That cannot be redacted from here, and it is the
+    honest argument for configuring `WEBFLOW_CLIENT_SECRET` wherever an OAuth
+    app exists, so a delivery has to carry a fresh signature as well as a URL
+    somebody could have read out of an access log.
     """
     base = str(
         os.getenv("WEBFLOW_WEBHOOK_BASE_URL")
@@ -3658,6 +3668,7 @@ async def merchant_connect_webflow(
         WebflowConnectionError,
         WebflowSiteAmbiguousError,
         drop_site_scoped_keys,
+        parse_webflow_credentials,
         serialize_webflow_credentials,
     )
 
@@ -3710,11 +3721,40 @@ async def merchant_connect_webflow(
     )
     store_name = (request.store_name or "").strip() or site_name or "Webflow Store"
 
-    existing_store = await database.fetch_one(
-        """SELECT store_id, api_key FROM merchant_stores
-           WHERE merchant_id = :merchant_id AND platform = 'webflow' AND domain = :domain""",
-        {"merchant_id": request.merchant_id, "domain": store_domain},
+    # THE SITE IS THE IDENTITY, NOT THE DOMAIN. `domain` is caller-supplied and
+    # otherwise merely derived from `shortName`, so keying the existing-store
+    # lookup on it alone means a second connect for the SAME site with a
+    # different explicit `domain` creates a SECOND store row bound to the same
+    # `site_id` — and then both stores sweep the same order list and the funnel
+    # counts that site's GMV twice, out of rows that are individually
+    # well-formed and impossible to flag downstream.
+    #
+    # So this store's own site binding is consulted first, and the domain lookup
+    # is the FALLBACK for a row that predates the binding (or was written by a
+    # path that never stored one). The site-bound branch cannot be replaced by a
+    # SQL `LIKE` on the blob: the credential cell is JSON and `site_id` is a key
+    # inside it, so the match is made in Python over this merchant's own
+    # Webflow rows, which is a handful.
+    existing_store = None
+    site_bound_rows = await database.fetch_all(
+        """SELECT store_id, domain, api_key FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND platform = 'webflow'""",
+        {"merchant_id": request.merchant_id},
     )
+    for row in site_bound_rows:
+        row = dict(row)
+        if str(
+            parse_webflow_credentials(row.get("api_key")).get("site_id") or ""
+        ).strip() == site_id:
+            existing_store = row
+            break
+    if existing_store is None:
+        existing_store = await database.fetch_one(
+            """SELECT store_id, domain, api_key FROM merchant_stores
+               WHERE merchant_id = :merchant_id AND platform = 'webflow'
+                 AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": store_domain},
+        )
 
     def _reconnect(preserved: dict) -> dict:
         """The blob to persist, computed INSIDE the merge's critical section.
@@ -3741,6 +3781,11 @@ async def merchant_connect_webflow(
     if existing_store:
         existing_store = dict(existing_store)
         store_id = existing_store["store_id"]
+        # The ROW's domain, not the request's. A reconnect matched on the site
+        # binding may carry a different `domain` argument, and answering with a
+        # value no row holds would tell the merchant a store exists under a name
+        # nothing can look up.
+        store_domain = str(existing_store.get("domain") or "").strip() or store_domain
         persisted = await webflow.merge_webflow_credentials(
             store_id=store_id,
             mutate=_reconnect,
@@ -3830,18 +3875,30 @@ async def ensure_webflow_webhooks_route(
 
     THE ORDER OF THE TWO WRITES IS THE WHOLE DESIGN. The URL secret is minted
     and PERSISTED first, then the webhook carrying it is registered at Webflow,
-    then the webhook ids are persisted. A crash after the first write leaves a
-    stored secret and no webhook — harmless, and fixed by re-running this. The
-    opposite order would leave Webflow delivering to a URL whose secret was
-    never stored, and the receiver would answer 401 to every delivery forever.
+    then the webhook ids are persisted. A failure after the first write leaves a
+    stored secret and no webhook — harmless ON FIRST PROVISIONING, and fixed by
+    re-running this. The opposite order would leave Webflow delivering to a URL
+    whose secret was never stored, and the receiver would answer 401 to every
+    delivery forever.
 
     `rotate=true` mints a NEW secret, which changes the registered URL. In-flight
     deliveries to the old URL will 401; Webflow retries them and the
     reconciliation sweep recovers anything that never lands. Without `rotate`,
     an existing secret is REUSED, so this is safe to re-run.
 
-    The secret is never returned and never logged: Pivota registers the webhook
-    itself, so no human needs to see it.
+    A ROTATION IS THE CASE WHERE "harmless" DOES NOT HOLD, because the store had
+    a WORKING webhook to lose: the live webhook still carries the old secret,
+    the new one is already persisted, and a 502/504 in between silences the
+    store until somebody re-runs this. So a registration failure during a
+    rotation restores the superseded secret (`_roll_back_rotation`). What that
+    cannot cover is the process dying between the two — documented as a residual
+    in docs/WEBFLOW_TELEMETRY.md rather than claimed away.
+
+    The secret is never returned, and no application logger writes it: the
+    access log and the rate limiter's ceiling warning redact the trailing path
+    segment (`middleware/structured_logging.py::redact_path`). Upstream request
+    logs (load balancer, proxy) inherently hold it — see
+    `_webflow_webhook_endpoint`.
     """
     store = await _webflow_store_for_caller(store_id, current_user)
 
@@ -3894,6 +3951,11 @@ async def ensure_webflow_webhooks_route(
         )
     _WEBFLOW_ENSURES_IN_FLIGHT.add(resolved_store_id)
     try:
+        # The secret this run REPLACED, captured inside the merge's critical
+        # section, and empty unless a working one was actually superseded. It is
+        # what makes a failed ROTATION recoverable: see `_roll_back_rotation`.
+        superseded: dict = {}
+
         def _mint(blob: dict) -> dict:
             """Mint only when there is nothing usable, unless asked to rotate.
 
@@ -3902,6 +3964,8 @@ async def ensure_webflow_webhooks_route(
             """
             current = str(blob.get("url_secret") or "").strip()
             if rotate or not current:
+                if current:
+                    superseded["secret"] = current
                 blob["url_secret"] = mint_url_secret()
             return blob
 
@@ -3919,6 +3983,53 @@ async def ensure_webflow_webhooks_route(
         prefix, callback_url = _webflow_webhook_endpoint(resolved_store_id, url_secret)
         triggers = list(WEBFLOW_ORDER_TRIGGERS)
 
+        async def _roll_back_rotation() -> None:
+            """Put the SUPERSEDED secret back when a rotation could not register.
+
+            "A crash between persist and register is harmless" is true only on
+            FIRST provisioning, where the store had no working webhook to lose.
+            On a rotation it is the opposite: the live webhook still carries the
+            OLD secret, the new one is already persisted, and every delivery
+            401s until somebody re-runs this — the store goes silent and only
+            the sweep recovers it.
+
+            So a registration failure restores the secret Webflow is actually
+            delivering with. Guarded on the stored value still being the one
+            THIS run minted, so a concurrent writer is never clobbered by the
+            rollback, and swallowed on failure because the caller is already
+            answering an error.
+            """
+            previous = str(superseded.get("secret") or "").strip()
+            if not previous:
+                return
+
+            def _restore(blob: dict) -> dict:
+                current = str(blob.get("url_secret") or "").strip()
+                if current and hmac.compare_digest(current, url_secret):
+                    blob["url_secret"] = previous
+                return blob
+
+            try:
+                await merge_webflow_credentials(
+                    store_id=resolved_store_id, mutate=_restore, db=database
+                )
+                logger.info(
+                    "webflow_webhooks_ensure action=rotation_rolled_back store_id=%s "
+                    "store_merchant_id=%s actor_role=%s actor_user_id=%s",
+                    resolved_store_id,
+                    store.get("merchant_id") or "-",
+                    current_user.get("role") or "-",
+                    current_user.get("sub") or "-",
+                )
+            except Exception:
+                logger.warning(
+                    "webflow_webhooks_ensure could not roll back a failed rotation "
+                    "store_id=%s — the store's webhooks now carry a secret this "
+                    "deployment no longer holds and every delivery will 401 until "
+                    "ensure is re-run",
+                    resolved_store_id,
+                )
+
         try:
             async with asyncio.timeout(WEBFLOW_ENSURE_TIMEOUT_SECONDS):
                 async with _WEBFLOW_WEBHOOK_INSTALL_CONCURRENCY:
@@ -3930,6 +4041,7 @@ async def ensure_webflow_webhooks_route(
                         store_path_prefix=prefix,
                     )
         except WebflowWebhookScopeError as exc:
+            await _roll_back_rotation()
             logger.info(
                 "webflow_webhooks_ensure action=scope_required store_id=%s "
                 "store_merchant_id=%s actor_role=%s actor_user_id=%s",
@@ -3949,12 +4061,15 @@ async def ensure_webflow_webhooks_route(
                 },
             ) from exc
         except WebflowWebhookError as exc:
+            await _roll_back_rotation()
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except httpx.HTTPError as exc:
+            await _roll_back_rotation()
             raise HTTPException(
                 status_code=502, detail="Webflow webhook management request failed"
             ) from exc
         except TimeoutError as exc:
+            await _roll_back_rotation()
             raise HTTPException(
                 status_code=504, detail="Webflow webhook installation timed out"
             ) from exc
@@ -3969,10 +4084,28 @@ async def ensure_webflow_webhooks_route(
             # Another writer replaced the secret between the two merges. The
             # webhooks just registered carry a URL the receiver will now 401, so
             # they are removed rather than left delivering into a wall.
+            discarded = sorted(
+                str(webhook_id) for webhook_id in result.webhook_ids.values()
+            )
             for webhook_id in result.webhook_ids.values():
                 await _discard_webflow_webhook(
                     api_token, webhook_id, delete_webflow_webhook
                 )
+            # The same principal fields as `scope_required` and `provisioned`,
+            # mirroring the Squarespace branch above. A lost race is the one
+            # outcome where webhooks were created at Webflow and then DELETED
+            # again, so the audit trail needs to name who caused that at least
+            # as much as it does for the outcomes that leave something behind.
+            logger.info(
+                "webflow_webhooks_ensure action=lost_race store_id=%s "
+                "store_merchant_id=%s actor_role=%s actor_user_id=%s "
+                "discarded_webhook_ids=%s",
+                resolved_store_id,
+                store.get("merchant_id") or "-",
+                current_user.get("role") or "-",
+                current_user.get("sub") or "-",
+                ",".join(discarded) or "-",
+            )
             raise HTTPException(
                 status_code=409,
                 detail=(

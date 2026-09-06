@@ -112,6 +112,10 @@ def _install(monkeypatch, *, credentials=None, recorder=None):
         "api_token": "wf-token",
         "site_id": SITE_ID,
     }
+    # What the row HOLDS, as distinct from what the run read at the top. They
+    # are the same object's contents until something writes between the two,
+    # which is exactly what `_write_between` in the concurrency test does.
+    stored = dict(blob)
     merged = {}
 
     async def fake_find(store_id):
@@ -122,9 +126,25 @@ def _install(monkeypatch, *, credentials=None, recorder=None):
             "api_key": json.dumps(blob),
         }
 
-    async def fake_merge(*, store_id, updates=None, **kwargs):
-        merged.update(updates or {})
-        return {**blob, **(updates or {})}
+    async def fake_merge(*, store_id, updates=None, mutate=None, **kwargs):
+        """A merge that genuinely READS the current blob, mutates it, writes back.
+
+        The sweep's final write is a `mutate` that merges only the lanes THIS
+        run walked into whatever `reconciliation` holds at write time. A double
+        that ignored the callback, or ran it against an empty dict, would make
+        that claim untestable — and would have kept passing while the sweep went
+        back to overwriting the whole subtree.
+        """
+        if mutate is not None:
+            blob.clear()
+            blob.update(mutate(dict(stored)))
+        if updates:
+            blob.update(updates)
+        stored.clear()
+        stored.update(blob)
+        merged.clear()
+        merged.update(blob)
+        return dict(blob)
 
     recorded = []
 
@@ -139,13 +159,15 @@ def _install(monkeypatch, *, credentials=None, recorder=None):
     monkeypatch.setattr(sweep, "find_webflow_store", fake_find)
     monkeypatch.setattr(sweep, "merge_webflow_credentials", fake_merge)
     monkeypatch.setattr(sweep, "record_webflow_order", fake_record)
-    return merged, recorded
+    return merged, recorded, stored
 
 
 async def _run(monkeypatch, client, *, credentials=None, recorder=None, **kwargs):
     from services.webflow_order_sweep import sweep_webflow_store
 
-    merged, recorded = _install(monkeypatch, credentials=credentials, recorder=recorder)
+    merged, recorded, _stored = _install(
+        monkeypatch, credentials=credentials, recorder=recorder
+    )
     stats = await sweep_webflow_store(
         store_id=STORE_ID, client=client, now=NOW, **kwargs
     )
@@ -722,3 +744,227 @@ async def test_one_stores_failure_does_not_stop_the_others(monkeypatch):
     assert result["processed"] == 2
     assert result["failed"] == 1
     assert result["accepted"] == 2
+
+
+# ---- the ordering claim applies to the `orders` lane ALONE -------------------
+
+
+async def test_the_money_out_lanes_are_never_armed_and_never_judged(monkeypatch):
+    """Their anchor is not the field the list is sorted by.
+
+    Assumption 7 is about `acceptedOn`. A `refunded` lane anchored on
+    `refundedOn` reads a list that arrives in `acceptedOn` order, so its anchors
+    arrive in essentially arbitrary sequence — and judging them reported a
+    "violation" on almost every store on almost every run, which is the same as
+    never reporting one and would bury a real `orders`-lane violation.
+    """
+    refunds = [
+        # Deliberately ASCENDING by `refundedOn` while descending by
+        # `acceptedOn`: under the old check this is a violation on every run.
+        _order("r-1", accepted=NOW - timedelta(days=9), status="refunded",
+               refunded=NOW - timedelta(hours=9)),
+        _order("r-2", accepted=NOW - timedelta(days=10), status="refunded",
+               refunded=NOW - timedelta(hours=1)),
+    ]
+    client = _Client(
+        pages_by_status={
+            None: [_order("o-1", accepted=NOW)],
+            "refunded": refunds,
+            "dispute-lost": [],
+        }
+    )
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "refunded": {
+                    "cursor": _iso(NOW - timedelta(days=1)),
+                    "ordering_verified": True,
+                }
+            },
+        },
+    )
+
+    refunded = _lane(stats, "refunded")
+    assert refunded["ordering_applicable"] is False
+    assert refunded["ordering_verified"] is None, (
+        "a money-out lane reported an ordering verdict it cannot earn"
+    )
+    assert refunded["early_stop_armed"] is False, (
+        "a money-out lane armed an early stop on an ordering it does not have — "
+        "a stop there skips the rest of the list permanently"
+    )
+    assert refunded.get("stopped_early") is not True
+    # A stale verdict from an earlier build is REMOVED, not merely ignored:
+    # left in place it would re-arm the stop the moment this guard regressed.
+    assert "ordering_verified" not in merged["reconciliation"]["refunded"]
+    # ...and the run no longer claims the store's list is out of order.
+    assert stats["ordering_verified"] is True
+    assert stats["unordered_lanes"] == []
+
+    # THE POSITIVE COUNTERPART: the `orders` lane IS judged, on the same run.
+    orders = _lane(stats, "orders")
+    assert orders["ordering_applicable"] is True
+    assert orders["ordering_verified"] is True
+
+
+async def test_only_the_orders_lane_can_report_a_violation(monkeypatch):
+    """The counterpart to the test above: a genuinely out-of-order unfiltered
+    list still disarms and still gets named, and the money-out lanes do not
+    dilute it."""
+    client = _Client(
+        pages_by_status={
+            None: [
+                _order("o-1", accepted=NOW - timedelta(hours=5)),
+                _order("o-2", accepted=NOW - timedelta(hours=1)),  # NEWER: a violation
+            ],
+            "refunded": [
+                _order("r-1", accepted=NOW - timedelta(days=9), status="refunded",
+                       refunded=NOW - timedelta(hours=9)),
+                _order("r-2", accepted=NOW - timedelta(days=10), status="refunded",
+                       refunded=NOW - timedelta(hours=1)),
+            ],
+            "dispute-lost": [],
+        }
+    )
+
+    stats, merged, _recorded = await _run(monkeypatch, client)
+
+    assert _lane(stats, "orders")["ordering_verified"] is False
+    assert merged["reconciliation"]["orders"]["ordering_verified"] is False
+    assert stats["ordering_verified"] is False
+    assert stats["unordered_lanes"] == ["orders"]
+
+
+async def test_a_run_that_judged_no_lane_reports_no_ordering_verdict(monkeypatch):
+    """`--lane refunded` must not answer `ordering_verified: false` and make the
+    script's NOTE fire for a run that checked nothing."""
+    client = _Client(pages_by_status={"refunded": []})
+
+    stats, _merged, _recorded = await _run(monkeypatch, client, lanes=["refunded"])
+
+    assert stats["ordering_verified"] is None
+    assert stats["unordered_lanes"] == []
+
+
+# ---- the state write merges; it does not overwrite the subtree ---------------
+
+
+async def test_the_state_write_touches_only_the_lanes_this_run_walked(monkeypatch):
+    """A lane this run did not run must survive its write.
+
+    The run reads `reconciliation` once and writes it many network calls later.
+    The row lock covers the WRITE, not that whole span, so persisting the
+    subtree computed from the original read discards every cursor another
+    replica wrote meanwhile.
+    """
+    client = _Client(pages_by_status={None: [_order("o-1", accepted=NOW)]})
+
+    _stats, merged, _recorded = await _run(
+        monkeypatch,
+        client,
+        lanes=["orders"],
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "refunded": {"cursor": _iso(NOW - timedelta(days=2))},
+                "dispute_lost": {"cursor": _iso(NOW - timedelta(days=3))},
+            },
+        },
+    )
+
+    state = merged["reconciliation"]
+    assert state["orders"]["cursor"] == _iso(NOW)
+    assert state["refunded"] == {"cursor": _iso(NOW - timedelta(days=2))}
+    assert state["dispute_lost"] == {"cursor": _iso(NOW - timedelta(days=3))}
+
+
+async def test_a_cursor_written_DURING_the_run_is_not_clobbered(monkeypatch):
+    """The interleaving itself, not just the shape.
+
+    A second replica persists the `refunded` lane while this run is still
+    walking `orders`. The read-modify-write spans that gap, so the only thing
+    that saves the other replica's cursor is that this run's final write merges
+    into the CURRENT row rather than into the copy it read at the top.
+    """
+    from services import webflow_order_sweep as sweep
+
+    client = _Client(pages_by_status={None: [_order("o-1", accepted=NOW)]})
+    _merged, _recorded, stored = _install(
+        monkeypatch,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"refunded": {"cursor": _iso(NOW - timedelta(days=2))}},
+        },
+    )
+
+    later = _iso(NOW - timedelta(minutes=5))
+    original_record = sweep.record_webflow_order
+
+    async def _write_between(**kwargs):
+        # The other replica lands its refunded cursor mid-walk.
+        stored["reconciliation"] = {
+            **stored.get("reconciliation", {}),
+            "refunded": {"cursor": later},
+        }
+        return await original_record(**kwargs)
+
+    monkeypatch.setattr(sweep, "record_webflow_order", _write_between)
+
+    await sweep.sweep_webflow_store(
+        store_id=STORE_ID, client=client, now=NOW, lanes=["orders"]
+    )
+
+    assert stored["reconciliation"]["refunded"] == {"cursor": later}, (
+        "this run's write discarded a cursor another writer landed while it was "
+        "walking Webflow"
+    )
+    assert stored["reconciliation"]["orders"]["cursor"] == _iso(NOW)
+
+
+# ---- an unreadable refund is counted, not dropped ---------------------------
+
+
+async def test_an_unreadable_refund_amount_is_counted_under_its_own_name(monkeypatch):
+    """The order still lands; the missing refund row is visible in the run.
+
+    Raising instead dropped the whole batch, so the sweep counted the order as
+    `invalid` and the purchase never reached the ledger at all — a strictly
+    worse trade than under-reporting money out and saying so.
+    """
+    from services.webflow_ledger import WebflowIngestResult
+
+    def _result(kwargs):
+        if kwargs["order"]["orderId"] == "r-1":
+            return WebflowIngestResult(
+                status="recorded",
+                accepted=1,
+                ignored_reasons=("refund_amount_unreadable: ...",),
+            )
+        return WebflowIngestResult(status="recorded", accepted=2)
+
+    client = _Client(
+        pages_by_status={
+            None: [_order("o-1", accepted=NOW)],
+            "refunded": [
+                _order("r-1", accepted=NOW - timedelta(hours=2), status="refunded",
+                       refunded=NOW - timedelta(hours=1), value=0)
+            ],
+            "dispute-lost": [],
+        }
+    )
+
+    stats, _merged, _recorded = await _run(monkeypatch, client, recorder=_result)
+
+    assert _lane(stats, "refunded")["refunds_unreadable"] == 1
+    assert _lane(stats, "orders")["refunds_unreadable"] == 0
+    assert stats["refunds_unreadable"] == 1
+    # It is NOT counted as invalid: the order itself was recorded.
+    assert stats["invalid"] == 0
+    assert stats["accepted"] == 3

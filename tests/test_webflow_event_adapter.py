@@ -49,10 +49,16 @@ def _order(**overrides):
     return order
 
 
-def _map(order, **kwargs):
+def _mapping(order, **kwargs):
     from services.webflow_event_adapter import map_webflow_order
 
     return map_webflow_order(order, store_id=STORE_ID, source=SOURCE, **kwargs)
+
+
+def _map(order, **kwargs):
+    """The BATCH out of a mapping. Most tests are about the events alone; the
+    ones about what was deliberately NOT recorded use `_mapping`."""
+    return _mapping(order, **kwargs).batch
 
 
 def _by_type(batch):
@@ -117,16 +123,93 @@ def test_a_float_that_is_a_whole_number_is_accepted():
 
 
 def test_zero_decimal_currencies_are_not_special_cased():
-    """Because the value is ALREADY minor units, there is nothing to special-case.
+    """Because the value is ALREADY minor units, there is nothing to convert.
 
     A JPY order of 5898 yen is `value: 5898`, exactly as a USD order of $58.98 is
     5898 cents. An adapter that carried the usual zero-decimal table would be
-    carrying dead code that could only ever introduce a bug.
+    carrying dead code that could only ever introduce a bug — SO LONG AS Webflow
+    really does state JPY that way, which is assumption 22 and is what the
+    tripwire below exists for.
     """
     events = _by_type(_map(_order(customerPaid={"unit": "JPY", "value": 5898})))
 
     assert events["order.paid"].amount_cents == 5898
     assert events["order.paid"].currency == "JPY"
+
+
+def test_a_zero_decimal_currency_trips_a_warning_naming_the_store_and_the_value(
+    caplog, monkeypatch
+):
+    """The tripwire under assumption 22.
+
+    "There is no zero-decimal table because there is nothing to special-case" is
+    only true if Webflow states JPY in yen rather than in hundredths of a yen.
+    No order this repo has seen proves that, and if it is wrong a ¥5,898 order is
+    filed as ¥589,800 with no second source to contradict it. So the FIRST such
+    order per process per currency says so, out loud.
+    """
+    import logging
+
+    from services import webflow_event_adapter as adapter
+
+    monkeypatch.setattr(adapter, "_ZERO_DECIMAL_OBSERVED", set())
+
+    with caplog.at_level(logging.WARNING, logger="webflow_event_adapter"):
+        _map(_order(customerPaid={"unit": "JPY", "value": 5898}))
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1, warnings
+    assert "webflow_zero_decimal_currency_observed" in warnings[0]
+    assert "JPY" in warnings[0]
+    assert STORE_ID in warnings[0]
+    assert "5898" in warnings[0]
+    assert ORDER_ID in warnings[0]
+
+    # ...and ONCE per currency, not once per order: a store doing steady JPY
+    # volume must not turn this into a log flood that gets muted.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="webflow_event_adapter"):
+        _map(_order(orderId="0000-0002", customerPaid={"unit": "JPY", "value": 1200}))
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_a_two_decimal_currency_trips_NOTHING(caplog, monkeypatch):
+    """The counterpart. A warning that fired for USD would fire on essentially
+    every order and mean nothing at all."""
+    import logging
+
+    from services import webflow_event_adapter as adapter
+
+    monkeypatch.setattr(adapter, "_ZERO_DECIMAL_OBSERVED", set())
+
+    with caplog.at_level(logging.WARNING, logger="webflow_event_adapter"):
+        _map(_order(customerPaid={"unit": "USD", "value": 5898}))
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_a_zero_amount_order_does_not_take_the_order_paid_key(caplog):
+    """`and paid_minor` in the `order.paid` guard, pinned.
+
+    A money event with a zero amount would take this order's DETERMINISTIC
+    `order.paid` key — and the ledger is first-write-wins, so the real figure
+    arriving on the next observation would be discarded forever. `is not None`
+    there looks equivalent and is not: it admits the zero.
+    """
+    events = _by_type(_map(_order(customerPaid={"unit": "USD", "value": 0})))
+
+    assert "order.paid" not in events, (
+        "a value:0 order took its own order.paid key — the real amount can now "
+        "never be recorded under it"
+    )
+    # And the order itself still exists: a guard that dropped everything would
+    # satisfy the assertion above while losing the purchase.
+    assert "order.created" in events
+    assert events["order.created"].amount_cents == 0
 
 
 # ---- currency ---------------------------------------------------------------
@@ -148,20 +231,69 @@ def test_a_paid_order_with_no_readable_currency_records_no_money_event():
     assert "order.paid" not in events
 
 
-def test_a_refunded_order_with_no_readable_money_is_LOUD():
-    """The negative counterpart of the test above.
+@pytest.mark.parametrize(
+    "case, customer_paid",
+    [
+        ("no currency", {"value": 5898}),
+        ("absent amount", {"unit": "USD"}),
+        ("zero amount", {"unit": "USD", "value": 0}),
+    ],
+)
+def test_a_refunded_order_with_no_readable_money_keeps_the_order_and_NAMES_the_gap(
+    case, customer_paid
+):
+    """The negative counterpart of the test above — and it must not cost the ORDER.
 
-    A refund silently omitted is money the ledger says never came back. That is
-    a different failure from an unbucketable purchase and must not share its
-    quiet handling.
+    A refund silently omitted is money the ledger says never came back, so it
+    cannot be swallowed. But raising took `order.created` with it: the receiver
+    answered 422, Webflow retries a 422 into the same 422, and the order never
+    landed at all. So the readable half is recorded and the unreadable half is a
+    NAMED reason a caller can count, log and print.
     """
+    from services.webflow_event_adapter import REFUND_AMOUNT_UNREADABLE
+
+    mapping = _mapping(
+        _order(
+            status="refunded",
+            refundedOn="2026-09-03T10:00:00.000Z",
+            customerPaid=customer_paid,
+            netAmount={"value": 5600},
+        )
+    )
+
+    types = {event.event_type for event in mapping.batch.events}
+    assert "order.created" in types, f"{case}: the order itself was dropped"
+    assert "refund.succeeded" not in types, f"{case}: an unreadable refund was invented"
+    assert len(mapping.ignored) == 1, case
+    assert mapping.ignored[0].startswith(REFUND_AMOUNT_UNREADABLE), case
+    assert ORDER_ID in mapping.ignored[0], case
+
+
+def test_a_readable_refund_reports_NOTHING_ignored():
+    """The positive counterpart: `ignored` must not be a field that is always
+    populated, or the counter it feeds means nothing."""
+    mapping = _mapping(
+        _order(
+            status="refunded",
+            refundedOn="2026-09-03T10:00:00.000Z",
+            customerPaid={"unit": "USD", "value": 5898},
+        )
+    )
+
+    assert mapping.ignored == ()
+    assert "refund.succeeded" in {e.event_type for e in mapping.batch.events}
+
+
+def test_a_malformed_refund_amount_is_STILL_fatal_to_the_whole_observation():
+    """Absent is not the same as WRONG. `"58.98"` is the 100x shape, and half
+    of it must never be recorded — that is a different claim from the one above
+    and it has to keep raising."""
     with pytest.raises(ValueError):
         _map(
             _order(
                 status="refunded",
                 refundedOn="2026-09-03T10:00:00.000Z",
-                customerPaid={"value": 5898},
-                netAmount={"value": 5600},
+                customerPaid={"unit": "USD", "value": "58.98"},
             )
         )
 
@@ -324,10 +456,12 @@ def test_event_ids_are_derived_from_the_order_and_not_from_the_ingress():
     paths armed would count every purchase twice."""
     from services.webflow_event_adapter import map_webflow_order
 
-    webhook = map_webflow_order(_order(), store_id=STORE_ID, source="webflow_webhook")
+    webhook = map_webflow_order(
+        _order(), store_id=STORE_ID, source="webflow_webhook"
+    ).batch
     sweep = map_webflow_order(
         _order(), store_id=STORE_ID, source="webflow_reconciliation"
-    )
+    ).batch
 
     assert [e.event_id for e in webhook.events] == [e.event_id for e in sweep.events]
     assert webhook.events[0].source == "webflow_webhook"
@@ -337,8 +471,8 @@ def test_event_ids_are_derived_from_the_order_and_not_from_the_ingress():
 def test_event_ids_are_scoped_to_the_store():
     from services.webflow_event_adapter import map_webflow_order
 
-    a = map_webflow_order(_order(), store_id="store-a", source=SOURCE)
-    b = map_webflow_order(_order(), store_id="store-b", source=SOURCE)
+    a = map_webflow_order(_order(), store_id="store-a", source=SOURCE).batch
+    b = map_webflow_order(_order(), store_id="store-b", source=SOURCE).batch
 
     assert a.events[0].event_id != b.events[0].event_id
 

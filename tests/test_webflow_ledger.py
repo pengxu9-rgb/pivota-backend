@@ -149,6 +149,7 @@ async def test_no_money_lock_is_taken_anywhere_in_this_integration():
     """
     from services import webflow_ledger, webflow_order_sweep
 
+    called_by_module = {}
     for module in (webflow_ledger, webflow_order_sweep):
         source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -157,8 +158,21 @@ async def test_no_money_lock_is_taken_anywhere_in_this_integration():
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
         }
+        called_by_module[module.__name__] = called
         assert "order_money_read_modify_write_lock" not in called
         assert "recorded_refund_amount_cents" not in called
+
+    # THE POSITIVE COUNTERPART, and it is not decoration. Every assertion above
+    # is an absence, and an absence is exactly what a broken extractor produces:
+    # a walk that resolved no call name at all — a renamed attribute, an `ast`
+    # shape this comprehension does not reach, a module that failed to parse into
+    # anything — would pass all four while proving nothing. So the SAME extracted
+    # set has to contain the call this integration certainly does make.
+    assert "ingest_merchant_event_batch" in called_by_module["services.webflow_ledger"], (
+        "the AST walk found no ingest call in the one module that exists to make "
+        "it — the extractor is broken, so the absences above prove nothing"
+    )
+    assert "record_webflow_order" in called_by_module["services.webflow_order_sweep"]
 
 
 async def test_the_summary_shape_is_the_same_whatever_happened(monkeypatch):
@@ -177,3 +191,72 @@ async def test_the_summary_shape_is_the_same_whatever_happened(monkeypatch):
     body = ignored.as_summary()
     assert body["accepted"] == 0 and body["duplicates"] == 0
     assert body["reason"].startswith("test_order")
+
+
+async def test_an_unreadable_refund_is_recorded_as_a_named_reason_not_an_exception(
+    monkeypatch, caplog
+):
+    """The order lands, the missing refund is NAMED.
+
+    Raising here dropped `order.created` with the refund: the receiver answered
+    422, Webflow retries a 422 into the same 422 until it gives up, and the order
+    never reached the ledger at all. Under-reporting money OUT is bad; losing the
+    purchase as well is strictly worse.
+    """
+    import logging
+
+    from services.webflow_event_adapter import REFUND_AMOUNT_UNREADABLE
+    from services.webflow_ledger import record_webflow_order
+
+    calls = _capture(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="webflow_ledger"):
+        result = await record_webflow_order(
+            merchant_id=MERCHANT_ID,
+            store_id=STORE_ID,
+            order=_order(
+                status="refunded",
+                refundedOn="2026-09-03T10:00:00.000Z",
+                customerPaid={"unit": "USD", "value": 0},
+            ),
+            from_webhook=True,
+        )
+
+    assert result.status == "recorded"
+    assert len(result.ignored_reasons) == 1
+    assert result.ignored_reasons[0].startswith(REFUND_AMOUNT_UNREADABLE)
+    # The batch that DID reach the ledger carries the order and no refund row.
+    types = {event.event_type for event in calls[0]["batch"].events}
+    assert "order.created" in types
+    assert "refund.succeeded" not in types
+    # And it is audible: money out that this bridge could not record must not be
+    # a silent field on a success response.
+    assert any(
+        REFUND_AMOUNT_UNREADABLE in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ), [r.getMessage() for r in caplog.records]
+    # The summary carries it too, so a webhook caller sees it without reading logs.
+    assert result.as_summary()["ignored_reasons"] == list(result.ignored_reasons)
+
+
+async def test_a_fully_mapped_order_reports_no_ignored_reasons(monkeypatch):
+    """The counterpart: `ignored_reasons` must be empty on the ordinary path, or
+    the sweep counter it feeds would count every order."""
+    from services.webflow_ledger import record_webflow_order
+
+    _capture(monkeypatch)
+
+    result = await record_webflow_order(
+        merchant_id=MERCHANT_ID,
+        store_id=STORE_ID,
+        order=_order(
+            status="refunded",
+            refundedOn="2026-09-03T10:00:00.000Z",
+            customerPaid={"unit": "USD", "value": 5898},
+        ),
+        from_webhook=False,
+    )
+
+    assert result.ignored_reasons == ()
+    assert "ignored_reasons" not in result.as_summary()

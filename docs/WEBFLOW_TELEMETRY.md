@@ -63,9 +63,20 @@ it: a `* 100` "for consistency with every other adapter in this repo" would file
 a $58.98 order as $5,898.00, and nothing downstream distinguishes an inflated
 amount from a real one.
 
-Because there is no conversion, there is also **no zero-decimal-currency table**.
-A ¥5,898 order is `value: 5898` exactly as a $58.98 one is; the usual JPY/KRW
-special case would be dead code that could only introduce a bug.
+Because there is no conversion, there is also **no zero-decimal-currency table**
+— and that is an **assumption**, not a consequence. See row 22: it is only
+correct if Webflow reports a ¥5,898 order as `value: 5898` rather than as
+`589800`, and this repo has never seen a Webflow order in a zero-decimal
+currency. If Webflow reports hundredths there, such an order is filed **100x
+inflated** and nothing downstream can tell it from a real one, because
+`customerPaid` is the only source for the figure.
+
+So the mapper carries a **tripwire** rather than an argument: the first order
+per process per zero-decimal currency (`utils.money.ZERO_DECIMAL_CURRENCIES`)
+logs a WARNING naming the store, the currency, the order and the observed
+`value`, so the first such order is visible instead of silently doubling as
+evidence. It is keyed on the currency, whose domain is that frozen 16-element
+set, so the bookkeeping is bounded by construction.
 
 A `value` the mapper cannot read as a whole number of minor units — a decimal
 string like `"58.98"`, a fractional float, a negative — is a **loud**
@@ -104,7 +115,32 @@ every site-token store.
 > A deployment that runs an OAuth app should set `WEBFLOW_CLIENT_SECRET`. Without
 > it, the URL secret is the only thing authenticating a delivery. That is
 > genuinely sufficient — it is a 256-bit secret over TLS — but it has no replay
-> window and no rotation short of re-provisioning.
+> window and no rotation short of re-provisioning, **and it is in a URL**.
+
+### A secret in a path, and where that path is written down
+
+A secret carried in the URL path is written into request logs the way a secret
+carried in a header is not. So:
+
+* **In this application, it is redacted.** `StructuredLoggingMiddleware` logs
+  `path` on **every** request — INFO on the 200s, WARNING on the 401s — and it
+  logged this one verbatim until `middleware/structured_logging.py::redact_path`
+  rewrote it to `/webhooks/webflow/{store_id}/[REDACTED]`. The redaction is a
+  small registry of `(prefix, segments_to_keep)` pairs rather than a Webflow
+  special case, so the next path-secret route registers a prefix instead of
+  growing a second rule. The rate limiter's anonymous-ceiling warning — the one
+  other logger an unauthenticated request to this path can reach — goes through
+  the same helper. The receiver's own 401 line and `telemetry_ingress`'s
+  non-2xx line never carried the path at all; they name the store id and the
+  logical write path. `tests/test_webflow_webhooks.py` drives the receiver
+  through the real middleware over `ASGITransport` and asserts the secret is
+  absent from every captured record, on the 200 path and the 401 path.
+* **Upstream of this application, it is not, and cannot be.** The load
+  balancer's access log, any proxy in front of it, and an APM trace all hold the
+  full path. Nothing in this repo can redact those. That is the honest argument
+  for setting `WEBFLOW_CLIENT_SECRET` wherever an OAuth app exists: Layer 2
+  requires a fresh signature over the body, which a URL recovered from an access
+  log does not provide.
 
 Every malformed input on either layer is a 401, never a 500 and never a 200: an
 empty header, a non-numeric timestamp, non-ASCII bytes, a signature over the body
@@ -164,8 +200,19 @@ restarts, and the sweep.
 | --- | --- | --- | --- |
 | `order.created` | always | `acceptedOn` (else now) | `customerPaid` |
 | `order.paid` | `status` ∈ {unfulfilled, fulfilled, disputed, dispute-lost, refunded} and a positive amount and currency | `acceptedOn` | `customerPaid` (`native_amount_semantics=customer_paid`) |
-| `refund.succeeded` | `status` ∈ {refunded, dispute-lost} | `refundedOn` / the dispute timestamps | the full `customerPaid` |
+| `refund.succeeded` | `status` ∈ {refunded, dispute-lost} **and** a positive amount and currency | `refundedOn` / the dispute timestamps | the full `customerPaid` |
 | `order.cancelled` | **never** | — | — |
+
+**An unreadable refund costs the refund row, not the order.** A
+`refunded`/`dispute-lost` order whose `customerPaid` is absent or `0` still
+records `order.created`; the refund becomes the named reason
+`refund_amount_unreadable`. Raising there dropped `order.created` too and 422'd
+the receiver — and Webflow retries a 422 into the same 422, so the order never
+landed at all. The reason is counted (`refunds_unreadable` per lane and per run),
+logged at WARNING, and printed as its own NOTE by the script, because refunded
+GMV really is under-reported until the amount becomes readable. A *malformed*
+value (`"58.98"`, a fractional float, a negative) is still fatal to the whole
+observation — that is the 100x claim and it must never be half-recorded.
 
 **`pending` is not paid.** It is Webflow's documented unpaid state (a PayPal
 payment awaiting capture), so it gets `order.created` alone. A later
@@ -227,11 +274,11 @@ python -m scripts.sweep_webflow_orders --lane refunded --apply
 
 ### Three lanes, because there is no modified-since filter
 
-| Lane | `status` filter | anchored on |
-| --- | --- | --- |
-| `orders` | *(none)* | `acceptedOn` |
-| `refunded` | `refunded` | `refundedOn` |
-| `dispute_lost` | `dispute-lost` | `disputeUpdatedOn` / `disputedOn` |
+| Lane | `status` filter | anchored on | ordering claim applies? |
+| --- | --- | --- | --- |
+| `orders` | *(none)* | `acceptedOn` | **yes** — the list's own sequence |
+| `refunded` | `refunded` | `refundedOn` | no — never armed, never judged |
+| `dispute_lost` | `dispute-lost` | `disputeUpdatedOn` / `disputedOn` | no — never armed, never judged |
 
 The anchor must be the field that MOVES when the thing the lane looks for
 happens. `acceptedOn` never changes after an order is accepted, so it can anchor
@@ -259,9 +306,25 @@ ever pass, or one after a violation — **walks the whole list**, and that walk 
 what establishes the verdict. A truncated pass cannot establish one: a violation
 is proof, but "no violation seen" is only proof when the whole list was read.
 
-`ordering_verified` and `early_stop_armed` are reported per lane per run, so the
-assumption is falsifiable from a real run rather than from the documentation, and
-the script prints a NOTE naming any store whose list was not ordered.
+**And it applies to the `orders` lane alone.** Assumption 7 is about
+`acceptedOn`, which is what an offset walk of the unfiltered list arrives in. The
+money-out lanes anchor on `refundedOn` / the dispute timestamps, which bear no
+relation to the list's sequence, so their anchors arrive in essentially arbitrary
+order. Judging them made almost every store report a "violation" on almost every
+run, and the script's NOTE fired every time — which is the same as it never
+firing, and it would have buried a genuine `orders`-lane violation. So those
+lanes are **never armed and never judged**: they walk their short, filtered list
+in full (bounded by the page cap, resuming on truncation like any other lane) and
+report `ordering_verified: null` with `ordering_applicable: false`, rather than a
+verdict they cannot earn. A stale `ordering_verified` left in their stored state
+by an earlier build is *removed*, not merely ignored, so it can never re-arm a
+stop they must not take.
+
+`ordering_applicable`, `ordering_verified` and `early_stop_armed` are reported
+per lane per run, so the assumption is falsifiable from a real run rather than
+from the documentation. The run-level `ordering_verified` aggregates the judged
+lanes only (`null` when none ran), `unordered_lanes` names the offenders, and the
+script's NOTE prints store/lane pairs.
 
 ### Truncation resumes; it never freezes
 
@@ -347,6 +410,19 @@ candidate ids and names. Guessing would bind the wrong shop, and every order
 swept afterwards would be filed under it — well-formed rows that nothing
 downstream could flag.
 
+**The SITE is the store's identity, not the domain.** The existing-store lookup
+consults this merchant's Webflow rows for one already bound to the resolved
+`site_id`, and falls back to `(merchant_id, platform, domain)` only when no
+site-bound row exists (a row written before the binding did). Keying on `domain`
+alone — which is caller-supplied, and otherwise merely derived from `shortName` —
+meant a second connect for the SAME site with a different explicit `domain`
+created a SECOND store bound to that site; both would then sweep the same order
+list and the funnel would count the site's GMV **twice**, out of rows that are
+individually well-formed and impossible to flag downstream. A reconnect matched
+on the site answers with the ROW's domain rather than the request's.
+*(Squarespace's connect has the same shape on `website_id` — a follow-up, not
+touched here.)*
+
 A connect that fails names the **upstream status** in its 400 detail
 (`… (upstream HTTP 404)`), so a wrong assumption about the endpoint is separable
 from a mistyped token on the first attempt.
@@ -413,12 +489,24 @@ persist the URL secret  ->  register the webhook at Webflow  ->  persist the ids
 ```
 
 A crash between the first and second step leaves a stored secret and no webhook:
-harmless, and fixed by re-running. The opposite order would leave Webflow
-delivering to a URL whose secret Pivota never stored, and the receiver would 401
-every one of them forever. After the second merge the persisted secret is
-compared against the one that was registered; if another writer replaced it, the
-just-registered webhooks are deleted and the call answers 409 rather than leaving
-them delivering into a wall.
+harmless **on first provisioning**, and fixed by re-running. The opposite order
+would leave Webflow delivering to a URL whose secret Pivota never stored, and the
+receiver would 401 every one of them forever. After the second merge the
+persisted secret is compared against the one that was registered; if another
+writer replaced it, the just-registered webhooks are deleted, an
+`action=lost_race` line names the store, the owning merchant, the actor and the
+discarded webhook ids, and the call answers 409 rather than leaving them
+delivering into a wall.
+
+**A ROTATION IS THE EXCEPTION, and "harmless" does not carry over to it.**
+`rotate=true` runs against a store whose webhook already WORKS, so a failure
+after the persist leaves the live webhook on the OLD secret while the new one is
+stored — and every delivery 401s until someone re-runs `ensure`. A registration
+that fails (502, 504, `scope_required`) therefore **restores the superseded
+secret** and logs `action=rotation_rolled_back`; the restore is guarded on the
+stored value still being the one this run minted, so it can never clobber a
+concurrent writer. A process killed between the persist and that handler is a
+residual gap, listed below.
 
 **Create first, then delete.** A webhook is created for every wanted trigger
 (`ecomm_new_order`, `ecomm_order_changed`) before any stale one is removed, so a
@@ -426,23 +514,30 @@ failed create cannot leave the store with no webhook at all; the worst case is a
 brief overlap whose only symptom is a duplicate delivery the dedupe absorbs. A
 delete that fails afterwards is swallowed and counted in `stale_removal_failures`.
 
-**"Stale" is deliberately narrow**: a webhook whose URL is one of OUR OWN older
-URLs for this store — same origin, same `/webhooks/webflow/{store_id}/` prefix,
-different secret — or a duplicate of a trigger we now hold once. A webhook
+**"Stale" is deliberately narrow**: a webhook whose URL **starts with** one of
+OUR OWN prefixes for this store — same origin, same `/webhooks/webflow/{store_id}/`
+prefix, different secret — or a duplicate of a trigger we now hold once. A webhook
 pointing anywhere else belongs to another integration of the merchant's and is
 left alone; deleting their Zapier hook because it was in the list would be a
-destructive answer to a provisioning request.
+destructive answer to a provisioning request. The match is **anchored**, not a
+substring test: `prefix in url` also fires on any URL that merely *contains*
+ours — a redirector or proxy of the merchant's whose target is this endpoint, or
+a staging deployment that embeds the prod URL — and the answer to a match here is
+DELETE.
 
 **A token without the webhook scope is 409 `scope_required`**, naming
 `webhooks:read` / `webhooks:write` and pointing at the reconcile path. A 502
 would tell the merchant to retry; what they actually need is to re-issue the
 token.
 
-**The secret is never returned and never logged.** The response says
-`secret_provisioned: true`, which triggers were created or reused, and how many
-stale webhooks were removed. Every outcome — provisioned, `scope_required` — is
-logged at INFO with the store, the owning merchant, and the **actor's role and
-user id**, because minting and rotating a credential is a staff-capable action.
+**The secret is never returned, and no application logger writes it.** The
+response says `secret_provisioned: true`, which triggers were created or reused,
+and how many stale webhooks were removed. Every outcome — `provisioned`,
+`scope_required`, `lost_race`, `rotation_rolled_back` — is logged at INFO with
+the store, the owning merchant, and the **actor's role and user id**, because
+minting and rotating a credential is a staff-capable action. The receiver's own
+access log redacts the secret out of the path; upstream infrastructure logs still
+hold it (see "A secret in a path", above).
 
 The callback origin comes from `WEBFLOW_WEBHOOK_BASE_URL`, `PUBLIC_BASE_URL` or
 `PIVOTA_BACKEND_BASE_URL` and must be HTTPS with no credentials, query or
@@ -465,7 +560,7 @@ assumption is wrong.
 | 6 | There is **no** modified-since / updated-since filter and no cursor on the orders list | **Verified** (by absence) | If one exists, the whole lane machinery could be replaced by a window and the sweep would get much cheaper. Nothing is mis-recorded meanwhile |
 | 7 | The orders list is returned **newest-first** | **ASSUMED, and specifically not trusted.** The early stop is armed only by a COMPLETE pass that observed non-increasing anchors, and disarmed by any observed violation | If the ordering is unstable rather than merely different, a resumed offset walk could skip rows. The mitigations are the overlap, the fact that a violation permanently disarms the early stop, and `ordering_verified` being reported per run. See Residual gaps |
 | 8 | `status` ∈ `pending`, `unfulfilled`, `fulfilled`, `disputed`, `dispute-lost`, `refunded`, and `status=dispute-lost` is a valid query value | **Verified** (the enum) / **Assumed** (that it filters) | The `dispute_lost` lane fails ALONE and is reported in `lane_failures`; the other two lanes are unaffected, and a lost dispute is still mapped whenever the webhook or the unfiltered lane sees the order |
-| 9 | Order fields `orderId`, `status`, `acceptedOn`, `fulfilledOn`, `refundedOn`, `disputedOn`, `customerPaid`, `netAmount`, `customerInfo`, `purchasedItems[]`, `purchasedItemsCount`, `stripeDetails`, `paypalDetails`, `paymentProcessor`, `metadata`, `customData` | **Verified** | A missing money field yields no money event rather than a zero one; a missing `orderId` is a 422 |
+| 9 | Order fields `orderId`, `status`, `acceptedOn`, `fulfilledOn`, `refundedOn`, `disputedOn`, `customerPaid`, `netAmount`, `customerInfo`, `purchasedItems[]`, `purchasedItemsCount`, `stripeDetails`, `paypalDetails`, `paymentProcessor`, `metadata`, `customData` | **Verified** | A missing money field yields no money event rather than a zero one; a missing `orderId` is a 422. A `refunded`/`dispute-lost` order whose `customerPaid` is absent or `0` does **not** fail the observation: `order.created` is still recorded and the missing refund is reported as the named reason `refund_amount_unreadable` (`WebflowMapping.ignored`, `WebflowIngestResult.ignored_reasons`, the sweep's `refunds_unreadable` counter, a WARNING from `services/webflow_ledger.py`, and a NOTE from the script). Raising instead dropped the whole batch, which 422'd the receiver — and Webflow retries a 422 into the same 422 until it gives up, so the order never landed at all. Refunded GMV is under-reported meanwhile, which is why it is counted and named rather than swallowed |
 | 10 | Money is `{"unit": "USD", "value": <integer minor units>, "string": "$58.98"}` | **Verified** | This is the 100x claim. It is pinned with the documented example in `tests/test_webflow_event_adapter.py`, and a `value` that is not whole minor units is REFUSED rather than guessed at, so a shape change is loud rather than silently inflationary |
 | 11 | `orderId` is a short opaque token (`0000-0001`-shaped hyphenated groups) | **Assumed** | The path allowlist is `^[A-Za-z0-9_-]{1,64}$`, which is wider than that shape and still cannot walk a URL path. An id outside it is refused rather than encoded-and-sent, so the failure mode is a refused fetch, not a request to the wrong endpoint |
 | 12 | Webflow signs a delivery with `x-webflow-timestamp` + `x-webflow-signature` = hex HMAC-SHA256 over `"{timestamp}:{body}"`, keyed with the OAuth **App's client secret**, and **only** for webhooks created by an OAuth App | **Verified** (the algorithm and the input) / **Assumed** (that a Site-API-token webhook is unsigned) | If site-token webhooks ARE signed, Layer 2 could be required unconditionally and Layer 1 would be belt-and-braces — no correctness loss either way. If the signed INPUT is not `"{timestamp}:{body}"`, every signed delivery 401s on a deployment that armed Layer 2; the rejection log names which layer refused it and the shape of the digest, which is what makes that decidable from one line rather than a packet capture. Layer 1 keeps working meanwhile |
@@ -478,6 +573,7 @@ assumption is wrong.
 | 19 | A `refunded` order carries `refundedOn`; a disputed one carries `disputedOn` (and possibly `disputeUpdatedOn`) | **Assumed** | The mapper falls through to `acceptedOn`, so a refund is anchored early rather than lost. The refund lane's cursor would then track `acceptedOn` and the lane would keep re-reading the same window — visible as a lane that never advances |
 | 20 | An **accepted** Webflow order (any status but `pending`) has been paid for | **Verified** (that `pending` is the unpaid state) / **Assumed** (that nothing else is unpaid) | If another status can be unpaid, `order.paid` overstates GMV for those orders. `pending` covers the documented case |
 | 21 | Webflow does **not** flag test orders (there is no test mode; a sandbox is a separate site with its own site id) | **Assumed** | Guarded anyway: `metadata.isTest` / `isTestOrder` / `testMode` / top-level `testmode` are all checked and such an order is ignored entirely. If a real flag exists under another name, a test order would be counted as GMV under a deterministic key that could then never be reused |
+| 22 | Webflow states a **zero-decimal** currency (JPY, KRW, VND, …) in that currency's OWN minor units, i.e. a ¥5,898 order is `value: 5898` — not in hundredths | **ASSUMED.** Row 10 is verified with a USD example; no Webflow order in a zero-decimal currency has been observed by this repo. Every sibling adapter in this repo multiplies by 10^decimals and the ledger convention is ISO minor units, so the two conventions genuinely differ here | If Webflow reports hundredths, every such order is recorded **100x inflated** — a ¥5,898 order as ¥589,800 — and nothing downstream can distinguish it, because `customerPaid` is the only source. The mapper logs a WARNING on the FIRST order per process per zero-decimal currency naming the store, the currency, the order id and the observed value, so the first one is visible rather than assumed away; `tests/test_webflow_event_adapter.py` pins that it fires for JPY and not for USD. Confirming the convention against one real merchant order closes this row |
 
 ## Residual gaps
 
@@ -497,6 +593,27 @@ assumption is wrong.
   re-provisioning.
 * **`ensure` rotation has a window.** `rotate=true` re-registers the URL; in-flight
   deliveries to the old one 401 until Webflow's retries or the sweep recover them.
+* **A rotation killed between the persist and the registration is not
+  self-healing.** "A crash between persist and register is harmless" holds on
+  FIRST provisioning only, where nothing was working yet. On a rotation against a
+  working store the live webhook still carries the OLD secret while the NEW one
+  is already stored, so **every delivery 401s** until `ensure` is re-run — the
+  store goes silent and only the sweep recovers it. A registration that FAILS
+  (502, 504, `scope_required`) now restores the superseded secret and logs
+  `action=rotation_rolled_back`, so the reachable half is closed; a process
+  killed between the persist and that handler is not, and the repair is to
+  re-run `ensure`.
+* **The sweep's state write is a read-modify-write spanning I/O.** A run reads
+  `reconciliation` once, spends many network calls walking Webflow, and writes at
+  the end. The row lock in `merge_store_credentials` covers the WRITE only, so it
+  is not what makes two replicas safe here. What does: the final write is a
+  `mutate` that merges only the lanes THIS run walked into whatever
+  `reconciliation` holds at write time (so a lane the run did not touch can never
+  be clobbered), the per-process `_WEBFLOW_SWEEPS_IN_FLIGHT` set stops the
+  same-process double-run, and a lost cursor for a lane both replicas *did* walk
+  is benign in the only direction available: a cursor that goes backwards causes
+  a **re-read**, and re-reading is free because the event ids are deterministic.
+  It can never cause a skip.
 * **No PSP visibility.** `customerPaid` is Webflow's own figure. A refund issued
   directly in Stripe, outside Webflow's commerce flow, is invisible to this bridge.
 * **No refund identity, and no refund count.** One full-order refund per order,
@@ -513,6 +630,8 @@ assumption is wrong.
   revoked; the sweep starts failing loudly on the site check, which is the signal,
   but no automation acts on it.
 * **The per-store `ensure` and `reconcile` guards are per-PROCESS.** They stop the
-  operator double-click and the retry-on-timeout, not two replicas. What makes a
-  genuinely concurrent writer safe is the row lock in `merge_store_credentials`,
-  not those sets.
+  operator double-click and the retry-on-timeout, not two replicas. The row lock
+  in `merge_store_credentials` makes each individual merge atomic — which is what
+  protects the `url_secret` against a concurrent cursor write — but it does not
+  serialize a whole sweep, whose modify half is unbounded I/O. See the read-
+  modify-write gap above for what actually bounds that.

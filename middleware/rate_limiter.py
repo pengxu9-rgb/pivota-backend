@@ -15,6 +15,7 @@ import secrets
 from collections import defaultdict
 from utils.redis_client import get_redis_client
 from config.settings import settings
+from middleware.structured_logging import redact_path
 
 import logging
 
@@ -337,7 +338,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             logger.warning(
                 "anon_rate_limit_ceiling_engaged path=%s count=%s limit=%s "
                 "identity=%s",
-                request.url.path,
+                # Redacted, not raw: this is the one other logger an
+                # unauthenticated request to a PATH-SECRET receiver
+                # (`/webhooks/webflow/{store_id}/{url_secret}`) can reach, and
+                # the ceiling fires precisely when such a receiver is being
+                # hammered. Same helper as the access log, so a prefix
+                # registered once is covered in both places.
+                redact_path(request.url.path),
                 count,
                 self.anon_global_rpm,
                 self._anonymous_identity(request) or "unidentified",

@@ -10,11 +10,20 @@ of operations in `routes/merchant_store_connections.py`:
     persist the URL secret  ->  register the webhook at Webflow  ->  persist ids
 
 A crash between the first and second step leaves a stored secret and no webhook:
-harmless, and fixed by re-running `ensure`. The opposite order — register, then
-persist — would leave Webflow delivering to a URL whose secret Pivota never
-stored, and the receiver would answer 401 to every one of them, forever. That is
-why this module never mints anything itself and takes the finished callback URL
-as an argument.
+harmless ON FIRST PROVISIONING, and fixed by re-running `ensure`. The opposite
+order — register, then persist — would leave Webflow delivering to a URL whose
+secret Pivota never stored, and the receiver would answer 401 to every one of
+them, forever. That is why this module never mints anything itself and takes the
+finished callback URL as an argument.
+
+"HARMLESS" IS FIRST-PROVISIONING ONLY. On a `rotate=true` against a store whose
+webhook already works, the same crash is the opposite of harmless: the live
+webhook still carries the OLD secret, the NEW one is already persisted, and
+every delivery 401s until `ensure` is re-run. The route closes the reachable
+half of that by restoring the superseded secret when a registration FAILS
+(`routes/merchant_store_connections.py::_roll_back_rotation`); a process killed
+between the persist and that handler is a residual, recorded as such in
+docs/WEBFLOW_TELEMETRY.md rather than argued away.
 
 CREATE FIRST, THEN DELETE. A webhook is created for every wanted trigger before
 any stale one is removed, so a failed create (rate limit, revoked token, Webflow
@@ -160,7 +169,16 @@ async def ensure_webflow_webhooks(
             and str(row.get("id") or "").strip() not in keep
             # OURS for this store, and not the URL we just settled on: an older
             # URL secret, or a duplicate of a trigger we now hold once.
-            and prefix in _url_of(row)
+            #
+            # ANCHORED at the start, not a substring test. `prefix` carries the
+            # origin, so a substring match also fires on any URL that merely
+            # CONTAINS ours — a redirector or proxy of the merchant's whose
+            # target happens to be this endpoint, or a staging deployment that
+            # embeds the prod URL. This function's answer to a match is DELETE,
+            # and deleting a webhook that is not ours is the one destructive
+            # thing it can do; `startswith` makes "one of our own older URLs for
+            # this store" mean exactly that.
+            and _url_of(row).startswith(prefix)
         ]
         removed: List[str] = []
         failures = 0

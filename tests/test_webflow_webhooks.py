@@ -389,10 +389,29 @@ def test_a_delivery_naming_this_site_is_accepted(monkeypatch):
     assert fetched[0]["site_id"] == SITE_ID
 
 
-def test_a_non_ascii_site_id_in_the_body_is_401_not_500(monkeypatch):
-    app, _ = _app(monkeypatch)
+@pytest.mark.parametrize(
+    "case, site_id",
+    [
+        ("latin-1", "sité-ïd"),
+        ("emoji", "site-\U0001f600"),
+        # A LONE SURROGATE. `json.loads` accepts `"\ud800"` and hands back a str
+        # Python cannot encode as UTF-8 at all — `.encode("utf-8")` raises
+        # `UnicodeEncodeError`, which is a 500, which is a denial-of-service
+        # handle reachable from one escape sequence in an unauthenticated body.
+        # The non-ASCII cases above do NOT cover it: they encode fine and only
+        # trip `compare_digest`'s TypeError, so `surrogatepass` is invisible to
+        # them. This is the case that pins it.
+        ("lone surrogate", "\ud800"),
+        ("lone surrogate inside a longer id", "site-\udfff-id"),
+    ],
+)
+def test_a_body_site_id_python_cannot_encode_is_401_not_500(monkeypatch, case, site_id):
+    app, fetched = _app(monkeypatch)
 
-    assert _post(TestClient(app), _delivery(site_id="sité-ïd")).status_code == 401
+    response = _post(TestClient(app), _delivery(site_id=site_id))
+
+    assert response.status_code == 401, f"{case}: {response.status_code} {response.text}"
+    assert fetched == [], case
 
 
 def test_a_delivery_with_no_site_id_still_reads_only_this_stores_site(monkeypatch):
@@ -579,3 +598,113 @@ def test_a_malformed_order_from_the_fetch_is_422(monkeypatch):
     )
 
     assert _post(TestClient(app), _delivery()).status_code == 422
+
+
+# ---- the URL secret must not reach a log record -----------------------------
+
+
+# The TEST's own HTTP client, which logs the URL it is calling. It is not part
+# of the server under test and it is not what runs in production — excluded by
+# name rather than by silencing the logger, so the exclusion is visible here
+# instead of hidden in a fixture. Everything else is scanned, whatever emitted it.
+_CLIENT_SIDE_LOGGERS = ("httpx", "httpcore")
+
+
+def _rendered(records) -> list:
+    """Every captured SERVER-SIDE record, message AND args, as strings.
+
+    A `%s`-style record holds its values in `args` until something formats it,
+    so scanning `record.message` alone would miss a secret that a handler will
+    happily write out later.
+    """
+    out = []
+    for record in records:
+        if record.name.split(".")[0] in _CLIENT_SIDE_LOGGERS:
+            continue
+        try:
+            out.append(record.getMessage())
+        except Exception:  # pragma: no cover - a record we still want to scan
+            out.append(str(record.msg))
+        out.append(repr(record.args))
+    return out
+
+
+async def _drive_through_the_real_middleware(app, path, payload):
+    """The receiver behind `StructuredLoggingMiddleware`, over ASGITransport.
+
+    Not `TestClient`: the point of this test is the middleware stack the app is
+    actually assembled with in `main.py`, and a test that mounted only the
+    router would pass while the access log wrote the secret on every delivery.
+    """
+    import httpx
+
+    from middleware.structured_logging import StructuredLoggingMiddleware
+
+    app.add_middleware(StructuredLoggingMiddleware)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://tests") as client:
+        return await client.post(
+            path,
+            content=json.dumps(payload, separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+
+
+async def test_the_url_secret_is_absent_from_every_log_record_on_the_ACCEPTED_path(
+    monkeypatch, caplog
+):
+    """A 256-bit secret in a URL PATH is a secret the access log writes down.
+
+    `StructuredLoggingMiddleware` logs `path` on every request — INFO here — and
+    it redacts query parameters only, so before `redact_path` this credential
+    was in the log line of every single successful delivery.
+    """
+    import logging
+
+    app, _ = _app(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG):
+        response = await _drive_through_the_real_middleware(app, PATH, _delivery())
+
+    assert response.status_code == 200, response.text
+    rendered = _rendered(caplog.records)
+    assert rendered, "no log records were captured at all — this test proves nothing"
+    leaked = [line for line in rendered if URL_SECRET in line]
+    assert leaked == [], leaked
+    # POSITIVE counterpart: the access line was written, and written REDACTED.
+    # Without this the assertion above would also pass if the middleware had
+    # never run, or had logged nothing.
+    assert any(
+        f"/webhooks/webflow/{STORE_ID}/[REDACTED]" in line for line in rendered
+    ), rendered
+
+
+async def test_the_url_secret_is_absent_from_every_log_record_on_the_REFUSED_path(
+    monkeypatch, caplog
+):
+    """The 401 is the more dangerous half: it logs at WARNING, and a wrong secret
+    is somebody ELSE's guess — but the receiver's own rejection line, the
+    telemetry-ingress line and the access line all run, and the access line is
+    the one that carried the path."""
+    import logging
+
+    wrong = "wf-guessed-secret-value"
+    app, fetched = _app(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG):
+        response = await _drive_through_the_real_middleware(
+            app, f"/webhooks/webflow/{STORE_ID}/{wrong}", _delivery()
+        )
+
+    assert response.status_code == 401
+    assert fetched == []
+    rendered = _rendered(caplog.records)
+    assert rendered, "no log records were captured at all — this test proves nothing"
+    assert [line for line in rendered if wrong in line] == []
+    assert any(
+        f"/webhooks/webflow/{STORE_ID}/[REDACTED]" in line for line in rendered
+    ), rendered
+    # And the diagnostic value of the rejection line survives the redaction: it
+    # still says WHICH layer refused and that the store was known, which is the
+    # whole reason that line exists.
+    assert any("webflow webhook rejected" in line for line in rendered)

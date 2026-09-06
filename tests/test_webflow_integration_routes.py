@@ -97,8 +97,17 @@ class _StoreDb:
     def _target(self):
         return self.row if self.row is not None else self.existing
 
-    async def fetch_all(self, *a, **kw):
-        return []
+    async def fetch_all(self, query, values=None, *a, **kw):
+        """The connect route's SITE-bound lookup: this merchant's Webflow rows.
+
+        Returns the row this fixture holds so the site match is exercised rather
+        than silently falling through to the domain lookup on every test.
+        """
+        flat = " ".join(str(query).split())
+        if "merchant_stores" not in flat or "AND domain =" in flat:
+            return []
+        source = self.existing
+        return [self._project(source, flat)] if source else []
 
     async def execute(self, query, values=None, *a, **kw):
         flat = " ".join(str(query).split())
@@ -720,3 +729,289 @@ def test_an_unknown_store_is_404_not_403(client, monkeypatch):
     )
 
     assert response.status_code == 404
+
+
+# ---- one store per SITE, not per domain -------------------------------------
+
+
+class _MultiStoreDb:
+    """Rows keyed by `store_id`, where an INSERT genuinely APPENDS a row.
+
+    A single-slot fake cannot observe this bug at all: what has to be visible is
+    a second connect CREATING a second store bound to the same Webflow site.
+    """
+
+    def __init__(self):
+        self.rows = []
+        self.inserts = 0
+
+    @staticmethod
+    def _project(row, query):
+        _, _, rest = query.partition("SELECT ")
+        columns, _, _ = rest.partition(" FROM ")
+        wanted = [c.strip() for c in columns.strip().split(",")]
+        return {k: v for k, v in row.items() if k in wanted}
+
+    def transaction(self):
+        class _Txn:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        return _Txn()
+
+    def _matching(self, flat, values):
+        params = dict(values or {})
+        out = []
+        for row in self.rows:
+            if row["merchant_id"] != params.get("merchant_id"):
+                continue
+            if "AND domain =" in flat and row["domain"] != params.get("domain"):
+                continue
+            if "store_id = :store_id" in flat and row["store_id"] != params.get("store_id"):
+                continue
+            out.append(row)
+        return out
+
+    async def fetch_one(self, query, values=None, *a, **kw):
+        flat = " ".join(str(query).split())
+        if "merchant_stores" not in flat:
+            return None
+        if "store_id = :store_id" in flat:
+            params = dict(values or {})
+            for row in self.rows:
+                if row["store_id"] == params.get("store_id"):
+                    return self._project(row, flat)
+            return None
+        rows = self._matching(flat, values)
+        return self._project(rows[0], flat) if rows else None
+
+    async def fetch_all(self, query, values=None, *a, **kw):
+        flat = " ".join(str(query).split())
+        if "merchant_stores" not in flat:
+            return []
+        return [self._project(row, flat) for row in self._matching(flat, values)]
+
+    async def execute(self, query, values=None, *a, **kw):
+        flat = " ".join(str(query).split())
+        params = dict(values or {})
+        if flat.startswith("INSERT INTO merchant_stores"):
+            self.inserts += 1
+            self.rows.append(
+                {
+                    "store_id": params["store_id"],
+                    "merchant_id": params["merchant_id"],
+                    "domain": params["domain"],
+                    "name": params.get("name"),
+                    "api_key": params["api_key"],
+                }
+            )
+            return None
+        if flat.startswith("UPDATE merchant_stores") and "api_key" in params:
+            for row in self.rows:
+                if row["store_id"] == params.get("store_id"):
+                    row["api_key"] = params["api_key"]
+        return None
+
+
+def test_two_connects_for_ONE_site_yield_ONE_store(client, monkeypatch):
+    """The site is the identity; the domain is a label.
+
+    `domain` is caller-supplied (and otherwise merely derived from `shortName`),
+    so keying the existing-store lookup on it meant a second connect naming the
+    same site with a different `domain` created a SECOND store bound to that
+    site. Both would then sweep the same order list, and the funnel would count
+    the site's GMV TWICE out of rows that are individually well-formed and
+    impossible to flag downstream.
+    """
+    from routes import merchant_store_connections as mod
+    from services import webflow_connection as conn
+
+    db = _MultiStoreDb()
+    monkeypatch.setattr(mod, "database", db)
+
+    async def fake_resolve(token, *, site_id=None, **kwargs):
+        return {"id": SITE_ID, "displayName": "My Shop", "shortName": "my-shop"}
+
+    monkeypatch.setattr(conn, "resolve_webflow_site", fake_resolve)
+
+    first = client.post(
+        "/integrations/webflow/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={"merchant_id": MERCHANT_A, "api_token": "wf-token"},
+    )
+    second = client.post(
+        "/integrations/webflow/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={
+            "merchant_id": MERCHANT_A,
+            "api_token": "wf-token-2",
+            "domain": "shop.example.com",
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert db.inserts == 1, "a second store was created for the same Webflow site"
+    assert len(db.rows) == 1
+    assert first.json()["store_id"] == second.json()["store_id"]
+    # The reconnect landed on the existing row rather than a new one...
+    assert json.loads(db.rows[0]["api_key"])["api_token"] == "wf-token-2"
+    # ...and answers with the domain the ROW actually holds, not the request's.
+    assert second.json()["domain"] == "my-shop.webflow.io"
+
+
+def test_a_connect_for_a_DIFFERENT_site_still_gets_its_own_store(client, monkeypatch):
+    """The counterpart. Scoping to the site must not collapse two genuinely
+    different sites of one merchant into a single store."""
+    from routes import merchant_store_connections as mod
+    from services import webflow_connection as conn
+
+    db = _MultiStoreDb()
+    monkeypatch.setattr(mod, "database", db)
+    sites = iter(
+        [
+            {"id": SITE_ID, "displayName": "A", "shortName": "a"},
+            {"id": OTHER_SITE_ID, "displayName": "B", "shortName": "b"},
+        ]
+    )
+
+    async def fake_resolve(token, *, site_id=None, **kwargs):
+        return next(sites)
+
+    monkeypatch.setattr(conn, "resolve_webflow_site", fake_resolve)
+
+    for token in ("tok-a", "tok-b"):
+        assert (
+            client.post(
+                "/integrations/webflow/connect",
+                headers=_auth("merchant", MERCHANT_A),
+                json={"merchant_id": MERCHANT_A, "api_token": token},
+            ).status_code
+            == 200
+        )
+
+    assert db.inserts == 2
+    assert sorted(
+        json.loads(row["api_key"])["site_id"] for row in db.rows
+    ) == sorted([SITE_ID, OTHER_SITE_ID])
+
+
+# ---- ensure: the lost race, and a failed rotation ---------------------------
+
+
+def _patch_discard(monkeypatch):
+    from services import webflow_webhook_subscriptions as subs
+
+    deleted = []
+
+    async def fake_delete(*, api_token, webhook_id, **kwargs):
+        deleted.append(webhook_id)
+
+    monkeypatch.setattr(subs, "delete_webflow_webhook", fake_delete)
+    return deleted
+
+
+def test_the_ensure_lost_race_is_audit_logged_with_the_actor(
+    client, monkeypatch, caplog
+):
+    """The one outcome where webhooks were created at Webflow and then DELETED.
+
+    Minting and discarding a merchant's webhooks is a staff-capable action, so it
+    needs the same principal fields as `provisioned` and `scope_required` — as
+    the Squarespace branch already has.
+    """
+    from routes import merchant_store_connections as mod
+    from services import webflow_connection as conn
+
+    db, api = _ensure_app(monkeypatch, {"api_token": "wf-token", "site_id": SITE_ID})
+    deleted = _patch_discard(monkeypatch)
+    real_merge = conn.merge_webflow_credentials
+    merges = {"n": 0}
+
+    async def racing_merge(**kwargs):
+        merges["n"] += 1
+        if merges["n"] == 2:
+            # Another writer replaced the secret between the two merges.
+            blob = json.loads(db._target()["api_key"])
+            blob["url_secret"] = "somebody-elses-secret"
+            db._target()["api_key"] = json.dumps(blob)
+        return await real_merge(**kwargs)
+
+    monkeypatch.setattr(conn, "merge_webflow_credentials", racing_merge)
+
+    with caplog.at_level("INFO"):
+        response = client.post(
+            f"/integrations/webflow/{STORE_ID}/webhooks/ensure",
+            headers=_auth("merchant", MERCHANT_A),
+        )
+
+    assert response.status_code == 409
+    assert "URL secret changed" in response.json()["detail"]
+    assert sorted(deleted) == ["wh-ecomm_new_order", "wh-ecomm_order_changed"]
+    assert "webflow_webhooks_ensure action=lost_race" in caplog.text
+    assert f"store_id={STORE_ID}" in caplog.text
+    assert f"store_merchant_id={MERCHANT_A}" in caplog.text
+    assert "actor_role=merchant" in caplog.text
+    assert f"actor_user_id=u-{MERCHANT_A}" in caplog.text
+    assert "discarded_webhook_ids=wh-ecomm_new_order,wh-ecomm_order_changed" in caplog.text
+    # Neither secret is in the audit trail.
+    assert "somebody-elses-secret" not in caplog.text
+
+
+def test_a_failed_ROTATION_restores_the_secret_webflow_is_still_delivering_with(
+    client, monkeypatch, caplog
+):
+    """"A crash between persist and register is harmless" is FIRST-PROVISIONING only.
+
+    On a rotation the store already HAS a working webhook. Persisting the new
+    secret and then failing to register leaves Webflow delivering to the OLD URL
+    with the OLD secret, which this deployment no longer holds — every delivery
+    401s and the store goes silent until somebody re-runs `ensure`.
+    """
+    from services.webflow_webhook_subscriptions import WebflowWebhookError
+
+    db, api = _ensure_app(
+        monkeypatch,
+        {"api_token": "wf-token", "site_id": SITE_ID, "url_secret": "the-live-one"},
+        api=_WebhookApi(error=WebflowWebhookError("Webflow webhook create failed")),
+    )
+
+    with caplog.at_level("INFO"):
+        response = client.post(
+            f"/integrations/webflow/{STORE_ID}/webhooks/ensure?rotate=true",
+            headers=_auth("merchant", MERCHANT_A),
+        )
+
+    assert response.status_code == 502
+    assert _stored(db)["url_secret"] == "the-live-one", (
+        "the rotation persisted a secret the live webhook does not carry and then "
+        "failed to register the new URL — every delivery now 401s"
+    )
+    assert "action=rotation_rolled_back" in caplog.text
+    assert "the-live-one" not in caplog.text
+
+
+def test_a_failed_FIRST_provisioning_keeps_the_minted_secret(client, monkeypatch):
+    """The counterpart, and the reason the rollback is scoped to a rotation.
+
+    First provisioning had nothing working to lose, and keeping the minted
+    secret is what makes the re-run reuse it instead of churning a new one.
+    """
+    from services.webflow_webhook_subscriptions import WebflowWebhookError
+
+    db, _api = _ensure_app(
+        monkeypatch,
+        {"api_token": "wf-token", "site_id": SITE_ID},
+        api=_WebhookApi(error=WebflowWebhookError("Webflow webhook create failed")),
+    )
+
+    response = client.post(
+        f"/integrations/webflow/{STORE_ID}/webhooks/ensure",
+        headers=_auth("merchant", MERCHANT_A),
+    )
+
+    assert response.status_code == 502
+    assert _stored(db)["url_secret"], "the minted secret was rolled back to nothing"

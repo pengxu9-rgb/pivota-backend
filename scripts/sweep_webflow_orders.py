@@ -79,10 +79,15 @@ async def _run(args: argparse.Namespace) -> int:
             "converge faster.",
             flush=True,
         )
+    # Only lanes the ordering claim APPLIES to can report a violation, and only
+    # the `orders` lane does — the money-out lanes anchor on timestamps the list
+    # is not sorted by, report `ordering_verified: null`, and never arm an early
+    # stop. Reading their anchors as a verdict made this NOTE fire on nearly
+    # every run, which is the same as it never firing.
     unordered = [
-        store["store_id"]
+        f"{store['store_id']} ({', '.join(store.get('unordered_lanes') or [])})"
         for store in result.get("stores", [])
-        if store.get("ordering_verified") is False
+        if store.get("unordered_lanes")
     ]
     if unordered:
         # The early stop rests on the list arriving newest-first, which Webflow
@@ -90,9 +95,25 @@ async def _run(args: argparse.Namespace) -> int:
         # is real: those lanes walked the whole list instead of stopping early.
         print(
             "\nNOTE: the orders list was NOT non-increasing by anchor timestamp "
-            f"for these stores: {', '.join(unordered)}. The early stop was "
-            "disabled for them and their lanes walked to the end of the list. "
-            "See the ordering row of docs/WEBFLOW_TELEMETRY.md.",
+            f"for these store/lane pairs: {', '.join(unordered)}. The early stop "
+            "was disabled for them and those lanes walked to the end of the "
+            "list. See the ordering row of docs/WEBFLOW_TELEMETRY.md.",
+            flush=True,
+        )
+    unreadable = [
+        f"{store['store_id']} ({store.get('refunds_unreadable')})"
+        for store in result.get("stores", [])
+        if int(store.get("refunds_unreadable") or 0)
+    ]
+    if unreadable:
+        # Money OUT that this bridge could not record. The orders themselves
+        # landed, so nothing looks broken in the totals — which is exactly why
+        # it needs its own line rather than a counter buried in the JSON.
+        print(
+            "\nNOTE: refunded/dispute-lost orders whose `customerPaid` could not "
+            f"be read, so no refund row was written: {', '.join(unreadable)}. "
+            "Refunded GMV is UNDER-reported for those stores until the amount "
+            "becomes readable. See row 9 of docs/WEBFLOW_TELEMETRY.md.",
             flush=True,
         )
     # A partial failure is a non-zero exit so a scheduled run is visibly red.
