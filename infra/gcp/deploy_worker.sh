@@ -45,7 +45,7 @@
 # ── WHAT A ROLL COSTS, SAID OUT LOUD ───────────────────────────────────────────────────────────
 # Cloud Run replaces the instance, so whatever the old process was mid-way through is SIGTERMed.
 # main.shutdown_event calls services.audit_scheduler.stop_scheduler, which PAUSES the scheduler,
-# waits a few seconds for in-flight runs to land (SCHEDULER_DRAIN_SECONDS, default 5, 0 to
+# waits a few seconds for in-flight runs to land (SCHEDULER_DRAIN_SECONDS, default 3, 0 to
 # disable), and then cancels whatever is still going. A short tick therefore completes; a long
 # one is still cancelled. Nothing is lost either way: an audit run holds a lease
 # (DEFAULT_LEASE_SECONDS=600, STALE_LEASE_GRACE_SECONDS=30) and the next worker reclaims it inline

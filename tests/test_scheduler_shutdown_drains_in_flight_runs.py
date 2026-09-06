@@ -121,6 +121,62 @@ def test_the_disconnect_still_happens_if_the_drain_is_cancelled():
     )
 
 
+@pytest.mark.parametrize(
+    "module, stopper",
+    [
+        ("services.agent_webhook_service", "stop_agent_webhook_retry_worker"),
+        ("services.merchant_webhook_service", "stop_merchant_webhook_retry_worker"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stopping_a_retry_worker_is_bounded(module, stopper):
+    """NOTHING BOUNDED SHUTDOWN'S WALL CLOCK, which is how this got in.
+
+    `stop_event` is only checked at the TOP of `_retry_worker_loop`, so setting it does not
+    interrupt an iteration — and an iteration is `process_due_retries(limit=20)`, up to twenty
+    sequential deliveries each with a 10s HTTP timeout. A bare `await` on that task is an await
+    of up to ~200s.
+
+    It was masked by accident: `database.disconnect()` ran BEFORE it, so the loop's next DB call
+    raised and the remaining rows failed instantly. Reordering the lifespan so the scheduler
+    drains while the pool is open removed that accidental bound and left a ~200s await ahead of
+    the disconnect — on `web` (min 2 / max 10, rolled every push) as well as `worker`. The
+    Cloud Run grace is ~10s, so one due retry to a dead destination would consume all of it and
+    the pool would never be closed.
+
+    A task that ignores its stop event stands in for that iteration.
+    """
+    import importlib as _il
+    mod = _il.import_module(module)
+
+    async def stubborn():
+        await asyncio.sleep(3600)   # never notices the event, exactly like a live delivery
+
+    task = asyncio.get_running_loop().create_task(stubborn())
+    mod._retry_worker_task = task
+    mod._retry_worker_stop = asyncio.Event()
+
+    started = asyncio.get_running_loop().time()
+    try:
+        await asyncio.wait_for(getattr(mod, stopper)(), timeout=20.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+        pytest.fail(
+            f"{stopper} never returned. Shutdown then waits on it indefinitely, past the "
+            "platform grace, and the container is killed before the pool is closed."
+        )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < mod._STOP_TIMEOUT_SECONDS * 5, (
+        f"{stopper} took {elapsed:.2f}s against a {mod._STOP_TIMEOUT_SECONDS}s bound"
+    )
+    assert task.cancelled() or task.done(), (
+        "the stop returned but left the worker running - the bound has to CANCEL, not just "
+        "stop waiting, or the task keeps holding a DB connection while the pool closes"
+    )
+    assert mod._retry_worker_task is None, "the module still holds a reference to a dead worker"
+
+
 # ── the configured default, which every case above monkeypatches away ─────────────────
 
 
