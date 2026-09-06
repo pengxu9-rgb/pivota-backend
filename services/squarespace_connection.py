@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
@@ -45,7 +45,30 @@ PLATFORM = "squarespace"
 
 
 class SquarespaceConnectionError(RuntimeError):
-    """The Squarespace API could not be reached, or refused the credential."""
+    """The Squarespace API could not be reached, or refused the credential.
+
+    `status_code` carries the upstream HTTP status when there was one. A
+    connect failure that reports only "connection failed" is indistinguishable
+    between "the key is wrong" (401), "this deployment cannot reach Squarespace"
+    (timeout), and "the endpoint is not what we assumed" (404) — and the
+    reachability of `GET /1.0/authorization/website` with a per-site API key is
+    itself an ASSUMED claim (docs/SQUARESPACE_TELEMETRY.md, row 4). Naming the
+    status is what makes a wrong assumption diagnosable from the response.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class SquarespaceUnauthorizedError(SquarespaceConnectionError):
+    """Squarespace refused THIS credential (401/403).
+
+    Distinguished from every other connection failure because it is the one a
+    caller can do something about: a Developer-Platform OAuth access token is
+    short-lived, and a store that also holds a per-site API key can fall back to
+    it for READ calls rather than going dark until someone reconnects.
+    """
 
 
 def build_squarespace_headers(access_token: str) -> Dict[str, str]:
@@ -81,23 +104,36 @@ def serialize_squarespace_credentials(credentials: Dict[str, Any]) -> str:
     return json.dumps(credentials, separators=(",", ":"))
 
 
-def squarespace_request_token(credentials: Dict[str, Any]) -> str:
-    """The token to read the Orders API with.
+def squarespace_read_tokens(credentials: Dict[str, Any]) -> List[str]:
+    """Every credential this store can READ with, best first.
 
-    The OAuth token is preferred when both are present: it is the credential
-    that also carries webhook subscriptions, so a store that has both should
-    exercise one identity, not two.
+    The OAuth token leads: it is the identity that also carries webhook
+    subscriptions, so a store holding both should exercise one identity rather
+    than two. But a Developer-Platform access token is SHORT-LIVED (assumed
+    ~30 minutes; docs/SQUARESPACE_TELEMETRY.md) and this repo has no refresh
+    path yet, so preferring it unconditionally would take a store that holds a
+    perfectly good per-site API key dark within the hour. Callers try these in
+    order and fall back on 401/403.
     """
-    return (
-        str(credentials.get("oauth_access_token") or "").strip()
-        or str(credentials.get("api_key") or "").strip()
-    )
+    tokens: List[str] = []
+    for key in ("oauth_access_token", "api_key"):
+        value = str(credentials.get(key) or "").strip()
+        if value and value not in tokens:
+            tokens.append(value)
+    return tokens
+
+
+def squarespace_request_token(credentials: Dict[str, Any]) -> str:
+    """The FIRST token to read the Orders API with, or "" when there is none."""
+    tokens = squarespace_read_tokens(credentials)
+    return tokens[0] if tokens else ""
 
 
 async def fetch_squarespace_website(
     access_token: str,
     *,
     timeout: float = SQUARESPACE_TIMEOUT_SECONDS,
+    client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
     """`GET /1.0/authorization/website` — the site this credential belongs to.
 
@@ -109,29 +145,40 @@ async def fetch_squarespace_website(
     token = str(access_token or "").strip()
     if not token:
         raise SquarespaceConnectionError("Squarespace credential is empty")
+
+    async def _call(http: httpx.AsyncClient) -> Any:
+        return await http.get(
+            f"{SQUARESPACE_API_ROOT}{SQUARESPACE_AUTHORIZATION_PATH}",
+            headers=build_squarespace_headers(token),
+        )
+
     try:
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.get(
-                f"{SQUARESPACE_API_ROOT}{SQUARESPACE_AUTHORIZATION_PATH}",
-                headers=build_squarespace_headers(token),
-            )
+        if client is not None:
+            response = await _call(client)
+        else:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
+            ) as http:
+                response = await _call(http)
     except httpx.HTTPError as exc:
         raise SquarespaceConnectionError(
             f"Squarespace authorization lookup failed: {exc}"
         ) from exc
     if response.status_code == 401 or response.status_code == 403:
-        raise SquarespaceConnectionError(
-            "Squarespace refused the credential (check the key and its Orders scope)"
+        raise SquarespaceUnauthorizedError(
+            "Squarespace refused the credential (check the key and its Orders scope)",
+            status_code=response.status_code,
         )
     if response.status_code == 429:
-        raise SquarespaceConnectionError("Squarespace rate-limited the authorization lookup")
+        raise SquarespaceConnectionError(
+            "Squarespace rate-limited the authorization lookup", status_code=429
+        )
     if response.status_code != 200:
         raise SquarespaceConnectionError(
-            f"Squarespace authorization lookup failed with HTTP {response.status_code}"
+            f"Squarespace authorization lookup failed with HTTP {response.status_code}",
+            status_code=response.status_code,
         )
     try:
         payload = response.json()
@@ -154,39 +201,78 @@ async def fetch_squarespace_website(
 async def merge_squarespace_credentials(
     *,
     store_id: str,
-    updates: Dict[str, Any],
+    updates: Optional[Dict[str, Any]] = None,
+    mutate: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    mark_connected: bool = False,
+    db: Any = None,
 ) -> Dict[str, Any]:
-    """Read-modify-write the store's credential blob, then re-read it.
+    """Read-modify-write the store's credential blob ATOMICALLY, then re-read it.
 
     Never an overwrite. The blob holds the webhook secret (the only copy Pivota
-    has) and the reconciliation cursor alongside the API key; a whole-cell
-    write is exactly the PrestaShop P1 where reconnecting a shop silently
-    disarmed its telemetry.
+    has), the OAuth token, the website binding and the reconciliation cursor
+    all in one cell; a whole-cell write is exactly the PrestaShop P1 where
+    reconnecting a shop silently disarmed its telemetry.
+
+    A read-modify-write is not enough on its own, which is what this function
+    exists to fix. Read, mutate, write, re-read with no transaction is a
+    LOST-UPDATE window: a sweep persisting its cursor between `ensure`'s read
+    and its write erases the once-shown `webhook_secret` (after which every
+    delivery 401s and no reconnect can recover it, because Squarespace shows
+    that secret exactly once), and the reverse interleaving reverts a reconnect
+    to the credential the merchant just replaced. So the whole cycle runs
+    inside `database.transaction()` and, on Postgres, behind `SELECT ... FOR
+    UPDATE` on the store row — the row lock is what makes a concurrent merge
+    WAIT rather than read a value that is about to be stale.
+
+    On SQLite there is no `FOR UPDATE`; the select is plain. That is tolerable
+    only because SQLite here is tests and local development, and it is why the
+    serialization claim is pinned in the Postgres gate
+    (`tests/test_squarespace_ledger_postgres.py`) rather than in the SQLite
+    suite, which cannot observe it.
+
+    `updates` is merged over the stored blob. `mutate` receives the LOCKED blob
+    and returns the one to persist, which is how the connect path expresses
+    "drop these keys when the credential now belongs to a different site"
+    inside the same critical section instead of hand-rolling a second one.
+    `mark_connected` additionally refreshes the row's connect bookkeeping, so a
+    reconnect is one statement rather than a merge racing an UPDATE.
 
     The re-read is not belt-and-braces: `databases` + asyncpg reports no
     rowcount from an UPDATE, so reading the row back is the only proof the
-    write landed, and under a race it is the only way to learn which writer
-    won.
+    write landed.
     """
-    from db.database import database
+    from db.database import IS_POSTGRES
+    from db.database import database as default_database
 
-    row = await database.fetch_one(
-        "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
-        {"store_id": store_id},
-    )
-    credentials = parse_squarespace_credentials(dict(row).get("api_key") if row else None)
-    credentials.update(updates)
-    await database.execute(
-        "UPDATE merchant_stores SET api_key = :api_key WHERE store_id = :store_id",
-        {
-            "store_id": store_id,
-            "api_key": serialize_squarespace_credentials(credentials),
-        },
-    )
-    persisted = await database.fetch_one(
-        "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
-        {"store_id": store_id},
-    )
+    handle = db if db is not None else default_database
+    select_sql = "SELECT api_key FROM merchant_stores WHERE store_id = :store_id"
+    # The row lock is the whole point of the transaction: without it two merges
+    # both read the pre-write blob and the second silently discards the first.
+    locking_sql = f"{select_sql} FOR UPDATE" if IS_POSTGRES else select_sql
+    assignments = "api_key = :api_key"
+    if mark_connected:
+        assignments += (
+            ", status = 'active', last_sync = CURRENT_TIMESTAMP,"
+            " connected_at = CURRENT_TIMESTAMP"
+        )
+
+    async with handle.transaction():
+        row = await handle.fetch_one(locking_sql, {"store_id": store_id})
+        credentials = parse_squarespace_credentials(
+            dict(row).get("api_key") if row else None
+        )
+        if mutate is not None:
+            credentials = dict(mutate(credentials))
+        if updates:
+            credentials.update(updates)
+        await handle.execute(
+            f"UPDATE merchant_stores SET {assignments} WHERE store_id = :store_id",
+            {
+                "store_id": store_id,
+                "api_key": serialize_squarespace_credentials(credentials),
+            },
+        )
+        persisted = await handle.fetch_one(select_sql, {"store_id": store_id})
     return parse_squarespace_credentials(
         dict(persisted).get("api_key") if persisted else None
     )

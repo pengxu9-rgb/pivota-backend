@@ -194,12 +194,21 @@ async def _sweep(monkeypatch, orders):
         status_code = 200
         content = b"{}"
 
+        def __init__(self, payload):
+            self._payload = payload
+
         def json(self):
-            return {"result": orders, "pagination": {}}
+            return self._payload
 
     class _Client:
         async def get(self, url, headers=None, params=None):
-            return _Response()
+            # The sweep proves the credential's SITE before it lists anything;
+            # answering the lookup with this store's own `website_id` is what
+            # makes this an end-to-end run of a correctly-connected store
+            # rather than of a store whose token points somewhere else.
+            if "/authorization/website" in str(url):
+                return _Response({"id": WEBSITE_ID})
+            return _Response({"result": orders, "pagination": {}})
 
         async def aclose(self):
             return None
@@ -214,9 +223,9 @@ async def _sweep(monkeypatch, orders):
             "api_key": json.dumps(_CREDENTIALS),
         }
 
-    async def fake_merge(*, store_id, updates):
-        persisted.update(updates)
-        return {**_CREDENTIALS, **updates}
+    async def fake_merge(*, store_id, updates=None, **kwargs):
+        persisted.update(updates or {})
+        return {**_CREDENTIALS, **(updates or {})}
 
     monkeypatch.setattr(sweep, "find_squarespace_store", fake_find)
     monkeypatch.setattr(sweep, "merge_squarespace_credentials", fake_merge)
@@ -271,6 +280,51 @@ async def test_a_webhook_and_a_later_sweep_of_one_order_produce_one_paid_row(
         # first-write-wins means, and it is the honest answer to "who told us".
         assert paid[0]["write_path"] == "squarespace_webhook"
         assert paid[0]["authority"] == "platform"
+    finally:
+        await test_database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_and_a_LATER_webhook_of_one_order_produce_one_paid_row(
+    tmp_path, monkeypatch
+):
+    """The SAME order, the OTHER way round.
+
+    Testing only webhook-then-sweep proves the sweep defers to an existing row;
+    it says nothing about the receiver defering to the sweep. And this ordering
+    is the COMMON one after any outage: Squarespace gives up retrying, the
+    sweep picks the order up, and then a later `order.update` delivery arrives
+    for the same order. If the dedupe were asymmetric — if the event ids or the
+    money guard depended on which path wrote first — that sequence would double
+    every recovered purchase, and only this direction would show it.
+    """
+    test_database = await _sqlite_ledger(tmp_path, monkeypatch, "sq-sweep-first")
+    try:
+        order = _order()
+
+        swept = await _sweep(monkeypatch, [order])
+        assert swept["accepted"] == 2  # order.created + order.paid
+
+        client = _webhook_client(monkeypatch, order)
+        delivered = _deliver(client)
+        assert delivered.status_code == 200, delivered.text
+        # Both events were already there; the delivery added no money.
+        assert delivered.json()["accepted"] == 0
+        assert delivered.json()["duplicates"] == 2
+
+        paid = await _events(test_database, "order.paid")
+        assert len(paid) == 1
+        assert paid[0]["payload"]["amount_cents"] == 4000
+        assert paid[0]["order_ref"] == ORDER_REF
+        # First-write-wins, so the provenance is the SWEEP's this time. That
+        # asymmetry in the answer is the point: the row records who actually
+        # told us first, not whichever path is nominally preferred.
+        assert paid[0]["write_path"] == "squarespace_reconciliation"
+        assert paid[0]["authority"] == "platform"
+
+        created = await _events(test_database, "order.created")
+        assert len(created) == 1
+        assert created[0]["write_path"] == "squarespace_reconciliation"
     finally:
         await test_database.disconnect()
 

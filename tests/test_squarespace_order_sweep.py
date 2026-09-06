@@ -37,27 +37,51 @@ def _order(order_id: str, modified: datetime, **overrides):
 
 
 class _FakeClient:
-    """Answers `fetch_squarespace_order_page` with scripted pages."""
+    """Answers `fetch_squarespace_order_page` with scripted pages.
 
-    def __init__(self, pages):
+    It also answers the SITE LOOKUP the sweep now makes once per run before it
+    lists anything (`GET /1.0/authorization/website`). That call is routed by
+    URL rather than consuming a scripted page, so the page script still reads
+    as the sequence of order pages a run walks. `website_id` is what the
+    lookup reports; `unauthorized_tokens` makes named credentials 401 there, so
+    the OAuth-expiry fallback can be exercised without a second fake.
+
+    `list_requests` excludes the site lookup: the bounds and cursor assertions
+    are about the ORDER LIST calls, and folding an extra request into that
+    sequence would silently shift every index.
+    """
+
+    def __init__(self, pages, *, website_id="site-1", unauthorized_tokens=()):
         self._pages = list(pages)
         self.requests = []
+        self.website_id = website_id
+        self.unauthorized_tokens = set(unauthorized_tokens)
+        self.website_lookups = []
 
     async def get(self, url, headers=None, params=None):
+        if "/authorization/website" in str(url):
+            token = str((headers or {}).get("Authorization", "")).removeprefix("Bearer ").strip()
+            self.website_lookups.append(token)
+            if token in self.unauthorized_tokens:
+                return _FakeResponse({"type": "AUTHORIZATION"}, status_code=401)
+            return _FakeResponse({"id": self.website_id})
         self.requests.append({"url": url, "params": dict(params or {})})
         page = self._pages.pop(0) if self._pages else {"result": [], "pagination": {}}
         return _FakeResponse(page)
+
+    @property
+    def list_requests(self):
+        return self.requests
 
     async def aclose(self):
         return None
 
 
 class _FakeResponse:
-    status_code = 200
-
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
         self.content = b"{}"
+        self.status_code = status_code
 
     def json(self):
         return self._payload
@@ -87,12 +111,21 @@ class _Recorder:
 
 def _wire(monkeypatch, *, credentials, recorder=None, store=True):
     """Patch the sweep's three collaborators: the store row, the ledger write,
-    and the credential-blob persistence."""
+    and the credential-blob persistence.
+
+    The persisted blob is STATEFUL across runs within one test: what a merge
+    writes is what the next `find` reads back. That is what makes a multi-run
+    claim — "repeated runs against an always-truncating store still make
+    progress" — a claim about the real cursor arithmetic rather than about the
+    same first run repeated. `credentials` itself is copied, never mutated, so
+    the module-level fixture cannot leak between tests.
+    """
     import json
 
     from services import squarespace_order_sweep as sweep
 
     persisted = {}
+    live = dict(credentials)
 
     async def fake_find(store_id):
         if not store:
@@ -101,12 +134,13 @@ def _wire(monkeypatch, *, credentials, recorder=None, store=True):
             "store_id": STORE_ID,
             "merchant_id": MERCHANT_ID,
             "domain": "shop.example",
-            "api_key": json.dumps(credentials),
+            "api_key": json.dumps(live),
         }
 
-    async def fake_merge(*, store_id, updates):
-        persisted.update(updates)
-        return {**credentials, **updates}
+    async def fake_merge(*, store_id, updates=None, **kwargs):
+        persisted.update(updates or {})
+        live.update(updates or {})
+        return dict(live)
 
     recorder = recorder or _Recorder()
     monkeypatch.setattr(sweep, "find_squarespace_store", fake_find)
@@ -632,3 +666,370 @@ async def test_the_sweep_hands_the_fetch_layer_no_bounds_once_it_holds_a_cursor(
     assert calls[1]["cursor"] == "cur-2"
     assert calls[1]["modified_after"] is None
     assert calls[1]["modified_before"] is None
+
+
+# ---- truncation converges instead of freezing ------------------------------
+
+
+class _AlwaysTruncatingClient(_FakeClient):
+    """Every page claims another page after it, forever.
+
+    The worst honest case: a window whose order volume the page cap can never
+    read in one pass. It is also the shape that exposed the frozen cursor —
+    holding the cursor while `now` advances means the NEXT window is wider than
+    the one that just failed, so the run truncates on the same prefix again and
+    the rest of the range is never read at all.
+    """
+
+    def __init__(self, *, website_id="site-1"):
+        super().__init__([], website_id=website_id)
+        self.windows = []
+
+    async def get(self, url, headers=None, params=None):
+        if "/authorization/website" in str(url):
+            return await super().get(url, headers=headers, params=params)
+        params = dict(params or {})
+        if "modifiedAfter" in params:
+            self.windows.append((params["modifiedAfter"], params["modifiedBefore"]))
+        self.requests.append({"url": url, "params": params})
+        return _FakeResponse(
+            {
+                "result": [_order("x", NOW - timedelta(days=1))],
+                "pagination": {"hasNextPage": True, "nextPageCursor": "more"},
+            }
+        )
+
+
+async def test_a_truncated_sweep_makes_cursor_progress_over_repeated_runs(
+    monkeypatch, caplog
+):
+    """The frozen-cursor trap, driven the only way it shows: by running twice.
+
+    A single truncated run looks correct — it holds the cursor, which is the
+    conservative thing to do. The bug is only visible across runs: with the
+    cursor held and `now` advancing, run 2 asks for a WIDER window than run 1,
+    truncates on the same page-cap prefix, and so does every run after it. The
+    store never advances past its first 20 pages.
+
+    So this asserts the property that actually matters — the cursor MOVES —
+    against a client that never stops truncating.
+    """
+    from services.squarespace_order_sweep import sweep_squarespace_store
+
+    _wire(monkeypatch, credentials=_CREDENTIALS)
+    client = _AlwaysTruncatingClient()
+
+    cursors = []
+    moment = NOW
+    for _ in range(24):
+        result = await sweep_squarespace_store(
+            store_id=STORE_ID,
+            now=moment,
+            client=client,
+            overlap_minutes=30,
+            max_pages=1,
+        )
+        assert result["truncated"] is True
+        cursors.append(result["cursor_after"])
+        # Real time moves on between runs; that is exactly what made the frozen
+        # window widen instead of narrow.
+        moment += timedelta(minutes=10)
+
+    advanced = [c for c in cursors if c]
+    assert advanced, (
+        "the cursor never moved across 24 truncated runs — the window is frozen "
+        f"and the store is stuck; windows tried: {client.windows[:6]}"
+    )
+    assert advanced[-1] > advanced[0] or len(set(advanced)) > 1, advanced
+
+    # And it converged by NARROWING. Without the bisect the windows widen with
+    # `now`, which is the failure this test exists to name.
+    spans = [
+        (datetime.fromisoformat(end.replace("Z", "+00:00"))
+         - datetime.fromisoformat(start.replace("Z", "+00:00")))
+        for start, end in client.windows
+    ]
+    assert spans[1] < spans[0], f"the second window did not narrow: {spans[:3]}"
+    assert min(spans) < spans[0] / 10, spans[:6]
+
+    # A range that could not be read even at the bisect floor is advanced PAST,
+    # and that is a loud event: staying put would be an unbounded outage, but a
+    # silent skip would be worse than a loud one. The log must name the range.
+    floor_errors = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "ERROR" and "bisect floor" in record.getMessage()
+    ]
+    assert floor_errors, "advancing past an unreadable range must be an ERROR"
+    assert "..' " not in floor_errors[0]
+    assert STORE_ID in floor_errors[0]
+    assert ".." in floor_errors[0], floor_errors[0]
+
+
+async def test_a_bounded_window_that_completes_advances_the_cursor_to_its_end(
+    monkeypatch,
+):
+    """A bisected window that FITS must move the cursor to that window's end.
+
+    Not to the highest `modifiedOn` seen: the bisect is digging forward out of
+    a range it could not read, and stopping at the high-water mark would leave
+    the next window overlapping the prefix it just finished — the same stall,
+    one step further along.
+    """
+    from services.squarespace_order_sweep import sweep_squarespace_store
+
+    cursor = NOW - timedelta(days=2)
+    credentials = {
+        **_CREDENTIALS,
+        "reconciliation": {
+            "orders_cursor": _iso(cursor),
+            # The previous run truncated at this point and could not reach it.
+            "truncated_window_end": _iso(NOW),
+        },
+    }
+    persisted, _ = _wire(monkeypatch, credentials=credentials)
+    # One page, no next page: this bounded window fits.
+    client = _FakeClient([_page([_order("a", cursor + timedelta(hours=1))])])
+
+    result = await sweep_squarespace_store(
+        store_id=STORE_ID, now=NOW, client=client, overlap_minutes=30, apply=True
+    )
+
+    assert result["truncated"] is False
+    assert result["window_bounded"] is True
+    assert result["cursor_after"] == result["window_end"], (
+        "a completed bounded window must advance to its END, not to the highest "
+        "modifiedOn it happened to see"
+    )
+    # The midpoint of the range the previous run could not finish.
+    assert result["window_end"] < _iso(NOW)
+    assert result["window_end"] > result["window_start"]
+    # The truncation marker is CLEARED, or the next run would bisect forever.
+    assert persisted["reconciliation"].get("truncated_window_end") is None
+
+
+async def test_the_next_run_resumes_from_a_completed_bounded_window(monkeypatch):
+    """Two runs in sequence: bisect, then keep stepping forward.
+
+    The cursor of run 2 must be strictly ahead of run 1's. This is the "climbs
+    back to real time" half of the fix; without it a store that fell behind
+    would bisect once and then sit at that point.
+    """
+    from services.squarespace_order_sweep import sweep_squarespace_store
+
+    cursor = NOW - timedelta(days=4)
+    credentials = {
+        **_CREDENTIALS,
+        "reconciliation": {
+            "orders_cursor": _iso(cursor),
+            "truncated_window_end": _iso(NOW),
+        },
+    }
+    _wire(monkeypatch, credentials=credentials)
+
+    first = await sweep_squarespace_store(
+        store_id=STORE_ID,
+        now=NOW,
+        client=_FakeClient([_page([])]),
+        overlap_minutes=30,
+        apply=True,
+    )
+    second = await sweep_squarespace_store(
+        store_id=STORE_ID,
+        now=NOW + timedelta(minutes=5),
+        client=_FakeClient([_page([])]),
+        overlap_minutes=30,
+        apply=True,
+    )
+
+    assert first["cursor_after"] < second["cursor_after"], (first, second)
+    # Widening, not crawling: the second bounded window reaches further than the
+    # first, so a store that fell days behind climbs back geometrically.
+    assert second["window_end"] > first["window_end"]
+
+
+async def test_the_operator_can_pin_the_window_end(monkeypatch):
+    """The escape hatch. An operator digging a store out of a busy range needs
+    to choose the bound rather than wait for the halving to find it."""
+    from services.squarespace_order_sweep import sweep_squarespace_store
+
+    _wire(monkeypatch, credentials=_CREDENTIALS)
+    client = _FakeClient([_page([])])
+
+    result = await sweep_squarespace_store(
+        store_id=STORE_ID,
+        now=NOW,
+        client=client,
+        overlap_minutes=30,
+        modified_before="2026-09-03T00:00:00.000Z",
+    )
+
+    assert client.requests[0]["params"]["modifiedBefore"] == "2026-09-03T00:00:00.000Z"
+    assert result["window_end"] == "2026-09-03T00:00:00.000Z"
+    assert result["window_bounded"] is True
+
+
+async def test_an_unparseable_window_override_is_refused(monkeypatch):
+    """Not silently ignored: an operator who mistypes the bound and is answered
+    with an ordinary `now` run believes they read a range they did not."""
+    from services.squarespace_order_sweep import (
+        SquarespaceSweepError,
+        sweep_squarespace_store,
+    )
+
+    _wire(monkeypatch, credentials=_CREDENTIALS)
+
+    with pytest.raises(SquarespaceSweepError, match="ISO-8601"):
+        await sweep_squarespace_store(
+            store_id=STORE_ID,
+            now=NOW,
+            client=_FakeClient([_page([])]),
+            modified_before="last tuesday",
+        )
+
+
+# ---- the site binding ------------------------------------------------------
+
+
+async def test_a_credential_naming_a_different_site_refuses_and_holds_the_cursor(
+    monkeypatch,
+):
+    """Cross-site contamination, which nothing downstream can detect.
+
+    Re-point a store from site A to site B while site A's OAuth token is still
+    in the blob and every read still reaches site A. Its orders are well-formed
+    — they just belong to somebody else's shop, and they land in the ledger
+    under this merchant. So the site is proven BEFORE the first list call.
+    """
+    from services.squarespace_order_sweep import (
+        SquarespaceSweepError,
+        sweep_squarespace_store,
+    )
+
+    persisted, recorder = _wire(
+        monkeypatch,
+        credentials={
+            "api_key": "sq-api-key",
+            "oauth_access_token": "token-for-site-OLD",
+            "website_id": "site-1",
+        },
+    )
+    client = _AlwaysTruncatingClient(website_id="site-SOMEONE-ELSE")
+
+    with pytest.raises(SquarespaceSweepError, match="different site"):
+        await sweep_squarespace_store(
+            store_id=STORE_ID, now=NOW, client=client, apply=True
+        )
+
+    # Nothing was listed, nothing was recorded, and the cursor is untouched.
+    assert client.requests == []
+    assert recorder.calls == []
+    assert persisted == {}
+
+
+async def test_a_matching_site_is_verified_once_per_run_not_once_per_page(
+    monkeypatch,
+):
+    """The positive counterpart, and a bound on the cost.
+
+    Without the second half, the check could be implemented per page — one
+    extra upstream call for every page of every store on every run — and this
+    file would still be green.
+    """
+    from services.squarespace_order_sweep import sweep_squarespace_store
+
+    _wire(monkeypatch, credentials=_CREDENTIALS)
+    client = _FakeClient(
+        [
+            _page([_order("a", NOW - timedelta(hours=2))], next_cursor="cur-2"),
+            _page([_order("b", NOW - timedelta(hours=1))]),
+        ]
+    )
+
+    result = await sweep_squarespace_store(store_id=STORE_ID, now=NOW, client=client)
+
+    assert result["status"] == "success"
+    assert result["pages"] == 2
+    assert client.website_lookups == ["sq-api-key"]
+
+
+async def test_a_store_with_no_website_binding_refuses_rather_than_sweeping(
+    monkeypatch,
+):
+    """No binding means nothing to compare the credential against, so the check
+    would be vacuous. Refuse and ask for a reconnect instead of sweeping
+    unverified."""
+    from services.squarespace_order_sweep import (
+        SquarespaceSweepError,
+        sweep_squarespace_store,
+    )
+
+    _wire(monkeypatch, credentials={"api_key": "sq-api-key"})
+    client = _FakeClient([_page([])])
+
+    with pytest.raises(SquarespaceSweepError, match="website_id"):
+        await sweep_squarespace_store(store_id=STORE_ID, now=NOW, client=client)
+    assert client.requests == []
+
+
+# ---- the OAuth token expires; the API key does not -------------------------
+
+
+async def test_an_expired_oauth_token_falls_back_to_the_api_key(monkeypatch):
+    """A Developer-Platform access token is short-lived and there is no refresh
+    path in this repo yet.
+
+    Preferring it unconditionally takes a store that holds a perfectly good
+    per-site API key dark within the hour, and the sweep is that store's ONLY
+    telemetry path. So a 401 falls back rather than failing the run.
+    """
+    from services.squarespace_order_sweep import sweep_squarespace_store
+
+    _wire(
+        monkeypatch,
+        credentials={
+            "api_key": "sq-api-key",
+            "oauth_access_token": "expired-token",
+            "website_id": "site-1",
+        },
+    )
+    client = _FakeClient(
+        [_page([_order("a", NOW - timedelta(hours=1))])],
+        unauthorized_tokens={"expired-token"},
+    )
+
+    result = await sweep_squarespace_store(store_id=STORE_ID, now=NOW, client=client)
+
+    assert result["status"] == "success"
+    assert result["seen"] == 1
+    # It TRIED the OAuth token first — the preference is still real — and then
+    # read with the key.
+    assert client.website_lookups == ["expired-token", "sq-api-key"]
+
+
+async def test_every_credential_being_refused_is_a_sweep_failure(monkeypatch):
+    """The fallback must not become "any 401 is fine". When nothing works the
+    run fails loudly and the cursor stays put; a silent success would report a
+    quiet, permanently empty sweep."""
+    from services.squarespace_order_sweep import (
+        SquarespaceSweepError,
+        sweep_squarespace_store,
+    )
+
+    persisted, _ = _wire(
+        monkeypatch,
+        credentials={
+            "api_key": "sq-api-key",
+            "oauth_access_token": "expired-token",
+            "website_id": "site-1",
+        },
+    )
+    client = _FakeClient(
+        [_page([])], unauthorized_tokens={"expired-token", "sq-api-key"}
+    )
+
+    with pytest.raises(SquarespaceSweepError, match="refused every stored credential"):
+        await sweep_squarespace_store(
+            store_id=STORE_ID, now=NOW, client=client, apply=True
+        )
+    assert persisted == {}

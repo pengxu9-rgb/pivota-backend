@@ -402,6 +402,10 @@ def test_a_redelivered_notification_id_short_circuits_the_fetch(monkeypatch):
     assert second.status_code == 200
     assert second.json()["status"] == "duplicate"
     assert second.json()["accepted"] == 0
+    # `duplicates: 1`, not 0. This IS a duplicate observation — the ledger would
+    # have counted it as one had the short-circuit not saved the API call — and
+    # reporting zero makes the metric read as if redeliveries never happen.
+    assert second.json()["duplicates"] == 1
     # The point of the cache: the redelivery cost no Orders API call.
     assert len(fetched) == 1
     assert len(recorder.calls) == 1
@@ -423,3 +427,361 @@ def test_a_different_notification_for_the_same_order_is_not_deduped(monkeypatch)
     assert second.json()["status"] == "recorded"
     assert len(fetched) == 2
     assert len(recorder.calls) == 2
+
+
+# ---- the OAuth token expires; the API key does not -------------------------
+
+
+def test_an_expired_oauth_token_falls_back_to_the_api_key_for_the_fetch(monkeypatch):
+    """A Developer-Platform access token is short-lived and there is no refresh
+    path in this repo yet.
+
+    Without the fallback, every delivery to an OAuth store 503s for the whole
+    window between expiry and a human reconnecting — and Squarespace gives up
+    retrying long before that. The store's telemetry then depends entirely on
+    the next scheduled sweep, on a lane that ships no scheduler.
+    """
+    from routes import squarespace_webhooks as route
+    from services.squarespace_order_fetch import SquarespaceOrderUnauthorizedError
+
+    recorder = _Recorder()
+    app, fetched = _app(
+        monkeypatch,
+        credentials={
+            "api_key": "sq-api-key",
+            "oauth_access_token": "expired-token",
+            "website_id": WEBSITE_ID,
+            "webhook_secret": SECRET,
+        },
+        recorder=recorder,
+    )
+
+    async def fake_fetch(*, access_token, order_id, **kwargs):
+        fetched.append({"access_token": access_token, "order_id": order_id})
+        if access_token == "expired-token":
+            raise SquarespaceOrderUnauthorizedError(
+                "Squarespace refused the credential for the order read (HTTP 401)"
+            )
+        return _order()
+
+    monkeypatch.setattr(route, "fetch_squarespace_order", fake_fetch)
+
+    response = _post(TestClient(app), _notification())
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "recorded"
+    # It TRIED the OAuth token first — the preference is still real — and then
+    # read with the key.
+    assert [call["access_token"] for call in fetched] == ["expired-token", "sq-api-key"]
+    assert len(recorder.calls) == 1
+
+
+def test_a_401_on_every_credential_is_still_a_503(monkeypatch):
+    """The fallback must not soften into "any 401 is fine": a delivery whose
+    order could not be read at all has to stay retryable, or the order is lost
+    until the sweep happens to pass over it."""
+    from routes import squarespace_webhooks as route
+    from services.squarespace_order_fetch import SquarespaceOrderUnauthorizedError
+
+    recorder = _Recorder()
+    app, fetched = _app(
+        monkeypatch,
+        credentials={
+            "api_key": "sq-api-key",
+            "oauth_access_token": "expired-token",
+            "website_id": WEBSITE_ID,
+            "webhook_secret": SECRET,
+        },
+        recorder=recorder,
+    )
+
+    async def fake_fetch(*, access_token, order_id, **kwargs):
+        fetched.append({"access_token": access_token})
+        raise SquarespaceOrderUnauthorizedError("refused")
+
+    monkeypatch.setattr(route, "fetch_squarespace_order", fake_fetch)
+
+    response = _post(TestClient(app), _notification())
+
+    assert response.status_code == 503
+    assert len(fetched) == 2
+    assert recorder.calls == []
+
+
+def test_a_non_auth_fetch_failure_does_not_burn_the_second_credential(monkeypatch):
+    """Only a 401/403 is worth retrying with a different identity. A 429 or a
+    5xx means the credential was fine and the API was not, so re-asking with
+    the API key doubles the load on an upstream that is already struggling."""
+    from routes import squarespace_webhooks as route
+    from services.squarespace_order_fetch import SquarespaceOrderFetchError
+
+    app, fetched = _app(
+        monkeypatch,
+        credentials={
+            "api_key": "sq-api-key",
+            "oauth_access_token": "good-token",
+            "website_id": WEBSITE_ID,
+            "webhook_secret": SECRET,
+        },
+    )
+
+    async def fake_fetch(*, access_token, order_id, **kwargs):
+        fetched.append({"access_token": access_token})
+        raise SquarespaceOrderFetchError("Squarespace rate-limited the order read")
+
+    monkeypatch.setattr(route, "fetch_squarespace_order", fake_fetch)
+
+    response = _post(TestClient(app), _notification())
+
+    assert response.status_code == 503
+    assert [call["access_token"] for call in fetched] == ["good-token"]
+
+
+# ---- making a wrong assumption diagnosable ---------------------------------
+
+
+def test_a_rejected_delivery_logs_the_squarespace_header_names_and_shape(
+    monkeypatch, caplog
+):
+    """That the signature is HMAC-SHA256 over the RAW BODY ALONE is an ASSUMED
+    claim (docs/SQUARESPACE_TELEMETRY.md).
+
+    If it is wrong — the documented input may concatenate a timestamp header or
+    the endpoint URL — the symptom is a 401 on every delivery a site ever
+    sends, and a bare 401 is indistinguishable from a wrong secret. This log
+    line is what makes the two decidable from production rather than from a
+    packet capture: which Squarespace-* headers were there to concatenate, and
+    whether the digest arrived hex- or base64-shaped.
+    """
+    import logging
+
+    app, fetched = _app(monkeypatch)
+    client = TestClient(app)
+    body = json.dumps(_notification(), separators=(",", ":")).encode()
+
+    with caplog.at_level(logging.WARNING, logger="squarespace_webhooks"):
+        response = client.post(
+            PATH,
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "Squarespace-Signature": "deadbeef",
+                "Squarespace-Timestamp": "1757000000",
+            },
+        )
+
+    assert response.status_code == 401
+    assert fetched == []
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    line = next(m for m in messages if "squarespace webhook rejected" in m)
+    # The NAMES are there...
+    assert "squarespace-timestamp" in line.lower()
+    assert "squarespace-signature" in line.lower()
+    assert "hex:8" in line
+    # ...and no VALUE ever is. A log that leaked the digest would hand an
+    # attacker with log access exactly what the secret protects.
+    assert "deadbeef" not in line
+    assert "1757000000" not in line
+    assert SECRET not in line
+
+
+@pytest.mark.parametrize(
+    "encoder,label",
+    [
+        (lambda d: base64.b64encode(d).decode(), "standard base64"),
+        (lambda d: base64.b64encode(d).decode().rstrip("="), "unpadded base64"),
+        (lambda d: base64.urlsafe_b64encode(d).decode(), "url-safe base64"),
+        (lambda d: base64.urlsafe_b64encode(d).decode().rstrip("="), "unpadded url-safe"),
+        (lambda d: d.hex(), "hex"),
+        (lambda d: d.hex().upper(), "upper-case hex"),
+    ],
+)
+def test_every_plausible_spelling_of_the_right_digest_is_accepted(
+    monkeypatch, encoder, label
+):
+    """The header's ENCODING is assumed, so the hedge is deliberately wide.
+
+    Widening costs nothing — a caller must still produce the digest, which
+    needs the secret. Narrowing, if the assumption is wrong, 401s every
+    delivery a site ever sends, and the secret cannot be re-read to try again.
+    """
+    app, fetched = _app(monkeypatch)
+    body = json.dumps(_notification(), separators=(",", ":")).encode()
+    digest = hmac.new(SECRET.encode(), body, hashlib.sha256).digest()
+
+    response = TestClient(app).post(
+        PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "Squarespace-Signature": encoder(digest),
+        },
+    )
+
+    assert response.status_code == 200, f"{label} was refused: {response.text}"
+    assert len(fetched) == 1
+
+
+def test_a_wrong_digest_in_a_plausible_spelling_is_still_401(monkeypatch):
+    """The counterpart to the hedge above: accepting more SPELLINGS must not
+    accept more DIGESTS."""
+    app, fetched = _app(monkeypatch)
+    body = json.dumps(_notification(), separators=(",", ":")).encode()
+    wrong = hmac.new(b"not-the-secret", body, hashlib.sha256).digest()
+
+    for spelling in (
+        base64.b64encode(wrong).decode(),
+        base64.urlsafe_b64encode(wrong).decode().rstrip("="),
+        wrong.hex(),
+    ):
+        response = TestClient(app).post(
+            PATH,
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "Squarespace-Signature": spelling,
+            },
+        )
+        assert response.status_code == 401, spelling
+    assert fetched == []
+
+
+def test_an_oversized_body_is_refused_from_its_content_length_alone(monkeypatch):
+    """Bounded WHILE it is read, not after.
+
+    Buffering a hostile body and then measuring it means the process has
+    already held whatever was sent. Same shape as
+    `routes/prestashop_webhooks.py`.
+    """
+    app, fetched = _app(monkeypatch)
+
+    response = TestClient(app).post(
+        PATH,
+        content=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "2",
+            "Squarespace-Signature": "x",
+        },
+    )
+    # A truthful small body gets as far as the signature check (401), which is
+    # the baseline the next assertion is measured against.
+    assert response.status_code == 401
+
+    from routes import squarespace_webhooks as route
+
+    assert route.MAX_SQUARESPACE_WEBHOOK_BYTES == 1_000_000
+    # And the reader is the streaming one, not `await request.body()`.
+    import inspect
+
+    source = inspect.getsource(route.receive_squarespace_webhook)
+    assert "_read_limited_body" in source
+    assert "await request.body()" not in source
+    assert fetched == []
+
+
+async def test_the_body_reader_stops_before_buffering_an_oversized_stream():
+    """Driven at the reader directly, because the claim is about what it does
+    BEFORE the body is complete: a client that lies about (or omits)
+    Content-Length must still be cut off mid-stream rather than buffered whole.
+    """
+    from fastapi import HTTPException
+
+    from routes import squarespace_webhooks as route
+
+    chunks_pulled = []
+
+    class _Request:
+        headers = {}
+
+        async def stream(self):
+            for index in range(100):
+                chunk = b"x" * 100_000
+                chunks_pulled.append(index)
+                yield chunk
+
+    with pytest.raises(HTTPException) as raised:
+        await route._read_limited_body(_Request())
+
+    assert raised.value.status_code == 413
+    # It stopped as soon as the cap was exceeded rather than draining all 10 MB.
+    assert len(chunks_pulled) <= 11, chunks_pulled
+
+
+# ---- the order id reaches a URL PATH ---------------------------------------
+
+
+class _UrlSpy:
+    """Captures the URL a fetch built, and answers 200 with one order."""
+
+    def __init__(self):
+        self.urls = []
+
+    async def get(self, url, headers=None, params=None):
+        self.urls.append(str(url))
+
+        class _Response:
+            status_code = 200
+            content = b"{}"
+
+            @staticmethod
+            def json():
+                return _order()
+
+        return _Response()
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../../authorization/website",
+        "..%2f..%2fauthorization%2fwebsite",
+        "1/../../authorization/website",
+        "abc?expand=all",
+        "abc#frag",
+        "abc def",
+        "",
+        "x" * 129,
+    ],
+)
+async def test_a_hostile_order_id_never_reaches_the_url(hostile):
+    """`data.orderId` is interpolated into a URL PATH and comes out of a
+    webhook body.
+
+    The delivery is signature-checked, but a signature proves the SENDER, not
+    the shape of a field inside it — and the sender here is whoever holds the
+    subscription secret for one store, which is not the same as "trusted to
+    choose our request path". `../../authorization/website` walks out of the
+    orders collection and makes the fetch read a different endpoint entirely,
+    with this store's credential.
+    """
+    from services.squarespace_order_fetch import (
+        SquarespaceOrderFetchError,
+        fetch_squarespace_order,
+    )
+
+    spy = _UrlSpy()
+    with pytest.raises(SquarespaceOrderFetchError):
+        await fetch_squarespace_order(
+            access_token="t", order_id=hostile, client=spy
+        )
+    assert spy.urls == [], spy.urls
+
+
+async def test_a_real_order_id_still_reaches_the_orders_collection():
+    """The positive counterpart. A validator that refused everything would
+    satisfy every case above while taking the integration offline."""
+    from services.squarespace_order_fetch import fetch_squarespace_order
+
+    spy = _UrlSpy()
+    order = await fetch_squarespace_order(
+        access_token="t", order_id=ORDER_ID, client=spy
+    )
+
+    assert order["id"] == ORDER_ID
+    assert spy.urls == [
+        f"https://api.squarespace.com/1.0/commerce/orders/{ORDER_ID}"
+    ]

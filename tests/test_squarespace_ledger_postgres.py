@@ -214,12 +214,19 @@ async def _sweep(monkeypatch, orders):
         status_code = 200
         content = b"{}"
 
+        def __init__(self, payload):
+            self._payload = payload
+
         def json(self):
-            return {"result": orders, "pagination": {}}
+            return self._payload
 
     class _Client:
         async def get(self, url, headers=None, params=None):
-            return _Response()
+            # The sweep proves the credential's SITE once per run before it
+            # lists anything.
+            if "/authorization/website" in str(url):
+                return _Response({"id": WEBSITE_ID})
+            return _Response({"result": orders, "pagination": {}})
 
         async def aclose(self):
             return None
@@ -232,8 +239,8 @@ async def _sweep(monkeypatch, orders):
             "api_key": json.dumps(_CREDENTIALS),
         }
 
-    async def fake_merge(*, store_id, updates):
-        return {**_CREDENTIALS, **updates}
+    async def fake_merge(*, store_id, updates=None, **kwargs):
+        return {**_CREDENTIALS, **(updates or {})}
 
     monkeypatch.setattr(sweep, "find_squarespace_store", fake_find)
     monkeypatch.setattr(sweep, "merge_squarespace_credentials", fake_merge)
@@ -484,3 +491,229 @@ async def test_an_order_with_nothing_refunded_takes_no_lock(monkeypatch):
     assert response.status_code == 200, response.text
     assert response.json()["accepted"] == 2
     assert taken == []
+
+
+# ---------------------------------------------------------------------------
+# The credential blob's critical section.
+#
+# `merge_squarespace_credentials` is a read-modify-write over ONE cell that
+# holds the API key, the OAuth token, the website binding, the once-shown
+# webhook secret and the reconciliation cursor. Without a row lock, two writers
+# both read the pre-write blob and the second silently discards the first: a
+# sweep's cursor write landing between `ensure`'s read and its write erases the
+# `webhook_secret`, after which every delivery 401s and no reconnect can
+# recover it, because Squarespace shows that secret exactly once.
+#
+# SQLite cannot observe any of that — it has no `FOR UPDATE`, and `databases`
+# serializes everything onto one connection — so the claim can only be pinned
+# HERE, with genuinely separate backends.
+
+
+# `merchant_stores` may already exist in this throwaway database, left by a
+# sibling gate with a NARROWER column set. So the table is created if absent and
+# the columns this test needs are added if missing — never dropped and rebuilt,
+# which would silently delete another gate's fixture. Cleanup removes only THIS
+# test's row for the same reason.
+_STORES_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS merchant_stores (
+        store_id TEXT PRIMARY KEY,
+        merchant_id TEXT,
+        platform TEXT,
+        domain TEXT,
+        status TEXT
+    )
+    """,
+    "ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS name TEXT",
+    "ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS api_key TEXT",
+    "ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS last_sync TIMESTAMPTZ",
+    "ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS connected_at TIMESTAMPTZ",
+)
+
+_SEED_BLOB = {
+    "api_key": "live-key",
+    "website_id": WEBSITE_ID,
+    "webhook_secret": "shown-exactly-once",
+    "reconciliation": {"orders_cursor": "2026-09-01T00:00:00.000Z"},
+}
+
+
+async def _merge_fixture():
+    """A `merchant_stores` row plus two INDEPENDENT backends to race on it.
+
+    Separate `databases.Database` objects, not two tasks on the shared handle:
+    `databases` shares one connection across child tasks, so two coroutines on
+    the same handle would serialize in the client and prove nothing about the
+    database. Each of these owns its own pool, so a lock is the only thing that
+    can order them.
+    """
+    import databases
+
+    from db.database import database
+
+    for statement in _STORES_DDL:
+        await database.execute(statement)
+    await database.execute(
+        "DELETE FROM merchant_stores WHERE store_id = :store_id",
+        {"store_id": STORE_ID},
+    )
+    await database.execute(
+        "INSERT INTO merchant_stores (store_id, merchant_id, platform, api_key)"
+        " VALUES (:store_id, :merchant_id, 'squarespace', :api_key)",
+        {
+            "store_id": STORE_ID,
+            "merchant_id": MERCHANT_ID,
+            "api_key": json.dumps(_SEED_BLOB),
+        },
+    )
+    first = databases.Database(DATABASE_URL)
+    second = databases.Database(DATABASE_URL)
+    await first.connect()
+    await second.connect()
+    return first, second
+
+
+async def _stored_blob():
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+        {"store_id": STORE_ID},
+    )
+    return json.loads(dict(row)["api_key"])
+
+
+async def test_two_concurrent_merges_serialize_and_neither_write_is_lost():
+    """The lost update, reproduced and then closed.
+
+    A third connection holds the row while both merges are launched, so their
+    interleaving is decided rather than raced:
+
+    * WITH `SELECT ... FOR UPDATE` inside the merge, both merges block on that
+      lock. They run one after the other, and the second one READS what the
+      first committed — so the secret and the cursor both survive.
+    * WITHOUT it, a plain `SELECT` does not block on a row lock in Postgres
+      (readers never block writers under MVCC). Both merges read the ORIGINAL
+      blob immediately, then queue on the UPDATE, and whichever commits last
+      overwrites the other's key entirely.
+
+    The `asyncio.sleep` is what makes that deterministic: it guarantees both
+    merges have reached their blocking point before the holder lets go.
+    """
+    import asyncio
+
+    from db.database import database
+    from services.squarespace_connection import merge_squarespace_credentials
+
+    first, second = await _merge_fixture()
+    try:
+        holder_released = asyncio.Event()
+
+        async def _hold_the_row():
+            async with database.transaction():
+                await database.fetch_one(
+                    "SELECT api_key FROM merchant_stores"
+                    " WHERE store_id = :store_id FOR UPDATE",
+                    {"store_id": STORE_ID},
+                )
+                await holder_released.wait()
+
+        holder = asyncio.create_task(_hold_the_row())
+        await asyncio.sleep(0.2)
+
+        # `ensure` rotating the subscription secret...
+        ensure = asyncio.create_task(
+            merge_squarespace_credentials(
+                store_id=STORE_ID,
+                updates={"webhook_secret": "rotated-secret"},
+                db=first,
+            )
+        )
+        # ...and a sweep persisting its cursor, at the same instant.
+        sweep = asyncio.create_task(
+            merge_squarespace_credentials(
+                store_id=STORE_ID,
+                updates={
+                    "reconciliation": {"orders_cursor": "2026-09-05T00:00:00.000Z"}
+                },
+                db=second,
+            )
+        )
+
+        # Both are now parked. Under a plain SELECT they have ALREADY read the
+        # stale blob by this point, which is precisely the bug.
+        await asyncio.sleep(0.4)
+        holder_released.set()
+        await holder
+        await asyncio.wait_for(asyncio.gather(ensure, sweep), timeout=20)
+
+        blob = await _stored_blob()
+        assert blob["webhook_secret"] == "rotated-secret", (
+            "the sweep's cursor write erased the rotated webhook secret — the "
+            "merge is not serialized, and Squarespace shows that secret once"
+        )
+        assert blob["reconciliation"] == {
+            "orders_cursor": "2026-09-05T00:00:00.000Z"
+        }, "the ensure erased the sweep's cursor"
+        # And nothing either writer was not asked to touch moved.
+        assert blob["api_key"] == "live-key"
+        assert blob["website_id"] == WEBSITE_ID
+    finally:
+        await first.disconnect()
+        await second.disconnect()
+        await database.execute(
+            "DELETE FROM merchant_stores WHERE store_id = :store_id",
+            {"store_id": STORE_ID},
+        )
+
+
+async def test_a_second_merge_WAITS_for_the_first_rather_than_reading_past_it():
+    """The mechanism behind the test above, asserted directly.
+
+    Without this, "neither write was lost" could hold by luck of scheduling on
+    a fast machine. What must be true is that a merge whose row is locked
+    elsewhere does not COMPLETE until the lock is released.
+    """
+    import asyncio
+
+    from db.database import database
+    from services.squarespace_connection import merge_squarespace_credentials
+
+    first, _second = await _merge_fixture()
+    try:
+        released = asyncio.Event()
+
+        async def _hold_the_row():
+            async with database.transaction():
+                await database.fetch_one(
+                    "SELECT api_key FROM merchant_stores"
+                    " WHERE store_id = :store_id FOR UPDATE",
+                    {"store_id": STORE_ID},
+                )
+                await released.wait()
+
+        holder = asyncio.create_task(_hold_the_row())
+        await asyncio.sleep(0.2)
+
+        merging = asyncio.create_task(
+            merge_squarespace_credentials(
+                store_id=STORE_ID, updates={"webhook_secret": "rotated"}, db=first
+            )
+        )
+        await asyncio.sleep(0.5)
+        assert not merging.done(), (
+            "the merge completed while another backend held the row — it is not "
+            "taking the lock"
+        )
+
+        released.set()
+        await holder
+        persisted = await asyncio.wait_for(merging, timeout=20)
+        assert persisted["webhook_secret"] == "rotated"
+    finally:
+        await first.disconnect()
+        await _second.disconnect()
+        await database.execute(
+            "DELETE FROM merchant_stores WHERE store_id = :store_id",
+            {"store_id": STORE_ID},
+        )

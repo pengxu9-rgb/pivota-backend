@@ -32,13 +32,17 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 from collections import OrderedDict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from db.database import database
-from services.squarespace_connection import parse_squarespace_credentials
+from services.squarespace_connection import (
+    parse_squarespace_credentials,
+    squarespace_read_tokens,
+)
 from services.squarespace_event_adapter import (
     SQUARESPACE_UNINSTALL_TOPIC,
     is_supported_squarespace_topic,
@@ -47,15 +51,21 @@ from services.squarespace_event_adapter import (
 from services.squarespace_ledger import record_squarespace_order
 from services.squarespace_order_fetch import (
     SquarespaceOrderFetchError,
+    SquarespaceOrderUnauthorizedError,
     fetch_squarespace_order,
 )
 from services.telemetry_ingress import current_ingress, telemetry_ingress_route
 
 
-# No module logger: every non-2xx this route raises is already logged by
-# `telemetry_ingress_route` with the write path, principal, status and a bounded
-# reason, and the two ignore reasons here (`testmode`, an unmapped topic) are
-# expected traffic rather than something to page on.
+# `telemetry_ingress_route` already logs every non-2xx this route raises with
+# the write path, principal, status and a bounded reason, and the two ignore
+# reasons here (`testmode`, an unmapped topic) are expected traffic. The logger
+# exists for the two things it CANNOT see: which Squarespace-* headers a
+# rejected delivery actually carried (the signature input is an ASSUMED claim,
+# so a wrong assumption has to be diagnosable from one 401 rather than from a
+# packet capture) and a read that fell back from the OAuth token to the API key.
+logger = logging.getLogger("squarespace_webhooks")
+
 router = APIRouter(prefix="/webhooks/squarespace", tags=["Squarespace Webhooks"])
 
 MAX_SQUARESPACE_WEBHOOK_BYTES = 1_000_000
@@ -79,13 +89,56 @@ def _remember_notification(key: str) -> None:
         _SEEN_NOTIFICATIONS.popitem(last=False)
 
 
+async def _read_limited_body(request: Request) -> bytes:
+    """The raw body, bounded WHILE it is read rather than after.
+
+    Buffering a body and then measuring it means a hostile sender has already
+    made this process hold whatever they sent. Same shape as
+    `routes/prestashop_webhooks.py`.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_SQUARESPACE_WEBHOOK_BYTES:
+                raise HTTPException(
+                    status_code=413, detail="Squarespace webhook exceeds 1 MB"
+                )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="Invalid Content-Length header"
+            ) from exc
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_SQUARESPACE_WEBHOOK_BYTES:
+            raise HTTPException(
+                status_code=413, detail="Squarespace webhook exceeds 1 MB"
+            )
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _signature_candidates(digest: bytes) -> List[str]:
+    """Every spelling of one digest this receiver will accept.
+
+    The header's encoding is ASSUMED, not verified (docs/SQUARESPACE_TELEMETRY.md
+    row 18), so hex, standard base64, url-safe base64 and their unpadded forms
+    are all compared. Widening costs nothing: a caller must still produce the
+    digest, which needs the secret. Narrowing, if the assumption is wrong,
+    401s every delivery a site ever sends.
+    """
+    standard = base64.b64encode(digest).decode("ascii")
+    urlsafe = base64.urlsafe_b64encode(digest).decode("ascii")
+    return [
+        digest.hex(),
+        standard,
+        standard.rstrip("="),
+        urlsafe,
+        urlsafe.rstrip("="),
+    ]
+
+
 def _valid_signature(raw: bytes, signature: Optional[str], secret: str) -> bool:
     """Constant-time HMAC-SHA256 over the RAW body with the subscription secret.
-
-    Both hex and base64 spellings of the same digest are accepted. The header's
-    encoding is the one claim in this integration that could not be pinned down
-    (see the assumed table in docs/SQUARESPACE_TELEMETRY.md); accepting either
-    costs nothing, because a caller must still produce the digest itself.
 
     A malformed header — empty, or carrying bytes that are not ASCII — is False,
     never an exception: `hmac.compare_digest` raises TypeError on a str with
@@ -99,11 +152,39 @@ def _valid_signature(raw: bytes, signature: Optional[str], secret: str) -> bool:
     except UnicodeEncodeError:
         return False
     digest = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()
-    if hmac.compare_digest(digest.hex(), supplied.lower()):
-        return True
-    return hmac.compare_digest(
-        base64.b64encode(digest).decode("ascii"), supplied
-    )
+    lowered = supplied.lower()
+    matched = False
+    for candidate in _signature_candidates(digest):
+        # Every candidate is compared, without an early return, so the work
+        # does not depend on which spelling matched.
+        if hmac.compare_digest(candidate, supplied) or hmac.compare_digest(
+            candidate.lower(), lowered
+        ):
+            matched = True
+    return matched
+
+
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+
+
+def _signature_shape(signature: Optional[str]) -> str:
+    """`hex`, `base64-ish`, `empty` or `non-ascii` — never the value itself.
+
+    A 401 on a delivery that really was signed by Squarespace means one of the
+    assumed claims about the signature is wrong, and the two candidates are the
+    ENCODING and the INPUT. This names the encoding actually seen so the first
+    is decidable from a log line.
+    """
+    supplied = str(signature or "").strip()
+    if not supplied:
+        return "empty"
+    try:
+        supplied.encode("ascii")
+    except UnicodeEncodeError:
+        return "non-ascii"
+    if all(char in _HEX_DIGITS for char in supplied):
+        return f"hex:{len(supplied)}"
+    return f"base64-ish:{len(supplied)}"
 
 
 def _summary(
@@ -140,9 +221,7 @@ async def receive_squarespace_webhook(
     request: Request,
     signature: Optional[str] = Header(default=None, alias=SQUARESPACE_SIGNATURE_HEADER),
 ):
-    raw = await request.body()
-    if len(raw) > MAX_SQUARESPACE_WEBHOOK_BYTES:
-        raise HTTPException(status_code=413, detail="Squarespace webhook exceeds 1 MB")
+    raw = await _read_limited_body(request)
 
     store = await database.fetch_one(
         """
@@ -160,6 +239,24 @@ async def receive_squarespace_webhook(
     # secret, and a wrong signature all answer the same 401: the caller learns
     # nothing about which it was.
     if not store or not _valid_signature(raw, signature, webhook_secret):
+        # The NAMES of the Squarespace-* headers, never a value. If the
+        # signature input is not the raw body alone — the documented input may
+        # concatenate a timestamp header or the endpoint URL — this is the line
+        # that says which header was there to concatenate, and whether the
+        # digest arrived hex- or base64-shaped.
+        logger.warning(
+            "squarespace webhook rejected store_id=%s store_known=%s secret_present=%s "
+            "signature_shape=%s squarespace_headers=%s",
+            store_id,
+            bool(store),
+            bool(webhook_secret),
+            _signature_shape(signature),
+            sorted(
+                name
+                for name in request.headers.keys()
+                if name.lower().startswith("squarespace")
+            ),
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_UNAUTHORIZED)
 
     store = dict(store)
@@ -214,10 +311,15 @@ async def receive_squarespace_webhook(
 
     seen_key = f"{store_id}:{notification_id}" if notification_id else None
     if seen_key and seen_key in _SEEN_NOTIFICATIONS:
+        # `duplicates: 1`, not 0. This IS a duplicate observation — the ledger
+        # would have counted it as one had the short-circuit not saved the
+        # Orders API call — and reporting zero makes the metric read as if
+        # redeliveries never happen.
         return _summary(
             status_value="duplicate",
             reason="notification_already_processed",
             topic=normalize_squarespace_topic(topic),
+            duplicates=1,
         )
 
     data = payload.get("data")
@@ -227,15 +329,33 @@ async def receive_squarespace_webhook(
             status_code=422, detail="Squarespace webhook is missing an order id"
         )
 
-    access_token = (
-        str(credentials.get("oauth_access_token") or "").strip()
-        or str(credentials.get("api_key") or "").strip()
-    )
-    try:
-        order = await fetch_squarespace_order(access_token=access_token, order_id=order_id)
-    except SquarespaceOrderFetchError as exc:
-        # Retryable: Squarespace redelivers a non-2xx.
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    # The OAuth token first, the API key as the fallback. A Developer-Platform
+    # access token is short-lived and this repo has no refresh path yet, so a
+    # store that also holds a working API key must not 503 every delivery for
+    # the hour between expiry and a human reconnecting it.
+    tokens = squarespace_read_tokens(credentials)
+    order = None
+    for index, token in enumerate(tokens):
+        try:
+            order = await fetch_squarespace_order(access_token=token, order_id=order_id)
+            break
+        except SquarespaceOrderUnauthorizedError as exc:
+            if index + 1 < len(tokens):
+                logger.warning(
+                    "squarespace order read fell back to the next credential "
+                    "store_id=%s rank=%s",
+                    store_id,
+                    index,
+                )
+                continue
+            # Retryable: Squarespace redelivers a non-2xx.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SquarespaceOrderFetchError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if order is None:
+        raise HTTPException(
+            status_code=503, detail="Squarespace order read has no usable credential"
+        )
 
     try:
         result = await record_squarespace_order(

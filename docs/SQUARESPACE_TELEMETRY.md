@@ -43,8 +43,14 @@ JSON, exactly like BigCommerce and PrestaShop:
 ```
 POST /integrations/squarespace/connect
 {"merchant_id": "...", "api_key": "...", "oauth_access_token": "...?",
+ "oauth_refresh_token": "...?", "oauth_expires_at": "...?",
  "store_name": "...?", "domain": "...?"}
 ```
+
+`oauth_refresh_token` and `oauth_expires_at` are **persisted but not yet used**
+— there is no refresh path (assumption 21, Residual gaps). Storing them now
+means the refresh, when it lands, does not require every OAuth store to
+reconnect first.
 
 The credential is validated by calling `GET /1.0/authorization/website`, which
 is also the **binding** step: the `id` it returns is persisted as `website_id`,
@@ -54,20 +60,66 @@ distinguished from this store's own — the subscription secret belongs to a
 subscription, not to a site.
 
 When both credentials are supplied the OAuth token is the one validated and the
-one used for reads: it is the identity that also carries webhook subscriptions,
-so it is the identity worth proving.
+one **preferred** for reads: it is the identity that also carries webhook
+subscriptions, so it is the identity worth proving. Preferred, not required —
+reads fall back to the API key on a 401, because the OAuth token expires and the
+API key does not (assumption 21).
 
-**A reconnect read-modify-writes the blob.** The same cell holds the webhook
+A connect that fails names the **upstream status** in its 400 detail
+(`… (upstream HTTP 404)`). Assumption 4 — that `authorization/website` answers a
+per-site API key at all — is load-bearing and unverified; a bare "connection
+failed" would look exactly like a mistyped key.
+
+**A reconnect read-modify-writes the blob, inside ONE critical section.** The
+same cell holds the API key, the OAuth token, the website binding, the webhook
 secret (Pivota's only copy) and the reconciliation cursor. Overwriting it is
 verbatim the PrestaShop P1: the receiver then 401s every delivery and the
-merchant has no way to tell a rotated secret from an outage. The one case where
-preserving is wrong is a credential that now belongs to a **different** site —
-then `webhook_secret`, `webhook_subscription_id` and `reconciliation` are
-dropped, because the secret would authenticate deliveries the `websiteId` bind
-rejects and the cursor is a high-water mark over another site's orders.
+merchant has no way to tell a rotated secret from an outage. Connect therefore
+goes through `merge_squarespace_credentials` like every other writer, passing a
+`mutate` callback that runs **under the same row lock** as the read and the
+write — a second, hand-rolled read-modify-write beside the shared one meant a
+sweep's cursor write landing between connect's read and its write reverted the
+merchant's new credential.
+
+The one case where preserving is wrong is a credential that now belongs to a
+**different** site. Then `webhook_secret`, `webhook_subscription_id`,
+`reconciliation` **and every OAuth field** (`oauth_access_token`,
+`oauth_refresh_token`, `oauth_expires_at`) are dropped. The OAuth token matters
+most and is the easiest to miss: it is *preferred over the API key on every
+read*, so a token the old site issued keeps the sweep listing the OLD site's
+orders and recording them under the store that now represents the new one. A
+token supplied *with* the reconnect is kept — the drop is of the stale identity,
+not a downgrade to sweep-only.
+
+`telemetry_mode` in the response is read off the blob **that persisted**, not
+off the request field: a reconnect that supplies no OAuth token still has
+webhooks if the stored one survived, and answering `sweep_only` there would tell
+the merchant their armed subscription is not armed.
 
 The key is never logged. The connect log line carries the store, merchant,
 website id, and whether an OAuth token was supplied — nothing more.
+
+### The credential blob is written under a row lock
+
+`merge_squarespace_credentials` is the ONE writer of `merchant_stores.api_key`
+for this platform, and it runs read → mutate → write → re-read inside
+`database.transaction()` behind `SELECT … FOR UPDATE` (on Postgres; a plain
+select on SQLite, which has no `FOR UPDATE` and where this is tests and local
+development only).
+
+The lock is not defensive habit. Without it, two writers both read the pre-write
+blob and the second silently discards the first: a sweep persisting its cursor
+between `ensure`'s read and its write **erases the `webhook_secret`** — after
+which every delivery 401s and no reconnect can recover it, because Squarespace
+shows that secret exactly once — and the reverse interleaving reverts a
+reconnect to the credential the merchant just replaced. Both interleavings are
+reproducible. The serialization claim is pinned in
+`tests/test_squarespace_ledger_postgres.py` with two genuinely separate
+backends, because SQLite cannot observe it.
+
+The re-read is not belt-and-braces either: `databases` + asyncpg reports no
+rowcount from an `UPDATE`, so reading the row back is the only proof the write
+landed.
 
 ## The wire
 
@@ -81,18 +133,23 @@ Squarespace-Signature: <hex HMAC-SHA256 of the raw body, keyed with the subscrip
 
 Auth chain, in order:
 
-1. 1 MB body cap → 413;
+1. 1 MB body cap → 413, enforced **while the body streams in** (and from
+   `Content-Length` first), not after buffering it — same shape as
+   `routes/prestashop_webhooks.py`. Measuring after buffering means a hostile
+   sender has already made this process hold whatever they sent;
 2. an **active** `platform = 'squarespace'` store row for `{store_id}`;
 3. a `webhook_secret` in that row's credential JSON;
-4. constant-time HMAC-SHA256 over the raw body (hex **or** base64 — see the
-   assumed table);
+4. constant-time HMAC-SHA256 over the raw body (hex either case, standard or
+   url-safe base64, padded or not — see assumptions 17 and 18);
 5. `identify` + the `platform` rate-limit tier;
 6. the JSON parses and is an object → 400;
 7. the body's `websiteId` equals the store's bound `website_id`;
 8. the topic is `order.create` or `order.update`;
 9. the notification `id` has not already been ingested by this process;
 10. `data.orderId` is present → 422;
-11. the order is fetched → 503 on failure;
+11. the order is fetched — the OAuth token first, falling back to the API key on
+    a 401/403 only (a 429 or 5xx is not retried with a second identity: the
+    credential was fine and the API was not) → 503 when no credential works;
 12. map, and ingest with `write_path="squarespace_webhook"` /
     `agent_identity_confidence="platform_asserted"` → authority `platform`.
 
@@ -100,6 +157,15 @@ Steps 2–4 answer with one 401 message, so a caller never learns which it hit �
 including an API-key-only store, whose "no secret" state is indistinguishable
 from a wrong signature. Step 7 has its own 401 message: it is a configuration
 error on a delivery that already proved it holds a secret.
+
+**A rejected delivery logs what makes a wrong assumption diagnosable.** At
+WARNING: the **names** of the `Squarespace-*` headers present (never a value),
+whether the store was known, whether a secret was stored, and whether the digest
+arrived hex- or base64-shaped. Assumption 17 — that the signed input is the raw
+body *alone* — is unverified; if it is wrong, the symptom is a 401 on every
+delivery, which is indistinguishable from a wrong secret without this line. A
+`Squarespace-Timestamp` in that header list, on a store whose secret is known
+good, is the tell.
 
 **A malformed signature header is 401, never 500.** `hmac.compare_digest` raises
 `TypeError` on a str with non-ASCII code points, and Starlette decodes header
@@ -114,9 +180,12 @@ sweep's next window.
 **The notification dedupe is an optimisation, not a guarantee.** A bounded
 per-process LRU of notification ids saves a redundant Orders API call on a
 redelivery, and ids are recorded only *after* a successful ingest so a delivery
-that 503'd is retried rather than swallowed. The actual correctness guarantee is
-the ledger's deterministic event ids, which hold across processes, restarts, and
-the sweep.
+that 503'd is retried rather than swallowed. A short-circuited redelivery
+answers `duplicates: 1`, not 0 — it IS a duplicate observation, and the ledger
+would have counted it as one had the cache not saved the API call; reporting
+zero would make the metric read as if redeliveries never happen. The actual
+correctness guarantee is the ledger's deterministic event ids, which hold across
+processes, restarts, and the sweep.
 
 ## Mapping
 
@@ -210,7 +279,10 @@ right and only that one per-event delta is short.
 
 ```
 POST /integrations/squarespace/{store_id}/reconcile?apply=true&max_pages=20
+POST /integrations/squarespace/{store_id}/reconcile?modified_before=2026-02-01T00:00:00Z
 python -m scripts.sweep_squarespace_orders --store-id store_x --apply
+python -m scripts.sweep_squarespace_orders --store-id store_x \
+    --modified-before 2026-02-01T00:00:00Z --apply
 ```
 
 One store per run. `GET /1.0/commerce/orders?modifiedAfter=&modifiedBefore=` for
@@ -230,9 +302,64 @@ Cursor safety, all three rules:
 * the cursor is **not advanced when the page cap truncated the run**.
   Squarespace documents no ordering for the orders list, so a run stopped early
   may have left behind orders whose `modifiedOn` is below the maximum it saw;
-  advancing past them would lose them for good. A truncated run reports
-  `truncated: true` and the next run re-reads the same window. Raise
-  `--max-pages` (or narrow the window) if a store stays truncated.
+  advancing past them would lose them for good.
+
+### Truncation is bisected, not frozen
+
+Holding the cursor on truncation is only half an answer, and on its own it is a
+**trap**. The window is `cursor − overlap → now`. If the cursor is held while
+`now` keeps advancing, every subsequent run asks for a *wider* window than the
+one that already failed, truncates on the same page-cap prefix, and the rest of
+the range is never read — permanently. A moderately busy store falls into that
+on its very first sweep (7 days × 20 pages) and never climbs out; the symptom is
+a store that reports `truncated: true` forever and whose cursor is `null`.
+
+So the sweep **bisects**:
+
+* a truncated run records the end of the window it could not finish
+  (`truncated_window_end`) in the reconciliation state;
+* the next run halves towards it —
+  `modifiedBefore = window_start + (window_end − window_start) / 2` — and keeps
+  halving until a window fits under the page cap;
+* a bounded window that **completes** advances the cursor to *that window's end*
+  (not to the highest `modifiedOn` seen, which would leave the next window
+  overlapping the prefix just finished) and **doubles** the width it tries next,
+  so a store that fell behind climbs back to real time geometrically;
+* the narrowest window is `overlap + 5 minutes`, never less. A window narrower
+  than the overlap would advance the cursor by less than the following window
+  rewinds it, and the sweep would go backwards;
+* if even that narrowest window still truncates, the run **accepts it, advances
+  past it, and logs an ERROR naming the exact range** that may be short. Staying
+  put would be an unbounded outage; a silent skip would be worse than a loud one.
+
+`modified_before` (route) / `--modified-before` (script) is the operator escape
+hatch over all of that: it pins the window's end for one run, for digging a
+store out of a range by hand rather than waiting for the halving to find it. A
+value that is not ISO-8601 is refused rather than ignored — an operator who
+mistypes the bound and is answered with an ordinary run would believe they read
+a range they did not.
+
+Raising `--max-pages` (capped at 200 on both surfaces) still converges faster
+than the bisect; the bisect is what makes an *unattended* run correct.
+
+### The credential must name this store's own site
+
+Before it lists anything, each run calls `GET /1.0/authorization/website` once
+and refuses (`SquarespaceSweepError`, logged, **cursor untouched**) if the `id`
+it returns is not this store's `website_id`.
+
+Without that check, re-pointing a store from site A to site B while site A's
+OAuth token is still in the blob makes the sweep keep listing **site A's**
+orders and record them under the store that now represents site B. Nothing
+downstream can tell: the orders are well-formed, they simply belong to somebody
+else's shop. (Connect drops the old site's OAuth token on a site change, which
+closes the same hole from the other end; this is the check that does not depend
+on connect having got it right.)
+
+The same call is where the OAuth→API-key fallback happens: a 401/403 on the
+OAuth token falls through to the per-site API key, so a store holding both does
+not go dark when a short-lived Developer-Platform token expires. Every stored
+credential being refused is a loud sweep failure, not a quiet empty run.
 
 An empty but *complete* window advances the cursor to the window's end: nothing
 modified in a window that was fully read means nothing was missed in it, and
@@ -279,11 +406,28 @@ Merchant-or-staff role gate; ownership comes off the fetched ROW, because
   the detail. Nothing is written.
 * **No `website_id` → 409.** Deliveries could not be bound to the site they came
   from; the store has to be reconnected.
-* **OAuth token → create.** Every subscription already pointing at our endpoint
-  is deleted first and a fresh one created. This is not tidiness: the secret is
-  returned by Squarespace exactly ONCE, at creation, and cannot be read back, so
-  reusing a subscription whose secret Pivota lost would leave it delivering
-  notifications the receiver can only answer 401 to.
+* **OAuth token → create, then delete.** A fresh subscription is created FIRST,
+  and only then is every older subscription pointing at our endpoint removed.
+  The replacement is not tidiness: the secret is returned by Squarespace exactly
+  ONCE, at creation, and cannot be read back, so reusing a subscription whose
+  secret Pivota lost would leave it delivering notifications the receiver can
+  only answer 401 to. The **order** is what bounds the blast radius — under
+  delete-then-create, a create that fails (a rate limit, an expired OAuth token,
+  a Squarespace 5xx) leaves the store with **no subscription at all** until
+  somebody notices and re-runs `ensure`. Creating first means the worst case is a
+  brief overlap of two subscriptions instead of a gap. A delete that fails after
+  a successful create is swallowed and reported as not-replaced: failing the
+  whole call there would throw away the one copy of the new secret over a
+  leftover subscription whose only symptom is duplicate deliveries the receiver
+  401s and the ledger would dedupe anyway.
+
+> **Every `ensure` ROTATES the secret. Do not call it on a schedule.**
+> Between the create and the merge that persists the new secret, deliveries
+> still signed with the OLD secret answer 401. Squarespace retries them, and
+> anything that never lands is picked up by the reconciliation sweep on its next
+> run — the sweep is what makes an `ensure` safe to run at all, and the reason
+> this is a bounded cost rather than lost telemetry. (Assumption 20: a
+> `rotateSecret` endpoint may exist, which would remove the window entirely.)
 
 The secret is persisted, then the row is **re-read** — `databases` + asyncpg
 reports no rowcount from an `UPDATE`, so the re-read is the only proof the write
@@ -315,7 +459,7 @@ is wrong.
 | 1 | Base URL `https://api.squarespace.com/1.0/`, auth `Authorization: Bearer <key>` | **Verified** | — |
 | 2 | A `User-Agent` header is **required**; Squarespace answers 400 without one | **Verified** | Every call 400s; caught immediately at connect |
 | 3 | 429 on rate limit | **Verified** | Surfaces as a retryable fetch/sweep error either way |
-| 4 | `GET /1.0/authorization/website` returns the site the credential belongs to, with `id` and `title` | **Verified** | Connect fails closed: no `website_id`, no store row |
+| 4 | `GET /1.0/authorization/website` returns the site the credential belongs to, with `id` and `title`, **and is reachable with a per-site API key** | **Assumed** — the endpoint and its shape are documented, but that it answers an API key (rather than only an OAuth token) is an inference from it not being listed as an OAuth-only surface | This is load-bearing twice over: it is connect's only validation AND the sweep's per-run site check. If an API key gets 401/404 here, **every API-key connect fails and every API-key sweep refuses** — i.e. the whole sweep-only tier is dead, which is the tier that exists for API-key stores. Made diagnosable rather than silent: the connect 400 carries `(upstream HTTP <status>)`, so a 404 says "wrong endpoint" and a 401 says "wrong key" on the first attempt instead of after a support thread. The fix, if it is wrong, is to validate an API-key connect against `GET /1.0/commerce/orders?modifiedAfter=…&modifiedBefore=…` with a one-second window instead, and to bind `website_id` from the OAuth token only |
 | 5 | The authorization response is the website object itself (not wrapped) | **Assumed** | A `{"website": {...}}` envelope is also accepted; anything else fails connect loudly |
 | 6 | `GET /1.0/commerce/orders` accepts `modifiedAfter` + `modifiedBefore` and paginates via `pagination.nextPageCursor` | **Verified** | Sweep errors on the first page; no silent partial run |
 | 7 | `modifiedAfter`/`modifiedBefore` must be sent **together**, and `cursor` may not be sent with them | **Assumed** | If they were compatible, sending only the cursor on later pages is still correct — this is the conservative direction |
@@ -328,10 +472,11 @@ is wrong.
 | 14 | Webhook Subscriptions API `POST/GET/DELETE /1.0/webhook_subscriptions`, topics `order.create`, `order.update`, `extension.uninstall` | **Verified** | `ensure` fails 502 with the platform's status; nothing is persisted |
 | 15 | **Webhook subscriptions are OAuth-only; a per-site API key cannot create one** | **Assumed (high confidence)** | This is the load-bearing assumption. If an API key *can* subscribe, the 409 `oauth_required` is over-strict: those stores get sweep latency instead of push, and the fix is to stop requiring `oauth_access_token` in `ensure_squarespace_webhooks`. Nothing is mis-recorded either way |
 | 16 | The subscription `secret` is returned exactly once, at creation, and cannot be read back | **Assumed** | If it can be read back, deleting-and-recreating an existing subscription is unnecessary churn, not a correctness problem |
-| 17 | Notifications are POSTed with `Squarespace-Signature` = HMAC-SHA256 over the raw body with the subscription secret | **Verified** (mechanism) | — |
-| 18 | That signature is **hex**-encoded | **Assumed** | Hedged: base64 is accepted too, both under `hmac.compare_digest`. Accepting both costs nothing — a caller must still produce the digest |
+| 17 | `Squarespace-Signature` is HMAC-SHA256 **over the raw request body ALONE**, keyed with the subscription secret | **Verified** (that it is HMAC-SHA256 keyed with the subscription secret) / **ASSUMED** (that the signed input is the body and nothing else — the documented input may concatenate a timestamp header, or the endpoint URL, before the body) | The single most consequential assumption in the receiver. If the input is a concatenation, **every delivery from every Squarespace site 401s, forever**, and the store is silently sweep-only while reporting `webhook_and_sweep`. Nothing is mis-recorded — the sweep still reconciles — but push telemetry is dead and, without the diagnostic below, indistinguishable from a wrong secret. So a rejected delivery logs at WARNING the **names** of the `Squarespace-*` headers present (never values) and whether the digest arrived hex- or base64-shaped: a `Squarespace-Timestamp` in that list, on a store whose secret is known good, is the tell. The fix is then a one-function change in `_valid_signature` |
+| 18 | That signature is **hex**-encoded | **Assumed** | Hedged as widely as the encoding could plausibly go: hex (either case), standard base64, url-safe base64, and both base64 forms unpadded, all compared under `hmac.compare_digest` with no early return. Widening costs nothing — a caller must still produce the digest, which needs the secret — while narrowing, if the guess is wrong, 401s every delivery a site ever sends |
 | 19 | Notification body `{id, topic, createdOn, websiteId, subscriptionId, data: {orderId}}`, thin | **Verified** | A body with no `data.orderId` is 422 and nothing is recorded |
-| 20 | There is no rotate-secret endpoint | **Assumed** | Only affects `ensure`'s delete-and-recreate strategy |
+| 20 | There is no rotate-secret endpoint | **Assumed, and specifically doubted**: `POST /1.0/webhook_subscriptions/{id}/actions/rotateSecret` is believed to exist | Not used, because its existence and response shape are unverified and a wrong guess here fails an `ensure` that is otherwise working. The cost of not using it is that every `ensure` **rotates the secret by replacing the subscription** (see "Provisioning the subscription"). If it does exist, adopting it removes the rotation window entirely and is a contained change in `services/squarespace_webhook_subscriptions.py` |
+| 21 | A Developer-Platform **OAuth access token is short-lived** (~30 minutes) and refreshes via a rotating refresh token | **Assumed (medium confidence)** | There is **no refresh path in this repo**. If the lifetime is short, an OAuth store's token goes stale and every read with it 401s. Handled, not fixed: reads try the OAuth token first and fall back to the per-site API key on 401/403 (order fetch, orders list, and the site lookup), so a store holding both keeps working; a store holding **only** an OAuth token goes dark until someone reconnects. `oauth_refresh_token` and `oauth_expires_at` are persisted when the connect request supplies them, so implementing the refresh does not require every OAuth store to reconnect first. See Residual gaps |
 
 ## Residual gaps
 
@@ -355,4 +500,26 @@ is wrong.
   notification is acknowledged, but nothing deactivates the store; a merchant
   who uninstalls the app leaves an active store row whose sweep will start
   failing on 401.
+* **No OAuth refresh path.** A Squarespace Developer Platform access token is
+  short-lived (assumed ~30 minutes, with a rotating refresh token — assumption
+  21), and **nothing in this repo refreshes one**. What exists instead is a
+  fallback: every READ (order fetch, orders list, the per-run site lookup) tries
+  the OAuth token first and falls back to the per-site API key on 401/403,
+  logging the fallback once per run with no values. So a store that holds
+  **both** credentials keeps working indefinitely; a store that holds **only** an
+  OAuth token goes dark — reads 401, the sweep fails loudly, deliveries 503 —
+  until a human reconnects it. `oauth_refresh_token` and `oauth_expires_at` are
+  persisted when the connect request supplies them, purely so that implementing
+  the refresh later does not require every OAuth store to reconnect first.
+  Closing this means a token-refresh call before expiry plus a merge of the
+  rotated pair into the credential blob, inside the same critical section the
+  rest of the blob's writes already use.
+* **`ensure` rotates the secret every time.** See the note above; in-flight
+  deliveries signed with the previous secret 401 until Squarespace's retries or
+  the sweep recover them.
+* **The per-store reconcile guard is per-PROCESS.** `POST /reconcile` refuses a
+  409 while a sweep for that store is already running in the same worker, which
+  stops the operator double-click and the retry-on-timeout. It does not
+  coordinate across replicas; what makes a genuinely concurrent sweep safe is
+  the row lock in `merge_squarespace_credentials`, not that guard.
 * **`order.paid` is inferred, not observed.** See assumption 11.

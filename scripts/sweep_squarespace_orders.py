@@ -14,6 +14,8 @@ classifies orders, writes nothing, and leaves the cursor where it was until
     python -m scripts.sweep_squarespace_orders                      # every active store, dry run
     python -m scripts.sweep_squarespace_orders --apply
     python -m scripts.sweep_squarespace_orders --store-id store_x --apply
+    python -m scripts.sweep_squarespace_orders --store-id store_x \
+        --modified-before 2026-02-01T00:00:00Z --apply   # pin the window's end
 
 WHY A SCRIPT *AND* A ROUTE. `POST /integrations/squarespace/{store_id}/reconcile`
 is the same sweep behind merchant-or-admin auth. Both exist because neither
@@ -48,6 +50,7 @@ async def _run(args: argparse.Namespace) -> int:
             overlap_minutes=args.overlap_minutes,
             initial_lookback_days=args.initial_lookback_days,
             max_pages=args.max_pages,
+            modified_before=args.modified_before,
             store_ids=args.store_id or None,
         )
     finally:
@@ -66,10 +69,15 @@ async def _run(args: argparse.Namespace) -> int:
         store["store_id"] for store in result.get("stores", []) if store.get("truncated")
     ]
     if truncated:
+        # NOT "re-run and it will sort itself out with a wider window" — that
+        # was the frozen-cursor bug. A truncated run records the end it could
+        # not reach and the NEXT run halves towards it, so repeated runs
+        # converge instead of re-reading the same page-cap prefix forever.
         print(
             "\nNOTE: the page cap stopped these stores before their window was "
-            f"fully read, so their cursors did NOT advance: {', '.join(truncated)}. "
-            "Re-run, or raise --max-pages.",
+            f"fully read: {', '.join(truncated)}. The next run BISECTS towards "
+            "the end it could not reach, so re-running makes progress; raise "
+            "--max-pages, or pin --modified-before, to converge faster.",
             flush=True,
         )
     # A partial failure is a non-zero exit so a scheduled run is visibly red.
@@ -107,6 +115,13 @@ def main() -> int:
         type=int,
         default=DEFAULT_MAX_PAGES,
         help="page cap per store per run (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--modified-before",
+        default=None,
+        help="ISO-8601 upper bound for this run's window (the operator escape "
+        "hatch over the automatic bisect). Default: now, or the bisected "
+        "midpoint when the previous run truncated.",
     )
     args = parser.parse_args()
     return asyncio.run(_run(args))

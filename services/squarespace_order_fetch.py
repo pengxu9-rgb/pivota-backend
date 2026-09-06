@@ -19,8 +19,10 @@ both recorded in docs/SQUARESPACE_TELEMETRY.md:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -31,6 +33,14 @@ from services.squarespace_connection import (
 
 
 SQUARESPACE_ORDERS_PATH = "/commerce/orders"
+# The order id is INTERPOLATED INTO A URL PATH. Everything that reaches here is
+# attacker-influenced: `data.orderId` comes out of a webhook body, and while the
+# body is signed, the signature proves the SENDER, not the shape of the field.
+# An id of `../../authorization/website` walks the path out of the orders
+# collection and makes the fetch read a different endpoint entirely. Squarespace
+# ids are opaque hex, so an allowlist costs nothing; the percent-encoding is the
+# second belt for anything the pattern would let through.
+SQUARESPACE_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SQUARESPACE_FETCH_TIMEOUT_SECONDS = 15.0
 # The receiver reads ONE order; a body larger than this is not an order.
 MAX_SQUARESPACE_ORDER_BYTES = 2_000_000
@@ -38,6 +48,15 @@ MAX_SQUARESPACE_ORDER_BYTES = 2_000_000
 
 class SquarespaceOrderFetchError(RuntimeError):
     """The order (or a page of orders) could not be read. Always retryable."""
+
+
+class SquarespaceOrderUnauthorizedError(SquarespaceOrderFetchError):
+    """Squarespace refused THIS credential for the read (401/403).
+
+    Its own type because it is the one read failure a caller can retry with a
+    DIFFERENT credential: a Developer-Platform OAuth token is short-lived and a
+    store that also holds a per-site API key can fall back to it.
+    """
 
 
 @dataclass(frozen=True)
@@ -61,6 +80,11 @@ def _json_object(response: httpx.Response, what: str) -> Dict[str, Any]:
 def _raise_for_status(response: httpx.Response, what: str) -> None:
     if response.status_code == 200:
         return
+    if response.status_code in (401, 403):
+        raise SquarespaceOrderUnauthorizedError(
+            f"Squarespace refused the credential for the {what} read "
+            f"(HTTP {response.status_code})"
+        )
     if response.status_code == 429:
         raise SquarespaceOrderFetchError(f"Squarespace rate-limited the {what} read")
     raise SquarespaceOrderFetchError(
@@ -80,10 +104,16 @@ async def fetch_squarespace_order(
     key = str(order_id or "").strip()
     if not token or not key:
         raise SquarespaceOrderFetchError("Squarespace order fetch credentials are incomplete")
+    if not SQUARESPACE_ORDER_ID_PATTERN.match(key):
+        # Refused rather than encoded-and-sent: an id outside this shape is not
+        # a Squarespace order id, so the only thing a request built from it can
+        # do is reach somewhere it should not.
+        raise SquarespaceOrderFetchError("Squarespace order id is not a valid identifier")
+    quoted = quote(key, safe="")
 
     async def _call(http: httpx.AsyncClient) -> Dict[str, Any]:
         response = await http.get(
-            f"{SQUARESPACE_API_ROOT}{SQUARESPACE_ORDERS_PATH}/{key}",
+            f"{SQUARESPACE_API_ROOT}{SQUARESPACE_ORDERS_PATH}/{quoted}",
             headers=build_squarespace_headers(token),
         )
         _raise_for_status(response, "order")

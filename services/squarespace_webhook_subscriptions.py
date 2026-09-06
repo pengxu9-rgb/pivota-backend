@@ -16,6 +16,19 @@ therefore re-register it at will:
   notifications the receiver answers 401 to, for good.
 * The secret must be persisted before the subscription can be trusted, and the
   caller re-reads the row to learn whether its own write won a race.
+
+EVERY ensure ROTATES THE SECRET, and that is a cost, not a free re-sync. The
+new subscription is created BEFORE the old one is deleted, so a failed create
+cannot leave a store with no subscription at all; but between the create and
+the merge that persists the new secret, notifications still signed with the OLD
+secret answer 401. Squarespace retries them, and anything that never lands is
+picked up by the reconciliation sweep on its next scheduled run — the sweep is
+what makes an ensure safe to run at any time. Do not call ensure on a schedule.
+
+(A `POST /1.0/webhook_subscriptions/{id}/actions/rotateSecret` may exist on the
+Developer Platform and would make this a true rotation with no window at all.
+It is NOT used here because its existence and response shape are unverified;
+see the assumed table in docs/SQUARESPACE_TELEMETRY.md.)
 """
 
 from __future__ import annotations
@@ -90,11 +103,31 @@ async def ensure_squarespace_subscription(
             if str(row.get("endpointUrl") or "").strip() == endpoint
             and str(row.get("id") or "").strip()
         ]
-        for subscription_id in stale:
-            await _delete_subscription(http, token, subscription_id)
+        # CREATE FIRST, then delete. The other order — delete the old one, then
+        # create — has a window in which the store has NO subscription at all,
+        # and a create that fails (rate limit, an expired OAuth token, a
+        # Squarespace 5xx) leaves it there: the merchant's telemetry is off
+        # until somebody notices and re-runs ensure. Creating first means the
+        # worst case is a brief overlap of two subscriptions rather than a gap.
         created = await _create_subscription(http, token, endpoint, wanted_topics)
+        created_id = str(created.get("id") or "").strip()
+        removed: List[str] = []
+        for subscription_id in stale:
+            if subscription_id == created_id:
+                continue
+            try:
+                await _delete_subscription(http, token, subscription_id)
+            except SquarespaceWebhookSubscriptionError:
+                # The new subscription is already live and its secret is the
+                # one that will be persisted. Failing the whole ensure here
+                # would throw away that secret — the ONE copy Squarespace ever
+                # shows — over a leftover subscription whose only symptom is
+                # duplicate deliveries the receiver 401s and the ledger's
+                # dedupe would drop anyway. Report what was actually removed.
+                continue
+            removed.append(subscription_id)
         return SquarespaceSubscriptionResult(
-            subscription_id=str(created.get("id") or "").strip(),
+            subscription_id=created_id,
             secret=str(created.get("secret") or "").strip(),
             topics=[
                 str(topic)
@@ -102,7 +135,7 @@ async def ensure_squarespace_subscription(
                 if str(topic).strip()
             ],
             endpoint_url=str(created.get("endpointUrl") or endpoint).strip(),
-            replaced_subscription_ids=stale,
+            replaced_subscription_ids=removed,
         )
     finally:
         if own_client:

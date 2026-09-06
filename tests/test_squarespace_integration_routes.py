@@ -42,13 +42,23 @@ def _auth(role: str, merchant_id=None):
 
 
 class _StoreDb:
-    """Only the columns each query SELECTs, so a projection bug is visible."""
+    """Only the columns each query SELECTs, so a projection bug is visible.
+
+    The UPDATE genuinely MUTATES the row and the re-read genuinely sees it.
+    That matters more than it looks: `merge_squarespace_credentials` reads,
+    mutates, writes and then re-reads, and a fake whose write went nowhere
+    would hand the merge back the PRE-write blob. Every assertion about what
+    survived a reconnect would then be reading the fixture rather than the
+    code, and the connect response's `telemetry_mode`, which is computed off
+    the persisted blob, would be answered from a stale read.
+    """
 
     def __init__(self, *, row=None, existing=None):
         self.row = row
         self.existing = existing
         self.executes = []
         self.values = []
+        self.transactions = 0
 
     @staticmethod
     def _project(row, query):
@@ -57,19 +67,45 @@ class _StoreDb:
         wanted = [c.strip() for c in columns.strip().split(",")]
         return {k: v for k, v in row.items() if k in wanted}
 
+    def transaction(self):
+        db = self
+
+        class _Txn:
+            async def __aenter__(self_inner):
+                db.transactions += 1
+                return self_inner
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        return _Txn()
+
     async def fetch_one(self, query, values=None, *a, **kw):
         flat = " ".join(str(query).split())
         if "merchant_stores" not in flat:
             return None
-        source = self.existing if "AND domain =" in flat else self.row
+        # Connect's existing-store lookup is the one with the domain
+        # predicate; every other read (the caller's store, and the merge's
+        # locking re-read) is keyed on store_id and resolves to whichever row
+        # this fixture was given.
+        source = self.existing if "AND domain =" in flat else self._target()
         return self._project(source, flat) if source else None
+
+    def _target(self):
+        return self.row if self.row is not None else self.existing
 
     async def fetch_all(self, *a, **kw):
         return []
 
     async def execute(self, query, values=None, *a, **kw):
-        self.executes.append(" ".join(str(query).split()))
-        self.values.append(dict(values or {}))
+        flat = " ".join(str(query).split())
+        self.executes.append(flat)
+        params = dict(values or {})
+        self.values.append(params)
+        if flat.startswith("UPDATE merchant_stores") and "api_key" in params:
+            target = self._target()
+            if target is not None:
+                target["api_key"] = params["api_key"]
         return None
 
 
@@ -204,6 +240,17 @@ def test_a_reconnect_to_a_different_site_drops_the_stale_secret_and_cursor(
                     "api_key": "old-key",
                     "website_id": "site-OLD",
                     "webhook_secret": "stale-secret",
+                    "webhook_subscription_id": "sub-OLD",
+                    # The OAuth token belongs in this fixture because it is the
+                    # WORST thing to leave behind, not merely another key: it is
+                    # preferred over the API key on every read, so a token the
+                    # old site issued keeps the sweep listing the OLD site's
+                    # orders and recording them under the store that now
+                    # represents the new one. A fixture without it lets that
+                    # ship green.
+                    "oauth_access_token": "oauth-for-site-OLD",
+                    "oauth_refresh_token": "refresh-for-site-OLD",
+                    "oauth_expires_at": "2026-09-01T00:30:00Z",
                     "reconciliation": {"orders_cursor": "2026-09-01T00:00:00.000Z"},
                 }
             ),
@@ -225,8 +272,156 @@ def test_a_reconnect_to_a_different_site_drops_the_stale_secret_and_cursor(
     assert response.status_code == 200, response.text
     blob = json.loads(db.values[-1]["api_key"])
     assert blob["website_id"] == WEBSITE_ID
+    assert blob["api_key"] == "new-key"
     assert "webhook_secret" not in blob
+    assert "webhook_subscription_id" not in blob
     assert "reconciliation" not in blob
+    assert "oauth_access_token" not in blob
+    assert "oauth_refresh_token" not in blob
+    assert "oauth_expires_at" not in blob
+    # And the response must not claim webhook coverage the store no longer has.
+    assert response.json()["telemetry_mode"] == "sweep_only"
+
+
+def test_a_reconnect_to_a_different_site_keeps_a_NEWLY_SUPPLIED_oauth_token(
+    client, monkeypatch
+):
+    """Dropping the old site's token must not drop the new site's.
+
+    The counterpart to the test above: without it, "pop oauth_access_token"
+    could be implemented as "never keep an OAuth token on a site change", which
+    would silently downgrade a merchant who re-pointed their store WITH a fresh
+    Developer-Platform token to sweep-only.
+    """
+    from routes import merchant_store_connections as mod
+    from services import squarespace_connection as conn
+
+    db = _StoreDb(
+        existing={
+            "store_id": STORE_ID,
+            "api_key": json.dumps(
+                {
+                    "api_key": "old-key",
+                    "website_id": "site-OLD",
+                    "oauth_access_token": "oauth-for-site-OLD",
+                }
+            ),
+        }
+    )
+    monkeypatch.setattr(mod, "database", db)
+
+    async def fake_website(token, **kwargs):
+        return {"id": WEBSITE_ID, "title": "Other Shop"}
+
+    monkeypatch.setattr(conn, "fetch_squarespace_website", fake_website)
+
+    response = client.post(
+        "/integrations/squarespace/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={
+            "merchant_id": MERCHANT_A,
+            "api_key": "new-key",
+            "oauth_access_token": "oauth-for-site-NEW",
+            "oauth_refresh_token": "refresh-NEW",
+            "oauth_expires_at": "2026-09-06T21:00:00Z",
+            "domain": "shop.example",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    blob = json.loads(db.values[-1]["api_key"])
+    assert blob["oauth_access_token"] == "oauth-for-site-NEW"
+    assert blob["oauth_refresh_token"] == "refresh-NEW"
+    assert blob["oauth_expires_at"] == "2026-09-06T21:00:00Z"
+    assert response.json()["telemetry_mode"] == "webhook_and_sweep"
+
+
+def test_a_reconnect_that_supplies_no_token_still_reports_the_stored_one(
+    client, monkeypatch
+):
+    """`telemetry_mode` is a fact about the STORE, not about this request.
+
+    A merchant rotating only their API key sends no OAuth token. Reading the
+    mode off the request field answers `sweep_only` for a store whose webhook
+    subscription is live and armed — telling them their push telemetry is off
+    when it is on.
+    """
+    from routes import merchant_store_connections as mod
+    from services import squarespace_connection as conn
+
+    db = _StoreDb(
+        existing={
+            "store_id": STORE_ID,
+            "api_key": json.dumps(
+                {
+                    "api_key": "old-key",
+                    "website_id": WEBSITE_ID,
+                    "oauth_access_token": "still-good",
+                    "webhook_secret": "live-secret",
+                }
+            ),
+        }
+    )
+    monkeypatch.setattr(mod, "database", db)
+
+    async def fake_website(token, **kwargs):
+        return {"id": WEBSITE_ID, "title": "My Shop"}
+
+    monkeypatch.setattr(conn, "fetch_squarespace_website", fake_website)
+
+    response = client.post(
+        "/integrations/squarespace/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={"merchant_id": MERCHANT_A, "api_key": "new-key", "domain": "shop.example"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["telemetry_mode"] == "webhook_and_sweep"
+    blob = json.loads(db.values[-1]["api_key"])
+    assert blob["oauth_access_token"] == "still-good"
+    assert blob["webhook_secret"] == "live-secret"
+
+
+def test_the_connect_path_uses_the_shared_merge_rather_than_its_own_write(
+    client, monkeypatch
+):
+    """ONE critical section over the credential cell, not two.
+
+    Connect used to hand-roll its own read-modify-write beside
+    `merge_squarespace_credentials`, which meant a sweep's cursor write landing
+    between connect's read and its write reverted the merchant's new
+    credential. Asserting the transaction was entered is what stops that second
+    copy growing back.
+    """
+    from routes import merchant_store_connections as mod
+    from services import squarespace_connection as conn
+
+    db = _StoreDb(
+        existing={
+            "store_id": STORE_ID,
+            "api_key": json.dumps({"api_key": "old-key", "website_id": WEBSITE_ID}),
+        }
+    )
+    monkeypatch.setattr(mod, "database", db)
+
+    async def fake_website(token, **kwargs):
+        return {"id": WEBSITE_ID}
+
+    monkeypatch.setattr(conn, "fetch_squarespace_website", fake_website)
+
+    response = client.post(
+        "/integrations/squarespace/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={"merchant_id": MERCHANT_A, "api_key": "new-key", "domain": "shop.example"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert db.transactions == 1, "the reconnect write must run inside the merge's transaction"
+    updates = [q for q in db.executes if q.startswith("UPDATE merchant_stores")]
+    assert len(updates) == 1, updates
+    # And it is the merge's own statement, carrying the connect bookkeeping.
+    assert "status = 'active'" in updates[0]
+    assert "connected_at = CURRENT_TIMESTAMP" in updates[0]
 
 
 def test_an_oauth_token_is_persisted_and_reported_as_webhook_capable(
@@ -576,3 +771,635 @@ def test_reconcile_reports_a_sweep_failure_as_502(client, monkeypatch):
     )
 
     assert response.status_code == 502
+
+
+def test_reconcile_passes_the_operator_window_override_through(client, monkeypatch):
+    """`modified_before` is the escape hatch over the automatic bisect.
+
+    A store the page cap cannot read in one pass converges on its own, but
+    slowly. Pinning the window's end is how an operator digs one out now, and
+    the route is useless as a hatch if it drops the value on the floor.
+    """
+    from routes import merchant_store_connections as mod
+    from services import squarespace_order_sweep as sweep
+
+    db = _StoreDb(row=_store_row({"api_key": "sq-key", "website_id": WEBSITE_ID}))
+    monkeypatch.setattr(mod, "database", db)
+    calls = []
+
+    async def fake_sweep(**kwargs):
+        calls.append(kwargs)
+        return {"status": "success", "store_id": kwargs["store_id"]}
+
+    monkeypatch.setattr(sweep, "sweep_squarespace_store", fake_sweep)
+
+    response = client.post(
+        f"/integrations/squarespace/{STORE_ID}/reconcile"
+        "?modified_before=2026-02-01T00:00:00Z",
+        headers=_auth("merchant", MERCHANT_A),
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls[0]["modified_before"] == "2026-02-01T00:00:00Z"
+
+
+def test_reconcile_defaults_the_window_override_to_none(client, monkeypatch):
+    """The positive counterpart: an ordinary run must not pin a window.
+
+    Without this, `modified_before` could be defaulted to some string and the
+    test above would still pass while every unattended run silently stopped
+    reading at a fixed instant.
+    """
+    from routes import merchant_store_connections as mod
+    from services import squarespace_order_sweep as sweep
+
+    db = _StoreDb(row=_store_row({"api_key": "sq-key", "website_id": WEBSITE_ID}))
+    monkeypatch.setattr(mod, "database", db)
+    calls = []
+
+    async def fake_sweep(**kwargs):
+        calls.append(kwargs)
+        return {"status": "success", "store_id": kwargs["store_id"]}
+
+    monkeypatch.setattr(sweep, "sweep_squarespace_store", fake_sweep)
+
+    response = client.post(
+        f"/integrations/squarespace/{STORE_ID}/reconcile",
+        headers=_auth("merchant", MERCHANT_A),
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls[0]["modified_before"] is None
+
+
+async def test_a_second_concurrent_reconcile_of_one_store_is_refused(monkeypatch):
+    """Two sweeps of the SAME store race on one `reconciliation` cell.
+
+    Whichever merge lands last decides the cursor, so the loser's pages are
+    either re-read or — if it had advanced further — skipped outright. The
+    route is reachable by an operator double-click and by any retry-on-timeout,
+    so the guard is not theoretical.
+
+    Driven against the route coroutine rather than the TestClient because the
+    claim is about two requests being IN FLIGHT at once, which a synchronous
+    client cannot produce.
+    """
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from routes import merchant_store_connections as mod
+    from services import squarespace_order_sweep as sweep
+
+    db = _StoreDb(row=_store_row({"api_key": "sq-key", "website_id": WEBSITE_ID}))
+    monkeypatch.setattr(mod, "database", db)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def fake_sweep(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        await release.wait()
+        return {"status": "success", "store_id": kwargs["store_id"]}
+
+    monkeypatch.setattr(sweep, "sweep_squarespace_store", fake_sweep)
+    caller = {"sub": "u-1", "role": "merchant", "merchant_id": MERCHANT_A}
+
+    first = asyncio.create_task(
+        mod.run_squarespace_reconciliation(store_id=STORE_ID, current_user=caller)
+    )
+    await started.wait()
+    try:
+        with pytest.raises(HTTPException) as raised:
+            await mod.run_squarespace_reconciliation(
+                store_id=STORE_ID, current_user=caller
+            )
+        assert raised.value.status_code == 409
+        assert raised.value.detail["reason"] == "sweep_already_running"
+        # The refusal did not start a second sweep.
+        assert len(calls) == 1
+    finally:
+        release.set()
+        assert (await first)["status"] == "success"
+
+    # And the guard RELEASES: a later run of the same store is not refused
+    # forever. A leaked in-flight marker would take the store's only telemetry
+    # path offline for the life of the process.
+    release.set()
+    again = await mod.run_squarespace_reconciliation(
+        store_id=STORE_ID, current_user=caller
+    )
+    assert again["status"] == "success"
+    assert len(calls) == 2
+
+
+async def test_a_reconcile_of_a_DIFFERENT_store_is_not_blocked(monkeypatch):
+    """The guard is per-STORE, not a global sweep lock.
+
+    A single shared flag would pass the test above and quietly serialize every
+    merchant's reconcile behind every other merchant's.
+    """
+    import asyncio
+
+    from routes import merchant_store_connections as mod
+    from services import squarespace_order_sweep as sweep
+
+    rows = {
+        STORE_ID: _store_row({"api_key": "k1", "website_id": WEBSITE_ID}),
+        "store_sq_2": {
+            **_store_row({"api_key": "k2", "website_id": WEBSITE_ID}),
+            "store_id": "store_sq_2",
+        },
+    }
+
+    class _MultiStoreDb(_StoreDb):
+        async def fetch_one(self, query, values=None, *a, **kw):
+            flat = " ".join(str(query).split())
+            if "merchant_stores" not in flat:
+                return None
+            row = rows.get(str((values or {}).get("store_id") or ""))
+            return self._project(row, flat) if row else None
+
+    monkeypatch.setattr(mod, "database", _MultiStoreDb())
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_sweep(**kwargs):
+        if kwargs["store_id"] == STORE_ID:
+            started.set()
+            await release.wait()
+        return {"status": "success", "store_id": kwargs["store_id"]}
+
+    monkeypatch.setattr(sweep, "sweep_squarespace_store", fake_sweep)
+    caller = {"sub": "u-1", "role": "merchant", "merchant_id": MERCHANT_A}
+
+    first = asyncio.create_task(
+        mod.run_squarespace_reconciliation(store_id=STORE_ID, current_user=caller)
+    )
+    await started.wait()
+    try:
+        other = await mod.run_squarespace_reconciliation(
+            store_id="store_sq_2", current_user=caller
+        )
+        assert other["store_id"] == "store_sq_2"
+    finally:
+        release.set()
+        await first
+
+
+async def test_a_reconcile_that_outruns_its_timeout_is_a_504(monkeypatch):
+    """A sweep is up to 200 sequential calls against somebody else's API.
+
+    Unbounded, it holds the connection until the proxy in front gives up, and
+    the caller learns nothing. The cursor is untouched either way — the sweep
+    persists it only after the whole page loop completes — so a 504 costs a
+    re-read, not a gap.
+    """
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from routes import merchant_store_connections as mod
+    from services import squarespace_order_sweep as sweep
+
+    db = _StoreDb(row=_store_row({"api_key": "sq-key", "website_id": WEBSITE_ID}))
+    monkeypatch.setattr(mod, "database", db)
+    monkeypatch.setattr(mod, "SQUARESPACE_RECONCILE_TIMEOUT_SECONDS", 0.05)
+
+    async def fake_sweep(**kwargs):
+        await asyncio.sleep(5)
+        return {}
+
+    monkeypatch.setattr(sweep, "sweep_squarespace_store", fake_sweep)
+
+    with pytest.raises(HTTPException) as raised:
+        await mod.run_squarespace_reconciliation(
+            store_id=STORE_ID,
+            current_user={"sub": "u-1", "role": "merchant", "merchant_id": MERCHANT_A},
+        )
+    assert raised.value.status_code == 504
+
+    # The in-flight marker was released by the timeout, not leaked.
+    assert STORE_ID not in mod._SQUARESPACE_SWEEPS_IN_FLIGHT
+
+
+# ---- the merge helper, for real --------------------------------------------
+#
+# Every test above stubs `merge_squarespace_credentials`, which is right for a
+# route test and wrong as the ONLY coverage: with the helper always stubbed,
+# replacing its whole body with `credentials = dict(updates)` — the exact
+# overwrite this integration exists to avoid — survives the entire suite. These
+# drive the real function against a real row.
+
+
+async def _sqlite_stores(tmp_path, name: str):
+    """A real `merchant_stores` table on aiosqlite.
+
+    Raw DDL rather than a metadata table because `merchant_stores` is raw SQL in
+    this repo; only the columns the merge reads and writes are here, so a merge
+    that touched a column it should not would fail loudly rather than silently.
+    """
+    import databases
+
+    db = databases.Database(f"sqlite+aiosqlite:///{tmp_path / name}.sqlite3")
+    await db.connect()
+    await db.execute(
+        """
+        CREATE TABLE merchant_stores (
+            store_id TEXT PRIMARY KEY,
+            merchant_id TEXT,
+            platform TEXT,
+            domain TEXT,
+            name TEXT,
+            api_key TEXT,
+            status TEXT,
+            last_sync TIMESTAMP,
+            connected_at TIMESTAMP
+        )
+        """
+    )
+    return db
+
+
+async def test_the_real_merge_preserves_every_key_it_was_not_asked_to_change(
+    tmp_path,
+):
+    """The mutant this kills: `credentials = dict(updates)`.
+
+    The blob is ONE cell holding the API key, the OAuth token, the website
+    binding, the once-shown webhook secret and the reconciliation cursor. A
+    sweep persists only `reconciliation`; if that write is an overwrite, the
+    webhook secret is gone — and Squarespace shows it exactly once, so no
+    reconnect can recover it and every delivery 401s for good.
+    """
+    from services.squarespace_connection import merge_squarespace_credentials
+
+    db = await _sqlite_stores(tmp_path, "merge_preserves")
+    try:
+        await db.execute(
+            "INSERT INTO merchant_stores (store_id, merchant_id, platform, api_key)"
+            " VALUES (:store_id, :merchant_id, 'squarespace', :api_key)",
+            {
+                "store_id": STORE_ID,
+                "merchant_id": MERCHANT_A,
+                "api_key": json.dumps(
+                    {
+                        "api_key": "live-key",
+                        "website_id": WEBSITE_ID,
+                        "oauth_access_token": "live-oauth",
+                        "webhook_secret": "shown-exactly-once",
+                        "webhook_subscription_id": "sub-1",
+                        "reconciliation": {"orders_cursor": "2026-09-01T00:00:00.000Z"},
+                    }
+                ),
+            },
+        )
+
+        persisted = await merge_squarespace_credentials(
+            store_id=STORE_ID,
+            updates={"reconciliation": {"orders_cursor": "2026-09-05T00:00:00.000Z"}},
+            db=db,
+        )
+
+        # The write landed...
+        assert persisted["reconciliation"] == {
+            "orders_cursor": "2026-09-05T00:00:00.000Z"
+        }
+        # ...and nothing else in the cell was touched.
+        assert persisted["webhook_secret"] == "shown-exactly-once"
+        assert persisted["api_key"] == "live-key"
+        assert persisted["website_id"] == WEBSITE_ID
+        assert persisted["oauth_access_token"] == "live-oauth"
+        assert persisted["webhook_subscription_id"] == "sub-1"
+
+        # And the return value is a genuine RE-READ of the row, not the dict the
+        # caller handed in: `databases` + asyncpg reports no rowcount from an
+        # UPDATE, so the re-read is the only proof the write actually landed.
+        stored = json.loads(
+            dict(
+                await db.fetch_one(
+                    "SELECT api_key FROM merchant_stores WHERE store_id = :s",
+                    {"s": STORE_ID},
+                )
+            )["api_key"]
+        )
+        assert stored == persisted
+    finally:
+        await db.disconnect()
+
+
+async def test_the_real_merge_runs_its_mutate_against_the_stored_blob(tmp_path):
+    """`mutate` is how connect drops the old site's keys inside the merge's own
+    critical section. It must see what is STORED, not an empty dict — a mutate
+    handed a blank blob would find nothing to drop and quietly preserve the
+    stale OAuth token it exists to remove."""
+    from services.squarespace_connection import merge_squarespace_credentials
+
+    db = await _sqlite_stores(tmp_path, "merge_mutate")
+    try:
+        await db.execute(
+            "INSERT INTO merchant_stores (store_id, merchant_id, platform, api_key)"
+            " VALUES (:store_id, :merchant_id, 'squarespace', :api_key)",
+            {
+                "store_id": STORE_ID,
+                "merchant_id": MERCHANT_A,
+                "api_key": json.dumps(
+                    {
+                        "api_key": "old-key",
+                        "website_id": "site-OLD",
+                        "oauth_access_token": "oauth-OLD",
+                        "webhook_secret": "stale",
+                    }
+                ),
+            },
+        )
+        seen = {}
+
+        def _mutate(blob):
+            seen.update(blob)
+            for key in ("oauth_access_token", "webhook_secret"):
+                blob.pop(key, None)
+            blob["website_id"] = WEBSITE_ID
+            return blob
+
+        persisted = await merge_squarespace_credentials(
+            store_id=STORE_ID,
+            mutate=_mutate,
+            updates={"api_key": "new-key"},
+            mark_connected=True,
+            db=db,
+        )
+
+        assert seen["oauth_access_token"] == "oauth-OLD", (
+            "mutate must receive the STORED blob"
+        )
+        assert "oauth_access_token" not in persisted
+        assert "webhook_secret" not in persisted
+        assert persisted == {"api_key": "new-key", "website_id": WEBSITE_ID}
+
+        # `mark_connected` is part of the same statement, so a reconnect is one
+        # write rather than a merge racing a status UPDATE.
+        row = dict(
+            await db.fetch_one(
+                "SELECT status, connected_at FROM merchant_stores WHERE store_id = :s",
+                {"s": STORE_ID},
+            )
+        )
+        assert row["status"] == "active"
+        assert row["connected_at"] is not None
+    finally:
+        await db.disconnect()
+
+
+async def test_the_real_merge_leaves_the_row_alone_when_not_marking_connected(
+    tmp_path,
+):
+    """The negative counterpart: an ordinary cursor write must not resurrect a
+    store an operator disabled, nor forge a `connected_at`."""
+    from services.squarespace_connection import merge_squarespace_credentials
+
+    db = await _sqlite_stores(tmp_path, "merge_no_mark")
+    try:
+        await db.execute(
+            "INSERT INTO merchant_stores"
+            " (store_id, merchant_id, platform, api_key, status)"
+            " VALUES (:store_id, :merchant_id, 'squarespace', :api_key, 'disabled')",
+            {
+                "store_id": STORE_ID,
+                "merchant_id": MERCHANT_A,
+                "api_key": json.dumps({"api_key": "k", "website_id": WEBSITE_ID}),
+            },
+        )
+
+        await merge_squarespace_credentials(
+            store_id=STORE_ID, updates={"reconciliation": {}}, db=db
+        )
+
+        row = dict(
+            await db.fetch_one(
+                "SELECT status, connected_at FROM merchant_stores WHERE store_id = :s",
+                {"s": STORE_ID},
+            )
+        )
+        assert row["status"] == "disabled"
+        assert row["connected_at"] is None
+    finally:
+        await db.disconnect()
+
+
+# ---- the subscription lifecycle itself -------------------------------------
+
+
+class _SubscriptionApi:
+    """A fake Squarespace webhook_subscriptions surface, in call order."""
+
+    def __init__(self, *, existing=(), create_fails=False, delete_fails=False):
+        self.existing = list(existing)
+        self.create_fails = create_fails
+        self.delete_fails = delete_fails
+        self.calls = []
+
+    async def get(self, url, headers=None, **kwargs):
+        self.calls.append(("list", None))
+        return _SubResponse(200, {"webhookSubscriptions": self.existing})
+
+    async def post(self, url, headers=None, json=None, **kwargs):
+        self.calls.append(("create", None))
+        if self.create_fails:
+            return _SubResponse(429, {})
+        return _SubResponse(
+            201,
+            {
+                "id": "sub-NEW",
+                "secret": "secret-NEW",
+                "endpointUrl": json["endpointUrl"],
+                "topics": json["topics"],
+            },
+        )
+
+    async def delete(self, url, headers=None, **kwargs):
+        self.calls.append(("delete", str(url).rsplit("/", 1)[-1]))
+        return _SubResponse(500 if self.delete_fails else 204, {})
+
+    async def aclose(self):
+        return None
+
+
+class _SubResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+async def test_ensure_creates_the_new_subscription_BEFORE_deleting_the_old():
+    """Order matters, and only in the failure case.
+
+    Delete-then-create has a window in which the store has NO subscription at
+    all, and a create that fails — a rate limit, an expired OAuth token, a
+    Squarespace 5xx — leaves it there: telemetry is off until somebody notices
+    and re-runs ensure. Creating first means the worst case is a brief overlap
+    of two subscriptions instead of a gap.
+    """
+    from services.squarespace_webhook_subscriptions import (
+        ensure_squarespace_subscription,
+    )
+
+    api = _SubscriptionApi(
+        existing=[{"id": "sub-OLD", "endpointUrl": "https://x.example/hook"}]
+    )
+
+    result = await ensure_squarespace_subscription(
+        access_token="oauth",
+        callback_url="https://x.example/hook",
+        topics=["order.create"],
+        client=api,
+    )
+
+    assert [name for name, _ in api.calls] == ["list", "create", "delete"], api.calls
+    assert result.subscription_id == "sub-NEW"
+    assert result.secret == "secret-NEW"
+    assert result.replaced_subscription_ids == ["sub-OLD"]
+
+
+async def test_a_failed_create_leaves_the_existing_subscription_in_place():
+    """The whole reason for the order above. Under delete-then-create this
+    store would come out of a failed ensure with no subscription at all."""
+    from services.squarespace_webhook_subscriptions import (
+        SquarespaceWebhookSubscriptionError,
+        ensure_squarespace_subscription,
+    )
+
+    api = _SubscriptionApi(
+        existing=[{"id": "sub-OLD", "endpointUrl": "https://x.example/hook"}],
+        create_fails=True,
+    )
+
+    with pytest.raises(SquarespaceWebhookSubscriptionError):
+        await ensure_squarespace_subscription(
+            access_token="oauth",
+            callback_url="https://x.example/hook",
+            topics=["order.create"],
+            client=api,
+        )
+
+    assert "delete" not in [name for name, _ in api.calls], api.calls
+
+
+async def test_a_failed_delete_does_not_throw_away_the_new_secret():
+    """The secret is shown exactly ONCE. Failing the ensure because a leftover
+    subscription could not be removed would discard the only copy Pivota will
+    ever have, over a subscription whose only symptom is duplicate deliveries
+    the receiver 401s."""
+    from services.squarespace_webhook_subscriptions import (
+        ensure_squarespace_subscription,
+    )
+
+    api = _SubscriptionApi(
+        existing=[{"id": "sub-OLD", "endpointUrl": "https://x.example/hook"}],
+        delete_fails=True,
+    )
+
+    result = await ensure_squarespace_subscription(
+        access_token="oauth",
+        callback_url="https://x.example/hook",
+        topics=["order.create"],
+        client=api,
+    )
+
+    assert result.secret == "secret-NEW"
+    # It is reported as NOT replaced, because it was not.
+    assert result.replaced_subscription_ids == []
+
+
+async def test_ensure_leaves_a_subscription_for_another_endpoint_alone():
+    """Only subscriptions pointing at OUR callback are ours to replace. A
+    merchant's own app subscribed to the same site must survive."""
+    from services.squarespace_webhook_subscriptions import (
+        ensure_squarespace_subscription,
+    )
+
+    api = _SubscriptionApi(
+        existing=[
+            {"id": "sub-THEIRS", "endpointUrl": "https://merchant.example/their-hook"}
+        ]
+    )
+
+    result = await ensure_squarespace_subscription(
+        access_token="oauth",
+        callback_url="https://x.example/hook",
+        topics=["order.create"],
+        client=api,
+    )
+
+    assert [name for name, _ in api.calls] == ["list", "create"]
+    assert result.replaced_subscription_ids == []
+
+
+@pytest.mark.parametrize(
+    "status_code,expected",
+    [(404, "upstream HTTP 404"), (401, "upstream HTTP 401"), (429, "upstream HTTP 429")],
+)
+def test_a_failed_connect_names_the_upstream_status(
+    client, monkeypatch, status_code, expected
+):
+    """That `GET /1.0/authorization/website` answers a per-site API key at all
+    is an ASSUMED claim (docs/SQUARESPACE_TELEMETRY.md).
+
+    If it is wrong, every API-key connect fails — and a bare "connection
+    failed" looks exactly like a mistyped key, so the assumption would be
+    debugged as a support queue instead of as a bad row in a table. A 404 in
+    the response detail says which it is on the first attempt.
+    """
+    from routes import merchant_store_connections as mod
+    from services import squarespace_connection as conn
+
+    monkeypatch.setattr(mod, "database", _StoreDb())
+
+    async def fake_website(token, **kwargs):
+        raise conn.SquarespaceConnectionError(
+            "Squarespace authorization lookup failed", status_code=status_code
+        )
+
+    monkeypatch.setattr(conn, "fetch_squarespace_website", fake_website)
+
+    response = client.post(
+        "/integrations/squarespace/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={"merchant_id": MERCHANT_A, "api_key": "k", "domain": "shop.example"},
+    )
+
+    assert response.status_code == 400
+    assert expected in response.text
+
+
+def test_a_connect_failure_with_no_upstream_status_says_nothing_about_one(
+    client, monkeypatch
+):
+    """The negative counterpart: a timeout has no status, and inventing one
+    (or printing `upstream HTTP None`) would send the reader looking for a
+    response that never arrived."""
+    from routes import merchant_store_connections as mod
+    from services import squarespace_connection as conn
+
+    monkeypatch.setattr(mod, "database", _StoreDb())
+
+    async def fake_website(token, **kwargs):
+        raise conn.SquarespaceConnectionError(
+            "Squarespace authorization lookup failed: timed out"
+        )
+
+    monkeypatch.setattr(conn, "fetch_squarespace_website", fake_website)
+
+    response = client.post(
+        "/integrations/squarespace/connect",
+        headers=_auth("merchant", MERCHANT_A),
+        json={"merchant_id": MERCHANT_A, "api_key": "k", "domain": "shop.example"},
+    )
+
+    assert response.status_code == 400
+    assert "upstream HTTP" not in response.text
+    assert "timed out" in response.text

@@ -267,6 +267,22 @@ backwards, and is **not advanced when the page cap truncated the run** — the
 orders list has no documented ordering, so a truncated run may have left orders
 behind whose `modifiedOn` is below the maximum it saw.
 
+Holding the cursor is only half the answer, and alone it is a trap: the window
+ends at `now`, so a held cursor makes each next window *wider* than the one that
+already truncated, and the store re-reads the same page-cap prefix forever. So a
+truncated run records the window end it could not reach and the next run
+**bisects** towards it, halving until a window fits; a completed bounded window
+advances the cursor to that window's end and doubles the next width, and the
+floor (`overlap + 5 min`) is advanced past with an ERROR naming the range rather
+than frozen. `modified_before` / `--modified-before` pins the bound by hand.
+
+Each run also proves its credential names **this store's own site** (one
+`GET /1.0/authorization/website`) before listing anything. Re-pointing a store
+at a different Squarespace site while the old site's OAuth token survives in the
+blob would otherwise file the old site's orders under the new store, and nothing
+downstream could tell — the orders are well-formed, they just belong to somebody
+else's shop.
+
 **Nothing schedules the sweep.** CI deploys no Cloud Run job for the lane and
 the APScheduler lane runs on a service that is not auto-deployed, so the sweep
 ships as an authenticated route
@@ -275,7 +291,12 @@ ships as an authenticated route
 documented rather than papered over.
 
 `docs/SQUARESPACE_TELEMETRY.md` carries the full flow, the field-by-field
-verified/assumed table (20 rows), and the residual gaps.
+verified/assumed table (21 rows — including the two load-bearing ones: that the
+signature covers the raw body *alone*, and that `authorization/website` answers
+a per-site API key), and the residual gaps, of which the largest is that there
+is **no OAuth refresh path**: reads fall back from a short-lived OAuth token to
+the per-site API key on 401, so a store holding both keeps working and a store
+holding only a token goes dark until it is reconnected.
 
 ## Wix native webhook bridge
 
