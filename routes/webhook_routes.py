@@ -6,10 +6,10 @@ Webhook 处理路由
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
+from services.shopify_domain import canonicalize_shop_domain, normalize_myshopify_domain
 from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header, Response, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional, Dict, Any, Tuple, List
-from urllib.parse import urlparse
 import stripe
 import os
 import hmac
@@ -843,19 +843,16 @@ async def _finalize_stripe_refund_failure(
     )
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    candidate = raw if "://" in raw else f"https://{raw}"
-    try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").strip().lower()
-        return host or None
-    except Exception:
-        return raw.lower()
+# Re-exported under the module-local name so the six call sites below read unchanged. The body was
+# byte-identical to services/shopify_domain.canonicalize_shop_domain; keeping two copies of a host
+# rule that decides where a credential may be sent is how they drift.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO: canonicalising is not pinning. Five of the six call sites here
+# COMPARE hosts -- the untrusted X-Shopify-Shop-Domain header against the stores connected to a
+# merchant -- and pinning those to *.myshopify.com would make any store whose stored domain is not
+# canonical stop matching its own webhooks, silently dropping deliveries. Only the site that turns a
+# domain into an Admin API URL is pinned, at that site.
+_canonicalize_shop_domain = canonicalize_shop_domain
 
 
 async def _stripe_webhook_secret_candidates(psp_id: Optional[str]) -> list[str]:
@@ -3897,19 +3894,27 @@ async def register_shopify_webhooks(
         if not shopify_store:
             raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-        shop_domain = shopify_store.get("domain")
+        # Pinned BEFORE the token resolve, not after. The resolver POSTs client credentials to
+        # {domain}/admin/oauth/access_token, and the loop below POSTs a live Admin token to
+        # {domain}/admin/api/.../webhooks.json once per topic -- about twenty requests. The old order
+        # canonicalised only after the resolver had already been handed the raw column.
+        shop_domain_canon = normalize_myshopify_domain(shopify_store.get("domain"))
+        if not shop_domain_canon:
+            # Does not echo the stored value: it is untrusted text and the merchant id already
+            # identifies the row.
+            raise HTTPException(
+                status_code=400,
+                detail="Stored Shopify domain is not a *.myshopify.com host",
+            )
+
         access_token, _ = await resolve_shopify_admin_access_token(
-            shop_domain=shop_domain,
+            shop_domain=shop_domain_canon,
             api_key_raw=shopify_store.get("api_key_raw") or shopify_store.get("api_key"),
             store_id=str(shopify_store.get("store_id") or "").strip() or None,
         )
-        
-        if not shop_domain or not access_token:
-            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
 
-        shop_domain_canon = _canonicalize_shop_domain(shop_domain)
-        if not shop_domain_canon:
-            raise HTTPException(status_code=400, detail="Invalid Shopify store domain")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Missing Shopify credentials")
         
         # 要注册的 webhook topics
         topics = [
@@ -3973,7 +3978,7 @@ async def register_shopify_webhooks(
                         "topic": topic,
                         "webhook_id": webhook["id"]
                     })
-                    logger.info(f"Registered webhook for {topic} on {shop_domain}")
+                    logger.info(f"Registered webhook for {topic} on {shop_domain_canon}")
                 else:
                     # Common idempotency response: address already taken
                     if response.status_code == 422:
