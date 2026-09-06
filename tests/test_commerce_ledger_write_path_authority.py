@@ -132,6 +132,19 @@ def test_every_production_write_path_has_exactly_one_authority():
         "squarespace_reconciliation"
     ] == frozenset({"platform_asserted"})
 
+    # Webflow, the same shape and for the same reason. Its webhook path is
+    # armed only once `webhooks/ensure` has been run; until then the sweep is
+    # the store's only telemetry, and a weaker authority on it would file an
+    # unprovisioned store's orders below a provisioned one's.
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["webflow_webhook"] == "platform"
+    assert service.LEDGER_AUTHORITY_BY_WRITE_PATH["webflow_reconciliation"] == "platform"
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH["webflow_webhook"] == frozenset(
+        {"platform_asserted"}
+    )
+    assert service._ALLOWED_CONFIDENCE_BY_WRITE_PATH[
+        "webflow_reconciliation"
+    ] == frozenset({"platform_asserted"})
+
 
 @pytest.mark.parametrize(
     "write_path, confidence",
@@ -145,6 +158,8 @@ def test_every_production_write_path_has_exactly_one_authority():
         ("prestashop_module", "platform_asserted"),
         ("squarespace_webhook", "platform_asserted"),
         ("squarespace_reconciliation", "platform_asserted"),
+        ("webflow_webhook", "platform_asserted"),
+        ("webflow_reconciliation", "platform_asserted"),
         ("stripe_webhook", "platform_asserted"),
     ],
 )
@@ -179,6 +194,10 @@ def test_each_ingress_may_assert_only_its_own_confidence(write_path, confidence)
         ("squarespace_webhook", "verified"),
         ("squarespace_reconciliation", "merchant_asserted"),
         ("squarespace_reconciliation", "browser_observed"),
+        ("webflow_webhook", "merchant_asserted"),
+        ("webflow_webhook", "verified"),
+        ("webflow_reconciliation", "merchant_asserted"),
+        ("webflow_reconciliation", "browser_observed"),
     ],
 )
 def test_a_mismatched_write_path_and_confidence_is_refused(write_path, confidence):

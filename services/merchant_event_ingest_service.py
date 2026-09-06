@@ -102,6 +102,14 @@ ALLOWED_MERCHANT_METADATA_KEYS = frozenset(
         # and this is what the merchant sees in their own back office.
         "native_order_number",
         "native_paid_state",
+        # The PSP's own refund / dispute identifiers, as reported by the
+        # platform (Webflow's `stripeDetails`). Diagnostics, never keys: they
+        # are present for a Stripe order and absent for a PayPal one, so keying
+        # a refund on them would give one refund two rows across observations
+        # that disagree about whether they are there. What they buy is the
+        # ability to reconcile a ledger refund against the PSP by hand.
+        "native_psp_refund_id",
+        "native_psp_dispute_id",
         "native_payment_gateway",
         "native_shipping_type",
         "webhook_trace_id",

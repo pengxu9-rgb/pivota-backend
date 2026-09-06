@@ -179,6 +179,13 @@ _ROUTES = [
         "Can only connect your own store",
     ),
     (
+        "webflow_connect",
+        "POST",
+        "/integrations/webflow/connect",
+        lambda m: {"json": {"merchant_id": m, "api_token": "wf-token-x"}},
+        "Can only connect your own store",
+    ),
+    (
         "prestashop_connect",
         "POST",
         "/integrations/prestashop/connect",
@@ -346,6 +353,8 @@ _ENSURE_PATHS = [
     ("prestashop", f"/integrations/prestashop/{STORE_B}/telemetry/ensure"),
     ("squarespace", f"/integrations/squarespace/{STORE_B}/webhooks/ensure"),
     ("squarespace-reconcile", f"/integrations/squarespace/{STORE_B}/reconcile"),
+    ("webflow", f"/integrations/webflow/{STORE_B}/webhooks/ensure"),
+    ("webflow-reconcile", f"/integrations/webflow/{STORE_B}/reconcile"),
 ]
 _ENSURE_IDS = [p[0] for p in _ENSURE_PATHS]
 _ENSURE_PATH = _ENSURE_PATHS[0][1]

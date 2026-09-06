@@ -1553,6 +1553,54 @@ def _squarespace_webhook_callback_url(store_id: str) -> str:
     return callback_url
 
 
+def _webflow_webhook_endpoint(store_id: str, url_secret: str) -> tuple[str, str]:
+    """The (prefix, URL) registered AT WEBFLOW, secret and all.
+
+    The per-store secret is a PATH SEGMENT, not a header, because Webflow does
+    not sign a webhook created with a Site API token — see
+    routes/webflow_webhooks.py. That makes this URL a credential: it is never
+    logged and never returned to a caller.
+    """
+    base = str(
+        os.getenv("WEBFLOW_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure WEBFLOW_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    secret = str(url_secret or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=503, detail="Webflow webhook secret was not provisioned"
+        )
+    # The PREFIX is `https://origin/webhooks/webflow/{store_id}/` — every URL of
+    # ours for this store, whatever secret it carries. `ensure` uses it to
+    # decide what "stale" means: anything at this prefix with a different secret
+    # is one of our own superseded endpoints and is removed, while anything else
+    # in the site's webhook list belongs to some other integration of the
+    # merchant's and is left alone.
+    prefix = f"{base}/webhooks/webflow/{quote(store_id, safe='')}/"
+    callback_url = f"{prefix}{quote(secret, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return prefix, callback_url
+
+
 def _bigcommerce_credentials(raw: object) -> dict:
     if isinstance(raw, dict):
         return dict(raw)
@@ -1681,6 +1729,24 @@ _SQUARESPACE_SWEEPS_IN_FLIGHT: set[str] = set()
 # timeout each. The request must not outlive the proxy in front of it.
 SQUARESPACE_RECONCILE_TIMEOUT_SECONDS = 240.0
 
+_WEBFLOW_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+# One in-flight `ensure` per store. `ensure` mints or rotates the URL secret and
+# then registers it at Webflow, and two of them racing would register two
+# different URLs of which only the last-persisted secret authenticates: the
+# other store's webhook would 401 every delivery until someone re-ran ensure.
+# Per-process, which is the honest bound — it stops the operator double-click
+# and the retry-on-timeout, not two replicas.
+_WEBFLOW_ENSURES_IN_FLIGHT: set[str] = set()
+# One in-flight sweep per store, for the same reason as Squarespace: two sweeps
+# of one store race on one `reconciliation` cell and the loser's offsets are
+# either re-read or skipped depending on which merge landed last.
+_WEBFLOW_SWEEPS_IN_FLIGHT: set[str] = set()
+# Three lanes x `max_pages` sequential upstream calls at a 15s timeout each. The
+# request must not outlive the proxy in front of it.
+WEBFLOW_RECONCILE_TIMEOUT_SECONDS = 240.0
+WEBFLOW_ENSURE_TIMEOUT_SECONDS = 90.0
+
+
 
 class ConnectBigCommerceRequest(BaseModel):
     merchant_id: str
@@ -1717,6 +1783,28 @@ class ConnectSquarespaceRequest(BaseModel):
     oauth_access_token: Optional[str] = Field(default=None, max_length=2048)
     oauth_refresh_token: Optional[str] = Field(default=None, max_length=2048)
     oauth_expires_at: Optional[str] = Field(default=None, max_length=64)
+    store_name: Optional[str] = Field(default=None, max_length=255)
+    domain: Optional[str] = Field(default=None, max_length=2048)
+
+
+class ConnectWebflowRequest(BaseModel):
+    """A Webflow connection is one Bearer token plus, optionally, the site.
+
+    `api_token` is either a Site API token (Site settings -> Apps &
+    integrations -> API access) or an OAuth App access token. Both reach the
+    same Data API v2 endpoints; they differ only in whether Webflow SIGNS the
+    webhook deliveries the token's webhooks produce, which is why the receiver
+    does not rely on a signature alone (routes/webflow_webhooks.py).
+
+    `site_id` is optional and resolved from `GET /v2/sites` when the token
+    reaches exactly one site. It is NOT guessed when the token reaches several:
+    binding the wrong site would file another shop's orders under this store,
+    and every sweep afterwards would keep doing it.
+    """
+
+    merchant_id: str = Field(min_length=1, max_length=128)
+    api_token: str = Field(min_length=1, max_length=2048)
+    site_id: Optional[str] = Field(default=None, max_length=64)
     store_name: Optional[str] = Field(default=None, max_length=255)
     domain: Optional[str] = Field(default=None, max_length=2048)
 
@@ -3530,6 +3618,483 @@ async def run_squarespace_reconciliation(
         ) from exc
     finally:
         _SQUARESPACE_SWEEPS_IN_FLIGHT.discard(resolved_store_id)
+
+# ---------------------------------------------------------------------------
+# Webflow. ONE Bearer token reaching the Data API v2; what differs between a
+# Site API token and an OAuth App token is only whether Webflow SIGNS the
+# deliveries. See docs/WEBFLOW_TELEMETRY.md.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/webflow/connect")
+async def merchant_connect_webflow(
+    request: ConnectWebflowRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect a Webflow site for commerce telemetry.
+
+    The token is validated by resolving the SITE it reaches, which is also the
+    BINDING step: `site_id` is persisted and every order read afterwards is
+    fetched from `/v2/sites/{site_id}/...`, so a token that later points
+    somewhere else cannot silently file another shop's orders under this store.
+
+    When no `site_id` is supplied the site is resolved only if the token reaches
+    exactly ONE. Zero or several is a 409 that lists the candidates: guessing
+    would bind the wrong shop, and the mistake would not be visible in any row
+    the sweep then wrote.
+
+    The token is never logged, and a reconnect READ-MODIFY-WRITEs the credential
+    blob rather than overwriting it — the same cell holds the URL secret that is
+    baked into the webhook registered AT WEBFLOW, and losing it leaves Webflow
+    delivering to a path this deployment can only answer 401 to.
+    """
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    from services import webflow_connection as webflow
+    from services.webflow_connection import (
+        WebflowConnectionError,
+        WebflowSiteAmbiguousError,
+        drop_site_scoped_keys,
+        serialize_webflow_credentials,
+    )
+
+    api_token = request.api_token.strip()
+    if not api_token:
+        raise HTTPException(status_code=400, detail="A Webflow API token is required")
+
+    try:
+        site = await webflow.resolve_webflow_site(
+            api_token, site_id=(request.site_id or "").strip() or None
+        )
+    except WebflowSiteAmbiguousError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "site_selection_required",
+                "message": str(exc),
+                # Ids and names only — enough to choose from, and nothing that
+                # describes another site's contents.
+                "sites": [
+                    {"id": row.get("id"), "displayName": row.get("displayName")}
+                    for row in exc.sites
+                ],
+            },
+        ) from exc
+    except WebflowConnectionError as exc:
+        # The upstream status is part of the detail. Several claims about the
+        # Data API here are ASSUMED (docs/WEBFLOW_TELEMETRY.md); if one is
+        # wrong, a 404 says "wrong endpoint" and a 401 says "wrong token" on the
+        # first attempt instead of after a support thread.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Webflow connection failed: {exc}"
+                + (
+                    f" (upstream HTTP {exc.status_code})"
+                    if getattr(exc, "status_code", None)
+                    else ""
+                )
+            ),
+        ) from exc
+
+    site_id = str(site.get("id") or "").strip()
+    site_name = str(site.get("displayName") or "").strip() or None
+    short_name = str(site.get("shortName") or "").strip()
+    store_domain = (
+        (request.domain or "").strip()
+        or (f"{short_name}.webflow.io" if short_name else "")
+        or f"webflow:{site_id}"
+    )
+    store_name = (request.store_name or "").strip() or site_name or "Webflow Store"
+
+    existing_store = await database.fetch_one(
+        """SELECT store_id, api_key FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND platform = 'webflow' AND domain = :domain""",
+        {"merchant_id": request.merchant_id, "domain": store_domain},
+    )
+
+    def _reconnect(preserved: dict) -> dict:
+        """The blob to persist, computed INSIDE the merge's critical section.
+
+        Running here rather than in a second read-modify-write of its own is
+        what stops a sweep's cursor write landing between connect's read and its
+        write and reverting the merchant's new token.
+        """
+        previous_site_id = str(preserved.get("site_id") or "").strip()
+        if previous_site_id and previous_site_id != site_id:
+            # The token now belongs to a DIFFERENT site. EVERY credential and
+            # every piece of site-derived state goes — not just the derived
+            # half. The credential is the dangerous one: it is what every read
+            # uses, so a surviving old token keeps the sweep reading the old
+            # site and filing its orders under the store that now represents the
+            # new one. `drop_site_scoped_keys` drops the whole declared set, so
+            # a second credential added later cannot escape it.
+            drop_site_scoped_keys(preserved)
+        preserved.update({"api_token": api_token, "site_id": site_id})
+        if site_name:
+            preserved["site_name"] = site_name
+        return preserved
+
+    if existing_store:
+        existing_store = dict(existing_store)
+        store_id = existing_store["store_id"]
+        persisted = await webflow.merge_webflow_credentials(
+            store_id=store_id,
+            mutate=_reconnect,
+            mark_connected=True,
+            db=database,
+        )
+    else:
+        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+        blob = {"api_token": api_token, "site_id": site_id}
+        if site_name:
+            blob["site_name"] = site_name
+        persisted = dict(blob)
+        await database.execute(
+            """INSERT INTO merchant_stores
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'webflow', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+            {
+                "store_id": store_id,
+                "merchant_id": request.merchant_id,
+                "domain": store_domain,
+                "name": store_name,
+                "api_key": serialize_webflow_credentials(blob),
+            },
+        )
+
+    logger.info(
+        "webflow_connect store_id=%s merchant_id=%s site_id=%s webhooks_provisioned=%s",
+        store_id,
+        request.merchant_id,
+        site_id,
+        bool(str(persisted.get("url_secret") or "").strip()),
+    )
+    return {
+        "status": "success",
+        "message": "Webflow store connected successfully",
+        "store_id": store_id,
+        "site_id": site_id,
+        "site_name": site_name,
+        "domain": store_domain,
+        # Read off the blob THAT PERSISTED, not off the request: a reconnect to
+        # the SAME site keeps its provisioning, and answering "not provisioned"
+        # there would tell the merchant to re-run an ensure that would rotate a
+        # working secret for nothing.
+        "telemetry_mode": (
+            "webhook_and_sweep"
+            if str(persisted.get("url_secret") or "").strip()
+            else "sweep_only_until_provisioned"
+        ),
+        "webhook_provisioning_path": f"/integrations/webflow/{store_id}/webhooks/ensure",
+        "reconcile_path": f"/integrations/webflow/{store_id}/reconcile",
+    }
+
+
+async def _webflow_store_for_caller(store_id: str, current_user: dict) -> dict:
+    """The store row, with the role gate and the ROW's ownership check applied.
+
+    `store_id` is caller-supplied and the SELECT keys on it alone, so the owning
+    merchant is a property of the ROW and nothing in the request says who it is.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'webflow'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected Webflow store not found")
+    store = dict(store)
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+    return store
+
+
+@router.post("/webflow/{store_id}/webhooks/ensure")
+async def ensure_webflow_webhooks_route(
+    store_id: str,
+    rotate: bool = Query(default=False),
+    current_user: dict = Depends(get_current_user),
+):
+    """Register the Webflow webhooks that feed `/webhooks/webflow/{id}/{secret}`.
+
+    THE ORDER OF THE TWO WRITES IS THE WHOLE DESIGN. The URL secret is minted
+    and PERSISTED first, then the webhook carrying it is registered at Webflow,
+    then the webhook ids are persisted. A crash after the first write leaves a
+    stored secret and no webhook — harmless, and fixed by re-running this. The
+    opposite order would leave Webflow delivering to a URL whose secret was
+    never stored, and the receiver would answer 401 to every delivery forever.
+
+    `rotate=true` mints a NEW secret, which changes the registered URL. In-flight
+    deliveries to the old URL will 401; Webflow retries them and the
+    reconciliation sweep recovers anything that never lands. Without `rotate`,
+    an existing secret is REUSED, so this is safe to re-run.
+
+    The secret is never returned and never logged: Pivota registers the webhook
+    itself, so no human needs to see it.
+    """
+    store = await _webflow_store_for_caller(store_id, current_user)
+
+    from services.webflow_connection import (
+        merge_webflow_credentials,
+        mint_url_secret,
+        parse_webflow_credentials,
+    )
+    from services.webflow_event_adapter import WEBFLOW_ORDER_TRIGGERS
+    from services.webflow_webhook_subscriptions import (
+        WebflowWebhookError,
+        WebflowWebhookScopeError,
+        delete_webflow_webhook,
+        ensure_webflow_webhooks,
+    )
+
+    credentials = parse_webflow_credentials(store.get("api_key"))
+    api_token = str(credentials.get("api_token") or "").strip()
+    site_id = str(credentials.get("site_id") or "").strip()
+    if not api_token:
+        raise HTTPException(
+            status_code=409,
+            detail="This Webflow store has no API token; reconnect it",
+        )
+    if not site_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Webflow store has no site_id binding; reconnect it so "
+                "orders can be read from the site they belong to"
+            ),
+        )
+
+    resolved_store_id = str(store["store_id"])
+    # Check-and-add with no `await` between them, so this is atomic on the event
+    # loop without a lock of its own. Two ensures racing would register two
+    # different URLs, and only the last-persisted secret authenticates.
+    if resolved_store_id in _WEBFLOW_ENSURES_IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "ensure_already_running",
+                "message": (
+                    "A Webflow webhook provisioning run is already in flight for "
+                    "this store; wait for it rather than racing it on the same "
+                    "URL secret."
+                ),
+                "store_id": resolved_store_id,
+            },
+        )
+    _WEBFLOW_ENSURES_IN_FLIGHT.add(resolved_store_id)
+    try:
+        def _mint(blob: dict) -> dict:
+            """Mint only when there is nothing usable, unless asked to rotate.
+
+            Reusing a working secret is what makes this endpoint idempotent, and
+            idempotence is what makes it safe to re-run after a partial failure.
+            """
+            current = str(blob.get("url_secret") or "").strip()
+            if rotate or not current:
+                blob["url_secret"] = mint_url_secret()
+            return blob
+
+        # `db=database` explicitly, the same as connect: this module's handle is
+        # the one the route's own reads go through, so the merge and the lookup
+        # can never end up talking to two different databases.
+        persisted = await merge_webflow_credentials(
+            store_id=resolved_store_id, mutate=_mint, db=database
+        )
+        url_secret = str(persisted.get("url_secret") or "").strip()
+        if not url_secret:
+            raise HTTPException(
+                status_code=503, detail="Webflow webhook secret could not be persisted"
+            )
+        prefix, callback_url = _webflow_webhook_endpoint(resolved_store_id, url_secret)
+        triggers = list(WEBFLOW_ORDER_TRIGGERS)
+
+        try:
+            async with asyncio.timeout(WEBFLOW_ENSURE_TIMEOUT_SECONDS):
+                async with _WEBFLOW_WEBHOOK_INSTALL_CONCURRENCY:
+                    result = await ensure_webflow_webhooks(
+                        api_token=api_token,
+                        site_id=site_id,
+                        callback_url=callback_url,
+                        trigger_types=triggers,
+                        store_path_prefix=prefix,
+                    )
+        except WebflowWebhookScopeError as exc:
+            logger.info(
+                "webflow_webhooks_ensure action=scope_required store_id=%s "
+                "store_merchant_id=%s actor_role=%s actor_user_id=%s",
+                resolved_store_id,
+                store.get("merchant_id") or "-",
+                current_user.get("role") or "-",
+                current_user.get("sub") or "-",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "scope_required",
+                    "message": str(exc),
+                    "required_scopes": list(WebflowWebhookScopeError.required_scopes),
+                    "store_id": resolved_store_id,
+                    "reconcile_path": f"/integrations/webflow/{resolved_store_id}/reconcile",
+                },
+            ) from exc
+        except WebflowWebhookError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail="Webflow webhook management request failed"
+            ) from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504, detail="Webflow webhook installation timed out"
+            ) from exc
+
+        stored = await merge_webflow_credentials(
+            store_id=resolved_store_id,
+            updates={"webhook_ids": dict(result.webhook_ids)},
+            db=database,
+        )
+        stored_secret = str(stored.get("url_secret") or "").strip()
+        if not hmac.compare_digest(stored_secret, url_secret):
+            # Another writer replaced the secret between the two merges. The
+            # webhooks just registered carry a URL the receiver will now 401, so
+            # they are removed rather than left delivering into a wall.
+            for webhook_id in result.webhook_ids.values():
+                await _discard_webflow_webhook(
+                    api_token, webhook_id, delete_webflow_webhook
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The Webflow URL secret changed while this provisioning ran; "
+                    "re-run it"
+                ),
+            )
+
+        logger.info(
+            "webflow_webhooks_ensure action=provisioned store_id=%s "
+            "store_merchant_id=%s actor_role=%s actor_user_id=%s rotated=%s "
+            "created=%s reused=%s removed=%s removal_failures=%s",
+            resolved_store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            bool(rotate),
+            ",".join(result.created_trigger_types) or "-",
+            ",".join(result.reused_trigger_types) or "-",
+            len(result.removed_webhook_ids),
+            result.stale_removal_failures,
+        )
+        return {
+            "status": "success",
+            "store_id": resolved_store_id,
+            "site_id": site_id,
+            # The URL itself carries the secret, so neither is returned.
+            "secret_provisioned": True,
+            "secret_rotated": bool(rotate),
+            "webhooks": [
+                {"trigger_type": trigger, "webhook_id": webhook_id}
+                for trigger, webhook_id in sorted(result.webhook_ids.items())
+            ],
+            "created": result.created_trigger_types,
+            "reused": result.reused_trigger_types,
+            "removed_stale": len(result.removed_webhook_ids),
+            "stale_removal_failures": result.stale_removal_failures,
+        }
+    finally:
+        _WEBFLOW_ENSURES_IN_FLIGHT.discard(resolved_store_id)
+
+
+async def _discard_webflow_webhook(api_token, webhook_id, delete) -> None:
+    """Best-effort removal of a webhook whose URL we cannot authenticate.
+
+    A failure here is logged and swallowed: the caller is already answering an
+    error, and raising a second failure over the first would hide what happened.
+    """
+    try:
+        await delete(api_token=api_token, webhook_id=webhook_id)
+    except Exception:
+        logger.warning(
+            "webflow_webhooks_ensure could not discard webhook_id=%s", webhook_id or "-"
+        )
+
+
+@router.post("/webflow/{store_id}/reconcile")
+async def run_webflow_reconciliation(
+    store_id: str,
+    apply: bool = Query(default=True),
+    overlap_minutes: int = Query(default=60, ge=0, le=10080),
+    max_pages: int = Query(default=10, ge=1, le=200),
+    page_limit: int = Query(default=100, ge=1, le=100),
+    lane: Optional[List[str]] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Run the Orders-list reconciliation sweep for one store, now.
+
+    The authenticated face of `scripts/sweep_webflow_orders.py`. Both exist
+    because neither scheduling surface in this repo ships this lane on merge —
+    see the scheduling section of docs/WEBFLOW_TELEMETRY.md.
+
+    Two guards wrap the sweep, both because it is an unbounded outbound loop over
+    somebody else's API. A per-store lock answers 409 rather than letting two
+    sweeps of the same store interleave: they would race on the same
+    `reconciliation` cell, and the loser's offsets would be re-read or skipped
+    depending on which merge landed last. The timeout bounds the request itself,
+    so a sweep against a slow upstream cannot hold the connection until the proxy
+    gives up.
+    """
+    store = await _webflow_store_for_caller(store_id, current_user)
+
+    from services.webflow_order_sweep import WebflowSweepError, sweep_webflow_store
+
+    resolved_store_id = str(store["store_id"])
+    # Check-and-add with no `await` between them, so this is atomic on the event
+    # loop without a lock of its own.
+    if resolved_store_id in _WEBFLOW_SWEEPS_IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "sweep_already_running",
+                "message": (
+                    "A Webflow reconciliation sweep is already running for this "
+                    "store; wait for it to finish rather than racing it on the "
+                    "same cursor."
+                ),
+                "store_id": resolved_store_id,
+            },
+        )
+    _WEBFLOW_SWEEPS_IN_FLIGHT.add(resolved_store_id)
+    try:
+        async with asyncio.timeout(WEBFLOW_RECONCILE_TIMEOUT_SECONDS):
+            return await sweep_webflow_store(
+                store_id=resolved_store_id,
+                apply=apply,
+                overlap_minutes=overlap_minutes,
+                max_pages=max_pages,
+                page_limit=page_limit,
+                lanes=lane,
+            )
+    except WebflowSweepError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        # The cursors are untouched: the sweep persists them only after the whole
+        # lane loop completes, so a timeout re-reads rather than skips.
+        raise HTTPException(
+            status_code=504, detail="Webflow reconciliation sweep timed out"
+        ) from exc
+    finally:
+        _WEBFLOW_SWEEPS_IN_FLIGHT.discard(resolved_store_id)
+
 
 @router.post("/prestashop/connect")
 async def merchant_connect_prestashop(

@@ -39,6 +39,16 @@ WritePath = Literal[
     # reads across so a cumulative refund total is never counted twice.
     "squarespace_webhook",
     "squarespace_reconciliation",
+    # Webflow is observed through the same two ingresses: a webhook receiver
+    # (authenticated by a per-store URL secret, and additionally by Webflow's
+    # signature when the deployment runs an OAuth app) and an Orders-list
+    # reconciliation sweep. Both carry authority `platform`. They must: Webflow
+    # webhooks are best-effort, so the sweep is the recovery path for every
+    # store and the ONLY path for one whose webhooks are not provisioned yet,
+    # and filing its orders below an identical provisioned store's would make a
+    # merchant's standing depend on whether an ensure had been run.
+    "webflow_webhook",
+    "webflow_reconciliation",
     "sfcc_cartridge",
     # PrestaShop has no outbound webhooks; the signed sender is the module
     # Pivota ships (integrations/prestashop-module/).
@@ -74,6 +84,8 @@ LEDGER_AUTHORITY_BY_WRITE_PATH: Dict[str, str] = {
     "shoplazza_webhook": "platform",
     "squarespace_webhook": "platform",
     "squarespace_reconciliation": "platform",
+    "webflow_webhook": "platform",
+    "webflow_reconciliation": "platform",
     "sfcc_cartridge": "platform",
     "prestashop_module": "platform",
     "adobe_io_events": "platform",
@@ -114,6 +126,8 @@ _ALLOWED_CONFIDENCE_BY_WRITE_PATH: Dict[str, frozenset[str]] = {
     "shoplazza_webhook": frozenset({"platform_asserted"}),
     "squarespace_webhook": frozenset({"platform_asserted"}),
     "squarespace_reconciliation": frozenset({"platform_asserted"}),
+    "webflow_webhook": frozenset({"platform_asserted"}),
+    "webflow_reconciliation": frozenset({"platform_asserted"}),
     "sfcc_cartridge": frozenset({"platform_asserted"}),
     "prestashop_module": frozenset({"platform_asserted"}),
     "adobe_io_events": frozenset({"platform_asserted"}),

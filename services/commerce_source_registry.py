@@ -97,6 +97,23 @@ _SOURCES: Dict[str, CommerceSourceDefinition] = {
         "connect a merchant-authorized catalogue feed before running Commerce "
         "Index product sync.",
     ),
+    # Webflow ships COMMERCE TELEMETRY only: a webhook receiver and an
+    # Orders-list reconciliation sweep that feed the canonical ledger. No
+    # catalogue capability is claimed — nothing in this repo reads Webflow's CMS
+    # or Products API, so `catalog_pull` here would make an empty product sync
+    # report success instead of an honest blocker. Telemetry is not a flag this
+    # registry models (Squarespace and the SFCC cartridge are the same shape),
+    # so every capability stays false and the guidance says why.
+    "webflow": CommerceSourceDefinition(
+        "webflow",
+        "storefront",
+        CommerceSourceCapabilities(),
+        "catalog",
+        "Webflow is connected for commerce telemetry only (order, payment, and "
+        "refund events). No Webflow catalogue adapter exists yet; connect a "
+        "merchant-authorized catalogue feed before running Commerce Index "
+        "product sync.",
+    ),
     # Square is retained because the existing sync endpoint accepts its credentials;
     # its fetch adapter can be enabled independently of this policy contract.
     "square": CommerceSourceDefinition("square", "storefront", _CATALOG_CAPABILITIES),

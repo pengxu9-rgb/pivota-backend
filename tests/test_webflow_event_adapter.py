@@ -1,0 +1,391 @@
+"""The pure Webflow order mapper.
+
+The centre of gravity here is MONEY. Webflow states amounts in minor units
+already, so the mapper does no conversion — and the single worst outcome this
+integration could produce is a 100x error from someone "fixing" that to match
+every other adapter in the repo. So the documented example (`5898` == $58.98) is
+pinned with its own test, and a `value` that is not a whole number of minor
+units is asserted to be REFUSED rather than guessed at.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+STORE_ID = "store-wf"
+ORDER_ID = "0000-0001"
+SOURCE = "webflow_webhook"
+
+
+def _order(**overrides):
+    order = {
+        "orderId": ORDER_ID,
+        "status": "unfulfilled",
+        "acceptedOn": "2026-09-01T10:00:00.000Z",
+        # The documented Webflow money shape: `unit` is the currency and `value`
+        # is an INTEGER number of minor units.
+        "customerPaid": {"unit": "USD", "value": 5898, "string": "$58.98"},
+        "netAmount": {"unit": "USD", "value": 5600, "string": "$56.00"},
+        "purchasedItemsCount": 2,
+        "purchasedItems": [
+            {
+                "count": 2,
+                "rowTotal": {"unit": "USD", "value": 5898},
+                "productId": "prod-1",
+                "productName": "A Very Nice Shirt",
+                "variantId": "var-1",
+                "variantSKU": "SKU-1",
+            }
+        ],
+        "customerInfo": {"fullName": "A Buyer", "email": "buyer@example.com"},
+        "paymentProcessor": "stripe",
+        "stripeDetails": {
+            "paymentIntentId": "pi_1",
+            "chargeId": "ch_1",
+            "customerId": "cus_1",
+        },
+    }
+    order.update(overrides)
+    return order
+
+
+def _map(order, **kwargs):
+    from services.webflow_event_adapter import map_webflow_order
+
+    return map_webflow_order(order, store_id=STORE_ID, source=SOURCE, **kwargs)
+
+
+def _by_type(batch):
+    return {event.event_type: event for event in batch.events}
+
+
+# ---- money: the 100x test ---------------------------------------------------
+
+
+def test_the_documented_money_example_is_read_as_minor_units_unchanged():
+    """`{"unit": "USD", "value": 5898, "string": "$58.98"}` is 5898 cents.
+
+    The mutant this kills is a `* 100` "for consistency with the other
+    adapters": that would file a $58.98 order as $5,898.00, and nothing
+    downstream distinguishes an inflated amount from a real one.
+    """
+    events = _by_type(_map(_order()))
+
+    assert events["order.paid"].amount_cents == 5898
+    assert events["order.paid"].currency == "USD"
+    # And the human-readable string Webflow also sends confirms the reading.
+    assert _order()["customerPaid"]["string"] == "$58.98"
+
+
+def test_a_money_value_as_an_integer_string_is_accepted():
+    """Webflow's JSON has been seen with both; both are whole minor units."""
+    events = _by_type(_map(_order(customerPaid={"unit": "USD", "value": "5898"})))
+
+    assert events["order.paid"].amount_cents == 5898
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "58.98",  # a decimal string is the shape that becomes 58 or 5898
+        58.98,
+        "5,898",
+        "abc",
+        True,
+        [5898],
+    ],
+)
+def test_a_value_that_is_not_whole_minor_units_is_refused_not_guessed(value):
+    from services.webflow_event_adapter import WebflowMoneyFormatError
+
+    with pytest.raises(WebflowMoneyFormatError):
+        _map(_order(customerPaid={"unit": "USD", "value": value}))
+
+
+def test_a_negative_amount_is_refused_rather_than_clamped():
+    from services.webflow_event_adapter import WebflowMoneyFormatError
+
+    with pytest.raises(WebflowMoneyFormatError):
+        _map(_order(customerPaid={"unit": "USD", "value": -100}))
+
+
+def test_a_float_that_is_a_whole_number_is_accepted():
+    """JSON `5898.0` is still 5898 cents; only a fractional one is a red flag."""
+    events = _by_type(_map(_order(customerPaid={"unit": "USD", "value": 5898.0})))
+
+    assert events["order.paid"].amount_cents == 5898
+
+
+def test_zero_decimal_currencies_are_not_special_cased():
+    """Because the value is ALREADY minor units, there is nothing to special-case.
+
+    A JPY order of 5898 yen is `value: 5898`, exactly as a USD order of $58.98 is
+    5898 cents. An adapter that carried the usual zero-decimal table would be
+    carrying dead code that could only ever introduce a bug.
+    """
+    events = _by_type(_map(_order(customerPaid={"unit": "JPY", "value": 5898})))
+
+    assert events["order.paid"].amount_cents == 5898
+    assert events["order.paid"].currency == "JPY"
+
+
+# ---- currency ---------------------------------------------------------------
+
+
+def test_the_currency_comes_from_unit_not_from_a_currency_key():
+    events = _by_type(_map(_order()))
+
+    assert events["order.created"].currency == "USD"
+
+
+def test_a_paid_order_with_no_readable_currency_records_no_money_event():
+    """No currency means the funnel cannot bucket the amount, so there is no
+    money event — but the order itself is still observed."""
+    batch = _map(_order(customerPaid={"value": 5898}, netAmount={"value": 5600}))
+    events = _by_type(batch)
+
+    assert "order.created" in events
+    assert "order.paid" not in events
+
+
+def test_a_refunded_order_with_no_readable_money_is_LOUD():
+    """The negative counterpart of the test above.
+
+    A refund silently omitted is money the ledger says never came back. That is
+    a different failure from an unbucketable purchase and must not share its
+    quiet handling.
+    """
+    with pytest.raises(ValueError):
+        _map(
+            _order(
+                status="refunded",
+                refundedOn="2026-09-03T10:00:00.000Z",
+                customerPaid={"value": 5898},
+                netAmount={"value": 5600},
+            )
+        )
+
+
+# ---- every status -----------------------------------------------------------
+
+
+def test_a_pending_order_is_created_but_not_paid():
+    """`pending` is Webflow's unpaid state (a PayPal payment awaiting capture).
+
+    A later `ecomm_order_changed`, or the sweep, completes it — and because the
+    event ids are deterministic, that later observation adds `order.paid` beside
+    the same `order.created` rather than duplicating the order.
+    """
+    batch = _map(_order(status="pending", acceptedOn=None))
+    events = _by_type(batch)
+
+    assert set(events) == {"order.created"}
+
+
+@pytest.mark.parametrize(
+    "status", ["unfulfilled", "fulfilled", "disputed", "dispute-lost", "refunded"]
+)
+def test_every_accepted_status_emits_order_paid(status):
+    """An accepted Webflow order was paid for, whatever happened to it after."""
+    order = _order(status=status)
+    if status == "refunded":
+        order["refundedOn"] = "2026-09-03T10:00:00.000Z"
+    if status in ("disputed", "dispute-lost"):
+        order["disputedOn"] = "2026-09-03T10:00:00.000Z"
+    events = _by_type(_map(order))
+
+    assert events["order.paid"].amount_cents == 5898
+    assert events["order.paid"].metadata["native_amount_semantics"] == "customer_paid"
+
+
+def test_a_disputed_order_holds_funds_and_emits_no_money_movement():
+    """`disputed` means the funds are HELD pending the outcome, not returned.
+
+    Recording a refund here and another one if the dispute is later lost would
+    count the same money out twice; recording one and never correcting it if the
+    dispute is WON would invent a refund that never happened.
+    """
+    batch = _map(_order(status="disputed", disputedOn="2026-09-03T10:00:00.000Z"))
+    events = _by_type(batch)
+
+    assert set(events) == {"order.created", "order.paid"}
+    assert events["order.paid"].metadata["native_status"] == "disputed"
+
+
+def test_a_refunded_order_emits_one_full_amount_refund():
+    """Webflow refunds are FULL-ORDER only, so the amount is the whole
+    `customerPaid` and there is exactly one of them — no cumulative delta, and
+    therefore no baseline read and no lock anywhere in this integration."""
+    batch = _map(
+        _order(
+            status="refunded",
+            refundedOn="2026-09-03T10:00:00.000Z",
+            stripeDetails={"refundId": "re_1", "refundReason": "requested_by_customer"},
+        )
+    )
+    events = _by_type(batch)
+    refund = events["refund.succeeded"]
+
+    assert refund.amount_cents == 5898
+    assert refund.currency == "USD"
+    assert refund.occurred_at.isoformat() == "2026-09-03T10:00:00+00:00"
+    assert refund.metadata["native_amount_semantics"] == "full_order_refund"
+    # The PSP's refund id is a DIAGNOSTIC, never the key: it is present for a
+    # Stripe order and absent for a PayPal one, so keying on it would give one
+    # refund two rows across observations that disagree about whether it is
+    # there.
+    assert refund.metadata["native_psp_refund_id"] == "re_1"
+    assert "native_psp_refund_reason" not in refund.metadata
+    assert refund.refund_id == f"{ORDER_ID}:refund"
+
+
+def test_a_lost_dispute_is_money_out_under_the_SAME_key_as_a_refund():
+    """The two statuses are mutually exclusive at any instant, but an order can
+    MOVE between them across observations. Two keys would then record the same
+    money twice; one key makes at most one refund row per order structurally
+    true, and both carry the identical full `customerPaid` amount anyway."""
+    refunded = _by_type(
+        _map(_order(status="refunded", refundedOn="2026-09-03T10:00:00.000Z"))
+    )["refund.succeeded"]
+    lost = _by_type(
+        _map(
+            _order(
+                status="dispute-lost",
+                disputedOn="2026-09-04T10:00:00.000Z",
+                stripeDetails={"disputeId": "dp_1"},
+            )
+        )
+    )["refund.succeeded"]
+
+    assert lost.amount_cents == 5898
+    assert lost.metadata["native_amount_semantics"] == "dispute_lost_full_amount"
+    assert lost.metadata["native_psp_dispute_id"] == "dp_1"
+    assert lost.event_id == refunded.event_id
+    assert lost.refund_id == refunded.refund_id == f"{ORDER_ID}:refund"
+
+
+def test_webflow_has_no_cancelled_state_so_none_is_invented():
+    """`order.cancelled` is never emitted. Inventing one from `refunded` would
+    file a refund as a cancellation and count the order in two funnels."""
+    for status in ("pending", "unfulfilled", "fulfilled", "refunded", "dispute-lost"):
+        order = _order(status=status)
+        order["refundedOn"] = "2026-09-03T10:00:00.000Z"
+        order["disputedOn"] = "2026-09-03T10:00:00.000Z"
+        assert "order.cancelled" not in _by_type(_map(order))
+
+
+# ---- identity and dedupe ----------------------------------------------------
+
+
+def test_event_ids_are_derived_from_the_order_and_not_from_the_ingress():
+    """A webhook observation and a sweep observation of one order must collapse
+    onto one ledger row. If `source` reached the id, an OAuth store with both
+    paths armed would count every purchase twice."""
+    from services.webflow_event_adapter import map_webflow_order
+
+    webhook = map_webflow_order(_order(), store_id=STORE_ID, source="webflow_webhook")
+    sweep = map_webflow_order(
+        _order(), store_id=STORE_ID, source="webflow_reconciliation"
+    )
+
+    assert [e.event_id for e in webhook.events] == [e.event_id for e in sweep.events]
+    assert webhook.events[0].source == "webflow_webhook"
+    assert sweep.events[0].source == "webflow_reconciliation"
+
+
+def test_event_ids_are_scoped_to_the_store():
+    from services.webflow_event_adapter import map_webflow_order
+
+    a = map_webflow_order(_order(), store_id="store-a", source=SOURCE)
+    b = map_webflow_order(_order(), store_id="store-b", source=SOURCE)
+
+    assert a.events[0].event_id != b.events[0].event_id
+
+
+def test_the_order_ref_is_namespaced():
+    assert _map(_order()).events[0].order_ref == f"webflow:{ORDER_ID}"
+
+
+def test_an_order_with_no_id_is_a_malformed_order():
+    with pytest.raises(ValueError):
+        _map(_order(orderId=None))
+
+
+# ---- what must NEVER reach the ledger ---------------------------------------
+
+
+def test_no_buyer_pii_reaches_the_ledger():
+    """`customerInfo` is a name and an email. Neither is a join key and both are
+    PII the ledger must never hold."""
+    batch = _map(_order())
+
+    for event in batch.events:
+        assert event.buyer_id is None
+        rendered = repr(event.metadata)
+        assert "buyer@example.com" not in rendered
+        assert "A Buyer" not in rendered
+
+
+def test_custom_data_is_never_read_as_a_pivota_order_identity():
+    """`customData` is buyer-entered free text. Reading a `pivota:` string out of
+    it would let a forged value merge this order into an interaction it does not
+    own (the BigCommerce reasoning)."""
+    batch = _map(
+        _order(customData=[{"name": "note", "value": "pivota:ord_someone_elses"}])
+    )
+
+    for event in batch.events:
+        assert event.order_ref == f"webflow:{ORDER_ID}"
+        assert "ord_someone_elses" not in repr(event.metadata)
+
+
+def test_line_items_keep_join_keys_and_quantity_and_nothing_else():
+    """No line-item AMOUNT is carried, deliberately.
+
+    The ledger's line-item vocabulary spells amounts as `price`/`subtotal`/
+    `total`, and every other adapter writes a DECIMAL string there. Webflow's are
+    minor-unit integers, so writing one under those names would plant the same
+    100x ambiguity this adapter refuses everywhere else — for a diagnostic, while
+    the order's real money is `customerPaid`. `productName` is merchant copy and
+    is dropped for the usual reason.
+    """
+    items = _map(_order()).events[0].metadata["native_line_items"]
+
+    assert items == [
+        {
+            "product_id": "prod-1",
+            "variant_id": "var-1",
+            "sku": "SKU-1",
+            "quantity": 2,
+        }
+    ]
+
+
+def test_a_flagged_test_order_is_ignored_entirely():
+    """Webflow is not known to flag test orders, so this guard is defensive —
+    but an unpaid test order in the paid totals is fabricated GMV under a
+    deterministic key that could then never be reused for the real one."""
+    from services.webflow_event_adapter import UnsupportedWebflowEvent
+
+    with pytest.raises(UnsupportedWebflowEvent):
+        _map(_order(metadata={"isTest": True}))
+
+
+# ---- triggers ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("ecomm_new_order", "ecomm_new_order"),
+        ("ECOMM_ORDER_CHANGED", "ecomm_order_changed"),
+        (" ecomm_new_order ", "ecomm_new_order"),
+        ("ecomm_inventory_changed", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_trigger_normalization(value, expected):
+    from services.webflow_event_adapter import normalize_webflow_trigger
+
+    assert normalize_webflow_trigger(value) == expected
