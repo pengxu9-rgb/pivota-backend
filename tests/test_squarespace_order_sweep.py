@@ -598,3 +598,37 @@ async def test_the_fetch_layer_stops_when_no_next_cursor_is_returned():
         client=_FakeClient([{"result": [], "pagination": {"nextPageCursor": "c"}}]),
     )
     assert page.next_cursor == "c"
+
+
+async def test_the_sweep_hands_the_fetch_layer_no_bounds_once_it_holds_a_cursor(
+    monkeypatch,
+):
+    """The sweep's OWN decision, separately from what the fetch layer then does
+    with it. Asserting only the wire cannot see this: the fetch layer drops the
+    bounds when a cursor is present, so it would mask a sweep that kept sending
+    them."""
+    from services import squarespace_order_sweep as sweep
+    from services.squarespace_order_fetch import SquarespaceOrderPage
+
+    _wire(monkeypatch, credentials=_CREDENTIALS)
+    calls = []
+    pages = [
+        SquarespaceOrderPage(orders=[], next_cursor="cur-2"),
+        SquarespaceOrderPage(orders=[], next_cursor=None),
+    ]
+
+    async def spying_fetch(**kwargs):
+        calls.append(kwargs)
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(sweep, "fetch_squarespace_order_page", spying_fetch)
+
+    await sweep.sweep_squarespace_store(
+        store_id=STORE_ID, now=NOW, client=_FakeClient([])
+    )
+
+    assert calls[0]["cursor"] is None
+    assert calls[0]["modified_after"] and calls[0]["modified_before"]
+    assert calls[1]["cursor"] == "cur-2"
+    assert calls[1]["modified_after"] is None
+    assert calls[1]["modified_before"] is None
