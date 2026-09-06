@@ -98,7 +98,7 @@ def _commit(root: Path, path: str, body: str, *, age_minutes: int = 0) -> str:
 
 
 def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
-           split: str = "") -> Path:
+           split: str = "", both100: str = "") -> Path:
     """`curl` and `gcloud` that answer for a chosen production state.
 
     The gcloud stub models the TWO-CALL shape the job actually uses: `run services describe`
@@ -126,7 +126,14 @@ def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
     for svc, val in images.items():
         serving, template = val if isinstance(val, tuple) else (val, val)
         live_rev, cand_rev = f"{svc}-live", f"{svc}-cand"
-        if svc == split:
+        if svc == both100:
+            # TWO REVISIONS BOTH CLAIMING 100%. The 50/50 shape is caught by the percent filter
+            # alone (neither entry is 100), so it cannot exercise the `len(live)==1` clause —
+            # relaxing that to `>=1` left the module green. This is the input only that clause
+            # can catch.
+            traffic = (f'{{"revisionName":"{live_rev}","percent":100}},'
+                       f'{{"revisionName":"{cand_rev}","percent":100}}')
+        elif svc == split:
             traffic = (f'{{"revisionName":"{live_rev}","percent":50}},'
                        f'{{"revisionName":"{cand_rev}","percent":50}}')
         elif serving != template:
@@ -161,11 +168,12 @@ def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
     return binn
 
 
-def _run_drift(tmp_path: Path, root: Path, *, web: str, images: dict,
-               grace: str = "240", gcloud_fails: str = "", split: str = "") -> tuple[int, str]:
+def _run_drift(tmp_path: Path, root: Path, *, web: str, images: dict, grace: str = "240",
+               gcloud_fails: str = "", split: str = "", both100: str = "") -> tuple[int, str]:
     script = tmp_path / "drift.sh"
     script.write_text(_drift_script())
-    binn = _stubs(tmp_path, web=web, images=images, gcloud_fails=gcloud_fails, split=split)
+    binn = _stubs(tmp_path, web=web, images=images, gcloud_fails=gcloud_fails, split=split,
+                  both100=both100)
     env = dict(os.environ)
     env["PATH"] = f"{binn}{os.pathsep}{env['PATH']}"
     env["GRACE_MINUTES"] = grace
@@ -340,6 +348,20 @@ def test_split_traffic_is_refused_rather_than_guessed(tmp_path):
     assert "proof-issuer" in out
 
 
+def test_two_revisions_both_claiming_all_traffic_are_refused(tmp_path):
+    """The 50/50 split above is caught by the `percent==100` filter alone, so it cannot
+    exercise the `len(live)==1` clause beside it — relaxing that to `>=1` left the suite green.
+    This shape (two entries both at 100) is the input only that clause can catch, and it is
+    what an inconsistent or mid-rollout traffic block looks like."""
+    root = _repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    code, out = _run_drift(tmp_path, root, web=head,
+                           images={"worker": head, "proof-issuer": head}, both100="proof-issuer")
+    assert code != 0, f"two revisions both at 100%% has no single answer and must refuse:\n{out}"
+    assert "proof-issuer" in out
+
+
 @pytest.mark.parametrize(
     "tag",
     [
@@ -389,7 +411,14 @@ def test_a_revision_that_declares_no_commit_is_refused(tmp_path):
                           capture_output=True, text=True).stdout.strip()
     code, out = _run_drift(tmp_path, root, web=head, images={"worker": "", "proof-issuer": head})
     assert code != 0, f"a revision declaring no commit must be refused:\n{out}"
-    assert "worker" in out
+    # ASSERT THE DEDICATED DIAGNOSIS. `code != 0` alone was satisfied by the 40-char length
+    # check further down — deleting this guard entirely left the module green, so the
+    # operator-facing message explaining WHY (nothing in Cloud Run injects that variable) was
+    # never exercised. Two guards that both close a door pin neither.
+    assert "declares no PIVOTA_COMMIT_SHA" in out, (
+        f"the refusal did not come from the absent-commit guard; some neighbouring check "
+        f"caught it and the operator gets the wrong explanation:\n{out}"
+    )
 
 
 # ── structure ──────────────────────────────────────────────────────────────────────────

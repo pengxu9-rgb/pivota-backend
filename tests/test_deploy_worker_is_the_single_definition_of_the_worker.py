@@ -350,8 +350,16 @@ def test_the_probe_program_verdict(tmp_path, health, build, expect_ok, why):
     srv = http.server.HTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        prog = _probe_program(tmp_path).replace(
+        raw = _probe_program(tmp_path)
+        prog = raw.replace(
             "https://worker-xyz.a.run.app", f"http://127.0.0.1:{srv.server_address[1]}"
+        )
+        # If the stub's URL ever changes, this replace silently no-ops and the probe makes a
+        # REAL outbound request to that hostname — a test that quietly stops testing, and
+        # starts reaching the network from CI. Fail here instead.
+        assert prog != raw, (
+            "the probe's URL was not substituted; the stub's status.url no longer matches what "
+            "this test replaces, and the program would have called the real hostname"
         )
         done = subprocess.run(["python3", "-c", prog], capture_output=True, text=True, timeout=60)
     finally:
@@ -381,10 +389,56 @@ def test_an_unreadable_current_image_refuses_before_deploying(tmp_path):
 def test_a_genuinely_absent_service_is_still_created(tmp_path):
     """The counterpart, and why the test above is not merely 'refuse on any error': a real
     first deploy must still work, or the refusal has broken bootstrapping."""
-    code, out, calls = _run(tmp_path, "prod", SHA, prev_image="",
-                            describe_error="ERROR: Cannot find service worker (NOT_FOUND)")
+    # GCLOUD'S REAL MESSAGE, measured against gcloud 581.0.0:
+    #     ERROR: (gcloud.run.services.describe) Cannot find service [worker]
+    # An earlier version of this test invented `... (NOT_FOUND)`, which the script's pattern
+    # happened to match — so the test certified a branch that was DEAD against real gcloud.
+    # An assertion about another program's output is worth exactly what it was measured against.
+    code, out, calls = _run(
+        tmp_path, "prod", SHA, prev_image="",
+        describe_error="ERROR: (gcloud.run.services.describe) Cannot find service [worker]")
     assert code == 0, f"a genuinely absent service must still be created:\n{out}"
     assert len(_deploys(calls)) == 1
+
+
+def test_a_project_level_not_found_does_not_read_as_an_absent_service(tmp_path):
+    """`NOT_FOUND` also appears in `NOT_FOUND: Project ... not found`. Treating that as "the
+    service does not exist" would deploy over a live worker with no rollback anchor — fail-open
+    in the precise direction this guard exists to close. The pattern is scoped to a message
+    naming THIS service for that reason."""
+    code, out, calls = _run(
+        tmp_path, "prod", SHA,
+        describe_error="ERROR: (gcloud.run.services.describe) NOT_FOUND: Project pivota-typo not found")
+    assert code != 0, f"a project-level not-found must refuse, not proceed:\n{out}"
+    assert not _deploys(calls), "it deployed with no idea what was running"
+
+
+def test_the_documented_arming_command_still_reconciles(tmp_path):
+    """`WORKERS=true PAUSED=0 infra/gcp/setup_scheduler.sh prod <a> <b>` is the arming command in
+    infra/gcp/README.md, and delegating the worker deploy broke it: WORKERS reaches the child
+    through the ENVIRONMENT, so simply not naming it on the preserve branch changed nothing, the
+    child's guard exited 2, and `set -e` killed the script before ONE Cloud Run Job or Scheduler
+    trigger was reconciled.
+
+    EXECUTED, not grepped. `assert "env -u WORKERS" in code_only` passes with that string sitting
+    on the WRONG branch — verified: moving it to the apply branch restores the regression in full
+    and leaves the whole module green."""
+    binn = _gcloud_stub(tmp_path)
+    env = dict(os.environ)
+    env.update(GCLOUD=str(binn / "gcloud"), WORKERS="true", PAUSED="0",
+               CLOUDSDK_CORE_PROJECT="pivota-prod")
+    done = subprocess.run(
+        ["bash", str(REPO / "infra" / "gcp" / "setup_scheduler.sh"), "prod", SHA, "gw" + "0" * 38],
+        capture_output=True, text=True, env=env, timeout=180)
+    out = done.stdout + done.stderr
+    assert "has no effect under CONFIG=preserve" not in out, (
+        "the documented arming command died at deploy_worker.sh's WORKERS guard — the child "
+        f"inherited WORKERS from this script's environment:\n{out[-2500:]}"
+    )
+    calls = (tmp_path / "calls.log").read_text() if (tmp_path / "calls.log").exists() else ""
+    assert "run deploy worker" in calls, (
+        f"the worker was never deployed by the arming command:\n{out[-2500:]}"
+    )
 
 
 # ── one definition ─────────────────────────────────────────────────────────────────────

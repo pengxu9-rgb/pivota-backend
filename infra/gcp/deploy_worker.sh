@@ -125,7 +125,18 @@ PREV_RC=0
 PREV_IMAGE="$("$GCLOUD" run services describe worker --project "$PROJECT" --region "$REGION" \
   --format='value(spec.template.spec.containers[0].image)' 2>"$PREV_ERR")" || PREV_RC=$?
 if [ "$PREV_RC" != 0 ]; then
-  if grep -qiE 'NOT_FOUND|could not be found|does not exist|not found' "$PREV_ERR"; then
+  # MEASURED against gcloud 581.0.0, because the previous pattern here was guessed and the
+  # guess was wrong: a missing Cloud Run service produces
+  #     ERROR: (gcloud.run.services.describe) Cannot find service [worker]
+  # which matches none of NOT_FOUND / could not be found / does not exist. So the "create it"
+  # branch was DEAD for real gcloud, and a genuine first deploy would have refused.
+  #
+  # SCOPED TO THIS SERVICE ON PURPOSE. A bare `NOT_FOUND` also appears in `NOT_FOUND: Project
+  # ... not found`, and treating a mis-scoped project as "the service is absent" would deploy
+  # with no rollback anchor - fail-open in the exact direction this guard exists to close.
+  # Anything this does not recognise refuses, which is the safe direction: a first deploy is
+  # rare and attended, a blind deploy over a live worker is neither.
+  if grep -qiE 'cannot find service \[?worker\]?' "$PREV_ERR"; then
     PREV_IMAGE=""
   else
     echo "could not read the worker's current image (gcloud exited $PREV_RC):" >&2

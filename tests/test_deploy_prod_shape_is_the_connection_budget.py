@@ -201,7 +201,11 @@ def test_the_web_deploy_does_not_override_the_shape_it_is_budgeted_for() -> None
     import yaml
 
     job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["deploy"]
-    body = yaml.dump(job)
+    # Strip SHELL comments out of the dumped job. These files are heavily commented, and a
+    # future comment inside the `web` step that happens to write `MAX_INSTANCES: 20` while
+    # explaining something would fail this test with no behaviour change at all — a ratchet
+    # that cries wolf gets deleted, and then it is not guarding anything.
+    body = "\n".join(l for l in yaml.dump(job).splitlines() if "#" not in l)
     # BOTH SPELLINGS. `VAR=value cmd` inline in a `run:` and a YAML `env:` mapping
     # (`CONCURRENCY_LIMIT: 80`) reach deploy_backend.sh identically, and checking only the
     # first let the second through — restoring the shape that wedged production twice, with

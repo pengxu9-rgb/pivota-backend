@@ -68,6 +68,9 @@ _INSIGHT_REFRESH_WORKER_EXPLICIT="${INSIGHT_REFRESH_WORKER+set}"
 _STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
 _STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
 _EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
+# Did the CALLER ask for a WORKERS value, or is this the default? The summary at the end needs
+# that distinction to tell "you asked and we ignored it" from "nobody mentioned it".
+WORKERS_REQUESTED="${WORKERS-}"
 : "${CONFIG:=preserve}"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 : "${WORKERS:=false}"
@@ -838,5 +841,21 @@ if [ "$INSIGHT_REFRESH_WORKER" != true ] && [ -n "$_INSIGHT_REFRESH_WORKER_EXPLI
 fi
 
 echo
-echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=$WORKERS)"
+# REPORT WHAT WAS APPLIED, NOT WHAT WAS ASKED FOR. Under `preserve` this script does not send
+# AUDIT_WORKER_ENABLED at all - it is applied through the env file, which only `apply` writes -
+# so printing "AUDIT_WORKER_ENABLED=$WORKERS" here stated as fact something the run had not
+# done. That is worse than the crash it replaced: `WORKERS=true ... setup_scheduler.sh` used to
+# die loudly at deploy_worker.sh's guard, and briefly instead exited 0 having reconciled
+# everything while telling the operator the drainers were armed. Read the live service.
+WORKER_ARMED="$("$GCLOUD" run services describe worker --region "$REGION" \
+  --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
+  | tr ';' '\n' | grep "'AUDIT_WORKER_ENABLED'" | grep -oE "'value': '[a-z]+'" \
+  | grep -oE "'[a-z]+'$" | tr -d "'" || true)"
+echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=${WORKER_ARMED:-<unreadable>})"
+if [ "$CONFIG" != apply ] && [ -n "${WORKERS_REQUESTED:-}" ] && [ "${WORKERS_REQUESTED:-}" != "$WORKER_ARMED" ]; then
+  echo "   NOTE: you passed WORKERS=$WORKERS_REQUESTED, and CONFIG=preserve did NOT apply it." >&2
+  echo "   AUDIT_WORKER_ENABLED is still '${WORKER_ARMED:-<unreadable>}'. To change it:" >&2
+  echo "     gcloud run services update worker --region $REGION --project $PROJECT \\" >&2
+  echo "       --update-env-vars AUDIT_WORKER_ENABLED=$WORKERS_REQUESTED" >&2
+fi
 "$GCLOUD" scheduler jobs list --location "$REGION" --format="table(name.basename(),schedule,state)"
