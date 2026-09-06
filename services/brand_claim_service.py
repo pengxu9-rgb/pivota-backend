@@ -220,7 +220,7 @@ def host_matches_known(domain: Optional[str], known_hosts: Iterable[str]) -> boo
     return False
 
 
-async def _inferred_merchant_hosts(merchant_id: str) -> set:
+async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) -> set:
     """The INFERRED tier, unchanged: hosts Pivota derives from what it already
     holds — onboarding store_url/website + catalog product source/canonical
     hosts. Does NOT include pivota_canonical_url (that's Pivota's host, not the
@@ -244,6 +244,8 @@ async def _inferred_merchant_hosts(merchant_id: str) -> set:
             if h:
                 hosts.add(h)
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning("_inferred_merchant_hosts: onboarding load failed: %s", str(exc)[:200])
     try:
         rows = await database.fetch_all(
@@ -261,11 +263,15 @@ async def _inferred_merchant_hosts(merchant_id: str) -> set:
                 if h:
                     hosts.add(h)
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning("_inferred_merchant_hosts: catalog load failed: %s", str(exc)[:200])
     return hosts
 
 
-async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[str, Any]]:
+async def merchant_owned_domains_detailed(
+    merchant_id: str, *, strict: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     """B1 — the official-domain set WITH its provenance, host -> details.
 
     Two tiers, and the difference between them is the whole point of B1:
@@ -301,10 +307,19 @@ async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[st
     if not merchant_id:
         return detailed
 
-    inferred = await _inferred_merchant_hosts(merchant_id)
-    # Best-effort by construction: on any DB error this returns [], and the
-    # result degrades to exactly today's inferred set rather than to nothing.
-    stored = await mod.list_official_domains(merchant_id)
+    inferred = (
+        await _inferred_merchant_hosts(merchant_id, strict=True) if strict
+        else await _inferred_merchant_hosts(merchant_id)
+    )
+    # Best-effort by construction for REPORTS: on any DB error this returns [],
+    # and the result degrades to exactly today's inferred set rather than to
+    # nothing. A GUARD passes strict=True and gets the exception instead — an
+    # empty owned set on a DB error read as "the merchant owns nothing here",
+    # which let a declaration through onto a host it already had.
+    stored = (
+        await mod.list_official_domains(merchant_id, strict=True) if strict
+        else await mod.list_official_domains(merchant_id)
+    )
     by_domain = {str(r.get("domain") or ""): r for r in stored if r.get("domain")}
 
     def _detail(host: str, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -342,13 +357,16 @@ async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[st
     return detailed
 
 
-async def merchant_owned_domains(merchant_id: str) -> set:
+async def merchant_owned_domains(merchant_id: str, *, strict: bool = False) -> set:
     """The official-domain set as a plain set of hosts — the shape every caller
     already depends on (notably `build_authority_map(merchant_extra_hosts=...)`
     in services/agent_center_bd_report_service.py, which decides `first_party`
     on every cited host). See `merchant_owned_domains_detailed` for what changed
     behind it: the set is now asserted/verified plus inferred, minus anything
-    measured DEAD."""
+    measured DEAD. `strict=True` raises on a DB error instead of returning a
+    smaller set; see merchant_owned_domains_detailed."""
+    if strict:
+        return set(await merchant_owned_domains_detailed(merchant_id, strict=True))
     return set(await merchant_owned_domains_detailed(merchant_id))
 
 
@@ -405,6 +423,11 @@ DECLARE_NOT_REGISTRABLE = "not_a_registrable_domain"
 DECLARE_TOO_MANY = "too_many_declarations"
 DECLARE_ALREADY_KNOWN = "already_in_your_official_set"
 DECLARE_WRITE_FAILED = "write_failed"
+# The owned-set read failed, so the question "does the merchant already have
+# this host" could not be answered. Refused — NOT "taken", which would tell the
+# merchant a rival owns their domain, and NOT granted, which is the fail-open
+# downgrade this status exists to prevent. The route maps it to 503.
+DECLARE_UNAVAILABLE = "official_set_unavailable"
 
 # A merchant with more than this many unproven declarations is not filling in a
 # second storefront, and each row is a free write that later readers must skip.
@@ -475,13 +498,20 @@ async def declare_official_domain(
 
     # Already proven for THIS merchant: declaring adds nothing and must not
     # downgrade a verified row to an unproven one.
+    # STRICT, and refused on failure. The default `list_official_domains`
+    # swallows its own errors and returns [], so `existing = {}` here meant the
+    # ALREADY_PROVEN check and the cap were both skipped on a DB blip, and the
+    # write below then flipped a VERIFIED row to declared/pending. The two
+    # ownership lookups above deliberately fail closed; this one did not.
     try:
         existing = {
             str(r.get("domain") or ""): r
-            for r in (await mod.list_official_domains(merchant_id) or [])
+            for r in (await mod.list_official_domains(merchant_id, strict=True) or [])
         }
-    except Exception:  # noqa: BLE001
-        existing = {}
+    except Exception:  # noqa: BLE001 — fails CLOSED
+        logger.warning("declare_official_domain stored-set load failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
     row = existing.get(host)
     if row and str(row.get("source") or "") in mod.OFFICIAL_SOURCES:
         return {"status": DECLARE_ALREADY_PROVEN, "domain": host,
@@ -506,11 +536,11 @@ async def declare_official_domain(
     # A declaration can therefore only ever create a genuinely NEW host, and
     # `declared` rows and the used set stay disjoint by construction.
     try:
-        already = await merchant_owned_domains(str(merchant_id))
-    except Exception:  # noqa: BLE001 — fails CLOSED like the lookups above
+        already = await merchant_owned_domains(str(merchant_id), strict=True)
+    except Exception:  # noqa: BLE001 — fails CLOSED, and says so
         logger.warning("declare_official_domain owned-set load failed for %s",
                        host, exc_info=True)
-        return {"status": DECLARE_TAKEN, "domain": host}
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
     if host in already:
         return {"status": DECLARE_ALREADY_KNOWN, "domain": host}
 
@@ -526,31 +556,31 @@ async def declare_official_domain(
         return {"status": DECLARE_TOO_MANY, "domain": host,
                 "declared_count": declared_count}
 
-    ok = False
+    # INSERT-ONLY, never the upsert. The upsert's `source = excluded.source`
+    # is the lever behind every downgrade this function has had to guard
+    # against; `insert_declared_domain` cannot overwrite a row of any other
+    # source, so a guard that raced or failed still cannot damage the set. It
+    # writes PENDING, not VERIFIED: stamping an unproven row verified would
+    # make it indistinguishable from a proven one in every later read.
     try:
-        ok = await mod.upsert_official_domain(
-            merchant_id=merchant_id,
-            domain=host,
-            source=mod.SOURCE_DECLARED,
-            # PENDING, not VERIFIED. record_official_domain hardcodes VERIFIED
-            # because both of its sources mean control was proven; this one does
-            # not, and stamping it verified would make an unproven row
-            # indistinguishable from a proven one in every later read.
-            verification_status=mod.VERIFICATION_PENDING,
-        )
+        landed = await mod.insert_declared_domain(merchant_id=merchant_id, domain=host)
     except Exception:  # noqa: BLE001
         logger.warning("declare_official_domain write failed for %s/%s",
                        merchant_id, host, exc_info=True)
         return {"status": DECLARE_WRITE_FAILED, "domain": host}
-
-    return {
+    if landed is None:
         # A FAILED WRITE IS NOT A BAD HOSTNAME. Returning INVALID_HOST here is
         # how the missing migration presented as "domain must be a valid public
         # hostname": the feature could not store anything and told the merchant
-        # their own valid domain was the problem. `upsert_official_domain` is
-        # best-effort and returns False on a swallowed DB error, so ok=False
-        # means OUR failure, not theirs.
-        "status": DECLARE_OK if ok else DECLARE_WRITE_FAILED,
+        # their own valid domain was the problem.
+        return {"status": DECLARE_WRITE_FAILED, "domain": host}
+    if landed != mod.SOURCE_DECLARED:
+        # Lost a race with a claim or a sweep that wrote the row first. Nothing
+        # was overwritten — that is the point of the INSERT-ONLY statement.
+        return {"status": DECLARE_ALREADY_PROVEN, "domain": host, "source": landed}
+
+    return {
+        "status": DECLARE_OK,
         "domain": host,
         "source": mod.SOURCE_DECLARED,
         "counts_toward_official_set": False,

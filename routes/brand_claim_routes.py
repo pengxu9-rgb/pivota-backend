@@ -117,6 +117,15 @@ async def declare_official_domain(
                 "before adding more"
             ),
         )
+    if status == svc.DECLARE_UNAVAILABLE:
+        # 503: the owned-set read failed, so whether the merchant already has
+        # this host could not be answered. Refusing is the only safe answer —
+        # granting here is how a verified row could be downgraded — and it is
+        # OUR outage, so neither 4xx nor "taken".
+        raise HTTPException(
+            status_code=503,
+            detail="could not read your official-domain set; retry shortly",
+        )
     if status == svc.DECLARE_WRITE_FAILED:
         # 500, and explicitly NOT 422: the hostname was fine, the write was
         # not. Answering 422 here is how a missing migration presented as

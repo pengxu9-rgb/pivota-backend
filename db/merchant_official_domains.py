@@ -152,6 +152,10 @@ merchant_official_domains = Table(
     ),
     Index("idx_merchant_official_domains_merchant", "merchant_id", "source"),
     Index("idx_merchant_official_domains_liveness_due", "last_checked_at"),
+    # The cross-tenant proof lookup (PROVEN_BY_OTHER_SQL) leads with `domain`, and no
+    # other index does: measured as a Seq Scan removing 50k rows at 50k rows. Two such
+    # scans per unrate-limited authenticated declare call.
+    Index("idx_merchant_official_domains_domain", "domain"),
     extend_existing=True,
 )
 
@@ -204,6 +208,8 @@ _DDL_STATEMENTS = [
     "ON merchant_official_domains (merchant_id, source);",
     "CREATE INDEX IF NOT EXISTS idx_merchant_official_domains_liveness_due "
     "ON merchant_official_domains (last_checked_at);",
+    "CREATE INDEX IF NOT EXISTS idx_merchant_official_domains_domain "
+    "ON merchant_official_domains (domain);",
 ]
 
 _DDL_LABEL = "ensure_merchant_official_domains_table"
@@ -276,6 +282,26 @@ ON CONFLICT (merchant_id, domain) DO UPDATE SET
                                    merchant_official_domains.last_checked_at),
     is_primary          = excluded.is_primary,
     updated_at          = excluded.updated_at
+"""
+
+# The DECLARED write. INSERT-ONLY: a declaration is the weakest source there is,
+# so it must never overwrite a row of any other source — `source =
+# excluded.source` in the upsert above is exactly the lever that flipped an
+# inferred row to `declared` (blinding the liveness sweep) and could flip a
+# verified row to declared/pending when the owned-set read failed open. The
+# guards in declare_official_domain run first; this statement makes the guard
+# unnecessary for CORRECTNESS and leaves it only for a better error message.
+# `databases` returns no rowcount on Postgres, so the caller re-reads the row
+# to learn whether it was ours.
+INSERT_DECLARED_DOMAIN_SQL = """
+INSERT INTO merchant_official_domains (
+    merchant_id, domain, source, verification_status,
+    liveness_status, last_checked_at, is_primary, created_at, updated_at
+) VALUES (
+    :merchant_id, :domain, :source, :verification_status,
+    'unchecked', NULL, FALSE, :now, :now
+)
+ON CONFLICT (merchant_id, domain) DO NOTHING
 """
 
 # The liveness sweep's write. It touches ONLY the liveness columns: a probe
@@ -426,6 +452,37 @@ async def upsert_official_domain(
         return False
 
 
+
+async def insert_declared_domain(*, merchant_id: str, domain: str) -> Optional[str]:
+    """Write a `declared` row IF AND ONLY IF the merchant has no row for the host.
+
+    Returns the row's source afterwards — `declared` when this write created it,
+    the pre-existing source when a row was already there (nothing was touched),
+    or None when the row cannot be read back. RAISES on a DB error: this is the
+    one write in the module whose caller must not mistake "could not write" for
+    "wrote", because it answers a merchant-facing request with a status code.
+    """
+    if not merchant_id or not domain:
+        return None
+    await ensure_merchant_official_domains_table()
+    stamp = _now_utc()
+    await database.execute(
+        INSERT_DECLARED_DOMAIN_SQL,
+        {
+            "merchant_id": merchant_id,
+            "domain": domain,
+            "source": SOURCE_DECLARED,
+            "verification_status": VERIFICATION_PENDING,
+            "now": stamp,
+        },
+    )
+    row = await database.fetch_one(
+        "SELECT source FROM merchant_official_domains "
+        "WHERE merchant_id = :merchant_id AND domain = :domain",
+        {"merchant_id": merchant_id, "domain": domain},
+    )
+    return str(row["source"]) if row is not None and row["source"] else None
+
 async def resolve_verified_merchant_for_domain(domain: str) -> Optional[str]:
     """The merchant that has PROVEN this domain is theirs, or None.
 
@@ -553,10 +610,22 @@ async def domain_is_proven_by_other_merchant(
     return row is not None
 
 
-async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
+async def list_official_domains(
+    merchant_id: str, *, strict: bool = False,
+) -> List[Dict[str, Any]]:
     """Every stored row for the merchant — including `dead` ones, which the
     caller filters. Returning them lets a report say WHY a host it once counted
-    is gone, which dropping them here would make impossible."""
+    is gone, which dropping them here would make impossible.
+
+    Best-effort by default: a DB error logs and returns [], so a report
+    degrades to the inferred set rather than to nothing. `strict=True` RAISES
+    instead. A GUARD must use strict: `declare_official_domain` asks this
+    function "does the merchant already own this host", and an empty answer on
+    a DB error read as "no" — so the declaration went through, and the upsert's
+    `source = excluded.source` downgraded a VERIFIED row to declared/pending.
+    Failing open in a reader is a degraded report; failing open in a guard is a
+    write that should not have happened.
+    """
     if not merchant_id:
         return []
     await ensure_merchant_official_domains_table()
@@ -566,6 +635,8 @@ async def list_official_domains(merchant_id: str) -> List[Dict[str, Any]]:
         )
         return [dict(r) for r in rows or []]
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning(
             "list_official_domains failed for %s: %s", merchant_id, str(exc)[:200]
         )
