@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from services import storefront_currency
+
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness
 
@@ -54,51 +56,60 @@ async def fetch_shopify_shop_locale(
     *,
     timeout_s: float = 10.0,
 ) -> Dict[str, Optional[str]]:
-    """Read a Shopify storefront's own currency and country from `/meta.json`.
+    """The storefront's own currency/country, via the module that already reads /meta.json.
 
     `/products.json` carries prices but NEVER the currency they are in, so every record this
     module built was currency-less and the ingest lane stamped USD on all of them. Measured
-    2026-09-06: jsmbeauty.sg prices its LIP-PRESSION Glowy Tint at 3000 minor = SGD 30.00, and
+    2026-09-06: jsmbeauty.sg prices LIP-PRESSION Glowy Tint at 3000 minor = SGD 30.00, and
     ingesting it through that lane wrote USD 30.
 
-    `/meta.json` is the storefront's own answer (`{"currency": "SGD", "country": "SG", ...}`),
-    served by the same Shopify surface as products.json. Verified on 7 storefronts: the 5
-    Singapore doors return SGD/SG, and flowerbeauty.com + maccosmetics.com return USD/US — so
-    reading it is a NO-OP for every brand already indexed.
+    DELEGATES to `services.storefront_currency.fetch_storefront_meta` rather than fetching here.
+    A first draft of this function was a second, uncached reader of the same endpoint -- which is
+    why a THIRD gated fetch had to be registered in this file's crawl-politeness budget. That
+    module already validates the currency, caches per domain for the process lifetime, and is the
+    place this knowledge belongs.
 
-    MERCHANT-CONTROLLED, so both values are shape-validated before they are believed: ISO-4217
-    alpha-3 and ISO-3166 alpha-2, uppercased. Anything else -> None, and the caller falls back to
-    its own default rather than writing a merchant's free text into a currency column (VARCHAR(8)
-    upstream, and a currency is a join key for price comparison). Best-effort throughout: a
-    non-Shopify host, a 404, or a non-JSON body returns {} and the caller keeps its default.
+    The politeness gate is preserved by injecting the fetch: `fetch_storefront_meta` takes a
+    `fetch` seam precisely so a caller can supply its own transport, so the shared gate still sees
+    every request this crawl lane makes against a merchant host.
+
+    ONLY `currency` IS RETURNED FOR THE WRITE PATH's use. `storefront_currency`'s own docstring
+    records why: "`market` and `currency` are different axes (destination served vs store base
+    currency) -- a KR/HK exporter legitimately prices in USD". `country` is passed through for
+    callers that want the storefront's home, never as a synonym for the market an offer serves.
     """
     host = _clean_domain(domain)
     if not host:
-        return {"currency": None, "market": None}
-    url = f"https://{host}/meta.json"
-    timeout = httpx.Timeout(timeout_s, connect=5.0)
-    headers = {"User-Agent": _UA, "Accept": "application/json"}
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
-            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
-            resp = await client.get(url)
-            crawl_politeness.note_response(
-                url, resp.status_code, retry_after=resp.headers.get("retry-after")
-            )
-            if resp.status_code != 200:
-                return {"currency": None, "market": None}
-            if "application/json" not in (resp.headers.get("content-type") or ""):
-                return {"currency": None, "market": None}
-            body = resp.json()
-    except Exception:
-        return {"currency": None, "market": None}
-    if not isinstance(body, dict):
-        return {"currency": None, "market": None}
-    cur = str(body.get("currency") or "").strip().upper()
-    mkt = str(body.get("country") or "").strip().upper()
+        return {"currency": None, "country": None}
+
+    async def _gated_fetch(url: str) -> Optional[str]:
+        headers = {"User-Agent": _UA, "Accept": "application/json"}
+        timeout = httpx.Timeout(timeout_s, connect=5.0)
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as client:
+                await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+                resp = await client.get(url)
+                crawl_politeness.note_response(
+                    url, resp.status_code, retry_after=resp.headers.get("retry-after")
+                )
+                if resp.status_code != 200:
+                    return None
+                if "application/json" not in (resp.headers.get("content-type") or ""):
+                    return None
+                return resp.text
+        except Exception:
+            return None
+
+    meta = await storefront_currency.fetch_storefront_meta(host, fetch=_gated_fetch)
+    if not isinstance(meta, dict):
+        return {"currency": None, "country": None}
+    cur = str(meta.get("currency") or "").strip().upper()
+    country = str(meta.get("country") or "").strip().upper()
     return {
         "currency": cur if _ISO_CURRENCY.match(cur) else None,
-        "market": mkt if _ISO_COUNTRY.match(mkt) else None,
+        "country": country if _ISO_COUNTRY.match(country) else None,
     }
 
 
@@ -964,7 +975,7 @@ async def records_for_brand(
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand,
             emit_variants=base_listings_only,
-            currency=locale.get("currency"), market=locale.get("market"),
+            currency=locale.get("currency"), market=locale.get("country"),
         )
         if not rec:
             continue

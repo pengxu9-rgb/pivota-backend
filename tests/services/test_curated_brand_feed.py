@@ -697,6 +697,17 @@ async def test_records_for_brand_enrich_skips_when_body_html_has_inci(monkeypatc
 
 
 
+def _clear_locale_cache():
+    """`storefront_currency` caches per domain for the PROCESS lifetime, negatives included.
+
+    Without this, the first test to record a None for a host fixes that answer for every later
+    test -- and the assertions would then be measuring the cache, not the code.
+    """
+    from services import storefront_currency
+
+    storefront_currency.clear_cache()
+
+
 def _silence_politeness(monkeypatch):
     """Neutralise the shared crawl politeness gate for a unit test.
 
@@ -741,15 +752,18 @@ def test_a_record_from_a_storefront_we_could_not_read_carries_no_currency():
 @pytest.mark.parametrize(
     "body,expected",
     [
-        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD", "market": "SG"}),
-        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD", "market": "SG"}),
-        ({"currency": "USD", "country": "US"}, {"currency": "USD", "market": "US"}),
+        ({"currency": "SGD", "country": "SG"}, {"currency": "SGD", "country": "SG"}),
+        ({"currency": "sgd", "country": "sg"}, {"currency": "SGD", "country": "SG"}),
+        ({"currency": "USD", "country": "US"}, {"currency": "USD", "country": "US"}),
         # merchant-controlled: anything not ISO-shaped is refused, not written through
-        ({"currency": "dollars", "country": "SG"}, {"currency": None, "market": "SG"}),
-        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD", "market": None}),
-        ({"currency": 5, "country": None}, {"currency": None, "market": None}),
-        ({}, {"currency": None, "market": None}),
-        ([], {"currency": None, "market": None}),
+        # An unparseable currency invalidates the WHOLE record, country included:
+        # `storefront_currency` returns None rather than half an answer, because it "returns None
+        # when it cannot prove the answer". Asserted as its behaviour, not worked around.
+        ({"currency": "dollars", "country": "SG"}, {"currency": None, "country": None}),
+        ({"currency": "SGD", "country": "SGP"}, {"currency": "SGD", "country": None}),
+        ({"currency": 5, "country": None}, {"currency": None, "country": None}),
+        ({}, {"currency": None, "country": None}),
+        ([], {"currency": None, "country": None}),
     ],
 )
 @pytest.mark.asyncio
@@ -761,6 +775,15 @@ async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, e
     class _Resp:
         status_code = 200
         headers = {"content-type": "application/json"}
+
+        # TEXT, not .json(). `fetch_storefront_meta`'s injected-fetch seam consumes the response
+        # BODY as a string and parses it itself, so a double exposing only .json() returns None
+        # for every case and the parametrisation silently tests nothing.
+        @property
+        def text(self):
+            import json as _j
+
+            return _j.dumps(body)
 
         def json(self):
             return body
@@ -780,6 +803,7 @@ async def test_meta_json_is_validated_before_it_is_believed(monkeypatch, body, e
     # stub answers robots.txt with JSON and the function under test never runs. It has its own
     # tests; this one is about the meta.json contract.
     _silence_politeness(monkeypatch)
+    _clear_locale_cache()
     assert await cbf.fetch_shopify_shop_locale("jsmbeauty.sg") == expected
 
 
@@ -801,7 +825,8 @@ async def test_an_unreadable_meta_json_is_best_effort_not_an_exception(monkeypat
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Boom())
     _silence_politeness(monkeypatch)
-    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "market": None}
+    _clear_locale_cache()
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "country": None}
 
 
 @pytest.mark.asyncio
@@ -817,7 +842,7 @@ async def test_records_for_brand_wires_the_locale_into_every_record(monkeypatch)
         return [_product()]
 
     async def _locale(domain, **kw):
-        return {"currency": "SGD", "market": "SG"}
+        return {"currency": "SGD", "country": "SG"}
 
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
@@ -841,7 +866,7 @@ async def test_records_for_brand_reads_the_locale_once_per_brand_not_once_per_pr
 
     async def _locale(domain, **kw):
         calls.append(domain)
-        return {"currency": "SGD", "market": "SG"}
+        return {"currency": "SGD", "country": "SG"}
 
     monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
     monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
@@ -873,6 +898,10 @@ async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, st
         status_code = status
         headers = {"content-type": ctype}
 
+        @property
+        def text(self):
+            return '{"currency": "XXX", "country": "ZZ"}'
+
         def json(self):
             return {"currency": "XXX", "country": "ZZ"}
 
@@ -888,5 +917,6 @@ async def test_meta_json_refuses_anything_that_is_not_a_json_200(monkeypatch, st
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
     _silence_politeness(monkeypatch)
+    _clear_locale_cache()
 
-    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "market": None}, label
+    assert await cbf.fetch_shopify_shop_locale("x.com") == {"currency": None, "country": None}, label

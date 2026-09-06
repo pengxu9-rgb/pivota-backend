@@ -537,6 +537,14 @@ def _market_of(pdp_payload: Dict[str, Any], fallback: str = DEFAULT_MARKET) -> s
 
     `_build_seed_inserts` already had `market: str = "US"` -- a parameter NO caller has ever
     passed, so every seed row in the index says US regardless of where the storefront sells.
+
+    SEEDS ONLY, deliberately. `catalog_offers.market` is NOT written from this: it is a different
+    axis from the store's home country -- destination served vs store base currency -- and
+    `services/storefront_currency.py` records why equating them destroys real inventory (a KR/HK
+    exporter legitimately prices in USD, and stamping market=KR beside currency=USD manufactures
+    a `_run_market_currency_disagreement` violation out of honest data). A seed carries the
+    storefront's own market because that is what a seed IS; an offer's serving region is decided
+    by its CURRENCY, which `has_offer_priced_for_region_sql` is the single source of truth for.
     """
     raw = str((pdp_payload or {}).get("market") or "").strip().upper()
     return raw if _ISO_MARKET.match(raw) else fallback
@@ -797,7 +805,6 @@ def _build_offer_inserts(
     offers: List[Dict[str, Any]],
     source_domain: Optional[str] = None,
     currency: str = DEFAULT_CURRENCY,
-    market: str = DEFAULT_MARKET,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
@@ -836,13 +843,6 @@ def _build_offer_inserts(
             "availability": availability,
             "inventory_quantity": 999 if offer.get("in_stock") else 0,
             "currency": currency,
-            # WRITTEN, not left to the column's `server_default 'US'`. Two reasons, both real:
-            # `catalog_invariant_checks._run_market_currency_disagreement` compares this against
-            # REGION_PRICING_CURRENCY[market], so a correctly-stamped SGD offer sitting on the
-            # default 'US' is a counted violation; and `backfill_offer_market_currency.py`, the
-            # only tool that repairs this column, guards on `currency = 'USD'` -- so a row we
-            # stamp SGD while leaving market 'US' can never be corrected by it.
-            "market": market,
             "list_price": price_value,
             "merchant_effective_price": price_value,
             "estimated_best_price": price_value,
@@ -958,7 +958,6 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         # Resolved HERE because this builder is the one consumer without the pdp payload in
         # scope; passing the payload just to read one field would widen its interface.
         currency=_currency_of(pdp_payload),
-        market=_market_of(pdp_payload),
     )
     # Real variants ride beside the canonical SKU: one SKU + one offer each,
     # priced and stocked per variant, at the brand-direct destination.
@@ -986,7 +985,6 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 # USD variant offer keeps the whole product on the US surface, now serving SGD
                 # amounts labelled USD. Measured on a 3-shade SGD line: offers {SGD: 1, USD: 3}.
                 currency=_currency_of(pdp_payload),
-                market=_market_of(pdp_payload),
             ))
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],

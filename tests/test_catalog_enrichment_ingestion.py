@@ -909,8 +909,16 @@ def test_seed_variants_are_bounded():
 
 
 
-def _seed_variant_currencies(out):
-    """Currencies on the variants nested inside every seed's `seed_data`."""
+def _seed_variant_currencies(out, key=None):
+    """Currencies on the variants nested inside every seed's `seed_data`.
+
+    With no `key`, computes what the SERVING lane computes:
+    `v.get("price_currency") or v.get("currency")` (routes/agent_api.py). Asserting only
+    `currency` measures the surface the code reaches SECOND -- a mutant flipping `price_currency`
+    alone survived a full review round for exactly that reason. The synthetic canonical variant
+    legitimately sets only `currency`, which is what that `or` is for, so the effective value is
+    the honest assertion for both branches.
+    """
     import json as _json
 
     found = set()
@@ -919,7 +927,7 @@ def _seed_variant_currencies(out):
         if isinstance(data, str):
             data = _json.loads(data)
         for v in (data or {}).get("variants") or []:
-            found.add(v.get("currency"))
+            found.add(v.get(key) if key else (v.get("price_currency") or v.get("currency")))
     return found
 
 
@@ -956,8 +964,10 @@ def test_a_storefronts_own_currency_reaches_every_row_it_prices():
     # which is exactly the shape the eighth site produced: {SGD: 1, USD: 3}.
     assert len(out["offers"]) >= 4, "the fixture must produce variant offers, not just canonical"
     assert {o["currency"] for o in out["offers"]} == {"SGD"}
-    assert {o["market"] for o in out["offers"]} == {"SG"}
     assert out["sku"]["currency"] == "SGD"
+    # THE VARIANT SKUs. Nothing else reads this column, which is exactly why a mutant flipping it
+    # to "USD" survived two review rounds: no assertion reached it.
+    assert {v["currency"] for v in out["variant_skus"]} == {"SGD"}
     assert {s["price_currency"] for s in out["seeds"]} == {"SGD"}
     assert {s["market"] for s in out["seeds"]} == {"SG"}
     # The seed's NESTED variant list, which is a separate site from every row above and was the
@@ -989,7 +999,6 @@ def test_a_record_with_no_currency_is_still_USD_and_US():
     out = ingest_validated_record(_record())
 
     assert {o["currency"] for o in out["offers"]} == {"USD"}
-    assert {o["market"] for o in out["offers"]} == {"US"}
     assert out["sku"]["currency"] == "USD"
     assert {s["price_currency"] for s in out["seeds"]} == {"USD"}
     assert {s["market"] for s in out["seeds"]} == {"US"}
@@ -1032,3 +1041,91 @@ def test_market_prefers_the_record_over_the_callers_default():
     assert _market_of({}, "US") == "US"
     assert _market_of({"market": "SGP"}, "US") == "US"      # alpha-3 is not alpha-2
     assert _market_of({"market": None}, "JP") == "JP"
+
+
+def test_the_synthetic_canonical_variant_also_carries_the_storefronts_currency():
+    """A product with FEWER THAN TWO real variants takes the synthetic-canonical branch instead
+    of the real-variant loop, and they are different code with their own currency literal.
+
+    Adding `variants` to `_sgd_record` closed the real-variant gap and REMOVED this one -- net
+    coverage moved sideways. Both branches now have a fixture.
+    """
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    out = ingest_validated_record(_sgd_record(variants=[]))
+
+    assert _seed_variant_currencies(out) == {"SGD"}
+    assert {o["currency"] for o in out["offers"]} == {"SGD"}
+
+
+# -- the offer upsert SQL itself ---------------------------------------------------------------
+# The whole apply.py contribution of the currency change went untested for two review rounds. A
+# mutant that dropped one bind while keeping its column produced a 21-column / 20-value INSERT --
+# a hard runtime failure on the core catalog write path -- with the entire suite green, because
+# every unit test drives a fake DB that never parses the statement.
+
+
+def _insert_columns_and_binds(sql):
+    """The INSERT column list and the VALUES bind list, as parallel sequences."""
+    import re as _re
+
+    cols = _re.search(r"INSERT INTO catalog_offers\s*\((.*?)\)\s*VALUES", sql, _re.S).group(1)
+    vals = _re.search(r"VALUES\s*\((.*?)\)\s*ON CONFLICT", sql, _re.S).group(1)
+    col_names = [c.strip() for c in cols.split(",") if c.strip()]
+    bind_names = []
+    for v in vals.split(","):
+        v = v.strip()
+        m = _re.search(r":([a-z_]+)", v)      # survives CAST(:x AS jsonb)
+        if m:
+            bind_names.append(m.group(1))
+    return col_names, bind_names
+
+
+def test_the_offer_upsert_columns_and_binds_line_up():
+    """A column with no bind (or the reverse) is a runtime error on every ingest, and no fake-DB
+    test can see it. Asserted positionally, not just by count, so a swap is caught too."""
+    from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL
+
+    cols, binds = _insert_columns_and_binds(_OFFER_UPSERT_SQL)
+
+    assert len(cols) == len(binds), f"{len(cols)} columns vs {len(binds)} binds"
+    assert cols == binds, [c for c, b in zip(cols, binds) if c != b]
+
+
+def test_every_offer_row_the_builder_makes_supplies_every_bind():
+    """The other half: the SQL and the row dict must agree. A bind the builder never emits is the
+    same runtime failure from the opposite direction."""
+    from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_record
+
+    _, binds = _insert_columns_and_binds(_OFFER_UPSERT_SQL)
+    offers = ingest_validated_record(_sgd_record())["offers"]
+
+    assert offers
+    for row in offers:
+        missing = [b for b in binds if b not in row]
+        assert not missing, f"offer row is missing binds the SQL requires: {missing}"
+
+
+def test_re_ingesting_a_storefront_can_CORRECT_its_currency():
+    """`derive_offer_id` is stable, so re-ingesting an already-indexed store takes the ON CONFLICT
+    arm. Without `currency = EXCLUDED.currency` there, a store whose real currency we have only
+    just learned keeps the USD the first ingest guessed -- and since
+    `has_offer_priced_for_region_sql` tests CURRENCY, that stale row stays on the US surface. The
+    fix would then reach brand-new offer_ids only, which is the half-migration this change exists
+    to end."""
+    from services.catalog_enrichment_agent.apply import _OFFER_UPSERT_SQL
+
+    import re as _re
+
+    # COMMENTS STRIPPED FIRST. The arm explains in prose why `market` is excluded, so a naive
+    # substring check matches the comment and asserts nothing about the statement -- it failed
+    # for exactly that reason before this line existed.
+    arm = _OFFER_UPSERT_SQL.split("DO UPDATE SET", 1)[1]
+    update_arm = "\n".join(
+        _re.sub(r"--.*$", "", line) for line in arm.splitlines()
+    )
+
+    assert "currency = EXCLUDED.currency" in update_arm
+    # market is a DIFFERENT AXIS and this lane does not own it -- see services/storefront_currency.py
+    assert "market" not in update_arm
