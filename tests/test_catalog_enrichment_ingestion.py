@@ -899,3 +899,278 @@ def test_seed_variants_are_bounded():
     ]
     variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
     assert len(variants) == ing.MAX_SEED_VARIANTS
+
+
+def test_seed_variants_announce_the_axis_they_vary_on():
+    """WHY THIS EXISTS. Real variant identity (#2073) was necessary and not
+    sufficient. The renderer already exposed the variant LIST — a variant with a
+    non-placeholder title is enough for that — but it renders the SELECTOR only
+    when a variant announces what it VARIES ON, reading `options` first and an
+    explicit `display_label` second. #2073's seven real MAC shades carried
+    neither, so they arrived as an unlabelled list with no way to pick one
+    (measured against the deployed gateway 2026-09-05: 0 of 3 displayable).
+
+    The renderer additionally demands visual evidence on a shade axis, which the
+    per-variant image_url supplies."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Color"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+
+    assert [v["options"] for v in variants] == [
+        [{"name": "Color", "value": "Ruby Woo"}],
+        [{"name": "Color", "value": "Bronx"}],
+        [{"name": "Color", "value": "Dangerous"}],
+    ]
+    # the shade axis is only displayable WITH visual evidence
+    assert all(v["image_url"] for v in variants)
+
+
+def test_a_variant_with_no_option_name_gets_no_axis_invented_for_it():
+    """`_build_seed_inserts` runs on ANY record with two or more variants, not
+    only folded shade lines — `run_catalog_enrichment ingest` feeds it
+    hand-validated JSONL. Guessing "Shade" there published a volume axis as
+    "Shade: 30 ml". Only the fold knows the axis, and it always names it."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    rec["pdp"]["variants"][0]["title"] = "30 ml"
+    rec["pdp"]["variants"][1]["title"] = "50 ml"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"] for v in variants] == [[], []]
+    # the variants still SERVE — they are just an unlabelled list, as before
+    assert [v["title"] for v in variants] == ["30 ml", "50 ml"]
+
+
+def test_an_axis_that_cannot_tell_two_variants_apart_is_dropped_entirely():
+    """`option1` is only the FIRST axis. A lip gloss sold Full/Pink and
+    Full/Sample yields two variants both labelled "Size: Full" — a picker with
+    indistinguishable entries, which is a wrong page where there was previously
+    a bare list. The per-element product-name check cannot see this."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Size"
+    rec["pdp"]["variants"][0]["title"] = "Full"
+    rec["pdp"]["variants"][1]["title"] = "Full"
+    rec["pdp"]["variants"][2]["title"] = "Travel"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"] for v in variants] == [[], [], []]
+
+
+def test_a_distinguishing_axis_survives_the_aggregate_check():
+    """The positive counterpart — the drop must not fire on a healthy product."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Shade"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"][0]["value"] for v in variants] == ["Ruby Woo", "Bronx", "Dangerous"]
+
+
+def test_a_placeholder_shade_yields_no_option_pair():
+    """"Default Title" is what a shop with no option axis returns. Rendered as a
+    selector it would read the same on every entry, which is worse than none."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Shade"
+    rec["pdp"]["variants"][0]["title"] = "Default Title"
+    # variant 1 keeps its REAL shade, so the placeholder filter is the only thing
+    # that can produce an unlabelled product here
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"] for v in variants] == [[], []]
+    # ...and both rows are still served — dropping a LABEL never drops a variant
+    assert [v["title"] for v in variants] == ["Default Title", "Bronx"]
+
+
+def test_a_shade_equal_to_the_product_name_yields_no_option_pair():
+    """The mapper falls back to the product title when option1 is absent. A
+    selector reading "Shade: Retro Matte Lipstick" names no choice."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Shade"
+    rec["pdp"]["variants"][0]["title"] = "retro matte LIPSTICK"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    # ...and because that leaves the product only PARTLY labelled, the rest go too
+    assert [v["options"] for v in variants] == [[], []]
+
+
+def test_the_synthetic_canonical_variant_gains_no_options():
+    """The non-folding lanes must stay byte-identical: one synthetic variant
+    named for the product, carrying no axis."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    variants = json.loads(
+        ing.ingest_validated_record(_variant_record(1))["seeds"][0]["seed_data"]
+    )["variants"]
+    assert len(variants) == 1
+    assert "options" not in variants[0]
+
+
+def test_seed_data_does_not_publish_the_brands_onboarding_category():
+    """A DELIBERATE OMISSION. The deployed renderer keyword-matches the seed's own
+    category and tags to decide whether a shade axis is allowed, so writing them
+    would carry the axis on products whose title says nothing cosmetic. It is the
+    wrong fix: `category_path` on this lane is a PER-BRAND constant threaded from
+    the onboarding row (`{"domain": "kosas.com", "category_path": "beauty/makeup"}`),
+    so every product of a brand would claim "makeup" — publishing a fragrance's
+    scents and a cleanser's sizes as shades, with a swatch demanded for each.
+
+    It also reaches much further than the axis: `brand_category` is a binary
+    component of the servability quality score, so minting a category out of a
+    brand-wide path moves rows across the 71.4 gate on a value that describes the
+    onboarding cohort rather than the product.
+
+    A real per-product category belongs here; the brand's path does not.
+    """
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    rec["pdp"]["tags"] = ["complexion"]
+    seed = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])
+    assert "category" not in seed
+    assert "tags" not in seed
+    assert seed["category_path"] == "beauty/makeup"   # unchanged for existing readers
+
+
+def test_a_partly_labelled_product_loses_every_label():
+    """The renderer shows a picker as soon as ONE variant is displayable, and
+    lists only the displayable ones. A base whose own variants sit on an axis the
+    renderer does not recognise, with shades folded in beside them, rendered a
+    shade picker offering 1 of 3 purchasable variants — the other two titled
+    "Default". Before this lane wrote any options that product showed nothing, so
+    a partial labelling is a regression, not a partial win."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    rec["pdp"]["variants"][0]["option_name"] = "Shade"
+    rec["pdp"]["variants"][1]["option_name"] = ""       # the base's own, unnamed axis
+    rec["pdp"]["variants"][2]["option_name"] = ""
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"] for v in variants] == [[], [], []]
+    # ...and every variant still SERVES, exactly as it did before any axis was named
+    assert [v["title"] for v in variants] == ["Ruby Woo", "Bronx", "Dangerous"]
+
+
+def test_a_product_on_two_axes_is_not_labelled_at_all():
+    """We cannot label our way out of this from here. The renderer accepts a
+    SHADE axis only on a product its own keyword gate reads as cosmetic, and
+    drops the option otherwise — so on a foundation sold in two sizes with shades
+    folded in, it keeps "Size", drops the shades, and renders a picker offering 2
+    of 4. Emitting one axis per product is what makes that call all-or-nothing."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    rec["pdp"]["variants"][0]["option_name"] = "Size"
+    rec["pdp"]["variants"][1]["option_name"] = "Size"
+    rec["pdp"]["variants"][2]["option_name"] = "Shade"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"] for v in variants] == [[], [], []]
+
+
+def test_a_single_axis_product_keeps_its_labels():
+    """The positive counterpart — the single-axis rule must not fire on the very
+    shape this lane exists to serve."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Shade"
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"][0]["name"] for v in variants] == ["Shade", "Shade", "Shade"]
+
+
+@pytest.mark.parametrize("placeholder", ["Default", "Default Title", "Title", "Variant",
+                                         "Single Item", "One Size", "N/A", "n/a", "  default  "])
+def test_every_placeholder_shade_value_yields_no_pair(placeholder):
+    """`_PLACEHOLDER_SHADE_VALUES` was pinned at 1 of its 7 entries — the other
+    six could be deleted with the suite still green."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Shade"
+    rec["pdp"]["variants"][0]["title"] = placeholder
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    # unlabelled + labelled is a partial labelling, so the whole product drops
+    assert [v["options"] for v in variants] == [[], []]
+
+
+def test_the_mapper_and_the_ingestion_agree_on_the_seam_between_them():
+    """END TO END, no hand-written record. The two modules each hardcode the
+    string `option_name` independently, and nothing executed the seam — renaming
+    one side is caught, but the contract itself was never run. This repo has a
+    history of cross-module string contracts breaking in exactly that gap."""
+    from services.catalog_enrichment_agent import ingestion as ing
+    from services.curated_brand_feed import fold_shade_listings, shopify_product_to_record
+
+    def prod(**over):
+        base = {"title": "T", "handle": "h", "vendor": "MAC Cosmetics", "product_type": "Lipstick",
+                "tags": [], "images": [], "options": [], "variants": []}
+        base.update(over)
+        return base
+
+    stub = prod(title="Retro Matte Lipstick", handle="rml",
+                options=[{"name": "Title", "values": ["Default Title"]}],
+                variants=[{"id": 1, "sku": "P", "price": "24.00", "option1": "Default Title",
+                           "available": True}])
+    shades = [
+        prod(title=f"Retro Matte Lipstick - {n}", handle=f"rml-{i}",
+             images=[{"src": f"https://cdn.x/{n}.jpg"}],
+             options=[{"name": "Title", "values": ["Default Title"]}],
+             variants=[{"id": 100 + i, "sku": f"M0N90{i}", "price": "24.00", "available": True,
+                        "featured_image": {"src": f"https://cdn.x/{n}.jpg"}}])
+        for i, n in enumerate(["Ruby Woo", "Bronx", "Dangerous"])
+    ]
+    out, report = fold_shade_listings([stub] + shades)
+    assert report["shades"] == 3, "fold refused — the rest of this test would be vacuous"
+
+    rec = shopify_product_to_record(out[0], domain="maccosmetics.com",
+                                    category_path="beauty/makeup", emit_variants=True)
+    rec["offers"][0]["validated_at"] = "shopify_products_json"
+    seed = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])
+
+    # "Color", not "Shade": the renderer rejects a shade-named axis outright when
+    # its cosmetic keyword gate is closed, and accepts a colour-named one.
+    assert [v["options"] for v in seed["variants"]] == [
+        [{"name": "Color", "value": "Ruby Woo"}],
+        [{"name": "Color", "value": "Bronx"}],
+        [{"name": "Color", "value": "Dangerous"}],
+    ]
+    assert all(v["image_url"] for v in seed["variants"])   # the shade axis needs a swatch
+
+
+def test_a_variant_with_no_shade_text_at_all_yields_no_pair():
+    """The mapper emits `title: option1 or title or None`, so a variant with
+    neither is an EMPTY value. Without the empty check that ships as
+    `{"name": "Shade", "value": ""}` — and beside two real distinct shades the
+    aggregate drop does not clear it (every variant labelled, keys distinct, one
+    axis), so an entry naming no choice reaches the selector."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(3)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "Shade"
+    rec["pdp"]["variants"][0]["title"] = ""
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert all(not v["options"] for v in variants), "an empty value must never be a label"
+
+
+def test_a_whitespace_only_axis_name_is_not_published():
+    """Hand-validated JSONL is human-authored — the lane this function's own
+    docstring names — so a name of spaces is a shape it will see."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    rec = _variant_record(2)
+    for v in rec["pdp"]["variants"]:
+        v["option_name"] = "   "
+    variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
+    assert [v["options"] for v in variants] == [[], []]
