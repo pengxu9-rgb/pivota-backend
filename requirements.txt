@@ -27,5 +27,12 @@ bcrypt
 prometheus-client
 boto3
 Pillow
-apscheduler  # PR-1b: weekly/monthly scheduled re-audit cron
+# PINNED, and the pin is load-bearing rather than hygiene. services/audit_scheduler.py's
+# shutdown drain exists BECAUSE AsyncIOExecutor.shutdown ignores its `wait` argument and cancels
+# every pending future regardless ("there is no way to honor wait=True without converting this
+# method into a coroutine method", apscheduler 3.11.3). A test greps that source as a tripwire,
+# so an unpinned bump turns a dependency change into a red CI whose message talks about design.
+# A 4.x upgrade moves the module path entirely and means re-deriving stop_scheduler, not
+# adjusting the test.
+apscheduler==3.11.3  # PR-1b: weekly/monthly scheduled re-audit cron
 python-pptx==1.0.2

@@ -8,7 +8,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import httpx
 
@@ -884,7 +884,26 @@ async def retry_delivery(merchant_id: str, delivery_id: str) -> Dict[str, Any]:
     )
 
 
-async def process_due_retries(limit: int = 20) -> int:
+async def process_due_retries(
+    limit: int = 20,
+    *,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> int:
+    """Deliver every retry that is due, oldest first.
+
+    `should_stop` IS CHECKED BETWEEN DELIVERIES, and that is what makes shutdown bounded.
+    Without it the only stop check was at the top of `_retry_worker_loop`, so a shutdown
+    arriving mid-batch still had to sit through the rest of it: up to `limit` sequential
+    deliveries at DELIVERY_TIMEOUT_SECONDS each, which at the default is ~200s. That was
+    survivable only because `database.disconnect()` used to run first and blow the remaining
+    rows up; once the lifespan was reordered so the scheduler could drain against a live pool,
+    the accidental bound was gone and the real one had to be written down. Its stop is now also
+    wrapped in `asyncio.wait_for`, but cancelling a delivery mid-flight is the fallback -
+    stopping cleanly between them is the intent.
+
+    Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
+    `next_retry_at` unchanged, so the next instance picks it up on its next poll.
+    """
     await ensure_merchant_webhook_tables()
     rows = await database.fetch_all(
         """
@@ -900,6 +919,15 @@ async def process_due_retries(limit: int = 20) -> int:
     )
     processed = 0
     for row in rows:
+        if should_stop is not None and should_stop():
+            # `info`, not `warning`: with the stop check in place this is the ORDINARY
+            # shutdown path and the worker restarts 15-34 times a day. A warning per restart
+            # is the kind of noise that teaches people to skim the log.
+            logger.info(
+                "%s webhook retry worker stopping: %d delivered, %d left due for the next "
+                "instance.", "merchant", processed, len(rows) - processed,
+            )
+            break
         try:
             await retry_delivery(str(row["merchant_id"]), str(row["delivery_id"]))
             processed += 1
@@ -912,7 +940,7 @@ async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             if getattr(database, "is_connected", False):
-                await process_due_retries(limit=20)
+                await process_due_retries(limit=20, should_stop=stop_event.is_set)
         except Exception as exc:
             logger.warning("Merchant webhook retry worker iteration failed: %s", exc)
         try:
@@ -933,10 +961,18 @@ async def start_merchant_webhook_retry_worker() -> None:
 
 # How long a shutdown may wait for the retry worker to finish its current iteration.
 #
-# SMALL, AND IT HAS TO BE BOUNDED AT ALL. `stop_event` is only checked at the TOP of
-# `_retry_worker_loop`, so setting it does not interrupt an iteration in progress — and an
-# iteration is `process_due_retries(limit=20)`, up to twenty sequential deliveries each with a
-# 10.0s HTTP timeout. A bare `await` on that task is therefore an await of up to ~200s.
+# SMALL, AND IT IS NOW THE FALLBACK RATHER THAN THE ONLY BOUND — but it must stay.
+#
+# `process_due_retries` checks the stop event BETWEEN deliveries, so the ordinary case is that
+# the loop notices and returns on its own well inside this window; the wait below then just
+# collects it. What this still covers is the stop that arrives DURING a delivery: `retry_delivery`
+# ends in an HTTP call with a 10.0s timeout and nothing interrupts it, so without this bound one
+# in-flight request is one full 10s — the entire Cloud Run grace — before the pool is closed.
+#
+# (Until the between-deliveries check existed, the event was only read at the TOP of
+# `_retry_worker_loop`, so this bound was covering a whole batch: up to twenty sequential
+# deliveries, ~200s. That is the shape this comment used to describe, and it is fixed — do not
+# read the improvement as a reason to drop the bound.)
 #
 # That used to be masked by accident: `database.disconnect()` ran BEFORE this, so the next
 # `database.*` call in the loop raised "DatabaseBackend is not running" and the remaining rows
