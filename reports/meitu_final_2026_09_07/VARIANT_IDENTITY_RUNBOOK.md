@@ -223,7 +223,14 @@ duplicate that work. When their rows land, run the 2.0 baseline probe against ea
 
 ## 3. Gateway — arm runtime variant sourcing
 
-Deployed env captured (secrets redacted) at `gateway_env_before.yaml` in this directory.
+Take the BEFORE snapshot of the deployed env first — it is the baseline every later diff and
+rollback decision reads, and it is deliberately NOT committed (a service env dump carries legacy
+hosts and plaintext values that the repo's URL ratchet refuses):
+
+```bash
+gcloud run services describe gateway --region us-west1 --project pivota-prod --format=yaml \
+  > reports/meitu_final_2026_09_07/gateway_env_before.yaml   # gitignored artefact, keep local
+```
 
 ### 3.1 What is actually there
 

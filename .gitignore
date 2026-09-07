@@ -64,3 +64,4 @@ infra/gcp/*.local.*
 # production pdp_ids and overlay ids and are read once by the operator between the dry
 # run and the apply; nothing downstream reads them, so they must not reach main.
 reports/pdp_overlay_backfill/
+reports/meitu_final_2026_09_07/gateway_env_before.yaml
