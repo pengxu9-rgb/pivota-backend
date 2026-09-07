@@ -133,3 +133,78 @@ async def test_a_webhook_already_at_the_exact_url_is_reused_not_recreated():
     assert client.deleted == []
     assert sorted(result.reused_trigger_types) == sorted(TRIGGERS)
     assert result.webhook_ids == {t: f"wh-{t}" for t in TRIGGERS}
+
+
+# ---- the listing has to reach past page 1 ------------------------------------
+
+
+class _PagedClient(_Client):
+    """A double that HONOURS `offset`/`limit`, so a one-page reader shows up.
+
+    The base double answers the same list to every call; a walk tested against
+    that cannot tell "reads one page" from "reads them all". Here the rows are
+    sliced by exactly the parameters the production code sent.
+    """
+
+    def __init__(self, existing):
+        super().__init__(existing)
+        self.list_calls = []
+
+    async def get(self, url, headers=None, params=None):
+        params = dict(params or {})
+        self.list_calls.append(params)
+        offset = int(params.get("offset") or 0)
+        limit = int(params.get("limit") or 100)
+        return _Response({"webhooks": self.existing[offset : offset + limit]})
+
+
+async def test_a_stale_webhook_past_the_first_page_is_still_removed():
+    """"Stale" is computed from this list, so a webhook of ours that falls off
+    page 1 is never seen, never deleted, and keeps an OLD url secret registered
+    at Webflow — one more orphan per rotation, on a surface nothing else in this
+    repo enumerates."""
+    from services.webflow_webhook_subscriptions import _WEBHOOK_PAGE_LIMIT
+
+    rows = [
+        _webhook(f"wh-other-{i}", f"https://hooks.zapier.example/{i}")
+        for i in range(_WEBHOOK_PAGE_LIMIT)
+    ]
+    rows.append(_webhook("wh-old", f"{PREFIX}an-older-secret"))
+    client = _PagedClient(rows)
+
+    result = await _ensure(client)
+
+    assert client.deleted == ["wh-old"]
+    assert result.removed_webhook_ids == ["wh-old"]
+    # Two list calls, the second resuming at the offset the first reached.
+    assert [call["offset"] for call in client.list_calls] == [0, _WEBHOOK_PAGE_LIMIT]
+
+
+async def test_the_walk_is_BOUNDED_against_an_endpoint_that_ignores_offset():
+    """Webflow's paging on this endpoint is an ASSUMED claim.
+
+    An endpoint that ignores `offset` and answers a full page every time would
+    make a naive `while` loop spin until the request timeout, on a route a
+    merchant can call. It stops on the first page that adds no new id.
+    """
+    from services.webflow_webhook_subscriptions import _WEBHOOK_PAGE_LIMIT
+
+    rows = [
+        _webhook(f"wh-other-{i}", f"https://hooks.zapier.example/{i}")
+        for i in range(_WEBHOOK_PAGE_LIMIT)
+    ]
+    client = _Client(rows)  # the base double: same answer to every call
+
+    result = await _ensure(client)
+
+    assert result.removed_webhook_ids == []
+    assert client.deleted == []
+
+
+async def test_a_short_first_page_ends_the_walk_in_one_call():
+    """The overwhelmingly common case must still cost exactly one request."""
+    client = _PagedClient([_webhook("wh-old", f"{PREFIX}an-older-secret")])
+
+    await _ensure(client)
+
+    assert len(client.list_calls) == 1

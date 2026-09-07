@@ -1559,17 +1559,25 @@ def _webflow_webhook_endpoint(store_id: str, url_secret: str) -> tuple[str, str]
     The per-store secret is a PATH SEGMENT, not a header, because Webflow does
     not sign a webhook created with a Site API token — see
     routes/webflow_webhooks.py. That makes this URL a credential: it is never
-    returned to a caller, and every APPLICATION logger that would otherwise
-    write it redacts the trailing segment
-    (`middleware/structured_logging.py::redact_path`, which the access log and
-    the rate limiter's ceiling warning both go through).
+    returned to a caller, and every logger THIS PROCESS writes redacts the
+    trailing segment through `middleware/structured_logging.py::redact_path` —
+    the app's structured access log, the rate limiter's ceiling warning, and
+    `uvicorn.access`, whose records go through
+    `UvicornAccessPathRedactionFilter` (installed in main.py at import). That
+    third one is not an app middleware: uvicorn writes the raw request line for
+    every response, and infra/gcp/Dockerfile starts it with neither
+    `--no-access-log` nor a `--log-config`, so it was the channel that kept
+    writing the secret verbatim after the two middlewares were fixed — and an
+    ASGITransport regression test cannot see it, because there is no uvicorn in
+    that loop.
 
-    It is NOT, however, absent from the world: a secret in a URL path is present
-    in every request log kept UPSTREAM of this process — the load balancer's, a
-    proxy's, an APM trace. That cannot be redacted from here, and it is the
-    honest argument for configuring `WEBFLOW_CLIENT_SECRET` wherever an OAuth
-    app exists, so a delivery has to carry a fresh signature as well as a URL
-    somebody could have read out of an access log.
+    ONE surface is left, and it is not reachable from here: the platform load
+    balancer's own `httpRequest.requestUrl` (and any proxy or APM in front of
+    this process), which records the full path regardless of what this
+    application logs. Nothing in this repo can redact that, and it is the honest
+    argument for configuring `WEBFLOW_CLIENT_SECRET` wherever an OAuth app
+    exists — Layer 2 demands a fresh signature over the body, which a URL
+    recovered from somebody else's access log does not provide.
     """
     base = str(
         os.getenv("WEBFLOW_WEBHOOK_BASE_URL")
@@ -3811,12 +3819,22 @@ async def merchant_connect_webflow(
             },
         )
 
+    # The ACTOR, the same two fields every `webflow_webhooks_ensure` line
+    # carries. Connect is the more consequential of the two — it is what binds
+    # a store to a site, and a reconnect pointed at a different site DROPS the
+    # old credential and every piece of state derived from it — so an audit
+    # trail that names who ran the ensure but not who ran the connect names the
+    # wrong half. `can_access_merchant` admits staff roles as well as the
+    # merchant, so "the merchant id" does not identify the caller.
     logger.info(
-        "webflow_connect store_id=%s merchant_id=%s site_id=%s webhooks_provisioned=%s",
+        "webflow_connect store_id=%s merchant_id=%s site_id=%s "
+        "webhooks_provisioned=%s actor_role=%s actor_user_id=%s",
         store_id,
         request.merchant_id,
         site_id,
         bool(str(persisted.get("url_secret") or "").strip()),
+        current_user.get("role") or "-",
+        current_user.get("sub") or "-",
     )
     return {
         "status": "success",
@@ -3894,11 +3912,12 @@ async def ensure_webflow_webhooks_route(
     cannot cover is the process dying between the two — documented as a residual
     in docs/WEBFLOW_TELEMETRY.md rather than claimed away.
 
-    The secret is never returned, and no application logger writes it: the
-    access log and the rate limiter's ceiling warning redact the trailing path
-    segment (`middleware/structured_logging.py::redact_path`). Upstream request
-    logs (load balancer, proxy) inherently hold it — see
-    `_webflow_webhook_endpoint`.
+    The secret is never returned, and NO logger this process writes holds it:
+    the app's structured access log, the rate limiter's ceiling warning and
+    `uvicorn.access` all pass the path through
+    `middleware/structured_logging.py::redact_path`. The load balancer's
+    `httpRequest.requestUrl` is the one surface left, and it is the reason to
+    configure `WEBFLOW_CLIENT_SECRET` — see `_webflow_webhook_endpoint`.
     """
     store = await _webflow_store_for_caller(store_id, current_user)
 
@@ -3907,6 +3926,7 @@ async def ensure_webflow_webhooks_route(
         mint_url_secret,
         parse_webflow_credentials,
     )
+    from routes.webflow_webhooks import webflow_bytes_equal
     from services.webflow_event_adapter import WEBFLOW_ORDER_TRIGGERS
     from services.webflow_webhook_subscriptions import (
         WebflowWebhookError,
@@ -4004,8 +4024,15 @@ async def ensure_webflow_webhooks_route(
                 return
 
             def _restore(blob: dict) -> dict:
+                # BYTES, through the receiver's own helper. `hmac.compare_digest`
+                # on `str` raises TypeError above code point 0x7F, and the
+                # stored value is whatever is in the blob — a hand-edited or
+                # migrated cell holding a non-ASCII string would turn this
+                # rollback into an unhandled 500 ON TOP of the failure it exists
+                # to repair, leaving the store silent with no secret restored. A
+                # mismatch is what it should be: a mismatch.
                 current = str(blob.get("url_secret") or "").strip()
-                if current and hmac.compare_digest(current, url_secret):
+                if webflow_bytes_equal(current, url_secret):
                     blob["url_secret"] = previous
                 return blob
 
@@ -4080,7 +4107,11 @@ async def ensure_webflow_webhooks_route(
             db=database,
         )
         stored_secret = str(stored.get("url_secret") or "").strip()
-        if not hmac.compare_digest(stored_secret, url_secret):
+        # BYTES, through the receiver's own helper, for the same reason as
+        # `_restore` above: a non-ASCII stored value must be a MISMATCH (which
+        # discards the webhooks and answers 409) rather than a TypeError, which
+        # would 500 with the webhooks left delivering into a wall.
+        if not webflow_bytes_equal(stored_secret, url_secret):
             # Another writer replaced the secret between the two merges. The
             # webhooks just registered carry a URL the receiver will now 401, so
             # they are removed rather than left delivering into a wall.

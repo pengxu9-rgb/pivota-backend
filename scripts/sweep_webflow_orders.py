@@ -96,8 +96,11 @@ async def _run(args: argparse.Namespace) -> int:
         print(
             "\nNOTE: the orders list was NOT non-increasing by anchor timestamp "
             f"for these store/lane pairs: {', '.join(unordered)}. The early stop "
-            "was disabled for them and those lanes walked to the end of the "
-            "list. See the ordering row of docs/WEBFLOW_TELEMETRY.md.",
+            "is disabled for them PERMANENTLY — `ordering_violated_at` is "
+            "persisted and no number of clean passes re-arms it — so those "
+            "lanes walk to the end of the list every run until an operator "
+            "clears the key by hand. See the ordering row of "
+            "docs/WEBFLOW_TELEMETRY.md.",
             flush=True,
         )
     unreadable = [
@@ -116,7 +119,49 @@ async def _run(args: argparse.Namespace) -> int:
             "becomes readable. See row 9 of docs/WEBFLOW_TELEMETRY.md.",
             flush=True,
         )
+    refused = [
+        (
+            f"{store['store_id']} ({store.get('invalid')}"
+            + (
+                f": {', '.join(store.get('invalid_order_ids') or [])}"
+                if store.get("invalid_order_ids")
+                else ""
+            )
+            + ")"
+        )
+        for store in result.get("stores", [])
+        if int(store.get("invalid") or 0)
+    ]
+    if refused:
+        # Orders this bridge REFUSED to file, almost always a
+        # `WebflowMoneyFormatError` — a money shape it will not guess at,
+        # because guessing is a 100x error. These used to sit in the JSON while
+        # the run reported success and exited 0, so a store whose every order
+        # was refused looked exactly like a quiet store.
+        print(
+            "\nNOTE: orders REFUSED and therefore not recorded at all: "
+            f"{', '.join(refused)}. This is what a changed Webflow money shape "
+            "looks like — read the webflow_order_sweep WARNING lines for the "
+            "reason. GMV is under-reported for those stores until it is fixed; "
+            "the run exits non-zero.",
+            flush=True,
+        )
+    pending_dropped = [
+        f"{store['store_id']} ({(store.get('pending') or {}).get('dropped_not_found')})"
+        for store in result.get("stores", [])
+        if int((store.get("pending") or {}).get("dropped_not_found") or 0)
+    ]
+    if pending_dropped:
+        print(
+            "\nNOTE: tracked `pending` orders dropped after repeated 404s: "
+            f"{', '.join(pending_dropped)}. A dropped id is one nothing comes "
+            "back for; if it was a real order its payment row now depends on a "
+            "webhook delivery. See the pending-replay section of "
+            "docs/WEBFLOW_TELEMETRY.md.",
+            flush=True,
+        )
     # A partial failure is a non-zero exit so a scheduled run is visibly red.
+    # `invalid > 0` is one: see `sweep_webflow_store`.
     return 0 if result.get("status") == "success" else 1
 
 

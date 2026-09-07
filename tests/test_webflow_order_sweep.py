@@ -70,8 +70,9 @@ class _Client:
     """
 
     def __init__(self, *, pages_by_status=None, site_id=SITE_ID, status_errors=None,
-                 site_status=200):
+                 site_status=200, orders_by_id=None):
         self.orders_by_status = pages_by_status or {}
+        self.orders_by_id = orders_by_id or {}
         self.site_id = site_id
         self.site_status = site_status
         self.status_errors = status_errors or {}
@@ -84,6 +85,19 @@ class _Client:
             if self.site_status != 200:
                 return _Response({}, status_code=self.site_status)
             return _Response({"id": self.site_id, "displayName": "Shop"})
+        head, _, tail = url.partition("/orders/")
+        if tail:
+            # `GET /v2/sites/{site}/orders/{id}` — the keyed read the pending
+            # replay uses. Served by the same double as the list so the real
+            # `fetch_webflow_order` (its id validation, its status mapping, its
+            # envelope check) is what runs.
+            self.calls.append({"kind": "order", "order_id": tail, "status": None})
+            order = self.orders_by_id.get(tail)
+            if order is None:
+                return _Response({"message": "not found"}, status_code=404)
+            if isinstance(order, int):
+                return _Response({"message": "boom"}, status_code=order)
+            return _Response(order)
         params = dict(params or {})
         status = params.get("status")
         self.calls.append({"kind": "orders", "status": status, **params})
@@ -162,14 +176,14 @@ def _install(monkeypatch, *, credentials=None, recorder=None):
     return merged, recorded, stored
 
 
-async def _run(monkeypatch, client, *, credentials=None, recorder=None, **kwargs):
+async def _run(monkeypatch, client, *, credentials=None, recorder=None, now=NOW, **kwargs):
     from services.webflow_order_sweep import sweep_webflow_store
 
     merged, recorded, _stored = _install(
         monkeypatch, credentials=credentials, recorder=recorder
     )
     stats = await sweep_webflow_store(
-        store_id=STORE_ID, client=client, now=NOW, **kwargs
+        store_id=STORE_ID, client=client, now=now, **kwargs
     )
     return stats, merged, recorded
 
@@ -968,3 +982,609 @@ async def test_an_unreadable_refund_amount_is_counted_under_its_own_name(monkeyp
     # It is NOT counted as invalid: the order itself was recorded.
     assert stats["invalid"] == 0
     assert stats["accepted"] == 3
+
+
+# ---- the sticky ordering verdict --------------------------------------------
+
+
+async def test_a_violation_is_NOT_undone_by_two_clean_complete_passes(monkeypatch):
+    """"A violation permanently disarms the early stop" was false.
+
+    The verdict used to be recomputed every run: a violation wrote False, and
+    the very next COMPLETE pass that happened to see no violation wrote True
+    again and re-armed the stop. That made the disarm last exactly one run — and
+    an unstable list is not unstable on every pass, so the re-arm is the common
+    case, not the rare one. `ordering_violated_at` is therefore persisted and
+    sticky, and only an operator removes it.
+    """
+    unordered = [
+        _order("old-0", accepted=NOW - timedelta(days=10)),
+        _order("fresh", accepted=NOW),  # newer than the row above: a violation
+        _order("old-1", accepted=NOW - timedelta(days=11)),
+    ]
+    ordered = [
+        _order(f"o-{i}", accepted=NOW - timedelta(minutes=i)) for i in range(4)
+    ]
+
+    first, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: unordered}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "orders": {
+                    "cursor": _iso(NOW - timedelta(days=1)),
+                    "ordering_verified": True,
+                }
+            },
+        },
+        page_limit=2,
+    )
+
+    assert _lane(first, "orders")["ordering_verified"] is False
+    violated_at = merged["reconciliation"]["orders"]["ordering_violated_at"]
+    assert violated_at == _iso(NOW)
+
+    state = merged["reconciliation"]
+    for run in (1, 2):
+        later = NOW + timedelta(days=run)
+        stats, merged, _recorded = await _run(
+            monkeypatch,
+            _Client(pages_by_status={None: ordered}),
+            credentials={
+                "api_token": "wf-token",
+                "site_id": SITE_ID,
+                "reconciliation": state,
+            },
+            now=later,
+            page_limit=2,
+        )
+        lane = _lane(stats, "orders")
+        assert lane["early_stop_armed"] is False, (
+            f"clean pass {run} re-armed the early stop on a store whose list has "
+            "been observed out of order"
+        )
+        assert lane["ordering_verified"] is False, f"clean pass {run} re-armed the verdict"
+        assert "stopped_early" not in lane
+        state = merged["reconciliation"]
+        assert state["orders"]["ordering_verified"] is False
+        # And it is the FIRST violation's time that is kept, not the last run's.
+        assert state["orders"]["ordering_violated_at"] == violated_at
+
+
+async def test_the_run_reports_WHY_the_stop_is_off(monkeypatch):
+    """An operator must be able to read the reason off a run rather than out of
+    the credential blob."""
+    stats, _merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: [_order("o-1", accepted=NOW)]}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "orders": {
+                    "cursor": _iso(NOW - timedelta(days=1)),
+                    "ordering_verified": True,
+                    "ordering_violated_at": "2026-08-01T00:00:00.000Z",
+                }
+            },
+        },
+    )
+
+    lane = _lane(stats, "orders")
+    assert lane["ordering_violated_at"] == "2026-08-01T00:00:00.000Z"
+    assert lane["early_stop_armed"] is False
+
+
+async def test_a_money_out_lane_never_carries_a_violation_marker(monkeypatch):
+    """The money-out lanes are never judged, so a marker left in their state by
+    an earlier build is REMOVED rather than left to be read as a verdict."""
+    _stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: [], "refunded": [], "dispute-lost": []}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "refunded": {"ordering_violated_at": "2026-08-01T00:00:00.000Z"}
+            },
+        },
+    )
+
+    assert "ordering_violated_at" not in merged["reconciliation"]["refunded"]
+
+
+# ---- `pending` orders no lane can ever come back for -------------------------
+
+
+def _mapping_recorder(seen_events):
+    """A recorder that maps the order for REAL and reports what it produced.
+
+    The claim being tested is that a completed pending order gets its
+    `order.paid` ROW — not merely that some function was called with it — and a
+    recorder that returned a canned result would leave that claim untested while
+    looking green.
+    """
+    from services.webflow_ledger import WebflowIngestResult
+
+    def _record(kwargs):
+        from services.webflow_event_adapter import map_webflow_order
+
+        mapping = map_webflow_order(
+            kwargs["order"],
+            store_id=kwargs["store_id"],
+            source="webflow_reconciliation",
+        )
+        types = [event.event_type for event in mapping.batch.events]
+        seen_events.append(
+            {"order_id": kwargs["order"].get("orderId"), "event_types": types}
+        )
+        return WebflowIngestResult(status="recorded", accepted=len(types))
+
+    return _record
+
+
+def _pending_ids(state):
+    return [entry["order_id"] for entry in state["reconciliation"]["pending_order_ids"]]
+
+
+async def test_an_order_that_was_pending_gets_its_paid_row_on_a_LATER_run(monkeypatch):
+    """The bug: `acceptedOn` does not move when a payment is captured.
+
+    A PayPal order is `pending` when the lane walks past it; the lane's cursor
+    then advances past its `acceptedOn` and NEVER comes back, so the order sits
+    in the ledger with `order.created` and no money, permanently. The webhook
+    would normally carry the transition — but the sweep exists precisely for the
+    store whose webhooks are unprovisioned or whose deliveries were dropped.
+    """
+    pending = _order("p-1", accepted=NOW - timedelta(days=2), status="pending")
+    fresh = _order("fresh", accepted=NOW)
+    events = []
+
+    first, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: [fresh, pending]}),
+        recorder=_mapping_recorder(events),
+    )
+
+    # Run 1: the order is pending, so it is created and NOT paid — and it is
+    # remembered, because nothing else ever will come back for it.
+    assert {"order_id": "p-1", "event_types": ["order.created"]} in events
+    assert _pending_ids(merged) == ["p-1"]
+    assert merged["reconciliation"]["orders"]["cursor"] == _iso(NOW)
+
+    # Run 2: the payment was captured. `acceptedOn` is unchanged and now sits
+    # below the cursor, so the LANE can only skip it.
+    captured = _order("p-1", accepted=NOW - timedelta(days=2), status="unfulfilled")
+    events.clear()
+    second_client = _Client(
+        pages_by_status={None: [fresh, captured]}, orders_by_id={"p-1": captured}
+    )
+    second, merged_2, _recorded_2 = await _run(
+        monkeypatch,
+        second_client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": merged["reconciliation"],
+        },
+        recorder=_mapping_recorder(events),
+    )
+
+    assert _lane(second, "orders")["skipped_already_recorded"] == 1, (
+        "the lane no longer skips this order, so this test is not exercising "
+        "the gap the replay exists to close"
+    )
+    # The replay read it BY ID and recorded it.
+    assert [call["order_id"] for call in second_client.calls if call["kind"] == "order"] == ["p-1"]
+    assert {"order_id": "p-1", "event_types": ["order.created", "order.paid"]} in events
+    assert second["pending"]["completed"] == 1
+    assert second["accepted"] >= 2, "the replay's rows are missing from the run totals"
+    # ...and it is dropped, so run 3 costs nothing.
+    assert "pending_order_ids" not in merged_2["reconciliation"]
+
+
+async def test_a_pending_order_completed_by_a_WEBHOOK_is_dropped_on_the_next_run(
+    monkeypatch,
+):
+    """The common case: the webhook delivered the transition and the ledger
+    already holds the row. The replay must still notice, and must let the id go
+    rather than re-reading it forever."""
+    captured = _order("p-1", accepted=NOW - timedelta(days=2), status="unfulfilled")
+    events = []
+    client = _Client(pages_by_status={None: []}, orders_by_id={"p-1": captured})
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"pending_order_ids": [{"order_id": "p-1", "misses": 0}]},
+        },
+        recorder=_mapping_recorder(events),
+    )
+
+    assert stats["pending"]["completed"] == 1
+    assert "pending_order_ids" not in merged["reconciliation"]
+
+
+async def test_an_order_still_pending_is_kept_and_recorded_by_nobody(monkeypatch):
+    still = _order("p-1", accepted=NOW - timedelta(days=2), status="pending")
+    events = []
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: []}, orders_by_id={"p-1": still}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"pending_order_ids": [{"order_id": "p-1", "misses": 2}]},
+        },
+        recorder=_mapping_recorder(events),
+    )
+
+    assert stats["pending"]["still_pending"] == 1
+    assert events == []
+    assert _pending_ids(merged) == ["p-1"]
+    # A successful READ resets the miss counter: it counts un-readability, and
+    # this order was perfectly readable.
+    assert merged["reconciliation"]["pending_order_ids"][0]["misses"] == 0
+
+
+async def test_an_id_that_404s_is_dropped_only_after_N_runs(monkeypatch):
+    """One 404 is usually the read racing Webflow. Three across three runs is
+    an order that is not coming back — and dropping it is money nobody will
+    reconcile, so it is counted and logged rather than forgotten."""
+    from services.webflow_order_sweep import PENDING_ORDER_MAX_MISSES
+
+    state = {"pending_order_ids": [{"order_id": "gone", "misses": 0}]}
+    for attempt in range(1, PENDING_ORDER_MAX_MISSES):
+        stats, merged, _recorded = await _run(
+            monkeypatch,
+            _Client(pages_by_status={None: []}),
+            credentials={
+                "api_token": "wf-token",
+                "site_id": SITE_ID,
+                "reconciliation": state,
+            },
+        )
+        assert stats["pending"]["dropped_not_found"] == 0, attempt
+        assert _pending_ids(merged) == ["gone"], attempt
+        state = merged["reconciliation"]
+        assert state["pending_order_ids"][0]["misses"] == attempt
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: []}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": state,
+        },
+    )
+
+    assert stats["pending"]["dropped_not_found"] == 1
+    assert "pending_order_ids" not in merged["reconciliation"]
+
+
+async def test_a_transport_failure_keeps_the_id_without_burning_a_miss(monkeypatch):
+    """A 429 or a 500 says nothing about the ORDER. Counting it as a miss would
+    let a bad afternoon at Webflow expire a store's whole pending set."""
+    client = _Client(pages_by_status={None: []}, orders_by_id={"p-1": 429})
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"pending_order_ids": [{"order_id": "p-1", "misses": 1}]},
+        },
+    )
+
+    assert stats["pending"]["fetch_failures"] == 1
+    assert merged["reconciliation"]["pending_order_ids"] == [
+        {"order_id": "p-1", "misses": 1}
+    ]
+
+
+async def test_the_tracked_set_is_BOUNDED_and_names_what_it_drops(monkeypatch, caplog):
+    """It lives in one database cell. An unbounded list of ids in a cell is a
+    slow-motion outage, and a silent truncation is money silently dropped."""
+    import logging
+
+    from services.webflow_order_sweep import PENDING_ORDER_ID_CAP
+
+    already = PENDING_ORDER_ID_CAP - 20
+    new_pending = [
+        _order(f"new-{i}", accepted=NOW - timedelta(minutes=i), status="pending")
+        for i in range(40)
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="webflow_order_sweep"):
+        stats, merged, _recorded = await _run(
+            monkeypatch,
+            _Client(pages_by_status={None: new_pending}),
+            credentials={
+                "api_token": "wf-token",
+                "site_id": SITE_ID,
+                "reconciliation": {
+                    "pending_order_ids": [
+                        {"order_id": f"old-{i}", "misses": 0} for i in range(already)
+                    ]
+                },
+            },
+        )
+
+    ids = _pending_ids(merged)
+    assert len(ids) == PENDING_ORDER_ID_CAP
+    # The OLDEST went, and the newly observed ones are all there.
+    assert "old-0" not in ids and "old-19" not in ids
+    assert "old-20" in ids
+    assert [f"new-{i}" for i in range(40)] == ids[-40:]
+    dropped_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "dropped" in record.getMessage() and "cap" in record.getMessage()
+    ]
+    assert dropped_lines, "the cap dropped ids silently"
+    assert "old-0" in dropped_lines[0] and "old-19" in dropped_lines[0]
+    assert stats["pending"]["tracked"] == already
+
+
+async def test_a_pending_id_is_tracked_even_when_the_lane_SKIPS_the_order(monkeypatch):
+    """The ordering of the two checks inside the lane, pinned.
+
+    An order that went `pending` before the cursor is exactly the one the set
+    exists for. Collecting ids after the `skipped_already_recorded` branch would
+    track only the orders that did not need tracking.
+    """
+    old_pending = _order("p-old", accepted=NOW - timedelta(days=30), status="pending")
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: [old_pending]}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"orders": {"cursor": _iso(NOW - timedelta(days=1))}},
+        },
+    )
+
+    assert _lane(stats, "orders")["skipped_already_recorded"] == 1
+    assert _pending_ids(merged) == ["p-old"]
+
+
+async def test_a_dry_run_reads_the_pending_set_and_changes_nothing(monkeypatch):
+    captured = _order("p-1", accepted=NOW - timedelta(days=2), status="unfulfilled")
+    events = []
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: []}, orders_by_id={"p-1": captured}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"pending_order_ids": [{"order_id": "p-1", "misses": 0}]},
+        },
+        recorder=_mapping_recorder(events),
+        apply=False,
+    )
+
+    assert stats["pending"]["refetched"] == 1
+    assert stats["pending"]["completed"] == 0
+    assert events == []
+    assert merged == {}, "a dry run wrote state"
+
+
+# ---- a refused order is a FAILED run ----------------------------------------
+
+
+async def test_a_money_shape_this_bridge_refuses_makes_the_run_partial(monkeypatch):
+    """`invalid` used to be a number in the JSON and nothing else.
+
+    `WebflowMoneyFormatError` is what a changed money shape looks like — the one
+    thing this integration refuses rather than guesses at — and a store whose
+    every order tripped it reported `status: success` with `accepted: 0`, which
+    is indistinguishable from a quiet store.
+    """
+    from services.webflow_event_adapter import WebflowMoneyFormatError
+
+    def _refuse(_kwargs):
+        raise WebflowMoneyFormatError("Webflow customerPaid disagrees with itself")
+
+    stats, _merged, _recorded = await _run(
+        monkeypatch,
+        _Client(
+            pages_by_status={
+                None: [
+                    _order("bad-1", accepted=NOW),
+                    _order("bad-2", accepted=NOW - timedelta(minutes=1)),
+                ]
+            }
+        ),
+        recorder=_refuse,
+    )
+
+    assert stats["invalid"] == 2
+    assert stats["accepted"] == 0
+    assert stats["status"] == "partial_failure"
+    # And the ids, so the NOTE has somewhere to point.
+    assert stats["invalid_order_ids"] == ["bad-1", "bad-2"]
+
+
+async def test_a_clean_run_is_still_a_success(monkeypatch):
+    """The counterpart. A status that were always partial would be ignored."""
+    stats, _merged, _recorded = await _run(
+        monkeypatch, _Client(pages_by_status={None: [_order("o-1", accepted=NOW)]})
+    )
+
+    assert stats["invalid"] == 0
+    assert stats["status"] == "success"
+    assert stats["invalid_order_ids"] == []
+
+
+async def test_one_stores_refusal_makes_the_ALL_STORES_run_partial(monkeypatch):
+    """The roll-up read `lane_failures` alone, so a store that refused every
+    order rolled up green."""
+    from services import webflow_order_sweep as sweep
+
+    async def fake_store_sweep(*, store_id, **kwargs):
+        return {
+            "status": "partial_failure",
+            "store_id": store_id,
+            "invalid": 3,
+            "lane_failures": [],
+        }
+
+    async def fake_active():
+        return [{"store_id": "store-a"}]
+
+    monkeypatch.setattr(sweep, "sweep_webflow_store", fake_store_sweep)
+    monkeypatch.setattr(
+        "services.webflow_connection.active_webflow_stores", fake_active
+    )
+
+    result = await sweep.sweep_all_webflow_stores()
+
+    assert result["invalid"] == 3
+    assert result["status"] == "partial_failure"
+
+
+# ---- the script's exit code -------------------------------------------------
+#
+# A scheduled run is only as loud as its exit code. These drive `main()` — the
+# real argument parsing, the real NOTE printing, the real return value — over a
+# stubbed sweep result, because what is under test is the reporting rather than
+# the sweep.
+
+
+class _FakeDb:
+    is_connected = False
+
+    def __init__(self):
+        self.connected = 0
+
+    async def connect(self):
+        self.connected += 1
+
+    async def disconnect(self):
+        return None
+
+
+def _drive_script(monkeypatch, result, argv=("prog", "--apply")):
+    import sys
+
+    from scripts import sweep_webflow_orders as script
+
+    async def fake_sweep(**kwargs):
+        return result
+
+    monkeypatch.setattr(script, "database", _FakeDb())
+    monkeypatch.setattr(script, "sweep_all_webflow_stores", fake_sweep)
+    monkeypatch.setattr(sys, "argv", list(argv))
+    return script.main()
+
+
+def test_the_script_exits_non_zero_when_orders_were_REFUSED(monkeypatch, capsys):
+    """`invalid > 0` is a failed run, and a failed run must be visibly red.
+
+    Before this, a store whose money shape had changed exited 0 with
+    `accepted: 0` — a green cron job recording nothing.
+    """
+    exit_code = _drive_script(
+        monkeypatch,
+        {
+            "status": "partial_failure",
+            "dry_run": False,
+            "processed": 1,
+            "invalid": 2,
+            "stores": [
+                {
+                    "store_id": "store-wf",
+                    "status": "partial_failure",
+                    "invalid": 2,
+                    "invalid_order_ids": ["bad-1", "bad-2"],
+                }
+            ],
+        },
+    )
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+    assert "store-wf (2: bad-1, bad-2)" in out
+
+
+def test_the_script_exits_zero_on_a_clean_run(monkeypatch, capsys):
+    """The contrast. Without it, an exit code that is always 1 proves nothing."""
+    exit_code = _drive_script(
+        monkeypatch,
+        {
+            "status": "success",
+            "dry_run": False,
+            "processed": 1,
+            "invalid": 0,
+            "stores": [{"store_id": "store-wf", "status": "success", "invalid": 0}],
+        },
+    )
+
+    assert exit_code == 0
+    assert "REFUSED" not in capsys.readouterr().out
+
+
+def test_the_script_names_pending_ids_it_dropped(monkeypatch, capsys):
+    exit_code = _drive_script(
+        monkeypatch,
+        {
+            "status": "success",
+            "dry_run": False,
+            "processed": 1,
+            "invalid": 0,
+            "stores": [
+                {
+                    "store_id": "store-wf",
+                    "status": "success",
+                    "invalid": 0,
+                    "pending": {"dropped_not_found": 4},
+                }
+            ],
+        },
+    )
+
+    assert exit_code == 0
+    assert "tracked `pending` orders dropped" in capsys.readouterr().out
+
+
+async def test_a_garbage_pending_id_is_dropped_rather_than_retried_forever(monkeypatch):
+    """The state is hand-editable (that is the documented way to clear an
+    `ordering_violated_at`), so it can hold anything.
+
+    An id the fetch's allowlist would refuse can never become valid, so keeping
+    it means a slot in a bounded set and a WARNING every run, forever.
+    """
+    client = _Client(pages_by_status={None: []})
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "pending_order_ids": [
+                    {"order_id": "../../token/introspect", "misses": 0},
+                    "0000-0007",
+                ]
+            },
+        },
+    )
+
+    assert stats["pending"]["tracked"] == 1
+    # It never reached the wire, and only the real id is carried forward.
+    assert [call["order_id"] for call in client.calls if call["kind"] == "order"] == [
+        "0000-0007"
+    ]
+    assert _pending_ids(merged) == ["0000-0007"]

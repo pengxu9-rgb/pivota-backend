@@ -221,3 +221,63 @@ def test_the_url_secret_is_sized_as_a_credential_not_as_an_id():
     assert len(secrets) == 50
     # 32 random bytes, base64url-encoded.
     assert all(len(value) >= 40 for value in secrets)
+
+
+# ---- the site list has to reach past page 1 ---------------------------------
+
+
+async def test_the_site_list_walks_past_the_first_page():
+    """The ambiguity check is what stops a store being bound to a site the
+    merchant did not mean, and it is computed from THIS list.
+
+    A one-page read of a token that reaches more sites than fit on a page would
+    resolve against a subset — silently answering "exactly one site" (bind it!)
+    or offering a truncated list of candidates.
+    """
+    from services.webflow_connection import _SITE_PAGE_LIMIT, list_webflow_sites
+
+    rows = [{"id": f"site-{i}", "displayName": f"Shop {i}"} for i in range(_SITE_PAGE_LIMIT + 3)]
+
+    class _PagedClient:
+        def __init__(self):
+            self.params = []
+
+        async def get(self, url, headers=None, params=None):
+            params = dict(params or {})
+            self.params.append(params)
+            offset = int(params.get("offset") or 0)
+            limit = int(params.get("limit") or 100)
+            return _Response({"sites": rows[offset : offset + limit]})
+
+    client = _PagedClient()
+
+    sites = await list_webflow_sites("wf-token", client=client)
+
+    assert len(sites) == _SITE_PAGE_LIMIT + 3
+    assert [call["offset"] for call in client.params] == [0, _SITE_PAGE_LIMIT]
+
+
+async def test_the_site_walk_is_BOUNDED_against_an_endpoint_that_ignores_offset():
+    """Whether `GET /v2/sites` pages at all is an ASSUMED claim. An endpoint
+    that answers a full page to every offset must not spin."""
+    from services.webflow_connection import _SITE_PAGE_LIMIT, list_webflow_sites
+
+    rows = [{"id": f"site-{i}"} for i in range(_SITE_PAGE_LIMIT)]
+    client = _Client({"/sites": _Response({"sites": rows})})
+
+    sites = await list_webflow_sites("wf-token", client=client)
+
+    assert len(sites) == _SITE_PAGE_LIMIT
+    assert len(client.calls) == 2, "the walk did not stop when a page added nothing new"
+
+
+async def test_a_short_site_list_still_costs_one_request():
+    """The overwhelmingly common case: a token reaching one site."""
+    client = _Client({"/sites": _Response({"sites": [{"id": "site-1"}]})})
+
+    from services.webflow_connection import list_webflow_sites
+
+    assert await list_webflow_sites("wf-token", client=client) == [
+        {"id": "site-1", "displayName": None, "shortName": None}
+    ]
+    assert len(client.calls) == 1

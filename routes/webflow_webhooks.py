@@ -25,6 +25,23 @@ So:
   does not runs on Layer 1 alone, and docs/WEBFLOW_TELEMETRY.md says so rather
   than implying a signature that is not being checked.
 
+WHERE THE URL SECRET IS WRITTEN DOWN. A secret in a path lands in request logs
+the way a header never does, so all three logging channels this process owns
+rewrite it through `middleware/structured_logging.py::redact_path`: the app's
+structured access log, the rate limiter's anonymous-ceiling warning, and
+`uvicorn.access` — the last via `UvicornAccessPathRedactionFilter`, installed in
+main.py at import. uvicorn's is the one that matters most and was the last to be
+closed: it writes the raw request line at INFO on every 200 AND every 401,
+infra/gcp/Dockerfile starts it with neither `--no-access-log` nor a
+`--log-config`, and no ASGITransport test can observe it because there is no
+uvicorn in that loop.
+
+What remains is OUTSIDE this process: the platform load balancer's
+`httpRequest.requestUrl`, and any proxy or APM in front of it, record the full
+path whatever the app does. That single residual is the argument for configuring
+`WEBFLOW_CLIENT_SECRET` wherever an OAuth app exists — a URL read out of
+somebody else's access log still cannot produce a fresh signature over the body.
+
 Rotating the URL secret (`ensure` with `rotate=true`) changes the registered
 URL. In-flight deliveries to the OLD url answer 401; Webflow retries them, and
 anything that never lands is recovered by the reconciliation sweep.
@@ -100,19 +117,38 @@ _UNAUTHORIZED = "Invalid Webflow webhook credentials"
 # event ids, which hold across processes, restarts, and the sweep. Entries are
 # recorded only AFTER a successful ingest, so a delivery that 503'd on the fetch
 # is retried rather than swallowed.
-_SEEN_DELIVERIES: "OrderedDict[str, None]" = OrderedDict()
-_SEEN_DELIVERY_CAP = 4096
+#
+# PER STORE, not one global list. A single 4096-entry LRU is a shared resource
+# with no fairness: one busy store's deliveries evict every other store's within
+# a few minutes, so the quiet store's redelivery — the case the cache exists for
+# — is the one that always misses. A per-store budget makes the saving a
+# property of the store rather than of its neighbours, and the two caps together
+# still bound the whole thing (stores x entries).
+_SEEN_DELIVERIES: "OrderedDict[str, OrderedDict[str, None]]" = OrderedDict()
+_SEEN_DELIVERY_CAP = 512
+_SEEN_DELIVERY_STORE_CAP = 64
 
 
-def _remember_delivery(key: str) -> None:
-    _SEEN_DELIVERIES[key] = None
-    _SEEN_DELIVERIES.move_to_end(key)
-    while len(_SEEN_DELIVERIES) > _SEEN_DELIVERY_CAP:
+def _remember_delivery(store_id: str, digest: str) -> None:
+    bucket = _SEEN_DELIVERIES.get(store_id)
+    if bucket is None:
+        bucket = OrderedDict()
+        _SEEN_DELIVERIES[store_id] = bucket
+    bucket[digest] = None
+    bucket.move_to_end(digest)
+    _SEEN_DELIVERIES.move_to_end(store_id)
+    while len(bucket) > _SEEN_DELIVERY_CAP:
+        bucket.popitem(last=False)
+    while len(_SEEN_DELIVERIES) > _SEEN_DELIVERY_STORE_CAP:
         _SEEN_DELIVERIES.popitem(last=False)
 
 
-def _delivery_key(store_id: str, raw: bytes) -> str:
-    return f"{store_id}:{hashlib.sha256(raw).hexdigest()}"
+def _delivery_seen(store_id: str, digest: str) -> bool:
+    return digest in (_SEEN_DELIVERIES.get(store_id) or ())
+
+
+def _delivery_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
 
 
 async def _read_limited_body(request: Request) -> bytes:
@@ -139,8 +175,14 @@ async def _read_limited_body(request: Request) -> bytes:
     return bytes(body)
 
 
-def _bytes_equal(expected: str, supplied: str) -> bool:
+def webflow_bytes_equal(expected: str, supplied: str) -> bool:
     """Constant-time compare of two strings AS BYTES.
+
+    PUBLIC, and imported by `routes/merchant_store_connections.py`: the
+    provisioning route compares the same `url_secret` against the same stored
+    blob, and it was doing so with a bare `hmac.compare_digest` on `str`. One
+    encoding rule for one secret, in one place, rather than two compares that
+    can disagree about what a non-ASCII stored value means.
 
     `hmac.compare_digest` raises TypeError when handed a str carrying non-ASCII
     code points, and Starlette decodes both header values and path segments as
@@ -294,7 +336,7 @@ async def receive_webflow_webhook(
     # Unknown store, inactive store, an unprovisioned store, a wrong URL secret
     # and (when Layer 2 is armed) a bad signature all answer the same 401: the
     # caller learns nothing about which it was.
-    if not store or not _bytes_equal(expected_secret, url_secret) or not signature_ok:
+    if not store or not webflow_bytes_equal(expected_secret, url_secret) or not signature_ok:
         logger.warning(
             "webflow webhook rejected store_id=%s store_known=%s secret_provisioned=%s "
             "url_secret_ok=%s signature_layer=%s signature_ok=%s signature_shape=%s "
@@ -302,7 +344,7 @@ async def receive_webflow_webhook(
             store_id,
             bool(store),
             bool(expected_secret),
-            bool(store) and _bytes_equal(expected_secret, url_secret),
+            bool(store) and webflow_bytes_equal(expected_secret, url_secret),
             "armed" if client_secret else "off",
             signature_ok,
             _signature_shape(signature),
@@ -346,11 +388,11 @@ async def receive_webflow_webhook(
     # which is scoped to this store's own `site_id` regardless.
     expected_site_id = str(credentials.get("site_id") or "").strip()
     delivered_site_id = str(envelope.get("siteId") or body.get("siteId") or "").strip()
-    if delivered_site_id and not _bytes_equal(expected_site_id, delivered_site_id):
+    if delivered_site_id and not webflow_bytes_equal(expected_site_id, delivered_site_id):
         raise HTTPException(status_code=401, detail="Invalid Webflow webhook source")
 
-    delivery_key = _delivery_key(store_id, raw)
-    if delivery_key in _SEEN_DELIVERIES:
+    delivery_digest = _delivery_digest(raw)
+    if _delivery_seen(store_id, delivery_digest):
         # `duplicates: 1`, not 0. This IS a duplicate observation — the ledger
         # would have counted it as one had the short-circuit not saved the API
         # call — and reporting zero makes the metric read as if redeliveries
@@ -407,5 +449,5 @@ async def receive_webflow_webhook(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    _remember_delivery(delivery_key)
+    _remember_delivery(store_id, delivery_digest)
     return result.as_summary(trigger_type=normalize_webflow_trigger(trigger))

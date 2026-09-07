@@ -1015,3 +1015,83 @@ def test_a_failed_FIRST_provisioning_keeps_the_minted_secret(client, monkeypatch
 
     assert response.status_code == 502
     assert _stored(db)["url_secret"], "the minted secret was rolled back to nothing"
+
+
+def test_a_non_ascii_stored_secret_is_a_MISMATCH_and_not_a_500(client, monkeypatch):
+    """`hmac.compare_digest` raises TypeError on a `str` above code point 0x7F.
+
+    Both secret compares in this route ran on `str`, so a stored `url_secret`
+    carrying one — a hand-edited cell, a migrated blob, a concurrent writer that
+    is not this code — turned the lost-race branch into an unhandled 500. The
+    500 is the worse outcome by some distance: the webhooks this run created at
+    Webflow are then left registered against a URL the receiver can only 401,
+    because the discard only happens on the 409 path.
+
+    The receiver has always compared as bytes with `surrogatepass`
+    (`routes/webflow_webhooks.py::webflow_bytes_equal`); this route now uses the
+    same helper, so ONE encoding rule covers both ends of one secret.
+    """
+    from routes import merchant_store_connections as mod
+    from services import webflow_connection as conn
+
+    db, api = _ensure_app(monkeypatch, {"api_token": "wf-token", "site_id": SITE_ID})
+    deleted = _patch_discard(monkeypatch)
+    real_merge = conn.merge_webflow_credentials
+    merges = {"n": 0}
+
+    async def racing_merge(**kwargs):
+        merges["n"] += 1
+        if merges["n"] == 2:
+            blob = json.loads(db._target()["api_key"])
+            # A lone surrogate AND a non-ASCII letter: `json.loads` produces the
+            # first from a `"\ud800"` escape, and plain `.encode("utf-8")` raises
+            # `UnicodeEncodeError` on it — which is why the helper's error
+            # handler is `surrogatepass` rather than the default.
+            blob["url_secret"] = "sécret-\ud800"
+            db._target()["api_key"] = json.dumps(blob)
+        return await real_merge(**kwargs)
+
+    monkeypatch.setattr(conn, "merge_webflow_credentials", racing_merge)
+
+    response = client.post(
+        f"/integrations/webflow/{STORE_ID}/webhooks/ensure",
+        headers=_auth("merchant", MERCHANT_A),
+    )
+
+    assert response.status_code == 409, response.text
+    assert "URL secret changed" in response.json()["detail"]
+    # And the webhooks that would otherwise deliver into a wall were removed.
+    assert sorted(deleted) == ["wh-ecomm_new_order", "wh-ecomm_order_changed"]
+
+
+def test_connect_names_the_actor_in_its_audit_line(client, monkeypatch, caplog):
+    """Connect is the more consequential of the two audited Webflow actions.
+
+    It BINDS a store to a site, and a reconnect pointed at a different site
+    drops the old credential and every piece of state derived from it. Staff
+    roles can run it for a merchant they do not belong to, so the merchant id
+    does not identify who did it.
+    """
+    from routes import merchant_store_connections as mod
+    from services import webflow_connection as conn
+
+    monkeypatch.setattr(mod, "database", _StoreDb())
+
+    async def fake_resolve(token, *, site_id=None, **kwargs):
+        return {"id": SITE_ID, "displayName": "My Shop", "shortName": "shop"}
+
+    monkeypatch.setattr(conn, "resolve_webflow_site", fake_resolve)
+
+    with caplog.at_level("INFO"):
+        response = client.post(
+            "/integrations/webflow/connect",
+            headers=_auth("merchant", MERCHANT_A),
+            json={"merchant_id": MERCHANT_A, "api_token": "wf-token"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert "webflow_connect" in caplog.text
+    assert "actor_role=merchant" in caplog.text
+    assert f"actor_user_id=u-{MERCHANT_A}" in caplog.text
+    # Still never the token.
+    assert "wf-token" not in caplog.text

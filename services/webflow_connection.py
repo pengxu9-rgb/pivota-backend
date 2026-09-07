@@ -47,6 +47,10 @@ logger = logging.getLogger("webflow_connection")
 WEBFLOW_API_ROOT = "https://api.webflow.com/v2"
 WEBFLOW_SITES_PATH = "/sites"
 WEBFLOW_TIMEOUT_SECONDS = 15.0
+# The site list, paged and bounded. 10 pages is 1,000 sites on one token, well
+# past any real Webflow workspace.
+_SITE_PAGE_LIMIT = 100
+_MAX_SITE_PAGES = 10
 
 PLATFORM = "webflow"
 
@@ -188,6 +192,7 @@ async def _get(
     timeout: float,
     client: Optional[httpx.AsyncClient],
     what: str,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Any:
     token = str(api_token or "").strip()
     if not token:
@@ -198,6 +203,16 @@ async def _get(
         # a GET, and the narrower call is the one a caller-supplied client
         # double has to implement, which keeps the sweep's tests driving the
         # real request-building code instead of a stub of it.
+        #
+        # `params` is passed only when there are any, so the site LOOKUP (which
+        # takes none) still issues the exact two-argument call every existing
+        # double implements.
+        if params:
+            return await http.get(
+                f"{WEBFLOW_API_ROOT}{path}",
+                headers=build_webflow_headers(token),
+                params=params,
+            )
         return await http.get(
             f"{WEBFLOW_API_ROOT}{path}", headers=build_webflow_headers(token)
         )
@@ -241,19 +256,45 @@ async def list_webflow_sites(
     timeout: float = WEBFLOW_TIMEOUT_SECONDS,
     client: Optional[httpx.AsyncClient] = None,
 ) -> List[Dict[str, Any]]:
-    """`GET /v2/sites` — every site this token can reach."""
-    payload = await _get(
-        WEBFLOW_SITES_PATH,
-        api_token=api_token,
-        timeout=timeout,
-        client=client,
-        what="site list",
-    )
-    raw = payload.get("sites") if isinstance(payload, dict) else payload
-    if not isinstance(raw, list):
-        raise WebflowConnectionError("Invalid Webflow site list response")
-    sites = [_site_summary(site) for site in raw]
-    return [site for site in sites if site.get("id")]
+    """`GET /v2/sites` — every site this token can reach, walking past page 1.
+
+    The list decides two things: whether the token resolves to exactly ONE site
+    (`resolve_webflow_site`), and which candidates a 409 offers the merchant to
+    choose from. Reading only the first page would make a token that reaches
+    more sites than fit on one page silently resolve against a subset — and the
+    dangerous half of that is the AMBIGUITY check, which is what stops a store
+    being bound to a site the merchant did not mean.
+
+    Bounded, and it stops on a SHORT page, so an endpoint that ignores
+    `offset`/`limit` and answers everything at once ends the walk in one call.
+    """
+    sites: List[Dict[str, Any]] = []
+    seen: set = set()
+    offset = 0
+    for _page in range(_MAX_SITE_PAGES):
+        payload = await _get(
+            WEBFLOW_SITES_PATH,
+            api_token=api_token,
+            timeout=timeout,
+            client=client,
+            what="site list",
+            params={"offset": offset, "limit": _SITE_PAGE_LIMIT},
+        )
+        raw = payload.get("sites") if isinstance(payload, dict) else payload
+        if not isinstance(raw, list):
+            raise WebflowConnectionError("Invalid Webflow site list response")
+        added = 0
+        for site in (_site_summary(row) for row in raw):
+            key = site.get("id")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            sites.append(site)
+            added += 1
+        if len(raw) < _SITE_PAGE_LIMIT or not added:
+            break
+        offset += len(raw)
+    return sites
 
 
 async def fetch_webflow_site(
