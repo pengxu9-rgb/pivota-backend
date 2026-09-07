@@ -994,6 +994,69 @@ def test_a_failed_ROTATION_restores_the_secret_webflow_is_still_delivering_with(
     assert "the-live-one" not in caplog.text
 
 
+def test_a_NON_ASCII_secret_makes_the_rollback_a_MISMATCH_not_an_exception(
+    client, monkeypatch, caplog
+):
+    """The rollback's own compare, pinned separately from the lost race's.
+
+    `_roll_back_rotation` is the recovery path for a rotation that could not
+    register, and its guard ("only restore if the stored value is still the one
+    THIS run minted") is a secret compare like every other in this route. On a
+    `str` above code point 0x7F `hmac.compare_digest` raises `TypeError` — and
+    here that would not even surface as an error: the rollback swallows
+    exceptions, because its caller is already answering one. So a plain compare
+    would turn "a concurrent writer holds the secret, so leave it alone" into "a
+    crash we logged as a failed rollback", and the two are indistinguishable
+    from outside while meaning opposite things.
+
+    Comparing as bytes through the receiver's own helper makes it what it should
+    be: an ordinary mismatch. The concurrent writer's secret stands, untouched,
+    and nothing is reported as a rollback failure.
+    """
+    from services import webflow_connection as conn
+    from services.webflow_webhook_subscriptions import WebflowWebhookError
+
+    db, _api = _ensure_app(
+        monkeypatch,
+        {"api_token": "wf-token", "site_id": SITE_ID, "url_secret": "the-live-one"},
+        api=_WebhookApi(error=WebflowWebhookError("Webflow webhook create failed")),
+    )
+    real_merge = conn.merge_webflow_credentials
+    merges = {"n": 0}
+    # A lone surrogate AND a non-ASCII letter, exactly as the lost-race test
+    # uses: `.encode("utf-8")` raises on the first, which is why the helper
+    # encodes with `surrogatepass`.
+    intruder = "sécret-\ud800"
+
+    async def racing_merge(**kwargs):
+        merges["n"] += 1
+        if merges["n"] == 2:
+            # Between the mint and the rollback, somebody else took the secret.
+            blob = json.loads(db._target()["api_key"])
+            blob["url_secret"] = intruder
+            db._target()["api_key"] = json.dumps(blob)
+        return await real_merge(**kwargs)
+
+    monkeypatch.setattr(conn, "merge_webflow_credentials", racing_merge)
+
+    with caplog.at_level("INFO"):
+        response = client.post(
+            f"/integrations/webflow/{STORE_ID}/webhooks/ensure?rotate=true",
+            headers=_auth("merchant", MERCHANT_A),
+        )
+
+    # The registration failure, and only it.
+    assert response.status_code == 502, response.text
+    assert merges["n"] == 2, "the rollback never ran, so nothing was compared"
+    # The concurrent writer's secret stands: a mismatch does NOT restore.
+    assert _stored(db)["url_secret"] == intruder
+    assert "could not roll back a failed rotation" not in caplog.text, (
+        "the compare raised instead of returning False — the rollback reported "
+        "a failure where the correct answer was 'somebody else owns this now'"
+    )
+    assert "the-live-one" not in caplog.text
+
+
 def test_a_failed_FIRST_provisioning_keeps_the_minted_secret(client, monkeypatch):
     """The counterpart, and the reason the rollback is scoped to a rotation.
 

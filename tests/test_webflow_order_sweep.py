@@ -16,7 +16,10 @@ What is pinned:
 * a truncated pass RESUMES from its offset on the next run instead of re-reading
   the same prefix forever;
 * each lane keeps its own cursor;
-* a lane whose status filter Webflow rejects fails alone.
+* a lane whose status filter Webflow rejects fails alone;
+* an order the mapper REFUSED is remembered and re-attempted by id on later
+  runs — the cursor advances past it, so `invalid > 0` is the signal for the run
+  that saw it and the persisted id is what makes the money recoverable.
 """
 
 from __future__ import annotations
@@ -1426,6 +1429,225 @@ async def test_a_clean_run_is_still_a_success(monkeypatch):
     assert stats["invalid_order_ids"] == []
 
 
+# ---- ...and is RETRIED, because the cursor has already gone past it ---------
+#
+# `invalid > 0` makes the RUN red. It does not make the order recoverable: the
+# lane's high water mark is taken from the anchor BEFORE the record is
+# attempted, so the completed pass advances the cursor past the very order it
+# refused. These drive the real mapper (`_mapping_recorder`), so the refusal
+# under test is a genuine `WebflowMoneyFormatError` raised by production code
+# rather than a stub that agrees to raise.
+
+
+def _refused_ids(state):
+    return [entry["order_id"] for entry in state["reconciliation"]["refused_order_ids"]]
+
+
+def _disagreeing(order_id, *, accepted):
+    """A money object that contradicts itself: 5898 minor units vs `"$60.00"`.
+
+    This is the shape row 10 of docs/WEBFLOW_TELEMETRY.md exists to catch, and
+    `map_webflow_order` refuses it rather than filing a figure that could be
+    100x wrong.
+    """
+    order = _order(order_id, accepted=accepted)
+    order["customerPaid"] = {"unit": "USD", "value": 5898, "string": "$60.00"}
+    return order
+
+
+async def test_a_refused_order_is_RETRIED_on_a_later_run_and_then_records(monkeypatch):
+    """The gap this closes.
+
+    Run 1 refuses the order and advances the cursor past it anyway. Run 2's
+    lane can therefore only report it `skipped_already_recorded` — so without a
+    persisted id, the money is missing from a GREEN run forever.
+    """
+    events = []
+    bad = _disagreeing("bad-1", accepted=NOW - timedelta(days=2))
+    fresh = _order("fresh", accepted=NOW)
+
+    first, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: [fresh, bad]}),
+        recorder=_mapping_recorder(events),
+    )
+
+    assert first["invalid"] == 1
+    assert first["status"] == "partial_failure"
+    # The cursor moved PAST the order it refused. That is the whole problem.
+    assert merged["reconciliation"]["orders"]["cursor"] == _iso(NOW)
+    assert _refused_ids(merged) == ["bad-1"]
+
+    # Run 2: the merchant fixed the money object. `acceptedOn` never moved, so
+    # it now sits below `cursor - overlap` and the lane cannot reach it.
+    fixed = _order("bad-1", accepted=NOW - timedelta(days=2))
+    events.clear()
+    second_client = _Client(
+        pages_by_status={None: [fresh, fixed]}, orders_by_id={"bad-1": fixed}
+    )
+    second, merged_2, _recorded_2 = await _run(
+        monkeypatch,
+        second_client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": merged["reconciliation"],
+        },
+        recorder=_mapping_recorder(events),
+    )
+
+    assert _lane(second, "orders")["skipped_already_recorded"] == 1, (
+        "the lane still reaches this order, so this test is not exercising the "
+        "gap the refused replay exists to close"
+    )
+    # It was read BY ID and the REAL mapper produced the money row.
+    assert [c["order_id"] for c in second_client.calls if c["kind"] == "order"] == [
+        "bad-1"
+    ]
+    assert {"order_id": "bad-1", "event_types": ["order.created", "order.paid"]} in events
+    assert second["refused"]["recorded"] == 1
+    assert second["invalid"] == 0
+    assert second["status"] == "success"
+    assert second["accepted"] >= 2, "the replay's rows are missing from the run totals"
+    # ...and the id is GONE. Keeping it would re-deliver this order on every
+    # run forever, and nothing downstream would ever complain: the rows dedupe.
+    assert "refused_order_ids" not in merged_2["reconciliation"]
+
+
+async def test_an_order_refused_AGAIN_stays_tracked_and_keeps_the_run_RED(monkeypatch):
+    """The other half. A retry that is refused again must not quietly drop the
+    id (the order would be lost) and must not report success (the store's money
+    shape is still wrong)."""
+    events = []
+    still_bad = _disagreeing("bad-1", accepted=NOW - timedelta(days=2))
+    client = _Client(pages_by_status={None: []}, orders_by_id={"bad-1": still_bad})
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        client,
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {
+                "orders": {"cursor": _iso(NOW), "ordering_verified": True},
+                "refused_order_ids": [{"order_id": "bad-1", "misses": 0}],
+            },
+        },
+        recorder=_mapping_recorder(events),
+    )
+
+    assert stats["refused"]["tracked"] == 1
+    assert stats["refused"]["invalid"] == 1
+    assert stats["refused"]["recorded"] == 0
+    assert events == []
+    # No lane refused anything this run — the replay ALONE has to carry the
+    # status, or a store whose orders have all aged past the cursor goes green
+    # while its money is still missing.
+    assert all(int(lane["invalid"]) == 0 for lane in stats["lanes"])
+    assert stats["invalid"] == 1
+    assert stats["status"] == "partial_failure"
+    assert stats["invalid_order_ids"] == ["bad-1"]
+    assert _refused_ids(merged) == ["bad-1"]
+
+
+async def test_a_refused_id_that_404s_is_dropped_only_after_N_runs(monkeypatch):
+    from services.webflow_order_sweep import REFUSED_ORDER_MAX_MISSES
+
+    state = {"refused_order_ids": [{"order_id": "gone", "misses": 0}]}
+    for attempt in range(1, REFUSED_ORDER_MAX_MISSES):
+        stats, merged, _recorded = await _run(
+            monkeypatch,
+            _Client(pages_by_status={None: []}),
+            credentials={
+                "api_token": "wf-token",
+                "site_id": SITE_ID,
+                "reconciliation": state,
+            },
+        )
+        assert stats["refused"]["dropped_not_found"] == 0
+        assert merged["reconciliation"]["refused_order_ids"][0]["misses"] == attempt
+        state = merged["reconciliation"]
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: []}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": state,
+        },
+    )
+
+    assert stats["refused"]["dropped_not_found"] == 1
+    assert "refused_order_ids" not in merged["reconciliation"]
+
+
+async def test_the_refused_set_is_BOUNDED_and_names_what_it_drops(monkeypatch, caplog):
+    """It lives in the same one database cell the pending set does."""
+    import logging
+
+    from services.webflow_order_sweep import REFUSED_ORDER_ID_CAP
+
+    already = REFUSED_ORDER_ID_CAP - 20
+    new_bad = [
+        _disagreeing(f"new-{i}", accepted=NOW - timedelta(minutes=i)) for i in range(40)
+    ]
+    events = []
+
+    with caplog.at_level(logging.WARNING, logger="webflow_order_sweep"):
+        stats, merged, _recorded = await _run(
+            monkeypatch,
+            # Every stored id 404s, so it is kept with a miss rather than
+            # resolved — the set genuinely has to hold all of them.
+            _Client(pages_by_status={None: new_bad}),
+            credentials={
+                "api_token": "wf-token",
+                "site_id": SITE_ID,
+                "reconciliation": {
+                    "refused_order_ids": [
+                        {"order_id": f"old-{i}", "misses": 0} for i in range(already)
+                    ]
+                },
+            },
+            recorder=_mapping_recorder(events),
+        )
+
+    ids = _refused_ids(merged)
+    assert len(ids) == REFUSED_ORDER_ID_CAP
+    assert "old-0" not in ids and "old-19" not in ids
+    assert "old-20" in ids
+    assert [f"new-{i}" for i in range(40)] == ids[-40:]
+    dropped_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "refused order id(s) at the cap" in record.getMessage()
+    ]
+    assert dropped_lines, "the cap dropped ids silently"
+    assert "old-0" in dropped_lines[0] and "old-19" in dropped_lines[0]
+
+
+async def test_a_dry_run_reads_the_refused_set_and_changes_nothing(monkeypatch):
+    fixed = _order("bad-1", accepted=NOW - timedelta(days=2))
+    events = []
+
+    stats, merged, _recorded = await _run(
+        monkeypatch,
+        _Client(pages_by_status={None: []}, orders_by_id={"bad-1": fixed}),
+        credentials={
+            "api_token": "wf-token",
+            "site_id": SITE_ID,
+            "reconciliation": {"refused_order_ids": [{"order_id": "bad-1", "misses": 0}]},
+        },
+        recorder=_mapping_recorder(events),
+        apply=False,
+    )
+
+    assert stats["refused"]["refetched"] == 1
+    assert stats["refused"]["recorded"] == 0
+    assert events == []
+    assert merged == {}, "a dry run wrote state"
+
+
 async def test_one_stores_refusal_makes_the_ALL_STORES_run_partial(monkeypatch):
     """The roll-up read `lane_failures` alone, so a store that refused every
     order rolled up green."""
@@ -1556,6 +1778,63 @@ def test_the_script_names_pending_ids_it_dropped(monkeypatch, capsys):
 
     assert exit_code == 0
     assert "tracked `pending` orders dropped" in capsys.readouterr().out
+
+
+def test_the_REFUSED_note_says_the_ids_are_retried_not_alarmed_once(
+    monkeypatch, capsys
+):
+    """The NOTE used to claim a durability the run did not have.
+
+    `invalid` and the exit code describe THIS run; what carries the orders
+    forward is `refused_order_ids`. An operator reading the NOTE has to be able
+    to tell which of the two they are looking at, because the answer decides
+    whether a green run tomorrow means "fixed" or "the cursor moved on".
+    """
+    _drive_script(
+        monkeypatch,
+        {
+            "status": "partial_failure",
+            "dry_run": False,
+            "processed": 1,
+            "invalid": 1,
+            "stores": [
+                {
+                    "store_id": "store-wf",
+                    "status": "partial_failure",
+                    "invalid": 1,
+                    "invalid_order_ids": ["bad-1"],
+                }
+            ],
+        },
+    )
+
+    out = capsys.readouterr().out
+    assert "re-attempted by id at the head of every run" in out
+    assert "not a one-shot" in out
+
+
+def test_the_script_names_REFUSED_ids_it_gave_up_on(monkeypatch, capsys):
+    """The only way a refused order stops being retried without ever landing."""
+    exit_code = _drive_script(
+        monkeypatch,
+        {
+            "status": "success",
+            "dry_run": False,
+            "processed": 1,
+            "invalid": 0,
+            "stores": [
+                {
+                    "store_id": "store-wf",
+                    "status": "success",
+                    "invalid": 0,
+                    "refused": {"dropped_not_found": 2},
+                }
+            ],
+        },
+    )
+
+    assert exit_code == 0
+    assert "REFUSED orders given up on after repeated 404s" in capsys.readouterr().out
 
 
 async def test_a_garbage_pending_id_is_dropped_rather_than_retried_forever(monkeypatch):

@@ -88,6 +88,25 @@ So the sweep does three things instead of assuming one.
    tracked order per run, not a walk, so its cost is a function of how many
    orders a store actually has awaiting capture.
 
+5. **A REFUSED ORDER IS REMEMBERED, FOR EXACTLY THE SAME REASON.** An order
+   `record_webflow_order` refuses — a `WebflowMoneyFormatError`, a money shape
+   this bridge will not guess at — is counted `invalid`, and `invalid > 0` makes
+   the run `partial_failure` and the script exit non-zero. That is the signal
+   for the run that OBSERVED it, and it is not durability: the lane's high water
+   mark is taken from the anchor BEFORE the record is attempted, so a completed
+   pass advances the cursor past an order it refused. Sixty minutes of newer
+   orders later the overlap no longer covers it, the lane reports it
+   `skipped_already_recorded`, and the run is green with that money missing.
+
+   So every refused id is remembered in `reconciliation.refused_order_ids`
+   (bounded, `REFUSED_ORDER_ID_CAP`) and re-fetched BY ID at the head of the
+   next run through the same recorder, exactly like the `pending` set. An id
+   leaves the set when a record attempt SUCCEEDS, when the order turns out to be
+   test-flagged, or when it 404s `REFUSED_ORDER_MAX_MISSES` consecutive runs
+   (counted). An attempt refused AGAIN keeps the id and counts `invalid` for
+   that run, so the store stays red every run until the shape is fixed rather
+   than for one run only.
+
 CURSOR SAFETY, per lane:
 
 * a completed pass advances the cursor to the highest anchor the pass saw, and
@@ -155,6 +174,7 @@ _NEXT_OFFSET_KEY = "next_offset"
 _ORDERING_KEY = "ordering_verified"
 _ORDERING_VIOLATED_AT_KEY = "ordering_violated_at"
 _PENDING_IDS_KEY = "pending_order_ids"
+_REFUSED_IDS_KEY = "refused_order_ids"
 
 # How many `pending` order ids a store may carry forward. The set exists because
 # `acceptedOn` does not move when an order leaves `pending`, so the lane's own
@@ -167,6 +187,13 @@ PENDING_ORDER_ID_CAP = 500
 # dropped. A 404 on a pending order is usually the read racing Webflow, so one
 # is not evidence; three across three runs is.
 PENDING_ORDER_MAX_MISSES = 3
+# The same two bounds for the REFUSED set (see point 5 of the module docstring).
+# Separate constants rather than a shared pair because the two sets answer
+# different questions and a store can be pathological in one without being
+# pathological in the other — but the reasoning behind each number is identical,
+# so they start equal.
+REFUSED_ORDER_ID_CAP = 500
+REFUSED_ORDER_MAX_MISSES = 3
 # How many order ids a stat carries as EXAMPLES. The counts are exact; the ids
 # are there so an operator has somewhere to start rather than a number alone.
 _EXAMPLE_ID_LIMIT = 5
@@ -347,6 +374,10 @@ async def _sweep_lane(
     # a store with a pathological list cannot make one run hold an unbounded
     # list in memory on the way to a bounded one on disk.
     pending_seen: List[str] = []
+    # Ids this walk REFUSED. Same bound, same reason, and the same "an id nobody
+    # comes back for is money nobody comes back for" stake: the cursor advances
+    # past a refused order, so this list is the only handle a later run has.
+    refused_seen: List[str] = []
     invalid_examples: List[str] = []
 
     stats: Dict[str, Any] = {
@@ -461,6 +492,12 @@ async def _sweep_lane(
                 # not a skipped one: the run's status carries it (see
                 # `sweep_webflow_store`), so a store whose money shape changed
                 # cannot report a green sweep while recording nothing.
+                #
+                # And the id is REMEMBERED, because the status is only the
+                # signal for THIS run. `high_water` above was taken from the
+                # anchor before this attempt, so a completed pass advances the
+                # cursor past this very order and no later pass comes back for
+                # it. See point 5 of the module docstring.
                 logger.warning(
                     "webflow sweep skipped a malformed order "
                     "(store_id=%s lane=%s order_id=%s error=%s)",
@@ -472,6 +509,11 @@ async def _sweep_lane(
                 stats["invalid"] += 1
                 if len(invalid_examples) < _EXAMPLE_ID_LIMIT:
                     invalid_examples.append(order_id)
+                if (
+                    len(refused_seen) < REFUSED_ORDER_ID_CAP
+                    and order_id not in refused_seen
+                ):
+                    refused_seen.append(order_id)
                 continue
             if result.status == "ignored":
                 stats["ignored"] += 1
@@ -553,12 +595,20 @@ async def _sweep_lane(
     stats["complete"] = complete
     stats["pending_order_ids"] = list(pending_seen)
     stats["pending_observed"] = len(pending_seen)
+    stats["refused_order_ids"] = list(refused_seen)
+    stats["refused_observed"] = len(refused_seen)
     stats["invalid_order_ids"] = list(invalid_examples)
     return stats, next_state
 
 
-def _pending_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The tracked `pending` ids out of a stored `reconciliation` subtree.
+def _tracked_entries(
+    state: Dict[str, Any], key: str, *, max_misses: int
+) -> List[Dict[str, Any]]:
+    """One tracked-id set out of a stored `reconciliation` subtree.
+
+    Shared by `pending_order_ids` and `refused_order_ids`: the two sets track
+    different failures but carry the identical shape and the identical hazard,
+    and two hand-copied readers would drift.
 
     Order is the state's own, oldest first, because that is what "the oldest is
     dropped" means at the cap. A bare string is accepted as well as an entry
@@ -570,7 +620,7 @@ def _pending_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     garbage id valid — and it would occupy a slot in a bounded set and produce a
     WARNING per run forever, which is the shape of a self-inflicted alert flood.
     """
-    raw = state.get(_PENDING_IDS_KEY)
+    raw = state.get(key)
     entries: List[Dict[str, Any]] = []
     seen: set = set()
     if not isinstance(raw, list):
@@ -592,7 +642,7 @@ def _pending_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                     int(misses)
                     if isinstance(misses, int)
                     and not isinstance(misses, bool)
-                    and 0 <= misses <= PENDING_ORDER_MAX_MISSES
+                    and 0 <= misses <= max_misses
                     else 0
                 ),
             }
@@ -729,13 +779,139 @@ async def _replay_pending_orders(
     return stats, kept
 
 
-def _merge_pending_entries(
+async def _replay_refused_orders(
+    *,
+    merchant_id: str,
+    store_id: str,
+    api_token: str,
+    site_id: str,
+    entries: List[Dict[str, Any]],
+    apply: bool,
+    http: httpx.AsyncClient,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Re-read every REFUSED order BY ID. Returns (stats, entries kept).
+
+    An order `record_webflow_order` refused was counted `invalid` by the run
+    that saw it, and `invalid > 0` made that run red — but the lane's high water
+    mark was taken from the order's anchor BEFORE the record was attempted, so
+    the completed pass advanced the cursor past it anyway. Once the overlap no
+    longer covers it the lane can only report it `skipped_already_recorded`, and
+    the money is missing from a green run. This replay is what makes the refusal
+    a RETRY rather than a one-run alarm. See point 5 of the module docstring.
+
+    An id leaves the set when a record attempt SUCCEEDS (whatever the recorder
+    then decides to do with the order — a refusal is the only failure this set
+    exists to retry), when the order is flagged a test order, or when it has
+    404'd `REFUSED_ORDER_MAX_MISSES` runs running. Every other outcome KEEPS it:
+    a refusal on the re-attempt is the shape still being wrong, and a transport
+    failure or a rate limit says nothing about the order at all.
+    """
+    stats: Dict[str, Any] = {
+        "lane": "refused_replay",
+        "tracked": len(entries),
+        "refetched": 0,
+        "recorded": 0,
+        "accepted": 0,
+        "duplicates": 0,
+        "ignored": 0,
+        "invalid": 0,
+        "refunds_unreadable": 0,
+        "test_orders_skipped": 0,
+        "dropped_not_found": 0,
+        "fetch_failures": 0,
+        "invalid_order_ids": [],
+    }
+    kept: List[Dict[str, Any]] = []
+    for entry in entries:
+        order_id = str(entry["order_id"])
+        try:
+            order = await fetch_webflow_order(
+                api_token=api_token,
+                site_id=site_id,
+                order_id=order_id,
+                client=http,
+            )
+        except WebflowOrderNotFoundError:
+            misses = int(entry.get("misses") or 0) + 1
+            if misses >= REFUSED_ORDER_MAX_MISSES:
+                stats["dropped_not_found"] += 1
+                logger.warning(
+                    "webflow sweep dropped a REFUSED order after %s consecutive "
+                    "404s (store_id=%s order_id=%s) — it was never recorded, and "
+                    "nothing will come back for it now",
+                    misses,
+                    store_id,
+                    order_id,
+                )
+                continue
+            kept.append({"order_id": order_id, "misses": misses})
+            continue
+        except WebflowOrderFetchError as exc:
+            stats["fetch_failures"] += 1
+            logger.warning(
+                "webflow sweep could not re-read a refused order "
+                "(store_id=%s order_id=%s error=%s)",
+                store_id,
+                order_id,
+                str(exc)[:200],
+            )
+            kept.append(dict(entry))
+            continue
+        stats["refetched"] += 1
+        if is_webflow_test_order(order):
+            stats["test_orders_skipped"] += 1
+            continue
+        if not apply:
+            # A dry run reads and classifies; it records nothing and drops
+            # nothing, so the next --apply run sees exactly this set.
+            stats["ignored"] += 1
+            kept.append({"order_id": order_id, "misses": 0})
+            continue
+        try:
+            result = await record_webflow_order(
+                merchant_id=merchant_id,
+                store_id=store_id,
+                order=order,
+                from_webhook=False,
+            )
+        except ValueError as exc:
+            # Refused AGAIN. The id is KEPT and the run is counted `invalid`,
+            # so the store stays red every run until the shape is fixed rather
+            # than only on the run that first saw it.
+            logger.warning(
+                "webflow sweep re-attempted a refused order and was refused "
+                "again (store_id=%s order_id=%s error=%s)",
+                store_id,
+                order_id,
+                str(exc)[:200],
+            )
+            stats["invalid"] += 1
+            if len(stats["invalid_order_ids"]) < _EXAMPLE_ID_LIMIT:
+                stats["invalid_order_ids"].append(order_id)
+            kept.append({"order_id": order_id, "misses": 0})
+            continue
+        # RECORDED. The id goes: keeping it would re-deliver this order to the
+        # ledger on every run forever, which is a self-inflicted load with no
+        # end condition (the rows dedupe, so nothing would ever notice).
+        if result.status == "ignored":
+            stats["ignored"] += 1
+        stats["recorded"] += 1
+        stats["refunds_unreadable"] += len(result.ignored_reasons)
+        stats["accepted"] += result.accepted
+        stats["duplicates"] += result.duplicates
+    return stats, kept
+
+
+def _merge_tracked_entries(
     *,
     current: List[Dict[str, Any]],
     kept: List[Dict[str, Any]],
     resolved: set,
     observed: List[str],
+    cap: int,
     store_id: str,
+    label: str,
+    consequence: str,
 ) -> List[Dict[str, Any]]:
     """The set to persist: what is stored NOW, minus what this run resolved,
     plus what this run observed — capped, oldest first out.
@@ -745,6 +921,10 @@ def _merge_pending_entries(
     is called from): the read and the write are separated by unbounded I/O, and
     a second replica's newly-tracked ids must not be discarded by this one's
     write. Removals are applied by id, so they survive that merge too.
+
+    Shared by both tracked sets (`pending_order_ids`, `refused_order_ids`).
+    `label` and `consequence` are only the WARNING's wording at the cap; the
+    behaviour is identical, because so is the hazard.
     """
     updated = {str(item["order_id"]): item for item in kept}
     merged: List[Dict[str, Any]] = []
@@ -766,19 +946,18 @@ def _merge_pending_entries(
         if order_id not in present:
             merged.append({"order_id": order_id, "misses": 0})
             present.add(order_id)
-    if len(merged) > PENDING_ORDER_ID_CAP:
-        dropped = merged[: len(merged) - PENDING_ORDER_ID_CAP]
-        merged = merged[len(merged) - PENDING_ORDER_ID_CAP :]
+    if len(merged) > cap:
+        dropped = merged[: len(merged) - cap]
+        merged = merged[len(merged) - cap :]
         logger.warning(
-            "webflow sweep dropped %s tracked pending order id(s) at the cap of "
-            "%s (store_id=%s dropped=%s) — an order dropped here will only get "
-            "its payment row from a webhook delivery, so this store either has "
-            "an unusual number of orders awaiting capture or a lane is "
-            "mis-classifying them",
+            "webflow sweep dropped %s tracked %s order id(s) at the cap of %s "
+            "(store_id=%s dropped=%s) — %s",
             len(dropped),
-            PENDING_ORDER_ID_CAP,
+            label,
+            cap,
             store_id,
             ",".join(str(item["order_id"]) for item in dropped),
+            consequence,
         )
     return merged
 
@@ -839,10 +1018,18 @@ async def sweep_webflow_store(
     # subtree computed from a read that happened many network calls ago — see
     # the comment on the write below.
     lane_states: Dict[str, Dict[str, Any]] = {}
-    tracked_pending = _pending_entries(previous_state)
+    tracked_pending = _tracked_entries(
+        previous_state, _PENDING_IDS_KEY, max_misses=PENDING_ORDER_MAX_MISSES
+    )
     pending_stats: Dict[str, Any] = {"lane": "pending_replay", "tracked": 0}
     pending_kept: List[Dict[str, Any]] = list(tracked_pending)
     pending_observed: List[str] = []
+    tracked_refused = _tracked_entries(
+        previous_state, _REFUSED_IDS_KEY, max_misses=REFUSED_ORDER_MAX_MISSES
+    )
+    refused_stats: Dict[str, Any] = {"lane": "refused_replay", "tracked": 0}
+    refused_kept: List[Dict[str, Any]] = list(tracked_refused)
+    refused_observed: List[str] = []
     try:
         await _verify_site(
             store_id=store_id, api_token=tokens[0], site_id=site_id, http=http
@@ -858,6 +1045,20 @@ async def sweep_webflow_store(
                 api_token=tokens[0],
                 site_id=site_id,
                 entries=tracked_pending,
+                apply=apply,
+                http=http,
+            )
+        # Also at the head of the run, and for the same reason: the lane's
+        # cursor has already advanced past every order in this set (the high
+        # water mark is taken before the record is attempted), so a lane pass
+        # can only report them `skipped_already_recorded`.
+        if tracked_refused:
+            refused_stats, refused_kept = await _replay_refused_orders(
+                merchant_id=merchant_id,
+                store_id=store_id,
+                api_token=tokens[0],
+                site_id=site_id,
+                entries=tracked_refused,
                 apply=apply,
                 http=http,
             )
@@ -897,15 +1098,22 @@ async def sweep_webflow_store(
             for order_id in lane_stats.get("pending_order_ids") or []:
                 if order_id not in pending_observed:
                     pending_observed.append(order_id)
+            for order_id in lane_stats.get("refused_order_ids") or []:
+                if order_id not in refused_observed:
+                    refused_observed.append(order_id)
     finally:
         if own_client:
             await http.aclose()
 
     stats["pending"] = pending_stats
-    # The replay's counters fold into the run's totals. It is an ingest path
-    # like a lane is, and a `pending` order completed by it that did not appear
-    # in `accepted` would make the run under-report what it actually wrote.
-    counted = list(stats["lanes"]) + [pending_stats]
+    stats["refused"] = refused_stats
+    # The replays' counters fold into the run's totals. Each is an ingest path
+    # like a lane is, and a `pending` order completed by one that did not appear
+    # in `accepted` would make the run under-report what it actually wrote —
+    # while a refused order refused AGAIN must land in `invalid`, which is what
+    # keeps the store red every run until its money shape is fixed rather than
+    # only on the run that first saw it.
+    counted = list(stats["lanes"]) + [pending_stats, refused_stats]
     for key in (
         "pages",
         "seen",
@@ -949,7 +1157,7 @@ async def sweep_webflow_store(
         # refusal exists to make loud.
         stats["status"] = "partial_failure"
 
-    if apply and (stats["lanes"] or tracked_pending):
+    if apply and (stats["lanes"] or tracked_pending or tracked_refused):
 
         def _merge_reconciliation(blob: Dict[str, Any]) -> Dict[str, Any]:
             """Merge THIS run's lanes into the CURRENT stored subtree.
@@ -965,12 +1173,13 @@ async def sweep_webflow_store(
             that goes backwards causes a re-read, and re-reading is free because
             the event ids are deterministic. It can never cause a skip.
 
-            `pending_order_ids` is merged the same way and for a sharper reason:
-            a lost cursor costs a re-read, but a lost pending id costs the ORDER
-            — nothing else in the sweep can reach it. So the set is not written
-            wholesale either; removals are applied by id and additions by union
-            against whatever is stored at write time, so a second replica's
-            newly-tracked ids survive this one's write.
+            `pending_order_ids` and `refused_order_ids` are merged the same way
+            and for a sharper reason: a lost cursor costs a re-read, but a lost
+            tracked id costs the ORDER — nothing else in the sweep can reach
+            either kind, because the cursor is already past both. So neither set
+            is written wholesale; removals are applied by id and additions by
+            union against whatever is stored at write time, so a second
+            replica's newly-tracked ids survive this one's write.
             """
             current = blob.get(_STATE_KEY)
             current = dict(current) if isinstance(current, dict) else {}
@@ -978,17 +1187,50 @@ async def sweep_webflow_store(
             resolved = {str(entry["order_id"]) for entry in tracked_pending} - {
                 str(entry["order_id"]) for entry in pending_kept
             }
-            pending = _merge_pending_entries(
-                current=_pending_entries(current),
+            pending = _merge_tracked_entries(
+                current=_tracked_entries(
+                    current, _PENDING_IDS_KEY, max_misses=PENDING_ORDER_MAX_MISSES
+                ),
                 kept=pending_kept,
                 resolved=resolved,
                 observed=pending_observed,
+                cap=PENDING_ORDER_ID_CAP,
                 store_id=store_id,
+                label="pending",
+                consequence=(
+                    "an order dropped here will only get its payment row from a "
+                    "webhook delivery, so this store either has an unusual "
+                    "number of orders awaiting capture or a lane is "
+                    "mis-classifying them"
+                ),
             )
             if pending:
                 current[_PENDING_IDS_KEY] = pending
             else:
                 current.pop(_PENDING_IDS_KEY, None)
+            refused_resolved = {
+                str(entry["order_id"]) for entry in tracked_refused
+            } - {str(entry["order_id"]) for entry in refused_kept}
+            refused = _merge_tracked_entries(
+                current=_tracked_entries(
+                    current, _REFUSED_IDS_KEY, max_misses=REFUSED_ORDER_MAX_MISSES
+                ),
+                kept=refused_kept,
+                resolved=refused_resolved,
+                observed=refused_observed,
+                cap=REFUSED_ORDER_ID_CAP,
+                store_id=store_id,
+                label="refused",
+                consequence=(
+                    "an order dropped here was never recorded at all and "
+                    "nothing will come back for it, so this store's money "
+                    "shape has been broken for long enough to fill the set"
+                ),
+            )
+            if refused:
+                current[_REFUSED_IDS_KEY] = refused
+            else:
+                current.pop(_REFUSED_IDS_KEY, None)
             current["last_run_at"] = _iso(moment)
             current["overlap_minutes"] = int(overlap.total_seconds() // 60)
             blob[_STATE_KEY] = current

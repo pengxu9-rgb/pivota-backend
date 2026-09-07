@@ -269,6 +269,33 @@ def _decimal_from_money_string(text: str) -> Optional[Decimal]:
         return None
 
 
+# Currencies whose minor-unit exponent `utils.money` does NOT know.
+#
+# `to_minor_units` splits the world in two: exponent 0 for
+# `ZERO_DECIMAL_CURRENCIES`, exponent 2 for everything else. These are the ISO
+# 4217 codes where the second half of that split is wrong — three minor digits,
+# or four for the two index units — so its multiplier is off by 10x or 100x for
+# them. The cross-check below is BUILT out of that multiplier, so running it
+# here would not verify assumption 10: it would manufacture a disagreement out
+# of this repo's own gap and REFUSE a perfectly correct order. A KWD 58.980
+# order is 58980 minor units and `to_minor_units` calls it 5898.
+#
+# So the cross-check is skipped for exactly these, at DEBUG, naming the
+# currency. `value` still gets every whole-number check in
+# `_amount_minor_units`; what is given up is only the second, independent
+# reading of the same amount — and the honest scope of the check is "wherever
+# this repo knows the multiplier", not "always".
+_UNKNOWN_EXPONENT_CURRENCIES = frozenset(
+    {
+        # Three minor digits.
+        "BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND",
+        # Four (index units; present for completeness rather than because
+        # Webflow is expected to price in them).
+        "CLF", "UYW",
+    }
+)
+
+
 def _cross_check_money_string(
     money: Dict[str, Any], *, field: str, value: int
 ) -> None:
@@ -289,9 +316,12 @@ def _cross_check_money_string(
     `value` gets, counted as `invalid` by the sweep and answered 422 by the
     receiver — and an operator reads both numbers off the message.
 
-    Skipped, at DEBUG, when there is nothing to check against: no `string`, a
-    `string` this parser will not guess at, or a currency whose minor-unit
-    exponent is unknown (the multiplier is exactly what the comparison needs).
+    Skipped, at DEBUG, when there is nothing to compare against or nothing to
+    compare WITH: no `string`; a `string` this parser will not guess at; no
+    readable currency; or a currency in `_UNKNOWN_EXPONENT_CURRENCIES`, the ISO
+    codes whose minor-unit exponent `utils.money` does not know (see that
+    constant — the multiplier is exactly what the comparison is made of, so
+    running it there would refuse correct orders rather than verify anything).
     """
     text = _text(money.get("string"))
     if not text:
@@ -300,6 +330,14 @@ def _cross_check_money_string(
     if not currency:
         logger.debug(
             "webflow money string not cross-checked (field=%s reason=no_currency)", field
+        )
+        return
+    if currency in _UNKNOWN_EXPONENT_CURRENCIES:
+        logger.debug(
+            "webflow money string not cross-checked "
+            "(field=%s currency=%s reason=unknown_minor_unit_exponent)",
+            field,
+            currency,
         )
         return
     parsed = _decimal_from_money_string(text)
