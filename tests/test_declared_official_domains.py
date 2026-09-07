@@ -1320,33 +1320,41 @@ async def test_the_basis_does_not_sample_inference_for_a_merchant_with_no_declar
     assert sorted((basis or {}).get("official_domains") or []) == ["brand.com"]
 
 
-def test_the_inferred_sample_is_host_grained_ordered_and_never_sorts_a_null():
-    """Two draws, each DISTINCT at the HOST, ordered, NULL-free, and excluding url_audit rows.
-    Host-grained because a per-product draw's LIMIT cut off whole storefronts; ordered because
-    the audit basis records this set into an INSERT-ONLY comparability key; NULL-free because
-    Postgres sorts NULL last and SQLite first, which would move the cut; url_audit excluded
-    because those rows carry RETAILER hosts under the merchant's id."""
-    import inspect
+def test_the_inferred_draws_are_module_constants_host_grained_ordered_and_schemed():
+    """Module-level constants (so tests/test_repo_sql_prepare_postgres.py PREPAREs them --
+    an f-string at the call site silently left that gate), DISTINCT at the host, ordered,
+    NULL/scheme-gated, and with NO platform predicate: url_audit rows carry a store-less
+    merchant's own host and excluding them emptied inference for exactly those merchants."""
     import re
+    d = svc.INFERRED_SOURCE_DOMAIN_HOSTS_SQL
+    assert "SELECT DISTINCT source_domain" in d and "source_domain IS NOT NULL" in d
+    assert "ORDER BY source_domain" in d
+    # int(), not a string compare: `"500" >= "1000"` is True lexicographically, and 500 is the one
+    # value this PR exists to remove.
+    assert int(re.search(r"LIMIT (\d+)", d).group(1)) >= 1000
+    pg, lite = svc.INFERRED_CANONICAL_URL_HOSTS_SQL_POSTGRES, svc.INFERRED_CANONICAL_URL_HOSTS_SQL_SQLITE
+    for u in (pg, lite):
+        assert "AS url_host" in u and "canonical_url LIKE '%://%'" in u and "ORDER BY url_host" in u
+        assert int(re.search(r"LIMIT (\d+)", u).group(1)) >= 1000
+        assert all(f"'{c}'" in u for c in "/?#"), "the host cut must stop at '/', '?' and '#'"
+    assert "split_part(" in pg and "instr(" in lite
+    for q in (d, pg, lite):
+        assert "platform" not in q, q
+        assert not re.search(r"SELECT DISTINCT source_domain\s*,\s*canonical_url", q)
+    # The call site reads the constants (a Name the PREPARE gate resolves), never an inline
+    # literal or an f-string; the Postgres one outside any non-Postgres branch.
+    import inspect
     src = inspect.getsource(svc._inferred_merchant_hosts)
-    draws = list(re.finditer(
-        r"SELECT DISTINCT (?P<sel>[^\n]+)\n\s+FROM catalog_products(?P<body>.*?)LIMIT (?P<limit>\d+)",
-        src, re.S,
-    ))
-    assert len(draws) == 2, [d.group(0) for d in draws]
-    domain, url = draws
-    assert domain.group("sel").strip() == "source_domain", domain.group(0)
-    assert "{url_host_expr} AS url_host" in url.group("sel"), url.group(0)
-    for d, col, order in ((domain, "source_domain", "source_domain"), (url, "canonical_url", "url_host")):
-        body = d.group("body")
-        assert f"{col} IS NOT NULL" in body, d.group(0)
-        assert "platform <> 'url_audit'" in body, d.group(0)
-        assert f"ORDER BY {order}" in body, d.group(0)
-        assert int(d.group("limit")) >= 1000, "the cap is a safety net on distinct HOSTS, not a sample size"
-    # No draw selects both columns at once: that is the pair-DISTINCT shape that truncated hosts.
-    assert not re.search(r"SELECT DISTINCT source_domain\s*,\s*canonical_url", src)
-    # Both engines get a host expression for canonical_url.
-    assert "split_part(canonical_url, '/', 3)" in src and "instr(canonical_url, '//')" in src
+    assert "INFERRED_SOURCE_DOMAIN_HOSTS_SQL" in src
+    assert "INFERRED_CANONICAL_URL_HOSTS_SQL_POSTGRES" in src and "INFERRED_CANONICAL_URL_HOSTS_SQL_SQLITE" in src
+    assert "SELECT DISTINCT" not in src
+    # And the gate really collects the Postgres draw: a top-level plain-literal constant.
+    import ast
+    tree = ast.parse(inspect.getsource(svc))
+    top = {n.targets[0].id for n in tree.body
+           if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+           and isinstance(n.value.value, str) and isinstance(n.targets[0], ast.Name)}
+    assert {"INFERRED_SOURCE_DOMAIN_HOSTS_SQL", "INFERRED_CANONICAL_URL_HOSTS_SQL_POSTGRES"} <= top, top
 
 
 async def _seed_catalog(database, mid: str, rows):
@@ -1376,14 +1384,14 @@ def _catalog_rows(mid: str, host: str, n: int, *, source_domain=..., platform: s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source_domain_present", [True, False])
-async def test_a_second_storefront_survives_a_catalog_larger_than_the_sample(monkeypatch, source_domain_present):
+@pytest.mark.parametrize("shape", ["both_columns", "url_only", "domain_only"])
+async def test_a_second_storefront_survives_a_catalog_larger_than_the_sample(monkeypatch, shape):
     """anua.com with 600 products and anua.us with 5, on the real table. A per-product draw
     with LIMIT 500 filled every slot with anua.com and inferred anua.us out of existence --
     out of first_party, out of the seeder, out of the basis. The host-grained draws cannot
-    lose a storefront to a product count -- on EITHER tier: two production ingest doors write
-    source_domain NULL (catalog_reconcile_service, sync_products_from_raw), and there the
-    canonical_url tier is the only host source."""
+    lose a storefront to a product count -- on EITHER tier: catalog_reconcile_service's
+    backfill calls ingest_standard_products with its source_domain=None default, and there
+    the canonical_url tier is the only host source."""
     from db.database import database
     import db.merchant_onboarding as onboarding
 
@@ -1396,10 +1404,15 @@ async def test_a_second_storefront_survives_a_catalog_larger_than_the_sample(mon
 
     await database.connect()
     try:
-        sd = ... if source_domain_present else None
-        await _seed_catalog(database, mid,
-                            _catalog_rows(mid, "anua.com", 600, source_domain=sd)
-                            + _catalog_rows(mid, "anua.us", 5, source_domain=sd))
+        sd = None if shape == "url_only" else ...
+        rows = (_catalog_rows(mid, "anua.com", 600, source_domain=sd)
+                + _catalog_rows(mid, "anua.us", 5, source_domain=sd))
+        if shape == "domain_only":
+            # Only the source_domain tier can answer: a fixture where both tiers agree lets
+            # either tier be deleted with the suite green (two guards, one door).
+            for r in rows:
+                r["cu"] = None
+        await _seed_catalog(database, mid, rows)
         hosts = await svc._inferred_merchant_hosts(mid)
         assert {"anua.com", "anua.us"} <= hosts, sorted(hosts)
         # And the same world draws the same set again.
@@ -1443,15 +1456,16 @@ async def test_inferred_hosts_are_normalized_from_both_tiers(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_audited_retailer_rows_are_not_inferred_as_the_merchants_storefront(monkeypatch):
-    """services/audit_index_intake.py writes audited RETAILER pages under the merchant's id
-    (platform url_audit, source_domain = the retailer's host). Inferring from them makes the
-    retailer first_party on every cited host -- the mirror image of the anua.us defect, which
-    the old per-product LIMIT merely happened to hide for large merchants."""
+async def test_a_store_less_merchants_url_audit_rows_still_infer_its_own_host(monkeypatch):
+    """A merchant with no connected store has ONLY url_audit rows, and on the live audit path
+    both columns of those rows carry the brand's own host. An earlier cut of this change
+    excluded platform url_audit as 'retailer pages': inference went empty for every such
+    merchant, the liveness seeder seeded nothing, and their stored inferred rows were revoked
+    from first_party. Pinned in the production shape -- url_audit is the only platform."""
     from db.database import database
     import db.merchant_onboarding as onboarding
 
-    mid = "test-sample-audit"
+    mid = "test-sample-url-audit-only"
 
     async def _no_onboarding(_mid):
         return {}
@@ -1460,16 +1474,85 @@ async def test_audited_retailer_rows_are_not_inferred_as_the_merchants_storefron
 
     await database.connect()
     try:
-        await _seed_catalog(database, mid,
-                            _catalog_rows(mid, "brand.com", 3)
-                            + _catalog_rows(mid, "sephora.com", 3, platform="url_audit"))
-        hosts = await svc._inferred_merchant_hosts(mid)
-        assert hosts == {"brand.com"}, sorted(hosts)
+        await _seed_catalog(database, mid, _catalog_rows(mid, "brand.com", 3, platform="url_audit"))
+        assert await svc._inferred_merchant_hosts(mid) == {"brand.com"}
     finally:
         try:
             await database.execute("DELETE FROM catalog_products WHERE merchant_id = :m", {"m": mid})
         finally:
             await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_url_host_cut_is_total_and_engine_agnostic(monkeypatch):
+    """The host is cut in SQL, so the cases urlparse used to absorb have to be pinned here:
+    a query or fragment directly after the host (cut in SQL so DISTINCT is at host grain --
+    two variant URLs must be one row); a schemeless value, on which the two engines guess
+    DIFFERENT tokens (`rand.com` vs `x`) -- it is now read by neither; userinfo, port and
+    case, which normalize_host still strips."""
+    from db.database import database
+    import db.merchant_onboarding as onboarding
+
+    mid = "test-sample-url-cut"
+
+    async def _no_onboarding(_mid):
+        return {}
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _no_onboarding)
+
+    urls = [
+        "https://query.example?variant=1",
+        "https://frag.example#top",
+        "https://bare.example",
+        "https://slash.example/",
+        "HTTPS://user:pw@Port.Example:8443/p?x=1#y",
+        "brand.com/products/x",          # schemeless: read by neither engine
+        "/products/x",                   # path only: read by neither engine
+        "//proto.example/p",             # protocol-relative: no '://', read by neither
+    ]
+    rows = []
+    for i, cu in enumerate(urls):
+        rows.append({"pk": f"{mid}-{i}", "ck": f"ck-{mid}-{i}", "m": mid, "pl": "shopify",
+                     "spid": f"s{i}", "sd": None, "cu": cu, "t": f"t{i}"})
+    await database.connect()
+    try:
+        await _seed_catalog(database, mid, rows)
+        hosts = await svc._inferred_merchant_hosts(mid)
+        assert hosts == {"query.example", "frag.example", "bare.example", "slash.example",
+                         "port.example"}, sorted(hosts)
+    finally:
+        try:
+            await database.execute("DELETE FROM catalog_products WHERE merchant_id = :m", {"m": mid})
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_url_draw_does_not_discard_the_source_domain_draw(monkeypatch):
+    """The two draws are consumed separately: the dialect-split URL draw failing must not
+    throw away the source_domain hosts already in hand (non-strict callers would otherwise see
+    an empty catalog tier and revoke stored inferred rows)."""
+    from db.database import database as real_db
+    import db.merchant_onboarding as onboarding
+
+    async def _no_onboarding(_mid):
+        return {}
+
+    real_fetch_all = real_db.fetch_all
+
+    async def _fetch_all(query, values=None, **kw):
+        if "url_host" in str(query):
+            raise RuntimeError("url draw down")
+        if "SELECT DISTINCT source_domain" in str(query):
+            return [{"source_domain": "brand.com"}]
+        return await real_fetch_all(query, values, **kw)
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _no_onboarding)
+    monkeypatch.setattr(real_db, "fetch_all", _fetch_all)
+
+    assert await svc._inferred_merchant_hosts("m1") == {"brand.com"}
+    with pytest.raises(RuntimeError):
+        await svc._inferred_merchant_hosts("m1", strict=True)
 
 
 @pytest.mark.asyncio
@@ -1508,3 +1591,32 @@ async def test_redeclaring_your_own_host_at_the_cap_is_idempotent_not_429(monkey
 
     new = await svc.declare_official_domain("m1", "d99.com")
     assert new["status"] == svc.DECLARE_TOO_MANY
+
+
+@pytest.mark.asyncio
+async def test_a_failing_domain_draw_does_not_abort_the_url_draw_and_raises_under_strict(monkeypatch):
+    """The mirror of the test above, and the case the per-draw try actually buys: with ONE try
+    a failing source_domain draw aborted before the URL draw ran. Non-strict: log, and the URL
+    hosts still come back. Strict: raise -- an under-set returned as if complete is exactly the
+    silent revocation the declare guard and the audit basis must never see."""
+    from db.database import database as real_db
+    import db.merchant_onboarding as onboarding
+
+    async def _no_onboarding(_mid):
+        return {}
+
+    real_fetch_all = real_db.fetch_all
+
+    async def _fetch_all(query, values=None, **kw):
+        if "SELECT DISTINCT source_domain" in str(query):
+            raise RuntimeError("domain draw down")
+        if "url_host" in str(query):
+            return [{"url_host": "brand.com"}]
+        return await real_fetch_all(query, values, **kw)
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _no_onboarding)
+    monkeypatch.setattr(real_db, "fetch_all", _fetch_all)
+
+    assert await svc._inferred_merchant_hosts("m1") == {"brand.com"}
+    with pytest.raises(RuntimeError):
+        await svc._inferred_merchant_hosts("m1", strict=True)
