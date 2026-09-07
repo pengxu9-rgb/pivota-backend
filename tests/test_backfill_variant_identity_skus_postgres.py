@@ -200,7 +200,7 @@ async def test_a_promoter_owned_identity_is_stamped_in_place_not_inserted_beside
     report = await _run()
 
     assert report.get("products_failed", 0) == 0
-    assert report["skus_existing_reused"] == 1 and report.get("skus_inserted", 0) == 0
+    assert report["skus_identity_owner_found"] == 1 and report.get("skus_inserted", 0) == 0
     skus = await _skus(_db, pk)
     assert [s["sku_key"] for s in skus] == [promoter_key]            # no second row
     payload = _payload(skus[0]["sku_payload"])
@@ -228,7 +228,7 @@ async def test_a_second_run_writes_nothing_new(_db) -> None:
     skus_2, offers_2 = await _skus(_db, pk), await _offers(_db, pk)
 
     assert first["skus_inserted"] == 2 and first["offers_inserted"] == 2
-    assert second["skus_existing_reused"] == 2 and second.get("skus_inserted", 0) == 0
+    assert second["skus_identity_owner_found"] == 2 and second.get("skus_inserted", 0) == 0
     assert second["offers_existing_updated"] == 2 and second.get("offers_inserted", 0) == 0
     assert [s["sku_key"] for s in skus_1] == [s["sku_key"] for s in skus_2]
     assert [o["offer_id"] for o in offers_1] == [o["offer_id"] for o in offers_2]
@@ -395,7 +395,7 @@ async def test_a_dry_run_leaves_existing_sku_rows_byte_identical(_db) -> None:
     dry = await _run(apply=False)
     assert await _sku_snapshot(_db) == before_skus
     assert await _counts(_db) == before_offers
-    assert dry["skus_existing_reused"] == 2 and dry["skus_identity_stamped"] == 1
+    assert dry["skus_identity_owner_found"] == 2 and dry["skus_identity_stamped"] == 1
 
     dry_adopt = await _run(apply=False, adopt=True)
     assert await _sku_snapshot(_db) == before_skus
@@ -403,26 +403,84 @@ async def test_a_dry_run_leaves_existing_sku_rows_byte_identical(_db) -> None:
     assert dry_adopt["offers_adopted"] == 1
 
 
-async def test_a_reason_without_a_timestamp_is_a_live_row(_db) -> None:
-    """`suppressed_at` is THE gate column; `suppression_reason` is a label. A labelled row with
-    no timestamp is served by every lane (catalog_invariant_checks has a dedicated check for the
-    class), so the backfill must treat it as live too -- both for the SKU identity and the scan."""
+async def test_a_reason_without_a_timestamp_is_not_a_target(_db) -> None:
+    """A row carrying `suppression_reason` but no `suppressed_at` is tombstoned to
+    catalog_trust_policy and excluded from cross-merchant recall (both columns gated, #1648),
+    while every serving read that gates on `suppressed_at` alone still serves it -- the
+    threshold-0 class catalog_invariant_checks exists to catch. Round 2 of this PR wrongly
+    treated such rows as live; the backfill must never hang a live offer off one."""
     pk = "ext:brand:label-only"
     await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
     await _canonical_offer(_db, pk)
     await _db.execute("UPDATE catalog_products SET suppression_reason = 'legacy_label' WHERE product_key = :pk", {"pk": pk})
+    report = await _run()
+    assert report.get("products_scanned", 0) == 0 and await _skus(_db, pk) == []
+
+    # and a label-only SKU owning the identity on a live product
+    pk2 = "ext:brand:label-only-sku"
+    await _product(_db, pk2, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk2)
     await _db.execute(
         """
         INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
                                   source_variant_id, title, suppression_reason)
         VALUES (:sk, :pk, 'merch_obs_brand', 'external_seed', :epid, :vid, 'A', 'legacy_label')
-        """, {"sk": f"{pk}::v::{REAL_VID}", "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
+        """, {"sk": f"{pk2}::v::{REAL_VID}", "pk": pk2, "epid": f"brand:{pk2}", "vid": REAL_VID})
+    report = await _run()
+    assert report["skipped_sku_suppressed"] == 1 and report.get("offers_inserted", 0) == 0
+    assert len(await _offers(_db, pk2)) == 1
+
+
+async def test_a_suppressed_row_under_the_derived_key_with_a_foreign_tuple_gets_no_live_offer(_db) -> None:
+    """The identity probes are keyed on (merchant_id, platform, product_key, source_variant_id);
+    the INSERT lands on sku_key. A suppressed row under OUR derived key but another merchant_id
+    misses both probes, is not a key collision (same vid), and ON CONFLICT (sku_key) would stamp
+    it and hang a live 9.00 offer on it. Round-3 review reproduced exactly that."""
+    from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
+
+    pk = "ext:brand:supforeign"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk)
+    key = derive_variant_sku_key(pk, REAL_VID)
+    await _db.execute(
+        """
+        INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
+                                  source_variant_id, title, suppressed_at, suppression_reason)
+        VALUES (:sk, :pk, 'merch_OTHER', 'external_seed', :epid, :vid, 'A', NOW(), 'merged_loser')
+        """, {"sk": key, "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
 
     report = await _run()
 
-    assert report["products_scanned"] == 1 and report["skus_existing_reused"] == 1
-    assert report.get("skipped_sku_suppressed", 0) == 0
-    assert len([o for o in await _offers(_db, pk) if o["sku_key"] == f"{pk}::v::{REAL_VID}"]) == 1
+    assert report["skipped_sku_suppressed"] == 1
+    assert report.get("skus_inserted", 0) == 0 and report.get("offers_inserted", 0) == 0
+    assert [o["sku_key"] for o in await _offers(_db, pk)] == [f"{pk}::canonical"]
+    row = await _db.fetch_one("SELECT merchant_id, sku_payload FROM catalog_skus WHERE sku_key = :k", {"k": key})
+    assert row["merchant_id"] == "merch_OTHER" and _payload(row["sku_payload"]) == {}
+
+
+async def test_the_on_conflict_arm_merges_the_existing_payload(_db) -> None:
+    """Reached only when a LIVE row with a foreign tuple sits under our derived key. The arm
+    must merge sku_payload, not replace it: a replace drops the promoter's own keys."""
+    from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
+
+    pk = "ext:brand:liveforeign"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk)
+    key = derive_variant_sku_key(pk, REAL_VID)
+    await _db.execute(
+        """
+        INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
+                                  source_variant_id, title, sku_payload)
+        VALUES (:sk, :pk, 'merch_OTHER', 'external_seed', :epid, :vid, 'A',
+                '{"promoted_by": "someone", "agent_version": "v9"}'::jsonb)
+        """, {"sk": key, "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
+
+    report = await _run()
+
+    assert report["skus_inserted"] == 1 and report["offers_inserted"] == 1
+    payload = _payload((await _db.fetch_one("SELECT sku_payload FROM catalog_skus WHERE sku_key = :k", {"k": key}))["sku_payload"])
+    assert payload["promoted_by"] == "someone" and payload["agent_version"] == "v9"
+    assert payload["variant_id_provenance"] == "merchant_issued"
 
 
 async def test_an_orphan_foreign_offer_on_the_derived_key_is_not_counted_as_an_insert(_db) -> None:
@@ -441,6 +499,7 @@ async def test_an_orphan_foreign_offer_on_the_derived_key_is_not_counted_as_an_i
 
     assert report["skipped_offer_owned_by_other_writer"] == 1
     assert report.get("skus_inserted", 0) == 0 and await _skus(_db, pk) == []
+    assert report.get("skus_identity_stamped", 0) == 0                    # no row, no stamp to count
 
 
 async def test_a_stale_one_variant_seed_does_not_unlock_inheritance_when_the_payload_has_siblings(_db) -> None:
@@ -639,6 +698,16 @@ async def test_limit_bounds_the_products_touched_and_paging_covers_the_table(_db
     from scripts import backfill_variant_identity_skus as bf
 
     monkeypatch.setattr(bf, "PAGE_SIZE", 2)                            # force several pages
+    page_reads: List[int] = []
+    real_fetch_all = bf.database.fetch_all
+
+    async def counting_fetch_all(query, values=None):
+        rows = await real_fetch_all(query, values)
+        if query is bf.SELECT_PRODUCTS_SQL:
+            page_reads.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(bf.database, "fetch_all", counting_fetch_all)
     for i in range(5):
         pk = f"ext:brand:p{i}"
         await _product(_db, pk, variants=[{"variant_id": f"5405734574510{i}", "title": "X", "price": "9.00"}])
@@ -647,10 +716,13 @@ async def test_limit_bounds_the_products_touched_and_paging_covers_the_table(_db
     limited = await _run(limit=3)
     assert limited["products_planned"] == 3 and limited["stopped_at_limit"] == 1
     assert limited["products_scanned"] <= 4                            # read stopped with the write
+    assert page_reads == [2, 2]                                        # two pages fetched, not the table
 
+    page_reads.clear()
     full = await _run()
+    assert page_reads == [2, 2, 1]                                     # paged to the end
     assert full["products_scanned"] == 5 and full["products_planned"] == 5
-    assert full["skus_existing_reused"] == 3 and full["skus_inserted"] == 2
+    assert full["skus_identity_owner_found"] == 3 and full["skus_inserted"] == 2
 
 
 # ------------------------------------------------------------------------ price provenance

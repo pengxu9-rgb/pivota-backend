@@ -113,6 +113,7 @@ SELECT_PRODUCTS_SQL = """
     FROM catalog_products cp
     WHERE cp.platform = 'external_seed'
       AND cp.suppressed_at IS NULL
+      AND cp.suppression_reason IS NULL
       AND cp.product_key > :after
     ORDER BY cp.product_key
     LIMIT :page
@@ -168,12 +169,15 @@ SELECT_SKU_BY_IDENTITY_SQL = """
       AND product_key = :product_key
       AND source_variant_id = :source_variant_id
       AND suppressed_at IS NULL
+      AND suppression_reason IS NULL
     LIMIT 1
 """
-#: `suppressed_at` is THE gate column every serving lane reads; `suppression_reason` is a label
-#: (services/catalog_invariant_checks: a reason without a timestamp is a known, still-served row
-#: class the crawl writer produced at scale). Filtering on the label would silently shrink the
-#: target set.
+#: BOTH suppression columns, as cross-merchant recall gates them (pivot_query_service, #1648):
+#: `suppressed_at` is the serving gate, and catalog_trust_policy tombstones on `suppression_reason`
+#: ALONE. A row with the label and no timestamp is a threshold-0 invariant violation
+#: (catalog_invariant_checks `suppression_reason_without_timestamp`, "Prod: 0 today") -- the one
+#: state in which a withdrawn row can keep serving. This script must never be the writer that
+#: hangs a live offer off one.
 
 #: A suppressed row that owns the identity: we must neither insert beside it (index) nor
 #: hang a live offer off it (the PDP's fetch_skus_for_keys has no suppression filter).
@@ -191,7 +195,9 @@ SELECT_ANY_SKU_BY_IDENTITY_SQL = """
 #: 60-char normalisation, so two long punctuated ids can collide). Re-identifying that row via
 #: ON CONFLICT would be silent data loss; the pick is skipped instead.
 SELECT_SKU_BY_KEY_SQL = """
-    SELECT source_variant_id FROM catalog_skus WHERE sku_key = :sku_key
+    SELECT source_variant_id, suppressed_at, suppression_reason
+    FROM catalog_skus
+    WHERE sku_key = :sku_key
 """
 
 #: The skip path (another writer owns the offer) may touch ONLY identity: currency,
@@ -413,12 +419,20 @@ async def _write_product(
             # `<pk>::v::<id>`. Stamp it in place and hang the offer off ITS key; a second
             # row would violate idx_catalog_skus_source_identity_v2.
             sku_key = str(existing["sku_key"])
-            counts["skus_existing_reused"] += 1
+            counts["skus_identity_owner_found"] += 1
         else:
             sku_key = derive_variant_sku_key(row["product_key"], vid)
             owner = await database.fetch_one(SELECT_SKU_BY_KEY_SQL, {"sku_key": sku_key})
             if owner is not None and str(owner["source_variant_id"]) != vid[:128]:
                 counts["skipped_sku_key_collision"] += 1
+                continue
+            if owner is not None and (
+                owner["suppressed_at"] is not None or owner["suppression_reason"] is not None
+            ):
+                # The identity probes are keyed on the 4-col tuple; the write lands on the
+                # sku_key. When the two diverge (a foreign merchant_id under our derived key)
+                # this is the only probe that sees the row the INSERT would ON CONFLICT into.
+                counts["skipped_sku_suppressed"] += 1
                 continue
 
         labels, attrs = _option_labels(variant)
