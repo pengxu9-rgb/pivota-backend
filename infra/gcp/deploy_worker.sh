@@ -129,7 +129,7 @@ trap _cleanup EXIT INT TERM
 # that was already broken. See _serving_revision.sh.
 PREV_ERR="$(mktemp)"; _TMPFILES="$_TMPFILES $PREV_ERR"
 PREV_RC=0
-PREV_IMAGE="$(serving_image worker 2>"$PREV_ERR")" || PREV_RC=$?
+PREV_REV="$(serving_revision worker 2>"$PREV_ERR")" || PREV_RC=$?
 if [ "$PREV_RC" != 0 ]; then
   # MEASURED against gcloud 581.0.0, because the previous pattern here was guessed and the
   # guess was wrong: a missing Cloud Run service produces
@@ -143,19 +143,18 @@ if [ "$PREV_RC" != 0 ]; then
   # Anything this does not recognise refuses, which is the safe direction: a first deploy is
   # rare and attended, a blind deploy over a live worker is neither.
   if grep -qiE 'cannot find service \[?worker\]?' "$PREV_ERR"; then
-    PREV_IMAGE=""
+    PREV_REV=""
   else
-    # SAY WHICH FAILURE THIS IS. Three different things land here — gcloud itself failing, a
-    # traffic block with no single named 100% revision, and the JSON/python read not working —
-    # and they used to print one empty-bodied message asserting "gcloud exited 1", which is
-    # false for the last two (gcloud exited 0). An operator got a blocked production deploy
-    # with no cause. The exit code is the helper's, not gcloud's, so it cannot be reported as
-    # gcloud's.
+    # SAY WHICH FAILURE THIS IS. Two different things land here - gcloud itself failing, and a
+    # traffic block with no single named 100% revision (or unparseable JSON) - and they used to
+    # print one message asserting "gcloud exited 1", which is false for the second. An operator
+    # got a blocked production deploy with no cause. The exit code is the helper's, not
+    # gcloud's, so it cannot be reported as gcloud's.
     if [ -s "$PREV_ERR" ]; then
-      echo "could not read the worker's current image; gcloud said:" >&2
+      echo "could not resolve the worker's serving revision; gcloud said:" >&2
       sed 's/^/  /' "$PREV_ERR" >&2
     else
-      echo "could not read the worker's current image, and gcloud reported no error." >&2
+      echo "could not resolve the worker's serving revision, and gcloud reported no error." >&2
       echo "That means the service was describable but had no single NAMED revision at 100%" >&2
       echo "traffic (a split or a half-finished rollout), or its JSON could not be parsed." >&2
       echo "  gcloud run services describe worker --project $PROJECT --region $REGION \\" >&2
@@ -166,32 +165,71 @@ if [ "$PREV_RC" != 0 ]; then
     exit 1
   fi
 fi
+
+# ONE describe of that revision, and BOTH facts read off it. The image and the declared commit
+# used to come from two independent resolutions (serving_image, then serving_env), each
+# re-resolving the 100%-traffic revision. Two pipeline runs racing on rapid merges move traffic
+# between those calls, so PREV_IMAGE could describe revision A while PREV_SHA described B - and
+# the rollback would deploy A's bytes stamped with B's commit, the exact "reports the sha it
+# failed to run" lie this block exists to prevent, with the drift alarm green over it.
+#
 # THE COMMIT A REVISION RUNS IS WHAT IT DECLARES, NOT WHAT ITS IMAGE REFERENCE ENDS IN. The
-# revision's image is a DIGEST (`backend@sha256:<64 hex>` -- Cloud Run resolves the tag at
-# revision creation; see _serving_revision.sh), so `${PREV_IMAGE##*:}` is the digest. The first
-# version of this block restamped PIVOTA_COMMIT_SHA from it on rollback, which would have set a
-# 64-hex digest as the worker's declared commit and turned prod-deploy-drift.yml permanently red
-# for the one service it cannot probe. Caught by a review that ran the real gcloud shape
-# through a stub that had been echoing a tag.
-PREV_SHA=""
-if [ "$PREV_RC" = 0 ] && [ -z "$PREV_IMAGE" ]; then
-  # rc 0 with nothing printed: the helper refuses this itself now, but the contract is cheap to
-  # hold here too -- an empty image is not "the service is absent", and the branch below would
-  # treat it as one.
-  echo "could not read the worker's current image: the serving revision answered with an empty image reference." >&2
-  echo "Refusing to deploy: without knowing what is running there is nothing to roll back to." >&2
-  exit 1
-fi
-if [ -n "$PREV_IMAGE" ]; then
-  PREV_SHA="$(serving_env worker PIVOTA_COMMIT_SHA 2>/dev/null)" || PREV_SHA=""
+# image is a DIGEST (`backend@sha256:<64 hex>` - Cloud Run resolves the tag at revision
+# creation; see _serving_revision.sh), so `${PREV_IMAGE##*:}` is the digest. An earlier version
+# restamped PIVOTA_COMMIT_SHA from it on rollback, which would have set a 64-hex digest as the
+# worker's declared commit and turned prod-deploy-drift.yml permanently red for the one service
+# it cannot probe.
+PREV_IMAGE=""; PREV_SHA=""
+if [ -n "$PREV_REV" ]; then
+  : > "$PREV_ERR"
+  PREV_JSON="$("$GCLOUD" run revisions describe "$PREV_REV" --project "$PROJECT" --region "$REGION" \
+    --format=json 2>"$PREV_ERR")" || {
+    # A READ failure, named as one. This used to fall through to "declares no PIVOTA_COMMIT_SHA"
+    # with a `gcloud run services update` remedy - and `services update` creates a revision from
+    # the TEMPLATE, which in the half-finished-rollout state this whole file exists for names
+    # the candidate that never became Ready. The misdiagnosis's remedy rolled production
+    # FORWARD into the breakage the script had just refused to touch.
+    echo "could not describe the worker's serving revision $PREV_REV; gcloud said:" >&2
+    sed 's/^/  /' "$PREV_ERR" >&2
+    echo "Refusing to deploy: this is a READ failure, not a missing stamp. Do NOT run" >&2
+    echo "'gcloud run services update' for it - retry when the API answers." >&2
+    exit 1
+  }
+  PREV_IMAGE="$(printf '%s' "$PREV_JSON" | python3 -c '
+import json,sys
+try: print(json.load(sys.stdin)["spec"]["containers"][0].get("image") or "")
+except Exception: sys.exit(1)' 2>/dev/null || true)"
+  PREV_SHA="$(printf '%s' "$PREV_JSON" | python3 -c '
+import json,sys
+try: c = json.load(sys.stdin)["spec"]["containers"][0]
+except Exception: sys.exit(1)
+for e in (c.get("env") or []):
+    if e.get("name") == "PIVOTA_COMMIT_SHA":
+        print(e.get("value") or ""); break' 2>/dev/null || true)"
+  if [ -z "$PREV_IMAGE" ]; then
+    echo "the worker's serving revision $PREV_REV carries an empty image reference, which cannot be" >&2
+    echo "redeployed as a rollback target. Refusing to deploy: nothing to roll back to." >&2
+    exit 1
+  fi
   if [ -z "$PREV_SHA" ]; then
-    echo "the worker's serving revision declares no PIVOTA_COMMIT_SHA, so what commit it runs is unknown" >&2
-    echo "and a rollback could not restamp it truthfully. prod-deploy-drift.yml refuses this same state." >&2
-    echo "Stamp it by hand, then redeploy:" >&2
+    # The describe SUCCEEDED (a read failure exits above), so this really is a revision that
+    # declares no commit - the remedy below is safe to print only because of that ordering.
+    echo "the worker's serving revision $PREV_REV declares no PIVOTA_COMMIT_SHA, so what commit it" >&2
+    echo "runs is unknown and a rollback could not restamp it truthfully. prod-deploy-drift.yml" >&2
+    echo "refuses this same state. Stamp it by hand, then redeploy:" >&2
     echo "  gcloud run services update worker --region $REGION --project $PROJECT \\" >&2
     echo "    --update-env-vars PIVOTA_COMMIT_SHA=<the commit that image was built from>" >&2
     exit 1
   fi
+  # A commit sha, and only a commit sha, goes into --update-env-vars: the value is
+  # interpolated into a comma-separated KEY=VALUE list, so a stored `abc,FOO=bar` would inject
+  # FOO on rollback. Requires prior write access to the service, so this is hygiene rather
+  # than a security boundary - but it also gives "not a digest" a POSITIVE check instead of
+  # resting on the env lookup being wired to the right variable.
+  case "$PREV_SHA" in
+    *[!0-9a-fA-F]*) echo "the worker's serving revision declares PIVOTA_COMMIT_SHA='$PREV_SHA', which is not a commit sha - refusing to read it as one" >&2; exit 1 ;;
+  esac
+  [ "${#PREV_SHA}" = 40 ] || { echo "the worker's serving revision declares PIVOTA_COMMIT_SHA='$PREV_SHA' (${#PREV_SHA} chars, want 40) - refusing to read it as a commit" >&2; exit 1; }
   echo "worker is on $PREV_SHA (image ${PREV_IMAGE##*/})"
   if [ "$PREV_SHA" = "$TAG" ]; then
     # Not an error, and not a no-op either: the health probe below is still worth running, because
