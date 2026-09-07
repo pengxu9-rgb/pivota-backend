@@ -31,13 +31,16 @@ TWO THINGS IT REFUSES TO DO.
 
 HOW IT WRITES. Per product, one transaction, one try/except: a failure is counted and logged as
 `products_failed`, never allowed to abort the run with an unknown number of rows applied, and the
-report counts only what committed. `--limit N` stops after N products are WRITTEN; the read is
-paged (PAGE_SIZE) so the scan is bounded by the pages those N products live in, not the table.
+report counts only what committed. `--limit N` stops after N plannable products were processed
+without error (`products_planned`; a product may process cleanly and write nothing when every
+pick is skipped); the read is paged (PAGE_SIZE) so the scan is bounded by the pages those N
+products live in, not the table.
 
 WHOSE OFFERS IT TOUCHES. Its job is products with NO variant offer. A variant SKU that already
 carries a live offer from another writer (ingestion's `catalog_enrichment_agent_v1`) is left
 alone and counted `skipped_offer_owned_by_other_writer` -- that offer was measured more recently
-than any seed snapshot. `--adopt-existing-offers` overrides that, and an adopted offer is
+than any seed snapshot, and so were the SKU row's currency / source_domain beside it, which only
+the identity stamp (sku_payload) may touch on that path. `--adopt-existing-offers` overrides that, and an adopted offer is
 re-stamped (`source_system`, `offer_payload`, `price_confidence` reset) so the batch stays
 identifiable and reversible. A silent variant never overwrites a measured availability.
 catalog_skus' live unique identity is the 4-column `idx_catalog_skus_source_identity_v2`
@@ -110,7 +113,6 @@ SELECT_PRODUCTS_SQL = """
     FROM catalog_products cp
     WHERE cp.platform = 'external_seed'
       AND cp.suppressed_at IS NULL
-      AND cp.suppression_reason IS NULL
       AND cp.product_key > :after
     ORDER BY cp.product_key
     LIMIT :page
@@ -166,9 +168,12 @@ SELECT_SKU_BY_IDENTITY_SQL = """
       AND product_key = :product_key
       AND source_variant_id = :source_variant_id
       AND suppressed_at IS NULL
-      AND suppression_reason IS NULL
     LIMIT 1
 """
+#: `suppressed_at` is THE gate column every serving lane reads; `suppression_reason` is a label
+#: (services/catalog_invariant_checks: a reason without a timestamp is a known, still-served row
+#: class the crawl writer produced at scale). Filtering on the label would silently shrink the
+#: target set.
 
 #: A suppressed row that owns the identity: we must neither insert beside it (index) nor
 #: hang a live offer off it (the PDP's fetch_skus_for_keys has no suppression filter).
@@ -187,6 +192,16 @@ SELECT_ANY_SKU_BY_IDENTITY_SQL = """
 #: ON CONFLICT would be silent data loss; the pick is skipped instead.
 SELECT_SKU_BY_KEY_SQL = """
     SELECT source_variant_id FROM catalog_skus WHERE sku_key = :sku_key
+"""
+
+#: The skip path (another writer owns the offer) may touch ONLY identity: currency,
+#: readiness_tier and source_domain on that row are the other writer's measurements and belong
+#: with the offer we are refusing to rewrite.
+STAMP_IDENTITY_ONLY_SQL = """
+    UPDATE catalog_skus
+       SET sku_payload = COALESCE(sku_payload, '{}'::jsonb) || CAST(:stamp AS jsonb),
+           updated_at  = NOW()
+     WHERE sku_key = :sku_key
 """
 
 STAMP_EXISTING_SKU_SQL = """
@@ -334,7 +349,11 @@ def plan_for_product(
             # The single-variant case is the only one `--allow-inherited-price` may
             # rescue: one merchant-issued variant IS the product, so the canonical
             # offer's price is its price. run() decides, with the flag in hand.
-            if len(variants) == 1 and len(real) == 1 and allow_inherited_price:
+            if (
+                allow_inherited_price
+                and len(variants) == 1 and len(real) == 1
+                and len(_as_list(row.get("payload_variants"))) <= 1
+            ):
                 out.append({"variant_id": vid, "variant": variant, "price": None})
                 continue
             counts["skipped_no_variant_price"] += 1
@@ -401,7 +420,6 @@ async def _write_product(
             if owner is not None and str(owner["source_variant_id"]) != vid[:128]:
                 counts["skipped_sku_key_collision"] += 1
                 continue
-            counts["skus_inserted"] += 1
 
         labels, attrs = _option_labels(variant)
         title = str(variant.get("title") or "").strip() or row["title"]
@@ -437,10 +455,15 @@ async def _write_product(
         if live is not None:
             if str(live["source_system"] or "") != SOURCE_SYSTEM and not adopt_existing_offers:
                 # Another writer measured this offer more recently than any seed snapshot.
-                # The SKU stamp still lands (identity is a fact); the money row is theirs.
+                # Identity is a fact and is stamped; the money row -- and the SKU row's
+                # currency / source_domain that describe it -- are theirs.
                 counts["skipped_offer_owned_by_other_writer"] += 1
-                if apply and existing is not None:
-                    await database.execute(STAMP_EXISTING_SKU_SQL, _stamp_params(sku_key, stamp, currency, row))
+                if existing is not None:
+                    counts["skus_identity_stamped"] += 1
+                    if apply:
+                        await database.execute(
+                            STAMP_IDENTITY_ONLY_SQL, {"sku_key": sku_key, "stamp": json.dumps(stamp)}
+                        )
                 continue
             offer_id = str(live["offer_id"])
             counts["offers_existing_updated" if str(live["source_system"] or "") == SOURCE_SYSTEM
@@ -474,6 +497,8 @@ async def _write_product(
         }
         counts["skus"] += 1
         counts["offers"] += 1
+        if existing is None:
+            counts["skus_inserted"] += 1
         if apply:
             if existing is not None:
                 await database.execute(STAMP_EXISTING_SKU_SQL, _stamp_params(sku_key, stamp, currency, row))
