@@ -161,7 +161,14 @@ jobs:
             local json sha
             json="$(curl -fsS --max-time 25 https://api.pivota.cc/health || true)"
             [ -n "$json" ] || { echo "::error::could not reach https://api.pivota.cc/health - production health is unknown" >&2; return 1; }
-            sha="$(printf '%s' "$json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("version") or {}).get("full_sha",""))' 2>/dev/null)"
+            # KEEP THE PARSE'S RETURN CODE. `curl -fsS` exits 0 for a 200 carrying a WAF or CDN
+            # interstitial, and a swallowed parse turned that HTML into "/health returned no
+            # version.full_sha" - a false statement about what web answered. Web stays a hard
+            # failure either way (an unverifiable web blocks; see the summary block below), but
+            # the message must name the class an operator will actually see.
+            local parse_rc=0
+            sha="$(printf '%s' "$json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("version") or {}).get("full_sha",""))' 2>/dev/null)" || parse_rc=$?
+            [ "$parse_rc" = 0 ] || { echo "::error::https://api.pivota.cc/health answered, but not with the health document (parse exited $parse_rc) - a proxy or WAF page? cannot verify what web runs" >&2; return 1; }
             [ -n "$sha" ] || { echo "::error::/health returned no version.full_sha - cannot verify what web runs" >&2; return 1; }
             printf '%s' "$sha"
           }
@@ -209,15 +216,29 @@ jobs:
             #     a revision declaring no commit, a commit that is not a sha. Nothing is broken
             #     with US; the service is genuinely unverifiable, and that is the condition under
             #     which the worker stayed invisible for a month. It must not decay to a warning.
+            #   GCLOUD ANSWERED, BUT NOT WITH THE DOCUMENT   -> return 2, a WARNING. An HTML 502
+            #     body with exit 0, or a body that is not JSON at all. (Valid JSON missing its
+            #     status block reads as "no 100% revision" and stays a VERDICT - a service
+            #     description without traffic is a production shape, not a proxy page.)
+            #     That is the first class wearing a successful exit code. It used to be read as
+            #     the second ("traffic is split" / "declares no PIVOTA_COMMIT_SHA") because the
+            #     parse's return code was swallowed with `|| true` - a false statement about
+            #     production at the wrong severity, the same swallow deploy_worker.sh removed
+            #     in #2110.
             #
-            # Collapsing the two - in either direction - loses one of them.
+            # Collapsing any two - in either direction - loses one of them.
             local describe rc=0
             describe="$(gcloud run services describe "$svc" --project pivota-prod --region us-west1 --format=json 2>/dev/null)" || rc=$?
             if [ "$rc" != 0 ] || [ -z "$describe" ]; then
-              echo "::warning::could not describe '$svc' (gcloud exited $rc) - its drift is UNKNOWN this run, not clean"
+              echo "::warning::could not describe '$svc' (gcloud exited $rc) - its drift is UNKNOWN this run, not clean" >&2
               return 2
             fi
-            rev="$(printf '%s' "$describe" | python3 -c 'import json,sys; d=json.load(sys.stdin); st=d.get("status",{}); live=[t for t in (st.get("traffic") or []) if t.get("percent")==100]; sys.exit(0) if len(live)!=1 else print(live[0].get("revisionName") or (st.get("latestReadyRevisionName","") if live[0].get("latestRevision") else ""))' 2>/dev/null || true)"
+            local rev parse_rc=0
+            rev="$(printf '%s' "$describe" | python3 -c 'import json,sys; d=json.load(sys.stdin); st=d.get("status",{}); live=[t for t in (st.get("traffic") or []) if t.get("percent")==100]; sys.exit(0) if len(live)!=1 else print(live[0].get("revisionName") or (st.get("latestReadyRevisionName","") if live[0].get("latestRevision") else ""))' 2>/dev/null)" || parse_rc=$?
+            if [ "$parse_rc" != 0 ]; then
+              echo "::warning::gcloud answered for '$svc' but not with a service description (parse exited $parse_rc) - its drift is UNKNOWN this run, not clean" >&2
+              return 2
+            fi
             if [ -z "$rev" ]; then
               echo "::error::'$svc' has no single 100%-traffic revision - its traffic is split, so there" >&2
               echo "::error::is no one answer to what it serves. This is a real production state, not a" >&2
@@ -240,10 +261,15 @@ jobs:
             local revjson revrc=0
             revjson="$(gcloud run revisions describe "$rev" --project pivota-prod --region us-west1 --format=json 2>/dev/null)" || revrc=$?
             if [ "$revrc" != 0 ] || [ -z "$revjson" ]; then
-              echo "::warning::could not describe revision '$rev' of '$svc' (gcloud exited $revrc) - drift UNKNOWN this run"
+              echo "::warning::could not describe revision '$rev' of '$svc' (gcloud exited $revrc) - drift UNKNOWN this run" >&2
               return 2
             fi
-            sha="$(printf '%s' "$revjson" | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["containers"][0]; print(next((e.get("value","") for e in (c.get("env") or []) if e.get("name")=="PIVOTA_COMMIT_SHA"), ""))' 2>/dev/null || true)"
+            local sha; parse_rc=0
+            sha="$(printf '%s' "$revjson" | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["containers"][0]; print(next((e.get("value","") for e in (c.get("env") or []) if e.get("name")=="PIVOTA_COMMIT_SHA"), ""))' 2>/dev/null)" || parse_rc=$?
+            if [ "$parse_rc" != 0 ]; then
+              echo "::warning::gcloud answered for revision '$rev' of '$svc' but not with a revision (parse exited $parse_rc) - drift UNKNOWN this run" >&2
+              return 2
+            fi
             if [ -z "$sha" ]; then
               echo "::error::revision '$rev' of '$svc' declares no PIVOTA_COMMIT_SHA, so what commit" >&2
               echo "::error::it runs is unknown. Nothing in Cloud Run injects that variable - the deploy" >&2
@@ -374,7 +400,9 @@ jobs:
           # It is still said out loud every run, because a permanently unreadable service is a
           # silent gap wearing a warning label - and that is the thing this file exists to catch.
           if [ -n "$UNKNOWN" ]; then
-            echo "::warning::drift is UNKNOWN this run for:$UNKNOWN (could not reach the Cloud Run API)"
+            # "could not READ", not "could not reach": the per-service warning above says which -
+            # the API failed, or it answered with something that is not the document.
+            echo "::warning::drift is UNKNOWN this run for:$UNKNOWN (could not read the Cloud Run API - see the per-service warning)"
           fi
           # A service whose ANSWER we refuse to interpret is a different matter and still fails.
           [ -z "$UNREADABLE" ] || { echo "::error::unverifiable:$UNREADABLE - see above"; exit 1; }

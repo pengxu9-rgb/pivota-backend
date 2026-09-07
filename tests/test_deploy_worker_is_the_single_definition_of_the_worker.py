@@ -758,3 +758,49 @@ def test_a_failed_revision_describe_with_no_stderr_still_names_itself(tmp_path):
     assert "reported no error" in out, out
     assert "gcloud said:" not in out, out
     assert "PIVOTA_COMMIT_SHA=<" not in out, out
+
+
+# ── the tag is an INPUT this script writes, so it is validated like the stamp it reads ──────
+
+
+@pytest.mark.parametrize(
+    "tag, why",
+    [
+        ("abc,FOO=bar,AUDIT_WORKER_ENABLED=true", "a comma in the tag injects env vars through the restamp"),
+        ("a b", "whitespace is not an image tag"),
+        ("latest", "the floating tag stamps no real commit"),
+        ("a" * 39, "prod needs the full 40-hex commit the drift alarm compares against main"),
+        ("A" * 40, "uppercase is refused by the alarm; refuse it here too"),
+        ("sha256:" + "d" * 64, "a digest is not a commit"),
+    ],
+)
+def test_a_tag_that_is_not_a_full_commit_sha_is_refused_on_prod(tmp_path, tag, why):
+    code, out, calls = _run(tmp_path, "prod", tag)
+    assert code != 0, f"{why}:\n{out}"
+    assert not _deploys(calls), f"nothing may be deployed with tag {tag!r}"
+    assert not [c for c in calls if c.startswith("run services describe")] or "refusing" in out or "needs a full" in out, out
+
+
+def test_staging_accepts_a_locally_built_tag_with_a_note(tmp_path):
+    """Staging is routinely fed local build tags, so a non-sha is a NOTE there, not a refusal."""
+    code, out, calls = _run(tmp_path, "staging", "local-build.7")
+    assert code == 0, out
+    assert "not a 40-character sha" in out, out
+    assert len(_deploys(calls)) == 1
+
+
+def test_staging_refuses_the_floating_tag_on_its_own(tmp_path):
+    """On prod `latest` is also refused by the 40-hex rule — two guards, one door — so the
+    floating-tag arm is pinned where it is the ONLY guard: staging."""
+    code, out, calls = _run(tmp_path, "staging", "latest")
+    assert code != 0 and not _deploys(calls), out
+    assert "floating tag" in out, out
+
+
+def test_staging_still_refuses_an_injection_shaped_tag(tmp_path):
+    """The comma refusal is environment-independent because the interpolation is: the tag is
+    written into a comma-separated --update-env-vars list in staging exactly as in prod.
+    (One `_run` per test: the stub's call log is per tmp_path and accumulates.)"""
+    code, out, calls = _run(tmp_path, "staging", "abc,FOO=bar")
+    assert code != 0 and not _deploys(calls), out
+    assert "refusing image tag" in out, out
