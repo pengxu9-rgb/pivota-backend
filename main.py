@@ -23,7 +23,10 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
-from middleware.structured_logging import StructuredLoggingMiddleware
+from middleware.structured_logging import (
+    StructuredLoggingMiddleware,
+    install_uvicorn_access_log_redaction,
+)
 from middleware.error_handler import ErrorHandlerMiddleware
 from middleware.ap2_security import AP2SecurityMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
@@ -93,6 +96,28 @@ def _guard_single_order_routes_py() -> None:
 
 # Core routers (only include what exists)
 _guard_single_order_routes_py()
+
+# AT IMPORT, before a single request can be served. `uvicorn.access` writes the
+# raw request line — `get_path_with_query_string(scope)` — at INFO on every
+# response, 200s and 401s alike, and infra/gcp/Dockerfile starts uvicorn with
+# neither `--no-access-log` nor a `--log-config`, so on Cloud Run that line goes
+# straight to Cloud Logging. `POST /webhooks/webflow/{store_id}/{url_secret}`
+# authenticates with a secret IN THE PATH (Webflow does not sign a site-token
+# webhook), so without this the credential is in the access line of every
+# delivery.
+#
+# It is installed here rather than only in the startup hook because uvicorn
+# imports `main:app` after it has configured logging and before it serves
+# anything: an import-time install is in place for the first request under
+# `uvicorn main:app`, under `uvicorn.run` below, and under `--reload`. The
+# lifespan calls it again, idempotently, to cover a deployment whose own
+# `--log-config` reconfigures logging in between.
+#
+# It cannot cover the LOAD BALANCER's `httpRequest.requestUrl`, which the
+# platform records regardless of this process — that surface is the argument for
+# configuring `WEBFLOW_CLIENT_SECRET`, and it is the ONLY one left.
+install_uvicorn_access_log_redaction()
+
 from routes.agent_routes import router as agent_router
 from routes.agent_briefs import router as agent_briefs_router
 from routes.quote_routes import router as quote_router
@@ -2108,6 +2133,13 @@ async def app_lifespan(_app: FastAPI):
     # CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION for a job -- and no RAILWAY_*) resolve
     # "development" and pass straight through.
     resolved_env = require_platform_env()
+    # Again, idempotently: a deployment that hands uvicorn its own
+    # `--log-config` reconfigures logging AFTER this module was imported, and
+    # `dictConfig` on a named logger drops handlers. It does not drop filters,
+    # so this is belt and braces rather than the load-bearing call — but the
+    # channel it guards carries a live credential, and a second `addFilter` on
+    # an already-installed filter is a no-op by construction.
+    install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
 

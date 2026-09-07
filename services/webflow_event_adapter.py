@@ -14,6 +14,16 @@ as VERIFIED or ASSUMED, with its consequence, in docs/WEBFLOW_TELEMETRY.md.
    under-counts, but a misread over-counts by 100x, and only one of those is
    visible in a total.
 
+   "A whole number" is not the same claim as "a whole number of MINOR units",
+   though, and the gap between them is the 100x error in the OTHER direction:
+   ``60`` is perfectly whole and is 1/100th of a ``"$60.00"`` order. So the
+   money object's own ``string`` is parsed and compared against ``value`` on
+   every observation that carries one (``_cross_check_money_string``), which
+   turns "Webflow states minor units" from an assumption into something
+   re-verified per delivery. A disagreement raises: there is no third source to
+   break the tie, so neither side wins and the order is refused rather than
+   filed at a figure that could be 100x wrong either way.
+
 2. **Refunds are FULL-ORDER only.** ``POST /v2/sites/{id}/orders/{id}/refund``
    refunds the whole order; the status becomes ``refunded`` and ``refundedOn`` is
    set. There are no partial refunds and no per-refund records, so a refund is
@@ -47,11 +57,12 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from services.commerce_order_ref import build_order_ref
 from services.merchant_event_ingest_service import MerchantCommerceEvent, MerchantEventBatch
-from utils.money import ZERO_DECIMAL_CURRENCIES
+from utils.money import ZERO_DECIMAL_CURRENCIES, to_minor_units
 
 
 logger = logging.getLogger("webflow_event_adapter")
@@ -121,6 +132,11 @@ _INTEGER_TEXT = re.compile(r"^[+-]?\d+$")
 # Keyed on the currency, whose domain is this frozen 16-element set, so the
 # bookkeeping is bounded by construction rather than by a cap that has to be
 # maintained.
+#
+# The `string` cross-check closes this for every order that carries one — a
+# `¥5,898` string against a `value` of 589800 is a refusal rather than a 100x
+# row — so what remains open is the zero-decimal order whose money object has NO
+# `string`. The warning stays for exactly that case.
 _ZERO_DECIMAL_OBSERVED: set = set()
 
 
@@ -196,6 +212,112 @@ def _currency_of(*candidates: Any) -> Optional[str]:
     return None
 
 
+def _decimal_from_money_string(text: str) -> Optional[Decimal]:
+    """The numeric value out of a Webflow money `string` (`"$58.98"`, `"¥5,898"`).
+
+    Currency symbols, letters, spaces (including NBSP and the narrow NBSP some
+    locales use as a group separator) and every other decoration are stripped;
+    what is left is digits, an optional leading sign, and up to two kinds of
+    separator. Returns None — never a guess — when what remains is not a single
+    unambiguous number.
+
+    THE SEPARATOR RULE, which is the whole difficulty:
+
+    * both `.` and `,` present -> the LAST of them is the decimal separator and
+      the other is the group separator (`"1,234.56"` and `"1.234,56"` both read
+      as 1234.56);
+    * one kind, appearing more than once -> group separator (`"1.234.567"`);
+    * one kind, appearing once, with exactly three digits after it -> group
+      separator (`"¥5,898"` is 5898, not 5.898);
+    * one kind, appearing once, otherwise -> decimal separator (`"$58.98"`).
+
+    The third rule is genuinely ambiguous in isolation — a European `"€1.500"`
+    meaning 1500 reads as 1500 here and a hypothetical `"$1.500"` meaning one
+    and a half would read as 1500 too. That ambiguity is the reason this value
+    is used only to CROSS-CHECK `value` and never to replace it: a disagreement
+    raises, so the worst case is a loud refusal rather than a wrong number.
+    """
+    cleaned = re.sub(r"[^0-9.,+-]", "", str(text or ""))
+    sign = -1 if cleaned.startswith("-") or "(" in str(text or "") else 1
+    cleaned = cleaned.lstrip("+-")
+    if not cleaned or not any(char.isdigit() for char in cleaned):
+        return None
+    if "-" in cleaned or "+" in cleaned:
+        # A sign in the middle is not a number this parser will guess at.
+        return None
+    dots = cleaned.count(".")
+    commas = cleaned.count(",")
+    if dots and commas:
+        decimal_sep = "." if cleaned.rfind(".") > cleaned.rfind(",") else ","
+    elif dots or commas:
+        separator = "." if dots else ","
+        count = dots or commas
+        tail = len(cleaned) - cleaned.rfind(separator) - 1
+        decimal_sep = separator if (count == 1 and tail != 3) else ""
+    else:
+        decimal_sep = ""
+    if decimal_sep:
+        group_sep = "," if decimal_sep == "." else "."
+        normalized = cleaned.replace(group_sep, "").replace(decimal_sep, ".")
+    else:
+        normalized = cleaned.replace(",", "").replace(".", "")
+    if not normalized or normalized == "." or normalized.count(".") > 1:
+        return None
+    try:
+        return Decimal(normalized) * sign
+    except InvalidOperation:
+        return None
+
+
+def _cross_check_money_string(
+    money: Dict[str, Any], *, field: str, value: int
+) -> None:
+    """`string` against `value`, in minor units. A disagreement RAISES.
+
+    Assumption 10 says `value` is already minor units, and the refusal in
+    `_amount_minor_units` only rejects things that are not whole numbers — so a
+    `value` of `60` for a $60.00 order (major units) passes every one of those
+    checks and files a $60 order as 60 cents. The money object carries a second,
+    independent statement of the same amount in `string`, and comparing the two
+    is what turns assumption 10 from an unverified claim into one that is
+    RE-VERIFIED on every delivery that carries the field.
+
+    NEITHER SIDE WINS A DISAGREEMENT. There is no third source to break the tie:
+    picking `string` would make this bridge's totals depend on a human-formatted
+    display value, and picking `value` is the assumption under test. So a
+    mismatch is a `WebflowMoneyFormatError` — the same loud refusal a malformed
+    `value` gets, counted as `invalid` by the sweep and answered 422 by the
+    receiver — and an operator reads both numbers off the message.
+
+    Skipped, at DEBUG, when there is nothing to check against: no `string`, a
+    `string` this parser will not guess at, or a currency whose minor-unit
+    exponent is unknown (the multiplier is exactly what the comparison needs).
+    """
+    text = _text(money.get("string"))
+    if not text:
+        return
+    currency = _currency_of(money)
+    if not currency:
+        logger.debug(
+            "webflow money string not cross-checked (field=%s reason=no_currency)", field
+        )
+        return
+    parsed = _decimal_from_money_string(text)
+    if parsed is None:
+        logger.debug(
+            "webflow money string not cross-checked (field=%s reason=unparseable)", field
+        )
+        return
+    expected = to_minor_units(parsed, currency)
+    if expected != value:
+        raise WebflowMoneyFormatError(
+            f"Webflow {field} disagrees with itself: value={value} minor units "
+            f"but string={text!r} is {expected} minor units in {currency}. "
+            "Neither is trusted over the other; the order is refused rather "
+            "than filed at a figure that could be 100x wrong."
+        )
+
+
 def _amount_minor_units(money: Any, *, field: str) -> Optional[int]:
     """Minor units straight out of a Webflow money object. NO conversion.
 
@@ -203,8 +325,14 @@ def _amount_minor_units(money: Any, *, field: str) -> Optional[int]:
     :class:`WebflowMoneyFormatError` when it is present but is not a whole
     number of minor units — including a decimal string like ``"58.98"``, which
     is precisely the shape that would silently become either 58 or 5898.
+
+    A `value` that survives those checks is then CROSS-CHECKED against the money
+    object's own `string` (`_cross_check_money_string`), because "a whole
+    number" is not the same claim as "a whole number of MINOR units": `60` is a
+    perfectly whole number and is 100x wrong for a `"$60.00"` order.
     """
-    raw = _money(money).get("value")
+    money = _money(money)
+    raw = money.get("value")
     if raw is None or raw == "":
         return None
     if isinstance(raw, bool):
@@ -235,6 +363,7 @@ def _amount_minor_units(money: Any, *, field: str) -> Optional[int]:
         raise WebflowMoneyFormatError(
             f"Webflow {field}.value is negative ({value})"
         )
+    _cross_check_money_string(money, field=field, value=value)
     return value
 
 
@@ -534,7 +663,17 @@ def _refund_event(
         "refund.succeeded",
         entity_id=f"{order_id}:refund",
         occurred_at=_occurred_at(
+            # THREE spellings for one timestamp, because which one Webflow
+            # actually sends is an assumed claim. `disputeUpdatedOn` is the
+            # spelling this bridge was written against; `disputeLastUpdated` is
+            # the one the Data API reference shows on the order object, and it
+            # is tried BEFORE `disputedOn` because it moves when the dispute is
+            # decided while `disputedOn` records when it was opened. Falling
+            # through to the opening timestamp back-dates the refund row by the
+            # length of the dispute; falling through to `acceptedOn` back-dates
+            # it to the order.
             order.get("disputeUpdatedOn") if dispute_lost else None,
+            order.get("disputeLastUpdated") if dispute_lost else None,
             order.get("disputedOn") if dispute_lost else None,
             order.get("refundedOn"),
             order.get("acceptedOn"),

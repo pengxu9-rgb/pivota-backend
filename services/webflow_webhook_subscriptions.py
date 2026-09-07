@@ -54,6 +54,13 @@ from services.webflow_connection import (
 )
 
 
+# One site's webhook list, paged. 100 is Webflow's usual maximum page size and
+# the cap is what keeps `ensure` a bounded outbound loop; 10 pages is 1,000
+# webhooks on one site, which is far past anything a real site carries.
+_WEBHOOK_PAGE_LIMIT = 100
+_MAX_WEBHOOK_PAGES = 10
+
+
 class WebflowWebhookError(RuntimeError):
     """Webhook management failed."""
 
@@ -227,20 +234,53 @@ async def delete_webflow_webhook(
 async def _list_webhooks(
     client: httpx.AsyncClient, token: str, site_id: str
 ) -> List[Dict[str, Any]]:
-    try:
-        response = await client.get(
-            f"{WEBFLOW_API_ROOT}/sites/{site_id}/webhooks",
-            headers=build_webflow_headers(token),
-        )
-    except httpx.HTTPError as exc:
-        raise WebflowWebhookError(f"Webflow webhook list failed: {exc}") from exc
-    _raise_for_status(response, "webhook list")
-    try:
-        return _webhooks(response.json())
-    except WebflowWebhookError:
-        raise
-    except Exception as exc:  # pragma: no cover - httpx raises subclasses
-        raise WebflowWebhookError("Invalid Webflow webhook list response") from exc
+    """Every webhook on the site, walking PAST page 1, bounded.
+
+    Reading only the first page is not a cosmetic gap here: this list is what
+    "stale" is computed from, so a webhook of ours that fell off page 1 is never
+    seen, never deleted, and keeps its OLD url secret registered at Webflow
+    forever. Every rotation then adds one more, and the orphans accumulate on a
+    surface nothing else in this repo enumerates.
+
+    The walk stops on a SHORT page — one carrying fewer rows than the limit
+    asked for — which is what makes it correct against an endpoint that ignores
+    `offset`/`limit` entirely (it answers everything at once, which is short,
+    which ends the walk in one call). It also stops when a page adds no new id,
+    so an endpoint that ignores `offset` but happens to return exactly `limit`
+    rows cannot spin, and at `_MAX_WEBHOOK_PAGES` regardless.
+    """
+    rows: List[Dict[str, Any]] = []
+    seen: set = set()
+    offset = 0
+    for _page in range(_MAX_WEBHOOK_PAGES):
+        try:
+            response = await client.get(
+                f"{WEBFLOW_API_ROOT}/sites/{site_id}/webhooks",
+                headers=build_webflow_headers(token),
+                params={"offset": offset, "limit": _WEBHOOK_PAGE_LIMIT},
+            )
+        except httpx.HTTPError as exc:
+            raise WebflowWebhookError(f"Webflow webhook list failed: {exc}") from exc
+        _raise_for_status(response, "webhook list")
+        try:
+            page = _webhooks(response.json())
+        except WebflowWebhookError:
+            raise
+        except Exception as exc:  # pragma: no cover - httpx raises subclasses
+            raise WebflowWebhookError("Invalid Webflow webhook list response") from exc
+        added = 0
+        for row in page:
+            key = str(row.get("id") or "").strip()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            rows.append(row)
+            added += 1
+        if len(page) < _WEBHOOK_PAGE_LIMIT or not added:
+            break
+        offset += len(page)
+    return rows
 
 
 async def _create_webhook(

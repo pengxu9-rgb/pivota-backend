@@ -46,6 +46,17 @@ from services.webflow_connection import WEBFLOW_API_ROOT, build_webflow_headers
 WEBFLOW_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 WEBFLOW_FETCH_TIMEOUT_SECONDS = 15.0
 # The receiver reads ONE order; a page reads at most 100. Neither is megabytes.
+#
+# MEASURED AFTER THE FACT, and deliberately not claimed otherwise. `httpx` has
+# already buffered the whole response into `response.content` by the time this
+# constant is consulted, so the check is a PARSE guard — it stops a wrong
+# endpoint or a hostile redirect target from being handed to `json.loads` and
+# expanded into objects — and NOT a memory bound. Bounding the read itself needs
+# `client.stream(...)` with a running byte count, which is what
+# `routes/webflow_webhooks.py::_read_limited_body` does for the INBOUND
+# direction, where the sender is untrusted. Here the peer is api.webflow.com
+# over TLS with `follow_redirects=False`, so the residual is a compromised or
+# impersonated Webflow, and the timeout is the bound that applies to it.
 MAX_WEBFLOW_RESPONSE_BYTES = 4_000_000
 # Webflow's documented maximum page size.
 WEBFLOW_MAX_PAGE_LIMIT = 100

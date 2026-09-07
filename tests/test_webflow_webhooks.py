@@ -708,3 +708,55 @@ async def test_the_url_secret_is_absent_from_every_log_record_on_the_REFUSED_pat
     # still says WHICH layer refused and that the store was known, which is the
     # whole reason that line exists.
     assert any("webflow webhook rejected" in line for line in rendered)
+
+
+def test_the_delivery_cache_is_budgeted_PER_STORE(monkeypatch):
+    """One global LRU is a shared resource with no fairness.
+
+    A single busy store's deliveries evicted every other store's within a few
+    minutes, so the quiet store's redelivery — the exact case the cache exists
+    for — was the one that always missed. The two caps still bound the whole
+    thing (stores x entries per store).
+    """
+    from routes import webflow_webhooks as route
+
+    route._SEEN_DELIVERIES.clear()
+    for index in range(route._SEEN_DELIVERY_CAP + 5):
+        route._remember_delivery("noisy-store", f"digest-{index}")
+    route._remember_delivery("quiet-store", "the-one-redelivery")
+
+    assert len(route._SEEN_DELIVERIES["noisy-store"]) == route._SEEN_DELIVERY_CAP
+    assert not route._delivery_seen("noisy-store", "digest-0"), "the per-store LRU"
+    # 5 over the cap went in, so 0..4 were evicted and 5 is the oldest kept.
+    assert route._delivery_seen("noisy-store", "digest-5"), "still within the budget"
+    assert route._delivery_seen("quiet-store", "the-one-redelivery"), (
+        "a busy store evicted a quiet store's entry — the per-store budget is "
+        "not per store"
+    )
+
+
+def test_the_number_of_TRACKED_STORES_is_bounded_too(monkeypatch):
+    """Per-store buckets in a dict that only ever grows is a slow leak keyed on
+    an id an attacker picks (the store id is in the URL)."""
+    from routes import webflow_webhooks as route
+
+    route._SEEN_DELIVERIES.clear()
+    for index in range(route._SEEN_DELIVERY_STORE_CAP + 3):
+        route._remember_delivery(f"store-{index}", "d")
+
+    assert len(route._SEEN_DELIVERIES) == route._SEEN_DELIVERY_STORE_CAP
+    assert not route._delivery_seen("store-0", "d")
+    assert route._delivery_seen(f"store-{route._SEEN_DELIVERY_STORE_CAP + 2}", "d")
+
+
+def test_one_stores_redelivery_is_not_another_stores(monkeypatch):
+    """The keys stay scoped: an identical BODY delivered to two stores is two
+    distinct observations, not a duplicate."""
+    from routes import webflow_webhooks as route
+
+    route._SEEN_DELIVERIES.clear()
+    digest = route._delivery_digest(b'{"triggerType":"ecomm_new_order"}')
+    route._remember_delivery("store-a", digest)
+
+    assert route._delivery_seen("store-a", digest)
+    assert not route._delivery_seen("store-b", digest)

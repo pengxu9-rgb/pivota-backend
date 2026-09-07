@@ -108,6 +108,151 @@ def test_a_value_that_is_not_whole_minor_units_is_refused_not_guessed(value):
         _map(_order(customerPaid={"unit": "USD", "value": value}))
 
 
+# ---- money: `value` cross-checked against `string` --------------------------
+#
+# The refusals above only reject values that are not WHOLE NUMBERS. That leaves
+# the other half of the 100x claim wide open: `60` is a perfectly whole number,
+# and it is 1/100th of a `"$60.00"` order. `string` is a second, independent
+# statement of the same amount in the same object, so it is parsed and compared —
+# and a disagreement RAISES, because there is no third source to break the tie.
+
+
+def test_the_documented_example_agrees_with_its_own_string():
+    """`{"unit":"USD","value":5898,"string":"$58.98"}` -> 5898, and the
+    cross-check is what now says so rather than the docstring."""
+    events = _by_type(_map(_order(customerPaid={"unit": "USD", "value": 5898,
+                                                "string": "$58.98"})))
+
+    assert events["order.paid"].amount_cents == 5898
+
+
+def test_a_zero_decimal_string_with_a_thousands_separator_agrees():
+    """`"\u00a55,898"` is 5898 yen, not 5.898 of anything.
+
+    A single separator with exactly three digits after it is a GROUP separator.
+    Getting this wrong would make the cross-check refuse every JPY order — the
+    parser has to be right about the boring case before its refusals mean
+    anything.
+    """
+    events = _by_type(
+        _map(_order(customerPaid={"unit": "JPY", "value": 5898,
+                                  "string": "\u00a55,898"}))
+    )
+
+    assert events["order.paid"].amount_cents == 5898
+
+
+def test_a_zero_decimal_value_stated_in_HUNDREDTHS_is_refused():
+    """Assumption 22, closed for any order that carries a `string`.
+
+    If Webflow reported a \u00a55,898 order as `value: 589800`, this bridge used to
+    file it as \u00a5589,800 — a 100x over-count with no second source to
+    contradict it. There IS a second source: the string in the same object.
+    """
+    from services.webflow_event_adapter import WebflowMoneyFormatError
+
+    with pytest.raises(WebflowMoneyFormatError) as excinfo:
+        _map(_order(customerPaid={"unit": "JPY", "value": 589800,
+                                  "string": "\u00a55,898"}))
+
+    message = str(excinfo.value)
+    assert "589800" in message and "5898" in message, message
+    assert "JPY" in message
+
+
+def test_a_value_in_MAJOR_units_is_refused_even_though_it_is_a_whole_number():
+    """The hole the whole-number check could never see.
+
+    `{"unit":"USD","value":60,"string":"$60.00"}` passes every earlier refusal —
+    60 is an integer, non-negative, not a decimal string — and files a $60 order
+    as 60 cents.
+    """
+    from services.webflow_event_adapter import WebflowMoneyFormatError
+
+    with pytest.raises(WebflowMoneyFormatError) as excinfo:
+        _map(_order(customerPaid={"unit": "USD", "value": 60,
+                                  "string": "$60.00"}))
+
+    assert "6000" in str(excinfo.value)
+
+
+def test_neither_side_wins_a_disagreement():
+    """Documented behaviour, pinned as behaviour: the observation is REFUSED.
+
+    Preferring `string` would make the ledger's totals depend on a display
+    value; preferring `value` is the assumption under test. So the mapper emits
+    NOTHING for this order — not a partially-mapped one, not a guess — and the
+    sweep counts it `invalid` while the receiver answers 422.
+    """
+    from services.webflow_event_adapter import WebflowMoneyFormatError
+
+    with pytest.raises(WebflowMoneyFormatError):
+        _map(_order(customerPaid={"unit": "USD", "value": 5898,
+                                  "string": "$1.00"}))
+
+
+@pytest.mark.parametrize(
+    "case, text",
+    [
+        ("plain", "58.98"),
+        ("a symbol and a group separator", "$1,234.56"),
+        ("a European decimal comma", "\u20ac1.234,56"),
+        ("a currency code instead of a symbol", "USD 1234.56"),
+        ("a space as the group separator", "1 234.56"),
+        ("a non-breaking space", "1\u00a0234.56"),
+    ],
+)
+def test_the_string_parser_reads_the_formats_a_money_string_comes_in(case, text):
+    from services.webflow_event_adapter import _decimal_from_money_string
+
+    assert _decimal_from_money_string(text) is not None, case
+
+
+@pytest.mark.parametrize(
+    "case, money",
+    [
+        ("no string at all", {"unit": "USD", "value": 5898}),
+        ("an empty string", {"unit": "USD", "value": 5898, "string": ""}),
+        ("a string with no digits", {"unit": "USD", "value": 5898, "string": "free"}),
+        (
+            # Without the currency there is no multiplier, so there is nothing
+            # to compare against. Skipped, not guessed at with 100.
+            "no readable currency",
+            {"value": 5898, "string": "$58.98"},
+        ),
+    ],
+)
+def test_a_missing_or_unreadable_string_keeps_the_previous_behaviour(case, money):
+    """The cross-check must never make an order that used to map stop mapping.
+
+    Most of the fixtures in this file, and every order Webflow has actually been
+    observed sending through the sweep's tests, carry no `string`.
+    """
+    events = _by_type(_map(_order(customerPaid=money)))
+
+    assert events["order.paid"].amount_cents == 5898, case
+
+
+def test_an_unparseable_string_is_a_DEBUG_line_and_not_a_refusal(caplog):
+    """A refusal here would turn an unfamiliar formatting locale into a store
+    that records no money at all — the cure being worse than the disease."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="webflow_event_adapter"):
+        events = _by_type(
+            _map(_order(customerPaid={"unit": "USD", "value": 5898,
+                                      "string": "fifty-eight ninety-eight"}))
+        )
+
+    assert events["order.paid"].amount_cents == 5898
+    assert any(
+        "not cross-checked" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG
+    )
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_a_negative_amount_is_refused_rather_than_clamped():
     from services.webflow_event_adapter import WebflowMoneyFormatError
 
@@ -435,6 +580,57 @@ def test_a_lost_dispute_is_money_out_under_the_SAME_key_as_a_refund():
     assert lost.metadata["native_psp_dispute_id"] == "dp_1"
     assert lost.event_id == refunded.event_id
     assert lost.refund_id == refunded.refund_id == f"{ORDER_ID}:refund"
+
+
+@pytest.mark.parametrize(
+    "case, order_fields, expected",
+    [
+        (
+            "the spelling this bridge was written against",
+            {"disputeUpdatedOn": "2026-09-05T10:00:00.000Z"},
+            "2026-09-05T10:00:00+00:00",
+        ),
+        (
+            # The spelling the Data API reference shows on the order object.
+            # Tried BEFORE `disputedOn` because it moves when the dispute is
+            # DECIDED, while `disputedOn` records when it was opened.
+            "the reference's spelling",
+            {"disputeLastUpdated": "2026-09-05T10:00:00.000Z"},
+            "2026-09-05T10:00:00+00:00",
+        ),
+        (
+            "both, with the original spelling winning",
+            {
+                "disputeUpdatedOn": "2026-09-05T10:00:00.000Z",
+                "disputeLastUpdated": "2026-09-06T10:00:00.000Z",
+            },
+            "2026-09-05T10:00:00+00:00",
+        ),
+        (
+            # The fallback. It back-dates the refund row by the length of the
+            # dispute, which is why the two decision spellings come first.
+            "neither, so the OPENING timestamp",
+            {"disputedOn": "2026-09-01T09:00:00.000Z"},
+            "2026-09-01T09:00:00+00:00",
+        ),
+    ],
+)
+def test_the_lost_dispute_anchor_reads_every_spelling_of_the_decision_time(
+    case, order_fields, expected
+):
+    """Which field Webflow actually sends is an ASSUMED claim (row 19).
+
+    Reading one spelling and falling through to `disputedOn` anchors the refund
+    at the moment the dispute was OPENED rather than lost — a row back-dated by
+    however long the dispute ran, which lands it in the wrong reporting period
+    and, on the sweep's dispute lane, behind a cursor that has already passed.
+    """
+    order = _order(status="dispute-lost", **order_fields)
+    order.pop("refundedOn", None)
+
+    event = _by_type(_map(order))["refund.succeeded"]
+
+    assert event.occurred_at.isoformat() == expected, case
 
 
 def test_webflow_has_no_cancelled_state_so_none_is_invented():
