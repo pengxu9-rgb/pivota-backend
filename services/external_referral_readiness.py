@@ -5,12 +5,15 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from fastapi import HTTPException
 from urllib.parse import urlparse
 
 from db.database import database
@@ -40,6 +43,102 @@ logger = logging.getLogger(__name__)
 
 EXTERNAL_REFERRAL_GATING_POLICY_VERSION = "external_referral_v1"
 EXTERNAL_REFERRAL_STALE_DAYS = 7
+
+# Minimum share of a run's candidates that must actually reach the origin before the run counts
+# as a success. Measured on prod 2026-09-06 the nightly run sat at ~0.50 (2,647 refreshed minus
+# 654 cache-served, over 4,000 candidates), so this threshold is deliberately set AT the current
+# level: it is meant to fire now, because a night that reaches the origin for half its rows is
+# the failure we are trying to make visible. Tunable without a deploy while hosts are triaged.
+_MIN_ORIGIN_YIELD_DEFAULT = 0.5
+
+# The only two HTTPException details that mean "this seed can never be crawled", as opposed to
+# "something went wrong this time". Kept as an explicit set so a new 4xx cannot quietly join them.
+_UNPROCESSABLE_SEED_DETAILS = frozenset({"SEED_NOT_FOUND", "INVALID_URL"})
+
+
+def _min_origin_yield() -> float:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_ORIGIN_YIELD", "").strip()
+    try:
+        value = float(raw) if raw else _MIN_ORIGIN_YIELD_DEFAULT
+    except ValueError:
+        return _MIN_ORIGIN_YIELD_DEFAULT
+    return min(max(value, 0.0), 1.0)
+
+
+def batch_run_status(
+    *,
+    failed: int,
+    stopped_early: bool,
+    attempted_count: int,
+    origin_reads: int,
+    price_changes: int = 0,
+    projections_attempted: int = 0,
+    projections_written: int = 0,
+) -> str:
+    """The run's health, as one word. Pure so it can be tested without a database.
+
+    Extracted rather than inlined in the summary dict BECAUSE a test that re-implements this
+    arithmetic proves nothing about the job — it passes whether or not the production path uses
+    it. Both the summary and the tests call this.
+
+    `failed` alone is the old rule and it is nearly always 0: a degraded read is not an
+    exception. The two ways a run silently does nothing are stopping on budget and reaching the
+    origin for too few of its candidates.
+    """
+    if failed:
+        return "degraded"
+    # `stopped_early` is REPORTED, not failed on. With --limit 4000 over 11,769 seeds the queue
+    # is designed to be drained across ~3 nights, so a budget stop is the steady state, not an
+    # incident. Conflating the two would make the alarm meaningless on night one. The yield
+    # below is the signal that actually distinguishes a short run from an empty one.
+    if attempted_count and (origin_reads / attempted_count) < _min_origin_yield():
+        return "degraded"
+    # Projection ran and healed nothing while prices were moving: the offers table is still
+    # drifting from the seed, which is the whole defect this hook exists to close. Silent
+    # before, because the outcome dicts were discarded — `no_mirror_product` x2,000 and
+    # `synced` x2,000 read identically.
+    if price_changes and projections_attempted and projections_written == 0:
+        return "degraded"
+    return "success"
+
+
+def _bump(counter: Dict[str, int], key: str) -> None:
+    counter[key] = int(counter.get(key) or 0) + 1
+
+
+def _degraded_reason_bucket(error: Any) -> str:
+    """Collapse a degraded row's error into a small, readable bucket.
+
+    Buckets, not raw strings: the raw text carries URLs and per-host detail, which makes the
+    histogram unreadable and can leak a destination into a log line. An HTTP status keeps its
+    code because that is the actionable part (403/429 = blocked, 404 = gone, 5xx = their side).
+    """
+    text = str(error or "").strip().lower()
+    if not text:
+        return "unspecified"
+    # Keywords FIRST, and the status pattern anchored on an http-ish prefix. A bare
+    # `\b([45]\d{2})\b` run first turned `port=443` inside a timeout message into bucket
+    # `http_443` — a port number is not a status code, and the timeout was the real reason.
+    for needle, bucket in (
+        ("timeout", "timeout"), ("timed out", "timeout"),
+        ("robots", "robots"), ("crawl", "crawl_paced"),
+        ("ssl", "tls"), ("tls", "tls"), ("certificate", "tls"),
+        ("dns", "dns"), ("name or service", "dns"), ("getaddrinfo", "dns"),
+        ("connection", "connection"), ("refused", "connection"),
+        ("challenge", "bot_challenge"), ("captcha", "bot_challenge"),
+        ("snapshot_failed", "snapshot_failed"),
+    ):
+        if needle in text:
+            return bucket
+    # A status code is introduced by a word that means "status", never by `port=`. Keywords have
+    # already run, so a timeout carrying `port=443` never reaches here; this guards the residue.
+    match = re.search(
+        r"(?:http|https|status|code|returned|responded)[ _:=]*\s*([45]\d{2})(?!\d)", text
+    )
+    if match:
+        return f"http_{match.group(1)}"
+    return "other"
+
 EXTERNAL_REFERRAL_BLOCKER_ANOMALIES = {
     "locale_market_mismatch",
     "non_product_fallback_page",
@@ -1585,6 +1684,14 @@ async def run_external_referral_refresh_batch(
     budget = _refresh_budget_seconds(budget_seconds)
     started = time.monotonic()
     skipped_for_budget = 0
+    degraded_reasons: Dict[str, int] = {}
+    unprocessable = 0
+    unprocessable_reasons: Dict[str, int] = {}
+    proj_attempted = 0
+    proj_written = 0
+    proj_seconds = 0.0
+    proj_skips: Dict[str, int] = {}
+    degraded_hosts: Dict[str, int] = {}
     stopped_early = False
     # A "success" that never contacted the origin. `resolve_external_offer` honours
     # `raise_on_unavailable` only for `ExternalOfferUnavailable`; a timeout, TLS error,
@@ -1662,17 +1769,63 @@ async def run_external_referral_refresh_batch(
                     price_skipped_non_positive += 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
+                proj = result.get("projection")
+                if isinstance(proj, dict):
+                    proj_attempted += int(proj.get("attempted") or 0)
+                    proj_written += int(proj.get("projected") or 0)
+                    proj_seconds += float(proj.get("seconds") or 0.0)
+                    for _k, _v in proj.items():
+                        if _k.startswith("skip_"):
+                            _bump(proj_skips, _k[5:])
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
             elif status == "degraded":
                 degraded += 1
+                # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
+                # `failed` branch below, and `failed` is structurally always 0 for a degraded
+                # read — so a night with 1,353 degraded rows reported a bare count and no way
+                # to tell a bot-challenge from a TLS error from a 404. Bucketed rather than
+                # raw so the histogram stays small enough to read in a log line.
+                _bump(degraded_reasons, _degraded_reason_bucket(result.get("error")))
+                _bump(degraded_hosts, str(result.get("domain") or "unknown"))
             else:
                 failed += 1
                 errors.append({"seed_id": seed_id, "status": status, "error": result.get("error")})
+        except HTTPException as exc:
+            # NARROW ON PURPOSE. Only the two permanent per-seed data conditions are absorbed:
+            # SEED_NOT_FOUND (404) and INVALID_URL (400). ~628 seeds carry no usable destination
+            # today, so counting those as `failed` would redden the exit code every night over a
+            # backlog the run cannot fix. Anything else — a 5xx from a helper, an auth failure —
+            # is a real fault and must stay in `failed`/`errors[]` where it can move the exit
+            # code; a broad `except HTTPException` would silently reclassify those as permanent.
+            detail = str(getattr(exc, "detail", "") or "").strip()
+            if getattr(exc, "status_code", None) in (400, 404) and detail in _UNPROCESSABLE_SEED_DETAILS:
+                unprocessable += 1
+                _bump(unprocessable_reasons, detail[:40])
+            else:
+                failed += 1
+                errors.append(
+                    {"seed_id": seed_id, "status": "failed", "error": f"http {getattr(exc, 'status_code', '?')}: {detail[:200]}"}
+                )
         except Exception as exc:
             failed += 1
             errors.append({"seed_id": seed_id, "status": "failed", "error": str(exc)[:300]})
+    # Real origin contact, not the success count: `refreshed` includes rows served from the
+    # cached snapshot because the gate refused, timed out or paced out. This ratio is the one
+    # number that says whether the run did its job.
+    origin_reads = max(0, refreshed - refreshed_from_cache)
+    # ATTEMPTED rows, not candidates. `skipped_for_budget` rows were never tried, so counting
+    # them in the denominator charges the run for work it deliberately deferred and sets the
+    # floor to flap: the 09-05 night reads 0.498 by candidates but ~0.596 by attempts.
+    # `unprocessable` rows leave the denominator too: a seed with no usable destination was
+    # never a candidate for an origin read, so charging the yield for it understates a healthy
+    # run by roughly the size of that permanent backlog (~628 today).
+    attempted_count = max(0, len(candidate_seed_ids) - skipped_for_budget - unprocessable)
+    origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
+    min_yield = _min_origin_yield()
+    low_yield = bool(attempted_count) and origin_yield < min_yield
+
     if refreshed_from_cache:
         logger.warning(
             "external referral refresh: %d/%d rows counted as refreshed came from the cached "
@@ -1680,7 +1833,36 @@ async def run_external_referral_refresh_batch(
             refreshed_from_cache, refreshed,
         )
     return {
-        "status": "success" if failed == 0 else "degraded",
+        # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
+        # exceptions — so a run that stopped on budget, or that served half its rows from cache
+        # without reaching a single origin, reported success. The job then exited 0 and Cloud
+        # Run showed a green tick over a night that refreshed almost nothing. `stopped_early`
+        # and `low_origin_yield` are the two ways that happens in practice.
+        "status": batch_run_status(
+            failed=failed,
+            stopped_early=stopped_early,
+            attempted_count=attempted_count,
+            origin_reads=origin_reads,
+            price_changes=price_changed,
+            projections_attempted=proj_attempted,
+            projections_written=proj_written,
+        ),
+        # "healed 2,000" vs "healed 0" — the projection OUTCOME, not just that it was called.
+        "unprocessable": unprocessable,
+        "unprocessable_reasons": dict(sorted(unprocessable_reasons.items(), key=lambda kv: -kv[1])[:8]),
+        # How much of the budget the projection itself consumed. With the flag armed the PDP
+        # rebuild is ~1s/key, so this is the number that says whether arming it halved throughput.
+        "projection_seconds": round(proj_seconds, 2),
+        "projections_attempted": proj_attempted,
+        "projections_written": proj_written,
+        "projection_skips": dict(sorted(proj_skips.items(), key=lambda kv: -kv[1])[:8]),
+        "attempted_count": attempted_count,
+        "degraded_reason_counts": dict(sorted(degraded_reasons.items(), key=lambda kv: -kv[1])[:12]),
+        "top_degraded_hosts": dict(sorted(degraded_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "origin_reads": origin_reads,
+        "origin_yield": round(origin_yield, 4),
+        "min_origin_yield": min_yield,
+        "low_origin_yield": low_yield,
         "gating_policy_version": EXTERNAL_REFERRAL_GATING_POLICY_VERSION,
         "candidate_count": len(candidate_seed_ids),
         # `candidate_count` is what we INTENDED to refresh, so on a budget stop it and
