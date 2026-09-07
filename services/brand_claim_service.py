@@ -248,21 +248,73 @@ async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) ->
             raise
         logger.warning("_inferred_merchant_hosts: onboarding load failed: %s", str(exc)[:200])
     try:
-        rows = await database.fetch_all(
+        # TWO HOST-GRAINED DRAWS. The previous single draw selected the (source_domain,
+        # canonical_url) pair DISTINCT with LIMIT 500 -- effectively one row per product -- so
+        # for a merchant with more than 500 products the LIMIT cut off whole hosts, and once
+        # the draw was ORDERED for determinism it cut them off on the axis that maximises the
+        # loss: the lexicographically-first storefront filled every slot and the second
+        # (anua.com 600 products, anua.us 5) vanished from the inferred set. A stored
+        # `inferred` row for the lost host is admitted only through this set, so the host
+        # dropped out of first_party, out of the liveness seeder, and out of the audit basis.
+        #
+        # Both tiers are drawn DISTINCT AT THE HOST, so no product count can truncate a
+        # storefront: source_domain is already a host; canonical_url is reduced to its host
+        # in SQL (split_part on Postgres, substr/instr on SQLite -- the two engines the suite
+        # and production run on). The cap is on distinct HOSTS and is a safety net far past
+        # any plausible storefront count; at the boundary the lexicographically-last hosts are
+        # the ones lost, and the source-level test names that. Both draws are ORDERED, so two
+        # runs against the same catalog infer the same hosts (the audit basis records this set
+        # into an INSERT-ONLY comparability key), and both exclude NULL explicitly: Postgres
+        # sorts NULL last and SQLite first, so a NULL inside the ordered window would put the
+        # cut in different places.
+        #
+        # URL-AUDIT ROWS ARE EXCLUDED. services/audit_index_intake.py writes audited
+        # RETAILER pages under the audited merchant's id with source_domain = the retailer's
+        # host, so inferring from them counts a retailer as the merchant's own storefront --
+        # first_party on every cited host, the mirror image of the anua.us defect. The old
+        # per-product LIMIT happened to truncate those away for large merchants; a
+        # host-grained draw would surface every one of them.
+        from db.database import IS_POSTGRES
+
+        url_host_expr = (
+            "split_part(canonical_url, '/', 3)" if IS_POSTGRES else
+            "substr(substr(canonical_url, instr(canonical_url, '//') + 2), 1,"
+            " CASE WHEN instr(substr(canonical_url, instr(canonical_url, '//') + 2), '/') = 0"
+            " THEN length(canonical_url)"
+            " ELSE instr(substr(canonical_url, instr(canonical_url, '//') + 2), '/') - 1 END)"
+        )
+        domain_rows = await database.fetch_all(
             """
-            SELECT DISTINCT source_domain, canonical_url
+            SELECT DISTINCT source_domain
               FROM catalog_products
              WHERE merchant_id = :merchant_id
-             ORDER BY source_domain, canonical_url
-             LIMIT 500
+               AND source_domain IS NOT NULL
+               AND platform <> 'url_audit'
+             ORDER BY source_domain
+             LIMIT 1000
             """,
             {"merchant_id": merchant_id},
         )
-        for r in rows or []:
-            for key in ("source_domain", "canonical_url"):
-                h = normalize_host(r[key])
-                if h:
-                    hosts.add(h)
+        url_rows = await database.fetch_all(
+            f"""
+            SELECT DISTINCT {url_host_expr} AS url_host
+              FROM catalog_products
+             WHERE merchant_id = :merchant_id
+               AND canonical_url IS NOT NULL
+               AND platform <> 'url_audit'
+             ORDER BY url_host
+             LIMIT 1000
+            """,
+            {"merchant_id": merchant_id},
+        )
+        for r in domain_rows or []:
+            h = normalize_host(r["source_domain"])
+            if h:
+                hosts.add(h)
+        for r in url_rows or []:
+            h = normalize_host(r["url_host"])
+            if h:
+                hosts.add(h)
     except Exception as exc:  # noqa: BLE001
         if strict:
             raise

@@ -1320,15 +1320,156 @@ async def test_the_basis_does_not_sample_inference_for_a_merchant_with_no_declar
     assert sorted((basis or {}).get("official_domains") or []) == ["brand.com"]
 
 
-def test_the_inferred_sample_is_ordered():
-    """LIMIT 500 with no ORDER BY is an arbitrary, call-to-call unstable slice for any
-    merchant with more than 500 products. The basis now reads this sample into an
-    INSERT-ONLY comparability key, so two runs against the same world must draw the same
-    500 rows."""
+def test_the_inferred_sample_is_host_grained_ordered_and_never_sorts_a_null():
+    """Two draws, each DISTINCT at the HOST, ordered, NULL-free, and excluding url_audit rows.
+    Host-grained because a per-product draw's LIMIT cut off whole storefronts; ordered because
+    the audit basis records this set into an INSERT-ONLY comparability key; NULL-free because
+    Postgres sorts NULL last and SQLite first, which would move the cut; url_audit excluded
+    because those rows carry RETAILER hosts under the merchant's id."""
     import inspect
+    import re
     src = inspect.getsource(svc._inferred_merchant_hosts)
-    q = src[src.index("SELECT DISTINCT source_domain"):src.index("LIMIT 500")]
-    assert "ORDER BY source_domain, canonical_url" in q, q
+    draws = list(re.finditer(
+        r"SELECT DISTINCT (?P<sel>[^\n]+)\n\s+FROM catalog_products(?P<body>.*?)LIMIT (?P<limit>\d+)",
+        src, re.S,
+    ))
+    assert len(draws) == 2, [d.group(0) for d in draws]
+    domain, url = draws
+    assert domain.group("sel").strip() == "source_domain", domain.group(0)
+    assert "{url_host_expr} AS url_host" in url.group("sel"), url.group(0)
+    for d, col, order in ((domain, "source_domain", "source_domain"), (url, "canonical_url", "url_host")):
+        body = d.group("body")
+        assert f"{col} IS NOT NULL" in body, d.group(0)
+        assert "platform <> 'url_audit'" in body, d.group(0)
+        assert f"ORDER BY {order}" in body, d.group(0)
+        assert int(d.group("limit")) >= 1000, "the cap is a safety net on distinct HOSTS, not a sample size"
+    # No draw selects both columns at once: that is the pair-DISTINCT shape that truncated hosts.
+    assert not re.search(r"SELECT DISTINCT source_domain\s*,\s*canonical_url", src)
+    # Both engines get a host expression for canonical_url.
+    assert "split_part(canonical_url, '/', 3)" in src and "instr(canonical_url, '//')" in src
+
+
+async def _seed_catalog(database, mid: str, rows):
+    """Rows into the REAL catalog_products shape, built (or patched up) from the model via the
+    shared helper -- never a hand-written subset, and never a create that another module's
+    narrower fixture can win first. tests/model_schema.py explains both failure directions."""
+    from db.catalog import catalog_products as cp_table
+    from tests.model_schema import ensure_model_tables
+
+    await ensure_model_tables([cp_table])
+    await database.execute("DELETE FROM catalog_products WHERE merchant_id = :m", {"m": mid})
+    await database.execute_many(
+        "INSERT INTO catalog_products (product_key, content_key, merchant_id, platform,"
+        " source_product_id, source_domain, canonical_url, title)"
+        " VALUES (:pk, :ck, :m, :pl, :spid, :sd, :cu, :t)",
+        rows,
+    )
+
+
+def _catalog_rows(mid: str, host: str, n: int, *, source_domain=..., platform: str = "shopify"):
+    sd = host if source_domain is ... else source_domain
+    return [
+        {"pk": f"{mid}-{host}-{i}", "ck": f"ck-{mid}-{host}-{i}", "m": mid, "pl": platform,
+         "spid": f"{host}-{i}", "sd": sd, "cu": f"https://{host}/products/p{i:04d}", "t": f"{host} {i}"}
+        for i in range(n)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_domain_present", [True, False])
+async def test_a_second_storefront_survives_a_catalog_larger_than_the_sample(monkeypatch, source_domain_present):
+    """anua.com with 600 products and anua.us with 5, on the real table. A per-product draw
+    with LIMIT 500 filled every slot with anua.com and inferred anua.us out of existence --
+    out of first_party, out of the seeder, out of the basis. The host-grained draws cannot
+    lose a storefront to a product count -- on EITHER tier: two production ingest doors write
+    source_domain NULL (catalog_reconcile_service, sync_products_from_raw), and there the
+    canonical_url tier is the only host source."""
+    from db.database import database
+    import db.merchant_onboarding as onboarding
+
+    mid = "test-sample-merchant"
+
+    async def _no_onboarding(_mid):
+        return {}
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _no_onboarding)
+
+    await database.connect()
+    try:
+        sd = ... if source_domain_present else None
+        await _seed_catalog(database, mid,
+                            _catalog_rows(mid, "anua.com", 600, source_domain=sd)
+                            + _catalog_rows(mid, "anua.us", 5, source_domain=sd))
+        hosts = await svc._inferred_merchant_hosts(mid)
+        assert {"anua.com", "anua.us"} <= hosts, sorted(hosts)
+        # And the same world draws the same set again.
+        assert await svc._inferred_merchant_hosts(mid) == hosts
+    finally:
+        try:
+            await database.execute("DELETE FROM catalog_products WHERE merchant_id = :m", {"m": mid})
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_inferred_hosts_are_normalized_from_both_tiers(monkeypatch):
+    """Production source_domain is Shopify's shop_domain -- `www.Brand.com`, mixed case -- and
+    canonical_url carries scheme, port and path. An un-normalized host fails the exact match
+    in host_matches_known and silently loses first_party."""
+    from db.database import database
+    import db.merchant_onboarding as onboarding
+
+    mid = "test-sample-normalize"
+
+    async def _no_onboarding(_mid):
+        return {}
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _no_onboarding)
+
+    await database.connect()
+    try:
+        rows = _catalog_rows(mid, "brand.com", 1, source_domain="WWW.Brand.COM")
+        rows[0]["cu"] = "HTTPS://WWW.Brand.COM:443/products/x?y=1"
+        rows += [{"pk": f"{mid}-u", "ck": f"ck-{mid}-u", "m": mid, "pl": "shopify", "spid": "u",
+                  "sd": None, "cu": "https://shop.other.example/p", "t": "u"}]
+        await _seed_catalog(database, mid, rows)
+        hosts = await svc._inferred_merchant_hosts(mid)
+        assert hosts == {"brand.com", "shop.other.example"}, sorted(hosts)
+    finally:
+        try:
+            await database.execute("DELETE FROM catalog_products WHERE merchant_id = :m", {"m": mid})
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_audited_retailer_rows_are_not_inferred_as_the_merchants_storefront(monkeypatch):
+    """services/audit_index_intake.py writes audited RETAILER pages under the merchant's id
+    (platform url_audit, source_domain = the retailer's host). Inferring from them makes the
+    retailer first_party on every cited host -- the mirror image of the anua.us defect, which
+    the old per-product LIMIT merely happened to hide for large merchants."""
+    from db.database import database
+    import db.merchant_onboarding as onboarding
+
+    mid = "test-sample-audit"
+
+    async def _no_onboarding(_mid):
+        return {}
+
+    monkeypatch.setattr(onboarding, "get_merchant_onboarding", _no_onboarding)
+
+    await database.connect()
+    try:
+        await _seed_catalog(database, mid,
+                            _catalog_rows(mid, "brand.com", 3)
+                            + _catalog_rows(mid, "sephora.com", 3, platform="url_audit"))
+        hosts = await svc._inferred_merchant_hosts(mid)
+        assert hosts == {"brand.com"}, sorted(hosts)
+    finally:
+        try:
+            await database.execute("DELETE FROM catalog_products WHERE merchant_id = :m", {"m": mid})
+        finally:
+            await database.disconnect()
 
 
 @pytest.mark.asyncio
