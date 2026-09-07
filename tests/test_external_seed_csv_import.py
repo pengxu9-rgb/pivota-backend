@@ -58,6 +58,16 @@ def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) ->
         monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
         monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
         monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
+        # Same ADR-009 D3 derivation as the catalog test below. This case only
+        # avoided the unstubbed `brand_claims` read by accident — its CSV carries no
+        # Brand column, so make_observed_merchant_id() raises on the empty brand
+        # before the claim lookup runs. Stub it so the test stays hermetic if the
+        # fixture ever gains a brand.
+        monkeypatch.setattr(
+            employee_products_module,
+            "_derive_seed_seller_columns",
+            AsyncMock(return_value=("merch_obs_test0000000000", "cross")),
+        )
 
         client = TestClient(app)
         csv_text = "destination_url,title\nhttps://example.com/p/1,Example\n"
@@ -143,6 +153,21 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
         monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
         monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
         monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
+        # ADR-009 D3 (added by #1191 "A9-3 seller_ref/seed_kind on seeds"): the seed
+        # INSERT path now derives (seller_ref, seed_kind) before writing. That call
+        # lands in services.seller_identity._resolve_claimed_merchant, which reads
+        # `brand_claims` via database.fetch_all() — a method this test's fake DB
+        # layer (fetch_one + _execute_seed_data_stmt) does not intercept, so it hit
+        # the real sqlite test DB and raised "no such table: brand_claims". That
+        # error is *deliberately* propagated by _resolve_claimed_merchant ("a caller
+        # that cannot check claims must not mint"), so the group upsert correctly
+        # aborted and reported created=0. Nothing about CSV grouping changed; the
+        # stub below restores this test to what it actually covers.
+        monkeypatch.setattr(
+            employee_products_module,
+            "_derive_seed_seller_columns",
+            AsyncMock(return_value=("merch_obs_test0000000000", "cross")),
+        )
 
         client = TestClient(app)
         csv_text = (
@@ -164,6 +189,11 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
 
         assert len(store_by_id) == 1
         stored = next(iter(store_by_id.values()))
+        # ADR-009 D3: a CSV-catalog seed has no anchor, so derivation resolves CROSS
+        # to an observed seller and the INSERT must carry both columns. Pins that the
+        # derived pair is actually threaded onto the row (not just stubbed away).
+        assert stored.get("seller_ref") == "merch_obs_test0000000000"
+        assert stored.get("seed_kind") == "cross"
         seed_data = stored.get("seed_data") or {}
         assert isinstance(seed_data, dict)
         variants = seed_data.get("variants") or []
