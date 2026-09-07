@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 from db import brand_claims as bc
-from db.database import database
+from db.database import IS_POSTGRES, database
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,59 @@ def host_matches_known(domain: Optional[str], known_hosts: Iterable[str]) -> boo
     return False
 
 
+# ── inferred-host draws, at HOST grain ───────────────────────────────────────────────────────
+# Module-level and static on purpose: tests/test_repo_sql_prepare_postgres.py resolves module
+# constants at fetch_all sites and PREPAREs them against real Postgres; an f-string built at the
+# call site silently leaves that gate. The dialect split is over constants for the same reason.
+#
+# source_domain is already a host. canonical_url is reduced to its host IN SQL so DISTINCT is at
+# host grain: only rows that carry a scheme are read (`LIKE '%://%'`), because a schemeless value
+# has no host position that the two engines agree on (split_part(url,'/',3) on Postgres and the
+# substr/instr cut on SQLite each guess a different token, and one of those guesses -- `rand.com`
+# from `brand.com/products/x` -- is a valid registrable domain that would be counted as the
+# merchant's). The cut stops at the first of '/', '?' or '#' so that DISTINCT is at HOST grain:
+# without the '?' and '#' cuts two variant URLs on one host are two rows eating cap slots, and
+# without the '/' cut every product is its own row -- the per-product truncation this exists to
+# remove. (normalize_host in Python would absorb any of them for a single value; the cut has to
+# happen in SQL because the LIMIT applies before Python sees anything.) Both draws ORDERED (the audit basis records this set into an INSERT-ONLY
+# comparability key) and NULL-free (Postgres sorts NULL last, SQLite first). The 1000-host cap is
+# a safety net far past any storefront count; at the boundary the lexicographically-last hosts
+# are the ones lost.
+INFERRED_SOURCE_DOMAIN_HOSTS_SQL = """
+SELECT DISTINCT source_domain
+  FROM catalog_products
+ WHERE merchant_id = :merchant_id
+   AND source_domain IS NOT NULL
+ ORDER BY source_domain
+ LIMIT 1000
+"""
+
+
+# The canonical_url draw, one PLAIN LITERAL per engine. tests/test_repo_sql_prepare_postgres.py
+# resolves only a top-level `NAME = "<literal>"` (no f-string, no assignment inside an `if`),
+# and skips call sites inside `if not IS_POSTGRES` / `else` branches -- so the Postgres text is
+# what the gate PREPAREs and the SQLite text is what the hermetic suite runs. The SQLite host
+# expression is the three-way cut written out (instr/substr have no split_part); it was
+# generated once from a helper and is kept verbatim so the AST sees a constant.
+INFERRED_CANONICAL_URL_HOSTS_SQL_POSTGRES = """
+SELECT DISTINCT split_part(split_part(split_part(substring(canonical_url from position('://' in canonical_url) + 3), '/', 1), '?', 1), '#', 1) AS url_host
+  FROM catalog_products
+ WHERE merchant_id = :merchant_id
+   AND canonical_url LIKE '%://%'
+ ORDER BY url_host
+ LIMIT 1000
+"""
+
+INFERRED_CANONICAL_URL_HOSTS_SQL_SQLITE = """
+SELECT DISTINCT CASE WHEN instr(CASE WHEN instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') > 0 THEN substr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, 1, instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') - 1) ELSE CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END END, '#') > 0 THEN substr(CASE WHEN instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') > 0 THEN substr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, 1, instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') - 1) ELSE CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END END, 1, instr(CASE WHEN instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') > 0 THEN substr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, 1, instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') - 1) ELSE CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END END, '#') - 1) ELSE CASE WHEN instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') > 0 THEN substr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, 1, instr(CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END, '?') - 1) ELSE CASE WHEN instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') > 0 THEN substr(substr(canonical_url, instr(canonical_url, '://') + 3), 1, instr(substr(canonical_url, instr(canonical_url, '://') + 3), '/') - 1) ELSE substr(canonical_url, instr(canonical_url, '://') + 3) END END END AS url_host
+  FROM catalog_products
+ WHERE merchant_id = :merchant_id
+   AND canonical_url LIKE '%://%'
+ ORDER BY url_host
+ LIMIT 1000
+"""
+
+
 async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) -> set:
     """The INFERRED tier, unchanged: hosts Pivota derives from what it already
     holds — onboarding store_url/website + catalog product source/canonical
@@ -228,9 +281,11 @@ async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) ->
 
     Kept as a separate function because it is now one of two tiers, and because
     the liveness sweep needs it to seed rows it can check
-    (services/official_domain_liveness.seed_inferred_domains). It is NOT
-    weakened and NOT removed: merchants who have never asserted a domain still
-    get exactly the set they got before, minus anything measured dead.
+    (services/official_domain_liveness.seed_inferred_domains). Merchants who have
+    never asserted a domain get the set they got before -- drawn at HOST grain
+    now (see the module-level SQL), with one deliberate delta: a canonical_url
+    with no scheme is no longer read, because the two engines guess different
+    hosts from it (0 of 5,080 measured production values).
     """
     hosts: set = set()
     if not merchant_id:
@@ -248,21 +303,47 @@ async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) ->
             raise
         logger.warning("_inferred_merchant_hosts: onboarding load failed: %s", str(exc)[:200])
     try:
-        rows = await database.fetch_all(
-            """
-            SELECT DISTINCT source_domain, canonical_url
-              FROM catalog_products
-             WHERE merchant_id = :merchant_id
-             ORDER BY source_domain, canonical_url
-             LIMIT 500
-            """,
-            {"merchant_id": merchant_id},
-        )
-        for r in rows or []:
-            for key in ("source_domain", "canonical_url"):
-                h = normalize_host(r[key])
+        # TWO HOST-GRAINED DRAWS, EACH IN ITS OWN TRY. The previous single draw selected the
+        # (source_domain, canonical_url) pair DISTINCT with LIMIT 500 -- one row per product --
+        # so for a merchant with more than 500 products the LIMIT cut off whole hosts, and
+        # once the draw was ORDERED for determinism it cut them off on the axis that
+        # maximises the loss: the lexicographically-first storefront filled every slot and
+        # the second (anua.com 600 products, anua.us 5) vanished. A stored `inferred` row for
+        # the lost host is admitted only through this set, so the host dropped out of
+        # first_party, out of the liveness seeder, and out of the audit basis.
+        #
+        # Both tiers are DISTINCT AT THE HOST (see the module-level SQL and its notes), so no
+        # product count can truncate a storefront. NOTHING IS EXCLUDED BY PLATFORM: a
+        # store-less merchant's only catalog rows come from URL audits (platform url_audit),
+        # and on the live audit path both columns of those rows carry the BRAND's own host --
+        # an earlier cut of this change excluded url_audit rows as "retailer pages" and would
+        # have emptied inference for exactly those merchants and revoked their stored
+        # inferred rows. The two draws are consumed separately so a failure of the URL draw
+        # (the dialect-split one) cannot discard the source_domain draw already in hand.
+        try:
+            domain_rows = await database.fetch_all(
+                INFERRED_SOURCE_DOMAIN_HOSTS_SQL, {"merchant_id": merchant_id},
+            )
+            for r in domain_rows or []:
+                h = normalize_host(r["source_domain"])
                 if h:
                     hosts.add(h)
+        except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
+            logger.warning("_inferred_merchant_hosts: source_domain draw failed: %s", str(exc)[:200])
+        if IS_POSTGRES:
+            url_rows = await database.fetch_all(
+                INFERRED_CANONICAL_URL_HOSTS_SQL_POSTGRES, {"merchant_id": merchant_id},
+            )
+        else:
+            url_rows = await database.fetch_all(
+                INFERRED_CANONICAL_URL_HOSTS_SQL_SQLITE, {"merchant_id": merchant_id},
+            )
+        for r in url_rows or []:
+            h = normalize_host(r["url_host"])
+            if h:
+                hosts.add(h)
     except Exception as exc:  # noqa: BLE001
         if strict:
             raise
