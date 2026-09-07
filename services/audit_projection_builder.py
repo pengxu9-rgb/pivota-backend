@@ -654,6 +654,14 @@ def build_revenue_recovery_projection(
         )
         stages[stage]["actions"].append(_action_for_merchant(a))
 
+    # DB retrieval order is not a presentation contract (timestamps may tie).
+    # Keep retained-report rebuilds and persisted projections deterministic.
+    for stage_data in stages.values():
+        stage_data["findings"].sort(key=lambda f: (
+            _SEVERITY_ORDER.get(f.get("severity"), 99),
+            str(f.get("type") or ""), str(f.get("summary") or ""),
+        ))
+
     unreadable = any(_is_meta_finding(f) for f in (findings or []))
     for name in _STAGES:
         if not _stage_is_measurable(name):
@@ -832,6 +840,13 @@ async def build_and_persist_all_projections(
     evidence = await list_evidence_for_run(audit_run_id=audit_run_id)
     findings = await list_findings_for_run(audit_run_id=audit_run_id)
     actions = await list_actions_for_run(audit_run_id=audit_run_id)
+
+    if strict and (audit_row is None or not findings):
+        # Accessors swallow database failures into None/[]; writing an empty
+        # projection successfully must not turn that failed read into completion.
+        logger.warning("strict projection input unavailable for audit=%s", audit_run_id)
+        return {"projections_built": 0,
+                "projections_failed": len(VALID_AUDIENCES - {AUDIENCE_PUBLIC_ANONYMOUS})}
 
     # PR-codex-review-followup: the per-audience builders include a
     # merchant_id field inside the payload, but the report_projections
