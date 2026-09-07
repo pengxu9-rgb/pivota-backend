@@ -98,7 +98,8 @@ def _commit(root: Path, path: str, body: str, *, age_minutes: int = 0) -> str:
 
 
 def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
-           split: str = "", both100: str = "") -> Path:
+           split: str = "", both100: str = "", garbage_service: str = "",
+           garbage_revision: str = "") -> Path:
     """`curl` and `gcloud` that answer for a chosen production state.
 
     The gcloud stub models the TWO-CALL shape the job actually uses: `run services describe`
@@ -115,11 +116,15 @@ def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
     binn = tmp_path / "bin"
     binn.mkdir(exist_ok=True)
     curl = binn / "curl"
-    curl.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf \'{{"version":{{"full_sha":"{web}"}}}}\'\n' if web else
-        "#!/usr/bin/env bash\nexit 7\n"
-    )
+    if web == "GARBAGE":
+        # A 200 carrying a WAF/CDN interstitial: curl -fsS exits 0, the body is not the document.
+        curl.write_text("#!/usr/bin/env bash\nprintf '<html>Attention Required</html>'\n")
+    else:
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'{{"version":{{"full_sha":"{web}"}}}}\'\n' if web else
+            "#!/usr/bin/env bash\nexit 7\n"
+        )
     curl.chmod(0o755)
 
     svc_cases, rev_cases = [], []
@@ -159,8 +164,11 @@ def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
         "#!/usr/bin/env bash\n"
         'if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then\n'
         f'  [ "$4" = "{gcloud_fails}" ] && exit 1\n'
+        # gcloud exiting 0 with a body that is not the document: an HTML 502 from a proxy.
+        f'  [ "$4" = "{garbage_service}" ] && {{ echo "<html>502 Bad Gateway</html>"; exit 0; }}\n'
         '  case "$4" in\n' + "\n".join(svc_cases) + "\n    *) exit 1 ;;\n  esac\n  exit 0\nfi\n"
         'if [ "$1" = run ] && [ "$2" = revisions ] && [ "$3" = describe ]; then\n'
+        f'  [ "$4" = "{garbage_revision}-live" ] && {{ echo "<html>502 Bad Gateway</html>"; exit 0; }}\n'
         '  case "$4" in\n' + "\n".join(rev_cases) + "\n    *) exit 1 ;;\n  esac\n  exit 0\nfi\n"
         "exit 0\n"
     )
@@ -169,11 +177,13 @@ def _stubs(tmp_path: Path, *, web: str, images: dict, gcloud_fails: str = "",
 
 
 def _run_drift(tmp_path: Path, root: Path, *, web: str, images: dict, grace: str = "240",
-               gcloud_fails: str = "", split: str = "", both100: str = "") -> tuple[int, str]:
+               gcloud_fails: str = "", split: str = "", both100: str = "",
+               garbage_service: str = "", garbage_revision: str = "") -> tuple[int, str]:
     script = tmp_path / "drift.sh"
     script.write_text(_drift_script())
     binn = _stubs(tmp_path, web=web, images=images, gcloud_fails=gcloud_fails, split=split,
-                  both100=both100)
+                  both100=both100, garbage_service=garbage_service,
+                  garbage_revision=garbage_revision)
     env = dict(os.environ)
     env["PATH"] = f"{binn}{os.pathsep}{env['PATH']}"
     env["GRACE_MINUTES"] = grace
@@ -532,3 +542,46 @@ def test_the_alarm_does_not_deploy_anything():
         assert forbidden not in body, (
             f"the drift alarm EXECUTES {forbidden!r}. It reports; it must not act."
         )
+
+
+@pytest.mark.parametrize("which", ["garbage_service", "garbage_revision"])
+def test_an_answer_that_is_not_the_document_is_a_read_failure_not_a_verdict(tmp_path, which):
+    """THE THIRD CLASS. gcloud exits 0 with an HTML 502 body (a proxy in front of the API). The
+    parse's return code used to be swallowed with `|| true`, so this read as "traffic is split"
+    or "declares no PIVOTA_COMMIT_SHA" — an ERROR asserting a production state that does not
+    exist. It is the plumbing class wearing a successful exit code: UNKNOWN, named, a warning."""
+    root = _repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    code, out = _run_drift(tmp_path, root, web=head,
+                           images={"worker": head, "proof-issuer": head},
+                           **{which: "proof-issuer"})
+    assert code == 0, f"an unparseable answer is a read failure and must not redden:\n{out}"
+    assert "UNKNOWN" in out and "proof-issuer" in out, out
+    assert "traffic is split" not in out and "declares no PIVOTA_COMMIT_SHA" not in out, (
+        f"the alarm asserted a production state it never read:\n{out}"
+    )
+    # The per-service warning must REACH the log: the function runs inside a command
+    # substitution, so a warning echoed to stdout is captured into $LIVE and discarded. The
+    # summary line alone satisfied the two asserts above while the new messages went nowhere.
+    expected = ("but not with a service description" if which == "garbage_service"
+                else "but not with a revision")
+    assert expected in out, f"the per-service warning never reached the log:\n{out}"
+    assert "could not reach the Cloud Run API" not in out, (
+        f"the summary misattributes an answered-but-unparseable body to an unreachable API:\n{out}"
+    )
+
+
+def test_a_health_answer_that_is_not_the_document_is_named_as_such(tmp_path):
+    """The third copy of the swallow, on the service users actually reach: `curl -fsS` exits 0
+    for a 200 carrying a WAF/CDN page, and the parse's swallowed return code turned that HTML
+    into "/health returned no version.full_sha" - a false statement about what web answered.
+    Web stays a hard failure (unverifiable web blocks); the message names the real class."""
+    root = _repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    code, out = _run_drift(tmp_path, root, web="GARBAGE",
+                           images={"worker": head, "proof-issuer": head})
+    assert code != 0, f"an unverifiable web must still block:\n{out}"
+    assert "not with the health document" in out, out
+    assert "returned no version.full_sha" not in out, f"misattributed:\n{out}"

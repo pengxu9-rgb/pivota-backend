@@ -62,6 +62,23 @@ case "$ENV" in
   *) echo "bad env '$ENV' (want staging|prod)" >&2; exit 2 ;;
 esac
 
+# THE TAG IS WRITTEN, NOT ONLY READ. It becomes the image reference AND the PIVOTA_COMMIT_SHA
+# stamp, interpolated into a comma-separated --update-env-vars list: a tag of
+# `abc,FOO=bar,AUDIT_WORKER_ENABLED=true` set the very flag the WORKERS guard below refuses to let
+# through preserve mode -- the script validated the stamp it READ off the serving revision and
+# not the one it was about to write. Image tags are [A-Za-z0-9_.-], so anything else is refused
+# in every environment; prod additionally demands a full 40-hex commit (the rule deploy-prod.yml
+# and deploy_gateway.sh already apply), because the stamp reaches the drift alarm as the
+# service's declared commit and an abbreviation there compares against nothing.
+case "$TAG" in
+  *[!A-Za-z0-9._-]*) echo "refusing image tag '$TAG': not a tag (it would be interpolated into --update-env-vars)" >&2; exit 2 ;;
+  latest) echo "refusing the floating tag 'latest' - pass the commit sha, so PIVOTA_COMMIT_SHA names a real commit" >&2; exit 2 ;;
+esac
+if ! [[ "$TAG" =~ ^[0-9a-f]{40}$ ]]; then
+  [ "$ENV" = prod ] && { echo "prod needs a full 40-character lowercase commit sha (got '$TAG')" >&2; exit 2; }
+  echo "note: '$TAG' is not a 40-character sha - PIVOTA_COMMIT_SHA will carry it verbatim" >&2
+fi
+
 : "${CONFIG:=preserve}"
 case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (got '$CONFIG')" >&2; exit 2 ;; esac
 
