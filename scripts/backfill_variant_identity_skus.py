@@ -53,9 +53,14 @@ whose currency disagrees with the offer it attaches to, and will not guess a sel
 whose live offers come from more than one merchant. Every refusal is counted in the report and in
 `writer_audit_log`; none is silent.
 
-    python3 scripts/backfill_variant_identity_skus.py                    # dry run
-    python3 scripts/backfill_variant_identity_skus.py --apply --limit 50
-    python3 scripts/backfill_variant_identity_skus.py --apply --after ext:foo::abc123
+    python3 scripts/backfill_variant_identity_skus.py                    # dry run, no token needed
+    python3 scripts/backfill_variant_identity_skus.py --apply --limit 50 \
+        --expect-contract backfill-v2-identity-index
+    python3 scripts/backfill_variant_identity_skus.py --apply --after ext:foo::abc123 \
+        --expect-contract backfill-v2-identity-index
+
+`--apply` refuses to run without the contract token, so a stale image fails on the argument
+rather than silently running the merged first draft. See CONTRACT below.
 """
 
 from __future__ import annotations
@@ -101,6 +106,25 @@ logger = logging.getLogger("backfill_variant_identity_skus")
 
 SOURCE_SYSTEM = "variant_identity_backfill_v1"
 WRITER_NAME = "backfill_variant_identity_skus"
+
+#: The contract token an operator must name to run this with --apply.
+#:
+#: WHY A SCRIPT NEEDS THIS. `scripts/ops/run_oneoff_job.sh` runs `backend:latest`, built from main.
+#: The first draft of this file — the one with all four blockers — is ALREADY MERGED, so the run
+#: command printed in a docstring executes whatever version the image happens to hold, which for
+#: any window between merge and image rebuild is the broken one. Nothing about the command says
+#: which version answered it. Measured 2026-09-07: the image's copy was byte-identical to the
+#: broken draft while this fixed copy sat unmerged on a branch.
+#:
+#: `--apply` therefore requires `--expect-contract backfill-v2-identity-index`. The old draft has
+#: no such flag, so argparse refuses it outright — a stale image fails loudly on the argument
+#: instead of silently running the version that crashes on 30% of its plan. Bump the token whenever
+#: a change would make an in-flight operator's command mean something different.
+CONTRACT = "backfill-v2-identity-index"
+
+
+class _OfferRefused(Exception):
+    """The guard rejected this variant's offer, so its SKU must not be committed alone."""
 
 #: The closed vocabulary catalog_offers.availability actually uses on this track. Raw crawl text
 #: ("In Stock", "Out of Stock", "low stock") matches no reader in the repo, and the middle one is
@@ -166,7 +190,10 @@ UPSERT_SKU_SQL = """
         -- MERGE, never replace: the existing blob may carry agent_version / source_handle /
         -- canonical_url from whoever wrote the row first, and destroying those would both lose
         -- provenance and mislabel their row as this batch's.
-        sku_payload = catalog_skus.sku_payload || EXCLUDED.sku_payload,
+        -- coalesce because `NULL || jsonb` is NULL, which would silently ERASE the provenance
+        -- marker this backfill exists to write. All 27,268 rows are objects today; the column
+        -- is nullable, so the day one is not, the failure is invisible.
+        sku_payload = coalesce(catalog_skus.sku_payload, '{}'::jsonb) || EXCLUDED.sku_payload,
         image_url   = coalesce(catalog_skus.image_url, EXCLUDED.image_url),
         barcode     = coalesce(catalog_skus.barcode, EXCLUDED.barcode),
         updated_at  = NOW()
@@ -314,6 +341,19 @@ async def run(
     *, apply: bool, limit: int = 0, after: str = "", page: int = 500
 ) -> Dict[str, Any]:
     counts: collections.Counter = collections.Counter()
+    # Pre-seed every outcome so the report distinguishes "zero" from "never measured". A bare
+    # Counter omits keys that never incremented, which makes a run that planned nothing look
+    # like a run that did not check — and `record_info` drops <= 0 for the same reason, so the
+    # same ambiguity reaches writer_audit_log.reasons.
+    for _k in (
+        "products_scanned", "products_planned", "skus", "offers",
+        "skipped_not_merchant_issued", "skipped_no_variant_price",
+        "skipped_no_live_offer", "skipped_multi_merchant_product",
+        "skipped_no_destination_url", "skipped_currency_disagrees_with_offer",
+        "adopted_existing_sku_row", "rolled_back_offer_refused_by_guard",
+        "skipped_unique_violation",
+    ):
+        counts[_k] = 0
     audit = WriterAuditAccumulator(
         writer_name=WRITER_NAME, batch_id=make_batch_id(SOURCE_SYSTEM)
     )
@@ -394,60 +434,86 @@ async def run(
                 if not apply:
                     counts["offers"] += 1
                     continue
-                async with database.transaction():
-                    written_key = await database.fetch_val(UPSERT_SKU_SQL, sku_params)
-                    written_key = str(written_key or sku_params["sku_key"])
-                    if written_key != sku_params["sku_key"]:
-                        # The identity already lived under another lane's spelling; we adopted
-                        # that row rather than minting a rival for the same variant.
-                        counts["adopted_existing_sku_row"] += 1
-                    chosen = meta["chosen"]
-                    destination = str(chosen.get("destination_url") or "").strip()
-                    offer_params = {
-                        # Derived from the DESTINATION, which is a property of the product, not
-                        # from whichever offer row an ORDER BY happened to return (B4).
-                        "offer_id": derive_offer_id(
-                            row["product_key"], written_key, destination
-                        ),
-                        "sku_key": written_key,
-                        "product_key": row["product_key"],
-                        "merchant_id": chosen.get("merchant_id") or row["merchant_id"],
-                        "catalog_track": chosen.get("catalog_track") or OFFER_CATALOG_TRACK,
-                        "truth_tier": chosen.get("truth_tier") or OFFER_TRUTH_TIER,
-                        "readiness_tier": chosen.get("readiness_tier") or OFFER_READINESS_TIER,
-                        "offer_mode": chosen.get("offer_mode") or OFFER_MODE,
-                        "channel": chosen.get("channel") or "default",
-                        "availability": _availability_of(
-                            meta["variant"], chosen.get("availability")
-                        ),
-                        "currency": meta["currency"],
-                        "list_price": meta["price"],
-                        "merchant_effective_price": meta["price"],
-                        "estimated_best_price": meta["price"],
-                        "source_system": SOURCE_SYSTEM,
-                        "source_domain": row.get("source_domain") or chosen.get("source_domain"),
-                        "market": chosen.get("market"),
-                        "offer_payload": json.dumps({
+                try:
+                    async with database.transaction():
+                        written_key = await database.fetch_val(UPSERT_SKU_SQL, sku_params)
+                        written_key = str(written_key or sku_params["sku_key"])
+                        if written_key != sku_params["sku_key"]:
+                            # The identity already lived under another lane's spelling; we adopted
+                            # that row rather than minting a rival for the same variant.
+                            counts["adopted_existing_sku_row"] += 1
+                        chosen = meta["chosen"]
+                        destination = str(chosen.get("destination_url") or "").strip()
+                        offer_params = {
+                            # Derived from the DESTINATION, which is a property of the product, not
+                            # from whichever offer row an ORDER BY happened to return (B4).
+                            "offer_id": derive_offer_id(
+                                row["product_key"], written_key, destination
+                            ),
+                            "sku_key": written_key,
+                            "product_key": row["product_key"],
+                            "merchant_id": chosen.get("merchant_id") or row["merchant_id"],
+                            "catalog_track": chosen.get("catalog_track") or OFFER_CATALOG_TRACK,
+                            "truth_tier": chosen.get("truth_tier") or OFFER_TRUTH_TIER,
+                            "readiness_tier": chosen.get("readiness_tier") or OFFER_READINESS_TIER,
+                            "offer_mode": chosen.get("offer_mode") or OFFER_MODE,
+                            "channel": chosen.get("channel") or "default",
+                            "availability": _availability_of(
+                                meta["variant"], chosen.get("availability")
+                            ),
+                            "currency": meta["currency"],
+                            "list_price": meta["price"],
+                            "merchant_effective_price": meta["price"],
+                            "estimated_best_price": meta["price"],
                             "source_system": SOURCE_SYSTEM,
-                            "batch_id": audit.batch_id,
-                            "variant_id": sku_params["source_variant_id"],
-                            "variant_id_provenance": MERCHANT_ISSUED,
-                            "price_from": "variant",
-                            # Carried, not merely claimed — without this every offer is a dead
-                            # end and agent_shop_gateway filters it out.
-                            "destination_url": destination,
-                        }),
-                    }
-                    accepted, reasons, _rejected = await guard_catalog_offer_rows(
-                        [offer_params]
-                    )
-                    audit.record_skips(reasons)
-                    for reason, n in reasons.items():
-                        counts["guard_" + reason] += n
-                    if accepted:
+                            "source_domain": row.get("source_domain") or chosen.get("source_domain"),
+                            "market": chosen.get("market"),
+                            "offer_payload": json.dumps({
+                                "source_system": SOURCE_SYSTEM,
+                                "batch_id": audit.batch_id,
+                                "variant_id": sku_params["source_variant_id"],
+                                "variant_id_provenance": MERCHANT_ISSUED,
+                                "price_from": "variant",
+                                # Carried, not merely claimed — without this every offer is a dead
+                                # end and agent_shop_gateway filters it out.
+                                "destination_url": destination,
+                            }),
+                        }
+                        accepted, reasons, _rejected = await guard_catalog_offer_rows(
+                            [offer_params]
+                        )
+                        audit.record_skips(reasons)
+                        for reason, n in reasons.items():
+                            counts["guard_" + reason] += n
+                        if not accepted:
+                            # The SKU is already INSERTed in this transaction. Committing now
+                            # would leave exactly the orphan SKU-without-offer state this
+                            # backfill exists to remove — and silently, since only `counts`
+                            # would record it. Roll the pair back instead: identity with no
+                            # offer is not a partial success, it is the bug.
+                            raise _OfferRefused()
                         await database.execute(UPSERT_OFFER_SQL, accepted[0])
                         counts["offers"] += 1
+                        # One SKU + one offer. record_applied(2) unconditionally charged 2 per
+                        # accepted offer and 0 for a SKU whose offer was rejected, so
+                        # writer_audit_log.applied_rows read 2 x offers rather than skus + offers.
                         audit.record_applied(2)
+                except _OfferRefused:
+                    counts["rolled_back_offer_refused_by_guard"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    # The one path ON CONFLICT still cannot cover: the supplied sku_key
+                    # collides with the PK while the identity tuple does NOT match, so
+                    # neither conflict target applies. 0 of 6,090 rows today, but it becomes
+                    # reachable when two variant ids normalize to the same 60-char token
+                    # (_normalize_token lowercases and collapses punctuation, so ABC_1 and
+                    # abc-1 collide) or when a product's merchant_id is re-resolved. Counting
+                    # and continuing beats killing a 6,090-row run on one row.
+                    if "unique" not in repr(exc).lower():
+                        raise
+                    counts["skipped_unique_violation"] += 1
+                    logger.warning(
+                        "unique violation on %s: %s", sku_params["sku_key"], repr(exc)[:200]
+                    )
 
             last_key = row["product_key"]
             touched += 1
@@ -472,7 +538,20 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="stop after N products (0 = all)")
     ap.add_argument("--after", default="", help="resume: only product_key > this")
     ap.add_argument("--page", type=int, default=500, help="scan page size")
+    ap.add_argument(
+        "--expect-contract",
+        default="",
+        help=f"required with --apply; must be {CONTRACT!r}. Its purpose is to fail on a stale "
+             "image: the merged first draft has no such flag, so argparse rejects the command "
+             "rather than running the broken version.",
+    )
     args = ap.parse_args()
+    if args.apply and args.expect_contract != CONTRACT:
+        ap.error(
+            f"--apply requires --expect-contract {CONTRACT}. Got {args.expect_contract!r}. "
+            "If you passed the right token and still see this, the image is running a "
+            "different version of this script than the one you read."
+        )
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     async def _go():

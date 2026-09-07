@@ -6,10 +6,12 @@ reached main. Each one is written so it fails if the fix is reverted.
 """
 
 import collections
+import inspect
 import json
 
 import pytest
 
+import scripts.backfill_variant_identity_skus as backfill
 from scripts.backfill_variant_identity_skus import (
     SELECT_LIVE_OFFERS_SQL,
     SELECT_PRODUCTS_SQL,
@@ -50,11 +52,18 @@ def test_sku_upsert_returns_the_key_that_actually_holds_the_identity():
     assert _sql(UPSERT_SKU_SQL).endswith("returning sku_key")
 
 
-def test_sku_upsert_merges_the_payload_instead_of_replacing_it():
+def test_sku_upsert_merges_the_payload_and_survives_a_null_column():
     """`sku_payload = EXCLUDED.sku_payload` would destroy agent_version / source_handle /
-    canonical_url on a row another writer created, and relabel it as this batch's."""
+    canonical_url on a row another writer created, and relabel it as this batch's.
+
+    The coalesce is the second half: `NULL || jsonb` is NULL in Postgres, so a row whose
+    sku_payload column is SQL NULL would have the provenance marker this backfill exists to
+    write silently ERASED. All 27,268 rows are objects today and the column is nullable."""
     sql = _sql(UPSERT_SKU_SQL)
-    assert "sku_payload = catalog_skus.sku_payload || excluded.sku_payload" in sql
+    assert (
+        "sku_payload = coalesce(catalog_skus.sku_payload, '{}'::jsonb) || excluded.sku_payload"
+        in sql
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -101,23 +110,34 @@ def test_the_seed_join_is_scoped_to_this_product_and_to_active_seeds():
 # ---------------------------------------------------------------------------
 
 
-def test_offer_id_is_stable_when_the_chosen_offer_row_changes():
-    """It used to hash the chosen offer's id, and 631 products tie on the ordering with no
-    tiebreaker — so a re-run wrote a SECOND offer instead of upserting. Deriving from the
-    destination makes it a property of the product."""
-    dest = "https://brand.com/products/x"
-    a = derive_offer_id("pk1", "pk1::v:123", dest)
-    b = derive_offer_id("pk1", "pk1::v:123", dest)
-    assert a == b
-    assert a != derive_offer_id("pk1", "pk1::v:124", dest)
+def test_offer_id_is_derived_from_the_destination_not_the_chosen_offer_row():
+    """B4. A first version of this test called derive_offer_id twice with the same arguments
+    and asserted they matched — which tests that a hash is a function, not that the CALL SITE
+    stopped hashing the chosen offer's id. A mutation reverting B4 survived it. This reads the
+    source of the call instead, which is the only check available without a Postgres."""
+    src = inspect.getsource(backfill.run)
+    call = src.split("derive_offer_id(", 1)[1].split(")", 1)[0]
+    assert "destination" in call, f"offer_id no longer derives from the destination: {call!r}"
+    assert "offer_id" not in call, (
+        "offer_id is being derived from the chosen offer row again — 631 products tie on the "
+        f"ordering with no tiebreaker, so re-runs write duplicates: {call!r}"
+    )
 
 
 def test_offer_upsert_restamps_source_system_on_the_update_path():
     """Without this a re-run rewrites prices and leaves the previous writer's stamp, so the
-    change is untraceable."""
-    assert "source_system            = excluded.source_system" in _sql(UPSERT_OFFER_SQL).replace(
-        "source_system = excluded.source_system", "source_system            = excluded.source_system"
-    ) or "source_system = excluded.source_system" in _sql(UPSERT_OFFER_SQL)
+    change is untraceable. (The first version of this assertion was self-cancelling: it or-ed
+    a string against a .replace() of itself, so it was true whenever it was true.)"""
+    assert "source_system" in _sql(UPSERT_OFFER_SQL).split("do update set", 1)[1]
+
+
+def test_apply_refuses_to_run_without_the_contract_token():
+    """A stale image runs the MERGED first draft, which has all four blockers and no such flag.
+    argparse then refuses the command instead of silently running the broken version."""
+    assert backfill.CONTRACT == "backfill-v2-identity-index"
+    src = inspect.getsource(backfill.main)
+    assert "--expect-contract" in src
+    assert "args.apply and args.expect_contract != CONTRACT" in src
 
 
 # ---------------------------------------------------------------------------
@@ -230,15 +250,29 @@ def test_plan_keeps_merchant_issued_priced_variants_only():
 def test_plan_records_every_refusal_rather_than_dropping_silently():
     counts = collections.Counter()
     plan_for_product(_row([{"variant_id": "brand-thing", "title": "x", "price": "1"}]), counts)
-    assert sum(counts.values()) >= 1
+    # `sum(counts.values()) >= 1` passed if ANY counter moved. Name the one that must.
+    assert counts["skipped_not_merchant_issued"] == 1
 
 
-def test_provenance_stamped_on_planned_rows_is_merchant_issued():
-    counts = collections.Counter()
-    picks = plan_for_product(
-        _row([{"variant_id": "43062643884185", "title": "Peach", "price": "24.00"}]), counts
+def test_the_offer_is_attached_to_the_returned_key_not_the_computed_one():
+    """B1's consumption half. `RETURNING sku_key` is pointless if the offer is then attached to
+    the key we computed: on the 4,287 rows that adopt the promoter's `::v::` spelling the offer
+    would hang off a sku_key that does not exist. A mutation doing exactly that survived the
+    original suite, because nothing read run()."""
+    src = inspect.getsource(backfill.run)
+    body = src.split("offer_params = {", 1)[1]
+    sku_key_line = [l for l in body.splitlines() if '"sku_key"' in l][0]
+    assert "written_key" in sku_key_line, (
+        f"offer is not attached to the RETURNING key: {sku_key_line.strip()!r}"
     )
-    assert picks and MERCHANT_ISSUED == "merchant_issued"
+
+
+def test_a_guard_rejection_rolls_the_sku_back_instead_of_orphaning_it():
+    """The SKU is INSERTed before the guard runs. Committing when the guard rejects the offer
+    leaves precisely the orphan SKU-without-offer state this backfill exists to remove."""
+    src = inspect.getsource(backfill.run)
+    assert "raise _OfferRefused()" in src
+    assert "rolled_back_offer_refused_by_guard" in src
 
 
 # ---------------------------------------------------------------------------
