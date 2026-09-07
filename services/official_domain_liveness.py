@@ -296,9 +296,19 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
     it grants nothing that inference did not already grant. It only makes the
     domain addressable by a liveness verdict.
 
-    Existing rows are left alone. `upsert_official_domain` would otherwise
-    rewrite an asserted/verified row's source back down to `inferred` and blank
-    the verdict a previous run recorded.
+    Existing rows are left alone -- with ONE exception. `upsert_official_domain`
+    would otherwise rewrite an asserted/verified row's source back down to
+    `inferred` and blank the verdict a previous run recorded.
+
+    The exception is a `declared` row whose host inference now produces. The
+    declare guard refuses a host already inferred, but that covers only the
+    order in which inference came FIRST: declare anua.us, then ingest the
+    catalog that carries it, and the row is `declared` while the inferred
+    branch counts the host official. The due-queues skip `declared` and the
+    audit basis drops it, so the host could never be measured dead. Promoting
+    it to `inferred` here makes the row what it would have been had inference
+    come first; it grants nothing, because the host was already in the used
+    set. Counted in the return value: it is a row the sweep can now check.
     """
     from services.brand_claim_service import _inferred_merchant_hosts
 
@@ -307,10 +317,28 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
     hosts = await _inferred_merchant_hosts(merchant_id)
     if not hosts:
         return 0
-    known = {str(r.get("domain") or "") for r in await mod.list_official_domains(merchant_id)}
+    # STRICT. This read decides what the loop below WRITES: an empty `known` on a DB blip
+    # would send every inferred host to the upsert, whose `source = excluded.source` and
+    # liveness COALESCE turn a `verified`/`dead` row into `inferred`/`unchecked` -- a dead
+    # domain back in the official set, the UCP fence losing the merchant, and the
+    # cross-tenant guard losing its proof. Reproduced against the real table. A seeder that
+    # cannot see what exists must not write; it logs and seeds nothing this run.
+    try:
+        known = {
+            str(r.get("domain") or ""): str(r.get("source") or "")
+            for r in await mod.list_official_domains(merchant_id, strict=True)
+        }
+    except Exception as exc:  # noqa: BLE001 -- fails CLOSED: no known-set, no writes
+        logger.warning("seed_inferred_domains: could not read the stored set for %s, seeding nothing: %s",
+                       merchant_id, str(exc)[:200])
+        return 0
     seeded = 0
     for host in sorted(hosts):
         if host in known:
+            if known[host] == mod.SOURCE_DECLARED and await mod.promote_declared_to_inferred(
+                merchant_id=merchant_id, domain=host, now=now,
+            ):
+                seeded += 1
             continue
         if await mod.upsert_official_domain(
             merchant_id=merchant_id,

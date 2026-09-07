@@ -220,7 +220,7 @@ def host_matches_known(domain: Optional[str], known_hosts: Iterable[str]) -> boo
     return False
 
 
-async def _inferred_merchant_hosts(merchant_id: str) -> set:
+async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) -> set:
     """The INFERRED tier, unchanged: hosts Pivota derives from what it already
     holds — onboarding store_url/website + catalog product source/canonical
     hosts. Does NOT include pivota_canonical_url (that's Pivota's host, not the
@@ -244,6 +244,8 @@ async def _inferred_merchant_hosts(merchant_id: str) -> set:
             if h:
                 hosts.add(h)
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning("_inferred_merchant_hosts: onboarding load failed: %s", str(exc)[:200])
     try:
         rows = await database.fetch_all(
@@ -251,6 +253,7 @@ async def _inferred_merchant_hosts(merchant_id: str) -> set:
             SELECT DISTINCT source_domain, canonical_url
               FROM catalog_products
              WHERE merchant_id = :merchant_id
+             ORDER BY source_domain, canonical_url
              LIMIT 500
             """,
             {"merchant_id": merchant_id},
@@ -261,11 +264,15 @@ async def _inferred_merchant_hosts(merchant_id: str) -> set:
                 if h:
                     hosts.add(h)
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         logger.warning("_inferred_merchant_hosts: catalog load failed: %s", str(exc)[:200])
     return hosts
 
 
-async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[str, Any]]:
+async def merchant_owned_domains_detailed(
+    merchant_id: str, *, strict: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     """B1 — the official-domain set WITH its provenance, host -> details.
 
     Two tiers, and the difference between them is the whole point of B1:
@@ -301,10 +308,19 @@ async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[st
     if not merchant_id:
         return detailed
 
-    inferred = await _inferred_merchant_hosts(merchant_id)
-    # Best-effort by construction: on any DB error this returns [], and the
-    # result degrades to exactly today's inferred set rather than to nothing.
-    stored = await mod.list_official_domains(merchant_id)
+    inferred = (
+        await _inferred_merchant_hosts(merchant_id, strict=True) if strict
+        else await _inferred_merchant_hosts(merchant_id)
+    )
+    # Best-effort by construction for REPORTS: on any DB error this returns [],
+    # and the result degrades to exactly today's inferred set rather than to
+    # nothing. A GUARD passes strict=True and gets the exception instead — an
+    # empty owned set on a DB error read as "the merchant owns nothing here",
+    # which let a declaration through onto a host it already had.
+    stored = (
+        await mod.list_official_domains(merchant_id, strict=True) if strict
+        else await mod.list_official_domains(merchant_id)
+    )
     by_domain = {str(r.get("domain") or ""): r for r in stored if r.get("domain")}
 
     def _detail(host: str, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -342,13 +358,16 @@ async def merchant_owned_domains_detailed(merchant_id: str) -> Dict[str, Dict[st
     return detailed
 
 
-async def merchant_owned_domains(merchant_id: str) -> set:
+async def merchant_owned_domains(merchant_id: str, *, strict: bool = False) -> set:
     """The official-domain set as a plain set of hosts — the shape every caller
     already depends on (notably `build_authority_map(merchant_extra_hosts=...)`
     in services/agent_center_bd_report_service.py, which decides `first_party`
     on every cited host). See `merchant_owned_domains_detailed` for what changed
     behind it: the set is now asserted/verified plus inferred, minus anything
-    measured DEAD."""
+    measured DEAD. `strict=True` raises on a DB error instead of returning a
+    smaller set; see merchant_owned_domains_detailed."""
+    if strict:
+        return set(await merchant_owned_domains_detailed(merchant_id, strict=True))
     return set(await merchant_owned_domains_detailed(merchant_id))
 
 
@@ -395,6 +414,201 @@ async def record_official_domain(
             merchant_id, host, str(exc)[:200],
         )
         return False
+
+
+DECLARE_OK = "declared"
+DECLARE_INVALID_HOST = "invalid_hostname"
+DECLARE_TAKEN = "claimed_by_another_merchant"
+DECLARE_ALREADY_PROVEN = "already_proven"
+DECLARE_NOT_REGISTRABLE = "not_a_registrable_domain"
+DECLARE_TOO_MANY = "too_many_declarations"
+DECLARE_ALREADY_KNOWN = "already_in_your_official_set"
+DECLARE_WRITE_FAILED = "write_failed"
+# The owned-set read failed, so the question "does the merchant already have
+# this host" could not be answered. Refused — NOT "taken", which would tell the
+# merchant a rival owns their domain, and NOT granted, which is the fail-open
+# downgrade this status exists to prevent. The route maps it to 503.
+DECLARE_UNAVAILABLE = "official_set_unavailable"
+
+# A merchant with more than this many unproven declarations is not filling in a
+# second storefront, and each row is a free write that later readers must skip.
+_MAX_DECLARED_PER_MERCHANT = 20
+
+
+async def declare_official_domain(
+    merchant_id: str, domain: Optional[str],
+) -> Dict[str, Any]:
+    """P0 item 5 — a merchant states an additional official domain.
+
+    WHY A THIRD SOURCE. `verified` and `asserted` both mean CONTROL WAS PROVEN
+    (they differ on whether the domain is also bound to the brand identity). A
+    self-declaration has proven nothing, so it is written as `declared`, which
+    is deliberately NOT in OFFICIAL_SOURCES: it is stored so the portal can
+    offer to verify it and so a claim can be started against it, and it does not
+    widen the set that decides `first_party`. A merchant who declared a retailer
+    would otherwise reclassify that retailer's citations as their own.
+
+    WHY THIS MATTERS. Measured in production: 1 of 42 merchants has any official
+    domain row, and 16 of 17 audited merchants fall back entirely to inference —
+    the condition the evidence base measured as a 13-point error on Anua's
+    headline, because inference knew `anua.com` and not `anua.us`.
+
+    Refuses a domain another merchant has already PROVEN. Declaration is cheap
+    and unproven, so without that guard it would be a way to attach a rival's
+    verified storefront to your own audit. It does NOT refuse a domain another
+    merchant merely declared — two unproven claims on one host is a conflict for
+    verification to settle, not for whoever typed first to win.
+
+    Returns {status, domain, ...}; never raises for ordinary refusals.
+    """
+    from db import merchant_official_domains as mod
+
+    host = normalize_host(domain)
+    if not merchant_id or not is_valid_public_hostname(host):
+        return {"status": DECLARE_INVALID_HOST, "domain": host or None}
+    # A public suffix or shared platform host is not a domain anyone owns.
+    # `myshopify.com` is not a merchant's storefront — one tenant of it is — and
+    # this module already keeps the list for exactly this class of widening.
+    if not _is_registrable_base(host):
+        return {"status": DECLARE_NOT_REGISTRABLE, "domain": host}
+
+    # STRICT: the resolver's default swallows a DB error into None, and `None`
+    # reads as "nobody owns it" below -- a grant. The except was unreachable
+    # through the real function and only its monkeypatched test ever hit it.
+    owner = None
+    try:
+        owner = await mod.resolve_verified_merchant_for_domain(host, strict=True)
+    except Exception:  # noqa: BLE001 — a lookup failure must not grant the write
+        logger.warning("declare_official_domain owner lookup failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
+    if owner and str(owner) != str(merchant_id):
+        return {"status": DECLARE_TAKEN, "domain": host}
+    # `resolve_verified_merchant_for_domain` only finds `verified` owners, but
+    # `asserted` ALSO means control was proven — it just is not bound to the
+    # brand. Both are proof, so both must block someone else's unproven
+    # declaration; checking only `verified` left a gap this guard's own
+    # description did not admit to.
+    try:
+        proven_elsewhere = await mod.domain_is_proven_by_other_merchant(
+            host, merchant_id,
+        )
+    except Exception:  # noqa: BLE001 — fails CLOSED, like the lookup above
+        logger.warning("declare_official_domain proof lookup failed for %s",
+                       host, exc_info=True)
+        # UNAVAILABLE, not TAKEN: "we could not check" told as "a rival owns
+        # your domain" is a 409 that lies about the world, on our outage.
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
+    if proven_elsewhere:
+        return {"status": DECLARE_TAKEN, "domain": host}
+
+    # Already proven for THIS merchant: declaring adds nothing and must not
+    # downgrade a verified row to an unproven one.
+    # STRICT, and refused on failure. The default `list_official_domains`
+    # swallows its own errors and returns [], so `existing = {}` here meant the
+    # ALREADY_PROVEN check and the cap were both skipped on a DB blip, and the
+    # write below then flipped a VERIFIED row to declared/pending. The two
+    # ownership lookups above deliberately fail closed; this one did not.
+    try:
+        existing = {
+            str(r.get("domain") or ""): r
+            for r in (await mod.list_official_domains(merchant_id, strict=True) or [])
+        }
+    except Exception:  # noqa: BLE001 — fails CLOSED
+        logger.warning("declare_official_domain stored-set load failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
+    row = existing.get(host)
+    if row and str(row.get("source") or "") in mod.OFFICIAL_SOURCES:
+        return {"status": DECLARE_ALREADY_PROVEN, "domain": host,
+                "source": row.get("source")}
+
+    # ALREADY IN THE OFFICIAL SET — including by INFERENCE — so there is
+    # nothing to declare, and declaring would actively damage it.
+    #
+    # This is the invariant made true by construction rather than patched at
+    # each consumer. The set a run USES is
+    #     (stored rows whose source is in OFFICIAL_SOURCES) UNION (inferred)
+    # which no filter on the `source` column alone can express. Two earlier
+    # fixes tried and both were wrong in the same way: the upsert does
+    # `source = excluded.source`, so declaring an INFERRED host flipped its row
+    # to `declared`, and then
+    #   - the liveness sweep's `source <> 'declared'` skipped it forever, while
+    #     the inferred branch kept counting it official — a host that can never
+    #     be measured dead, which is the us.judydoll.com overstatement this
+    #     table exists to remove; and
+    #   - the audit basis stopped recording a host the run demonstrably used.
+    #
+    # A declaration can therefore only ever create a host that is NEW AT
+    # DECLARE TIME. That is the whole guarantee this guard gives -- not
+    # "disjoint by construction", which three review rounds asserted and the
+    # fourth falsified: declare anua.us before the catalog carries it, then
+    # ingest, and inference produces a host whose row says `declared`. The
+    # other ordering is healed elsewhere: the liveness seeder promotes such a
+    # row to `inferred` (services/official_domain_liveness.seed_inferred_domains)
+    # and the audit basis records a declared host that inference also produces
+    # (services/audit_evidence_builder.record_audit_basis). Both read the USED
+    # set, not the source column alone.
+    #
+    # The CAP is checked before this load on purpose: the owned-set read is a
+    # 500-row catalog scan plus an onboarding read on an unrate-limited route,
+    # and a merchant already at the cap should not get it for free.
+    #
+    # It bounds only rows a declaration can CREATE: a host that already has a row of
+    # any source is not a new row. The sixth round removed that `host not in existing`
+    # gate because the upsert could flip an existing row's source; the INSERT-ONLY
+    # writer below cannot, so re-declaring one of your own hosts at the cap is the
+    # idempotent no-op it always should have been rather than a 429.
+    declared_count = sum(
+        1 for r in existing.values()
+        if str(r.get("source") or "") == mod.SOURCE_DECLARED
+    )
+    if host not in existing and declared_count >= _MAX_DECLARED_PER_MERCHANT:
+        return {"status": DECLARE_TOO_MANY, "domain": host,
+                "declared_count": declared_count}
+
+    try:
+        already = await merchant_owned_domains(str(merchant_id), strict=True)
+    except Exception:  # noqa: BLE001 — fails CLOSED, and says so
+        logger.warning("declare_official_domain owned-set load failed for %s",
+                       host, exc_info=True)
+        return {"status": DECLARE_UNAVAILABLE, "domain": host}
+    if host in already:
+        return {"status": DECLARE_ALREADY_KNOWN, "domain": host}
+
+    # INSERT-ONLY, never the upsert. The upsert's `source = excluded.source`
+    # is the lever behind every downgrade this function has had to guard
+    # against; `insert_declared_domain` cannot overwrite a row of any other
+    # source, so a guard that raced or failed still cannot damage the set. It
+    # writes PENDING, not VERIFIED: stamping an unproven row verified would
+    # make it indistinguishable from a proven one in every later read.
+    try:
+        landed = await mod.insert_declared_domain(merchant_id=merchant_id, domain=host)
+    except Exception:  # noqa: BLE001
+        logger.warning("declare_official_domain write failed for %s/%s",
+                       merchant_id, host, exc_info=True)
+        return {"status": DECLARE_WRITE_FAILED, "domain": host}
+    if landed is None:
+        # A FAILED WRITE IS NOT A BAD HOSTNAME. Returning INVALID_HOST here is
+        # how the missing migration presented as "domain must be a valid public
+        # hostname": the feature could not store anything and told the merchant
+        # their own valid domain was the problem.
+        return {"status": DECLARE_WRITE_FAILED, "domain": host}
+    if landed != mod.SOURCE_DECLARED:
+        # Lost a race with a claim or a sweep that wrote the row first. Nothing
+        # was overwritten — that is the point of the INSERT-ONLY statement.
+        return {"status": DECLARE_ALREADY_PROVEN, "domain": host, "source": landed}
+
+    return {
+        "status": DECLARE_OK,
+        "domain": host,
+        "source": mod.SOURCE_DECLARED,
+        "counts_toward_official_set": False,
+        "next_step": (
+            "Start a brand claim for this domain and publish the DNS TXT "
+            "record to prove control; it is not counted until then."
+        ),
+    }
 
 
 async def record_verified_official_domain(
