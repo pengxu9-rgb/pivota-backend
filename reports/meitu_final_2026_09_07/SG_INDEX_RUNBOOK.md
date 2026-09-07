@@ -109,8 +109,9 @@ Per-domain feed shape, measured the same day:
 
 ## 3. Which image the job must be on
 
-The lane changes in this runbook are on branch `feat/sg-market-catalog-onboarding`
-(PR title `feat(catalog): …`). **Backend images build only on push to main**, so:
+The lane changes in this runbook are on branch `feat/sg-market-catalog-onboarding`,
+**PR #2121** (https://github.com/pengxu9-rgb/pivota-backend/pull/2121).
+**Backend images build only on push to main**, so:
 
 1. Merge the PR.
 2. Take the merge commit SHA — call it `<SHA>` — and wait for the backend image
@@ -180,21 +181,35 @@ retailer rows. Read the dry-run report before applying.
 ### The step that actually makes SG servable
 
 **None of the three commands above will produce a single serving-eligible SG row on their own.**
-`no_us_offer` blocks them. After the PR merges, the region list must be widened on the service
-that computes eligibility:
+`no_us_offer` blocks them. After the PR merges, the region list must be widened —
+**in two places, not one.**
+
+`scripts/promote_brand_official_canonicals.py` imports
+`index_pipeline_state_service.recompute_serving_eligibility` and runs it INSIDE THE JOB
+(`:54`, `:278`). The predicate is a module-level constant built at import, so the value that
+decides eligibility is the one in the **job's** environment, not the web service's. Setting only
+`web` leaves command 3 computing the old US-only answer and writing `serving_eligible=false` —
+and it would look exactly like the change not working.
 
 ```bash
+# 1. the JOB — this is the one that decides what command 3 writes
+gcloud run jobs update catalog-curated-brand-onboard --region us-west1 --project pivota-prod \
+  --update-env-vars PIVOTA_SERVING_PRICING_REGIONS=US,SG --quiet
+
+# 2. the SERVICE — for every later runtime recompute
 gcloud run services update web --region us-west1 --project pivota-prod \
   --update-env-vars PIVOTA_SERVING_PRICING_REGIONS=US,SG
 ```
 
-Unset, it is `US` and the emitted SQL is byte-identical to today's (asserted in
-`tests/test_region_pricing.py`). Set to `US,SG`, an offer priced in SGD satisfies the gate — a
-membership test on a currency code, never a conversion. Set it BEFORE command 3 so the promotion
-recompute sees it; otherwise re-run command 3 after.
+Do both BEFORE command 3. Unset, the value is `US` and the emitted SQL is byte-identical to
+today's (asserted in `tests/test_region_pricing.py`). Set to `US,SG`, an offer priced in SGD
+satisfies the gate — a membership test on a currency code, never a conversion.
 
-`deploy_backend.sh` reasserts `web`'s shape on every service, so confirm this var survives the
-next deploy or add it to the deploy script's env set.
+⚠️ `--update-env-vars` on a job replaces nothing else, but the §3 `jobs update --image` and this
+one are separate calls; run the image update first so the flags exist in the image being
+configured. And `deploy_backend.sh` reasserts `web`'s shape on every service, so confirm the var
+survives the next deploy or add it to the deploy script's env set — otherwise the SG rows go
+dark again on an unrelated roll, silently.
 
 ---
 
