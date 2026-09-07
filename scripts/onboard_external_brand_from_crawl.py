@@ -99,6 +99,7 @@ from services.pdp_scope_classifier import (
 # and the seed row records that seller (seller_ref/seed_kind) so T2 attribution
 # keys conversions by seller.
 from services.seller_identity import derive_seed_seller, ensure_observed_seller
+from services.variant_identity import PRODUCT_DERIVED
 from services.shopify_publication_signal import (
     PUBLISHED,
     UNKNOWN,
@@ -353,6 +354,14 @@ def build_default_seed_variant(p: Dict[str, Any]) -> Dict[str, Any]:
         "id": variant_id,
         "variant_id": variant_id,
         "sku": variant_id,
+        # This id is OURS, not the merchant's — it restates external_product_id, which is
+        # exactly the shape the gateway's isRestatedProductId guard refuses. That is correct
+        # and this row must never reach a checkout: it exists so the readiness gate does not
+        # score the seed `zero_variants` and drop it from recall (see the docstring above).
+        # Stamped explicitly so consumers filter on a declared fact rather than re-deriving
+        # it from the string — 1,473 rows on prod carry this shape (2026-09-07).
+        "variant_id_provenance": PRODUCT_DERIVED,
+        "purchasable": False,
         "title": p.get("title") or "Default",
         "price_amount": p.get("price_amount"),
         "price": p.get("price_amount"),
