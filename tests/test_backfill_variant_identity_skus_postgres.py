@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS external_product_seeds (
 );
 """
 
+SEEDS_PATCH_DDL = [
+    # the first file alphabetically creates it as `(id text)` and nothing more
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_url TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT NULL",
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'",
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS tool TEXT NOT NULL DEFAULT '*'",
+    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE external_product_seeds ALTER COLUMN status SET DEFAULT 'active'",
+]
+
 REAL_VID = "54057345745090"          # a merchant-issued Shopify variant id
 REAL_VID_2 = "54057345745091"
 
@@ -70,6 +82,11 @@ async def _db():
         await database.connect()
     await ensure_model_tables([catalog_products, catalog_skus, catalog_offers])
     await database.execute(SEEDS_DDL)
+    # Twelve other gate files CREATE this table IF NOT EXISTS with narrower hand-written DDLs,
+    # and the alphabetically-first one wins in CI: without these, `status` had no default and
+    # the active-seed subquery matched nothing (seen on run 34169629995). Patch, don't assume.
+    for ddl in SEEDS_PATCH_DDL:
+        await database.execute(ddl)
     for t in ("catalog_offers", "catalog_skus", "catalog_products", "external_product_seeds"):
         await database.execute(f"TRUNCATE {t}")
     yield database
@@ -99,8 +116,9 @@ async def _product(
     if via_seed:
         await db.execute(
             """
-            INSERT INTO external_product_seeds (id, external_product_id, destination_url, seed_data)
-            VALUES (:id, :epid, 'https://brand.com/p', CAST(:sd AS jsonb))
+            INSERT INTO external_product_seeds (id, external_product_id, destination_url, seed_data,
+                                                status, market, tool)
+            VALUES (:id, :epid, 'https://brand.com/p', CAST(:sd AS jsonb), 'active', 'US', '*')
             """,
             {"id": f"seed:{pk}", "epid": epid,
              "sd": json.dumps({"snapshot": {"variants": variants}})},
@@ -591,16 +609,29 @@ async def test_the_newest_seed_wins_and_a_product_is_never_fanned_out(_db) -> No
     await _product(_db, pk, via_seed=True, variants=[{"variant_id": REAL_VID, "title": "Old", "price": "1.00"}])
     await _db.execute(
         """
-        INSERT INTO external_product_seeds (id, external_product_id, destination_url, seed_data, updated_at)
-        VALUES ('seed:newer', :epid, 'https://brand.com/p', CAST(:sd AS jsonb), NOW() + interval '1 hour')
+        INSERT INTO external_product_seeds (id, external_product_id, destination_url, seed_data, updated_at,
+                                            status, market, tool)
+        VALUES ('seed:newer', :epid, 'https://brand.com/p', CAST(:sd AS jsonb), NOW() + interval '1 hour',
+                'active', 'US', 'other-tool')
         """,
         {"epid": f"brand:{pk}", "sd": json.dumps({"snapshot": {"variants": [
             {"variant_id": REAL_VID, "title": "New", "price": "2.00"}]}})},
     )
     await _canonical_offer(_db, pk)
 
+    await _db.execute(
+        """
+        INSERT INTO external_product_seeds (id, external_product_id, destination_url, seed_data, updated_at,
+                                            status, market, tool)
+        VALUES ('seed:retired', :epid, 'https://brand.com/p', CAST(:sd AS jsonb), NOW() + interval '2 hour',
+                'retired', 'US', 'third-tool')
+        """,
+        {"epid": f"brand:{pk}", "sd": json.dumps({"snapshot": {"variants": [
+            {"variant_id": REAL_VID, "title": "Dead", "price": "3.00"}]}})},
+    )
+
     report = await _run()
 
     assert report["products_scanned"] == 1
     offers = [o for o in await _offers(_db, pk) if o["sku_key"] != f"{pk}::canonical"]
-    assert len(offers) == 1 and float(offers[0]["list_price"]) == 2.0
+    assert len(offers) == 1 and float(offers[0]["list_price"]) == 2.0     # newest ACTIVE, not newest
