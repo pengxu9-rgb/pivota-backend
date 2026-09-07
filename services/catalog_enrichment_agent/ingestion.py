@@ -60,6 +60,31 @@ from services.strong_identifier import (
 from services.text_normalization.brand_case import proper_case_brand
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
+
+def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
+    """The variant's OWN positive price, or None.
+
+    One rule for every writer of a variant offer (ingest here, the backfill in
+    scripts/backfill_variant_identity_skus.py): a variant is priced only when it
+    carries a parseable amount > 0 under one of the keys the crawlers emit. The
+    product's price is never substituted -- variants differ precisely in the
+    things that carry price (30 ml vs 50 ml, a set vs a single) -- and a 0 or
+    missing amount is never projected as an offer, because the serving price
+    gate and recall both read catalog_offers and a priceless row there is at
+    best inert and at worst a 0.00 on a PDP.
+    """
+    for key in ("price", "price_amount", "list_price"):
+        raw = variant.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
 
 AGENT_VERSION = "catalog_enrichment_agent_v1"
@@ -324,9 +349,10 @@ def _build_variant_sku_inserts(
             "sku_payload": json.dumps({
                 "agent_version": AGENT_VERSION,
                 "variant_id": vid,
-                # Where this id came from, decided once at write time. The money
-                # path reads THIS rather than re-sniffing the string, so a
-                # storage token can never be mistaken for merchant identity.
+                # Where this id came from, decided once at write time, so a money
+                # path can read THIS rather than re-sniff the string. As of
+                # 2026-09-07 no consumer reads it yet; the ingest-time gate above
+                # (single-variant admission on MERCHANT_ISSUED only) is the guard.
                 "variant_id_provenance": provenance,
                 "source_handle": v.get("source_handle"),
                 "canonical_url": canonical_url,
@@ -1100,10 +1126,17 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         by_vid = {str(v.get("variant_id") or ""): v for v in (pdp_payload.get("variants") or [])}
         for vsku in variant_sku_rows:
             v = by_vid.get(str(vsku["source_variant_id"])) or {}
+            price = variant_own_price(v)
+            if price is None:
+                # The SKU still lands (its identity is real); the offer does not. Before
+                # #2113 a single-variant record could not reach this loop at all, so
+                # lifting the count gate would have projected a None/0-priced offer for
+                # every recovered product whose variant carried no price of its own.
+                continue
             variant_offer_rows.extend(_build_offer_inserts(
                 product_key=pdp_row["product_key"],
                 sku_key=vsku["sku_key"],
-                offers=[dict(primary, price=v.get("price"), in_stock=bool(v.get("in_stock")))],
+                offers=[dict(primary, price=price, in_stock=bool(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
                 # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
                 # created an eighth CALL that silently took the default -- so a shade line landed
