@@ -58,6 +58,7 @@ from services.strong_identifier import (
     extract_strong_identifier,
 )
 from services.text_normalization.brand_case import proper_case_brand
+from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
 
@@ -256,16 +257,46 @@ def _build_variant_sku_inserts(
     """One catalog_skus row per real variant, in the shape merchant sync writes
     for a shade: title = shade name, visible_option_labels = ['shade_<name>']
     (the label prefix catalog_sync_service's shade extractor keys on), the
-    variant's own sku / barcode / image. Nothing when the record has fewer
-    than two variants — the canonical SKU already represents the product."""
+    variant's own sku / barcode / image.
+
+    SINGLE-VARIANT PRODUCTS. This used to `return []` for anything with fewer
+    than two variants, on the reasoning that "the canonical SKU already
+    represents the product". It does not, for the purpose that matters: the
+    canonical SKU's `source_variant_id` is the *product_key* (see
+    _build_canonical_sku_insert), a storage token minted to satisfy
+    idx_catalog_skus_source_identity, and the gateway's isRestatedProductId
+    guard correctly refuses to spend money against an id derivable from the
+    product id. So a product whose one variant carried a REAL merchant id had
+    that id in hand and dropped it, and ended up with no purchasable SKU at
+    all. Measured on prod 2026-09-07: 519 products in exactly that state.
+
+    The count is therefore no longer the test — provenance is. A lone variant
+    earns its own SKU only when `variant_identity` can positively place its id
+    as the merchant's; otherwise emitting one would just mint a second decoy
+    beside the canonical row. Multi-variant products keep their existing
+    admission rule (any non-empty id), because those rows also drive the PDP
+    shade selector and recall, and tightening them here would silently drop
+    display data that has nothing to do with checkout. Every row carries its
+    provenance in sku_payload so the money path can filter without re-deriving
+    it from the string."""
     variants = pdp_payload.get("variants") or []
-    if len(variants) < 2:
-        return []
+    product_id = canonical_product_name(
+        pdp_payload["brand"], pdp_payload["product_name"]
+    )
+    single = len(variants) < 2
     rows: List[Dict[str, Any]] = []
     seen: set = set()
     for v in variants:
         vid = str(v.get("variant_id") or "").strip()
         if not vid:
+            continue
+        provenance = variant_id_provenance(
+            vid,
+            product_id=product_id,
+            product_key=product_key,
+            handle=v.get("source_handle"),
+        )
+        if single and provenance != MERCHANT_ISSUED:
             continue
         sku_key = derive_variant_sku_key(product_key, vid)
         if sku_key in seen:
@@ -293,6 +324,10 @@ def _build_variant_sku_inserts(
             "sku_payload": json.dumps({
                 "agent_version": AGENT_VERSION,
                 "variant_id": vid,
+                # Where this id came from, decided once at write time. The money
+                # path reads THIS rather than re-sniffing the string, so a
+                # storage token can never be mistaken for merchant identity.
+                "variant_id_provenance": provenance,
                 "source_handle": v.get("source_handle"),
                 "canonical_url": canonical_url,
             }),

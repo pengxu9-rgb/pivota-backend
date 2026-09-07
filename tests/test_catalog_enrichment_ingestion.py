@@ -824,10 +824,37 @@ def test_variants_become_shade_skus_and_offers_beside_the_canonical():
     assert len({o["offer_id"] for o in offers}) == 4
 
 
-def test_single_variant_records_write_only_the_canonical_sku():
+def test_a_single_variant_record_keeps_its_real_merchant_id():
+    """Was `test_single_variant_records_write_only_the_canonical_sku`, which asserted
+    `variant_skus == []` on the reasoning that the canonical SKU already represents a
+    one-variant product. It does not, for buying: the canonical SKU's source_variant_id
+    is the product_key (a token minted for idx_catalog_skus_source_identity), and the
+    gateway's isRestatedProductId guard refuses to spend against an id derivable from
+    the product id. So this record — which carries a real 14-digit Shopify id — used to
+    have that id thrown away and end up with nothing purchasable. 519 prod products were
+    in exactly this state on 2026-09-07."""
     from services.catalog_enrichment_agent import ingestion as ing
 
     result = ing.ingest_validated_record(_variant_record(1))
+    assert [s["source_variant_id"] for s in result["variant_skus"]] == ["54057345745090"]
+    # One offer per SKU, canonical included — the same shape multi-variant records already
+    # produce (3 variants -> 4 SKUs, 4 offers, see test_plan_counts_variant_skus). So a
+    # recovered single-variant product gains exactly one SKU and one offer, not a fan-out.
+    assert len(result["offers"]) == 2
+
+
+def test_a_single_variant_record_with_a_fabricated_id_still_writes_no_variant_sku():
+    """The half of the old test that was right, kept. Lifting the count gate must not
+    mint a decoy SKU for the 1,608 prod products whose only variant id we invented
+    ourselves — here `<external_product_id>-default`, the shape
+    scripts/onboard_external_brand_from_crawl.py writes 1,473 times."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(1)
+    pdp = record["pdp"]
+    epid = ing.canonical_product_name(pdp["brand"], pdp["product_name"])
+    pdp["variants"][0]["variant_id"] = f"{epid}-default"
+    result = ing.ingest_validated_record(record)
     assert result["variant_skus"] == []
     assert len(result["offers"]) == 1
 

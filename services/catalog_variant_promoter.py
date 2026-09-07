@@ -76,6 +76,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
+from services.variant_identity import variant_id_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -217,11 +218,23 @@ def is_real_variant(variant: Dict[str, Any]) -> bool:
 
 
 def filter_real_variants(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Drop Default-Title placeholders. If after filtering only one
-    variant remains AND that variant's title matches the parent product
-    title (e.g. mirror script stuffing the product title as a synthetic
-    canonical variant), still drop it — that's not a real shade
-    variant either. Caller passes the parent title for that check."""
+    """Drop Default-Title placeholders.
+
+    This docstring used to promise a second rule — "if after filtering only one variant
+    remains AND that variant's title matches the parent product title, still drop it;
+    caller passes the parent title for that check" — which the body never implemented
+    and the signature could not have supported (no parent title is passed). It was an
+    unverified claim, and it mattered: it read as cover for exactly the case that turns
+    out to need care, the lone variant whose title repeats its parent's.
+
+    The rule is NOT reinstated, because measurement says the title is the wrong test.
+    Of the 1,648 prod products in that shape on 2026-09-07, 40 carry a genuine numeric
+    Shopify variant id — a real single-variant product legitimately repeats the product
+    title — while the other 1,608 carry an id we minted ourselves. Title collision
+    separates those two groups not at all. Provenance does, so the buyability decision
+    belongs to `services.variant_identity.is_merchant_issued_variant_id` and the caller
+    that spends money, not to a string comparison here.
+    """
     return [v for v in variants if is_real_variant(v)]
 
 
@@ -277,13 +290,26 @@ def build_variant_row(
 ) -> Optional[VariantRow]:
     """Assemble the catalog_skus upsert dict from one variant + the
     primary's identity. Returns None when the variant doesn't carry
-    a variant_id (can't compute a stable sku_key)."""
+    a variant_id (can't compute a stable sku_key).
+
+    Admission is deliberately NOT gated on provenance. This promoter exists so the agent
+    UI can render shade swatches (Stage 2b-ii), and a variant whose id we cannot place is
+    still a real shade the buyer needs to see. What would be wrong is letting that row look
+    like merchant identity downstream, so the provenance is decided here, once, and carried
+    on the row — measured on prod 2026-09-07, 1,645 of the 2,803 promotable products carry
+    an id one of our own writers minted."""
     variant_id = str(variant.get("variant_id") or variant.get("id") or "").strip()
     if not variant_id:
         return None
 
     sku_key = _derive_sku_key(primary["product_key"], variant_id)
     options = variant.get("options")
+    payload = dict(variant)
+    payload["variant_id_provenance"] = variant_id_provenance(
+        variant_id,
+        product_id=primary.get("source_product_id"),
+        product_key=primary.get("product_key"),
+    )
     return VariantRow(
         sku_key=sku_key,
         product_key=primary["product_key"],
@@ -298,7 +324,7 @@ def build_variant_row(
         image_url=variant.get("image_url") or None,
         visible_option_labels=_visible_option_labels(options),
         visible_attributes=_visible_attributes(options),
-        sku_payload=variant,
+        sku_payload=payload,
     )
 
 
