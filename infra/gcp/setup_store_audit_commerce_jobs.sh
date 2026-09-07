@@ -42,7 +42,7 @@ WEB_URL="$(printf '%s' "$WEB_SPEC" | python3 -c 'import json,sys; print(json.loa
 # conjunct and wrote down why; this sibling copy kept it, which is the drift a shared
 # definition exists to stop.
 WEB_REVISION="$(serving_revision web || true)"
-[ -n "$WEB_REVISION" ] || { echo "web needs exactly one untagged 100%-traffic revision" >&2; exit 2; }
+[ -n "$WEB_REVISION" ] || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before creating Store Audit commerce Jobs" >&2; exit 2; }
 READY="$("$GCLOUD" run revisions describe "$WEB_REVISION" --region "$REGION" --format=json | python3 -c '
 import json,sys
 env=json.load(sys.stdin).get("spec",{}).get("containers",[{}])[0].get("env",[])

@@ -34,10 +34,19 @@ SCHEDULER = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 
 SHA = "a" * 40
 PREV = "b" * 40
+IMG = "us-west1-docker.pkg.dev/pivota-shared/pivota/backend"
+# What a REVISION's image reference looks like: Cloud Run resolves the tag at revision creation,
+# so `revisions describe` answers a digest, never the sha-shaped tag the deploy asked for
+# (measured on prod 2026-09-06). A stub echoing a tag here let a rollback that stamped the
+# digest as PIVOTA_COMMIT_SHA pass for a day.
+DIGEST = "sha256:" + "d" * 64
+NOT_FOUND = "ERROR: (gcloud.run.services.describe) Cannot find service [worker]"
 
 
 def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bool = False,
-                 prev_image: str = PREV, describe_error: str = "", probe_log: str = "") -> Path:
+                 prev_image: str = PREV, describe_error: str = "", probe_log: str = "",
+                 prev_sha_declared: bool = True, revision_image_empty: bool = False,
+                 traffic_json: str = '{"status":{"traffic":[{"revisionName":"worker-live","percent":100}]}}') -> Path:
     """A `gcloud` that records every invocation and can fail on demand.
 
     Recording matters more than answering: the assertions below read the RECORDED argv of
@@ -48,8 +57,16 @@ def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bo
     binn.mkdir(exist_ok=True)
     log = tmp_path / "calls.log"
     argvlog = tmp_path / "argv.log"
-    prev = (f"us-west1-docker.pkg.dev/pivota-shared/pivota/backend:{prev_image}"
-            if prev_image else "")
+    prev = f"{IMG}:{prev_image}" if prev_image else ""
+    # A service that does not exist FAILS `services describe` with the not-found message; that
+    # is the only thing that may send the script down the create path. An empty answer with
+    # rc 0 is a different, fail-open state and is modelled separately (revision_image_empty).
+    if not prev_image and not describe_error:
+        describe_error = NOT_FOUND
+    rev_image = "" if revision_image_empty else (f"{IMG}@{DIGEST}" if prev_image else "")
+    rev_env = (f'{{"name":"PIVOTA_COMMIT_SHA","value":"{prev_image}"}},' if prev_sha_declared else "")
+    rev_json = (f'{{"spec":{{"containers":[{{"image":"{rev_image}","env":[{rev_env}'
+                f'{{"name":"PIVOTA_ENV","value":"production"}}]}}]}}}}')
     stub = binn / "gcloud"
     # An empty `prev` models a service that does not exist. `describe_error` models the
     # DIFFERENT thing the old code could not distinguish: the API failing for any other reason.
@@ -59,7 +76,6 @@ def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bo
     # One 100%-traffic revision, named so `run revisions describe` can answer for it. An empty
     # `prev` (service absent) still produces valid JSON; the script's not-found handling is
     # driven by `describe_error`, which is what real gcloud actually emits.
-    traffic_json = '{"status":{"traffic":[{"revisionName":"worker-live","percent":100}]}}'
     stub.write_text(f"""#!/usr/bin/env bash
 # Flatten newlines: the probe program is a multi-line `python -c` argument, and a
 # line-based log would record only its first line — so an assertion about the probe's
@@ -85,7 +101,10 @@ if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
   exit 0
 fi
 if [ "$1" = run ] && [ "$2" = revisions ] && [ "$3" = describe ]; then
-  printf '%s\\n' "{prev}"
+  case "$*" in
+    *--format=json*) printf '%s\\n' '{rev_json}' ;;
+    *) printf '%s\\n' "{rev_image}" ;;
+  esac
   exit 0
 fi
 if [ "$1" = run ] && [ "$2" = jobs ] && [ "$3" = execute ]; then
@@ -279,12 +298,20 @@ def test_an_unhealthy_worker_fails_the_deploy_and_is_rolled_back(tmp_path):
     # stamping the old sha passed — producing exactly the "reports the sha it failed to run"
     # state this test names. Found by a mutation audit, 2026-09-05.
     assert _flag(argvs[0], "--image").endswith(f":{SHA}"), "the forward deploy shipped the wrong image"
-    assert _flag(argvs[1], "--image").endswith(f":{PREV}"), (
+    # BY DIGEST. The serving revision's image is `backend@sha256:...`, and that is exactly the
+    # bytes that were serving, so it is the right thing to deploy on a rollback.
+    assert _flag(argvs[1], "--image") == f"{IMG}@{DIGEST}", (
         f"the rollback did not redeploy the previous IMAGE: {_flag(argvs[1], '--image')}"
     )
-    assert f"PIVOTA_COMMIT_SHA={PREV}" in " ".join(argvs[1]), (
+    restamp = _flag(argvs[1], "--update-env-vars")
+    assert f"PIVOTA_COMMIT_SHA={PREV}," in restamp, (
         "the rollback restamped the wrong commit — the service would report the sha it "
-        "failed to run"
+        f"failed to run: {restamp}"
+    )
+    assert "sha256" not in restamp and "d" * 64 not in restamp, (
+        "the rollback derived the commit from the image reference, which is a DIGEST — the "
+        f"worker would declare a 64-hex digest as its commit and the drift alarm would refuse "
+        f"it forever: {restamp}"
     )
 
 
@@ -294,6 +321,72 @@ def test_a_failed_probe_with_no_previous_image_still_fails(tmp_path):
     code, out, calls = _run(tmp_path, "prod", SHA, probe_fails=True, prev_image="")
     assert code != 0, f"an unhealthy first deploy must still fail:\n{out}"
     assert len(_deploys(calls)) == 1, "nothing to roll back to, so exactly one deploy"
+
+
+def test_the_declared_commit_is_what_the_operator_and_the_restamp_see(tmp_path):
+    """`${PREV_IMAGE##*:}` is the digest, not the commit. The line an operator reads during
+    an incident, and the value a rollback stamps, must both come from the revision's DECLARED
+    PIVOTA_COMMIT_SHA (`serving_env`), never from the image reference."""
+    code, out, _ = _run(tmp_path, "prod", SHA)
+    assert code == 0, out
+    line = next(l for l in out.splitlines() if l.startswith("worker is on"))
+    assert line.startswith(f"worker is on {PREV} "), (
+        f"the operator-facing line did not lead with the DECLARED commit: {line!r}"
+    )
+
+
+def test_redeploying_the_serving_commit_does_not_roll_back_onto_itself(tmp_path):
+    """Compared on the declared commit, not the image reference: PREV_IMAGE is a digest and
+    IMAGE is a tag, so a string comparison is ALWAYS "different". A redeploy of the commit
+    already serving, whose probe then fails, must not perform a second production deploy of
+    the same bytes — the image flap this script argues against in its own comments."""
+    code, out, _ = _run(tmp_path, "prod", PREV, probe_fails=True)
+    assert code != 0, out
+    assert "already on" in out, f"the same-commit redeploy was not recognised:\n{out}"
+    argvs = _deploy_argvs(tmp_path)
+    assert len(argvs) == 1, (
+        f"a failed redeploy of the SAME commit rolled back onto itself: {len(argvs)} deploys"
+    )
+
+
+def test_a_serving_revision_with_no_declared_commit_is_refused_before_deploying(tmp_path):
+    """If the revision declares no PIVOTA_COMMIT_SHA, a rollback could not restamp it
+    truthfully — and prod-deploy-drift.yml already refuses this state. Refuse here too,
+    before anything is touched, and say how to fix it."""
+    code, out, calls = _run(tmp_path, "prod", SHA, prev_sha_declared=False)
+    assert code != 0, out
+    assert not _deploys(calls), "nothing may be deployed over a revision of unknown commit"
+    assert "PIVOTA_COMMIT_SHA" in out and "gcloud run services update worker" in out, out
+
+
+def test_an_empty_image_answer_is_not_an_absent_service(tmp_path):
+    """gcloud's value() projection prints EMPTY with rc 0 when a field path does not
+    resolve. The old read turned that into "the service does not exist" and deployed over a
+    live worker with no rollback anchor. Both the helper and the script now refuse it."""
+    code, out, calls = _run(tmp_path, "prod", SHA, revision_image_empty=True)
+    assert code != 0, out
+    assert not _deploys(calls), "an unreadable image is not a licence to create the service"
+    assert "does not exist yet" not in out, out
+
+
+@pytest.mark.parametrize(
+    "kw, expect, why",
+    [
+        ({"describe_error": "ERROR: (gcloud.run.services.describe) PERMISSION_DENIED: nope"},
+         "gcloud said:", "an API failure must be reported as gcloud's own words"),
+        ({"traffic_json": '{"status":{"traffic":[{"revisionName":"a","percent":100},'
+                          '{"revisionName":"b","percent":100}]}}'},
+         "gcloud reported no error", "a split is the helper refusing, not gcloud failing"),
+    ],
+)
+def test_the_refusal_names_which_failure_it_is(tmp_path, kw, expect, why):
+    """Three different things land in the refusal and they used to print one message
+    asserting "gcloud exited 1", false for two of them. An operator on a blocked production
+    deploy needs the cause. The two branches are pinned separately so swapping them fails."""
+    code, out, calls = _run(tmp_path, "prod", SHA, **kw)
+    assert code != 0, out
+    assert not _deploys(calls)
+    assert expect in out, f"{why}:\n{out}"
 
 
 # ── the probe program, EXECUTED ────────────────────────────────────────────────────────
@@ -503,7 +596,7 @@ def test_a_probe_that_ran_and_said_unhealthy_still_rolls_back(tmp_path):
     assert code != 0
     argvs = _deploy_argvs(tmp_path)
     assert len(argvs) == 2, f"a real unhealthy verdict must roll back, got {len(argvs)} deploys"
-    assert _flag(argvs[1], "--image").endswith(f":{PREV}")
+    assert _flag(argvs[1], "--image") == f"{IMG}@{DIGEST}", _flag(argvs[1], "--image")
 
 
 def test_the_probe_authenticates(tmp_path):

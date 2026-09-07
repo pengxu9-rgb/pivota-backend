@@ -59,7 +59,11 @@ WEB_JSON = (
     '"traffic":[{"revisionName":"web-00088-kaz","percent":100}]}}'
 )
 REVISION_JSON = (
-    '{"spec":{"containers":[{"env":['
+    # A revision declares the commit it was built from; deploy_worker.sh refuses one that does
+    # not (it could not restamp a rollback truthfully), so the fake must carry it.
+    '{"spec":{"containers":[{"image":"us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:'
+    + "e" * 64 + '","env":['
+    '{"name":"PIVOTA_COMMIT_SHA","value":"' + "e" * 40 + '"},'
     '{"name":"STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED","value":"true"},'
     '{"name":"STORE_AUDIT_UCP_PROBE_INTERNAL_KEY","valueFrom":{"secretKeyRef":'
     '{"name":"STORE_AUDIT_UCP_PROBE_INTERNAL_KEY"}}},'

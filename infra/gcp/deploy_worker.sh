@@ -166,13 +166,38 @@ if [ "$PREV_RC" != 0 ]; then
     exit 1
   fi
 fi
+# THE COMMIT A REVISION RUNS IS WHAT IT DECLARES, NOT WHAT ITS IMAGE REFERENCE ENDS IN. The
+# revision's image is a DIGEST (`backend@sha256:<64 hex>` -- Cloud Run resolves the tag at
+# revision creation; see _serving_revision.sh), so `${PREV_IMAGE##*:}` is the digest. The first
+# version of this block restamped PIVOTA_COMMIT_SHA from it on rollback, which would have set a
+# 64-hex digest as the worker's declared commit and turned prod-deploy-drift.yml permanently red
+# for the one service it cannot probe. Caught by a review that ran the real gcloud shape
+# through a stub that had been echoing a tag.
+PREV_SHA=""
+if [ "$PREV_RC" = 0 ] && [ -z "$PREV_IMAGE" ]; then
+  # rc 0 with nothing printed: the helper refuses this itself now, but the contract is cheap to
+  # hold here too -- an empty image is not "the service is absent", and the branch below would
+  # treat it as one.
+  echo "could not read the worker's current image: the serving revision answered with an empty image reference." >&2
+  echo "Refusing to deploy: without knowing what is running there is nothing to roll back to." >&2
+  exit 1
+fi
 if [ -n "$PREV_IMAGE" ]; then
-  echo "worker is on ${PREV_IMAGE##*:}"
-  if [ "$PREV_IMAGE" = "$IMAGE" ]; then
+  PREV_SHA="$(serving_env worker PIVOTA_COMMIT_SHA 2>/dev/null)" || PREV_SHA=""
+  if [ -z "$PREV_SHA" ]; then
+    echo "the worker's serving revision declares no PIVOTA_COMMIT_SHA, so what commit it runs is unknown" >&2
+    echo "and a rollback could not restamp it truthfully. prod-deploy-drift.yml refuses this same state." >&2
+    echo "Stamp it by hand, then redeploy:" >&2
+    echo "  gcloud run services update worker --region $REGION --project $PROJECT \\" >&2
+    echo "    --update-env-vars PIVOTA_COMMIT_SHA=<the commit that image was built from>" >&2
+    exit 1
+  fi
+  echo "worker is on $PREV_SHA (image ${PREV_IMAGE##*/})"
+  if [ "$PREV_SHA" = "$TAG" ]; then
     # Not an error, and not a no-op either: the health probe below is still worth running, because
-    # "the image tag matches" and "the scheduler booted and registered its jobs" are different
+    # "the commit matches" and "the scheduler booted and registered its jobs" are different
     # claims and this repo has been bitten by treating the first as evidence of the second.
-    echo "already on $TAG - redeploying anyway to re-verify (a matching tag is not a health check)"
+    echo "already on $TAG - redeploying anyway to re-verify (a matching commit is not a health check)"
   fi
 else
   echo "note: worker does not exist yet in $PROJECT - creating it"
@@ -372,8 +397,12 @@ if [ "$probe_rc" != 0 ]; then
   echo "  gcloud run services update worker --region $REGION --project $PROJECT \\" >&2
   echo "    --update-env-vars AUDIT_WORKER_ENABLED=true" >&2
   echo "  gcloud logging read 'resource.labels.job_name=\"$PROBE_JOB\"' --project $PROJECT --limit 20" >&2
-  if [ -n "$PREV_IMAGE" ] && [ "$PREV_IMAGE" != "$IMAGE" ]; then
-    echo "rolling back to ${PREV_IMAGE##*:}" >&2
+  # Compared on the DECLARED commit, not on the image reference: PREV_IMAGE is a digest and IMAGE
+  # is a tag, so a string comparison of the two is always "different" and a redeploy of the SAME
+  # commit whose probe failed would roll back onto itself -- the image flap the comment above
+  # argues against, with a digest stamped as the commit.
+  if [ -n "$PREV_IMAGE" ] && [ "$PREV_SHA" != "$TAG" ]; then
+    echo "rolling back to $PREV_SHA (image ${PREV_IMAGE##*/})" >&2
     # Roll the IMAGE back rather than shifting traffic. Traffic is not the control here: a worker
     # instance does work from its lifespan, not from requests, so `update-traffic` to the old
     # revision would leave the unhealthy one's instance alive and draining alongside it. Replacing
@@ -384,9 +413,9 @@ if [ "$probe_rc" != 0 ]; then
     # make a failed deploy's recovery a second full configuration write, at the moment we least
     # understand what is wrong. (Reachable only in principle today - `apply` needs the
     # Railway-ported files, which no longer exist.)
-    CONFIG_ARGS=(--update-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=worker,PIVOTA_COMMIT_SHA=${PREV_IMAGE##*:},SKIP_HEAVY_STARTUP_INIT=true,DB_POOL_MIN_SIZE=2,DB_POOL_MAX_SIZE=10")
+    CONFIG_ARGS=(--update-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=worker,PIVOTA_COMMIT_SHA=$PREV_SHA,SKIP_HEAVY_STARTUP_INIT=true,DB_POOL_MIN_SIZE=2,DB_POOL_MAX_SIZE=10")
     deploy_image "$PREV_IMAGE" \
-      && echo "rolled back to ${PREV_IMAGE##*:}" >&2 \
+      && echo "rolled back to $PREV_SHA" >&2 \
       || echo "::error::ROLLBACK ALSO FAILED. The worker needs hands." >&2
   fi
   exit 1

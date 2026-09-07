@@ -1,8 +1,8 @@
 # What a Cloud Run service is ACTUALLY SERVING — not what its template asks for.
 #
-# Sourced by deploy_worker.sh and setup_scheduler.sh — including setup_scheduler's two Store
-# Audit guards, which each carried their own copy of the 100%-traffic resolution until this
-# file existed. `prod-deploy-drift.yml` keeps an inline implementation because it is a workflow
+# Sourced by deploy_worker.sh, setup_scheduler.sh, setup_store_audit_commerce_jobs.sh and
+# setup_store_audit_ucp_jobs.sh — including setup_scheduler's two Store Audit guards, which each
+# carried their own copy of the 100%-traffic resolution until this file existed. `prod-deploy-drift.yml` keeps an inline implementation because it is a workflow
 # and cannot source a shell file; if you change the semantics here, change it there too. That
 # is the ONLY remaining copy, and it is one more than anybody wants.
 #
@@ -54,10 +54,13 @@ live = [t for t in (st.get("traffic") or []) if t.get("percent") == 100]
 # filtering would let a two-entry split resolve by ignoring half of itself.
 if len(live) != 1: sys.exit(1)
 # `revisionName` on a STATUS traffic target is the resolved one and is populated in practice
-# (measured across web/worker/proof-issuer/gateway 2026-09-06: always present, and always equal
-# to latestReadyRevisionName). The latestRevision fallback is kept anyway because the UCP guard
-# this function absorbed carried it -- dropping a fallback that costs one line, on a script that
-# provisions secret-bearing Jobs, is not a trade worth making for tidiness.
+# (measured across web/worker/proof-issuer/gateway 2026-09-06: always present). It is NOT
+# always equal to latestReadyRevisionName: measured the same day on web, revisionName was
+# web-00572-guh while latestReadyRevisionName was web-00575-gak -- a newer revision Ready but
+# not yet taking traffic, i.e. the half-finished-rollout state this file exists for. So
+# revisionName is preferred because it is the SERVING one, and the latestRevision fallback
+# (kept from the UCP guard this function absorbed) answers only when the target itself says
+# it follows latest.
 name = live[0].get("revisionName") or (
     st.get("latestReadyRevisionName", "") if live[0].get("latestRevision") else "")
 if not name: sys.exit(1)
@@ -65,8 +68,16 @@ print(name)' 2>/dev/null
 }
 
 # The container image on the revision that is serving.
+#
+# THIS IS A DIGEST REFERENCE, NEVER THE TAG. Cloud Run resolves the tag when it creates the
+# revision, so `spec.containers[0].image` on a revision reads `.../backend@sha256:<64 hex>`
+# even though the deploy asked for `.../backend:<commit sha>` (measured on prod 2026-09-06;
+# prod-deploy-drift.yml documents the same). It is the right thing to DEPLOY on a rollback --
+# it names exactly the bytes that were serving -- and the wrong thing to derive a commit from:
+# `${{image##*:}}` yields the digest, not the sha. The commit a revision runs is what it
+# DECLARES: `serving_env <svc> PIVOTA_COMMIT_SHA`.
 serving_image(){ # <service>
-  local rev; rev="$(serving_revision "$1")" || return 1
+  local rev out; rev="$(serving_revision "$1")" || return 1
   [ -n "$rev" ] || return 1
   # NO `| head -1`. A pipeline's status is the LAST command's, so `head` would swallow a
   # failing describe and return 0 with empty output — breaking the contract three lines above
@@ -76,8 +87,14 @@ serving_image(){ # <service>
   # caller today sets pipefail, but this is a shared file and a GitHub Actions `run:` step is
   # `bash -e` WITHOUT it. `value()` on a single field is one line; head was never needed.
   local proj=(); [ -n "${PROJECT:-}" ] && proj=(--project "$PROJECT")
-  "$GCLOUD" run revisions describe "$rev" ${proj[@]+"${proj[@]}"} --region "$REGION" \
-    --format='value(spec.containers[0].image)'
+  out="$("$GCLOUD" run revisions describe "$rev" ${proj[@]+"${proj[@]}"} --region "$REGION" \
+    --format='value(spec.containers[0].image)')" || return 1
+  # gcloud's value() projection prints EMPTY with rc 0 when the field path does not resolve.
+  # The contract in the header is "non-zero when it cannot answer", and deploy_worker.sh reads
+  # an empty answer as "the service does not exist" -- which would deploy over a live worker
+  # with no rollback anchor. Empty is not an answer.
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
 }
 
 # One env var's value on the revision that is serving.

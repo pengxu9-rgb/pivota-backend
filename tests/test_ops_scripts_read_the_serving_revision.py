@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,8 @@ _DEFAULT_TRAFFIC = ('{"revisionName":"rev-live","percent":100},'
 
 
 def _stub_gcloud(tmp_path: Path, *, armed_serving="true", armed_template="false",
-                 traffic: str = _DEFAULT_TRAFFIC, extra_status: str = "") -> Path:
+                 traffic: str = _DEFAULT_TRAFFIC, extra_status: str = "",
+                 revision_image: str | None = None) -> Path:
     """A `gcloud` whose service TEMPLATE and SERVING revision deliberately disagree.
 
     `traffic` is DATA, not a string patched into the generated script afterwards. The stub is
@@ -78,6 +80,14 @@ if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
   exit 0
 fi
 if [ "$1" = run ] && [ "$2" = revisions ] && [ "$3" = describe ]; then
+  # The image on a REVISION is a DIGEST reference (Cloud Run resolves the tag at revision
+  # creation), and value() prints EMPTY with rc 0 for a field path that does not resolve — both
+  # modelled so the helper's contract is tested against what gcloud does. The digest here is the
+  # revision's sha padded to 64 hex, so a test can still tell WHICH revision answered.
+  case "$4 $*" in
+    "rev-live "*"value(spec.containers[0].image)"*) printf '%s\\n' "{revision_image if revision_image is not None else img + "@sha256:" + SERVING + "0" * 24}"; exit 0 ;;
+    "rev-cand "*"value(spec.containers[0].image)"*) printf '%s\\n' "{img}@sha256:{TEMPLATE}{"0" * 24}"; exit 0 ;;
+  esac
   case "$4" in
     rev-live)
       echo '{{"spec":{{"containers":[{{"image":"{img}:{SERVING}",'\\
@@ -206,7 +216,12 @@ def test_a_lone_nameless_entry_is_refused(tmp_path):
     name check beside it — two guards closing one door. A single entry at 100 with no
     revisionName and no latestRevision reaches the name clause and nothing else.
     """
-    binn = _stub_gcloud(tmp_path, traffic='{"percent":100}')
+    # latestReadyRevisionName IS present, so the only thing standing between this entry and an
+    # answer is the `latestRevision` conjunct: a fallback made unconditional would answer
+    # rev-live here. Without this field the case could not tell the name clause from the
+    # conjunct — two guards, one door.
+    binn = _stub_gcloud(tmp_path, traffic='{"percent":100}',
+                        extra_status='"latestReadyRevisionName":"rev-live",')
     script = f'''
 set -euo pipefail
 GCLOUD="{binn / 'gcloud'}"; PROJECT=pivota-prod; REGION=us-west1
@@ -394,4 +409,85 @@ def test_the_serving_read_is_defined_once():
         f"these scripts carry their own 100%-traffic resolution instead of sourcing the "
         f"helper: {copies}. That is how the `not x.get(\"tag\")` conjunct survived in one "
         f"copy after being removed from another."
+    )
+
+
+def test_an_empty_image_answer_is_refused_by_the_helper(tmp_path):
+    """gcloud's value() projection prints EMPTY with rc 0 when the field path does not
+    resolve. The header promises "non-zero when it cannot answer", and deploy_worker.sh read
+    an empty answer as "the service does not exist" — a deploy over a live worker with no
+    rollback anchor. Empty is not an answer."""
+    out = _source_and_call(
+        tmp_path,
+        'serving_image worker && echo "ANSWERED:[$(serving_image worker)]" || echo REFUSED',
+        revision_image="",
+    )
+    assert "REFUSED" in out and "ANSWERED" not in out, out
+
+
+def test_the_image_the_helper_returns_is_a_digest_reference(tmp_path):
+    """Documented in the helper and relied on by deploy_worker.sh: a revision's image is
+    `...@sha256:<64 hex>`. The stub answers that shape, so a caller that derives a commit
+    from the reference is caught by the deploy_worker tests, not by production."""
+    out = _source_and_call(tmp_path, "serving_image worker")
+    digest = out.rsplit("@sha256:", 1)[1] if "@sha256:" in out else ""
+    assert len(digest) == 64 and digest.startswith(SERVING), out
+
+
+# ── the workflow's copy must agree with the helper ─────────────────────────────────────────
+# `prod-deploy-drift.yml` cannot source a shell file, so it carries the one remaining inline
+# copy of the 100%-traffic predicate, and the helper's header says "change both or neither".
+# That was a comment, and the copy promptly drifted (the alarm filtered a nameless entry out and
+# answered with its neighbour while the helper refused). This lifts BOTH programs out of their
+# files and runs them over one fixture table.
+
+_WORKFLOW = REPO / ".github" / "workflows" / "prod-deploy-drift.yml"
+
+
+def _helper_predicate() -> str:
+    text = (GCP / "_serving_revision.sh").read_text(encoding="utf-8")
+    start = text.index("serving_revision(){")
+    body = text[start:]
+    a = body.index("python3 -c '") + len("python3 -c '")
+    b = body.index("' 2>/dev/null", a)
+    return body[a:b]
+
+
+def _workflow_predicate() -> str:
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    line = next(l for l in text.splitlines() if 'rev="$(printf' in l and "python3 -c '" in l)
+    a = line.index("python3 -c '") + len("python3 -c '")
+    b = line.index("' 2>/dev/null", a)
+    return line[a:b]
+
+
+def _answer(program: str, payload: str) -> str:
+    done = subprocess.run([sys.executable, "-c", program], input=payload, capture_output=True,
+                          text=True, timeout=30)
+    # The helper signals "cannot answer" by exit 1 with nothing printed; the workflow prints
+    # nothing and exits 0 (its caller tests emptiness). Both reduce to "the printed name".
+    return done.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "traffic, extra, expect",
+    [
+        ('[{"revisionName":"A","percent":100}]', "", "A"),
+        ('[{"revisionName":"A","percent":100},{"revisionName":"B","percent":0,"tag":"c-x"}]', "", "A"),
+        ('[{"revisionName":"A","percent":100,"tag":"c-x"}]', "", "A"),
+        ('[{"percent":100,"latestRevision":true}]', '"latestReadyRevisionName":"L",', "L"),
+        ('[{"percent":100}]', '"latestReadyRevisionName":"L",', ""),
+        ('[{"revisionName":"A","percent":100},{"percent":100}]', "", ""),
+        ('[{"revisionName":"A","percent":50},{"revisionName":"B","percent":50}]', "", ""),
+        ("[]", "", ""),
+        ('[{"revisionName":"A","percent":"100"}]', "", ""),
+    ],
+)
+def test_the_alarm_and_the_helper_resolve_every_traffic_shape_identically(traffic, extra, expect):
+    payload = '{"status":{' + extra + '"traffic":' + traffic + "}}"
+    helper = _answer(_helper_predicate(), payload)
+    workflow = _answer(_workflow_predicate(), payload)
+    assert helper == workflow == expect, (
+        f"traffic={traffic} extra={extra!r}: helper={helper!r} workflow={workflow!r} "
+        f"expected={expect!r}. The alarm and the scripts it watches disagree on what is serving."
     )

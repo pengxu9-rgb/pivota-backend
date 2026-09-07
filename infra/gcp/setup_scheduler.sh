@@ -168,13 +168,14 @@ if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   EXPECTED_UCP_BACKEND_BASE_URL="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
   [ "$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL" = "$EXPECTED_UCP_BACKEND_BASE_URL" ] \
     || { echo "STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_UCP_BACKEND_BASE_URL)" >&2; exit 2; }
-  # The service template can describe a 0%-traffic candidate. The untagged
-  # service URL used by the Job instead reaches the single untagged 100%
-  # revision. Refuse a split/candidate state rather than declaring receipt
+  # The service template can describe a 0%-traffic candidate. The service URL
+  # used by the Job instead reaches the single 100%-traffic revision (which
+  # normally carries its c-<sha> tag: deploy_backend.sh promotes the tagged
+  # candidate). Refuse a split/candidate state rather than declaring receipt
   # ready based on code that is not actually serving the URL.
   WEB_ACTIVE_REVISION="$(serving_revision web || true)"
   [ -n "$WEB_ACTIVE_REVISION" ] \
-    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit Jobs are created" >&2; exit 2; }
+    || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before Store Audit Jobs are created" >&2; exit 2; }
   WEB_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_ACTIVE_REVISION" --region "$REGION" --format=json)"
   # Refuse to create or arm a crawler against a revision where Cloud Run would
   # accept OIDC but the app would still return a disabled-receipt 404. This
@@ -201,7 +202,7 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
     || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_COMMERCE_BACKEND_BASE_URL)" >&2; exit 2; }
   WEB_COMMERCE_ACTIVE_REVISION="$(serving_revision web || true)"
   [ -n "$WEB_COMMERCE_ACTIVE_REVISION" ] \
-    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit commerce Jobs are created" >&2; exit 2; }
+    || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before Store Audit commerce Jobs are created" >&2; exit 2; }
   WEB_COMMERCE_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_COMMERCE_ACTIVE_REVISION" --region "$REGION" --format=json)"
   WEB_COMMERCE_RECEIPT_READY="$(printf '%s' "$WEB_COMMERCE_ACTIVE_SPEC" | python3 -c '
 import json,sys
