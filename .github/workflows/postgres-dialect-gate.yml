@@ -118,6 +118,7 @@ on:
       - "core/**"
       - "db/migrations/**"
       - "tests/test_*_postgres.py"
+      - "tests/integration/test_recovery_postgres.py"
       # The two files that can neuter this ENTIRE job, neither matched above.
       # tests/conftest.py pins DATABASE_URL — today conditionally, but making
       # that unconditional turns every gate file's `pytestmark` into a skip,
@@ -185,6 +186,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Recovery report JSONB to authenticated HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYDB'
+          import asyncio
+          import asyncpg
+          async def create_test_database():
+              connection = await asyncpg.connect(
+                  host="localhost", port=5432, user="postgres",
+                  password="postgres", database="postgres")
+              try:
+                  await connection.execute("CREATE DATABASE recovery_contract_test")
+              finally:
+                  await connection.close()
+          asyncio.run(create_test_database())
+          PYDB
+          RUN_RECOVERY_POSTGRES=1 \
+            DATABASE_URL=postgresql://postgres:postgres@localhost:5432/recovery_contract_test \
+            python -m pytest tests/integration/test_recovery_postgres.py -q --junitxml=pytest-recovery-postgres.xml
+          python - <<'PYTEST'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse("pytest-recovery-postgres.xml").getroot().iter("testcase"))
+          assert cases and not any(c.find("skipped") is not None for c in cases), "Recovery PostgreSQL test did not execute"
+          PYTEST
 
       - name: Preflight — prove the Postgres URL actually took effect
         shell: bash
@@ -384,5 +411,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: postgres-dialect-gate-${{ github.run_id }}
-          path: pytest-postgres.xml
+          path: |
+            pytest-postgres.xml
+            pytest-recovery-postgres.xml
           retention-days: 14
