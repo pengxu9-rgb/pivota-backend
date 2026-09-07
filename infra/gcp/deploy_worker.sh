@@ -189,23 +189,38 @@ if [ -n "$PREV_REV" ]; then
     # the TEMPLATE, which in the half-finished-rollout state this whole file exists for names
     # the candidate that never became Ready. The misdiagnosis's remedy rolled production
     # FORWARD into the breakage the script had just refused to touch.
-    echo "could not describe the worker's serving revision $PREV_REV; gcloud said:" >&2
-    sed 's/^/  /' "$PREV_ERR" >&2
+    if [ -s "$PREV_ERR" ]; then
+      echo "could not describe the worker's serving revision $PREV_REV; gcloud said:" >&2
+      sed 's/^/  /' "$PREV_ERR" >&2
+    else
+      echo "could not describe the worker's serving revision $PREV_REV, and gcloud reported no error." >&2
+    fi
     echo "Refusing to deploy: this is a READ failure, not a missing stamp. Do NOT run" >&2
     echo "'gcloud run services update' for it - retry when the API answers." >&2
     exit 1
   }
-  PREV_IMAGE="$(printf '%s' "$PREV_JSON" | python3 -c '
+  # ONE parse, both facts, and a parse failure is a READ failure. Two separate readers each
+  # ended in `2>/dev/null || true`, which threw away the return code -- so "parsed fine, the
+  # image field is empty" and "this is not JSON at all" (an HTML 502 body with rc 0, an empty
+  # body, a JSON list) were indistinguishable, and which refusal fired depended only on the
+  # ORDER of the two blocks below. Swapped, a non-JSON answer printed the `services update`
+  # remedy -- the roll-forward this block exists never to suggest for a non-stamp problem.
+  PREV_FACTS="$(printf '%s' "$PREV_JSON" | python3 -c '
 import json,sys
-try: print(json.load(sys.stdin)["spec"]["containers"][0].get("image") or "")
-except Exception: sys.exit(1)' 2>/dev/null || true)"
-  PREV_SHA="$(printf '%s' "$PREV_JSON" | python3 -c '
-import json,sys
-try: c = json.load(sys.stdin)["spec"]["containers"][0]
-except Exception: sys.exit(1)
-for e in (c.get("env") or []):
-    if e.get("name") == "PIVOTA_COMMIT_SHA":
-        print(e.get("value") or ""); break' 2>/dev/null || true)"
+c = json.load(sys.stdin)["spec"]["containers"][0]
+print(c.get("image") or "")
+print(next((e.get("value") or "" for e in (c.get("env") or [])
+            if e.get("name") == "PIVOTA_COMMIT_SHA"), ""))' 2>/dev/null)" || {
+    echo "could not parse the JSON gcloud returned for the worker's serving revision $PREV_REV." >&2
+    echo "Refusing to deploy: this is a READ failure, not a missing stamp. Do NOT run" >&2
+    echo "'gcloud run services update' for it - retry when the API answers properly." >&2
+    exit 1
+  }
+  PREV_IMAGE="$(printf '%s\n' "$PREV_FACTS" | sed -n 1p)"
+  # Everything after line 1 is the stamp, newlines included: `sed -n 2p` took only the first
+  # line, which turned a multi-line stamp #2108 REFUSED into a silently corrected 40-hex prefix
+  # (and a leading-newline stamp into a false "declares no commit" with the roll-forward remedy).
+  PREV_SHA="$(printf '%s\n' "$PREV_FACTS" | sed -n '2,$p')"
   if [ -z "$PREV_IMAGE" ]; then
     echo "the worker's serving revision $PREV_REV carries an empty image reference, which cannot be" >&2
     echo "redeployed as a rollback target. Refusing to deploy: nothing to roll back to." >&2
@@ -226,8 +241,11 @@ for e in (c.get("env") or []):
   # FOO on rollback. Requires prior write access to the service, so this is hygiene rather
   # than a security boundary - but it also gives "not a digest" a POSITIVE check instead of
   # resting on the env lookup being wired to the right variable.
+  # Lowercase hex only, matching prod-deploy-drift.yml's check exactly: an uppercase stamp
+  # would pass here, be refused there, and never equal $TAG, so the already-on branch would
+  # silently never fire.
   case "$PREV_SHA" in
-    *[!0-9a-fA-F]*) echo "the worker's serving revision declares PIVOTA_COMMIT_SHA='$PREV_SHA', which is not a commit sha - refusing to read it as one" >&2; exit 1 ;;
+    *[!0-9a-f]*) echo "the worker's serving revision declares PIVOTA_COMMIT_SHA='$PREV_SHA', which is not a commit sha - refusing to read it as one" >&2; exit 1 ;;
   esac
   [ "${#PREV_SHA}" = 40 ] || { echo "the worker's serving revision declares PIVOTA_COMMIT_SHA='$PREV_SHA' (${#PREV_SHA} chars, want 40) - refusing to read it as a commit" >&2; exit 1; }
   echo "worker is on $PREV_SHA (image ${PREV_IMAGE##*/})"

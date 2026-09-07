@@ -47,6 +47,8 @@ def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bo
                  prev_image: str = PREV, describe_error: str = "", probe_log: str = "",
                  prev_sha_declared: bool = True, revision_image_empty: bool = False,
                  prev_sha_value: str | None = None, revision_describe_error: str = "",
+                 revision_json_override: str | None = None,
+                 revision_describe_fails_silently: bool = False,
                  traffic_json: str = '{"status":{"traffic":[{"revisionName":"worker-live","percent":100}]}}') -> Path:
     """A `gcloud` that records every invocation and can fail on demand.
 
@@ -67,9 +69,12 @@ def _gcloud_stub(tmp_path: Path, *, probe_fails: bool = False, image_missing: bo
     rev_image = "" if revision_image_empty else (f"{IMG}@{DIGEST}" if prev_image else "")
     declared = prev_image if prev_sha_value is None else prev_sha_value
     rev_env = (f'{{"name":"PIVOTA_COMMIT_SHA","value":"{declared}"}},' if prev_sha_declared else "")
-    rev_error_block = (f'echo "{revision_describe_error}" >&2; exit 1; ' if revision_describe_error else "")
+    rev_error_block = (f'echo "{revision_describe_error}" >&2; exit 1; ' if revision_describe_error
+                       else ('exit 1; ' if revision_describe_fails_silently else ''))
     rev_json = (f'{{"spec":{{"containers":[{{"image":"{rev_image}","env":[{rev_env}'
                 f'{{"name":"PIVOTA_ENV","value":"production"}}]}}]}}}}')
+    if revision_json_override is not None:
+        rev_json = revision_json_override
     stub = binn / "gcloud"
     # An empty `prev` models a service that does not exist. `describe_error` models the
     # DIFFERENT thing the old code could not distinguish: the API failing for any other reason.
@@ -715,7 +720,8 @@ def test_an_empty_image_answer_says_so_rather_than_claiming_a_split(tmp_path):
     assert "no single NAMED revision" not in out, f"the refusal misdescribed the state:\n{out}"
 
 
-@pytest.mark.parametrize("bad", ["abc,FOO=bar", "a" * 39, "sha256:" + "d" * 64, "A" * 40 + "z", "g" * 40])
+@pytest.mark.parametrize("bad", ["abc,FOO=bar", "a" * 39, "sha256:" + "d" * 64, "A" * 40 + "z", "g" * 40, "B" * 40,
+                                 "b" * 40 + "\\n,FOO=bar", "\\n" + "b" * 40])
 def test_a_declared_commit_that_is_not_a_sha_is_refused(tmp_path, bad):
     """PREV_SHA is interpolated into a comma-separated --update-env-vars list on rollback, so a
     stored `abc,FOO=bar` would inject FOO. And a digest-shaped value is exactly the thing this
@@ -724,3 +730,31 @@ def test_a_declared_commit_that_is_not_a_sha_is_refused(tmp_path, bad):
     assert code != 0, out
     assert not _deploys(calls), f"deployed over a revision whose declared commit is {bad!r}"
     assert "PIVOTA_COMMIT_SHA" in out
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["<html>502 Bad Gateway</html>", "", '{"status":{}}', '{"spec":{"containers":[]}}', "[]"],
+)
+def test_an_unparseable_revision_answer_is_a_read_failure_not_a_missing_stamp(tmp_path, body):
+    """`revisions describe` exiting 0 with a body that is not the revision (an HTML 502, an
+    empty body, a list, a JSON without containers) used to be read as "empty image", and — had
+    two blocks ever been reordered — as "declares no PIVOTA_COMMIT_SHA" with the roll-forward
+    remedy. A parse failure is a READ failure: named as one, no remedy printed."""
+    code, out, calls = _run(tmp_path, "prod", SHA, revision_json_override=body)
+    assert code != 0, out
+    assert not _deploys(calls), "nothing may be deployed when the anchor could not be parsed"
+    assert "could not parse" in out, out
+    assert "declares no PIVOTA_COMMIT_SHA" not in out and "empty image reference" not in out, out
+    assert "PIVOTA_COMMIT_SHA=<" not in out, f"the roll-forward remedy was printed for a parse failure:\n{out}"
+
+
+def test_a_failed_revision_describe_with_no_stderr_still_names_itself(tmp_path):
+    """The sibling branch forty lines up learned this the hard way: a non-zero exit with an
+    empty stderr must not print an empty-bodied "gcloud said:". Still a read failure, still no
+    roll-forward remedy."""
+    code, out, calls = _run(tmp_path, "prod", SHA, revision_describe_fails_silently=True)
+    assert code != 0 and not _deploys(calls), out
+    assert "reported no error" in out, out
+    assert "gcloud said:" not in out, out
+    assert "PIVOTA_COMMIT_SHA=<" not in out, out
