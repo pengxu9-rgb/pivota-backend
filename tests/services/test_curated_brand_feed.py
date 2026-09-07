@@ -1555,3 +1555,19 @@ async def test_a_native_variant_becomes_a_sku_AND_a_priced_offer(monkeypatch):
     # without re-deriving it from the string.
     provs = {_json.loads(s["sku_payload"])["variant_id_provenance"] for s in variant_skus}
     assert provs == {"merchant_issued"}
+
+
+def test_a_duplicated_native_variant_id_is_emitted_once():
+    """The dedupe at the native gate is load-bearing, not cosmetic: a record carrying the
+    same variant_id twice makes ingestion's `_drop_options_that_do_not_distinguish` see
+    non-distinct labels and strip `options` from EVERY seed variant of the product — the
+    shade selector disappears for the whole PDP. Shopify feeds do repeat a variant across
+    `variants` and `options` shapes; the mapper must emit each id once."""
+    twice = _native(variants=[
+        {"id": 39406294532166, "price": "11.99", "option1": "Dune", "available": True},
+        {"id": 39406294532166, "price": "11.99", "option1": "Dune", "available": True},
+        {"id": 39406294532168, "price": "11.99", "option1": "Rose", "available": True},
+    ])
+    vs = shopify_product_to_record(
+        twice, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
+    assert [v["variant_id"] for v in vs] == ["39406294532166", "39406294532168"]
