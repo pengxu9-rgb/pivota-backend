@@ -46,7 +46,7 @@ KNOWN_TEST_MERCHANT_IDS: Set[str] = frozenset(
     {
         # 92sfrj-bi.myshopify.com — founder's test store (Winona "Test fixture
         # for PDP" $1.69, PawStyle, MOYU scratch rows).
-        "merch_efbc46b4619cfbdf",
+        "merch_efbc46b4619cfbdf",  # runtime-hardcode-guard: denylist
         # pivota-review-demo*.myshopify.com — Shopify's stock dev-store sample
         # catalog. This was the App Store review rig; Pivota moved to
         # custom-app-only creds on 2026-07-21, so nothing depends on these

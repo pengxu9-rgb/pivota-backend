@@ -152,9 +152,12 @@ jobs:
       # exists to replace. Each entry states what is wrong and who should fix it.
       # Removing an entry is the definition of progress here.
       #
-      #   test_runtime_hardcode_guard          — RED. Reports 3 hardcoded merchant
-      #     ids in comments (services/pdp_renderability.py:219 and two siblings).
-      #     A real finding; the guard is doing its job and the debt is unpaid.
+      #   test_runtime_hardcode_guard          — ✅ FIXED and REMOVED from this list.
+      #     It reported a rig merchant id in two full-line COMMENTS and in the
+      #     denylist that EXCLUDES that rig from serving — none a runtime default.
+      #     The guard now classifies a line by how the id can reach runtime
+      #     (scripts/audit_runtime_hardcodes.line_is_violation) and its tests pin
+      #     both directions, so it is back in the sweep and green.
       #   test_schema_guard_migration_coverage — ✅ FIXED and REMOVED from this
       #     list (#1624, issue #1617). It was the most valuable entry here:
       #     migration 187 added `merchant_onboarding.signup_source` with no
@@ -163,9 +166,16 @@ jobs:
       #     entry is a promise to come back, and this is what honouring one looks
       #     like. 46 of 46 column-adding migrations are now covered, so this
       #     gate should stay green.
-      #   test_audit_scheduler_worker_env_gate — RED (2 tests). Appeared after the
-      #     2026-07-28 recon, so it is a recent regression, not ancient debt.
-      #   test_external_seed_csv_import        — RED alone AND in the sweep.
+      #   test_audit_scheduler_worker_env_gate — ✅ REMOVED from this list. Listed
+      #     RED (2 tests) on 2026-07-28; on 2026-09-07 it passes alone (16) and
+      #     inside the exact sweep command with every quarantine entry lifted
+      #     (16,449 passed, 0 failed), so whatever regressed it has since been
+      #     fixed at the source. If it reddens again, the entry comes back WITH
+      #     the failing test names, not a count.
+      #   test_external_seed_csv_import        — ✅ FIXED and REMOVED from this list.
+      #     The import path's seller-of-record derivation reads `brand_claims`
+      #     and deliberately propagates a failed read; the hermetic test never
+      #     built the table. It now builds it from the model.
       #   test_winnable_prompts                — RESOLVED, entry removed. The
       #     diagnosis written here was right: `tests/test_vertex_gemini_credentials.py`
       #     reloaded `config.settings` + `services.vertex_gemini` under patched
@@ -219,9 +229,6 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests readiness/tests \
-            --ignore=tests/test_runtime_hardcode_guard.py \
-            --ignore=tests/test_audit_scheduler_worker_env_gate.py \
-            --ignore=tests/test_external_seed_csv_import.py \
             --ignore=readiness/tests/test_real_merchant_goldens.py \
             --ignore=readiness/tests/test_shopify_live_source.py \
             --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
