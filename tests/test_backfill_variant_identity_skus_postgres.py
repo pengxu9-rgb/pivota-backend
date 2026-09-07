@@ -126,10 +126,17 @@ async def _canonical_offer(db, pk: str, *, price: float = 24.0, suppressed: bool
     )
 
 
-async def _run(apply: bool = True, limit: int = 0, inherit: bool = False) -> Dict[str, Any]:
+async def _run(apply: bool = True, limit: int = 0, inherit: bool = False, adopt: bool = False) -> Dict[str, Any]:
     from scripts.backfill_variant_identity_skus import run
 
-    return await run(apply=apply, limit=limit, allow_inherited_price=inherit)
+    return await run(apply=apply, limit=limit, allow_inherited_price=inherit, adopt_existing_offers=adopt)
+
+
+async def _counts(db) -> Dict[str, int]:
+    out = {}
+    for t in ("catalog_skus", "catalog_offers"):
+        out[t] = await db.fetch_val(f"SELECT COUNT(*) FROM {t}")
+    return out
 
 
 async def _skus(db, pk: str) -> List[Dict[str, Any]]:
@@ -141,7 +148,8 @@ async def _skus(db, pk: str) -> List[Dict[str, Any]]:
 
 async def _offers(db, pk: str) -> List[Dict[str, Any]]:
     rows = await db.fetch_all(
-        "SELECT offer_id, sku_key, availability, list_price, offer_payload, suppressed_at "
+        "SELECT offer_id, sku_key, availability, list_price, offer_payload, suppressed_at, "
+        "source_system, price_confidence, market, catalog_track, source_domain "
         "FROM catalog_offers WHERE product_key = :pk ORDER BY offer_id", {"pk": pk})
     return [dict(r) for r in rows]
 
@@ -209,36 +217,215 @@ async def test_a_second_run_writes_nothing_new(_db) -> None:
     assert len(offers_2) == 3                                          # canonical + 2, twice
 
 
-async def test_an_ingest_written_variant_offer_is_updated_not_doubled(_db) -> None:
-    """ingestion writes `<pk>::v:<vid>` + an offer keyed on the destination_url. The backfill
-    must find that live offer by sku_key and update its price, not stand a second offer
-    beside it under a different offer_id."""
+async def _ingest_owned_variant(db, pk: str, *, variant: Dict[str, Any]) -> str:
+    """ingestion already wrote `<pk>::v:<vid>` and an offer keyed on the destination_url,
+    measured at 12.00 / out_of_stock / confidence 0.7 with its own payload."""
     from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
 
-    pk = "ext:brand:ingested"
-    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "Ruby Woo", "price": "26.00"}])
-    await _canonical_offer(_db, pk)
+    await _product(db, pk, variants=[variant])
+    await _canonical_offer(db, pk, price=31.0, availability="in_stock")
     vkey = derive_variant_sku_key(pk, REAL_VID)
+    await db.execute(
+        """
+        INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
+                                  source_variant_id, title, currency, readiness_tier)
+        VALUES (:sk, :pk, 'merch_obs_brand', 'external_seed', :epid, :vid, 'Ruby Woo', 'GBP', 'commerce_ready')
+        """, {"sk": vkey, "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
+    await db.execute(
+        """
+        INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, list_price,
+                                    merchant_effective_price, availability, price_confidence,
+                                    source_system, offer_payload)
+        VALUES ('offer:ingest:abc', :sk, :pk, 'merch_obs_brand', 12.00, 12.00, 'out_of_stock', 0.7,
+                'catalog_enrichment_agent_v1', '{"agent": "ingest"}'::jsonb)
+        """, {"sk": vkey, "pk": pk})
+    return vkey
+
+
+async def test_an_offer_another_writer_owns_is_left_alone_by_default(_db) -> None:
+    """The script's job is products with NO variant offer. An ingest-measured offer is fresher
+    than any seed snapshot; the default run stamps the SKU's identity and touches nothing else."""
+    pk = "ext:brand:ingested"
+    vkey = await _ingest_owned_variant(_db, pk, variant={"variant_id": REAL_VID, "title": "Ruby Woo", "price": "26.00"})
+
+    report = await _run()
+
+    assert report["skipped_offer_owned_by_other_writer"] == 1
+    assert report.get("offers_inserted", 0) == 0 and report.get("offers_adopted", 0) == 0
+    offers = [o for o in await _offers(_db, pk) if o["sku_key"] == vkey]
+    assert [o["offer_id"] for o in offers] == ["offer:ingest:abc"]
+    assert float(offers[0]["list_price"]) == 12.0 and offers[0]["availability"] == "out_of_stock"
+    assert offers[0]["source_system"] == "catalog_enrichment_agent_v1"
+    sku = (await _skus(_db, pk))[0]
+    assert _payload(sku["sku_payload"])["variant_id_provenance"] == "merchant_issued"
+
+
+async def test_an_adopted_offer_is_restamped_and_a_silent_variant_keeps_its_measured_availability(_db) -> None:
+    """THE P0 OF THE FIRST REVIEW ROUND. With --adopt-existing-offers the ingest offer is
+    re-priced -- but under THIS writer's provenance (source_system, payload merge, confidence
+    reset), and its measured out_of_stock survives a variant that said nothing about stock."""
+    pk = "ext:brand:adopted"
+    vkey = await _ingest_owned_variant(_db, pk, variant={"variant_id": REAL_VID, "title": "Ruby Woo"})  # no price, silent
+
+    report = await _run(adopt=True, inherit=True)
+
+    assert report["offers_adopted"] == 1 and report["offers_price_inherited"] == 1
+    offers = [o for o in await _offers(_db, pk) if o["sku_key"] == vkey]
+    assert [o["offer_id"] for o in offers] == ["offer:ingest:abc"]           # updated, not doubled
+    o = offers[0]
+    assert float(o["list_price"]) == 31.0                                    # inherited, flagged on
+    assert o["availability"] == "out_of_stock"                               # measured value kept
+    assert o["source_system"] == "variant_identity_backfill_v1"
+    assert o["price_confidence"] is None
+    payload = _payload(o["offer_payload"])
+    assert payload["agent"] == "ingest"                                      # merged, not replaced
+    assert payload["price_from"] == "canonical"
+    assert payload["variant_id_provenance"] == "merchant_issued"
+    # the reused SKU row now agrees with the offer beside it
+    row = await _db.fetch_one("SELECT currency, readiness_tier FROM catalog_skus WHERE sku_key = :k", {"k": vkey})
+    assert row["currency"] == "USD" and row["readiness_tier"] == "referral_only"
+
+
+async def test_an_adopted_offer_takes_the_variants_own_availability_when_it_spoke(_db) -> None:
+    pk = "ext:brand:adopted-spoke"
+    vkey = await _ingest_owned_variant(_db, pk, variant={
+        "variant_id": REAL_VID, "title": "Ruby Woo", "price": "26.00", "in_stock": True})
+
+    await _run(adopt=True)
+
+    o = [o for o in await _offers(_db, pk) if o["sku_key"] == vkey][0]
+    assert o["availability"] == "in_stock" and float(o["list_price"]) == 26.0
+
+
+async def test_a_string_false_in_stock_is_not_in_stock(_db) -> None:
+    pk = "ext:brand:stringy"
+    await _product(_db, pk, variants=[
+        {"variant_id": REAL_VID, "title": "A", "price": "9.00", "in_stock": "false"},
+        {"variant_id": REAL_VID_2, "title": "B", "price": "9.00", "in_stock": "no"},
+    ])
+    await _canonical_offer(_db, pk, availability="in_stock")
+
+    await _run()
+
+    offers = {o["sku_key"]: o["availability"] for o in await _offers(_db, pk)}
+    by_vid = {s["source_variant_id"]: s["sku_key"] for s in await _skus(_db, pk)}
+    # a string is not a boolean: neither may be read as in_stock (truthiness did), and neither is a
+    # claim of out_of_stock either -- unknown, which the serving denylist treats as servable
+    assert offers[by_vid[REAL_VID]] == "unknown"
+    assert offers[by_vid[REAL_VID_2]] == "unknown"
+
+
+# ------------------------------------------------------------------------------ dry run
+
+async def test_a_dry_run_writes_nothing_and_reports_what_apply_would_do(_db) -> None:
+    """The default invocation IS the dry run; its `if apply:` guard is the only thing between an
+    operator's preview and 13,270 writes."""
+    pk = "ext:brand:dry"
+    await _product(_db, pk, variants=[
+        {"variant_id": REAL_VID, "title": "A", "price": "9.00"},
+        {"variant_id": REAL_VID_2, "title": "B", "price": "9.00"},
+    ])
+    await _canonical_offer(_db, pk)
+    before = await _counts(_db)
+
+    dry = await _run(apply=False)
+    assert await _counts(_db) == before
+    assert dry["applied"] == 0 and dry["skus_inserted"] == 2 and dry["offers_inserted"] == 2
+
+    wet = await _run(apply=True)
+    assert wet["applied"] == 1
+    assert {k: v for k, v in wet.items() if k != "applied"} == {k: v for k, v in dry.items() if k != "applied"}
+    assert (await _counts(_db))["catalog_skus"] == before["catalog_skus"] + 2
+
+
+# ------------------------------------------------------- the canonical read never picks a variant
+
+async def test_the_canonical_read_skips_variant_offers_even_without_a_canonical_key(_db) -> None:
+    """Two guards closed this door (the NOT LIKE and the ORDER BY tie-break on `::canonical`);
+    this fixture defeats the tie-break -- the product's only non-variant offer is keyed
+    `<pk>::merchantsku` -- so only the NOT LIKE can keep run 2's second variant from sourcing its
+    market / track / domain from the variant offer run 1 wrote."""
+    pk = "ext:brand:nocanon"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _db.execute(
+        """
+        INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, catalog_track, market,
+                                    source_domain, availability, list_price, offer_payload)
+        VALUES ('offer:merchantsku', :sk, :pk, 'merch_obs_brand', 'external_referral', 'GB',
+                'brand.co.uk', 'in_stock', 9.00, '{}'::jsonb)
+        """, {"sk": f"{pk}::merchantsku", "pk": pk})
+    await _run()
+    # run 1's variant offer is now the NEWEST unsuppressed offer on the product; poison it
+    await _db.execute(
+        "UPDATE catalog_offers SET market = 'XX', catalog_track = 'poison', source_domain = 'poison.example', "
+        "updated_at = NOW() + interval '1 hour' WHERE product_key = :pk AND sku_key <> :sk",
+        {"pk": pk, "sk": f"{pk}::merchantsku"})
+    await _db.execute(
+        "UPDATE catalog_products SET product_payload = CAST(:p AS jsonb) WHERE product_key = :pk",
+        {"pk": pk, "p": json.dumps({"variants": [
+            {"variant_id": REAL_VID, "title": "A", "price": "9.00"},
+            {"variant_id": REAL_VID_2, "title": "B", "price": "9.00"}]})})
+
+    await _run()
+
+    by_vid = {s["source_variant_id"]: s["sku_key"] for s in await _skus(_db, pk)}
+    second = [o for o in await _offers(_db, pk) if o["sku_key"] == by_vid[REAL_VID_2]][0]
+    assert second["market"] == "GB" and second["catalog_track"] == "external_referral"
+    assert second["source_domain"] == "brand.com" or second["source_domain"] == "brand.co.uk"
+    assert second["source_domain"] != "poison.example"
+
+
+# ------------------------------------------------------------------------ suppression filters
+
+async def test_a_suppressed_sku_owning_the_identity_gets_no_live_offer(_db) -> None:
+    pk = "ext:brand:supsku"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk)
+    await _db.execute(
+        """
+        INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
+                                  source_variant_id, title, suppressed_at, suppression_reason)
+        VALUES (:sk, :pk, 'merch_obs_brand', 'external_seed', :epid, :vid, 'A', NOW(), 'merged_loser')
+        """, {"sk": f"{pk}::v::{REAL_VID}", "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
+
+    report = await _run()
+
+    assert report["skipped_sku_suppressed"] == 1
+    assert report.get("offers_inserted", 0) == 0
+    assert len(await _skus(_db, pk)) == 1                                   # nothing inserted beside it
+    assert len(await _offers(_db, pk)) == 1                                 # canonical only
+
+
+async def test_a_suppressed_product_is_not_scanned(_db) -> None:
+    pk = "ext:brand:supprod"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk)
+    await _db.execute("UPDATE catalog_products SET suppressed_at = NOW(), suppression_reason = 'unpublished' "
+                      "WHERE product_key = :pk", {"pk": pk})
+
+    report = await _run()
+
+    assert report.get("products_scanned", 0) == 0 and await _skus(_db, pk) == []
+
+
+async def test_a_derived_key_owned_by_a_different_variant_is_never_reidentified(_db) -> None:
+    pk = "ext:brand:collide"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk)
+    from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
+    key = derive_variant_sku_key(pk, REAL_VID)
     await _db.execute(
         """
         INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
                                   source_variant_id, title)
-        VALUES (:sk, :pk, 'merch_obs_brand', 'external_seed', :epid, :vid, 'Ruby Woo')
-        """, {"sk": vkey, "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
-    await _db.execute(
-        """
-        INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, list_price,
-                                    source_system, offer_payload)
-        VALUES ('offer:ingest:abc', :sk, :pk, 'merch_obs_brand', 24.00,
-                'catalog_enrichment_agent_v1', '{}'::jsonb)
-        """, {"sk": vkey, "pk": pk})
+        VALUES (:sk, :pk, 'merch_obs_brand', 'external_seed', :epid, 'some-other-variant', 'Other')
+        """, {"sk": key, "pk": pk, "epid": f"brand:{pk}"})
 
     report = await _run()
 
-    assert report["offers_existing_updated"] == 1 and report.get("offers_inserted", 0) == 0
-    offers = [o for o in await _offers(_db, pk) if o["sku_key"] == vkey]
-    assert [o["offer_id"] for o in offers] == ["offer:ingest:abc"]
-    assert float(offers[0]["list_price"]) == 26.0
+    assert report["skipped_sku_key_collision"] == 1
+    row = await _db.fetch_one("SELECT source_variant_id FROM catalog_skus WHERE sku_key = :k", {"k": key})
+    assert row["source_variant_id"] == "some-other-variant"
 
 
 # ----------------------------------------------------------------- suppressed offers stay dead
@@ -319,6 +506,8 @@ async def test_one_failing_product_is_counted_and_the_run_continues(_db) -> None
     report = await _run()
 
     assert report["products_failed"] == 1
+    assert report["skus_inserted"] == 1 and report["offers_inserted"] == 1    # the good product only
+    assert report["products_planned"] == 1
     assert await _skus(_db, "ext:brand:a-bad") == []
     assert len(await _offers(_db, "ext:brand:a-bad")) == 1          # canonical only, nothing half-written
     assert len(await _skus(_db, "ext:brand:b-good")) == 1
@@ -381,6 +570,20 @@ async def test_inherited_price_is_opt_in_single_variant_only_and_stamped(_db) ->
     # the two-variant product's unpriced sibling still gets nothing, flag or no flag
     pair_vids = {s["source_variant_id"] for s in await _skus(_db, pair)}
     assert pair_vids == {REAL_VID_2}
+
+
+async def test_a_default_title_placeholder_beside_one_real_variant_does_not_qualify_for_inheritance(_db) -> None:
+    pk = "ext:brand:placeholder"
+    await _product(_db, pk, variants=[
+        {"variant_id": "brand-x-default", "title": "Default Title"},
+        {"variant_id": REAL_VID, "title": "Only real"},                  # unpriced
+    ])
+    await _canonical_offer(_db, pk, price=31.0)
+
+    report = await _run(inherit=True)
+
+    assert report.get("offers_price_inherited", 0) == 0
+    assert await _skus(_db, pk) == []
 
 
 async def test_the_newest_seed_wins_and_a_product_is_never_fanned_out(_db) -> None:

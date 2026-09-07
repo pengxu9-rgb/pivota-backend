@@ -30,7 +30,16 @@ TWO THINGS IT REFUSES TO DO.
    Off by default; multi-variant products never inherit under any flag.
 
 HOW IT WRITES. Per product, one transaction, one try/except: a failure is counted and logged as
-`products_failed`, never allowed to abort the run with an unknown number of rows applied.
+`products_failed`, never allowed to abort the run with an unknown number of rows applied, and the
+report counts only what committed. `--limit N` stops after N products are WRITTEN; the read is
+paged (PAGE_SIZE) so the scan is bounded by the pages those N products live in, not the table.
+
+WHOSE OFFERS IT TOUCHES. Its job is products with NO variant offer. A variant SKU that already
+carries a live offer from another writer (ingestion's `catalog_enrichment_agent_v1`) is left
+alone and counted `skipped_offer_owned_by_other_writer` -- that offer was measured more recently
+than any seed snapshot. `--adopt-existing-offers` overrides that, and an adopted offer is
+re-stamped (`source_system`, `offer_payload`, `price_confidence` reset) so the batch stays
+identifiable and reversible. A silent variant never overwrites a measured availability.
 catalog_skus' live unique identity is the 4-column `idx_catalog_skus_source_identity_v2`
 (merchant_id, platform, product_key, source_variant_id) -- migration 123 dropped the 3-column
 one -- and `services/catalog_variant_promoter` already writes `<pk>::v::<id>` rows with that
@@ -90,15 +99,18 @@ SOURCE_SYSTEM = "variant_identity_backfill_v1"
 #: JOIN cannot fan a product out into duplicate rows.
 SELECT_PRODUCTS_SQL = """
     SELECT cp.product_key, cp.merchant_id, cp.platform, cp.source_product_id,
-           cp.source_domain, cp.title, cp.brand,
+           cp.source_domain, cp.title,
            (SELECT eps.seed_data->'snapshot'->'variants'
               FROM external_product_seeds eps
              WHERE eps.external_product_id = cp.source_product_id
+               AND eps.status = 'active'
              ORDER BY eps.updated_at DESC NULLS LAST
              LIMIT 1)                                AS seed_variants,
            (cp.product_payload->'variants')          AS payload_variants
     FROM catalog_products cp
     WHERE cp.platform = 'external_seed'
+      AND cp.suppressed_at IS NULL
+      AND cp.suppression_reason IS NULL
       AND cp.product_key > :after
     ORDER BY cp.product_key
     LIMIT :page
@@ -133,7 +145,7 @@ VARIANT_SKU_KEY_PATTERN = "%::v:%"
 #: The one live offer a variant SKU already carries, whoever wrote it. Re-runs and a later
 #: ingest of the same product must UPDATE it, never stand a second offer beside it.
 SELECT_LIVE_OFFER_FOR_SKU_SQL = """
-    SELECT offer_id
+    SELECT offer_id, source_system
     FROM catalog_offers
     WHERE sku_key = :sku_key
       AND suppressed_at IS NULL
@@ -153,13 +165,37 @@ SELECT_SKU_BY_IDENTITY_SQL = """
       AND platform = :platform
       AND product_key = :product_key
       AND source_variant_id = :source_variant_id
+      AND suppressed_at IS NULL
+      AND suppression_reason IS NULL
     LIMIT 1
+"""
+
+#: A suppressed row that owns the identity: we must neither insert beside it (index) nor
+#: hang a live offer off it (the PDP's fetch_skus_for_keys has no suppression filter).
+SELECT_ANY_SKU_BY_IDENTITY_SQL = """
+    SELECT sku_key
+    FROM catalog_skus
+    WHERE merchant_id = :merchant_id
+      AND platform = :platform
+      AND product_key = :product_key
+      AND source_variant_id = :source_variant_id
+    LIMIT 1
+"""
+
+#: The derived key may already belong to a DIFFERENT variant (derive_variant_sku_key hashes a
+#: 60-char normalisation, so two long punctuated ids can collide). Re-identifying that row via
+#: ON CONFLICT would be silent data loss; the pick is skipped instead.
+SELECT_SKU_BY_KEY_SQL = """
+    SELECT source_variant_id FROM catalog_skus WHERE sku_key = :sku_key
 """
 
 STAMP_EXISTING_SKU_SQL = """
     UPDATE catalog_skus
-       SET sku_payload = COALESCE(sku_payload, '{}'::jsonb) || CAST(:stamp AS jsonb),
-           updated_at  = NOW()
+       SET sku_payload    = COALESCE(sku_payload, '{}'::jsonb) || CAST(:stamp AS jsonb),
+           currency       = :currency,
+           readiness_tier = :readiness_tier,
+           source_domain  = COALESCE(:source_domain, source_domain),
+           updated_at     = NOW()
      WHERE sku_key = :sku_key
 """
 
@@ -177,8 +213,7 @@ UPSERT_SKU_SQL = """
         CAST(:sku_payload AS jsonb), :readiness_tier, NOW()
     )
     ON CONFLICT (sku_key) DO UPDATE SET
-        source_variant_id = EXCLUDED.source_variant_id,
-        sku_payload       = EXCLUDED.sku_payload,
+        sku_payload       = COALESCE(catalog_skus.sku_payload, '{}'::jsonb) || EXCLUDED.sku_payload,
         updated_at        = NOW()
 """
 
@@ -199,7 +234,13 @@ UPSERT_OFFER_SQL = """
         list_price               = EXCLUDED.list_price,
         merchant_effective_price = EXCLUDED.merchant_effective_price,
         estimated_best_price     = EXCLUDED.estimated_best_price,
-        availability             = EXCLUDED.availability,
+        price_confidence         = NULL,
+        availability             = CASE WHEN CAST(:variant_spoke AS boolean)
+                                        THEN EXCLUDED.availability
+                                        ELSE catalog_offers.availability END,
+        source_system            = EXCLUDED.source_system,
+        offer_payload            = COALESCE(catalog_offers.offer_payload, '{}'::jsonb)
+                                   || EXCLUDED.offer_payload,
         updated_at               = NOW()
 """
 
@@ -224,20 +265,23 @@ def _price_of(variant: Dict[str, Any]) -> Optional[float]:
     return variant_own_price(variant)
 
 
-def _availability_of(variant: Dict[str, Any], fallback: Optional[str]) -> str:
-    """The one availability vocabulary (utils/availability_vocabulary). A crawled
-    `"https://schema.org/InStock"` or `"Sold Out"` must land as `in_stock` /
-    `out_of_stock`, never verbatim; anything unclassifiable is `unknown`, which the
-    serving denylist treats as servable -- the same asymmetry every other lane keeps."""
+def _availability_of(variant: Dict[str, Any], fallback: Optional[str]) -> Tuple[str, bool]:
+    """(availability, variant_spoke) through the one vocabulary (utils/availability_vocabulary).
+
+    A crawled `"https://schema.org/InStock"` or `"Sold Out"` lands as `in_stock` /
+    `out_of_stock`, never verbatim; anything unclassifiable is `unknown`, which the serving
+    denylist treats as servable -- the same asymmetry every other lane keeps. `variant_spoke`
+    is False only when the variant carried NO availability evidence of its own: then the
+    product's is the best evidence for a NEW offer, and no evidence at all against an
+    EXISTING offer's measured value."""
     raw = variant.get("availability")
     if raw is not None and str(raw).strip():
-        # The variant SAID something. If we cannot read it, it is unknown -- the product's
-        # in_stock must not be written over a statement the variant made about itself.
-        return normalize_availability(raw) or "unknown"
-    if "in_stock" in variant and variant.get("in_stock") is not None:
-        return "in_stock" if variant.get("in_stock") else "out_of_stock"
-    # The variant said nothing: the product-level availability is the best evidence.
-    return normalize_availability(fallback) or "unknown"
+        return normalize_availability(raw) or "unknown", True
+    flag = variant.get("in_stock")
+    if flag is not None and str(flag).strip() != "":
+        # Through the vocabulary, not truthiness: "false" and "no" are strings, and true.
+        return normalize_availability(flag) or "unknown", True
+    return normalize_availability(fallback) or "unknown", False
 
 
 def _option_labels(variant: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
@@ -290,7 +334,7 @@ def plan_for_product(
             # The single-variant case is the only one `--allow-inherited-price` may
             # rescue: one merchant-issued variant IS the product, so the canonical
             # offer's price is its price. run() decides, with the flag in hand.
-            if len(real) == 1 and allow_inherited_price:
+            if len(variants) == 1 and len(real) == 1 and allow_inherited_price:
                 out.append({"variant_id": vid, "variant": variant, "price": None})
                 continue
             counts["skipped_no_variant_price"] += 1
@@ -309,10 +353,12 @@ def _positive(value: Any) -> Optional[float]:
 
 async def _write_product(
     *, row: Dict[str, Any], picks: List[Dict[str, Any]], canonical: Dict[str, Any],
-    counts: collections.Counter, apply: bool,
+    counts: collections.Counter, apply: bool, adopt_existing_offers: bool = False,
 ) -> None:
     """Every SKU+offer pair of one product, in one transaction. Raises on failure; the
-    caller counts it. Dry runs read (to report what a real run would reuse) and skip writes."""
+    caller counts it -- `counts` here is the PRODUCT's own counter, merged into the report
+    only after its transaction commits, so a rolled-back product reports zero rows.
+    Dry runs read (to report what a real run would reuse) and skip writes."""
     for pick in picks:
         vid, variant = pick["variant_id"], pick["variant"]
         price = pick["price"]
@@ -334,6 +380,9 @@ async def _write_product(
             "source_variant_id": vid[:128],
         }
         existing = await database.fetch_one(SELECT_SKU_BY_IDENTITY_SQL, identity)
+        if existing is None and await database.fetch_one(SELECT_ANY_SKU_BY_IDENTITY_SQL, identity):
+            counts["skipped_sku_suppressed"] += 1
+            continue
         stamp = {
             "variant_id": vid,
             "variant_id_provenance": MERCHANT_ISSUED,
@@ -348,6 +397,10 @@ async def _write_product(
             counts["skus_existing_reused"] += 1
         else:
             sku_key = derive_variant_sku_key(row["product_key"], vid)
+            owner = await database.fetch_one(SELECT_SKU_BY_KEY_SQL, {"sku_key": sku_key})
+            if owner is not None and str(owner["source_variant_id"]) != vid[:128]:
+                counts["skipped_sku_key_collision"] += 1
+                continue
             counts["skus_inserted"] += 1
 
         labels, attrs = _option_labels(variant)
@@ -379,10 +432,19 @@ async def _write_product(
             "variant_id_provenance": MERCHANT_ISSUED,
             "price_from": price_from,
         }
+        availability, variant_spoke = _availability_of(variant, canonical.get("availability"))
         live = await database.fetch_one(SELECT_LIVE_OFFER_FOR_SKU_SQL, {"sku_key": sku_key})
         if live is not None:
+            if str(live["source_system"] or "") != SOURCE_SYSTEM and not adopt_existing_offers:
+                # Another writer measured this offer more recently than any seed snapshot.
+                # The SKU stamp still lands (identity is a fact); the money row is theirs.
+                counts["skipped_offer_owned_by_other_writer"] += 1
+                if apply and existing is not None:
+                    await database.execute(STAMP_EXISTING_SKU_SQL, _stamp_params(sku_key, stamp, currency, row))
+                continue
             offer_id = str(live["offer_id"])
-            counts["offers_existing_updated"] += 1
+            counts["offers_existing_updated" if str(live["source_system"] or "") == SOURCE_SYSTEM
+                   else "offers_adopted"] += 1
         else:
             # derive_offer_id's third argument is a destination_url at ingest time; it is only
             # hash input. A CONSTANT salt keeps the id a pure function of (product, sku) so
@@ -399,7 +461,8 @@ async def _write_product(
             "readiness_tier": canonical.get("readiness_tier") or OFFER_READINESS_TIER,
             "offer_mode": canonical.get("offer_mode") or OFFER_MODE,
             "channel": canonical.get("channel") or "default",
-            "availability": _availability_of(variant, canonical.get("availability")),
+            "availability": availability,
+            "variant_spoke": variant_spoke,
             "currency": currency,
             "list_price": price,
             "merchant_effective_price": price,
@@ -413,15 +476,25 @@ async def _write_product(
         counts["offers"] += 1
         if apply:
             if existing is not None:
-                await database.execute(
-                    STAMP_EXISTING_SKU_SQL, {"sku_key": sku_key, "stamp": json.dumps(stamp)}
-                )
+                await database.execute(STAMP_EXISTING_SKU_SQL, _stamp_params(sku_key, stamp, currency, row))
             else:
                 await database.execute(UPSERT_SKU_SQL, sku_params)
             await database.execute(UPSERT_OFFER_SQL, offer_params)
 
 
-async def run(*, apply: bool, limit: int, allow_inherited_price: bool) -> Dict[str, Any]:
+def _stamp_params(sku_key: str, stamp: Dict[str, Any], currency: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "sku_key": sku_key,
+        "stamp": json.dumps(stamp),
+        "currency": currency,
+        "readiness_tier": OFFER_READINESS_TIER,
+        "source_domain": row.get("source_domain"),
+    }
+
+
+async def run(
+    *, apply: bool, limit: int, allow_inherited_price: bool, adopt_existing_offers: bool = False
+) -> Dict[str, Any]:
     counts: collections.Counter = collections.Counter()
     touched = 0
     after = ""
@@ -450,23 +523,25 @@ async def run(*, apply: bool, limit: int, allow_inherited_price: bool) -> Dict[s
                 key = "skipped_all_offers_suppressed" if had_any else "skipped_no_canonical_offer"
                 counts[key] += len(picks)
                 continue
-            counts["products_planned"] += 1
+            local: collections.Counter = collections.Counter()
+            kwargs = dict(
+                row=row, picks=picks, canonical=dict(canonical), counts=local,
+                adopt_existing_offers=adopt_existing_offers,
+            )
             try:
                 if apply:
                     async with database.transaction():
-                        await _write_product(
-                            row=row, picks=picks, canonical=dict(canonical), counts=counts, apply=True
-                        )
+                        await _write_product(apply=True, **kwargs)
                 else:
-                    await _write_product(
-                        row=row, picks=picks, canonical=dict(canonical), counts=counts, apply=False
-                    )
+                    await _write_product(apply=False, **kwargs)
             except Exception as exc:  # noqa: BLE001 -- one product must not abort 13k
                 counts["products_failed"] += 1
                 logger.warning(
                     "product %s failed (%s: %s); continuing", row["product_key"], type(exc).__name__, exc
                 )
                 continue
+            counts.update(local)                       # only what committed
+            counts["products_planned"] += 1
             touched += 1
             if limit and touched >= limit:
                 counts["stopped_at_limit"] = 1
@@ -490,6 +565,12 @@ def main() -> int:
         "canonical offer's price (stamped price_from=canonical). Multi-variant products "
         "never inherit: siblings differ in exactly the dimension that carries price.",
     )
+    ap.add_argument(
+        "--adopt-existing-offers",
+        action="store_true",
+        help="also re-price and re-stamp a variant offer another writer (ingestion) already "
+        "owns. Off by default: that offer was measured more recently than any seed snapshot.",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -500,6 +581,7 @@ def main() -> int:
                 apply=args.apply,
                 limit=args.limit,
                 allow_inherited_price=args.allow_inherited_price,
+                adopt_existing_offers=args.adopt_existing_offers,
             )
         finally:
             await database.disconnect()
