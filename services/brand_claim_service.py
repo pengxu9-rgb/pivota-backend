@@ -253,6 +253,7 @@ async def _inferred_merchant_hosts(merchant_id: str, *, strict: bool = False) ->
             SELECT DISTINCT source_domain, canonical_url
               FROM catalog_products
              WHERE merchant_id = :merchant_id
+             ORDER BY source_domain, canonical_url
              LIMIT 500
             """,
             {"merchant_id": merchant_id},
@@ -552,11 +553,17 @@ async def declare_official_domain(
     # The CAP is checked before this load on purpose: the owned-set read is a
     # 500-row catalog scan plus an onboarding read on an unrate-limited route,
     # and a merchant already at the cap should not get it for free.
+    #
+    # It bounds only rows a declaration can CREATE: a host that already has a row of
+    # any source is not a new row. The sixth round removed that `host not in existing`
+    # gate because the upsert could flip an existing row's source; the INSERT-ONLY
+    # writer below cannot, so re-declaring one of your own hosts at the cap is the
+    # idempotent no-op it always should have been rather than a 429.
     declared_count = sum(
         1 for r in existing.values()
         if str(r.get("source") or "") == mod.SOURCE_DECLARED
     )
-    if declared_count >= _MAX_DECLARED_PER_MERCHANT:
+    if host not in existing and declared_count >= _MAX_DECLARED_PER_MERCHANT:
         return {"status": DECLARE_TOO_MANY, "domain": host,
                 "declared_count": declared_count}
 

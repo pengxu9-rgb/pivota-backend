@@ -1194,3 +1194,176 @@ async def test_a_merchant_at_the_cap_does_not_get_the_catalog_scan(monkeypatch):
 
     out = await svc.declare_official_domain("m1", "one-too-many.com")
     assert out["status"] == svc.DECLARE_TOO_MANY
+
+
+# ---------------------------------------------------------------------
+# Eighth round: the seeder's own read, the heal's tenant scope, the sample
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_seeder_writes_nothing_when_it_cannot_see_what_exists(monkeypatch):
+    """The seeder decides what to WRITE from `known`. Before this round that read was
+    best-effort: one DB blip made `known` empty, every inferred host went to the upsert,
+    and a verified/dead row came back `inferred`/`unchecked` -- a dead domain in the
+    official set again, the UCP fence losing the merchant, the cross-tenant guard
+    losing its proof. Real table, real blip on that one read."""
+    from db.database import database
+    from db import merchant_official_domains as m
+    from services import official_domain_liveness as liveness
+
+    mid = "test-seeder-blip"
+
+    async def _inferred(_mid, **_kw):
+        return {"brand.com", "new-host.com"}
+
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
+
+    await database.connect()
+    try:
+        await m.ensure_merchant_official_domains_table()
+        await database.execute(
+            "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+        )
+        assert await m.upsert_official_domain(
+            merchant_id=mid, domain="brand.com", source=m.SOURCE_VERIFIED,
+            verification_status=m.VERIFICATION_VERIFIED, liveness_status=m.LIVENESS_DEAD,
+        ) is True
+
+        real_list = m.list_official_domains
+        seen = []
+
+        async def _blip(_mid, **kw):
+            seen.append(kw)
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(m, "list_official_domains", _blip)
+        seeded = await liveness.seed_inferred_domains(mid)
+        monkeypatch.setattr(m, "list_official_domains", real_list)
+
+        assert seeded == 0
+        assert seen and seen[0].get("strict") is True, "the seeder must ask STRICTLY"
+        rows = {r["domain"]: r for r in await m.list_official_domains(mid)}
+        assert set(rows) == {"brand.com"}, f"the seeder wrote on a blip: {sorted(rows)}"
+        assert rows["brand.com"]["source"] == m.SOURCE_VERIFIED
+        assert rows["brand.com"]["liveness_status"] == m.LIVENESS_DEAD
+    finally:
+        try:
+            await database.execute(
+                "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+            )
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_heal_never_touches_another_merchants_row(monkeypatch):
+    """Two merchants may each hold a `declared` row for one host -- the guard deliberately
+    does not refuse a domain another merchant merely declared. A's seeder must promote
+    only A's row. Dropping `merchant_id` from the heal's SQL survived the suite until this."""
+    from db.database import database
+    from db import merchant_official_domains as m
+    from services import official_domain_liveness as liveness
+
+    async def _inferred(_mid, **_kw):
+        return {"shared.com"}
+
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _inferred)
+
+    await database.connect()
+    try:
+        await m.ensure_merchant_official_domains_table()
+        for mid in ("test-heal-a", "test-heal-b"):
+            await database.execute(
+                "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+            )
+            assert await m.insert_declared_domain(merchant_id=mid, domain="shared.com") == m.SOURCE_DECLARED
+
+        assert await liveness.seed_inferred_domains("test-heal-a") == 1
+
+        a = {r["domain"]: r for r in await m.list_official_domains("test-heal-a")}
+        b = {r["domain"]: r for r in await m.list_official_domains("test-heal-b")}
+        assert a["shared.com"]["source"] == m.SOURCE_INFERRED
+        assert b["shared.com"]["source"] == m.SOURCE_DECLARED, "the heal crossed tenants"
+    finally:
+        try:
+            for mid in ("test-heal-a", "test-heal-b"):
+                await database.execute(
+                    "DELETE FROM merchant_official_domains WHERE merchant_id = :m", {"m": mid},
+                )
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_basis_does_not_sample_inference_for_a_merchant_with_no_declared_rows(monkeypatch):
+    """The declared-aware filter runs the inference sample only when a declared row exists.
+    For every other merchant the basis stays a pure stored-row read -- deterministic and
+    comparable with every run before this change. A tripwire, because the mutant that
+    always samples is output-neutral and only visible as cost."""
+    import db.merchant_official_domains as real_mod
+    import services.audit_evidence_builder as aeb
+
+    async def _rows(_mid, **_kw):
+        return [{"domain": "brand.com", "source": real_mod.SOURCE_VERIFIED,
+                 "liveness_status": "live"}]
+
+    async def _tripwire(_mid, **_kw):
+        raise AssertionError("inference was sampled for a merchant with no declared rows")
+
+    monkeypatch.setattr(real_mod, "list_official_domains", _rows)
+    monkeypatch.setattr(svc, "_inferred_merchant_hosts", _tripwire)
+
+    basis = await aeb.record_audit_basis(
+        audit_run_id="r1", brand_report={"brand_rollup": {}}, merchant_id="m1", persist=False,
+    )
+    assert sorted((basis or {}).get("official_domains") or []) == ["brand.com"]
+
+
+def test_the_inferred_sample_is_ordered():
+    """LIMIT 500 with no ORDER BY is an arbitrary, call-to-call unstable slice for any
+    merchant with more than 500 products. The basis now reads this sample into an
+    INSERT-ONLY comparability key, so two runs against the same world must draw the same
+    500 rows."""
+    import inspect
+    src = inspect.getsource(svc._inferred_merchant_hosts)
+    q = src[src.index("SELECT DISTINCT source_domain"):src.index("LIMIT 500")]
+    assert "ORDER BY source_domain, canonical_url" in q, q
+
+
+@pytest.mark.asyncio
+async def test_redeclaring_your_own_host_at_the_cap_is_idempotent_not_429(monkeypatch):
+    """The cap bounds rows a declaration can CREATE. A host that already has a row is not a
+    new row, and the INSERT-ONLY writer cannot change it, so re-declaring it at the cap is
+    the no-op it always should have been."""
+    async def _none(_domain, **_kw):
+        return None
+
+    async def _not_proven(_domain, _mid):
+        return False
+
+    declared = [
+        {"domain": f"d{i}.com", "source": mod.SOURCE_DECLARED, "verification_status": "pending"}
+        for i in range(svc._MAX_DECLARED_PER_MERCHANT)
+    ]
+
+    async def _stored(_mid, **_kw):
+        return declared
+
+    async def _owned(_mid, **_kw):
+        return set()
+
+    async def _insert(**kw):
+        return mod.SOURCE_DECLARED  # ON CONFLICT DO NOTHING: the row was already ours
+
+    monkeypatch.setattr(mod, "resolve_verified_merchant_for_domain", _none)
+    monkeypatch.setattr(mod, "domain_is_proven_by_other_merchant", _not_proven)
+    monkeypatch.setattr(mod, "list_official_domains", _stored)
+    monkeypatch.setattr(svc, "merchant_owned_domains", _owned)
+    monkeypatch.setattr(mod, "insert_declared_domain", _insert)
+
+    again = await svc.declare_official_domain("m1", "d3.com")
+    assert again["status"] == svc.DECLARE_OK
+
+    new = await svc.declare_official_domain("m1", "d99.com")
+    assert new["status"] == svc.DECLARE_TOO_MANY

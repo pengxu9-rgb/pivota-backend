@@ -317,10 +317,21 @@ async def seed_inferred_domains(merchant_id: str, *, now: Optional[datetime] = N
     hosts = await _inferred_merchant_hosts(merchant_id)
     if not hosts:
         return 0
-    known = {
-        str(r.get("domain") or ""): str(r.get("source") or "")
-        for r in await mod.list_official_domains(merchant_id)
-    }
+    # STRICT. This read decides what the loop below WRITES: an empty `known` on a DB blip
+    # would send every inferred host to the upsert, whose `source = excluded.source` and
+    # liveness COALESCE turn a `verified`/`dead` row into `inferred`/`unchecked` -- a dead
+    # domain back in the official set, the UCP fence losing the merchant, and the
+    # cross-tenant guard losing its proof. Reproduced against the real table. A seeder that
+    # cannot see what exists must not write; it logs and seeds nothing this run.
+    try:
+        known = {
+            str(r.get("domain") or ""): str(r.get("source") or "")
+            for r in await mod.list_official_domains(merchant_id, strict=True)
+        }
+    except Exception as exc:  # noqa: BLE001 -- fails CLOSED: no known-set, no writes
+        logger.warning("seed_inferred_domains: could not read the stored set for %s, seeding nothing: %s",
+                       merchant_id, str(exc)[:200])
+        return 0
     seeded = 0
     for host in sorted(hosts):
         if host in known:

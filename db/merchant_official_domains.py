@@ -773,7 +773,11 @@ def is_excluded(liveness_status: Optional[str]) -> bool:
 
 __all__: Sequence[str] = (
     "EXCLUDING_LIVENESS",
+    "INSERT_DECLARED_DOMAIN_SQL",
+    "PROMOTE_DECLARED_TO_INFERRED_SQL",
     "SOURCE_DECLARED",
+    "insert_declared_domain",
+    "promote_declared_to_inferred",
     "domain_is_proven_by_other_merchant",
     "LIVENESS_DEAD",
     "LIVENESS_LIVE",
