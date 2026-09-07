@@ -253,6 +253,52 @@ def test_an_unparseable_string_is_a_DEBUG_line_and_not_a_refusal(caplog):
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+def test_a_THREE_decimal_currency_is_skipped_rather_than_falsely_refused(caplog):
+    """`utils.money` does not know this currency's exponent, and the check is
+    BUILT out of that exponent.
+
+    A KWD 58.980 order is 58980 minor units, and `to_minor_units` — which knows
+    only "0 for the zero-decimal list, 2 for everything else" — calls it 5898.
+    Comparing them would refuse a perfectly correct order on the strength of
+    this repo's own gap, so the check names the gap and stands down.
+    """
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="webflow_event_adapter"):
+        events = _by_type(
+            _map(_order(customerPaid={"unit": "KWD", "value": 58980,
+                                      "string": "KWD 58.980"}))
+        )
+
+    assert events["order.paid"].amount_cents == 58980
+    assert any(
+        "unknown_minor_unit_exponent" in record.getMessage()
+        and "KWD" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG
+    ), "the skip is silent, so nobody can tell it happened"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_the_skip_is_NARROW_and_a_two_decimal_currency_is_still_checked():
+    """The counterpart. A skip list that swallowed the ordinary currencies would
+    delete the cross-check while leaving its docstring in place."""
+    from services.webflow_event_adapter import (
+        _UNKNOWN_EXPONENT_CURRENCIES,
+        WebflowMoneyFormatError,
+    )
+    from utils.money import ZERO_DECIMAL_CURRENCIES
+
+    # Neither of the two exponents `utils.money` DOES know may be listed here:
+    # for those the multiplier is right and the check must run.
+    assert not (_UNKNOWN_EXPONENT_CURRENCIES & ZERO_DECIMAL_CURRENCIES)
+    assert "USD" not in _UNKNOWN_EXPONENT_CURRENCIES
+
+    with pytest.raises(WebflowMoneyFormatError):
+        _map(_order(customerPaid={"unit": "USD", "value": 60,
+                                  "string": "$60.00"}))
+
+
 def test_a_negative_amount_is_refused_rather_than_clamped():
     from services.webflow_event_adapter import WebflowMoneyFormatError
 

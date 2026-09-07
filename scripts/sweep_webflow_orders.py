@@ -16,6 +16,17 @@ classifies orders, writes nothing, and leaves every cursor where it was until
     python -m scripts.sweep_webflow_orders --store-id store_x --apply
     python -m scripts.sweep_webflow_orders --lane refunded --apply   # money-out lanes only
 
+A REFUSED ORDER IS RETRIED, AND THE EXIT CODE IS A PER-RUN SIGNAL. An order the
+mapper refuses (`WebflowMoneyFormatError` — a money shape this bridge will not
+guess at) is counted `invalid`, which makes the store `partial_failure` and this
+script exit non-zero. That status describes the RUN. What makes the money
+recoverable is separate: the id is persisted in
+`reconciliation.refused_order_ids` and re-fetched by id at the head of every
+subsequent run through the same recorder, until it records, is found to be a
+test order, 404s three runs running, or is pushed out of the bounded set. So the
+red exit repeats every run while the shape is still wrong; it is not a single
+alarm that a green run afterwards would silently retract.
+
 WHY A SCRIPT *AND* A ROUTE. `POST /integrations/webflow/{store_id}/reconcile` is
 the same sweep behind merchant-or-admin auth. Both exist because neither
 scheduling surface in this repo actually ships this lane on merge: CI deploys no
@@ -138,12 +149,38 @@ async def _run(args: argparse.Namespace) -> int:
         # because guessing is a 100x error. These used to sit in the JSON while
         # the run reported success and exited 0, so a store whose every order
         # was refused looked exactly like a quiet store.
+        #
+        # The count is what THIS run observed, and that is the whole claim it
+        # makes. Durability is a separate mechanism: the ids are persisted in
+        # `reconciliation.refused_order_ids` and re-attempted at the head of
+        # every run, so the number stays non-zero until the shape is fixed
+        # rather than falling silent once the cursor moves past the orders.
         print(
             "\nNOTE: orders REFUSED and therefore not recorded at all: "
             f"{', '.join(refused)}. This is what a changed Webflow money shape "
             "looks like — read the webflow_order_sweep WARNING lines for the "
-            "reason. GMV is under-reported for those stores until it is fixed; "
-            "the run exits non-zero.",
+            "reason. GMV is under-reported for those stores until it is fixed. "
+            "Each id is REMEMBERED and re-attempted by id at the head of every "
+            "run until it records or ages out of the bounded set, so this NOTE "
+            "and the non-zero exit are the signal for THIS run and will keep "
+            "firing while the shape is still wrong — they are not a one-shot "
+            "alarm you have to catch.",
+            flush=True,
+        )
+    refused_dropped = [
+        f"{store['store_id']} ({(store.get('refused') or {}).get('dropped_not_found')})"
+        for store in result.get("stores", [])
+        if int((store.get("refused") or {}).get("dropped_not_found") or 0)
+    ]
+    if refused_dropped:
+        # The one way a refused order stops being retried without ever having
+        # been recorded. Loud, because after this nothing comes back for it.
+        print(
+            "\nNOTE: REFUSED orders given up on after repeated 404s: "
+            f"{', '.join(refused_dropped)}. They were never recorded and are no "
+            "longer retried; if they were real orders their money is missing "
+            "from the ledger for good. See the refused-replay section of "
+            "docs/WEBFLOW_TELEMETRY.md.",
             flush=True,
         )
     pending_dropped = [
@@ -161,7 +198,10 @@ async def _run(args: argparse.Namespace) -> int:
             flush=True,
         )
     # A partial failure is a non-zero exit so a scheduled run is visibly red.
-    # `invalid > 0` is one: see `sweep_webflow_store`.
+    # `invalid > 0` is one: see `sweep_webflow_store`. It counts what THIS run
+    # refused — including the re-attempts of ids the refused set carried in — so
+    # a store whose money shape is still wrong is red on every run, not on the
+    # first one only.
     return 0 if result.get("status") == "success" else 1
 
 

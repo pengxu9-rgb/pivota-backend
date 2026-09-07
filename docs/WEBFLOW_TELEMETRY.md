@@ -49,6 +49,7 @@ JSON, exactly like BigCommerce, PrestaShop and Squarespace:
                     "refunded": {"cursor": "...", "next_offset": 0},
                     "dispute_lost": {"...": "..."},
                     "pending_order_ids": [{"order_id": "...", "misses": 0}],
+                    "refused_order_ids": [{"order_id": "...", "misses": 0}],
                     "last_run_at": "...", "overlap_minutes": 60}}
 ```
 
@@ -100,6 +101,17 @@ will not guess at, keeps the previous behaviour and logs at DEBUG — the cure f
 an unfamiliar formatting locale must not be a store that records no money at all.
 This is what turns the tripwire above from a warning into a refusal for any
 zero-decimal order that carries a `string`.
+
+**The check runs only where this repo knows the multiplier.** `to_minor_units`
+knows exponent 0 for the zero-decimal list and assumes 2 for everything else,
+and the comparison is made *of* that multiplier — so for the ISO three- and
+four-decimal codes (`_UNKNOWN_EXPONENT_CURRENCIES`: BHD, IQD, JOD, KWD, LYD,
+OMR, TND, CLF, UYW) it would not verify anything, it would refuse correct
+orders: a KWD 58.980 order is 58980 minor units and `to_minor_units` calls it
+5898. Those are skipped at DEBUG, naming the currency; `value` still gets every
+whole-number refusal above. The skip is deliberately narrow, and
+`tests/test_webflow_event_adapter.py` pins that it does not overlap the
+currencies whose exponent *is* known.
 
 ## Receiver auth: two layers
 
@@ -441,7 +453,7 @@ lost cursor costs a re-read, but a **lost pending id costs the order**, because
 nothing else in the sweep can reach it. Removals are applied by id and additions
 by union against whatever is stored when the write happens.
 
-### A refused order makes the run RED
+### A refused order makes the run RED — and is RETRIED until it records
 
 `invalid` counts orders this bridge would not file at all — overwhelmingly a
 `WebflowMoneyFormatError`, which is what a changed money shape looks like. It
@@ -451,6 +463,39 @@ refused reported a green sweep with `accepted: 0` — indistinguishable from a
 quiet store. Now `invalid > 0` marks the store `partial_failure`, rolls up to the
 all-stores run, prints a NOTE naming the count and the first few order ids, and
 exits non-zero.
+
+**That status is the signal for the run that observed it, and nothing more.** The
+lane's high water mark is read off the order's anchor **before** the record is
+attempted, so a completed pass advances the cursor past an order it refused.
+About `overlap_minutes` (default 60) of newer orders later the threshold no
+longer covers it, every later pass reports it `skipped_already_recorded`, and
+the run is green with that money permanently missing — the same trap as a
+`pending` order, arrived at from the other direction.
+
+So durability is its own mechanism, and it is the pending set's, key for key.
+Every refused id is persisted in `reconciliation.refused_order_ids` and
+**re-fetched by id at the head of every subsequent run** (`GET
+/v2/sites/{site}/orders/{id}`, then the same recorder, the same deterministic
+event ids) until it resolves:
+
+| Outcome of the re-attempt | What happens to the id |
+| --- | --- |
+| recorded (the recorder did not refuse) | **dropped** — keeping it would re-deliver the order every run forever |
+| refused again | kept, counted `invalid` for **this** run, so the store stays red |
+| flagged a test order | dropped |
+| **404** | kept, miss counter +1; dropped and counted (`dropped_not_found`, its own NOTE) after `REFUSED_ORDER_MAX_MISSES` = 3 consecutive runs |
+| any other fetch failure (429, 5xx, transport) | kept, **no** miss burned |
+| dry run (`--apply` absent) | read and classified, kept, nothing recorded |
+
+The set is bounded at `REFUSED_ORDER_ID_CAP` = 500, oldest dropped first with a
+WARNING **naming them**, and merged by id at write time — for both, the same
+reasons as the pending set above. The replay's counters fold into the run's
+totals, which is what keeps `invalid` non-zero on a run whose lanes saw nothing.
+
+The practical shape of the two together: `invalid` and the non-zero exit are
+**per-run** and repeat for as long as the shape is wrong, and
+`refused_order_ids` is what carries the orders forward so that a single fix
+records all of them on the next run.
 
 ### The credential must name this store's own site
 
@@ -657,7 +702,7 @@ assumption is wrong.
 | 7 | The orders list is returned **newest-first** | **ASSUMED, and specifically not trusted.** The early stop is armed only by a COMPLETE pass that observed non-increasing anchors, and disarmed by any observed violation | If the ordering is unstable rather than merely different, a resumed offset walk could skip rows. The mitigations are the overlap, the fact that an observed violation disarms the early stop PERMANENTLY (`ordering_violated_at` is persisted; no number of clean passes re-arms it, only an operator clearing the key), and `ordering_verified` / `ordering_violated_at` being reported per lane per run. See Residual gaps |
 | 8 | `status` ∈ `pending`, `unfulfilled`, `fulfilled`, `disputed`, `dispute-lost`, `refunded`, and `status=dispute-lost` is a valid query value | **Verified** (the enum) / **Assumed** (that it filters) | The `dispute_lost` lane fails ALONE and is reported in `lane_failures`; the other two lanes are unaffected, and a lost dispute is still mapped whenever the webhook or the unfiltered lane sees the order |
 | 9 | Order fields `orderId`, `status`, `acceptedOn`, `fulfilledOn`, `refundedOn`, `disputedOn`, `customerPaid`, `netAmount`, `customerInfo`, `purchasedItems[]`, `purchasedItemsCount`, `stripeDetails`, `paypalDetails`, `paymentProcessor`, `metadata`, `customData` | **Verified** | A missing money field yields no money event rather than a zero one; a missing `orderId` is a 422. A `refunded`/`dispute-lost` order whose `customerPaid` is absent or `0` does **not** fail the observation: `order.created` is still recorded and the missing refund is reported as the named reason `refund_amount_unreadable` (`WebflowMapping.ignored`, `WebflowIngestResult.ignored_reasons`, the sweep's `refunds_unreadable` counter, a WARNING from `services/webflow_ledger.py`, and a NOTE from the script). Raising instead dropped the whole batch, which 422'd the receiver — and Webflow retries a 422 into the same 422 until it gives up, so the order never landed at all. Refunded GMV is under-reported meanwhile, which is why it is counted and named rather than swallowed |
-| 10 | Money is `{"unit": "USD", "value": <integer minor units>, "string": "$58.98"}` | **Verified, and now RE-VERIFIED on every delivery that carries `string`** | This is the 100x claim. It is pinned with the documented example in `tests/test_webflow_event_adapter.py`, and a `value` that is not whole minor units is REFUSED rather than guessed at. The whole-number check alone left the other half of the claim open, though: `60` is a perfectly whole number and is 1/100th of a `"$60.00"` order. So `string` — a second, independent statement of the same amount in the same object — is parsed and compared against `value` in that currency's minor units, and a **disagreement raises**. Neither side wins: there is no third source to break the tie, so the observation is refused rather than filed at a figure that could be 100x wrong in either direction. A money object with no `string`, or one this parser will not guess at, keeps the previous behaviour and logs at DEBUG |
+| 10 | Money is `{"unit": "USD", "value": <integer minor units>, "string": "$58.98"}` | **Verified, and now RE-VERIFIED on every delivery that carries `string`** | This is the 100x claim. It is pinned with the documented example in `tests/test_webflow_event_adapter.py`, and a `value` that is not whole minor units is REFUSED rather than guessed at. The whole-number check alone left the other half of the claim open, though: `60` is a perfectly whole number and is 1/100th of a `"$60.00"` order. So `string` — a second, independent statement of the same amount in the same object — is parsed and compared against `value` in that currency's minor units, and a **disagreement raises**. Neither side wins: there is no third source to break the tie, so the observation is refused rather than filed at a figure that could be 100x wrong in either direction. A money object with no `string`, one this parser will not guess at, one with no readable currency, or one in a currency whose minor-unit exponent `utils.money` does not know (the ISO three- and four-decimal codes: BHD, IQD, JOD, KWD, LYD, OMR, TND, CLF, UYW) keeps the previous behaviour and logs at DEBUG naming the reason. That last skip is not a gap being tolerated but the check declining to run on a multiplier this repo gets wrong: `to_minor_units` knows exponent 0 for the zero-decimal list and assumes 2 for everything else, so comparing a correct KWD 58.980 order (58980 minor units) against its own 5898 would REFUSE it |
 | 11 | `orderId` is a short opaque token (`0000-0001`-shaped hyphenated groups) | **Assumed** | The path allowlist is `^[A-Za-z0-9_-]{1,64}$`, which is wider than that shape and still cannot walk a URL path. An id outside it is refused rather than encoded-and-sent, so the failure mode is a refused fetch, not a request to the wrong endpoint |
 | 12 | Webflow signs a delivery with `x-webflow-timestamp` + `x-webflow-signature` = hex HMAC-SHA256 over `"{timestamp}:{body}"`, keyed with the OAuth **App's client secret**, and **only** for webhooks created by an OAuth App | **Verified** (the algorithm and the input) / **Assumed** (that a Site-API-token webhook is unsigned) | If site-token webhooks ARE signed, Layer 2 could be required unconditionally and Layer 1 would be belt-and-braces — no correctness loss either way. If the signed INPUT is not `"{timestamp}:{body}"`, every signed delivery 401s on a deployment that armed Layer 2; the rejection log names which layer refused it and the shape of the digest, which is what makes that decidable from one line rather than a packet capture. Layer 1 keeps working meanwhile |
 | 13 | The replay window is 5 minutes and `x-webflow-timestamp` is epoch **milliseconds** | **Assumed** | Seconds are accepted too (a value below 10^10 is read as seconds), because guessing wrong in that direction would reject every delivery. The unit affects only the freshness check |
