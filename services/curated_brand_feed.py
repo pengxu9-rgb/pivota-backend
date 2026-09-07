@@ -29,6 +29,7 @@ from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness
+from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -910,14 +911,41 @@ def shopify_product_to_record(
     pdp_variants: List[Dict[str, Any]] = []
     # OPT-IN. Emitting variants writes one extra SKU + offer per variant downstream,
     # which changes recall fan-out, offer aggregation and INCI attachment for EVERY
-    # row a caller ingests — so it fires only for the fold lane that asked for it.
-    # `records_for_brand(base_listings_only=True)` is the only caller that does.
-    if emit_variants and len(sellable) >= 1 and product.get(FOLDED_INTO_KEY):
+    # row a caller ingests — so it never fires unless a caller asked for it.
+    #
+    # WHY THE FOLD IS NO LONGER THE ONLY GATE. This used to additionally require
+    # `product.get(FOLDED_INTO_KEY)`, i.e. only a listing the shade-fold had just
+    # BUILT could carry variants. That silently excluded every storefront that
+    # publishes its shades natively, as one product with many variants — which is
+    # the normal Shopify shape, not the exception. Measured on flowerbeauty.com
+    # 2026-09-07: `/products.json` serves 49 products, 29 of them multi-variant,
+    # carrying 185 real numeric Shopify variant ids; `fold_shade_listings` folds
+    # ZERO of them (bases=0, shades=0), so the gate refused all 185 and the brand
+    # ingested 49 SKUs whose `source_variant_id` was the product key. #2113 taught
+    # ingestion to stop DISCARDING real variant ids; this is the other half — the
+    # feed never put them in the record for it to keep.
+    #
+    # The two lanes admit on different rules, deliberately. A FOLDED row's variants
+    # were assembled by us out of separate per-shade listings and a variant there
+    # may legitimately carry a synthesised `<handle>:<i>` id (see the fallback
+    # below), which is display data the shade selector needs; ingestion's own
+    # provenance check decides whether it may also be sold. A NATIVE row has no
+    # such excuse: its ids come straight off the merchant's own feed, so anything
+    # `variant_identity` cannot positively place as merchant-issued is dropped
+    # here rather than carried forward as a decoy that looks purchasable.
+    native = not product.get(FOLDED_INTO_KEY)
+    if emit_variants and len(sellable) >= 1:
         seen_ids: set = set()
         base_option_name = _base_option_name(product)
         for i, v in enumerate(sellable):
             vid = str(v.get("id") or v.get("variant_id") or f"{handle}:{i}").strip()
             if vid in seen_ids:
+                continue
+            if native and variant_id_provenance(
+                vid,
+                product_id=product.get("id"),
+                handle=handle,
+            ) != MERCHANT_ISSUED:
                 continue
             seen_ids.add(vid)
             # option1 is the merchant's own shade value and outranks a name derived
@@ -1199,6 +1227,11 @@ async def records_for_brand(
     brand: Optional[str] = None,
     max_products: int = 500,
     base_listings_only: bool = False,
+    # Emit the merchant's OWN variants for products that are natively multi-variant
+    # (the normal Shopify shape). Off by default: it adds one SKU + one offer per
+    # variant, which moves recall fan-out and offer aggregation for every row the
+    # caller ingests. `base_listings_only` implies it for the rows the fold builds.
+    emit_real_variants: bool = False,
     enrich_missing_inci: bool = False,
     max_pdp_inci_fetches: int = 300,
     # 0.0 since the shared politeness gate owns pacing. This ad-hoc sleep predates it and now
@@ -1226,7 +1259,7 @@ async def records_for_brand(
     for p in products:
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand,
-            emit_variants=base_listings_only,
+            emit_variants=base_listings_only or emit_real_variants,
             currency=locale.get("currency"),
         )
         if not rec:
