@@ -58,7 +58,27 @@ Two consequences:
   already gets post-#2113 code**. That is how every probe in this directory was run.
 - The **`catalog-curated-brand-onboard` job is stale and must be repointed** before it is used.
   Note it is currently also *repurposed*: its `--args` run `scripts.ops_currency_probe`, not the
-  onboard. Prefer `run_oneoff_job.sh` over resurrecting it.
+  onboard, and its `PIVOTA_COMMIT_SHA` env (`a8e4a605…`) disagrees with its own image tag
+  (`23594c37f…`) — so the job does not know what it is running. **Prefer `run_oneoff_job.sh`**,
+  which creates a throwaway job on `:latest` and deletes it on every exit path.
+
+  If the job must be used anyway, repoint the image first — `jobs update` MERGES, so this touches
+  nothing but the image:
+
+  ```bash
+  gcloud run jobs update catalog-curated-brand-onboard \
+    --region us-west1 --project pivota-prod \
+    --image us-west1-docker.pkg.dev/pivota-shared/pivota/backend:<sha of main AFTER the feed fix>
+  ```
+
+  Pin a full SHA, never `:latest` — a job that floats on a moving tag cannot be rolled back to the
+  thing that ran. Then re-describe and confirm both the image and the args before executing:
+
+  ```bash
+  gcloud run jobs describe catalog-curated-brand-onboard --region us-west1 --project pivota-prod \
+    --format='yaml(spec.template.spec.template.spec.containers[0].image,
+                   spec.template.spec.template.spec.containers[0].args)'
+  ```
 
 Verification commands used:
 
