@@ -13827,6 +13827,13 @@ async def run_brand_report(
         # and parity logging do. Best-effort: a stamp failure must never sink
         # the report.
         try:
+            from services.selection_measurement import response_observations
+            for _r in per_sku_reports:
+                _r["selection_observations"] = response_observations(
+                    _flatten_probe_runs(probe_runs_by_sku.get(_r.get("sku_key"), [])),
+                    sku_key=_r.get("sku_key"), merchant_host=_merchant_host,
+                    merchant_brand=merchant_name, merchant_vendors=_merchant_vendors,
+                )
             _facts_by_sku = {
                 _sku_key: compute_run_facts(
                     _flatten_probe_runs(_sku_probe_runs),

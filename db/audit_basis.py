@@ -61,7 +61,8 @@ logger = logging.getLogger(__name__)
 # v1: first cut. Components at this version — prompt_basis.PROMPT_BASIS_VERSION
 # = 3, primary_destination.PRIMARY_DESTINATION_VERSION = 1, official-domain set
 # from migration 207.
-METHODOLOGY_VERSION = "1"
+# v2: response-level selection contract and conservative comparison gating.
+METHODOLOGY_VERSION = "2"
 
 # The fields whose equality defines comparability. Named as data, not as a chain
 # of `and`s, so the set is greppable and a reviewer can COUNT the conjuncts

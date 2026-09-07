@@ -4132,7 +4132,12 @@ async def answer_merchant_audit_question(
             detail="This audit doesn't have a report to answer from yet.",
         )
 
-    context = _build_ask_context(report, body.product_key)
+    from services.revenue_recovery_report import recovery_from_report
+    context = recovery_from_report(
+        report, run_id=body.run_id,
+        catalog_available=False if run.get("subject_type") == "merchant_url" else None,
+    )
+    context = await _apply_actions_paywall(context, merchant_id)
     if not context:
         raise HTTPException(
             status_code=409,

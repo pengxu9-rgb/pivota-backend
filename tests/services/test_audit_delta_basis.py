@@ -74,18 +74,18 @@ def test_a_changed_tier_mix_is_not_your_movement():
     assert verdict["same"] is False
 
 
-def test_absent_bases_fall_through_to_todays_verdict():
+def test_absent_bases_are_unknown():
     """Runs predating audit_basis carry no evidence of a model change either
     way. Failing them closed would silently desensitise every merchant's next
     re-audit, so the change is strictly additive."""
-    assert ad.measurement_basis_between(_report("sel_1"), _report("sel_1"))["same"] is True
+    assert ad.measurement_basis_between(_report("sel_1"), _report("sel_1"))["same"] is None
     assert ad.measurement_basis_between(_report("sel_1"), _report("sel_2"))["same"] is False
 
 
-def test_one_sided_basis_also_falls_through():
+def test_one_sided_basis_is_unknown():
     assert ad.measurement_basis_between(
         _report("sel_1"), _report("sel_1"), _basis(), None
-    )["same"] is True
+    )["same"] is None
 
 
 def test_a_different_prompt_set_still_wins_and_keeps_its_own_note():

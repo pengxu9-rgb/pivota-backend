@@ -151,11 +151,7 @@ def test_contract_envelope_and_score_block():
     assert score["band_thresholds"] == [6.0, 7.5, 9.0]
     # None subscores (category_visibility on per_sku runs) are omitted, not zeroed.
     assert [s["key"] for s in score["subscores"]] == ["visibility", "attribution"]
-    assert score["delta"] == {
-        "raw": 5,
-        "previous_audit_run_id": "audit-0",
-        "days_since_last_audit": 14,
-    }
+    assert score["delta"] is None  # Unqualified historical deltas are not comparable.
 
 
 def test_display_score_preserves_small_deltas():
@@ -629,7 +625,7 @@ def test_no_exclusions_keeps_historical_semantics():
     assert score["unmeasured_excluded"] == []
     assert score["weakest_dimension"]["key"] == "routability"
     assert score["explainer"] and "Not counted" not in score["explainer"]
-    assert score["delta"] is not None
+    assert score["delta"] is None
 
 
 def test_wedge_route_declares_routability_unmeasurable():
@@ -668,8 +664,8 @@ def test_since_last_audit_passthrough_and_absence():
     }
     out = build_report_summary(report)["since_last_audit"]
     assert out["days_since_last"] == 7
-    assert out["material_movements"] == 1
-    assert out["basis_same"] is True
+    assert out["material_movements"] == 0
+    assert out["basis_same"] is None
     assert out["movements"][0]["label"] == "AI visibility"  # verbatim
 
 
@@ -713,11 +709,11 @@ def test_reaudit_delta_end_to_end_on_real_per_sku_shape():
     # visibility = weakest dim (20 -> 33), attribution = citation (20 -> 46)
     assert moves["visibility"]["from"] == 20 and moves["visibility"]["to"] == 33
     assert moves["attribution"]["from"] == 20 and moves["attribution"]["to"] == 46
-    assert moves["attribution"]["is_material"] is True
+    assert moves["attribution"]["is_material"] is False
     # And the contract counter reads the real key end-to-end.
     current["reaudit_delta"] = delta
     out = build_report_summary(current)["since_last_audit"]
-    assert out["material_movements"] >= 1
+    assert out["material_movements"] == 0
 
 
 def test_share_of_voice_prompt_level_counts():

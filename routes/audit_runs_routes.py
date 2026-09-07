@@ -1337,6 +1337,24 @@ async def create_audit_run(
     )
 
 
+@router.get("/products")
+async def list_audit_products(auth_merchant_id: str = Depends(get_current_merchant), limit: int = 500, offset: int = 0):
+    from sqlalchemy import select
+    from db.catalog import catalog_products
+    from db.database import database
+    if not 1 <= limit <= 500 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid pagination")
+    rows = await database.fetch_all(select(
+        catalog_products.c.product_key, catalog_products.c.platform,
+        catalog_products.c.source_product_id, catalog_products.c.title,
+    ).where(catalog_products.c.merchant_id == auth_merchant_id)
+      .order_by(catalog_products.c.product_key).offset(offset).limit(limit + 1))
+    return {"products": [{"product_key": r["product_key"], "platform": r["platform"],
+                          "platform_product_id": r["source_product_id"], "title": r["title"]}
+                         for r in rows[:limit]],
+            "next_offset": offset + limit if len(rows) > limit else None}
+
+
 @router.get("/readiness")
 async def get_audit_readiness(
     auth_merchant_id: str = Depends(get_current_merchant),
@@ -1425,6 +1443,19 @@ async def get_audit_run(
         proj = await fetch_projection(
             audit_run_id=run_id, audience=audience,
         )
+        if audience == "revenue_recovery" and row.get("stage") == "completed":
+            from services.audit_projection_builder import _BUILDER_VERSION
+            if proj is None or proj.get("builder_version") != _BUILDER_VERSION:
+                from services.revenue_recovery_report import recovery_from_report
+                from services.audit_projection_builder import coerce_jsonb_to_dict
+                report = coerce_jsonb_to_dict(row.get("report_jsonb"))
+                if report:
+                    payload = recovery_from_report(
+                        report, run_id=run_id,
+                        catalog_available=False if row.get("subject_type") == "merchant_url" else None,
+                    )
+                    payload["historical_rebuild"] = True
+                    proj = {"payload_jsonb": payload}
         if proj is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

@@ -803,13 +803,9 @@ async def _process_one_audit_run_inner(
             ):
                 return True
             if is_synthetic:
-                # URL-audit minimal completion: skip canonical-evidence,
-                # verifiers, audience projections, and verification-enqueue —
-                # all catalog-coupled, and the /url-readiness GET reads
-                # report_jsonb directly (no projection needed). Crucially, the
-                # post-processing block below FAILS the whole run if projection
-                # build or verification-enqueue raises (which they can on
-                # synthetic product_keys), so synthetic runs must not enter it.
+                brand_report["catalog_dimensions_available"] = False
+                # Persist URL evidence and projections before completion, while
+                # keeping catalog verifiers and their enqueue out of this lane.
                 await _record_final_report_fields(
                     run_id=run_id,
                     brand_report=brand_report,
@@ -826,9 +822,24 @@ async def _process_one_audit_run_inner(
                 cost_summary = await _aggregate_cost_summary_for_run(
                     run_id=run_id, brand_report=brand_report,
                 )
+                try:
+                    canonical, projections = await _persist_url_recovery(
+                        run_id=run_id, merchant_id=merchant_id, brand_report=brand_report,
+                    )
+                except Exception as exc:
+                    await _fail_run_and_refund(
+                        run_id=run_id, merchant_id=merchant_id, launch_options=launch_options,
+                        from_stage=mar.STAGE_VERIFYING, cost_summary_jsonb=cost_summary,
+                        error_jsonb={"stage": "url_recovery_persistence", "message": str(exc)[:200]},
+                        reason="verifying_post_processing",
+                    )
+                    return True
                 await mar.record_partial_result(
                     run_id=run_id, worker_id=WORKER_ID,
-                    partial_result_jsonb={"verifying": {"skipped": "url_audit"}},
+                    partial_result_jsonb={"verifying": {
+                        "canonical_evidence": canonical, "projections": projections,
+                        "catalog_verifiers": "skipped: no connected catalog",
+                    }},
                 )
                 ok = await mar.transition_stage(
                     run_id=run_id,
@@ -2034,3 +2045,21 @@ async def _lease_heartbeat(
                 "_lease_heartbeat: extend raised for run_id=%s: %s; "
                 "continuing", run_id, str(exc)[:200],
             )
+
+
+async def _persist_url_recovery(*, run_id, merchant_id, brand_report):
+    """URL reports have evidence too. Catalog verification remains a separate lane."""
+    from copy import deepcopy
+    from services.audit_evidence_builder import persist_canonical_evidence
+    from services.audit_projection_builder import build_and_persist_all_projections
+    report = deepcopy(brand_report)
+    report["catalog_dimensions_available"] = False
+    canonical = await persist_canonical_evidence(
+        audit_run_id=run_id, merchant_id=merchant_id, brand_report=report,
+    )
+    if any(canonical.get(k, 0) for k in ("evidence_items_failed", "findings_failed", "actions_failed")):
+        raise RuntimeError("URL audit evidence persistence failed; retry is idempotent")
+    projections = await build_and_persist_all_projections(audit_run_id=run_id, strict=True)
+    if projections.get("projections_failed", 0) or not projections.get("projections_built", 0):
+        raise RuntimeError("URL audit projection persistence failed; retry is idempotent")
+    return canonical, projections

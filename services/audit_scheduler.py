@@ -100,6 +100,7 @@ _STATE_NAMES = {0: "STOPPED", 1: "RUNNING", 2: "PAUSED"}
 # explicit entry, so nobody inherits the default by accident.
 _DEFAULT_RUN_DEADLINE_SECONDS = 3600.0
 _JOB_RUN_DEADLINES = {
+    "official_domain_liveness": 180,
     # daily / weekly crons: heavy sweeps. daily_audit_check runs LLM audits
     # INLINE (gather of 3, each routinely >15 min): 4h.
     "daily_audit_check": 14400,
@@ -1123,6 +1124,13 @@ async def start_scheduler() -> None:
             coalesce=True,
             max_instances=1,
             misfire_grace_time=120,
+        )
+
+        from jobs.official_domain_liveness import run_official_domain_liveness_tick
+        _add_job(
+            run_official_domain_liveness_tick, "interval", hours=6,
+            id="official_domain_liveness", replace_existing=True,
+            coalesce=True, max_instances=1, misfire_grace_time=120,
         )
 
         # ADR-010 D-2 Phase B: weekly catalog identity-reconcile sweep —

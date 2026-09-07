@@ -247,7 +247,7 @@ def _score_block(
     # exclusions actually change the displayed score the comparison is
     # apples-to-oranges, so it's dropped rather than shown wrong.
     out["delta"] = (
-        None if (excluded_applied and raw != raw_persisted) else delta
+        None  # Unqualified legacy deltas are not comparable; use since_last_audit.
     )
     out["weakest_dimension"] = weakest
     out["unmeasured_excluded"] = list(excluded_applied)
@@ -757,7 +757,20 @@ def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     delta = report.get("reaudit_delta")
     if not isinstance(delta, dict):
         return None
-    movements = [m for m in _as_list(delta.get("movements")) if isinstance(m, dict)]
+    from services.audit_delta import MATERIAL_SCORE_DELTA, SCORE_SIGNALS
+    movements = [dict(m) for m in _as_list(delta.get("movements")) if isinstance(m, dict)]
+    basis = _as_dict(delta.get("measurement_basis"))
+    comparable = basis.get("contract_version") == "2" and basis.get("same") is True
+    for m in movements:
+        if m.get("signal") not in SCORE_SIGNALS:
+            continue
+        before, after = m.get("from"), m.get("to")
+        numeric = type(before) in (int, float) and type(after) in (int, float)
+        resolved = comparable and numeric and abs(after - before) >= MATERIAL_SCORE_DELTA
+        m["is_material"] = bool(resolved)
+        m["direction"] = ("improved" if after > before else "regressed") if resolved else "unknown"
+        m["detection"] = {"verdict": "resolved" if resolved else "below_detection_floor" if comparable and numeric else "not_comparable", "threshold": MATERIAL_SCORE_DELTA}
+
     return {
         "is_first_audit": bool(delta.get("is_first_audit")),
         "days_since_last": delta.get("days_since_last"),
@@ -766,7 +779,7 @@ def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         # Producer emits is_material (review P1: reading "material" made this
         # counter permanently zero on real passthrough data).
         "material_movements": sum(1 for m in movements if m.get("is_material")),
-        "basis_same": (_as_dict(delta.get("measurement_basis"))).get("same"),
+        "basis_same": True if comparable else None,
     }
 
 

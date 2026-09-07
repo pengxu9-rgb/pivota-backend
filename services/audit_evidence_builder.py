@@ -197,6 +197,11 @@ def extract_evidence_items(
                 "confidence": CONFIDENCE_EVIDENCE_HIGH,
             })
 
+    from services.selection_measurement import report_observations
+    for observation in report_observations(brand_report):
+        out.append({"evidence_type": "selection_response", "payload": observation,
+                    "product_key": observation.get("product_key"), "confidence": None})
+
     # P0.2: stamp the canonical entity key on every evidence dict that maps to
     # a depositable (resolved) content_key. Section-agnostic final pass so new
     # evidence sections inherit it for free. Unresolved / unmapped product_keys
@@ -575,12 +580,21 @@ def _findings_from_brand_rollup(
     comparison the report never made, which is how the /100-score-rendered-as-a-
     percentage defect got in next door.
     """
-    out: List[Dict[str, Any]] = []
+    from services.selection_measurement import report_observations, selection_measurement
+    out: List[Dict[str, Any]] = [{
+        "finding_type": "recovery_measurement", "severity": "low",
+        "payload": {"selection": selection_measurement(report_observations(brand_report)),
+                    "selection_gap": rollup.get("selection_gap"),
+                    "catalog_available": brand_report.get("catalog_dimensions_available") is not False},
+        "short_summary": "Response-level measurement basis", "confidence": None,
+    }]
     dims = rollup.get("dimensions")
     if not isinstance(dims, dict):
         return out
     for key, dim in dims.items():
         if not isinstance(dim, dict):
+            continue
+        if key == "routability" and brand_report.get("catalog_dimensions_available") is False:
             continue
         band = str(dim.get("band") or "").lower()
         severity = _ROLLUP_FINDING_BANDS.get(band)
@@ -1733,6 +1747,8 @@ def _evidence_signature(ev: Dict[str, Any]) -> str:
     canonical truth (same type + product + host + excerpt prefix).
     """
     payload = ev.get("payload") or {}
+    if ev.get("evidence_type") == "selection_response":
+        return "selection_response:" + str(payload["observation_id"])
     excerpt = (payload.get("excerpt_text") or "")[:80]
     host = payload.get("host") or ""
     matched_url = payload.get("matched_url") or ""

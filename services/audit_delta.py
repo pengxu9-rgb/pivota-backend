@@ -121,6 +121,11 @@ def build_reaudit_delta(
             )
         )
 
+    if basis.get("same") is not True:
+        for movement in movements:
+            movement.update(is_material=False, direction="unknown")
+            movement["detection"]["verdict"] = "not_comparable"
+
     prior_stable = _stable_fields(prior)
     current_stable = _stable_fields(current)
     for signal in ("primary_gap", "controller_archetype", "top_controller", "verdict"):
@@ -259,6 +264,9 @@ def _measurement_basis(
     # and failing them closed would silently desensitise every merchant's next
     # re-audit. This is strictly additive — it can only ever turn a True into a
     # False, never the reverse.
+    if not isinstance(current_basis, Mapping) or not isinstance(prior_basis, Mapping):
+        return {"same": None, "prompt_set_id": current_id,
+                "note": "The full measurement basis is unavailable; improvement cannot be established."}
     if isinstance(current_basis, Mapping) and isinstance(prior_basis, Mapping):
         from db.audit_basis import bases_are_comparable
 
@@ -278,6 +286,7 @@ def _measurement_basis(
 
     return {
         "same": True,
+        "contract_version": "2",
         "prompt_set_id": current_id,
         "note": (
             "Measured on the same prompt set as your last audit — score "
