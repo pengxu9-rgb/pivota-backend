@@ -145,6 +145,8 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL="${STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL%/}"
 fi
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=infra/gcp/_serving_revision.sh
+. "$HERE/_serving_revision.sh"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
 GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
@@ -166,30 +168,14 @@ if [ "$STORE_AUDIT_UCP_REPROBE_WORKER" = true ]; then
   EXPECTED_UCP_BACKEND_BASE_URL="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
   [ "$STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL" = "$EXPECTED_UCP_BACKEND_BASE_URL" ] \
     || { echo "STORE_AUDIT_UCP_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_UCP_BACKEND_BASE_URL)" >&2; exit 2; }
-  # The service template can describe a 0%-traffic candidate. The untagged
-  # service URL used by the Job instead reaches the single untagged 100%
-  # revision. Refuse a split/candidate state rather than declaring receipt
+  # The service template can describe a 0%-traffic candidate. The service URL
+  # used by the Job instead reaches the single 100%-traffic revision (which
+  # normally carries its c-<sha> tag: deploy_backend.sh promotes the tagged
+  # candidate). Refuse a split/candidate state rather than declaring receipt
   # ready based on code that is not actually serving the URL.
-  WEB_ACTIVE_REVISION="$(printf '%s' "$WEB_UCP_SPEC" | python3 -c '
-import json,sys
-o=json.load(sys.stdin)
-# percent==100 ONLY. The `not t.get("tag")` conjunct that used to be here refused the
-# normal post-deploy state: deploy_backend.sh ships every candidate with `--tag c-<sha>`
-# and then promotes it, so the SERVING revision keeps its own candidate tag until a later
-# deploy retires it. Verified in prod 2026-08-26 — web-00098-kax held 100% traffic AND
-# tag c-6f8b201ba7dc, and this guard refused, making setup_scheduler.sh unrunnable
-# whenever Store Audit is armed.
-#
-# A tag is an ADDITIONAL address for a revision, not a replacement for the plain service
-# URL, so it says nothing about whether that revision serves the untagged URL. What the
-# guard is actually for is unchanged and still enforced: exactly one revision at 100%.
-# A split (50/50) yields no 100% entry and is still refused; a 0%-traffic candidate is
-# still excluded, because it has no percent.
-active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if t.get("percent") == 100]
-print(active[0] if len(active) == 1 else "")
-')"
+  WEB_ACTIVE_REVISION="$(serving_revision web || true)"
   [ -n "$WEB_ACTIVE_REVISION" ] \
-    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit Jobs are created" >&2; exit 2; }
+    || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before Store Audit Jobs are created" >&2; exit 2; }
   WEB_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_ACTIVE_REVISION" --region "$REGION" --format=json)"
   # Refuse to create or arm a crawler against a revision where Cloud Run would
   # accept OIDC but the app would still return a disabled-receipt 404. This
@@ -214,26 +200,9 @@ if [ "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" = true ]; then
   EXPECTED_COMMERCE_BACKEND_BASE_URL="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("url", ""))')"
   [ "$STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL" = "$EXPECTED_COMMERCE_BACKEND_BASE_URL" ] \
     || { echo "STORE_AUDIT_COMMERCE_PROBE_BACKEND_BASE_URL must exactly match web service URL ($EXPECTED_COMMERCE_BACKEND_BASE_URL)" >&2; exit 2; }
-  WEB_COMMERCE_ACTIVE_REVISION="$(printf '%s' "$WEB_COMMERCE_SPEC" | python3 -c '
-import json,sys
-o=json.load(sys.stdin)
-# percent==100 ONLY. The `not t.get("tag")` conjunct that used to be here refused the
-# normal post-deploy state: deploy_backend.sh ships every candidate with `--tag c-<sha>`
-# and then promotes it, so the SERVING revision keeps its own candidate tag until a later
-# deploy retires it. Verified in prod 2026-08-26 — web-00098-kax held 100% traffic AND
-# tag c-6f8b201ba7dc, and this guard refused, making setup_scheduler.sh unrunnable
-# whenever Store Audit is armed.
-#
-# A tag is an ADDITIONAL address for a revision, not a replacement for the plain service
-# URL, so it says nothing about whether that revision serves the untagged URL. What the
-# guard is actually for is unchanged and still enforced: exactly one revision at 100%.
-# A split (50/50) yields no 100% entry and is still refused; a 0%-traffic candidate is
-# still excluded, because it has no percent.
-active=[t.get("revisionName", "") for t in o.get("status",{}).get("traffic", []) if t.get("percent") == 100]
-print(active[0] if len(active) == 1 else "")
-')"
+  WEB_COMMERCE_ACTIVE_REVISION="$(serving_revision web || true)"
   [ -n "$WEB_COMMERCE_ACTIVE_REVISION" ] \
-    || { echo "web must have exactly one untagged 100%-traffic revision before Store Audit commerce Jobs are created" >&2; exit 2; }
+    || { echo "web has no single 100%-traffic revision (traffic is split, or a rollout is half-finished) - resolve that before Store Audit commerce Jobs are created" >&2; exit 2; }
   WEB_COMMERCE_ACTIVE_SPEC="$("$GCLOUD" run revisions describe "$WEB_COMMERCE_ACTIVE_REVISION" --region "$REGION" --format=json)"
   WEB_COMMERCE_RECEIPT_READY="$(printf '%s' "$WEB_COMMERCE_ACTIVE_SPEC" | python3 -c '
 import json,sys
@@ -847,10 +816,11 @@ echo
 # done. That is worse than the crash it replaced: `WORKERS=true ... setup_scheduler.sh` used to
 # die loudly at deploy_worker.sh's guard, and briefly instead exited 0 having reconciled
 # everything while telling the operator the drainers were armed. Read the live service.
-WORKER_ARMED="$("$GCLOUD" run services describe worker --region "$REGION" \
-  --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
-  | tr ';' '\n' | grep "'AUDIT_WORKER_ENABLED'" | grep -oE "'value': '[a-z]+'" \
-  | grep -oE "'[a-z]+'$" | tr -d "'" || true)"
+# THE SERVING REVISION, because the line below says "live" and an operator will read it that
+# way. `spec.template` is what the last deploy ASKED FOR; if that deploy did not take, the two
+# disagree and this would report the arming state of a revision serving nobody. Written the
+# first time as a template read, in the same commit whose comment said "Read the live service".
+WORKER_ARMED="$(serving_env worker AUDIT_WORKER_ENABLED || true)"
 echo "worker:    $("$GCLOUD" run services describe worker --region "$REGION" --format='value(status.url)') (min=max=1, AUDIT_WORKER_ENABLED=${WORKER_ARMED:-<unreadable>})"
 if [ "$CONFIG" != apply ] && [ -n "${WORKERS_REQUESTED:-}" ] && [ "${WORKERS_REQUESTED:-}" != "$WORKER_ARMED" ]; then
   echo "   NOTE: you passed WORKERS=$WORKERS_REQUESTED, and CONFIG=preserve did NOT apply it." >&2

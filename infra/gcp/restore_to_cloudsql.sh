@@ -50,6 +50,11 @@ drain_services(){
   local dir="$1" svc mins
   for svc in $("$GCLOUD" run services list --project "$PROJECT" --region "$REGION" --format='value(metadata.name)'); do
     if [ "$dir" = down ]; then
+      # `spec.template` IS THE RIGHT READ HERE. This captures a value to PUT BACK later with
+      # `run services update --min-instances`, which sets the template — so the template is
+      # what must be recorded. The serving revision's annotation would restore whatever a
+      # half-finished deploy happened to leave running. (See infra/gcp/_serving_revision.sh for
+      # the opposite question and when to use it.)
       mins=$("$GCLOUD" run services describe "$svc" --project "$PROJECT" --region "$REGION" \
         --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])")
       echo "${svc}=${mins:-0}" >> "$SCALE_STATE"

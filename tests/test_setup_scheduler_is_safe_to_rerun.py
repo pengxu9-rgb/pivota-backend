@@ -59,7 +59,11 @@ WEB_JSON = (
     '"traffic":[{"revisionName":"web-00088-kaz","percent":100}]}}'
 )
 REVISION_JSON = (
-    '{"spec":{"containers":[{"env":['
+    # A revision declares the commit it was built from; deploy_worker.sh refuses one that does
+    # not (it could not restamp a rollback truthfully), so the fake must carry it.
+    '{"spec":{"containers":[{"image":"us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:'
+    + "e" * 64 + '","env":['
+    '{"name":"PIVOTA_COMMIT_SHA","value":"' + "e" * 40 + '"},'
     '{"name":"STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED","value":"true"},'
     '{"name":"STORE_AUDIT_UCP_PROBE_INTERNAL_KEY","valueFrom":{"secretKeyRef":'
     '{"name":"STORE_AUDIT_UCP_PROBE_INTERNAL_KEY"}}},'
@@ -272,27 +276,40 @@ _ACTIVE_RE = re.compile(r"python3 -c '\n(import json,sys\no=json\.load\(sys\.std
 
 
 def _preflight_blocks():
-    src = (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text(encoding="utf-8")
-    blocks = [b for b in _ACTIVE_RE.findall(src) if "revisionName" in b and "percent" in b]
-    assert len(blocks) == 2, (
-        f"expected 2 active-revision preflight blocks in setup_scheduler.sh, found {len(blocks)}. "
-        "If the shape changed, fix this extractor - do NOT restate the predicate here, or these "
-        "tests stop testing the script."
+    """The ONE predicate both preflights now use, lifted out of the shared helper.
+
+    This used to extract TWO inline copies from setup_scheduler.sh and assert they agreed —
+    which was the right test for the code as it stood, and it is why the tagged-revision
+    regression below was caught here in the first place. The copies are gone: both preflights
+    call `serving_revision` from infra/gcp/_serving_revision.sh, so there is one predicate to
+    run and nothing left to disagree.
+
+    That consolidation was not cosmetic. A FIFTH copy of this rule lived in
+    setup_store_audit_commerce_jobs.sh and still carried the `not x.get("tag")` conjunct these
+    very tests exist to forbid — so that script exited 2 on every run against production. The
+    guard was right, the tests were right, and the drift happened in the copy nobody was
+    testing.
+    """
+    src = (REPO / "infra" / "gcp" / "_serving_revision.sh").read_text(encoding="utf-8")
+    marker = "python3 -c '"
+    i = src.index(marker, src.index("serving_revision()")) + len(marker)
+    block = src[i:src.index("'", i)]
+    assert "revisionName" in block and "percent" in block, (
+        "could not lift the predicate out of _serving_revision.sh - fix this extractor, do "
+        "NOT restate the predicate here, or these tests stop testing the shipped code."
     )
-    return blocks
+    return [block]
 
 
 def _active_revision(traffic):
-    """Run the script's OWN predicate over a traffic list; assert both copies agree."""
+    """Run the shipped predicate over a traffic list. '' means it refused to answer."""
     payload = json.dumps({"status": {"traffic": traffic}})
-    results = set()
-    for block in _preflight_blocks():
-        proc = subprocess.run(["python3", "-c", block], input=payload,
-                              capture_output=True, text=True)
-        assert proc.returncode == 0, f"preflight block failed: {proc.stderr}"
-        results.add(proc.stdout.strip())
-    assert len(results) == 1, f"the UCP and commerce preflights disagree: {results}"
-    return results.pop()
+    (block,) = _preflight_blocks()
+    proc = subprocess.run(["python3", "-c", block], input=payload,
+                          capture_output=True, text=True)
+    # The helper signals "no single answer" with a non-zero exit and no output, where the
+    # inline copies printed an empty string. Both mean the same thing to every caller.
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def test_a_tagged_serving_revision_is_still_the_serving_revision():
@@ -337,10 +354,21 @@ def test_two_revisions_at_100_is_refused():
     ]) == ""
 
 
-def test_both_preflights_use_the_same_predicate():
-    """The UCP and commerce guards are two copies of one rule; they must not drift apart."""
-    blocks = _preflight_blocks()
-    assert blocks[0] == blocks[1], "the two preflight blocks have diverged"
+def test_both_preflights_use_the_shared_predicate():
+    """They were two copies of one rule and could drift apart; now they cannot, because there
+    is one rule. Asserted on comment-stripped source so an explanatory comment cannot satisfy
+    it — and the point is not that the string appears but that no inline copy remains."""
+    body = "\n".join(
+        l for l in (REPO / "infra" / "gcp" / "setup_scheduler.sh").read_text().splitlines()
+        if not l.lstrip().startswith("#")
+    )
+    assert body.count("serving_revision web") == 2, (
+        "both Store Audit preflights must resolve the serving revision through the shared "
+        f"helper; found {body.count('serving_revision web')} call(s)"
+    )
+    assert 'percent") == 100' not in body and 'percent")==100' not in body, (
+        "setup_scheduler.sh has grown its own copy of the predicate again"
+    )
 
 
 def _secrets_for(calls: list[str], job: str) -> str:

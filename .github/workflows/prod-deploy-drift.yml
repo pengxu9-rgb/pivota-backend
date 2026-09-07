@@ -191,6 +191,12 @@ jobs:
           # deploy-time check for that lives in deploy_worker.sh, which probes /__scheduler_health
           # from inside the VPC. What this job answers is narrower and is the question it was
           # built for: is the commit that is SERVING the one main says it should be.
+          #
+          # THIS PREDICATE MUST MATCH infra/gcp/_serving_revision.sh. A workflow cannot source a
+          # shell file, so this is the one copy that has to be kept in step by hand -- and it
+          # promptly drifted: when the helper was tightened to refuse a nameless 100% entry
+          # rather than filter it out and answer with its neighbour, this was not updated, which
+          # briefly left the ALARM laxer than the scripts it watches. Change both or neither.
           live_sha_image(){
             local svc="$1" rev sha
 
@@ -211,7 +217,7 @@ jobs:
               echo "::warning::could not describe '$svc' (gcloud exited $rc) - its drift is UNKNOWN this run, not clean"
               return 2
             fi
-            rev="$(printf '%s' "$describe" | python3 -c 'import json,sys; d=json.load(sys.stdin); live=[t["revisionName"] for t in (d.get("status",{}).get("traffic") or []) if t.get("percent")==100 and t.get("revisionName")]; print(live[0] if len(live)==1 else "")' 2>/dev/null || true)"
+            rev="$(printf '%s' "$describe" | python3 -c 'import json,sys; d=json.load(sys.stdin); st=d.get("status",{}); live=[t for t in (st.get("traffic") or []) if t.get("percent")==100]; sys.exit(0) if len(live)!=1 else print(live[0].get("revisionName") or (st.get("latestReadyRevisionName","") if live[0].get("latestRevision") else ""))' 2>/dev/null || true)"
             if [ -z "$rev" ]; then
               echo "::error::'$svc' has no single 100%-traffic revision - its traffic is split, so there" >&2
               echo "::error::is no one answer to what it serves. This is a real production state, not a" >&2
