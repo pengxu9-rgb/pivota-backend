@@ -17,6 +17,7 @@ import asyncio
 from typing import Any, Dict, List
 
 import pytest
+from fastapi import HTTPException
 
 import routes.employee_products as ep
 import services.external_referral_readiness as err
@@ -354,3 +355,79 @@ def test_a_CACHE_SERVED_row_does_not_project(monkeypatch):
     )
     assert result["snapshot_from_cache"] is True
     assert projected == [], "a row we did not re-read must not be re-projected"
+
+
+def test_the_pdp_half_reports_its_own_outcome(monkeypatch):
+    """The view rebuild used to fold into nothing: `projected` came solely from the offer write,
+    and `refresh_agent_pdp_view_for_seed` returned None on its silent no-ops. A skipped or
+    raising rebuild left `projected: 1` and no skip."""
+    import asyncio as _asyncio
+
+    async def fake_sync(seed_id):
+        return {"status": "synced"}
+
+    async def skipped_pdp(**kw):
+        return "skipped_no_attached_key"
+
+    async def boom_pdp(**kw):
+        raise RuntimeError("view rebuild exploded")
+
+    monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
+    monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
+
+    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", skipped_pdp)
+    counts = _asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
+    assert counts["projected"] == 1
+    assert counts["pdp_skipped"] == 1 and counts["pdp_skip_skipped_no_attached_key"] == 1
+    assert "pdp_refreshed" not in counts and "pdp_errored" not in counts
+
+    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", boom_pdp)
+    counts = _asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
+    assert counts["projected"] == 1 and counts["errored"] == 1 and counts["pdp_errored"] == 1
+
+
+def test_projection_seconds_include_the_pdp_rebuild(monkeypatch):
+    """The PDP rebuild is the ~1s/key half; a timer stopped before it measures the cheap half
+    and reports a budget cost that is not there."""
+    import asyncio as _asyncio
+
+    async def fake_sync(seed_id):
+        return {"status": "synced"}
+
+    async def slow_pdp(**kw):
+        await _asyncio.sleep(0.05)
+        return "refreshed"
+
+    monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
+    monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
+    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", slow_pdp)
+    counts = _asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
+    assert counts["pdp_refreshed"] == 1
+    assert counts["seconds"] >= 0.05, counts
+
+
+def test_an_invalid_url_seed_is_stamped_before_it_is_refused(monkeypatch):
+    """~628 seeds carry no usable destination. INVALID_URL used to raise BEFORE
+    `_stamp_crawl_attempt`, so `last_crawl_attempt_at` stayed NULL and the queue's
+    `NULLS FIRST` put those rows at the head of every night's batch, forever."""
+    from unittest.mock import AsyncMock
+
+    async def fake_fetch_one(_q, values=None):
+        return {
+            "id": "eps_nourl", "market": "US", "tool": "*",
+            "destination_url": None, "canonical_url": None, "domain": None,
+            "seed_data": {"snapshot": {}}, "status": "active",
+            "price_amount": 20.0, "price_currency": "USD",
+        }
+
+    stamp = AsyncMock(return_value=None)
+    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "_stamp_crawl_attempt", stamp)
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(ep._refresh_external_seed_by_id("eps_nourl", max_wait=0))
+    assert excinfo.value.status_code == 400 and "INVALID_URL" in str(excinfo.value.detail)
+    stamp.assert_awaited_once()
+    assert stamp.await_args.args[0] == "eps_nourl"

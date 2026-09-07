@@ -74,6 +74,7 @@ def batch_run_status(
     price_changes: int = 0,
     projections_attempted: int = 0,
     projections_written: int = 0,
+    projections_errored: int = 0,
 ) -> str:
     """The run's health, as one word. Pure so it can be tested without a database.
 
@@ -98,6 +99,11 @@ def batch_run_status(
     # before, because the outcome dicts were discarded — `no_mirror_product` x2,000 and
     # `synced` x2,000 read identically.
     if price_changes and projections_attempted and projections_written == 0:
+        return "degraded"
+    # Every projection that was attempted raised. Distinct from the rule above: prices may
+    # not have moved (so `price_changes` is 0) and the writer may still have blown up on
+    # every row -- the error count was previously collected and read by nothing.
+    if projections_attempted and projections_errored >= projections_attempted:
         return "degraded"
     return "success"
 
@@ -1689,8 +1695,12 @@ async def run_external_referral_refresh_batch(
     unprocessable_reasons: Dict[str, int] = {}
     proj_attempted = 0
     proj_written = 0
+    proj_errored = 0
     proj_seconds = 0.0
     proj_skips: Dict[str, int] = {}
+    pdp_refreshed = 0
+    pdp_errored = 0
+    pdp_skips: Dict[str, int] = {}
     degraded_hosts: Dict[str, int] = {}
     stopped_early = False
     # A "success" that never contacted the origin. `resolve_external_offer` honours
@@ -1773,9 +1783,14 @@ async def run_external_referral_refresh_batch(
                 if isinstance(proj, dict):
                     proj_attempted += int(proj.get("attempted") or 0)
                     proj_written += int(proj.get("projected") or 0)
+                    proj_errored += int(proj.get("errored") or 0)
                     proj_seconds += float(proj.get("seconds") or 0.0)
+                    pdp_refreshed += int(proj.get("pdp_refreshed") or 0)
+                    pdp_errored += int(proj.get("pdp_errored") or 0)
                     for _k, _v in proj.items():
-                        if _k.startswith("skip_"):
+                        if _k.startswith("pdp_skip_"):
+                            _bump(pdp_skips, _k[len("pdp_skip_"):])
+                        elif _k.startswith("skip_"):
                             _bump(proj_skips, _k[5:])
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
@@ -1846,6 +1861,7 @@ async def run_external_referral_refresh_batch(
             price_changes=price_changed,
             projections_attempted=proj_attempted,
             projections_written=proj_written,
+            projections_errored=proj_errored,
         ),
         # "healed 2,000" vs "healed 0" — the projection OUTCOME, not just that it was called.
         "unprocessable": unprocessable,
@@ -1855,7 +1871,14 @@ async def run_external_referral_refresh_batch(
         "projection_seconds": round(proj_seconds, 2),
         "projections_attempted": proj_attempted,
         "projections_written": proj_written,
+        # Errors were counted in the helper and read NOWHERE: a projection that raised on every
+        # row summarised as healthy. The PDP half has its own counters because `projections_written`
+        # means the OFFER landed, and the view rebuild can silently no-op or fail independently.
+        "projections_errored": proj_errored,
         "projection_skips": dict(sorted(proj_skips.items(), key=lambda kv: -kv[1])[:8]),
+        "pdp_refreshed": pdp_refreshed,
+        "pdp_errored": pdp_errored,
+        "pdp_skips": dict(sorted(pdp_skips.items(), key=lambda kv: -kv[1])[:8]),
         "attempted_count": attempted_count,
         "degraded_reason_counts": dict(sorted(degraded_reasons.items(), key=lambda kv: -kv[1])[:12]),
         "top_degraded_hosts": dict(sorted(degraded_hosts.items(), key=lambda kv: -kv[1])[:10]),

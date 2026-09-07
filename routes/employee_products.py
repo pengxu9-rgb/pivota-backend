@@ -4514,15 +4514,26 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
     try:
         from services.seed_data_writer import refresh_agent_pdp_view_for_seed
 
-        await refresh_agent_pdp_view_for_seed(
+        # THE PDP HALF REPORTS ITS OWN OUTCOME. `projected` means the OFFER was written; the
+        # view rebuild used to fold into nothing -- a raising or silently no-op'ing refresh (no
+        # attached_product_key, no content_key) left `projected: 1` and no skip, so the surface
+        # this hook is named for could fail on every row while the summary read healed.
+        pdp = await refresh_agent_pdp_view_for_seed(
             seed_id=seed_id, proposal_id=None, refresh_source="external_referral_refresh",
         )
+        if pdp == "refreshed":
+            counts["pdp_refreshed"] = 1
+        else:
+            counts["pdp_skipped"] = 1
+            counts["pdp_skip_" + str(pdp or "unknown")] = 1
     except Exception as exc:  # noqa: BLE001 - same isolation the assembler documents
         counts["errored"] = 1
+        counts["pdp_errored"] = 1
         logger.warning(
             "external seed refresh: agent_pdp_view projection failed seed_id=%s err=%s",
             seed_id, str(exc)[:200],
         )
+    # Measured AFTER both surfaces: the PDP rebuild is the ~1s/key half.
     counts["seconds"] = round(time.monotonic() - _started, 4)
     return counts
 

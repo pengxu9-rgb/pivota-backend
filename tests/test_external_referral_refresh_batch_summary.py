@@ -133,3 +133,66 @@ def test_main_returns_zero_on_a_healthy_summary(monkeypatch):
     monkeypatch.setattr(job.database, "disconnect", lambda: asyncio.sleep(0))
     monkeypatch.setattr("sys.argv", ["external_referral_refresh", "--limit", "1"])
     assert job.main() == 0
+
+
+def test_cache_served_rows_are_not_origin_reads(monkeypatch):
+    """`origin_reads = refreshed - refreshed_from_cache` is the run's ONLY live alarm while the
+    projection flag is off (production today): `failed` is structurally 0 for a degraded read
+    and `stopped_early` is report-only. Every earlier test handed the batch a precomputed
+    `origin_reads`; `origin_reads = refreshed` survived. Cache-served rows must yield zero."""
+    rows = [dict(_ok(price="unchanged", projected=0, attempted=0), snapshot_from_cache=True)
+            for _ in range(5)]
+    summary = _run(monkeypatch, rows)
+    assert summary["refreshed"] == 5
+    assert summary["refreshed_from_cache"] == 5
+    assert summary["origin_reads"] == 0
+    assert summary["origin_yield"] == 0.0
+    assert summary["status"] == "degraded"
+
+
+def test_a_mix_of_origin_and_cache_reads_yields_the_origin_share(monkeypatch):
+    rows = [_ok() for _ in range(3)] + [dict(_ok(), snapshot_from_cache=True) for _ in range(2)]
+    summary = _run(monkeypatch, rows)
+    assert summary["origin_reads"] == 3 and summary["attempted_count"] == 5
+    assert summary["origin_yield"] == 0.6
+    assert summary["status"] == "success"
+
+
+def _errored(*, pdp_only=False, price="unchanged"):
+    # `price="unchanged"` on purpose: with prices moving, the OLDER rule (prices moved and
+    # nothing written) already degrades the run, and this helper exists to reach the rule
+    # that fires when every projection RAISED while no price moved.
+    row = _ok(price=price, projected=0 if not pdp_only else 1)
+    row["projection"] = {
+        "attempted": 1, "projected": 1 if pdp_only else 0, "skipped": 0, "errored": 1,
+        "pdp_errored": 1, "seconds": 0.5,
+    }
+    return row
+
+
+def test_projection_errors_reach_the_summary_and_an_all_errored_run_is_degraded(monkeypatch):
+    """`errored` was written in the helper and read nowhere; a projection that raised on every
+    row summarised as healthy. And the PDP half reports separately: the offer landing is not
+    the PDP being rebuilt."""
+    summary = _run(monkeypatch, [_errored(), _errored(), _errored()])
+    assert summary["projections_errored"] == 3
+    assert summary["pdp_errored"] == 3
+    assert summary["status"] == "degraded"
+    # One healthy projection among the errors is not an all-errored run.
+    summary = _run(monkeypatch, [_errored(), _ok()])
+    assert summary["projections_errored"] == 1 and summary["status"] == "success"
+
+
+def test_pdp_outcomes_are_counted_separately_from_the_offer_write(monkeypatch):
+    rows = []
+    r = _ok(); r["projection"].update({"pdp_refreshed": 1}); rows.append(r)
+    r = _ok(); r["projection"].update({"pdp_skipped": 1, "pdp_skip_skipped_no_attached_key": 1}); rows.append(r)
+    r = _ok(); r["projection"].update({"pdp_skipped": 1, "pdp_skip_skipped_no_attached_key": 1}); rows.append(r)
+    r = _ok(projected=0); r["projection"].update({"skip_no_mirror_product": 1, "skipped": 1,
+                                                  "pdp_skipped": 1, "pdp_skip_skipped_no_content_key": 1}); rows.append(r)
+    summary = _run(monkeypatch, rows)
+    assert summary["projections_written"] == 3
+    assert summary["pdp_refreshed"] == 1
+    assert summary["pdp_skips"] == {"skipped_no_attached_key": 2, "skipped_no_content_key": 1}
+    # The offer-side skip histogram is pinned at the seam too: `{}` used to survive.
+    assert summary["projection_skips"] == {"no_mirror_product": 1}
