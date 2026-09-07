@@ -246,7 +246,17 @@ _CATEGORY_REFINEMENT_TERMS = frozenset(
 # column cannot match — a real gap, but a PRE-EXISTING one (before this branch nothing was admitted
 # by brand at all), and closing it in SQL costs ~25 more replaces per column. It belongs in a
 # normalized column, not in the hot query.
-_BRAND_IDENTITY_SEPARATORS = (".", ",", "-", "'", "+", "/", "&", "(", ")")
+#
+# TRADEMARK GLYPHS ARE SEPARATORS, NOT LETTERS. A merchant writes the mark INTO the name —
+# "Stay All Day® Liquid Lipstick", "M·A·Cximal", "Pop™ Longwear Lipstick" — and the glyph
+# glues itself to the word beside it, so the space-padded LIKE below asks for " day " and the
+# column offers " day® ". Measured on prod 2026-09-07: the anchor for "Stila Stay All Day
+# Liquid Lipstick" matched 0 of Stila's 124 rows for exactly this reason, every one of whose
+# titles carries "Stay All Day®". These four fold to a space for the same reason "-" does:
+# they delimit words, they never spell one.
+_BRAND_IDENTITY_SEPARATORS = (
+    ".", ",", "-", "'", "+", "/", "&", "(", ")", "®", "™", "©", "·",
+)
 
 
 def _brand_identity_expr(column: str) -> str:
@@ -280,6 +290,30 @@ def _category_brand_anchor_terms(query: str) -> List[str]:
     terms = _filter_relevance_terms(_tokenize_relevance(query))
     residual = [term for term in terms if term not in _CATEGORY_REFINEMENT_TERMS]
     return residual[:4] if len(residual) >= 2 else []
+
+
+def _category_evidence_phrases(lowered: str, category_prefix: str) -> List[str]:
+    """The query's OWN spans that, alone, resolve to `category_prefix`.
+
+    "stila stay all day liquid lipstick" -> ["liquid lipstick"] / ["lipstick"]. This is the
+    literal, whole-word evidence a row must carry in its own text before a taxonomy escape
+    admits it, and it is derived from the query rather than from a hardcoded word list so a
+    new category alias needs no change here.
+
+    Hoisted out of the brand-anchor branch so the ancestor-taxonomy escape and the
+    missing-taxonomy escape apply the SAME evidence standard. They were written to the same
+    standard by hand once; two copies of a rule is one copy too many.
+    """
+    query_words = re.findall(r"[a-z0-9]+", lowered)[:40]
+    phrases: List[str] = []
+    for width in range(1, 5):
+        for start in range(len(query_words) - width + 1):
+            phrase = " ".join(query_words[start:start + width])
+            if any(f" {known} " in f" {phrase} " for known in phrases):
+                continue
+            if category_path_prefix_for_query(phrase) == category_prefix:
+                phrases.append(phrase)
+    return phrases
 
 
 def _vertical_intent(query: str) -> bool:
@@ -1117,6 +1151,64 @@ async def _fetch_canonical_search_rows(
             + CASE WHEN p.category_path IS NOT NULL AND p.category_path LIKE :category_path_prefix THEN 90 ELSE 0 END
         """
 
+        # ANCESTOR TAXONOMY — a path that STOPS SHORT of the query's category is missing
+        # depth, not evidence of a different category.
+        #
+        # The clause above asks for `category_path LIKE 'beauty/makeup/lip/%'`. A row whose
+        # path is 'beauty/makeup' fails it, and so does the `missing_taxonomy` escape further
+        # down, which fires only when the path IS NULL. The result is an inversion: a row that
+        # asserted a COARSE but CORRECT ancestor is strictly less recallable than a row that
+        # asserted nothing at all.
+        #
+        # Measured on prod 2026-09-07. The curated-brand lane (source_system
+        # 'catalog_enrichment_agent_v1') writes depth-2 paths for whole brands: Stila
+        # 124/124 rows at exactly 'beauty/makeup', Tarte 231/231, Flower Beauty 49/49 — 0
+        # rows with a 'beauty/makeup/lip/%' path between them. So "Stila Stay All Day Liquid
+        # Lipstick" admitted 0 Stila rows (the phrase door needs the literal phrase in one
+        # column; the brand-admit door reads brand/merchant_name only and no brand is named
+        # "Stila Stay All Day"), and the page came back Pixi/Fenty/Kylie — all of them
+        # seed-mirror rows that DO carry 'beauty/makeup/lip/%'. Not a ranking loss: a recall
+        # miss, with Stila's 123 live, priced, serving-eligible offers never a candidate.
+        #
+        # THE WIDENING IS BOUNDED BY TWO CONJUNCTS, not one:
+        #   1. the row's path must be a strict ANCESTOR of the query's prefix — 'beauty/makeup'
+        #      admits under 'beauty/makeup/lip/', 'beauty/skincare' never does, and a NULL path
+        #      still admits nothing here (that case keeps its existing brand-gated escape); and
+        #   2. the row's OWN text must carry a whole-word category phrase from the query, the
+        #      same evidence standard `missing_taxonomy` already applies.
+        # A bare ancestor test without (2) would admit every 'beauty/makeup' row — foundations,
+        # mascara, brushes — into every lip query, which is the failure the +90 category score
+        # exists to avoid.
+        #
+        # SUBSTR/LENGTH, not LIKE, for the ancestor test: `p.category_path` would be the LIKE
+        # PATTERN there, so a stored '_' (real: 'beauty/makeup/lip/lip_oil') would silently
+        # become a single-character wildcard. Both functions exist in production PostgreSQL and
+        # in the SQLite integration harness.
+        #
+        # The SCORE is deliberately unchanged: an ancestor-only row does not earn the +90 that
+        # a real depth match earns. It is admitted so it can compete, not promoted.
+        # PARAMS AND SQL IN THE SAME BRANCH. An unused bind is not ignored on this stack —
+        # text() raises ArgumentError("doesn't define a bound parameter named ...") and the
+        # whole query dies. Binding inside the branch that emits the clause referencing them
+        # is what makes that unreachable rather than merely absent today.
+        evidence_phrases = _category_evidence_phrases(lowered, category_prefix)[:8]
+        if evidence_phrases:
+            ancestor_evidence: List[str] = []
+            for index, phrase in enumerate(evidence_phrases):
+                param_name = f"category_evidence_{index}"
+                params[param_name] = f"% {phrase} %"
+                ancestor_evidence.extend(
+                    f"{_brand_identity_expr(field)} LIKE :{param_name}"
+                    for field in ("p.title", "p.product_type", "s.title")
+                )
+            params["category_path_exact"] = category_prefix
+            category_where += (
+                "\n            OR (NULLIF(TRIM(COALESCE(p.category_path, '')), '') IS NOT NULL"
+                "\n                AND SUBSTR(:category_path_exact, 1, LENGTH(p.category_path) + 1)"
+                "\n                    = p.category_path || '/'"
+                "\n                AND (" + " OR ".join(ancestor_evidence) + "))\n"
+            )
+
     # A multi-token residual next to a known category is a possible brand
     # anchor.  This is deliberately independent of the broad token-recall flag:
     # it does not widen arbitrary queries, and category recall already admits
@@ -1248,15 +1340,7 @@ async def _fetch_canonical_search_rows(
             # whole-word category phrase in product evidence. Do not override
             # an existing category path or admit the brand's entire inventory.
             category_evidence = []
-            query_words = re.findall(r"[a-z0-9]+", lowered)[:40]
-            category_phrases = []
-            for width in range(1, 5):
-                for start in range(len(query_words) - width + 1):
-                    phrase = " ".join(query_words[start:start + width])
-                    if any(f" {known} " in f" {phrase} " for known in category_phrases):
-                        continue
-                    if category_path_prefix_for_query(phrase) == category_prefix:
-                        category_phrases.append(phrase)
+            category_phrases = _category_evidence_phrases(lowered, category_prefix)
             for index, phrase in enumerate(category_phrases[:8]):
                 param_name = f"brand_category_evidence_{index}"
                 params[param_name] = f"% {phrase} %"
