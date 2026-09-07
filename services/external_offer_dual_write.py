@@ -60,6 +60,17 @@ OFFER_CATALOG_TRACK = "external_referral"
 OFFER_TRUTH_TIER = "observed"
 OFFER_READINESS_TIER = "referral_only"
 OFFER_MODE = "redirect"
+
+# THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
+# returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
+# no_mirror_product, synced, error. Only `synced` means a row was written.
+#
+# This exists because the refresh hook first hardcoded {"synced","inserted","updated","ok"} —
+# three of which this function cannot emit, and "ok" is what its own tests stubbed. Deleting
+# "synced" from that set would have left projections_written at 0 every night while writes were
+# landing, degrading the run and failing the job nightly. Import these instead of restating them.
+OFFER_SYNC_WRITTEN_STATUSES = frozenset({"synced"})
+OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 OFFER_PRICE_CONFIDENCE = Decimal("0.6")
@@ -71,11 +82,23 @@ OFFER_ID_PREFIX = "offer:external_seed:"
 def dual_write_enabled() -> bool:
     """Flag: run the synchronous seed→offer dual-write on seed writes.
 
-    Default OFF — genuine dark launch (slice 3 ships inert). The projection is
-    inert to live serving anyway (the pivot lane reading catalog_offers is
-    flag-off; the mainline serves seeds directly), but a default-ON write hook
-    is not "dark" — flip EXTERNAL_OFFER_DUAL_WRITE_ENABLED=1 to start populating,
-    co-gated with the Phase-2 pivot cutover.
+    Default OFF.
+
+    THE "inert to live serving" CLAIM THIS DOCSTRING USED TO MAKE IS FALSE, and believing it
+    cost roughly a quarter of the catalogue its price accuracy. `catalog_offers` IS read on two
+    live surfaces: the PDP, via `agent_pdp_view_assembler.fetch_offers_for_keys` →
+    `normalize_offer`, and the index's `serving_eligible.has_price` gate, via
+    `index_pipeline_state_service` → `priced_offer_sql`. Only the search/offers lane reads the
+    seed directly. So with this flag off, the nightly external-referral refresh updated the seed
+    and the PDP kept quoting whatever `catalog_offers` was mirrored with — measured on prod
+    2026-09-06, **1,321 of 5,316 live products (25%) showed a different price on the PDP than in
+    search**, 917 of them with a seed read inside 7 days.
+
+    It is still default OFF because arming it is a deploy-time decision (it adds a write to
+    every seed-write path), but "dark" now means "not yet armed", NOT "harmless to leave off".
+    Flip EXTERNAL_OFFER_DUAL_WRITE_ENABLED=1 on web, worker and the
+    external-referral-refresh job together — arming it on only some of them leaves exactly the
+    split-brain above.
     """
     return os.getenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "false").strip().lower() in {
         "1", "true", "yes", "on",

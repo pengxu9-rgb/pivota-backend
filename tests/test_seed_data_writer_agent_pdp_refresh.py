@@ -197,12 +197,13 @@ async def test_refresh_returns_early_when_attached_product_key_is_null(monkeypat
     fake_db = _RecordingDB(seed_row={"attached_product_key": None})
     monkeypatch.setattr(writer, "database", fake_db)
 
-    await writer.refresh_agent_pdp_view_for_seed(
+    outcome = await writer.refresh_agent_pdp_view_for_seed(
         seed_id="seed_unattached",
         proposal_id=1,
         refresh_source="writer_commit:1",
     )
 
+    assert outcome == "skipped_no_attached_key"
     assert len(fake_db.fetch_one_calls) == 1
     assert fake_db.fetch_all_calls == []
     assert fake_db.execute_calls == []
@@ -216,12 +217,13 @@ async def test_refresh_returns_early_when_content_key_is_null(monkeypatch) -> No
     )
     monkeypatch.setattr(writer, "database", fake_db)
 
-    await writer.refresh_agent_pdp_view_for_seed(
+    outcome = await writer.refresh_agent_pdp_view_for_seed(
         seed_id="seed_legacy",
         proposal_id=2,
         refresh_source="writer_commit:2",
     )
 
+    assert outcome == "skipped_no_content_key"
     assert len(fake_db.fetch_one_calls) == 2
     assert fake_db.fetch_all_calls == []
     assert fake_db.execute_calls == []
@@ -236,11 +238,12 @@ async def test_refresh_returns_early_when_assemble_row_returns_none(monkeypatch)
     )
     monkeypatch.setattr(writer, "database", fake_db)
 
-    await writer.refresh_agent_pdp_view_for_seed(
+    outcome = await writer.refresh_agent_pdp_view_for_seed(
         seed_id="seed_no_title",
         proposal_id=3,
         refresh_source="writer_commit:3",
     )
+    assert outcome == "skipped_not_refreshable"
 
     assert any(call["params"] == {"ck": "ck_no_title"} for call in fake_db.fetch_all_calls)
     assert fake_db.execute_calls == []
@@ -283,11 +286,12 @@ async def test_refresh_sql_targets_the_right_content_key(monkeypatch) -> None:
     )
     monkeypatch.setattr(writer, "database", fake_db)
 
-    await writer.refresh_agent_pdp_view_for_seed(
+    outcome = await writer.refresh_agent_pdp_view_for_seed(
         seed_id="seed_attached",
         proposal_id=909,
         refresh_source="writer_commit:909",
     )
+    assert outcome == "refreshed", "the success path must say so — callers count it now"
 
     product_fetch = next(
         call for call in fake_db.fetch_all_calls
