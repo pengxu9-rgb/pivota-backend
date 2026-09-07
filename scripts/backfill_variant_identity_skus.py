@@ -56,6 +56,7 @@ from services.catalog_enrichment_agent.ingestion import (  # noqa: E402
     OFFER_TRUTH_TIER,
     derive_offer_id,
     derive_variant_sku_key,
+    variant_own_price,
 )
 from services.catalog_variant_promoter import (  # noqa: E402
     _extract_variants_from_payload,
@@ -151,18 +152,9 @@ def _as_list(value: Any) -> List[Dict[str, Any]]:
 
 
 def _price_of(variant: Dict[str, Any]) -> Optional[float]:
-    """The variant's OWN price. Never the product's — see the module docstring."""
-    for key in ("price_amount", "price", "list_price"):
-        raw = variant.get(key)
-        if raw is None or raw == "":
-            continue
-        try:
-            value = float(str(raw).replace(",", ""))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
-    return None
+    """The variant's OWN price. Never the product's — see the module docstring.
+    One rule with ingestion: `variant_own_price`."""
+    return variant_own_price(variant)
 
 
 def _availability_of(variant: Dict[str, Any], fallback: Optional[str]) -> str:

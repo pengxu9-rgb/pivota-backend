@@ -859,6 +859,139 @@ def test_a_single_variant_record_with_a_fabricated_id_still_writes_no_variant_sk
     assert len(result["offers"]) == 1
 
 
+# --- a variant offer carries the variant's OWN positive price or is not written ---------
+
+
+def _lone_real_variant_record(**variant_overrides):
+    """One variant with a real 14-digit id -- the shape #2113 admits -- whose price
+    fields are whatever the test says, and nothing else."""
+    record = _variant_record(1)
+    v = record["pdp"]["variants"][0]
+    v.pop("price", None)
+    v.update(variant_overrides)
+    return record
+
+
+def test_a_lone_variant_without_a_price_of_its_own_gets_a_sku_but_no_offer():
+    """Post-merge review of #2113: a single-variant record could not reach the variant
+    offer loop before the count gate was lifted, so lifting it projected a None-priced
+    catalog_offers row (list/effective/estimated all NULL, price_confidence NULL) for
+    every recovered product whose variant carried no price key. The invariant is the one
+    the PR's own backfill enforces: never inherit, never project None."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record())
+    assert [s["source_variant_id"] for s in result["variant_skus"]] == ["54057345745090"]
+    offers = result["offers"]
+    assert len(offers) == 1                                   # canonical only
+    assert offers[0]["sku_key"] == result["sku"]["sku_key"]
+    assert offers[0]["list_price"] == 24.0
+    assert all(o["list_price"] is not None for o in offers)
+
+
+def test_a_zero_priced_variant_is_not_projected_as_an_offer():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record(price=0))
+    assert len(result["variant_skus"]) == 1
+    assert len(result["offers"]) == 1
+    assert all((o["list_price"] or 0) > 0 for o in result["offers"])
+
+
+def test_a_variant_priced_under_price_amount_is_still_priced():
+    """The seed writer emits `price_amount` beside `price`; a crawler that emits only the
+    former used to yield a NULL-priced offer because the loop read `price` alone."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record(price_amount="27.50"))
+    vsku = result["variant_skus"][0]
+    by_sku = {o["sku_key"]: o for o in result["offers"]}
+    assert len(by_sku) == 2
+    assert by_sku[vsku["sku_key"]]["list_price"] == 27.5
+    assert by_sku[vsku["sku_key"]]["merchant_effective_price"] == 27.5
+    assert by_sku[vsku["sku_key"]]["price_confidence"] == 0.7
+
+
+def test_a_variant_never_inherits_the_canonical_price():
+    """Mutant f2 from the review survived: nothing pinned that a priceless variant does not
+    silently take the product's price. Canonical is 24.0; if a variant offer existed it
+    could only have got 24.0 by inheritance."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record(price=None))
+    vkey = result["variant_skus"][0]["sku_key"]
+    assert vkey not in {o["sku_key"] for o in result["offers"]}
+
+
+def test_multi_variant_records_skip_only_the_unpriced_variant_offer():
+    """The rule is per variant, not per record: two priced shades keep their offers, the
+    unpriced third keeps its SKU and loses only its offer."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(3)
+    record["pdp"]["variants"][2]["price"] = ""
+    result = ing.ingest_validated_record(record)
+    vskus = result["variant_skus"]
+    assert len(vskus) == 3
+    offered = {o["sku_key"] for o in result["offers"]}
+    assert vskus[0]["sku_key"] in offered and vskus[1]["sku_key"] in offered
+    assert vskus[2]["sku_key"] not in offered
+    assert len(result["offers"]) == 3                         # canonical + 2
+
+
+def test_variant_own_price_is_the_one_rule_the_backfill_uses_too():
+    from services.catalog_enrichment_agent import ingestion as ing
+    from scripts import backfill_variant_identity_skus as bf
+
+    for v, expected in [
+        ({"price": "24.00"}, 24.0), ({"price_amount": 24}, 24.0), ({"list_price": "1,024.50"}, 1024.5),
+        ({"price": 0}, None), ({"price": "0.00"}, None), ({"price": None}, None), ({"price": ""}, None),
+        ({"price": "n/a"}, None), ({}, None), ({"price": -5, "price_amount": 3}, 3.0),
+        # ORDER, not just the key set: price_amount wins over price, price over list_price,
+        # as the four other readers of these dicts already do.
+        ({"price": "24.00", "price_amount": 19.99}, 19.99),
+        ({"price": "24.00", "list_price": 30.0}, 24.0),
+        ({"price_amount": 19.99, "list_price": 30.0}, 19.99),
+    ]:
+        assert ing.variant_own_price(v) == expected, v
+        assert bf._price_of(v) == expected, v
+    # The backfill DELEGATES; a re-inlined copy would drift the day the rule changes.
+    assert bf._price_of.__code__.co_names and "variant_own_price" in bf._price_of.__code__.co_names
+
+
+def test_the_seed_row_prices_a_real_variant_by_the_same_rule_as_its_offer():
+    """The PDP reads seed_data['variants'] directly while search prices from
+    catalog_offers; a shade priced only under `price_amount` used to be 26.00 in one
+    and None in the other."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(3)
+    v = record["pdp"]["variants"][2]
+    v.pop("price"); v["price_amount"] = "26.00"
+    record["pdp"]["variants"][1]["price"] = 0
+    result = ing.ingest_validated_record(record)
+    seed_variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    by_vid = {sv["variant_id"]: sv for sv in seed_variants}
+    assert by_vid["54057345745092"]["price_amount"] == 26.0
+    assert by_vid["54057345745091"]["price_amount"] is None        # 0 is not a price
+    offered = {o["sku_key"]: o["list_price"] for o in result["offers"]}
+    vskus = {s["source_variant_id"]: s["sku_key"] for s in result["variant_skus"]}
+    assert offered[vskus["54057345745092"]] == 26.0
+    assert vskus["54057345745091"] not in offered
+
+
+def test_the_synthetic_seed_variant_is_stamped_as_minted():
+    """tests/test_variant_id_fabrication_ratchet.py exempts this writer on the strength of
+    the stamp; the stamp has to exist."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_record())
+    variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    assert len(variants) == 1
+    assert variants[0]["variant_id_provenance"] == "product_derived"
+    assert variants[0]["purchasable"] is False
+
+
 def test_plan_counts_variant_skus():
     from services.catalog_enrichment_agent import ingestion as ing
 
