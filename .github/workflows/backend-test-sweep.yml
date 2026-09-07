@@ -293,6 +293,14 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys, math, collections, xml.etree.ElementTree as ET
+          # 2026-09-06: 16,182 executed on main; the 14,500 floor had grown 1,682
+          # of slack (cap 15,950) and the cap tripped, as designed, on the push
+          # run for the Webflow telemetry PR (#2103), after passing advisory on
+          # the PR itself. The deploy gate refused, so prod stayed on the prior
+          # commit until this re-float landed. Re-floated into the window the
+          # assert printed (14,711..16,182) at the same ~97%-of-measured:
+          # ~480 tests of deletion headroom, cap 17,270.
+          #
           # 2026-09-05: 14,973 executed on main; the 13,600 floor had grown 1,373
           # of slack (cap 14,960) and the cap tripped, as designed — on the
           # push-to-main run, where it is fatal, after passing advisory on the
@@ -303,7 +311,7 @@ jobs:
           # 2026-09-03: 14,027 executed on main; the 12,000 floor had grown 2,027
           # of slack (cap 13,200) and the cap tripped, as designed. Re-floated
           # into the window the assert printed (12,752..14,027).
-          FLOOR = 14500
+          FLOOR = 15700
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
@@ -364,7 +372,11 @@ jobs:
           # still noticing the file leaving; cap(120) = 270 stays clear of 133.
           # tests.services: 1,852 executed on 2026-09-03 against a 1,600 floor
           # (cap 1,760); re-floated into its window (1,684..1,852).
-          SUBTREES = {'tests.services': 1800, 'readiness.tests': 120}
+          # tests.services: 1,967 executed on 2026-09-06 against the 1,800 floor
+          # (cap 1,980) -- 13 tests from tripping on the next services test
+          # added. Re-floated within its window (1,789..1,967) to 1,900:
+          # ~67 of deletion headroom, cap 2,090.
+          SUBTREES = {'tests.services': 1900, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
