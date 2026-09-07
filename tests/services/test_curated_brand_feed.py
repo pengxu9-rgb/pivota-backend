@@ -104,6 +104,10 @@ def test_mapper_emits_variants_only_when_a_caller_asked_for_them():
     the callers that do not ask must keep emitting exactly one SKU per product."""
     assert shopify_product_to_record(_native(), domain="x.com", category_path="x")["pdp"]["variants"] == []
     assert shopify_product_to_record(_multi(), domain="x.com", category_path="x")["pdp"]["variants"] == []
+    # The fold lane's switch alone must NOT reach a native row: a `--base-listings-only`
+    # run (MAC) keeps emitting exactly one SKU for every product it did not fold.
+    assert shopify_product_to_record(_native(), domain="x.com", category_path="x",
+                                     emit_variants=True)["pdp"]["variants"] == []
 
 
 def test_native_multi_variant_rows_emit_their_real_merchant_ids():
@@ -112,7 +116,7 @@ def test_native_multi_variant_rows_emit_their_real_merchant_ids():
     all. Measured on flowerbeauty.com 2026-09-07: 29 of 49 products multi-variant,
     185 real variant ids, ZERO folded, so the fold gate refused every one."""
     rec = shopify_product_to_record(
-        _native(), domain="x.com", category_path="x", emit_variants=True)
+        _native(), domain="x.com", category_path="x", emit_native_variants=True)
     vs = rec["pdp"]["variants"]
     assert [(v["variant_id"], v["title"], v["price"], v["in_stock"]) for v in vs] == [
         ("39406294532166", "Dune", 11.99, True),
@@ -126,13 +130,13 @@ def test_a_native_row_drops_an_id_it_cannot_place_as_the_merchants():
     purchasable and is not — the failure the gateway's isRestatedProductId catches.
     `_multi`'s ids are 11/13: too short to be a Shopify variant id."""
     rec = shopify_product_to_record(
-        _multi(), domain="x.com", category_path="x", emit_variants=True)
+        _multi(), domain="x.com", category_path="x", emit_native_variants=True)
     assert rec["pdp"]["variants"] == []
     # ...and an id that merely restates the product's own id is refused on shape alone.
     restated = _native(variants=[{"id": 6644068515910, "price": "11.99",
                                   "option1": "Only", "available": True}])
     assert shopify_product_to_record(
-        restated, domain="x.com", category_path="x", emit_variants=True)["pdp"]["variants"] == []
+        restated, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"] == []
 
 
 def test_a_native_single_variant_row_still_earns_its_real_id():
@@ -141,7 +145,7 @@ def test_a_native_single_variant_row_still_earns_its_real_id():
     one = _native(id=1759336595526, variants=[
         {"id": 17281773207622, "price": "8.00", "option1": "Flamingo Flirt", "available": True}])
     vs = shopify_product_to_record(
-        one, domain="x.com", category_path="x", emit_variants=True)["pdp"]["variants"]
+        one, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
     assert [v["variant_id"] for v in vs] == ["17281773207622"]
 
 
@@ -1506,6 +1510,11 @@ async def test_records_for_brand_wires_emit_real_variants_through(monkeypatch):
 
     off = await cbf.records_for_brand(domain="x.com", category_path="c")
     assert off[0]["pdp"]["variants"] == []
+
+    # The MAC lane's flag on its own must not change what a native row yields.
+    fold_only = await cbf.records_for_brand(
+        domain="x.com", category_path="c", base_listings_only=True)
+    assert fold_only[0]["pdp"]["variants"] == []
 
     on = await cbf.records_for_brand(domain="x.com", category_path="c", emit_real_variants=True)
     assert [v["variant_id"] for v in on[0]["pdp"]["variants"]] == [

@@ -176,12 +176,13 @@ Both upserts are keyed (`derive_variant_sku_key`, `derive_offer_id`), so a re-ru
 ### 2.4 Promote the official canonicals
 
 ```bash
-scripts/ops/run_oneoff_job.sh scripts/promote_brand_official_canonicals.py \
-  --brand "Flower Beauty" --domain flowerbeauty.com --apply
+scripts/ops/run_oneoff_job.sh scripts/promote_brand_official_canonicals.py --apply
 ```
 
-> Read that script's own `--help` first — it was not exercised in this investigation and its flag
-> names are not verified here.
+> The script takes only `--apply` and `--limit N` (verified in review, 2026-09-07). It has NO brand
+> or domain filter: it promotes the whole unpromoted Path-C population, which is the documented
+> step 2 after every curated-brand run. Dry-run first (omit `--apply`) and read the blocker
+> breakdown it prints; the Flower Beauty rows are expected to move from `blocked` to `shadow`.
 
 ### 2.5 Verify (read-only)
 

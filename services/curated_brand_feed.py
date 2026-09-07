@@ -841,6 +841,10 @@ def shopify_product_to_record(
     category_path: str,
     brand_override: Optional[str] = None,
     emit_variants: bool = False,
+    # Separate switch for NATIVE (un-folded) multi-variant rows, so the fold lane's
+    # `emit_variants=True` cannot silently start emitting variants for the rows it
+    # did not fold — `--base-listings-only` runs (MAC) stay byte-identical.
+    emit_native_variants: bool = False,
     currency: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
@@ -934,7 +938,8 @@ def shopify_product_to_record(
     # `variant_identity` cannot positively place as merchant-issued is dropped
     # here rather than carried forward as a decoy that looks purchasable.
     native = not product.get(FOLDED_INTO_KEY)
-    if emit_variants and len(sellable) >= 1:
+    emit_here = emit_native_variants if native else emit_variants
+    if emit_here and len(sellable) >= 1:
         seen_ids: set = set()
         base_option_name = _base_option_name(product)
         for i, v in enumerate(sellable):
@@ -1259,7 +1264,8 @@ async def records_for_brand(
     for p in products:
         rec = shopify_product_to_record(
             p, domain=domain, category_path=category_path, brand_override=brand,
-            emit_variants=base_listings_only or emit_real_variants,
+            emit_variants=base_listings_only,
+            emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),
         )
         if not rec:
