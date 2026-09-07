@@ -79,6 +79,7 @@ from services.catalog_enrichment_agent.ingestion import (  # noqa: E402
     OFFER_TRUTH_TIER,
     derive_offer_id,
     derive_variant_sku_key,
+    variant_own_price,
 )
 from services.catalog_offer_writer_guard import (  # noqa: E402
     WriterAuditAccumulator,
@@ -213,18 +214,13 @@ def _as_list(value: Any) -> List[Dict[str, Any]]:
 
 def _price_of(variant: Dict[str, Any]) -> Optional[float]:
     """The variant's OWN price. Never the product's — a variant differs from its siblings in
-    exactly the dimension that carries price (30 ml vs 50 ml, a set vs a single)."""
-    for key in ("price_amount", "price", "list_price"):
-        raw = variant.get(key)
-        if raw is None or raw == "":
-            continue
-        try:
-            value = float(str(raw).replace(",", ""))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
-    return None
+    exactly the dimension that carries price (30 ml vs 50 ml, a set vs a single).
+
+    ONE RULE with ingestion, per #2116: `variant_own_price` is the single definition, so the
+    ingest-time writer and this backfill cannot disagree about whether a row is priced. They
+    did disagree once — the loop lifted by #2113 read `v.get("price")` directly and wrote NULL
+    prices for variants that carry only `price_amount`."""
+    return variant_own_price(variant)
 
 
 def normalize_availability(raw: Any, fallback: Optional[str] = None) -> str:

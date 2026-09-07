@@ -296,8 +296,10 @@ def build_variant_row(
     UI can render shade swatches (Stage 2b-ii), and a variant whose id we cannot place is
     still a real shade the buyer needs to see. What would be wrong is letting that row look
     like merchant identity downstream, so the provenance is decided here, once, and carried
-    on the row — measured on prod 2026-09-07, 1,645 of the 2,803 promotable products carry
-    an id one of our own writers minted."""
+    on the row so a consumer can filter on it — measured on prod 2026-09-07, 1,645 of the
+    2,803 promotable products carry an id one of our own writers minted. As of that date no
+    money path reads the stamp yet; the gateway's isRestatedProductId guard is what refuses
+    a product-derived id at checkout."""
     variant_id = str(variant.get("variant_id") or variant.get("id") or "").strip()
     if not variant_id:
         return None
