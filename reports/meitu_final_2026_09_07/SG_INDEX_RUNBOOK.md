@@ -199,9 +199,20 @@ gcloud run jobs update catalog-curated-brand-onboard --region us-west1 --project
 # 2. the SERVICE — for every later runtime recompute
 gcloud run services update web --region us-west1 --project pivota-prod \
   --update-env-vars PIVOTA_SERVING_PRICING_REGIONS=US,SG
+
+# 3. the WORKER — jobs/nightly_index_health_job.py (04:00 UTC, production worker only,
+#    services/audit_scheduler.py:354-360) re-runs the eligibility batch over the WHOLE corpus
+#    and rewrites serving_eligible. Unset here, every SG row goes back to no_us_offer on the
+#    first nightly pass. The worker is NOT shipped by deploy-prod (manual roll) — it must also
+#    be on an image that carries this change before the var means anything to it.
+gcloud run services update worker --region us-west1 --project pivota-prod \
+  --update-env-vars PIVOTA_SERVING_PRICING_REGIONS=US,SG
 ```
 
-Do both BEFORE command 3. Unset, the value is `US` and the emitted SQL is byte-identical to
+`scripts/recompute_index_serving_eligibility.py` is a fourth reader with the same requirement
+(pass the var in `ENV_VARS` when running it through `run_oneoff_job.sh`).
+
+Do all three BEFORE command 3. Unset, the value is `US` and the emitted SQL is byte-identical to
 today's (asserted in `tests/test_region_pricing.py`). Set to `US,SG`, an offer priced in SGD
 satisfies the gate — a membership test on a currency code, never a conversion.
 

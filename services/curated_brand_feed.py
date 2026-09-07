@@ -1344,7 +1344,20 @@ async def records_for_brand(
                 f"page reads exactly like a missing file. If {actual or 'the proven value'} "
                 f"is genuinely right, pass --require-currency {actual or '<code>'} instead."
             )
-    if only_vendors:
+    if only_vendors is not None:
+        # A filter that was ASKED FOR but normalises to nothing is refused, not skipped.
+        # `--only-vendor "$VENDOR"` with the variable unset, or a jsonl row
+        # `"only_vendors": [""]`, would otherwise pass an empty set to the filter, which
+        # returns the whole feed — and the brand override then relabels every product of a
+        # 224-vendor retailer as the target brand, signalled only by a "1000 -> 1000" line.
+        wanted = [v for v in only_vendors if str(v or "").strip()]
+        if not wanted:
+            raise ValueError(
+                f"{domain}: --only-vendor was given but every entry is blank "
+                f"({list(only_vendors)!r}). Name the vendor, or drop the flag to ingest "
+                f"the whole feed deliberately."
+            )
+        only_vendors = wanted
         before = len(products)
         products = filter_products_by_vendor(products, only_vendors)
         if not products:

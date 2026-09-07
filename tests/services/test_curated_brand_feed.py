@@ -1745,3 +1745,59 @@ async def test_omitting_the_currency_gate_leaves_the_old_behaviour_exactly(monke
 
     assert len(recs) == 1
     assert recs[0]["pdp"]["currency"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_blank_vendor_filter_is_refused_not_ignored(monkeypatch):
+    """`--only-vendor "$VENDOR"` with the variable unset, or a jsonl row `[""]`, used to
+    normalise to an EMPTY set, which `filter_products_by_vendor` reads as "no filter" —
+    the whole retailer feed came through and the brand override relabelled it. Asking
+    for a filter and naming nothing is an error."""
+    async def _products(domain, **kw):
+        return _retailer_feed()
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+
+    for blank in ([""], ["   "], ["", " "]):
+        with pytest.raises(ValueError, match="every entry is blank"):
+            await cbf.records_for_brand(
+                domain="cocomo.sg", category_path="beauty/makeup",
+                brand="VELY VELY", only_vendors=blank,
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_vendor_filter_runs_before_the_shade_fold(monkeypatch):
+    """The fold matches on normalised TITLE only and never consults `vendor`. Filtering
+    after folding lets a neighbour brand's "<base> - <shade>" row fold into the target
+    brand's base and ship as its SKU + priced offer. Filter first, so no fold can cross a
+    brand boundary."""
+    feed = [
+        {"id": 7001, "handle": "dewy-glow-lip-gloss", "title": "Dewy Glow Lip Gloss",
+         "vendor": "VELY VELY", "product_type": "Lip Gloss", "body_html": "<p>x</p>",
+         "images": [{"src": "https://cdn.x/a.jpg"}],
+         "variants": [{"id": 44922188071158, "price": "21.90", "option1": "Default Title",
+                       "available": True}]},
+        {"id": 7002, "handle": "dewy-glow-lip-gloss-coral", "title": "Dewy Glow Lip Gloss - Coral",
+         "vendor": "MEDICUBE", "product_type": "Lip Gloss", "body_html": "<p>y</p>",
+         "images": [{"src": "https://cdn.x/b.jpg"}],
+         "variants": [{"id": 44922188071999, "price": "22.90", "option1": "Coral",
+                       "available": True}]},
+    ]
+
+    async def _products(domain, **kw):
+        return feed
+
+    async def _locale(domain, **kw):
+        return {"currency": "SGD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _locale)
+
+    recs = await cbf.records_for_brand(
+        domain="cocomo.sg", category_path="beauty/makeup", brand="VELY VELY",
+        only_vendors=["VELY VELY"], base_listings_only=True,
+    )
+    assert [r["pdp"]["product_name"] for r in recs] == ["Dewy Glow Lip Gloss"]
+    # Fold-then-filter would have folded MEDICUBE's Coral into this base as a variant.
+    assert [v["title"] for v in recs[0]["pdp"]["variants"]] == []

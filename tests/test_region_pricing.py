@@ -235,6 +235,16 @@ class TestServingPricingRegions:
         monkeypatch.delenv(ips._SERVING_REGIONS_ENV, raising=False)
         assert ips.serving_pricing_regions() == ["US"]
 
+    def test_the_sql_constant_is_fixed_at_import_so_the_env_must_be_set_per_process(self, monkeypatch):
+        """The predicate is a module-level constant. Setting the env AFTER import changes
+        `serving_pricing_regions()` and nothing else — which is exactly why the runbook says
+        the variable must be present on every PROCESS that recomputes eligibility (the
+        onboarding job, `web`, and the worker's nightly index-health job), not just one.
+        A refactor to a lazy read would silently change that deploy contract; this pins it."""
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, "US,SG")
+        assert ips.serving_pricing_regions() == ["US", "SG"]
+        assert ips._HAS_SERVING_REGION_OFFER_EXISTS == ips._HAS_US_OFFER_EXISTS
+
     @pytest.mark.parametrize("blank", ["", "   ", ",", " , "])
     def test_a_blank_setting_is_us_only_not_no_regions(self, monkeypatch, blank):
         """An operator who clears the var, or a deploy that sets it empty, must
