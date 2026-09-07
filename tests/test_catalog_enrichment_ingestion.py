@@ -947,9 +947,49 @@ def test_variant_own_price_is_the_one_rule_the_backfill_uses_too():
         ({"price": "24.00"}, 24.0), ({"price_amount": 24}, 24.0), ({"list_price": "1,024.50"}, 1024.5),
         ({"price": 0}, None), ({"price": "0.00"}, None), ({"price": None}, None), ({"price": ""}, None),
         ({"price": "n/a"}, None), ({}, None), ({"price": -5, "price_amount": 3}, 3.0),
+        # ORDER, not just the key set: price_amount wins over price, price over list_price,
+        # as the four other readers of these dicts already do.
+        ({"price": "24.00", "price_amount": 19.99}, 19.99),
+        ({"price": "24.00", "list_price": 30.0}, 24.0),
+        ({"price_amount": 19.99, "list_price": 30.0}, 19.99),
     ]:
         assert ing.variant_own_price(v) == expected, v
         assert bf._price_of(v) == expected, v
+    # The backfill DELEGATES; a re-inlined copy would drift the day the rule changes.
+    assert bf._price_of.__code__.co_names and "variant_own_price" in bf._price_of.__code__.co_names
+
+
+def test_the_seed_row_prices_a_real_variant_by_the_same_rule_as_its_offer():
+    """The PDP reads seed_data['variants'] directly while search prices from
+    catalog_offers; a shade priced only under `price_amount` used to be 26.00 in one
+    and None in the other."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(3)
+    v = record["pdp"]["variants"][2]
+    v.pop("price"); v["price_amount"] = "26.00"
+    record["pdp"]["variants"][1]["price"] = 0
+    result = ing.ingest_validated_record(record)
+    seed_variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    by_vid = {sv["variant_id"]: sv for sv in seed_variants}
+    assert by_vid["54057345745092"]["price_amount"] == 26.0
+    assert by_vid["54057345745091"]["price_amount"] is None        # 0 is not a price
+    offered = {o["sku_key"]: o["list_price"] for o in result["offers"]}
+    vskus = {s["source_variant_id"]: s["sku_key"] for s in result["variant_skus"]}
+    assert offered[vskus["54057345745092"]] == 26.0
+    assert vskus["54057345745091"] not in offered
+
+
+def test_the_synthetic_seed_variant_is_stamped_as_minted():
+    """tests/test_variant_id_fabrication_ratchet.py exempts this writer on the strength of
+    the stamp; the stamp has to exist."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_record())
+    variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    assert len(variants) == 1
+    assert variants[0]["variant_id_provenance"] == "product_derived"
+    assert variants[0]["purchasable"] is False
 
 
 def test_plan_counts_variant_skus():

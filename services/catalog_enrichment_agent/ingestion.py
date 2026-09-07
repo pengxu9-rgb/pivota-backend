@@ -58,7 +58,7 @@ from services.strong_identifier import (
     extract_strong_identifier,
 )
 from services.text_normalization.brand_case import proper_case_brand
-from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+from services.variant_identity import MERCHANT_ISSUED, PRODUCT_DERIVED, variant_id_provenance
 
 
 def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
@@ -66,14 +66,17 @@ def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
 
     One rule for every writer of a variant offer (ingest here, the backfill in
     scripts/backfill_variant_identity_skus.py): a variant is priced only when it
-    carries a parseable amount > 0 under one of the keys the crawlers emit. The
-    product's price is never substituted -- variants differ precisely in the
-    things that carry price (30 ml vs 50 ml, a set vs a single) -- and a 0 or
-    missing amount is never projected as an offer, because the serving price
-    gate and recall both read catalog_offers and a priceless row there is at
-    best inert and at worst a 0.00 on a PDP.
+    carries a parseable amount > 0 under one of the keys this repo's variant
+    dicts use. `price_amount` is read first, as beauty_external_ranking,
+    external_seed_audit, employee_products and source_pdp_offer_image_repair
+    already do, so every lane prices the same row the same way. The product's
+    price is never substituted -- variants differ precisely in the things that
+    carry price (30 ml vs 50 ml, a set vs a single) -- and a 0 or missing amount
+    is never projected as an offer, because the serving price gate and recall
+    both read catalog_offers and a priceless row there is at best inert and at
+    worst a 0.00 on a PDP.
     """
-    for key in ("price", "price_amount", "list_price"):
+    for key in ("price_amount", "price", "list_price"):
         raw = variant.get(key)
         if raw is None or raw == "":
             continue
@@ -644,6 +647,11 @@ def _build_seed_inserts(
             "price": price,
             "availability": availability,
             "in_stock": in_stock,
+            # The id above is minted from the product; say so on the row, as
+            # scripts/onboard_external_brand_from_crawl.py does for its default
+            # variant, so the ratchet's exemption rests on a stamp that is written.
+            "variant_id_provenance": PRODUCT_DERIVED,
+            "purchasable": False,
         }
         # REAL variants when the record carries them. Every external-seed lane
         # builds its variant list from seed_data['variants'], NOT from
@@ -678,8 +686,10 @@ def _build_seed_inserts(
                     "title": shade or pdp_payload["product_name"],
                     "currency": _currency_of(pdp_payload),
                     "price_currency": _currency_of(pdp_payload),
-                    "price_amount": v.get("price"),
-                    "price": v.get("price"),
+                    # Same rule as the offer writer, or the PDP (which reads this
+                    # column directly) and search would price one shade differently.
+                    "price_amount": variant_own_price(v),
+                    "price": variant_own_price(v),
                     "availability": "in_stock" if v_in_stock else "out_of_stock",
                     "in_stock": v_in_stock,
                     "image_url": image_url,
