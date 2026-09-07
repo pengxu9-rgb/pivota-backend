@@ -27,6 +27,40 @@ FORBIDDEN_STRINGS = (
 )
 FORBIDDEN = tuple(re.compile(value, re.IGNORECASE) for value in FORBIDDEN_STRINGS)
 
+# A line may carry a forbidden id and NOT be a leaked runtime default:
+#
+#   * a full-line comment. Prose that names a rig ("the 763 rows under merch_...
+#     are held out of the sitemap only by that merchant's indexable bit") is the
+#     explanation an operator needs at the one place they are already looking;
+#     forbidding it pushes the reason out of the code. The id in prose is inert.
+#   * a DENYLIST entry. services/test_merchant_policy.py lists the rig ids so
+#     serving lanes EXCLUDE them -- the inverse of a leaked default. Such a line
+#     says so with the marker below, and the marker must name the reason: a bare
+#     "noqa" would let a real default hide behind a comment. The marker is
+#     honoured ONLY in the files named in DENYLIST_FILES: an unscoped marker is
+#     a self-service opt-out, and a default in routes/ or services/ followed by
+#     the marker would otherwise pass (measured in review).
+#
+# Inline comments are NOT stripped: `x = "merch_..."  # a comment` is a default
+# with a comment, and the guard must still see it.
+DENYLIST_MARKER = "runtime-hardcode-guard: denylist"
+DENYLIST_FILES = frozenset({"services/test_merchant_policy.py"})
+
+
+def line_is_violation(line: str, rel: str = "") -> bool:
+    """True when `line` (in file `rel`) carries a forbidden id in a way that can
+    reach runtime."""
+    stripped = line.strip()
+    if not any(pattern.search(line) for pattern in FORBIDDEN):
+        return False
+    if stripped.startswith("#"):
+        return False
+    if DENYLIST_MARKER in line and "#" in line and rel in DENYLIST_FILES:
+        # The marker must sit in the trailing comment, after the code.
+        code, _, comment = line.partition("#")
+        return DENYLIST_MARKER not in comment
+    return True
+
 
 def _should_skip(path: Path) -> bool:
     rel = path.relative_to(REPO_ROOT).as_posix()
@@ -75,7 +109,7 @@ def collect_violations() -> list[str]:
             continue
         rel = file_path.relative_to(REPO_ROOT).as_posix()
         for line_no, line in enumerate(lines, start=1):
-            if any(pattern.search(line) for pattern in FORBIDDEN):
+            if line_is_violation(line, rel):
                 violations.append(f"{rel}:{line_no}: {line.strip()}")
     return violations
 

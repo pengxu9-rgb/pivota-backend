@@ -5,6 +5,26 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+def _ensure_real_tables() -> None:
+    """The models' own DDL through tests/model_schema.ensure_model_tables -- create AND
+    patch-up, because `checkfirst=True` alone skips a narrower table another module
+    created first (tests/model_schema.py documents both failure directions).
+
+    Two reads/writes on the import path reach the real database past the faked seed
+    statements: the seller-of-record derivation reads `brand_claims` (and propagates a
+    failed read on purpose), then mints the observed seller into `catalog_merchants`.
+    Only those two tables are load-bearing here -- the products/skus/offers mirror does
+    not fire for a CSV-catalog seed with no anchor -- and a fixture narrower than
+    production is how the source-CHECK bug shipped, so they are built from the models."""
+    import asyncio
+
+    from db.brand_claims import brand_claims
+    from db.catalog import catalog_merchants
+    from tests.model_schema import ensure_model_tables
+
+    asyncio.run(ensure_model_tables([brand_claims, catalog_merchants]))
+
+
 def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) -> None:
     from utils.auth import get_current_employee
 
@@ -98,6 +118,13 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
 
     import routes.employee_products as employee_products_module
 
+    # The import derives each group's seller-of-record (a `brand_claims` read that
+    # deliberately PROPAGATES a failed read rather than answering "no claim") and
+    # mirrors the group into the catalog tables. A hermetic DB without those tables
+    # turned every group into an error and `created` into 0. Build the REAL tables
+    # from the models rather than stubbing the reads and writes.
+    _ensure_real_tables()
+
     app = FastAPI()
     app.include_router(employee_products_module.router)
     app.dependency_overrides[get_current_employee] = override_employee
@@ -164,6 +191,11 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
 
         assert len(store_by_id) == 1
         stored = next(iter(store_by_id.values()))
+        # The widened fixture makes the seller-of-record derivation RUN for real; pin its
+        # outcome, or the derivation could return (None, None) with this file green. A CSV
+        # catalog with a Brand and a foreign product host is an observed CROSS seller.
+        assert stored["seed_kind"] == "cross", stored
+        assert str(stored["seller_ref"] or "").startswith("merch_obs_"), stored
         seed_data = stored.get("seed_data") or {}
         assert isinstance(seed_data, dict)
         variants = seed_data.get("variants") or []
