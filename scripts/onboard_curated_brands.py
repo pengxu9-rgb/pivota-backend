@@ -65,6 +65,7 @@ async def _run(args: argparse.Namespace) -> int:
             brand=b.get("brand"),
             max_products=args.max_products,
             base_listings_only=args.base_listings_only,
+            emit_real_variants=args.emit_real_variants,
         )
         print(f"  {b['domain']}: {len(recs)} products")
         fold = getattr(records_for_brand, "last_fold_report", None) if args.base_listings_only else None
@@ -120,6 +121,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             "fold single-variant '<base> - <shade>' listings into the base listing's variants "
             "(maccosmetics.com publishes one product per shade; as-is that mints one PDP per shade). "
             "The base keeps one PDP; each shade becomes a SKU + offer of it."
+        ),
+    )
+    p.add_argument(
+        "--emit-real-variants",
+        dest="emit_real_variants",
+        action="store_true",
+        help=(
+            "emit the merchant's OWN variants for natively multi-variant products, one "
+            "purchasable SKU + priced offer each (flowerbeauty.com publishes 29 such products "
+            "carrying 185 real Shopify variant ids; without this the brand ingests 49 SKUs whose "
+            "source_variant_id is the product key, which no checkout can spend). Ids that "
+            "services/variant_identity cannot place as merchant-issued are dropped, not minted."
         ),
     )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")

@@ -81,13 +81,79 @@ def _multi(**over):
     ], **over)
 
 
-def test_mapper_emits_variants_only_for_a_folded_row_that_asked_for_them():
-    """Writing variants costs one SKU + offer each downstream, so it is opt-in AND
-    limited to rows fold_shade_listings actually folded — the two other callers of
-    records_for_brand must keep emitting exactly one SKU per product."""
+#: A natively multi-variant product, in the shape `/products.json` actually serves it:
+#: one product, several shades, each carrying a real numeric Shopify variant id.
+def _native(**over):
+    kw = {
+        "id": 6644068515910,
+        "variants": [
+            {"id": 39406294532166, "sku": "A", "price": "11.99", "option1": "Dune",
+             "available": True, "featured_image": {"src": "https://cdn.x/a.jpg"}},
+            {"id": 39406294532167, "sku": "B", "price": "0.01", "option1": "Promo",
+             "available": True},
+            {"id": 39406294532168, "sku": "C", "price": "11.99", "option1": "Rose",
+             "available": False},
+        ],
+    }
+    kw.update(over)
+    return _product(**kw)
+
+
+def test_mapper_emits_variants_only_when_a_caller_asked_for_them():
+    """Writing variants costs one SKU + offer each downstream, so it stays opt-in —
+    the callers that do not ask must keep emitting exactly one SKU per product."""
+    assert shopify_product_to_record(_native(), domain="x.com", category_path="x")["pdp"]["variants"] == []
     assert shopify_product_to_record(_multi(), domain="x.com", category_path="x")["pdp"]["variants"] == []
-    assert shopify_product_to_record(_multi(), domain="x.com", category_path="x",
-                                     emit_variants=True)["pdp"]["variants"] == []   # not folded
+    # The fold lane's switch alone must NOT reach a native row: a `--base-listings-only`
+    # run (MAC) keeps emitting exactly one SKU for every product it did not fold.
+    assert shopify_product_to_record(_native(), domain="x.com", category_path="x",
+                                     emit_variants=True)["pdp"]["variants"] == []
+
+
+def test_native_multi_variant_rows_emit_their_real_merchant_ids():
+    """The gate used to require FOLDED_INTO_KEY, so a storefront that publishes its
+    shades natively — the NORMAL Shopify shape — contributed no purchasable SKU at
+    all. Measured on flowerbeauty.com 2026-09-07: 29 of 49 products multi-variant,
+    185 real variant ids, ZERO folded, so the fold gate refused every one."""
+    rec = shopify_product_to_record(
+        _native(), domain="x.com", category_path="x", emit_native_variants=True)
+    vs = rec["pdp"]["variants"]
+    assert [(v["variant_id"], v["title"], v["price"], v["in_stock"]) for v in vs] == [
+        ("39406294532166", "Dune", 11.99, True),
+        ("39406294532168", "Rose", 11.99, False),
+    ]   # the 0.01 promo row is under MIN_SELLABLE_PRICE, as before
+
+
+def test_a_native_row_drops_an_id_it_cannot_place_as_the_merchants():
+    """A native row's ids come straight off the merchant's feed, so there is no
+    excuse for one we cannot place. Emitting it would mint a decoy SKU that looks
+    purchasable and is not — the failure the gateway's isRestatedProductId catches.
+    `_multi`'s ids are 11/13: too short to be a Shopify variant id."""
+    rec = shopify_product_to_record(
+        _multi(), domain="x.com", category_path="x", emit_native_variants=True)
+    assert rec["pdp"]["variants"] == []
+    # ...and an id that merely restates the product's own id is refused on shape alone.
+    restated = _native(variants=[{"id": 6644068515910, "price": "11.99",
+                                  "option1": "Only", "available": True}])
+    assert shopify_product_to_record(
+        restated, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"] == []
+
+
+def test_a_native_single_variant_row_still_earns_its_real_id():
+    """One shade is not a reason to drop identity: flowerbeauty's Petal Pout Lip
+    Color is a one-variant product whose variant id (17281773207622) is real."""
+    one = _native(id=1759336595526, variants=[
+        {"id": 17281773207622, "price": "8.00", "option1": "Flamingo Flirt", "available": True}])
+    vs = shopify_product_to_record(
+        one, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
+    assert [v["variant_id"] for v in vs] == ["17281773207622"]
+
+
+def test_mapper_emits_variants_for_a_folded_row_that_asked_for_them():
+    """The fold lane is unchanged, and admits on a DIFFERENT rule: its variants were
+    assembled by us out of separate per-shade listings and may carry a synthesised
+    id, which the shade selector needs. Ingestion's own provenance check decides
+    whether such a row may also be sold."""
     folded = _multi(**{cbf.FOLDED_INTO_KEY: 2})
     rec = shopify_product_to_record(folded, domain="x.com", category_path="x", emit_variants=True)
     vs = rec["pdp"]["variants"]
@@ -1425,3 +1491,83 @@ async def test_a_pdp_that_is_down_yields_None_and_never_raises(monkeypatch):
     _silence_politeness(monkeypatch)
 
     assert await cbf.fetch_pdp_description("jsmbeauty.sg", "lip-pression-glowy-tint") is None
+
+
+# --- the opt-in must reach the mapper, and the record must reach a purchasable row ---
+
+@pytest.mark.asyncio
+async def test_records_for_brand_wires_emit_real_variants_through(monkeypatch):
+    """`emit_real_variants` is the whole point of the flag: prove it reaches the
+    mapper, and that it stays OFF unless a caller asks."""
+    async def _fake_products(domain, max_products=500):
+        return [_native()]
+
+    async def _fake_locale(domain, **kw):
+        return {"currency": "USD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _fake_products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _fake_locale)
+
+    off = await cbf.records_for_brand(domain="x.com", category_path="c")
+    assert off[0]["pdp"]["variants"] == []
+
+    # The MAC lane's flag on its own must not change what a native row yields.
+    fold_only = await cbf.records_for_brand(
+        domain="x.com", category_path="c", base_listings_only=True)
+    assert fold_only[0]["pdp"]["variants"] == []
+
+    on = await cbf.records_for_brand(domain="x.com", category_path="c", emit_real_variants=True)
+    assert [v["variant_id"] for v in on[0]["pdp"]["variants"]] == [
+        "39406294532166", "39406294532168"]
+
+
+@pytest.mark.asyncio
+async def test_a_native_variant_becomes_a_sku_AND_a_priced_offer(monkeypatch):
+    """A SKU written without a catalog_offers row is INERT — the serving price gate
+    and recall both read catalog_offers. So the end of this lane is the PAIR, at the
+    variant's OWN price, not the product's."""
+    import json as _json
+
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+
+    async def _fake_products(domain, max_products=500):
+        return [_native()]
+
+    async def _fake_locale(domain, **kw):
+        return {"currency": "USD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", _fake_products)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", _fake_locale)
+
+    recs = await cbf.records_for_brand(
+        domain="x.com", category_path="c", emit_real_variants=True)
+    plan = ingest_validated_jsonl(recs)
+
+    variant_skus = [s for s in plan["skus"] if "::v:" in s["sku_key"]]
+    assert sorted(s["source_variant_id"] for s in variant_skus) == [
+        "39406294532166", "39406294532168"]
+
+    offer_keys = {o["sku_key"] for o in plan["offers"]}
+    assert all(s["sku_key"] in offer_keys for s in variant_skus), (
+        "a variant SKU with no catalog_offers row is invisible to the price gate")
+
+    # ...and it is stamped with where the id came from, so the money path can filter
+    # without re-deriving it from the string.
+    provs = {_json.loads(s["sku_payload"])["variant_id_provenance"] for s in variant_skus}
+    assert provs == {"merchant_issued"}
+
+
+def test_a_duplicated_native_variant_id_is_emitted_once():
+    """The dedupe at the native gate is load-bearing, not cosmetic: a record carrying the
+    same variant_id twice makes ingestion's `_drop_options_that_do_not_distinguish` see
+    non-distinct labels and strip `options` from EVERY seed variant of the product — the
+    shade selector disappears for the whole PDP. Shopify feeds do repeat a variant across
+    `variants` and `options` shapes; the mapper must emit each id once."""
+    twice = _native(variants=[
+        {"id": 39406294532166, "price": "11.99", "option1": "Dune", "available": True},
+        {"id": 39406294532166, "price": "11.99", "option1": "Dune", "available": True},
+        {"id": 39406294532168, "price": "11.99", "option1": "Rose", "available": True},
+    ])
+    vs = shopify_product_to_record(
+        twice, domain="x.com", category_path="x", emit_native_variants=True)["pdp"]["variants"]
+    assert [v["variant_id"] for v in vs] == ["39406294532166", "39406294532168"]
