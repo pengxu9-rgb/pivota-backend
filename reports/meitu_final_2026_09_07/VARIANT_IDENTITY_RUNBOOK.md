@@ -416,8 +416,25 @@ SELECT count(*) FROM catalog_offers o WHERE o.source_system = 'variant_identity_
   AND NOT EXISTS (SELECT 1 FROM catalog_skus s WHERE s.sku_key = o.sku_key);
 ```
 
-A `writer_audit_log` row with `writer_name = 'backfill_variant_identity_skus'` is written on
-every applied run, including one that ends in an exception.
+**READ THE AUDIT ROW. THE LOG IS A CONVENIENCE.** Cloud Logging drops lines, and it can drop
+the report *entirely*: the 2026-09-08 full run exited 0, printed `==> job succeeded`, and showed
+neither the fenced report nor even the "Disconnected from database" line. One line cannot be
+silently truncated — which is why it is one line — but it can still go missing wholesale, and an
+absent report looks the same as a job that never got that far.
+
+The recovery is `writer_audit_log`, which carries the whole counter set on every applied run,
+including one that ends in an exception:
+
+```sql
+SELECT batch_id, applied_rows, skipped_rows, reasons
+FROM writer_audit_log
+WHERE writer_name = 'backfill_variant_identity_skus'
+ORDER BY id DESC LIMIT 1;
+```
+
+`reasons` holds every counter plus a `zero_counters` list, so "measured zero" stays
+distinguishable from "never measured" — `applied_rows` is `pairs x 2`. The entire report of the
+final run was recovered from this row after the log lost it.
 
 ### Progress, 2026-09-08
 
