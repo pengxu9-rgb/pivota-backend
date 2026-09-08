@@ -266,17 +266,103 @@ async def test_it_rewrites_low_stock_to_unknown_and_leaves_the_legal_values_alon
 async def test_an_out_of_stock_spelling_is_repaired_to_out_of_stock_not_to_unknown(db):
     """`unknown` must not become a dumping ground. The vocabulary DOES recognise "Sold Out",
     and collapsing everything it cannot exact-match to `unknown` would resurrect sold-out
-    products into a servable state — `unknown` is servable."""
+    products into a servable state — `unknown` is servable.
+
+    The operator has to NAME that verdict, though: `out_of_stock` delists, so the default
+    allowed set is `{unknown}` and this run passes the wider set on purpose (the refusal is
+    pinned separately below)."""
     await _product(db, SEED_PRODUCT, "external_seed")
     await _offer(db, P + ":o:sold", track="external_referral", tier="referral_only",
                  availability="Sold Out")
 
-    report = await _run(db)
+    report = await _run(db, allowed_verdicts=frozenset({"unknown", "out_of_stock"}))
 
     assert report["availability"]["vocabulary_verdict"]["Sold Out"] == "out_of_stock"
+    assert report["availability"]["apply_would_refuse"] == {}
     row = dict(await db.fetch_one(
         "SELECT availability FROM catalog_offers WHERE offer_id = :k", {"k": P + ":o:sold"}))
     assert row["availability"] == "out_of_stock"
+
+
+async def test_apply_refuses_a_delisting_verdict_it_was_not_told_to_write_and_writes_nothing(db):
+    """THE BLAST RADIUS IS THE VOCABULARY'S, NOT THE DRY RUN'S. The availability repair is
+    lane-agnostic on purpose, and the vocabulary has three outcomes, so an `--apply` can write
+    `out_of_stock` — a delisting on every surface that reads the column — on an INTERNAL
+    merchant's checkout offer. The dry run prints the verdicts, but the apply re-reads the
+    offending set from the database: a "Temporarily out of stock" that a crawler wrote between
+    the reviewed dry run and the apply would be delisted under a verdict nobody read.
+
+    So an apply refuses any verdict outside its allowed set, and it refuses BEFORE the first
+    write: the readiness_tier repairs must be untouched too, and no audit row may exist,
+    because a half-run with no audit row is the shape an operator cannot see."""
+    import scripts.fix_external_track_vocabulary as fix
+
+    await _product(db, SEED_PRODUCT, "external_seed")
+    await _product(db, SHOPIFY_PRODUCT, "shopify")
+    # A readiness_tier candidate on the external lane — the repair that runs FIRST in `run()`.
+    await _offer(db, P + ":o:ext", track="external_referral", tier="commerce_ready",
+                 availability="low_stock")
+    await _sku(db, P + ":s:ext", SEED_PRODUCT, "external_seed", "commerce_ready")
+    # An internal checkout offer whose raw value the vocabulary resolves to a DELISTING.
+    await _offer(db, P + ":o:internal", track="merchant_checkout", tier="commerce_ready",
+                 availability="Temporarily out of stock", product_key=SHOPIFY_PRODUCT)
+
+    # The dry run names what an apply with the default set would refuse.
+    plan = await _run(db, apply=False)
+    assert plan["availability"]["vocabulary_verdict"] == {
+        "low_stock": "unknown", "Temporarily out of stock": "out_of_stock"}
+    assert plan["availability"]["apply_would_refuse"] == {
+        "Temporarily out of stock": "out_of_stock"}
+    assert plan["availability"]["allowed_verdicts"] == ["unknown"]
+
+    with pytest.raises(fix.RefusedVerdict) as exc:
+        await _run(db)
+    assert exc.value.refused == {"Temporarily out of stock": "out_of_stock"}
+    assert "--allow-verdict out_of_stock" in str(exc.value)
+
+    # Nothing was written — not the availability, and not the two repairs that run before it.
+    assert await _tier(db, "catalog_offers", "offer_id", P + ":o:ext") == "commerce_ready"
+    assert await _tier(db, "catalog_skus", "sku_key", P + ":s:ext") == "commerce_ready"
+    rows = {r["offer_id"]: r["availability"] for r in [
+        dict(x) for x in await db.fetch_all(
+            "SELECT offer_id, availability FROM catalog_offers WHERE offer_id LIKE :p",
+            {"p": P + "%"})]}
+    assert rows[P + ":o:ext"] == "low_stock"
+    assert rows[P + ":o:internal"] == "Temporarily out of stock"
+    assert dict(await db.fetch_one(
+        "SELECT count(*) AS n FROM writer_audit_log WHERE writer_name = :w",
+        {"w": "fix_external_track_vocabulary"}))["n"] == 0
+
+    # Named, the same run writes everything — and records the wider set on the audit row.
+    applied = await _run(db, allowed_verdicts=frozenset({"unknown", "out_of_stock"}))
+    assert applied["total_updated"] == 4
+    assert applied["availability"]["apply_would_refuse"] == {}
+    rows = {r["offer_id"]: r["availability"] for r in [
+        dict(x) for x in await db.fetch_all(
+            "SELECT offer_id, availability FROM catalog_offers WHERE offer_id LIKE :p",
+            {"p": P + "%"})]}
+    assert rows[P + ":o:ext"] == "unknown"
+    assert rows[P + ":o:internal"] == "out_of_stock"
+
+
+async def test_a_resurrecting_verdict_is_refused_the_same_way(db):
+    """`in_stock` is the other decision. The vocabulary does map `InStock` to it, and writing
+    a positive availability builds carts, so it is named per run like the delisting is."""
+    import scripts.fix_external_track_vocabulary as fix
+
+    await _product(db, SHOPIFY_PRODUCT, "shopify")
+    await _offer(db, P + ":o:internal", track="merchant_checkout", tier="commerce_ready",
+                 availability="InStock", product_key=SHOPIFY_PRODUCT)
+
+    with pytest.raises(fix.RefusedVerdict):
+        await _run(db)
+    row = dict(await db.fetch_one(
+        "SELECT availability FROM catalog_offers WHERE offer_id = :k",
+        {"k": P + ":o:internal"}))
+    assert row["availability"] == "InStock"
+
+    applied = await _run(db, allowed_verdicts=frozenset({"unknown", "in_stock"}))
+    assert applied["availability"]["updated"] == 1
 
 
 # --- dry run, idempotency, audit --------------------------------------------------------------
@@ -387,7 +473,7 @@ def test_the_cli_prints_the_report_on_exactly_one_fenced_line():
     which DROPS LINES: a multi-line report arrives with arbitrary keys missing and nothing
     saying anything is gone. An in-process assertion on `report()`'s dict cannot see that.
     """
-    for mode in (["--report"], []):
+    for mode in (["--report"], [], ["--allow-verdict", "out_of_stock"]):
         proc = subprocess.run(
             [sys.executable, "-B", "scripts/fix_external_track_vocabulary.py"] + mode,
             cwd=REPO_ROOT, capture_output=True, text=True, timeout=180,
@@ -397,4 +483,15 @@ def test_the_cli_prints_the_report_on_exactly_one_fenced_line():
                   if ln.startswith("VOCABREPORT>>>") and ln.endswith("<<<VOCABREPORT")]
         assert len(fenced) == 1, proc.stdout[-3000:]
         body = json.loads(fenced[0][len("VOCABREPORT>>>"):-len("<<<VOCABREPORT")])
-        assert body["mode"] == ("report" if mode else "dry_run")
+        assert body["mode"] == ("report" if mode == ["--report"] else "dry_run")
+        if mode == ["--allow-verdict", "out_of_stock"]:
+            assert body["availability"]["allowed_verdicts"] == ["out_of_stock", "unknown"]
+
+    # A verdict outside the vocabulary is an argparse error, not a silently widened set.
+    proc = subprocess.run(
+        [sys.executable, "-B", "scripts/fix_external_track_vocabulary.py",
+         "--allow-verdict", "low_stock"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 2
+    assert "invalid choice" in proc.stderr

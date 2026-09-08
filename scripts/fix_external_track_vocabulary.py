@@ -33,8 +33,18 @@ limited stock, therefore in_stock". That reasoning is what this comment exists t
 The module states the asymmetry in prose and the code obeys it: it searches generously for
 out-of-stock and NEVER infers in-stock from anything it has not listed, because a fabricated
 positive builds a cart that dies at checkout. `low_stock` is not listed. So the vocabulary's
-answer is None, whose stored spelling is `unknown` — and `unknown` is SERVABLE, so nothing is
-delisted by this repair.
+answer is None, whose stored spelling is `unknown` — and `unknown` is SERVABLE, so the
+`low_stock` repair delists nothing.
+
+THE APPLY REFUSES A VERDICT NOBODY NAMED. That is a claim about `low_stock`, not about the
+repair: the vocabulary has three outcomes, so a raw value it recognises as sold-out — `oos`,
+`discontinued`, "Temporarily out of stock" — resolves to `out_of_stock`, which every serving
+surface treats as not-servable, on whichever lane holds it. The dry run prints each verdict,
+but `--apply` re-reads the offending set from the database, so a value that arrived between
+the reviewed dry run and the apply would be written under a verdict nobody read. An apply
+therefore writes only `unknown` unless the operator names the other verdicts with
+`--allow-verdict`, and it refuses BEFORE its first write — the readiness_tier repairs
+included — so a refused run leaves the database as the dry run found it.
 
 This script therefore does not carry a mapping table of its own. It calls
 `normalize_availability` on whatever out-of-vocabulary strings the database actually holds and
@@ -63,11 +73,21 @@ It does not touch internal-merchant offers' readiness tier: repair 1 is predicat
 `catalog_track = 'external_referral'`, so a legitimately `commerce_ready` merchant offer is
 outside every UPDATE's WHERE. Repair 3 IS lane-agnostic on purpose — the availability
 vocabulary is repo-wide, and an internal offer holding `low_stock` is the same defect — but it
-writes only the `availability` column and never a readiness tier.
+writes only the `availability` column and never a readiness tier, and it writes a delisting
+or a resurrection only when the run names it (see above).
+
+Every UPDATE stamps `updated_at = NOW()`, deliberately: hiding a repair behind a stale
+timestamp would be worse than announcing it. The cost is visible — `jobs/
+agent_pdp_view_reconciler_cron` selects content keys whose offers moved since the view was
+refreshed, rebuilds ~300 per 6h pass, and ERROR-logs when the drift count exceeds its
+threshold (200), so a full apply is expected to trip that alert for roughly three passes.
+Announce the run before it, so the log line is not triaged as an incident.
 
     python3 scripts/fix_external_track_vocabulary.py --report   # read-only, before/after
     python3 scripts/fix_external_track_vocabulary.py            # dry run, prints the plan
     python3 scripts/fix_external_track_vocabulary.py --apply    # writes + writer_audit_log row
+    python3 scripts/fix_external_track_vocabulary.py --apply --allow-verdict out_of_stock
+                                                                # ...and the named delisting
 
 There is no `--expect-contract` token here (the pattern `backfill_variant_identity_skus` uses
 to defend against a stale image running a merged earlier draft) because this file is NEW: an
@@ -114,6 +134,35 @@ UNKNOWN = "unknown"
 #: Every value catalog_offers.availability is allowed to hold. Derived from the vocabulary's
 #: own outcomes — do not add a member here without adding it to the vocabulary first.
 LEGAL_AVAILABILITY = frozenset({IN_STOCK, OUT_OF_STOCK, UNKNOWN})
+
+#: The verdicts an --apply may WRITE without being named on the command line. `unknown` is
+#: the neutral value — servable, and what the column defaults to — so writing it changes no
+#: buyer-visible decision. The other two are decisions: `out_of_stock` DELISTS a product on
+#: every surface that reads the column, and `in_stock` resurrects one. The dry run prints the
+#: verdict per raw value, but `--apply` re-reads the offending set from the database, so a
+#: raw value that arrived between the reviewed dry run and the apply would be written under a
+#: verdict nobody read. The apply therefore refuses any verdict not named with
+#: `--allow-verdict`, BEFORE it writes anything, and the operator names a delisting on purpose.
+DEFAULT_ALLOWED_VERDICTS = frozenset({UNKNOWN})
+
+
+class RefusedVerdict(RuntimeError):
+    """An --apply would write an availability verdict the operator did not allow.
+
+    Raised before ANY write, including the two readiness_tier repairs, so a refused run
+    leaves the database exactly as the dry run found it."""
+
+    def __init__(self, refused: Dict[str, str], allowed: frozenset):
+        self.refused = dict(refused)
+        self.allowed = frozenset(allowed)
+        super().__init__(
+            "refusing to --apply: the vocabulary's verdict for "
+            + ", ".join(f"{raw!r} -> {v!r}" for raw, v in sorted(refused.items()))
+            + f" is not in the allowed set {sorted(allowed)}; re-run with "
+            + " ".join(f"--allow-verdict {v}" for v in sorted(set(refused.values())))
+            + " once that decision has been read and made"
+        )
+
 
 #: Sentinels around the one-line report. `scripts/ops/run_oneoff_job.sh` reads the job's output
 #: back from Cloud Logging, which DROPS LINES — a multi-line report arrives with arbitrary keys
@@ -205,8 +254,9 @@ SELECT_OFFENDING_AVAILABILITY_SQL = """
 """
 
 #: One statement per distinct raw value, so :target is whatever the vocabulary returned for
-#: THAT string. A caller must never pass a :target equal to :raw — the row would keep matching
-#: and the loop would not terminate — and `_repair_availability` refuses that case explicitly.
+#: THAT string. A caller must never pass a :target equal to :raw: the keyset cursor still
+#: advances, so it would terminate, but as a no-op mass UPDATE stamping `updated_at` on every
+#: row holding a legal value — a freshness lie. `_apply_availability` refuses that case.
 UPDATE_AVAILABILITY_SQL = """
     UPDATE catalog_offers
        SET availability = :target, updated_at = NOW()
@@ -349,17 +399,14 @@ async def _page_availability_null(db: Any, after: str, page: int) -> List[str]:
     return [str(dict(r)["offer_id"]) for r in rows]
 
 
-async def _repair_availability(*, apply: bool, page: int, limit: int, db: Any
-                               ) -> Tuple[int, int, Dict[str, str], Dict[str, int]]:
-    """Plan (and optionally apply) the availability repair.
+def _plan_availability(offending: List[Dict[str, Any]]
+                       ) -> Tuple[int, Dict[str, str], Dict[str, int]]:
+    """The availability plan: (planned rows, verdict-per-raw-value, row-count-per-raw-value).
 
-    Returns (planned, moved, verdict-per-raw-value, row-count-per-raw-value). The verdicts are
-    returned so the DRY RUN prints them: an operator seeing `{"low_stock": "unknown"}` before
-    any write is the whole point, because that single decision is the one this script could
-    plausibly get wrong.
+    The verdicts are what the DRY RUN prints: an operator seeing `{"low_stock": "unknown"}`
+    before any write is the whole point, because that single decision is the one this script
+    could plausibly get wrong — and `--apply` refuses to write a verdict that was not allowed.
     """
-    db = db or database
-    offending = [dict(r) for r in await db.fetch_all(SELECT_OFFENDING_AVAILABILITY_SQL)]
     verdicts: Dict[str, str] = {}
     counts: Dict[str, int] = {}
     planned = 0
@@ -370,34 +417,44 @@ async def _repair_availability(*, apply: bool, page: int, limit: int, db: Any
         verdicts[key] = availability_repair_for(raw)
         counts[key] = n
         planned += n
+    return planned, verdicts, counts
 
+
+def _refused_verdicts(verdicts: Dict[str, str], allowed: frozenset) -> Dict[str, str]:
+    return {raw: v for raw, v in verdicts.items() if v not in allowed}
+
+
+async def _apply_availability(*, offending: List[Dict[str, Any]], page: int, limit: int,
+                              db: Any) -> int:
+    """Write the availability repair for an already-planned, already-allowed offending set."""
     moved = 0
-    if apply:
-        for row in offending:
-            raw = row["value"]
-            if limit and moved >= limit:
-                break
-            budget = 0 if not limit else limit - moved
-            if raw is None:
-                moved += await _drain(
-                    lambda after, page_size: _page_availability_null(db, after, page_size),
-                    page=page, limit=budget)
-                continue
-            target = availability_repair_for(raw)
-            if target == str(raw):
-                # Unreachable while the selecting predicate excludes the legal vocabulary, and
-                # refused rather than trusted: this is the shape that loops forever, because
-                # the updated row keeps matching `availability = :raw`.
-                raise AssertionError(
-                    f"availability {raw!r} maps to itself; that value belongs in the "
-                    f"vocabulary, not in a repair"
-                )
-            raw_text = str(raw)
+    for row in offending:
+        raw = row["value"]
+        if limit and moved >= limit:
+            break
+        budget = 0 if not limit else limit - moved
+        if raw is None:
             moved += await _drain(
-                lambda after, page_size, r=raw_text, t=target: _page_availability(
-                    db, r, t, after, page_size),
+                lambda after, page_size: _page_availability_null(db, after, page_size),
                 page=page, limit=budget)
-    return planned, moved, verdicts, counts
+            continue
+        target = availability_repair_for(raw)
+        if target == str(raw):
+            # Unreachable while the selecting predicate excludes the legal vocabulary, and
+            # refused rather than trusted. Not because it would loop — the keyset cursor
+            # advances regardless — but because it would be a no-op mass UPDATE that stamps
+            # `updated_at` on every row holding a legal value: a freshness lie, and one the
+            # PDP-view reconciler would then spend hours re-deriving nothing from.
+            raise AssertionError(
+                f"availability {raw!r} maps to itself; that value belongs in the "
+                f"vocabulary, not in a repair"
+            )
+        raw_text = str(raw)
+        moved += await _drain(
+            lambda after, page_size, r=raw_text, t=target: _page_availability(
+                db, r, t, after, page_size),
+            page=page, limit=budget)
+    return moved
 
 
 def _ints(rows: Any) -> List[Dict[str, Any]]:
@@ -421,13 +478,23 @@ async def report(db: Any = None) -> Dict[str, Any]:
 
 
 async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
-              db: Any = None) -> Dict[str, Any]:
+              db: Any = None,
+              allowed_verdicts: frozenset = DEFAULT_ALLOWED_VERDICTS) -> Dict[str, Any]:
     db = db or database
+    allowed = frozenset(allowed_verdicts)
     audit = WriterAuditAccumulator(
         writer_name=WRITER_NAME, batch_id=make_batch_id(SOURCE_SYSTEM))
 
     offer_tier_planned = int(dict(await db.fetch_one(COUNT_OFFER_TIER_SQL))["n"] or 0)
     sku_tier_planned = int(dict(await db.fetch_one(COUNT_SKU_TIER_SQL))["n"] or 0)
+
+    # The availability plan is read BEFORE any write, so a verdict the operator did not allow
+    # refuses the whole run — the two readiness_tier repairs included — with nothing written.
+    offending = [dict(r) for r in await db.fetch_all(SELECT_OFFENDING_AVAILABILITY_SQL)]
+    avail_planned, verdicts, avail_counts = _plan_availability(offending)
+    refused = _refused_verdicts(verdicts, allowed)
+    if apply and refused:
+        raise RefusedVerdict(refused, allowed)
 
     offer_tier_moved = 0
     sku_tier_moved = 0
@@ -439,8 +506,10 @@ async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
             lambda after, page_size: _page_sku_tier(db, after, page_size),
             page=page, limit=limit)
 
-    avail_planned, avail_moved, verdicts, avail_counts = await _repair_availability(
-        apply=apply, page=page, limit=limit, db=db)
+    avail_moved = 0
+    if apply:
+        avail_moved = await _apply_availability(
+            offending=offending, page=page, limit=limit, db=db)
 
     out: Dict[str, Any] = {
         "mode": "apply" if apply else "dry_run",
@@ -452,6 +521,9 @@ async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
             # The verdict per distinct stored value, printed on the DRY RUN too.
             "vocabulary_verdict": verdicts,
             "rows_per_raw_value": avail_counts,
+            # What an --apply with THIS allowed set would refuse. Empty on a run that wrote.
+            "apply_would_refuse": refused,
+            "allowed_verdicts": sorted(allowed),
         },
         "total_planned": offer_tier_planned + sku_tier_planned + avail_planned,
         "total_updated": offer_tier_moved + sku_tier_moved + avail_moved,
@@ -485,19 +557,37 @@ def main() -> int:
     ap.add_argument("--page", type=int, default=500, help="rows per UPDATE statement")
     ap.add_argument("--limit", type=int, default=0,
                     help="cap the rows EACH repair may move (0 = all)")
+    ap.add_argument("--allow-verdict", action="append", default=None, metavar="VERDICT",
+                    choices=sorted(LEGAL_AVAILABILITY),
+                    help="an availability verdict --apply may write, in addition to "
+                         "'unknown'. Repeatable. 'out_of_stock' delists and 'in_stock' "
+                         "resurrects, so each must be named per run; an --apply whose dry "
+                         "run shows a verdict not named here refuses before writing anything")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    allowed = DEFAULT_ALLOWED_VERDICTS | frozenset(args.allow_verdict or ())
 
     async def _go():
         await database.connect()
         try:
             if args.report:
                 return await report()
-            return await run(apply=args.apply, page=args.page, limit=args.limit)
+            return await run(apply=args.apply, page=args.page, limit=args.limit,
+                             allowed_verdicts=allowed)
         finally:
             await database.disconnect()
 
-    out = asyncio.run(_go())
+    try:
+        out = asyncio.run(_go())
+    except RefusedVerdict as exc:
+        # The refusal is the report: one fenced line the operator can read back, and a
+        # non-zero exit so `run_oneoff_job.sh` reports the job as failed.
+        out = {"mode": "refused", "refused_verdicts": exc.refused,
+               "allowed_verdicts": sorted(exc.allowed), "error": str(exc)}
+        print(REPORT_BEGIN + json.dumps(out, sort_keys=True, default=str) + REPORT_END,
+              flush=True)
+        print(str(exc), file=sys.stderr, flush=True)
+        return 2
     print(REPORT_BEGIN + json.dumps(out, sort_keys=True, default=str) + REPORT_END, flush=True)
     return 0
 
