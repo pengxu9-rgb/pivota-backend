@@ -448,12 +448,19 @@ def test_the_budget_bounds_a_wide_result_set(monkeypatch):
 
 
 def test_the_budget_bounds_a_few_slow_merchants(monkeypatch):
-    """The other failure shape: few candidates, each slow. Zero seconds means the very first
-    check is already over budget."""
+    """The other failure shape: few candidates, each slow.
+
+    Asserted AFTER the first spend, not at construction. The clock now starts on the first
+    question, so a freshly built budget has spent no time by definition — an earlier version of
+    this test asserted `available() is False` straight after construction, which only held
+    because the clock was (wrongly) already running through the request's own DB lanes."""
     from routes.agent_shop_gateway import _PreflightBudget
 
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "0")
-    assert _PreflightBudget().available() is False
+    b = _PreflightBudget()
+    assert b.available() is True, "nothing asked yet, so no time spent on the gate"
+    b.spend()
+    assert b.available() is False, "a zero-second budget is spent by the first question"
 
 
 def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
@@ -464,3 +471,94 @@ def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "")
     b = _PreflightBudget()
     assert b.available() is True
+
+
+# ---------------------------------------------------------------------------
+# The coverage denominator has to actually exist
+# ---------------------------------------------------------------------------
+
+
+def test_coverage_is_measured_against_the_population_the_gate_applies_to():
+    """The denominator is `cart_prefilled`, NOT `candidates`.
+
+    Candidates counts every seed offer considered, including referral-only ones the gate is
+    blind to by design — and those are the majority. A first version divided by candidates and
+    also left memo hits out of the numerator, so a request whose six cart handoffs were all
+    answered (one ask + five memo hits) reported 0.333, and a referral-only request reported
+    0.000. Both errors push the same way: a working gate reads as absent, and week one of
+    shadow would have been dismissed on the strength of it.
+    """
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    f = preflight_coverage_fields({
+        "candidates": 40, "cart_prefilled": 6, "asked": 1, "memo_hits": 5,
+        "skipped_by_budget": 0, "degraded_to_referral": 2,
+    })
+    assert f["preflight_answered_fraction"] == 1.0, (
+        "six cart handoffs, all answered — dividing by candidates would say 0.15")
+    assert f["preflight_cart_prefilled"] == 6
+    assert f["preflight_candidates"] == 40, "the wider count is still reported, just not the base"
+    assert f["preflight_memo_hits"] == 5
+
+
+def test_a_partly_covered_request_reports_the_shortfall():
+    """The number has to be able to say "the gate covered half of this request", or the budget
+    is invisible."""
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    f = preflight_coverage_fields({
+        "candidates": 40, "cart_prefilled": 20, "asked": 8, "memo_hits": 2,
+        "skipped_by_budget": 10, "degraded_to_referral": 0,
+    })
+    assert f["preflight_answered_fraction"] == 0.5
+    assert f["preflight_skipped_by_budget"] == 10
+
+
+def test_a_referral_only_request_reports_no_coverage_at_all():
+    """Not 0.000 — nothing. The gate applied to no part of this request, and a fraction of zero
+    reads as "the gate failed" rather than "the gate did not apply". Keying the early return on
+    `candidates` put exactly that line on every referral-only resolve."""
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    assert preflight_coverage_fields(
+        {"candidates": 40, "cart_prefilled": 0, "asked": 0, "memo_hits": 0}) == {}
+
+
+def test_coverage_carries_the_mode_it_was_measured_under(monkeypatch):
+    """A coverage number without its mode cannot be compared across a rollout."""
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    f = preflight_coverage_fields({"candidates": 2, "cart_prefilled": 2, "asked": 2})
+    assert f["preflight_mode"] == "shadow"
+
+
+def test_the_scope_says_the_rate_is_over_questions_asked():
+    """`would_block_rate` divides by asked, not by candidates. A reader who takes it as
+    "how often a cart handoff is stale" is wrong whenever the budget or the memo bit."""
+    assert "ASKED" in cp.REPORT_SCOPE
+    assert "not over candidates" in cp.REPORT_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# The budget clock must measure the gate, not the request
+# ---------------------------------------------------------------------------
+
+
+def test_the_clock_starts_at_the_first_question_not_at_construction(monkeypatch):
+    """The budget is built at the top of the resolve, and 0.7-1.1s of the request's own
+    fetch_all lanes run before the first preflight. A clock started at construction spent
+    itself on work the gate did not do — and biased the measurement against exactly the
+    population worth measuring, since a slow-DB request reached the retry lanes with the
+    budget gone and the gate silently absent."""
+    import time as _t
+
+    from routes.agent_shop_gateway import _PreflightBudget
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "0.05")
+    b = _PreflightBudget()
+    _t.sleep(0.1)  # the request's own DB lanes, doing no preflight work
+    assert b.available() is True, "the clock must not have been running before the first ask"
+    b.spend()
+    _t.sleep(0.1)
+    assert b.available() is False, "once spent, the clock runs"

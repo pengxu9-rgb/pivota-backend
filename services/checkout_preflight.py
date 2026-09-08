@@ -341,7 +341,9 @@ SHADOW_REPORT_SQL = """
 #: A reader who takes this rate as "how often an external offer is stale" will be wrong twice.
 REPORT_SCOPE = (
     "offers.resolve external-seed lane, cart-prefilled handoffs only; "
-    "search/prefetch/mint lanes not gated"
+    "search/prefetch/mint lanes not gated; "
+    "within a request, the first N distinct (pdp_url, variant) questions in seed-row order — "
+    "rate is over questions ASKED, not over candidates offered"
 )
 
 

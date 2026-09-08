@@ -4299,8 +4299,13 @@ async def _handle_offers_resolve(
     # so it also dedups across rows that resolve to the same product.
     _preflight_budget = _PreflightBudget()
     _preflight_memo: Dict[Tuple[str, str], bool] = {}
-    _preflight_stats: Dict[str, int] = {"candidates": 0, "asked": 0, "memo_hits": 0,
-                                        "skipped_by_budget": 0, "degraded_to_referral": 0}
+    # READ at the end of the request by `_emit_preflight_coverage`. A first version only
+    # INCREMENTED these — five writes, zero reads, discarded at function exit — while a comment
+    # claimed they gave the rate a denominator. They did not, and a counter nobody reads is
+    # indistinguishable from one that is always zero.
+    _preflight_stats: Dict[str, int] = {"candidates": 0, "cart_prefilled": 0, "asked": 0,
+                                        "memo_hits": 0, "skipped_by_budget": 0,
+                                        "degraded_to_referral": 0}
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         for row in seed_rows:
@@ -4446,8 +4451,18 @@ async def _handle_offers_resolve(
                 # and silently shrink results, which is the "gate that deletes supply" shape
                 # this repo has been bitten by. So the offer ships as an honest referral.
                 _cart_vid = redirect_identity.get("cart_variant_id")
+                # `candidates` is every seed offer considered; `cart_prefilled` is the subset
+                # the gate applies to. Coverage MUST be measured against the second: dividing
+                # by the first mixes in referral-only offers the gate is blind to by design —
+                # the majority — so a request the gate covered 6-of-6 reported 0.333 and a
+                # referral-only one reported 0.000. Week one of shadow would have read "the
+                # gate covers almost nothing", which is a statement about the denominator.
                 _preflight_stats["candidates"] += 1
-                if _cart_vid:
+                # `is_enabled()` here, not only inside the helper. The helper short-circuits so
+                # no request is spent when off — but the COUNTERS still moved, so an off
+                # request attached coverage fields describing work nobody did.
+                if _cart_vid and checkout_preflight.is_enabled():
+                    _preflight_stats["cart_prefilled"] += 1
                     _q = (str(canonical_url or destination_url), str(_cart_vid))
                     if _q in _preflight_memo:
                         _preflight_stats["memo_hits"] += 1
@@ -5911,8 +5926,20 @@ async def _handle_offers_resolve(
         reason = "no_candidates"
     latency_ms = int((time.perf_counter() - started) * 1000)
 
+    _coverage = preflight_coverage_fields(_preflight_stats)
+    # The values ride in the MESSAGE as well as in `extra`: no formatter in this repo renders
+    # `extra`, so a record carrying them only there prints as the bare string
+    # "offers.resolve.summary". See preflight_coverage_fields' NOTE ON OBSERVABILITY.
+    _summary_msg = "offers.resolve.summary" + (
+        " preflight mode=%s cart_prefilled=%d asked=%d memo_hits=%d skipped_by_budget=%d"
+        " answered_fraction=%.3f" % (
+            _coverage["preflight_mode"], _coverage["preflight_cart_prefilled"],
+            _coverage["preflight_asked"], _coverage["preflight_memo_hits"],
+            _coverage["preflight_skipped_by_budget"], _coverage["preflight_answered_fraction"],
+        ) if _coverage else ""
+    )
     logger.info(
-        "offers.resolve.summary",
+        _summary_msg,
         extra={
             "event": "offers.resolve.summary",
             "product_id": product_id,
@@ -5924,6 +5951,10 @@ async def _handle_offers_resolve(
             "latency_ms": latency_ms,
             "sources": source_status,
             "canonical_ref": canonical_ref,
+            # READ the counters. Without this they are increments with no reads — the round-3
+            # finding. Folded into THIS record rather than a second line so coverage carries
+            # the request's identity, mode and latency alongside it.
+            **_coverage,
         },
     )
 
@@ -8337,6 +8368,52 @@ def resolve_cart_permalink(
     )
 
 
+def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
+    """Coverage of the population the gate ACTUALLY applies to, or {} when it applied to none.
+
+    `answered_fraction` divides by `cart_prefilled`, not by `candidates`. A first version used
+    candidates, which counts every seed offer considered — including referral-only ones the gate
+    is deliberately blind to, and they are the majority. It also put memo hits in the denominator
+    and not the numerator, so a request whose six cart handoffs were all answered from one ask
+    plus five memo hits reported 0.333. Both errors push the same way: they make a working gate
+    look absent.
+
+    Returned as fields rather than logged directly so they ride on the existing
+    `offers.resolve.summary` record, which already carries the request's identity and latency. A
+    second bare line would have had neither, and nothing to join it to.
+
+    NOTE ON OBSERVABILITY -- read before trusting these numbers. (1) They are NOT in
+    `checkout_preflight_observations`; that table holds one row per ask and none of these
+    counters. An earlier docstring claimed otherwise. (2) The record they ride on is a
+    `logger.info` on this module's logger. In production (`uvicorn main:app`, no --log-config;
+    `setup_structured_logging()` is defined and NEVER called from main -- see
+    routes/scheduler_health.py, which exists because of exactly this) the root logger sits at
+    WARNING, so this INFO record is NOT EMITTED AT ALL until that changes. That is not
+    "best-effort sampling"; the record does not leave the process. (3) Even where it is emitted,
+    no formatter in this repo renders `extra`, so the values are also written into the message
+    text by the caller. Persisting the counters (a request-coverage row that `shadow_report`
+    can join) is the named follow-up; until it lands, the shadow report's would_block_rate has
+    no coverage denominator anyone can read in prod.
+    """
+    covered = stats.get("cart_prefilled", 0)
+    if not covered:
+        # Not "nothing happened" — the gate applied to nothing on this request, which is the
+        # normal case for a referral-only resolve. Keying this on `candidates` put a coverage
+        # line on every such request with a fraction of 0.000.
+        return {}
+    answered = stats.get("asked", 0) + stats.get("memo_hits", 0)
+    return {
+        "preflight_mode": checkout_preflight.mode(),
+        "preflight_candidates": stats.get("candidates", 0),
+        "preflight_cart_prefilled": covered,
+        "preflight_asked": stats.get("asked", 0),
+        "preflight_memo_hits": stats.get("memo_hits", 0),
+        "preflight_skipped_by_budget": stats.get("skipped_by_budget", 0),
+        "preflight_degraded_to_referral": stats.get("degraded_to_referral", 0),
+        "preflight_answered_fraction": round(answered / covered, 3),
+    }
+
+
 class _PreflightBudget:
     """Bounds how much of a single resolve the preflight may consume.
 
@@ -8346,7 +8423,14 @@ class _PreflightBudget:
     """
 
     def __init__(self) -> None:
-        self._started = time.monotonic()
+        # Started LAZILY, on the first question rather than at construction. The budget is
+        # built at the top of the resolve, and 0.7-1.1s of the request's own fetch_all lanes
+        # run between there and the first preflight — so a clock started here spent part of
+        # itself on work the gate did not do. Worse, it biased the measurement against exactly
+        # the population worth measuring: a slow-DB request reached the retry lanes with the
+        # budget already gone and the gate silently absent, so the slowest merchants were the
+        # least likely to be checked.
+        self._started: Optional[float] = None
         self._spent = 0
         try:
             self._max_calls = max(0, int(os.getenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST") or 8))
@@ -8360,9 +8444,14 @@ class _PreflightBudget:
     def available(self) -> bool:
         if self._spent >= self._max_calls:
             return False
+        if self._started is None:
+            # No question asked yet, so no time has been spent on this gate.
+            return True
         return (time.monotonic() - self._started) < self._budget_s
 
     def spend(self) -> None:
+        if self._started is None:
+            self._started = time.monotonic()
         self._spent += 1
 
 
