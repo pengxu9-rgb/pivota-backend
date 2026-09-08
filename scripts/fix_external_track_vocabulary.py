@@ -146,7 +146,13 @@ LEGAL_AVAILABILITY = frozenset({IN_STOCK, OUT_OF_STOCK, UNKNOWN})
 DEFAULT_ALLOWED_VERDICTS = frozenset({UNKNOWN})
 
 
-class RefusedVerdict(RuntimeError):
+class RefusedApply(RuntimeError):
+    """An --apply refused before its first write. `report` is the fenced line's body."""
+
+    report: Dict[str, Any] = {}
+
+
+class RefusedVerdict(RefusedApply):
     """An --apply would write an availability verdict the operator did not allow.
 
     Raised before ANY write, including the two readiness_tier repairs, so a refused run
@@ -155,12 +161,34 @@ class RefusedVerdict(RuntimeError):
     def __init__(self, refused: Dict[str, str], allowed: frozenset):
         self.refused = dict(refused)
         self.allowed = frozenset(allowed)
+        self.report = {"refused_verdicts": self.refused, "allowed_verdicts": sorted(allowed)}
         super().__init__(
             "refusing to --apply: the vocabulary's verdict for "
             + ", ".join(f"{raw!r} -> {v!r}" for raw, v in sorted(refused.items()))
             + f" is not in the allowed set {sorted(allowed)}; re-run with "
             + " ".join(f"--allow-verdict {v}" for v in sorted(set(refused.values())))
             + " once that decision has been read and made"
+        )
+
+
+class RefusedRawValue(RefusedApply):
+    """An --apply found a raw availability value the operator did not expect.
+
+    The verdict check is verdict-grain: once `out_of_stock` is allowed, ANY raw value the
+    vocabulary resolves to it is written, including one a crawler stored between the reviewed
+    dry run and the apply. `--expect-raw-value` pins the apply to the raw values that were
+    actually read: when any are named, an offending value outside the list refuses the run."""
+
+    def __init__(self, unexpected: Dict[str, str], expected: frozenset):
+        self.unexpected = dict(unexpected)
+        self.expected = frozenset(expected)
+        self.report = {"unexpected_raw_values": self.unexpected,
+                       "expected_raw_values": sorted(expected)}
+        super().__init__(
+            "refusing to --apply: the offending set holds raw value(s) "
+            + ", ".join(f"{raw!r} -> {v!r}" for raw, v in sorted(unexpected.items()))
+            + f" that were not named with --expect-raw-value (named: {sorted(expected)}); "
+            "re-run the dry run, read them, and name them"
         )
 
 
@@ -273,9 +301,12 @@ UPDATE_AVAILABILITY_SQL = """
 
 #: `availability = :raw` cannot match a NULL, so the impossible-by-NOT-NULL case needs its own
 #: statement rather than being silently left behind by the one above.
+#: `:target` is the PLANNED verdict for the NULL group, not a literal, so the value this branch
+#: writes is the one the allowed-set check saw — the one write in the file that could otherwise
+#: bypass it.
 UPDATE_AVAILABILITY_NULL_SQL = """
     UPDATE catalog_offers
-       SET availability = 'unknown', updated_at = NOW()
+       SET availability = :target, updated_at = NOW()
      WHERE offer_id IN (
         SELECT offer_id
           FROM catalog_offers
@@ -394,8 +425,9 @@ async def _page_availability(db: Any, raw: str, target: str, after: str,
     return [str(dict(r)["offer_id"]) for r in rows]
 
 
-async def _page_availability_null(db: Any, after: str, page: int) -> List[str]:
-    rows = await db.fetch_all(UPDATE_AVAILABILITY_NULL_SQL, {"after": after, "page": page})
+async def _page_availability_null(db: Any, target: str, after: str, page: int) -> List[str]:
+    rows = await db.fetch_all(
+        UPDATE_AVAILABILITY_NULL_SQL, {"target": target, "after": after, "page": page})
     return [str(dict(r)["offer_id"]) for r in rows]
 
 
@@ -424,6 +456,13 @@ def _refused_verdicts(verdicts: Dict[str, str], allowed: frozenset) -> Dict[str,
     return {raw: v for raw, v in verdicts.items() if v not in allowed}
 
 
+def _unexpected_raw_values(verdicts: Dict[str, str], expected: frozenset) -> Dict[str, str]:
+    """Empty when no raw values were named — the pin is opt-in, the verdict check is not."""
+    if not expected:
+        return {}
+    return {raw: v for raw, v in verdicts.items() if raw not in expected}
+
+
 async def _apply_availability(*, offending: List[Dict[str, Any]], page: int, limit: int,
                               db: Any) -> int:
     """Write the availability repair for an already-planned, already-allowed offending set."""
@@ -434,8 +473,10 @@ async def _apply_availability(*, offending: List[Dict[str, Any]], page: int, lim
             break
         budget = 0 if not limit else limit - moved
         if raw is None:
+            target = availability_repair_for(None)
             moved += await _drain(
-                lambda after, page_size: _page_availability_null(db, after, page_size),
+                lambda after, page_size, t=target: _page_availability_null(
+                    db, t, after, page_size),
                 page=page, limit=budget)
             continue
         target = availability_repair_for(raw)
@@ -479,9 +520,11 @@ async def report(db: Any = None) -> Dict[str, Any]:
 
 async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
               db: Any = None,
-              allowed_verdicts: frozenset = DEFAULT_ALLOWED_VERDICTS) -> Dict[str, Any]:
+              allowed_verdicts: frozenset = DEFAULT_ALLOWED_VERDICTS,
+              expected_raw_values: frozenset = frozenset()) -> Dict[str, Any]:
     db = db or database
     allowed = frozenset(allowed_verdicts)
+    expected = frozenset(expected_raw_values)
     audit = WriterAuditAccumulator(
         writer_name=WRITER_NAME, batch_id=make_batch_id(SOURCE_SYSTEM))
 
@@ -493,8 +536,11 @@ async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
     offending = [dict(r) for r in await db.fetch_all(SELECT_OFFENDING_AVAILABILITY_SQL)]
     avail_planned, verdicts, avail_counts = _plan_availability(offending)
     refused = _refused_verdicts(verdicts, allowed)
+    unexpected = _unexpected_raw_values(verdicts, expected)
     if apply and refused:
         raise RefusedVerdict(refused, allowed)
+    if apply and unexpected:
+        raise RefusedRawValue(unexpected, expected)
 
     offer_tier_moved = 0
     sku_tier_moved = 0
@@ -524,6 +570,8 @@ async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
             # What an --apply with THIS allowed set would refuse. Empty on a run that wrote.
             "apply_would_refuse": refused,
             "allowed_verdicts": sorted(allowed),
+            "apply_would_refuse_raw_values": unexpected,
+            "expected_raw_values": sorted(expected),
         },
         "total_planned": offer_tier_planned + sku_tier_planned + avail_planned,
         "total_updated": offer_tier_moved + sku_tier_moved + avail_moved,
@@ -540,6 +588,10 @@ async def run(*, apply: bool = False, page: int = 500, limit: int = 0,
         # writer_audit_log cannot, and "what did we decide low_stock meant, on the run that
         # actually wrote" is the question a future reader will have.
         audit.reasons["availability_vocabulary_verdict"] = verdicts
+        # How wide the operator's authorisation was, so a row showing only `unknown`
+        # verdicts can be told apart from a run that was allowed to delist and found nothing.
+        audit.reasons["allowed_verdicts"] = sorted(allowed)
+        audit.reasons["expected_raw_values"] = sorted(expected)
         audit.reasons["source_system"] = SOURCE_SYSTEM
         await write_writer_audit_log(audit, db=db)
         out["batch_id"] = audit.batch_id
@@ -563,9 +615,15 @@ def main() -> int:
                          "'unknown'. Repeatable. 'out_of_stock' delists and 'in_stock' "
                          "resurrects, so each must be named per run; an --apply whose dry "
                          "run shows a verdict not named here refuses before writing anything")
+    ap.add_argument("--expect-raw-value", action="append", default=None, metavar="RAW",
+                    help="a raw availability value the reviewed dry run showed. Repeatable. "
+                         "When any are named, an --apply refuses before writing anything if "
+                         "the offending set holds a value not named here — the verdict check "
+                         "alone admits any value that resolves to an allowed verdict")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     allowed = DEFAULT_ALLOWED_VERDICTS | frozenset(args.allow_verdict or ())
+    expected = frozenset(args.expect_raw_value or ())
 
     async def _go():
         await database.connect()
@@ -573,17 +631,16 @@ def main() -> int:
             if args.report:
                 return await report()
             return await run(apply=args.apply, page=args.page, limit=args.limit,
-                             allowed_verdicts=allowed)
+                             allowed_verdicts=allowed, expected_raw_values=expected)
         finally:
             await database.disconnect()
 
     try:
         out = asyncio.run(_go())
-    except RefusedVerdict as exc:
+    except RefusedApply as exc:
         # The refusal is the report: one fenced line the operator can read back, and a
         # non-zero exit so `run_oneoff_job.sh` reports the job as failed.
-        out = {"mode": "refused", "refused_verdicts": exc.refused,
-               "allowed_verdicts": sorted(exc.allowed), "error": str(exc)}
+        out = {"mode": "refused", "error": str(exc), **exc.report}
         print(REPORT_BEGIN + json.dumps(out, sort_keys=True, default=str) + REPORT_END,
               flush=True)
         print(str(exc), file=sys.stderr, flush=True)

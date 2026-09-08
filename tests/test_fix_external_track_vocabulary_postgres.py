@@ -345,6 +345,63 @@ async def test_apply_refuses_a_delisting_verdict_it_was_not_told_to_write_and_wr
     assert rows[P + ":o:internal"] == "out_of_stock"
 
 
+async def test_a_named_verdict_still_refuses_a_raw_value_the_dry_run_never_showed(db):
+    """The verdict check is verdict-grain. Once `out_of_stock` is allowed, ANY raw value the
+    vocabulary resolves to it is written — including `reserved` on 5,000 internal checkout
+    offers that a crawler stored between the reviewed dry run and the apply. Naming the raw
+    values the dry run showed pins the apply to them; an unnamed one refuses before any write.
+    Not naming any keeps the pin off: the verdict check alone is the default guarantee."""
+    import scripts.fix_external_track_vocabulary as fix
+
+    await _product(db, SEED_PRODUCT, "external_seed")
+    await _product(db, SHOPIFY_PRODUCT, "shopify")
+    await _offer(db, P + ":o:ext", track="external_referral", tier="commerce_ready",
+                 availability="Sold Out")
+    await _offer(db, P + ":o:internal", track="merchant_checkout", tier="commerce_ready",
+                 availability="reserved", product_key=SHOPIFY_PRODUCT)
+    wide = frozenset({"unknown", "out_of_stock"})
+
+    plan = await _run(db, apply=False, allowed_verdicts=wide,
+                      expected_raw_values=frozenset({"Sold Out"}))
+    assert plan["availability"]["apply_would_refuse"] == {}
+    assert plan["availability"]["apply_would_refuse_raw_values"] == {"reserved": "out_of_stock"}
+
+    with pytest.raises(fix.RefusedRawValue) as exc:
+        await _run(db, allowed_verdicts=wide, expected_raw_values=frozenset({"Sold Out"}))
+    assert exc.value.unexpected == {"reserved": "out_of_stock"}
+    assert await _tier(db, "catalog_offers", "offer_id", P + ":o:ext") == "commerce_ready"
+    rows = {r["offer_id"]: r["availability"] for r in [
+        dict(x) for x in await db.fetch_all(
+            "SELECT offer_id, availability FROM catalog_offers WHERE offer_id LIKE :p",
+            {"p": P + "%"})]}
+    assert rows == {P + ":o:ext": "Sold Out", P + ":o:internal": "reserved"}
+    assert dict(await db.fetch_one(
+        "SELECT count(*) AS n FROM writer_audit_log WHERE writer_name = :w",
+        {"w": "fix_external_track_vocabulary"}))["n"] == 0
+
+    applied = await _run(db, allowed_verdicts=wide,
+                         expected_raw_values=frozenset({"Sold Out", "reserved"}))
+    assert applied["availability"]["updated"] == 2
+    reasons = dict(await db.fetch_one(
+        "SELECT reasons FROM writer_audit_log WHERE writer_name = :w",
+        {"w": "fix_external_track_vocabulary"}))["reasons"]
+    reasons = reasons if isinstance(reasons, dict) else json.loads(reasons)
+    # The audit row records how WIDE the authorisation was, not only what was written.
+    assert reasons["allowed_verdicts"] == ["out_of_stock", "unknown"]
+    assert reasons["expected_raw_values"] == ["Sold Out", "reserved"]
+
+
+def test_the_null_branch_writes_the_planned_verdict_not_a_literal():
+    """The column is NOT NULL, so the branch is unreachable today — which is exactly why its
+    target must be the planned verdict bound at run time: a literal would be the one write in
+    the file that bypasses the allowed-set check, the day a migration relaxes the constraint."""
+    import scripts.fix_external_track_vocabulary as fix
+
+    assert ":target" in fix.UPDATE_AVAILABILITY_NULL_SQL
+    assert "'unknown'" not in fix.UPDATE_AVAILABILITY_NULL_SQL
+    assert fix.availability_repair_for(None) == "unknown"
+
+
 async def test_a_resurrecting_verdict_is_refused_the_same_way(db):
     """`in_stock` is the other decision. The vocabulary does map `InStock` to it, and writing
     a positive availability builds carts, so it is named per run like the delisting is."""
@@ -465,6 +522,35 @@ async def test_report_is_read_only_and_counts_the_sku_population_both_ways(db):
               out["offers_by_readiness_tier_and_track"]}
     assert ("commerce_ready", "external_referral") in tracks
     assert "low_stock" in {r["availability"] for r in out["offers_by_availability"]}
+
+
+async def test_the_cli_exits_2_on_a_refusal_and_reports_it_on_the_fenced_line(db):
+    """`run_oneoff_job.sh` reads the container's exit code as the verdict. A refusal that
+    exited 0 would be ticked off as a successful repair while the rows are still there, with
+    the only trace a JSON key inside a Cloud Logging line. Driven as a subprocess against the
+    same database, so what is asserted is what `main()` actually printed and returned."""
+    await _product(db, SEED_PRODUCT, "external_seed")
+    await _offer(db, P + ":o:ext", track="external_referral", tier="commerce_ready",
+                 availability="Sold Out")
+
+    proc = subprocess.run(
+        [sys.executable, "-B", "scripts/fix_external_track_vocabulary.py", "--apply"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 2, (proc.stdout[-2000:], proc.stderr[-2000:])
+    fenced = [ln for ln in proc.stdout.splitlines()
+              if ln.startswith("VOCABREPORT>>>") and ln.endswith("<<<VOCABREPORT")]
+    assert len(fenced) == 1, proc.stdout[-3000:]
+    body = json.loads(fenced[0][len("VOCABREPORT>>>"):-len("<<<VOCABREPORT")])
+    assert body["mode"] == "refused"
+    assert body["refused_verdicts"] == {"Sold Out": "out_of_stock"}
+    assert "--allow-verdict out_of_stock" in proc.stderr
+
+    # And it wrote nothing — the tier repair that runs first included.
+    assert await _tier(db, "catalog_offers", "offer_id", P + ":o:ext") == "commerce_ready"
+    assert dict(await db.fetch_one(
+        "SELECT count(*) AS n FROM writer_audit_log WHERE writer_name = :w",
+        {"w": "fix_external_track_vocabulary"}))["n"] == 0
 
 
 def test_the_cli_prints_the_report_on_exactly_one_fenced_line():
