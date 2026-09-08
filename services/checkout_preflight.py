@@ -345,7 +345,7 @@ REPORT_SCOPE = (
 )
 
 
-async def shadow_report(window_days: int = 7) -> Dict[str, Any]:
+async def shadow_report(window_days: int = 7) -> Dict[str, Any]:  # noqa: D401
     """What enforcement WOULD have refused, and why. This is the evidence that decides whether
     `enforce` is armed — read it rather than the 31.1% from the pre-backfill sample."""
     rows = await database.fetch_all(SHADOW_REPORT_SQL, {"days": int(window_days)})

@@ -408,14 +408,25 @@ async def test_a_structural_exception_follows_the_operators_instruction(monkeypa
     assert await _preflight_allows_external_offer({"offer_id": "x"}) is False
 
 
-def test_the_report_names_what_it_does_not_cover():
+async def test_the_report_names_what_it_does_not_cover(monkeypatch):
     """A refusal rate is only meaningful with its denominator named, and this one is narrower
     than "external offers" in two ways at once: three other hand-over paths publish the same
     pre-filled cart_url and are not gated, and within the gated lane only cart-prefilled
     handoffs are asked about. A reader taking it as "how often an external offer is stale"
-    would be wrong twice, so the scope travels with the number."""
-    assert "cart-prefilled" in cp.REPORT_SCOPE
-    assert "not gated" in cp.REPORT_SCOPE
+    would be wrong twice.
+
+    Asserted on the RETURNED REPORT, not on the constant: a first version checked
+    `cp.REPORT_SCOPE` directly, so deleting `scope` from the output dict left it green while
+    the number travelled naked."""
+    class _Rows:
+        async def fetch_all(self, *a, **k):
+            return []
+
+    monkeypatch.setattr(cp, "database", _Rows())
+    report = await cp.shadow_report(window_days=7)
+    assert "scope" in report, "the report must carry its own denominator"
+    assert "cart-prefilled" in report["scope"]
+    assert "not gated" in report["scope"]
 
 
 # ---------------------------------------------------------------------------
