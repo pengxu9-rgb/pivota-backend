@@ -124,12 +124,21 @@ def main() -> int:
                        "  axis. This is the refusal that protects us: defaulting here is what\n"
                        "  would substitute the $95 Mini for the $140 Standard.",
             "details": "The product id resolved but details refused it. The code above is Reap's.",
+            "variant": "Reap returned 200 for a DIFFERENT variant than the one we asked for.\n"
+                       "  This is the silent substitution: an unavailable option resolves to an\n"
+                       "  available sibling with no warning. The reason line names what we asked\n"
+                       "  for and what came back. Refusing is correct — quoting it would price\n"
+                       "  the wrong physical object.",
         }.get(step, "  Transport or configuration — see the reason above."))
         return 3
 
     if resolved.price_disagrees:
         print("\nNOTE: prices differ AFTER resolving the exact variant. That is a real signal —\n"
               "unlike a preview-vs-row comparison, which is a size mismatch, not drift.")
+    if resolved.single_variant_product:
+        print("\nNOTE: option-less product — the variant came from `defaultVariant`, which is the\n"
+              "one legitimate read of that field: with no sibling variants there is no\n"
+              "availability ordering and so no substitution possible.")
     if resolved.available is False:
         print("\nNOTE: Reap marks this variant unavailable. One third-party observation about a\n"
               "variant the merchant's own storefront may still list. Not a delisting.")
@@ -146,6 +155,12 @@ def main() -> int:
     print(f"ok      : {quote.ok}")
     print(f"status  : {quote.status}")
     print(f"error   : {quote.error}")
+    if quote.merchant_probably_not_completable:
+        print("\n503 AGENTIC_SERVICE_UNAVAILABLE on the quote. Measured across nine merchants,\n"
+              "the two that answer this way are the two that are not UCP merchants — Reap's\n"
+              "search index is far wider than its checkout coverage, so a search hit is not a\n"
+              "quotable product. Treat as per-merchant, not as an outage. n=2: record it, do not\n"
+              "suppress the merchant permanently on one sample.")
     if quote.ok:
         data = quote.data
         print(f"quoteId : {data.get('id')}")

@@ -38,6 +38,13 @@ different size at a 32% lower price while looking entirely successful, and readi
 staleness would have "corrected" a row that was right. `select_option_ids` therefore fails
 closed on every axis it cannot match, and no code path here falls back to a default variant.
 
+A 200 IS NOT EVIDENCE REAP DID WHAT WE ASKED. Resolving an option value whose `available` flag
+is false SILENTLY SUBSTITUTES a different variant: asking for `Size=Standard` ($140, unavailable)
+returns 200 with the Mini variant at $95, no warning and no error field. So the response is
+checked against the request every time -- `variant_matches_request` -- and a substitution is a
+refusal. Same family as `defaultVariant` being availability-ordered, and the reason nothing in
+this module reads a status code as an answer.
+
 FAIL CLOSED, EVERYWHERE. Every ambiguity in the join refuses instead of guessing: more than one
 candidate product, a merchant whose name we cannot tie to our domain, an option axis with no
 matching label, a details response that reports the product under `errors`. The cost of refusing
@@ -76,7 +83,17 @@ REAP_VERSION = "2025-02-14"
 #: Required by the spec on quote and checkout creation (not on the read-only product endpoints).
 _IDEMPOTENT_PATHS = ("/agentic/quotes", "/agentic/checkouts")
 
+#: Per-path read timeouts. NOT one number: the product endpoints answer in well under a second,
+#: but a quote takes 13-16 s measured across nine merchants, because Reap is talking to the
+#: merchant's own commerce layer while we wait. The 12 s default this module shipped with would
+#: have timed out EVERY quote while every test passed -- a bound that only a live call can find.
 _DEFAULT_TIMEOUT_S = 12.0
+_QUOTE_TIMEOUT_S = 35.0
+_SLOW_PATHS = ("/agentic/quotes", "/agentic/checkouts")
+
+
+def default_timeout_for(path: str) -> float:
+    return _QUOTE_TIMEOUT_S if path in _SLOW_PATHS else _DEFAULT_TIMEOUT_S
 
 #: Reap's own id prefixes, used to reject a value from the wrong namespace before it is sent.
 #: This is the guard that would have caught #2136's central error: our storefront variant id
@@ -166,29 +183,33 @@ def _norm(text: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
 
 
+def normalise_domain(value: Any) -> str:
+    """Strip scheme, `www.`, path and case from a domain so two spellings of one host compare
+    equal. Used for MATCHING only, never for anything we send."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+    text = text.split("/")[0].split("?")[0].split("#")[0]
+    text = text.split("@")[-1].split(":")[0]
+    return re.sub(r"^www\.", "", text).strip(".")
+
+
 def merchant_domain_matches(reap_merchant_name: Any, our_domain: Any) -> bool:
-    """Is Reap's `merchant.name` the merchant our row belongs to?
+    """Is Reap's `merchant.name` the merchant our row belongs to? An EXACT domain comparison.
 
-    Reap returns a display name, not a domain, and our catalog holds a domain. There is no
-    identifier in common, so this compares the registrable-ish stem of the domain against the
-    normalised name. It is deliberately strict about the direction: the stem must appear in the
-    name, not the reverse, because a two-letter stem would otherwise match half their catalog.
+    CORRECTED 8 Sep. An earlier version of this function compared the stem of our domain against
+    what I believed was a display name ("fentybeauty.com" -> "Fenty Beauty"), because I had
+    written down "Reap returns a display name, not a domain" without checking. `merchant.name`
+    is the DOMAIN, and it is the only merchant key Reap returns. That mistake was not merely
+    redundant work: stem-in-name matching also accepts `cosrx.com` for a merchant named
+    `notcosrx.com`, which is a substring match on a security-relevant boundary.
 
-    UNVERIFIED AT SCALE: measured on `fentybeauty.com` -> "Fenty Beauty" and `cosrx.com` ->
-    "COSRX". A merchant whose display name shares no token with its domain will refuse here, and
-    refusing is the right failure -- it produces a referral link, not a wrong quote. If that
-    turns out to be common, the fix is a stored mapping, NOT a looser comparison.
+    Exact and fail-closed. If a merchant ever legitimately fails this, the fix is a stored
+    mapping, never a looser comparison.
     """
-    domain = str(our_domain or "").strip().lower()
-    if not domain:
-        return False
-    domain = re.sub(r"^(?:https?://)?(?:www\.)?", "", domain).split("/")[0]
-    stem = _norm(domain.rsplit(".", 1)[0].split(".")[-1] if "." in domain else domain)
-    stem = stem.replace(" ", "")
-    if len(stem) < 3:
-        return False
-    name = _norm(reap_merchant_name).replace(" ", "")
-    return bool(name) and stem in name
+    ours = normalise_domain(our_domain)
+    return bool(ours) and normalise_domain(reap_merchant_name) == ours
 
 
 @dataclass
@@ -321,6 +342,36 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             unmatched_axes=unmatched, chosen=chosen,
         )
     return OptionMatch(ok=True, option_ids=option_ids, chosen=chosen)
+
+
+def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[str]:
+    """Does the variant Reap returned actually have the options we asked for? Returns a refusal
+    reason, or None if it matches.
+
+    THIS IS THE MOST IMPORTANT GUARD IN THE FILE, and it exists because the API does not behave
+    the way its status code suggests. Measured 8 Sep: resolving an option value whose
+    `available` flag is false SILENTLY SUBSTITUTES a different variant. Asking for
+    `Size=Standard` ($140, unavailable) returns **200** with `id: var_bb8b...`, `name: "Mini"`,
+    `options: [{"name": "Size", "value": "Mini"}]`, price $95. No warning. No error field. A
+    caller that trusts the 200 -- as this module did when it was first written -- quotes the
+    buyer for a different physical object at a 32% lower price and has a clean success in hand.
+
+    It is the same family as `previewVariant` being availability-ordered, and it is why nothing
+    here may treat "Reap returned 200" as "Reap did what we asked". The response is checked
+    against the request, every time.
+    """
+    data = variant if isinstance(variant, dict) else {}
+    got = {
+        str(o.get("name") or ""): str(o.get("value") or "")
+        for o in data.get("options") or [] if isinstance(o, dict)
+    }
+    for axis, label in chosen.items():
+        if axis not in got:
+            return f"response_missing_axis:{axis}"
+        if _norm(got[axis]) != _norm(label):
+            # Named in full because this is the case a human has to be able to see at a glance.
+            return f"substituted_on_axis:{axis}:asked={label}:got={got[axis]}"
+    return None
 
 
 def variant_title_tokens(title: Any) -> List[str]:
@@ -499,6 +550,12 @@ class ReapResponse:
     status: Optional[int] = None
     data: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    #: 503 AGENTIC_SERVICE_UNAVAILABLE on a QUOTE. Set as an inference, not a fact: measured on
+    #: nine merchants, the two that 503 (laurageller.com, shop.simon.com) are the two that are
+    #: not UCP merchants, and Reap's own FAQ scopes coverage to UCP merchants. n=2, so this is a
+    #: hypothesis with a mechanism, not a proven rule -- treat it as "probably not completable
+    #: via Reap", record it, and do not use it to suppress a merchant permanently on one sample.
+    merchant_probably_not_completable: bool = False
     #: Reap returns `warnings[]` on search with a 200. `MERCHANT_NOT_FOUND` arrives this way for
     #: every merchantPreference value tried in sandbox, so a caller that reads only the status
     #: would record a clean success for a search that ignored its merchant scope entirely.
@@ -517,7 +574,7 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
         return ReapResponse(ok=False, error="reap_client_not_configured")
     url = validate_base_url()
     key = _api_key() or ""
-    timeout = float(timeout_seconds or os.getenv("REAP_API_TIMEOUT_SECONDS") or _DEFAULT_TIMEOUT_S)
+    timeout = float(timeout_seconds or os.getenv("REAP_API_TIMEOUT_SECONDS") or default_timeout_for(path))
 
     import httpx
 
@@ -536,7 +593,10 @@ async def _post(path: str, body: Dict[str, Any], *, timeout_seconds: Optional[fl
         # partner's error payload can echo the request, and the request can contain a buyer's
         # address. Operators reproducing a failure should use the probe script, not prod logs.
         logger.warning("reap %s rejected: status=%s", path, resp.status_code)
-        return ReapResponse(ok=False, status=resp.status_code, error=f"reap_status_{resp.status_code}")
+        return ReapResponse(
+            ok=False, status=resp.status_code, error=f"reap_status_{resp.status_code}",
+            merchant_probably_not_completable=(resp.status_code == 503 and path in _SLOW_PATHS),
+        )
 
     try:
         payload = resp.json()
@@ -615,6 +675,11 @@ class VariantResolution:
     reason: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
     candidates: List[Dict[str, Any]] = field(default_factory=list)
+    #: True when the product has no option axes and the single variant was taken from
+    #: `defaultVariant`. The ONE legitimate use of that field -- see `resolve_our_row`.
+    single_variant_product: bool = False
+    #: Set when the quote leg reported 503. See `ReapResponse.merchant_probably_not_completable`.
+    merchant_probably_not_completable: bool = False
 
 
 async def resolve_our_row(
@@ -658,6 +723,30 @@ async def resolve_our_row(
     if product is None:
         return VariantResolution(ok=False, reason=f"details:{err}", warnings=found.warnings)
 
+    axes = product.get("options") if isinstance(product.get("options"), list) else []
+    if not axes:
+        # A product with NO axes has exactly one variant, and `/agentic/products/variant` cannot
+        # be used for it at all: an empty `optionIds` is a 422 ("expected array to have >=1
+        # items"). So `defaultVariant` is read directly here.
+        #
+        # This is the one legitimate read of that field and it is not a weakening of the rule
+        # above it. The rule refuses `defaultVariant` as a FALLBACK -- as a substitute for a
+        # variant we asked for and could not resolve -- because it is availability-ordered among
+        # SIBLINGS. With no siblings there is no ordering and no substitution possible: the
+        # default is the product. The guard that keeps these apart is `axes` being empty, not a
+        # judgement call at the call site.
+        default = product.get("defaultVariant") if isinstance(product.get("defaultVariant"), dict) else {}
+        variant_id = str(default.get("id") or "").strip()
+        if not variant_id.startswith(VARIANT_ID_PREFIX):
+            return VariantResolution(ok=False, reason="single_variant_product_has_no_variant_id",
+                                     warnings=found.warnings)
+        price = _price_of(default)
+        return VariantResolution(
+            ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
+            available=default.get("available"), single_variant_product=True,
+            price_disagrees=_disagrees(price, our_price), warnings=found.warnings,
+        )
+
     options = select_option_ids(product, variant_title_tokens(variant_title))
     if not options.ok:
         # NOTE the thing NOT done here: there is no fallback to `defaultVariant`. It is
@@ -673,21 +762,63 @@ async def resolve_our_row(
         timeout_seconds=timeout_seconds,
     )
     if not resolved.ok:
-        return VariantResolution(ok=False, reason=resolved.error or "variant_failed", warnings=found.warnings)
+        # 400 and 422 mean different things on this endpoint: 422 is a malformed body (ours to
+        # fix), 400 AGENTIC_REQUEST_REJECTED is Reap declining to resolve (theirs). Both are
+        # carried through in the status so the distinction survives to whoever reads it.
+        return VariantResolution(ok=False, reason=resolved.error or "variant_failed",
+                                 warnings=found.warnings)
 
     variant = resolved.data
     variant_id = str(variant.get("id") or "").strip()
     if not variant_id.startswith(VARIANT_ID_PREFIX):
-        return VariantResolution(ok=False, reason="resolved_id_not_in_reap_namespace", warnings=found.warnings)
+        return VariantResolution(ok=False, reason="resolved_id_not_in_reap_namespace",
+                                 warnings=found.warnings)
 
-    price_block = variant.get("price") if isinstance(variant.get("price"), dict) else {}
-    amount = price_block.get("amount")
-    price = (float(amount), str(price_block.get("currency") or "")) if isinstance(amount, (int, float)) else None
-    disagrees = bool(
-        price is not None and our_price is not None and abs(price[0] - float(our_price)) >= 0.01
-    )
+    # A 200 is not evidence Reap did what we asked. See `variant_matches_request`.
+    mismatch = variant_matches_request(variant, options.chosen)
+    if mismatch:
+        return VariantResolution(ok=False, reason=f"variant:{mismatch}",
+                                 matched_options=options.chosen, warnings=found.warnings)
+
+    price = _price_of(variant)
     return VariantResolution(
         ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
-        available=variant.get("available"), price_disagrees=disagrees,
+        available=variant.get("available"), price_disagrees=_disagrees(price, our_price),
         matched_options=options.chosen, warnings=found.warnings,
     )
+
+
+def _price_of(variant: Any) -> Optional[Tuple[float, str]]:
+    """`price.amount` is a decimal in MAJOR units as a JSON number, not a minor-unit integer."""
+    block = (variant or {}).get("price") if isinstance(variant, dict) else None
+    block = block if isinstance(block, dict) else {}
+    amount = block.get("amount")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        return None
+    return float(amount), str(block.get("currency") or "")
+
+
+def _disagrees(price: Optional[Tuple[float, str]], our_price: Optional[float]) -> bool:
+    return bool(price is not None and our_price is not None
+                and abs(price[0] - float(our_price)) >= 0.01)
+
+
+def quote_total(quote_payload: Any) -> Optional[Tuple[float, str]]:
+    """`amountBreakdown.finalAmount` as `(amount, currency)`.
+
+    Provided because the breakdown has ONE field nested a level deeper than its siblings:
+    `itemsSubtotal.amount`, `shipping.amount` and `finalAmount.amount` are flat, but tax is
+    `tax.amount.amount` (alongside `tax.includedInPrices`). A caller summing the parts by a
+    uniform rule silently drops or mis-reads tax.
+    """
+    data = quote_payload if isinstance(quote_payload, dict) else {}
+    breakdown = data.get("amountBreakdown") if isinstance(data.get("amountBreakdown"), dict) else {}
+    return _price_of({"price": breakdown.get("finalAmount")})
+
+
+def quote_tax(quote_payload: Any) -> Optional[Tuple[float, str]]:
+    """The one amount nested a level deeper than the others: `amountBreakdown.tax.amount.amount`."""
+    data = quote_payload if isinstance(quote_payload, dict) else {}
+    breakdown = data.get("amountBreakdown") if isinstance(data.get("amountBreakdown"), dict) else {}
+    tax = breakdown.get("tax") if isinstance(breakdown.get("tax"), dict) else {}
+    return _price_of({"price": tax.get("amount")})

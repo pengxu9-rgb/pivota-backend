@@ -35,7 +35,7 @@ FENTY_SEARCH = {
     "products": [
         {
             "id": "prd_dfe0ceb2123640d496edcd7c21b94c0b",
-            "merchant": {"name": "Fenty Beauty"},
+            "merchant": {"name": "fentybeauty.com"},
             "name": "Fenty Eau de Parfum",
             "priceRange": {"min": {"amount": 39.0, "currency": "USD"},
                            "max": {"amount": 140.0, "currency": "USD"}},
@@ -47,7 +47,7 @@ FENTY_SEARCH = {
         {
             # THE TRAP. A bundle, priced at exactly our row's $140.00.
             "id": "prd_05de098d000000000000000000000000",
-            "merchant": {"name": "Fenty Beauty"},
+            "merchant": {"name": "fentybeauty.com"},
             "name": "Fenty Eau de Parfum 75ML + Decorative Logo Tray",
             "priceRange": {"min": {"amount": 140.0, "currency": "USD"},
                            "max": {"amount": 140.0, "currency": "USD"}},
@@ -57,7 +57,7 @@ FENTY_SEARCH = {
         {
             # Another retailer's listing of the same branded item.
             "id": "prd_otherretailer0000000000000000",
-            "merchant": {"name": "Sephora"},
+            "merchant": {"name": "sephora.com"},
             "name": "Fenty Eau de Parfum",
             "priceRange": {"min": {"amount": 140.0, "currency": "USD"},
                            "max": {"amount": 140.0, "currency": "USD"}},
@@ -71,7 +71,7 @@ FENTY_DETAILS = {
     "products": [
         {
             "id": "prd_dfe0ceb2123640d496edcd7c21b94c0b",
-            "merchant": {"name": "Fenty Beauty"},
+            "merchant": {"name": "fentybeauty.com"},
             "name": "Fenty Eau de Parfum",
             "media": [],
             "options": [
@@ -128,17 +128,21 @@ def test_a_merchant_absent_from_the_results_refuses_rather_than_taking_the_first
     assert not match.ok and match.reason == "merchant_not_in_results"
 
 
-@pytest.mark.parametrize("name,domain,expected", [
-    ("Fenty Beauty", "fentybeauty.com", True),
-    ("COSRX", "cosrx.com", True),
-    ("COSRX", "https://www.cosrx.com/products/x", True),
-    ("Fenty Beauty", "sephora.com", False),
-    ("Sephora", "fentybeauty.com", False),
-    # A stem too short to be evidence of anything.
-    ("Anything At All", "ab.com", False),
+@pytest.mark.parametrize("reap_name,our_domain,expected", [
+    ("fentybeauty.com", "fentybeauty.com", True),
+    ("cosrx.com", "https://www.cosrx.com/products/x", True),
+    ("cosrx.com", "WWW.COSRX.COM", True),
+    ("fentybeauty.com", "sephora.com", False),
+    # The substring bug the first version of this function had: stem-in-name matching accepted
+    # every one of these. `merchant.name` is a DOMAIN, so the comparison is exact.
+    ("notcosrx.com", "cosrx.com", False),
+    ("cosrx.com.evil.example", "cosrx.com", False),
+    ("shop.cosrx.com", "cosrx.com", False),
+    ("", "cosrx.com", False),
+    ("cosrx.com", "", False),
 ])
-def test_merchant_domain_matching(name, domain, expected):
-    assert rc.merchant_domain_matches(name, domain) is expected
+def test_merchant_domain_matching_is_exact(reap_name, our_domain, expected):
+    assert rc.merchant_domain_matches(reap_name, our_domain) is expected
 
 
 # --- the join: the bundle trap ---------------------------------------------------------------
@@ -333,6 +337,11 @@ class _Recorder:
     calls = []
 
     def __init__(self, *a, **kw):
+        # Recorded on the INSTANCE and echoed into every call this client makes, because the
+        # timeout is chosen in `_post` and handed to the constructor -- asserting on what
+        # `default_timeout_for` RETURNS proves only that the helper is right, not that anything
+        # calls it. A mutation that ignored the helper in `_post` survived a test that checked
+        # only the helper.
         self.timeout = kw.get("timeout")
 
     async def __aenter__(self):
@@ -342,7 +351,8 @@ class _Recorder:
         return False
 
     async def post(self, url, json=None, headers=None):
-        _Recorder.calls.append({"url": url, "body": json, "headers": headers})
+        _Recorder.calls.append({"url": url, "body": json, "headers": headers,
+                                "timeout": self.timeout})
         payload = _Recorder.next_payload
         return _FakeResponse(_Recorder.next_status, payload)
 
@@ -538,3 +548,227 @@ def test_a_wrong_merchant_stops_the_chain_before_details(monkeypatch):
     ))
     assert not got.ok and got.reason == "search:merchant_not_in_results"
     assert calls == ["/agentic/products/search"]
+
+
+# --- the substitution: a 200 that did not do what we asked -------------------------------------
+#
+# Measured 8 Sep, and the single most dangerous thing found in the sandbox. Resolving an option
+# value whose `available` flag is false returns 200 with a DIFFERENT variant and no warning.
+
+MINI_SUBSTITUTED = {
+    "id": "var_bb8b0001", "name": "Mini",
+    "options": [{"name": "Size", "value": "Mini"}],
+    "price": {"amount": 95.0, "currency": "USD"},
+    "available": True, "requiresShipping": True, "media": [],
+}
+
+
+def test_a_substituted_variant_is_refused_even_though_reap_returned_200(monkeypatch):
+    """We ask for Standard ($140, unavailable). Reap answers 200 with Mini ($95). Trusting the
+    status quotes the buyer a different physical object at a 32% lower price, with a clean
+    success in hand and nothing in the response saying otherwise."""
+    _chain(monkeypatch, variant=MINI_SUBSTITUTED)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard", our_price=140.00,
+    ))
+    assert not got.ok
+    assert got.reason == "variant:substituted_on_axis:Size:asked=Standard:got=Mini"
+    assert got.variant_id is None
+
+
+def test_the_substitution_check_names_what_was_asked_and_what_came_back():
+    """The refusal has to be legible to a human at a glance: this is a partner-behaviour finding,
+    and a bare `variant_mismatch` would send someone back to the sandbox to rediscover it."""
+    reason = rc.variant_matches_request(MINI_SUBSTITUTED, {"Size": "Standard"})
+    assert reason == "substituted_on_axis:Size:asked=Standard:got=Mini"
+
+
+def test_a_response_missing_the_axis_entirely_is_also_refused():
+    assert rc.variant_matches_request({"id": "var_x", "options": []}, {"Size": "Standard"}) \
+        == "response_missing_axis:Size"
+
+
+def test_a_variant_that_does_match_passes_the_check():
+    assert rc.variant_matches_request(STANDARD_VARIANT, {"Size": "Standard"}) is None
+
+
+def test_the_check_is_case_and_punctuation_insensitive():
+    """Reap echoes the label it holds, which need not be byte-identical to the one we sent."""
+    variant = {"id": "var_x", "options": [{"name": "Size", "value": "STANDARD"}]}
+    assert rc.variant_matches_request(variant, {"Size": "Standard"}) is None
+
+
+def test_every_axis_is_checked_not_just_the_first():
+    variant = {"id": "var_x", "options": [
+        {"name": "Size", "value": "Standard"}, {"name": "Color", "value": "Blue"}]}
+    assert rc.variant_matches_request(variant, {"Size": "Standard", "Color": "Rose"}) \
+        == "substituted_on_axis:Color:asked=Rose:got=Blue"
+
+
+# --- the option-less product: the one legitimate read of defaultVariant --------------------------
+
+SINGLE_VARIANT_DETAILS = {
+    "products": [{
+        "id": "prd_single", "merchant": {"name": "cosrx.com"},
+        "name": "Snail Mucin Essence", "media": [], "options": [],
+        "defaultVariant": {"id": "var_only", "name": "Default",
+                           "options": [], "price": {"amount": 31.80, "currency": "USD"},
+                           "available": True, "media": []},
+    }],
+    "errors": [],
+}
+
+SINGLE_VARIANT_SEARCH = {
+    "id": "qry_2",
+    "products": [{"id": "prd_single", "merchant": {"name": "cosrx.com"},
+                  "name": "Snail Mucin Essence",
+                  "priceRange": {"min": {"amount": 31.8, "currency": "USD"},
+                                 "max": {"amount": 31.8, "currency": "USD"}}}],
+    "pagination": {"nextCursor": None, "hasNextPage": False, "returnedCount": 1},
+    "warnings": [],
+}
+
+
+def test_an_option_less_product_uses_its_default_variant_without_calling_variant(monkeypatch):
+    """`/agentic/products/variant` cannot serve this case at all: an empty `optionIds` is a 422.
+    With no sibling variants there is no availability ordering and so no substitution possible --
+    which is why this read of `defaultVariant` is not the fallback the module refuses elsewhere."""
+    fake = _chain(monkeypatch, search=SINGLE_VARIANT_SEARCH, details=SINGLE_VARIANT_DETAILS)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="cosrx.com", product_name="Snail Mucin Essence", our_price=31.80,
+    ))
+    assert got.ok and got.variant_id == "var_only"
+    assert got.single_variant_product is True
+    assert got.price == (31.80, "USD") and got.price_disagrees is False
+    assert fake.variant_body is None  # never called — an empty optionIds is a 422
+
+
+def test_an_option_less_product_needs_no_variant_title(monkeypatch):
+    """There is nothing for a title to disambiguate, so requiring one would refuse every
+    single-variant product on the index."""
+    _chain(monkeypatch, search=SINGLE_VARIANT_SEARCH, details=SINGLE_VARIANT_DETAILS)
+    got = _run(rc.resolve_our_row(merchant_domain="cosrx.com", product_name="Snail Mucin Essence"))
+    assert got.ok
+
+
+def test_a_product_with_axes_still_refuses_without_a_title(monkeypatch):
+    """The single-variant path must not become a hole in the rule it sits next to."""
+    _chain(monkeypatch)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum"))
+    assert not got.ok and got.reason == "options:no_variant_title_supplied"
+
+
+def test_a_single_variant_product_without_a_reap_id_refuses(monkeypatch):
+    details = json.loads(json.dumps(SINGLE_VARIANT_DETAILS))
+    details["products"][0]["defaultVariant"]["id"] = "41669483823149"
+    _chain(monkeypatch, search=SINGLE_VARIANT_SEARCH, details=details)
+    got = _run(rc.resolve_our_row(merchant_domain="cosrx.com", product_name="Snail Mucin Essence"))
+    assert not got.ok and got.reason == "single_variant_product_has_no_variant_id"
+
+
+# --- timeouts: a bound only a live call could find ------------------------------------------------
+
+def test_a_quote_is_GIVEN_a_timeout_long_enough_for_a_real_quote(wire):
+    """Quotes take 13-16 s measured across nine merchants, because Reap is talking to the
+    merchant's own commerce layer while we wait. The 12 s default this module shipped with would
+    have timed out EVERY quote while every test stayed green.
+
+    This asserts on the value that reaches the transport, not on what the helper returns. An
+    earlier version checked `default_timeout_for(...) >= 30` and a mutant that ignored the helper
+    inside `_post` survived it -- the helper was right and nothing used it."""
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert wire.calls[0]["timeout"] >= 30.0
+
+
+def test_a_product_call_is_given_the_short_timeout(wire):
+    """Same assertion from the other side: the long bound must not leak onto the fast endpoints,
+    where a 35 s hang would sit in a serving path."""
+    _run(rc.search_products(query="x"))
+    assert wire.calls[0]["timeout"] == 12.0
+
+
+def test_the_two_paths_really_do_get_different_timeouts(wire):
+    _run(rc.search_products(query="x"))
+    _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert wire.calls[0]["timeout"] < wire.calls[1]["timeout"]
+
+
+def test_an_explicit_timeout_still_wins(wire):
+    _run(rc.search_products(query="x", timeout_seconds=3.0))
+    assert wire.calls[0]["timeout"] == 3.0
+
+
+# --- 503 on a quote: a per-merchant signal, not an outage -------------------------------------------
+
+def test_a_503_on_a_quote_is_flagged_as_probably_not_completable(wire):
+    """Measured: the two merchants of nine that 503 are the two that are not UCP merchants, and
+    Reap's coverage is scoped to UCP merchants. A serving path that reads this as an outage
+    retries a merchant that will never quote."""
+    wire.next_status = 503
+    got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert not got.ok and got.status == 503
+    assert got.merchant_probably_not_completable is True
+
+
+def test_a_503_on_a_product_endpoint_is_not_read_as_a_merchant_verdict(wire):
+    """The inference is about quoting. A 503 on search is an outage like any other, and treating
+    it as a merchant verdict would suppress merchants on an unrelated failure."""
+    wire.next_status = 503
+    got = _run(rc.search_products(query="x"))
+    assert not got.ok and got.merchant_probably_not_completable is False
+
+
+def test_other_failures_are_not_flagged_as_merchant_verdicts(wire):
+    wire.next_status = 400  # AGENTIC_REQUEST_REJECTED — e.g. a non-domestic shipping address
+    got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
+    assert got.merchant_probably_not_completable is False
+
+
+# --- the amount breakdown's one uneven field ----------------------------------------------------
+
+QUOTE_200 = {
+    "id": "f1e2d3c4", "shippingOptions": [
+        {"id": "ship_std", "name": "Standard", "selected": True,
+         "price": {"amount": 0.0, "currency": "USD"}}],
+    "amountBreakdown": {
+        "itemsSubtotal": {"amount": 140.0, "currency": "USD"},
+        "shipping": {"amount": 0.0, "currency": "USD"},
+        # Nested ONE LEVEL DEEPER than its siblings.
+        "tax": {"amount": {"amount": 12.60, "currency": "USD"}, "includedInPrices": False},
+        "discounts": [], "additionalCharges": [],
+        "finalAmount": {"amount": 152.60, "currency": "USD"},
+    },
+    "expiresAt": "2026-09-08T21:00:00Z",
+}
+
+
+def test_the_total_is_read_from_final_amount():
+    assert rc.quote_total(QUOTE_200) == (152.60, "USD")
+
+
+def test_tax_is_read_from_the_level_it_actually_lives_at():
+    """`itemsSubtotal.amount`, `shipping.amount` and `finalAmount.amount` are flat; tax is
+    `tax.amount.amount`. A uniform rule over the breakdown silently mis-reads it."""
+    assert rc.quote_tax(QUOTE_200) == (12.60, "USD")
+
+
+def test_a_missing_tax_block_is_none_rather_than_zero():
+    """Absent tax and zero tax are different claims, and a total that quietly reads absent as
+    zero is the shape of a money bug."""
+    payload = json.loads(json.dumps(QUOTE_200))
+    payload["amountBreakdown"].pop("tax")
+    assert rc.quote_tax(payload) is None
+
+
+def test_amounts_are_read_as_major_units_not_minor():
+    """Decimal major units as JSON numbers, not minor-unit integers. Reading 152.60 as cents
+    would be a 100x error in the direction that looks plausible."""
+    total = rc.quote_total(QUOTE_200)
+    assert total and abs(total[0] - 152.60) < 0.001
+
+
+def test_a_boolean_is_not_accepted_as_an_amount():
+    """`isinstance(True, int)` is True in Python, so a bool would otherwise become 1.0."""
+    assert rc._price_of({"price": {"amount": True, "currency": "USD"}}) is None
