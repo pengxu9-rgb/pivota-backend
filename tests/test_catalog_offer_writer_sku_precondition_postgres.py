@@ -263,6 +263,71 @@ async def test_capture_refuses_the_offer_when_the_identity_is_suppressed(db):
 
     assert counts["offers_refused_no_sku"] == 1
     assert writable == []
+    # WHICH GUARD REFUSED. Two guards close this door — the mint's DO UPDATE
+    # WHERE, and `guard_catalog_offer_rows(live_only=True)` after it — and with
+    # only "the offer was refused" asserted, either could be deleted alone and
+    # every test would stay green. The mint-WHERE path refuses BEFORE adopting
+    # the suppressed row, so nothing was adopted; the backstop path (the next
+    # test) adopts first and refuses after. 0 here pins the mint's WHERE.
+    assert counts["skus_adopted_other_key"] == 0
+
+
+async def test_the_guard_backstop_refuses_what_a_mint_without_its_where_adopts(db, monkeypatch):
+    """THE SECOND GUARD, PINNED ON ITS OWN. The mint is run WITHOUT its DO UPDATE
+    WHERE — the future mint bug the backstop exists for — so it adopts the
+    suppressed identity and hands the offer on. `guard_catalog_offer_rows(...,
+    live_only=True)` must then refuse it. `skus_adopted_other_key == 1` is what
+    says the refusal came from the backstop and not from the mint: remove the
+    backstop and the offer is written against a suppressed SKU; remove the
+    mint's WHERE and the sibling test above fails instead."""
+    from scripts import capture_us_market_offers as mod
+
+    where = ("     WHERE catalog_skus.suppressed_at IS NULL\n"
+             "       AND catalog_skus.suppression_reason IS NULL\n")
+    assert where in mod.MINT_CANONICAL_SKU_SQL
+    monkeypatch.setattr(mod, "MINT_CANONICAL_SKU_SQL",
+                        mod.MINT_CANONICAL_SKU_SQL.replace(where, ""))
+
+    await _product(db)
+    await _existing_sku(db, "other::lane::spelling", source_variant_id=PK,
+                        suppressed=True)
+
+    writable, counts = await mod.ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-backstop")
+
+    assert counts["skus_adopted_other_key"] == 1
+    assert counts["offers_refused_no_sku"] == 1
+    assert writable == []
+    # Adoption touched only updated_at; the identity is still suppressed.
+    assert await db.fetch_val(
+        "SELECT suppressed_at IS NOT NULL FROM catalog_skus "
+        "WHERE sku_key = 'other::lane::spelling'") is True
+
+
+async def test_the_mint_itself_refuses_a_product_suppressed_after_the_probe(db, monkeypatch):
+    """MINT_CANONICAL_SKU_SQL's own `cp.suppressed_at IS NULL` is unreachable
+    through the module's call path: SUPPRESSED_PRODUCT_PROBE_SQL runs first and
+    drops the product's rows before any mint. It is race-only — the product is
+    suppressed between the probe and the INSERT — so the probe is stubbed to
+    miss, which is the only way to drive the statement against a suppressed
+    product. Remove the predicate and a SKU is minted under a withdrawn product
+    (measured: `skus_minted: 1`, no catalog_skus row before, one after)."""
+    from scripts import capture_us_market_offers as mod
+
+    monkeypatch.setattr(mod, "SUPPRESSED_PRODUCT_PROBE_SQL",
+                        mod.SUPPRESSED_PRODUCT_PROBE_SQL + "\n       AND FALSE")
+    await _product(db, suppressed=True)
+
+    writable, counts = await mod.ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-mint-race")
+
+    assert counts["offers_refused_product_suppressed"] == 0  # the probe missed
+    assert counts["skus_to_mint"] == 1
+    assert counts["skus_minted"] == 0
+    assert counts["offers_refused_no_sku"] == 1
+    assert writable == []
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_skus WHERE product_key = :pk", {"pk": PK}) == 0
 
 
 async def test_capture_leaves_an_already_existing_sku_alone(db):
@@ -564,6 +629,72 @@ async def test_a_refresh_does_not_lift_a_tombstone_it_did_not_cause(db):
     assert f"'{PRODUCT_SUPPRESSED_REASON}'" not in _sql
 
 
+async def test_a_refresh_does_not_lift_a_duplicate_offer_tombstone(db):
+    """THE LIKELIEST LABEL FOR THIS LANE TO MEET. The mirror and the capture
+    write the same shelf under two offer_id namespaces, so the duplicate pass
+    will gate one of them as `duplicate_offer` with the other as keeper — and the
+    capture's next nightly refresh then hits the gated row. The DO UPDATE's CASE
+    lifts `orphan_no_sku` only; widening it to `duplicate_offer` too passed every
+    test before this one and would have rebuilt the group on the next refresh.
+    Driven with the reconciler's real duplicate pass, so the row carries exactly
+    the stamp prod rows will."""
+    from scripts.capture_us_market_offers import (
+        OFFER_UPSERT_SQL, derive_us_offer_id, ensure_skus_for_planned,
+    )
+    from scripts.reconcile_catalog_offers import REASON_DUPLICATE, run as reconcile
+    from services.catalog_invariant_checks import _CHECKS
+
+    dup_sql = [c for c in _CHECKS
+               if c["name"] == "duplicate_offers_per_sku_channel_market"][0]["count_sql"]
+
+    async def excess():
+        return int((await db.fetch_one(dup_sql))["c"] or 0)
+
+    baseline = await excess()
+    offer_id = derive_us_offer_id(PK)
+    await _product(db)
+    await _existing_sku(db, SKU)
+    writable, _ = await ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-dup")
+    params = {k: v for k, v in writable[0].items() if k != "content_key"}
+    await db.execute(OFFER_UPSERT_SQL, params)
+    await db.execute(
+        "UPDATE catalog_offers SET updated_at = TIMESTAMP '2026-01-01' "
+        "WHERE offer_id = :oid", {"oid": offer_id})
+    # The mirror's row for the same shelf, newer, so it wins the election.
+    await db.execute(
+        """INSERT INTO catalog_offers
+             (offer_id, sku_key, product_key, merchant_id, catalog_track,
+              truth_tier, readiness_tier, offer_mode, channel, market,
+              availability, currency, list_price, source_system, updated_at)
+           VALUES ('offer:external_seed:fixture',:sk,:pk,:m,'external_referral',
+                   'observed','referral_only','redirect','external_referral','US',
+                   'in_stock','USD',24.0,'external_seed_mirror',
+                   TIMESTAMP '2026-09-01')""",
+        {"sk": SKU, "pk": PK, "m": MERCHANT})
+    assert await excess() == baseline + 1
+
+    report = await reconcile(apply=True, limit=0, passes=("duplicates",))
+    assert report["duplicates"]["sample"] == [offer_id]
+    gated = await _offer_state(db, offer_id)
+    assert gated["suppression_reason"] == REASON_DUPLICATE
+    assert await excess() == baseline
+
+    # The nightly refresh lands on the gated row.
+    assert await db.fetch_val(OFFER_UPSERT_SQL, params) == offer_id
+
+    after = await _offer_state(db, offer_id)
+    assert after["suppressed_at"] is not None
+    assert after["suppression_reason"] == REASON_DUPLICATE
+    meta = json.loads(after["suppression_metadata"])
+    assert meta["reconcile_pass"] == "duplicates"
+    assert meta["reconcile_keeper_offer_id"] == "offer:external_seed:fixture"
+    assert float(after["list_price"]) == 24.0  # the price still refreshes
+    assert (await _offer_state(db, "offer:external_seed:fixture"))["suppressed_at"] is None
+    assert await excess() == baseline
+    assert f"'{REASON_DUPLICATE}'" not in OFFER_UPSERT_SQL
+
+
 async def test_the_upsert_writes_nothing_when_the_product_is_suppressed(db):
     """The fail-closed backstop, and the count that goes with it. `execute()`
     returns no rowcount through `databases` + asyncpg, so a writer that assumed
@@ -645,6 +776,31 @@ async def test_attach_refuses_an_offer_whose_sku_does_not_exist(db):
         "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
 
 
+async def test_attach_refuses_when_the_canonical_sku_is_suppressed(db):
+    """LIVE, NOT MERELY EXISTING. The first cut asked `fetch_existing_catalog_sku_keys`,
+    so a suppressed `::canonical` row let a live retailer offer through onto an
+    identity somebody had withdrawn — the same unservable state as an orphan,
+    reached through a row that happens to exist. The capture lane asks the live
+    question; so must this one."""
+    from scripts.attach_retailer_offer import (
+        OrphanOfferRefused, attach_retailer_offer, build_retailer_offer_row,
+    )
+
+    await _product(db, content_key=None)
+    await _existing_sku(db, SKU, suppressed=True)
+    row = build_retailer_offer_row(
+        product_key=PK, merchant_id="oliveyoung_global", merchant_name="Olive Young",
+        retailer_url="https://global.oliveyoung.com/product/detail?prdtNo=1",
+        price=25.9,
+    )
+    with pytest.raises(OrphanOfferRefused) as excinfo:
+        await attach_retailer_offer(row)
+
+    assert excinfo.value.sku_key == SKU
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+
+
 async def test_attach_writes_when_the_canonical_sku_is_there(db):
     """The refusal must not be a blanket one: with the chain materialized the
     tool still does its job."""
@@ -700,6 +856,43 @@ async def test_attach_drive_exits_2_on_the_refusal_and_writes_no_offer(db):
             await db.connect()
     assert await db.fetch_val(
         "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+
+
+async def test_attach_dry_run_makes_the_same_refusal_and_exits_2(db, capsys):
+    """THE DRY RUN'S REFUSAL, PINNED. The comment in `_drive` says the dry run
+    makes the same check; gating that branch on `args.apply` passed every test
+    before this one, and would have printed "would attach" for an offer --apply
+    then refuses — a report and a run that disagree, the defect this whole change
+    is about. A dry run writes no audit row either way."""
+    import argparse
+
+    from scripts import attach_retailer_offer as mod
+
+    await _product(db, content_key=None)
+    args = argparse.Namespace(
+        product_key=PK, merchant_id="oliveyoung_global", merchant_name=None,
+        retailer_url="https://global.oliveyoung.com/product/detail?prdtNo=1",
+        market="US", currency="USD", price="25.9", availability="in_stock",
+        apply=False,
+    )
+    try:
+        assert await mod._drive(args) == 2
+    finally:
+        if not db.is_connected:
+            await db.connect()
+
+    out = capsys.readouterr().out
+    line = [l for l in out.splitlines() if l.startswith(mod.REPORT_BEGIN)][0]
+    report = json.loads(line[len(mod.REPORT_BEGIN):-len(mod.REPORT_END)])
+    assert report["applied"] == 0
+    assert report["offers_refused_no_sku"] == 1
+    assert report["refusal"] == "orphan_no_sku"
+    assert report["written"] == 0
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+    assert await db.fetch_val(
+        "SELECT count(*) FROM writer_audit_log WHERE writer_name = :w",
+        {"w": mod.SOURCE_SYSTEM}) == 0
 
 
 async def test_attach_main_propagates_that_exit_code(db):

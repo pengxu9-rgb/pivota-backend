@@ -506,6 +506,10 @@ async def test_revert_batch_restores_only_that_batch(db):
                  suppressed=True)
 
     first = await run(apply=True, limit=0, passes=("orphans",))
+    # The SKU gets materialized after the sweep — the one situation in which
+    # putting an `orphan_no_sku` row back is right. Without this the revert
+    # skips it as `sku_still_missing`; see the tests below.
+    await _sku(db, SKU_ORPHAN, PK_LIVE)
     reverted = await run(apply=True, limit=0, passes=(), revert=first["batch_id"])
 
     assert reverted["revert"]["restored"] == 1
@@ -619,3 +623,293 @@ async def test_cascade_helper_with_no_keys_touches_nothing(db):
     assert await cascade_offer_suppression([]) == []
     assert await cascade_offer_suppression(["", "  ", None]) == []
     assert (await _state(db, "o:untouched"))["suppressed_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# --revert-batch puts back ONLY what would not re-create one of the three states
+# ---------------------------------------------------------------------------
+async def _invariant(db, name):
+    """The check's OWN count_sql, table-wide — so every assertion here is a
+    delta against a baseline taken before the fixture rows exist (the gate
+    shares one database and an absolute 0 would be a claim about file order)."""
+    from services.catalog_invariant_checks import _CHECKS
+
+    check = [c for c in _CHECKS if c["name"] == name][0]
+    row = await db.fetch_one(check["count_sql"])
+    return int((row["c"] if row is not None else 0) or 0)
+
+
+async def test_revert_skips_a_cascaded_offer_while_its_product_is_still_suppressed(db):
+    """MEASURED BEFORE THE CHECK EXISTED: a sweep drove
+    `suppressed_product_with_live_offer` 1 -> 0 and reverting that batch put it
+    straight back to 1, because the revert restored the offer under a product
+    that was still suppressed. A revert undoes a sweep that was WRONG; this row
+    was not swept wrongly, and restoring it re-creates the state the next
+    nightly run gates again. Once the product comes back, so may the offer.
+    Pins the `product_still_suppressed` branch of REVERT_CANDIDATES_SQL.
+    """
+    from scripts.reconcile_catalog_offers import run
+
+    baseline = await _invariant(db, "suppressed_product_with_live_offer")
+    await _product(db, PK_DEAD, suppressed=True)
+    await _sku(db, SKU_DEAD, PK_DEAD)
+    await _offer(db, "o:on_dead", sku_key=SKU_DEAD, product_key=PK_DEAD)
+    sweep = await run(apply=True, limit=0, passes=("cascade",))
+    assert sweep["cascade"]["suppressed"] == 1
+    assert await _invariant(db, "suppressed_product_with_live_offer") == baseline
+
+    plan = await run(apply=False, limit=0, passes=(), revert=sweep["batch_id"])
+    applied = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+
+    for report in (plan, applied):
+        assert report["revert"]["would_restore"] == 0
+        assert report["revert"]["restored"] == 0
+        assert report["revert"]["skipped"] == {
+            "product_suppressed": {"product_still_suppressed": 1}}
+        assert report["revert"]["skipped_total"] == 1
+    assert (await _state(db, "o:on_dead"))["suppressed_at"] is not None
+    assert await _invariant(db, "suppressed_product_with_live_offer") == baseline
+
+    # The product comes back; NOW the offer may.
+    await db.execute(
+        "UPDATE catalog_products SET suppressed_at = NULL, suppression_reason = NULL "
+        "WHERE product_key = :pk", {"pk": PK_DEAD})
+    again = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+    assert again["revert"]["restored"] == 1
+    assert again["revert"]["skipped"] == {}
+    assert (await _state(db, "o:on_dead"))["suppressed_at"] is None
+
+
+async def test_revert_skips_a_duplicate_while_a_live_rival_holds_the_shelf(db):
+    """The duplicate half of the same measurement: reverting the loser beside a
+    still-live keeper rebuilt the group (`duplicate_offers_per_sku_channel_market`
+    0 -> 1). The check is "any LIVE row on this shelf", which subsumes "the keeper
+    is still live" — and catches a row a writer put on the shelf since, which a
+    keeper-only check would restore against. Once the shelf is empty, the loser
+    may come back. Pins the `live_rival_on_shelf` branch.
+    """
+    from scripts.reconcile_catalog_offers import run
+
+    baseline = await _invariant(db, "duplicate_offers_per_sku_channel_market")
+    await _product(db, PK_LIVE)
+    await _sku(db, SKU_LIVE, PK_LIVE)
+    await _offer(db, "o:stale", sku_key=SKU_LIVE, product_key=PK_LIVE,
+                 updated_at=_AT(2026, 1, 1))
+    await _offer(db, "o:fresh", sku_key=SKU_LIVE, product_key=PK_LIVE,
+                 updated_at=_AT(2026, 9, 1))
+    sweep = await run(apply=True, limit=0, passes=("duplicates",))
+    assert sweep["duplicates"]["suppressed"] == 1
+
+    reverted = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+
+    assert reverted["revert"]["restored"] == 0
+    assert reverted["revert"]["skipped"] == {"duplicate_offer": {"live_rival_on_shelf": 1}}
+    assert (await _state(db, "o:stale"))["suppressed_at"] is not None
+    assert await _invariant(db, "duplicate_offers_per_sku_channel_market") == baseline
+
+    # Another lane retires the keeper; the shelf is empty and the loser is the
+    # only supply left for it.
+    await db.execute(
+        "UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'fixture' "
+        "WHERE offer_id = 'o:fresh'")
+    again = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+    assert again["revert"]["restored"] == 1
+    assert (await _state(db, "o:stale"))["suppressed_at"] is None
+    assert await _invariant(db, "duplicate_offers_per_sku_channel_market") == baseline
+
+
+async def test_revert_skips_an_orphan_whose_sku_is_still_missing(db):
+    """The third half, measured the same way (`offers_without_sku` 0 -> 1 on
+    revert). The orphan anti-join is exact — a row it gated HAS no SKU — so the
+    only revert of an `orphan_no_sku` row that does not re-create the defect is
+    one that runs after the SKU appeared. Pins the `sku_still_missing` branch,
+    and the audit row a revert writes.
+    """
+    from scripts.reconcile_catalog_offers import run
+
+    baseline = await _invariant(db, "offers_without_sku")
+    await _product(db, PK_LIVE)
+    await _offer(db, "o:orphan", sku_key=SKU_ORPHAN, product_key=PK_LIVE)
+    sweep = await run(apply=True, limit=0, passes=("orphans",))
+    assert sweep["orphans"]["suppressed"] == 1
+
+    reverted = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+
+    assert reverted["revert"]["restored"] == 0
+    assert reverted["revert"]["skipped"] == {"orphan_no_sku": {"sku_still_missing": 1}}
+    assert (await _state(db, "o:orphan"))["suppressed_at"] is not None
+    assert await _invariant(db, "offers_without_sku") == baseline
+
+    await _sku(db, SKU_ORPHAN, PK_LIVE)
+    again = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+    assert again["revert"]["restored"] == 1
+    assert (await _state(db, "o:orphan"))["suppressed_at"] is None
+    assert await _invariant(db, "offers_without_sku") == baseline
+
+    # The revert's audit row names the batch it undid, so the trail can be
+    # followed from the revert back to the sweep.
+    audit = await db.fetch_one(
+        "SELECT applied_rows, reasons FROM writer_audit_log "
+        "WHERE writer_name = :w ORDER BY id DESC LIMIT 1",
+        {"w": "reconcile_catalog_offers"})
+    assert audit["applied_rows"] == 1
+    reasons = _jsonb(audit["reasons"])
+    assert reasons["reverted_batch_id"] == sweep["batch_id"]
+    assert reasons["reverted_batch_rows"] == 1
+
+
+async def test_revert_restores_at_most_one_row_per_shelf(db):
+    """Two cascaded rows on ONE shelf: they were a duplicate group before the
+    product was withdrawn (cascade runs first and claims both, so neither was
+    labelled `duplicate_offer`). The product comes back; restoring both would
+    rebuild the group in the same statement. The SQL's CASE cannot see its own
+    siblings, so the caller walks the rows in keeper-election order and restores
+    the first per shelf. The other keeps its stamp, so a later revert still
+    considers it — and then reports `live_rival_on_shelf`.
+
+    WHICH ONE: the sweep's UPDATE stamped `updated_at = NOW()` on both rows in
+    one statement, so the Jan/Sep freshness the fixture wrote is gone by revert
+    time and the offer_id tie-break decides. `o:dead_a`, deterministically —
+    measured, and the reason the SQL comment says so.
+    """
+    from scripts.reconcile_catalog_offers import SIBLING_RESTORED_FIRST, run
+
+    baseline = await _invariant(db, "duplicate_offers_per_sku_channel_market")
+    await _product(db, PK_DEAD, suppressed=True)
+    await _sku(db, SKU_DEAD, PK_DEAD)
+    await _offer(db, "o:dead_a", sku_key=SKU_DEAD, product_key=PK_DEAD,
+                 updated_at=_AT(2026, 1, 1))
+    await _offer(db, "o:dead_b", sku_key=SKU_DEAD, product_key=PK_DEAD,
+                 updated_at=_AT(2026, 9, 1))
+    sweep = await run(apply=True, limit=0, passes=("cascade",))
+    assert sweep["cascade"]["suppressed"] == 2
+    await db.execute(
+        "UPDATE catalog_products SET suppressed_at = NULL, suppression_reason = NULL "
+        "WHERE product_key = :pk", {"pk": PK_DEAD})
+
+    reverted = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+
+    assert reverted["revert"]["restored"] == 1
+    assert reverted["revert"]["sample"] == ["o:dead_a"]  # equal updated_at; lowest id
+    assert reverted["revert"]["skipped"] == {
+        "product_suppressed": {SIBLING_RESTORED_FIRST: 1}}
+    assert (await _state(db, "o:dead_a"))["suppressed_at"] is None
+    loser = await _state(db, "o:dead_b")
+    assert loser["suppressed_at"] is not None
+    assert _jsonb(loser["suppression_metadata"])["reconcile_batch_id"] == sweep["batch_id"]
+    assert await _invariant(db, "duplicate_offers_per_sku_channel_market") == baseline
+
+    again = await run(apply=False, limit=0, passes=(), revert=sweep["batch_id"])
+    assert again["revert"]["skipped"] == {
+        "product_suppressed": {"live_rival_on_shelf": 1}}
+
+
+async def test_pass_scopes_the_revert_to_that_passs_reason(db):
+    """`--revert-batch <id> --pass cascade` restores only the rows the cascade
+    pass gated. The first cut rejected the combination and reverted all three
+    reasons at once, so an operator undoing one pass's decision had to undo the
+    other two as well. The out-of-scope rows are reported, not silently absent.
+    """
+    from scripts.reconcile_catalog_offers import _parse_args, run
+
+    args = _parse_args(["--apply", "--revert-batch", "b-1", "--pass", "cascade"])
+    assert args.revert_batch == "b-1" and args.passes == ["cascade"]
+
+    await _product(db, PK_LIVE)
+    await _product(db, PK_DEAD, suppressed=True)
+    await _sku(db, SKU_DEAD, PK_DEAD)
+    await _offer(db, "o:orphan", sku_key=SKU_ORPHAN, product_key=PK_LIVE)
+    await _offer(db, "o:on_dead", sku_key=SKU_DEAD, product_key=PK_DEAD)
+    sweep = await run(apply=True, limit=0, passes=PASSES_ALL)
+    assert sweep["suppressed_total"] == 2
+    # Both defects are gone: the SKU appeared and the product came back.
+    await _sku(db, SKU_ORPHAN, PK_LIVE)
+    await db.execute(
+        "UPDATE catalog_products SET suppressed_at = NULL, suppression_reason = NULL "
+        "WHERE product_key = :pk", {"pk": PK_DEAD})
+
+    scoped = await run(apply=True, limit=0, passes=("cascade",), revert=sweep["batch_id"])
+
+    assert scoped["passes"] == ["cascade"]
+    assert scoped["revert"]["reasons"] == ["product_suppressed"]
+    assert scoped["revert"]["restored"] == 1
+    assert scoped["revert"]["sample"] == ["o:on_dead"]
+    assert scoped["revert"]["skipped"] == {"orphan_no_sku": {"reason_out_of_scope": 1}}
+    assert (await _state(db, "o:orphan"))["suppressed_at"] is not None
+
+    # Unscoped, the rest follows.
+    rest = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+    assert rest["passes"] == []
+    assert rest["revert"]["restored"] == 1
+    assert rest["revert"]["sample"] == ["o:orphan"]
+
+
+async def test_revert_reports_rows_healed_since_the_batch(db):
+    """`capture_us_market_offers`' refresh lifts an `orphan_no_sku` tombstone
+    once the SKU exists and STRIPS the batch stamp with it (so the revert cannot
+    count a row it can no longer restore). That made `would_restore` smaller
+    than the run's `suppressed` with nothing saying why. The revert now reads
+    the sweep's audit row and reports the difference as `healed_since_batch`.
+    Driven with the capture lane's real statement, not a stand-in UPDATE.
+    """
+    from scripts.capture_us_market_offers import OFFER_UPSERT_SQL
+    from scripts.reconcile_catalog_offers import run
+
+    await _product(db, PK_LIVE)
+    await _sku(db, SKU_LIVE, PK_LIVE)
+    await _offer(db, "o:orphan_a", sku_key=SKU_ORPHAN, product_key=PK_LIVE)
+    await _offer(db, "o:orphan_b", sku_key=SKU_ORPHAN, product_key=PK_LIVE,
+                 channel="native")
+    sweep = await run(apply=True, limit=0, passes=("orphans",))
+    assert sweep["orphans"]["suppressed"] == 2
+
+    # The lane runs again with the identity resolved; its refresh heals one.
+    landed = await db.fetch_val(OFFER_UPSERT_SQL, {
+        "offer_id": "o:orphan_a", "sku_key": SKU_LIVE, "product_key": PK_LIVE,
+        "availability": "in_stock", "list_price": 11.0,
+        "source_system": "us_market_capture", "source_domain": "brand.example",
+        "offer_payload": json.dumps({"capture": "fixture"}),
+    })
+    assert landed == "o:orphan_a"
+    healed = await _state(db, "o:orphan_a")
+    assert healed["suppressed_at"] is None
+    assert "reconcile_batch_id" not in _jsonb(healed["suppression_metadata"])
+
+    plan = await run(apply=False, limit=0, passes=(), revert=sweep["batch_id"])
+
+    assert plan["revert"]["batch_rows_recorded"] == 2
+    assert plan["revert"]["stamped_rows"] == 1
+    assert plan["revert"]["healed_since_batch"] == 1
+    assert plan["revert"]["would_restore"] == 0
+    assert plan["revert"]["skipped"] == {"orphan_no_sku": {"sku_still_missing": 1}}
+
+    # A batch id nothing recorded reports null, never a guessed zero.
+    unknown = await run(apply=False, limit=0, passes=(), revert="no-such-batch")
+    assert unknown["revert"]["batch_rows_recorded"] is None
+    assert unknown["revert"]["healed_since_batch"] is None
+    assert unknown["revert"]["stamped_rows"] == 0
+
+
+async def test_revert_leaves_a_row_another_lane_retombstoned(db):
+    """Another lane's UPDATE merges metadata with `||`, so a row it re-gated
+    after our sweep still carries our batch stamp — under THEIR reason. Their
+    decision stands, and the report says so under their label rather than
+    folding it into `reason_out_of_scope`."""
+    from scripts.reconcile_catalog_offers import run
+
+    await _product(db, PK_LIVE)
+    await _offer(db, "o:orphan", sku_key=SKU_ORPHAN, product_key=PK_LIVE)
+    sweep = await run(apply=True, limit=0, passes=("orphans",))
+    await _sku(db, SKU_ORPHAN, PK_LIVE)
+    await db.execute(
+        "UPDATE catalog_offers SET suppression_reason = 'currency_quarantine' "
+        "WHERE offer_id = 'o:orphan'")
+
+    reverted = await run(apply=True, limit=0, passes=(), revert=sweep["batch_id"])
+
+    assert reverted["revert"]["restored"] == 0
+    assert reverted["revert"]["skipped"] == {
+        "currency_quarantine": {"retombstoned_by_another_lane": 1}}
+    state = await _state(db, "o:orphan")
+    assert state["suppressed_at"] is not None
+    assert state["suppression_reason"] == "currency_quarantine"

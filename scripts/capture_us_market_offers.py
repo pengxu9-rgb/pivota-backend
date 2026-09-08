@@ -267,7 +267,21 @@ OFFER_UPSERT_SQL = """
 # `cp.suppressed_at IS NULL` for the same reason CANDIDATES_SQL carries it: a
 # product withdrawn between the scan and the write must mint NOTHING, so this
 # lane can never be the thing that re-creates a live SKU (and then a live offer)
-# under a tombstoned product.
+# under a tombstoned product. THROUGH THIS MODULE'S OWN CALL PATH IT IS
+# RACE-ONLY: `ensure_skus_for_planned` runs SUPPRESSED_PRODUCT_PROBE_SQL first
+# and drops a suppressed product's rows before any mint, so this predicate is
+# reached only when the product is suppressed in the window between that probe
+# and this INSERT. The test that pins it stubs the probe to return nothing, which
+# is the only way to drive this statement against a suppressed product.
+#
+# THE DO UPDATE's WHERE IS THE FIRST OF TWO GUARDS on a suppressed identity, and
+# the two are pinned separately. Here, a suppressed identity row returns NO
+# `sku_key`, so the caller refuses BEFORE adopting it (`skus_adopted_other_key`
+# stays 0). If this WHERE were lost, the caller would adopt the suppressed row
+# and `guard_catalog_offer_rows(live_only=True)` would then refuse the offer —
+# same outcome, `skus_adopted_other_key` 1. Both tests exist because with only
+# "the offer was refused" asserted, either guard could be deleted alone and every
+# test would still pass.
 #
 # ON CONFLICT targets the 4-column identity index, never the sku_key primary key
 # — see the module docstring. DO UPDATE touches only `updated_at`: adopting
@@ -561,6 +575,8 @@ async def ensure_skus_for_planned(
          construction. What it buys is that a future mint bug is REFUSED rather
          than written, and refused in the vocabulary every other writer already
          reports. `live_only=True` so it asks the same question step 1 does.
+         Pinned on its own: a test runs the mint WITHOUT its DO UPDATE WHERE (the
+         future bug) and expects this step to refuse what that mint adopted.
     """
     counts = {"skus_existing": 0, "skus_to_mint": 0, "skus_minted": 0,
               "skus_adopted_other_key": 0, "offers_refused_no_sku": 0,
@@ -613,9 +629,10 @@ async def ensure_skus_for_planned(
              "sku_payload": _sku_payload(row["product_key"], batch_id)},
         )
         if written_key is None:
-            # Either the product vanished between the scan and now (the
-            # INSERT ... SELECT yielded no row) or the identity lives on a
-            # suppressed SKU. Both are "no live identity to hang this on".
+            # Either the product vanished or was suppressed between the probe
+            # above and now (the INSERT ... SELECT yielded no row) or the
+            # identity lives on a suppressed SKU. All are "no live identity to
+            # hang this on".
             counts["offers_refused_no_sku"] += 1
             print(f"  [SKIP] no live SKU identity for {row['product_key'][:60]}",
                   flush=True)
