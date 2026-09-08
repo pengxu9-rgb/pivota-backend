@@ -504,6 +504,62 @@ async def test_a_reingest_adopts_the_promoter_row_and_updates_its_backfill_offer
     assert float(offer["list_price"]) == 19.0
 
 
+async def test_an_adopted_row_with_a_NULL_payload_keeps_the_plans_keys(db):
+    """THE COALESCE IN `_SKU_UPSERT_SQL`, PINNED.
+
+    The merge is written
+    `sku_payload = COALESCE(catalog_skus.sku_payload, '{}'::jsonb) || EXCLUDED...`.
+    Without the COALESCE it is `catalog_skus.sku_payload || EXCLUDED.sku_payload`,
+    and `NULL || jsonb` is NULL in Postgres — SILENTLY. The DO UPDATE would then
+    ERASE the payload it exists to write, on exactly the rows that have nothing
+    to lose from the merge in the first place.
+
+    Every other merge test here starts from a row seeded with a payload, so all
+    of them survive the mutant. `sku_payload` is nullable and unstamped rows are
+    ordinary — a promoter row written before the payload existed, or any row a
+    lane inserted without one — so this is the row shape that separates the two.
+
+    It is a real regression and not a cosmetic one: `variant_id_provenance` is
+    what `services/variant_identity` reads to decide an id is merchant-issued,
+    and a NULL payload is indistinguishable from an unverified one downstream."""
+    promoter_key = _promoter_key()
+    await _seed_product(db)
+    # No `sku_payload` column in the INSERT, so it is SQL NULL — not 'null'::jsonb,
+    # which would concatenate to an array rather than annihilate.
+    await db.execute(
+        """INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,
+             source_product_id, source_variant_id, title, readiness_tier, updated_at)
+           VALUES (:sk,:pk,:m,:p,:spid,:v,'Ruby','commerce_ready',NOW())""",
+        {"sk": promoter_key, "pk": PK, "m": MERCHANT, "p": PLATFORM,
+         "spid": SPID, "v": VID},
+    )
+    assert await db.fetch_val(
+        "SELECT sku_payload FROM catalog_skus WHERE sku_key = :k", {"k": promoter_key}
+    ) is None, "the fixture must start from a genuine SQL NULL"
+
+    planned = _planned_sku()
+    counts = await _apply(_plan([planned], []), batch=False)
+
+    assert counts["skus"] == 1
+    assert counts["skus_adopted_existing_identity"] == 1
+    assert counts["skus_identity_conflict"] == 0
+
+    row = dict(
+        await db.fetch_one(
+            "SELECT sku_key, sku_payload FROM catalog_skus WHERE product_key = :pk",
+            {"pk": PK},
+        )
+    )
+    assert row["sku_key"] == promoter_key, "the adoption renamed the stored key"
+    assert row["sku_payload"] is not None, (
+        "the DO UPDATE annihilated the payload — `NULL || jsonb` is NULL, so the "
+        "COALESCE in _SKU_UPSERT_SQL is missing"
+    )
+    payload = _jsonb(row["sku_payload"])
+    assert payload["agent_version"] == "ingest_v_test"
+    assert payload["variant_id"] == VID
+
+
 # --- (b) the bulk path -------------------------------------------------------
 
 
