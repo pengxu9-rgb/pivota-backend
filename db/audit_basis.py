@@ -415,6 +415,23 @@ _EVIDENCE_REQUIRED_FIELDS = frozenset({
     "methodology_version", "providers_and_models", "primary_destination_version",
 })
 
+# The pinned-set identity, which is a PAIR and not two independent fields.
+# `audit_delta._basis_id` reads the stronger of the two (W2.1 selected_set_id,
+# else W2 prompt_set_id), so "we know which set was probed" means at least one
+# of them is present — a run predating W2.1 legitimately carries a
+# prompt_set_id and no selected_set_id, and `_pinned_set_ids` records the one
+# it has on purpose. Putting BOTH in _EVIDENCE_REQUIRED_FIELDS would therefore
+# make every pre-W2.1 run permanently non-comparable; putting NEITHER lets two
+# bases with no set identity at all compare NULL == NULL on these fields and
+# come back True on no evidence.
+#
+# Today that state is unreachable: audit_delta._measurement_basis resolves the
+# id first and answers same=None when either side lacks it, so such a pair
+# never gets here. That gate lives in another module and is one refactor from
+# moving, and this function's own docstring already promises False. So the
+# check is real rather than implied.
+_SET_IDENTITY_FIELDS = ("selected_set_id", "prompt_set_id")
+
 
 def bases_are_comparable(
     a: Optional[Mapping[str, Any]],
@@ -456,6 +473,9 @@ def bases_are_comparable(
         # two runs were measured the same way; it is the absence of evidence.
         if field in _EVIDENCE_REQUIRED_FIELDS and not left:
             return False
+    # Both sides are equal by here, so checking one is checking both.
+    if not any(_normalized_component(f, a) for f in _SET_IDENTITY_FIELDS):
+        return False
     return True
 
 

@@ -72,6 +72,14 @@ UNCHECKED = mod.LIVENESS_UNCHECKED
 HTTP_TIMEOUT_SECONDS = 12.0
 DNS_TIMEOUT_SECONDS = 5.0
 
+# HTTP_TIMEOUT_SECONDS is PER HOP and httpx applies it afresh to each redirect:
+# 12s x (max_redirects=5 + 1) is 72 seconds for ONE domain, inside a sweep the
+# scheduler gives run_deadline_seconds=60. One host redirecting slowly in a
+# loop would eat the whole window and starve every domain behind it. This bounds
+# the entire chain; PublicHTTPSTransport enforces it and a chain that runs out
+# raises, which classify_host_liveness reads as `unverifiable` — never as dead.
+HTTP_TOTAL_TIMEOUT_SECONDS = 25.0
+
 # How long a liveness verdict stands before the sweep re-asks. A week: the
 # consumer is a BD report, not a checkout, and a domain that goes dark is
 # caught inside the same reporting cycle. It also keeps the probe volume at one
@@ -264,7 +272,10 @@ async def probe_host_liveness(
     owns_client = client is None
     client = client or httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True, max_redirects=5,
-        transport=PublicHTTPSTransport(), trust_env=False
+        transport=PublicHTTPSTransport(
+            total_timeout=HTTP_TOTAL_TIMEOUT_SECONDS,
+        ),
+        trust_env=False
     )
     try:
         resp = await client.get(url, headers={"User-Agent": USER_AGENT})
@@ -415,7 +426,10 @@ async def refresh_official_domain_liveness(
     owns_client = client is None
     client = client or httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True, max_redirects=5,
-        transport=PublicHTTPSTransport(), trust_env=False
+        transport=PublicHTTPSTransport(
+            total_timeout=HTTP_TOTAL_TIMEOUT_SECONDS,
+        ),
+        trust_env=False
     )
     try:
         for row in due:
@@ -465,6 +479,7 @@ __all__: Iterable[str] = (
     "DEAD",
     "DEFAULT_RUN_DEADLINE_SECONDS",
     "DEFAULT_SWEEP_LIMIT",
+    "HTTP_TOTAL_TIMEOUT_SECONDS",
     "HostLiveness",
     "LIVE",
     "LIVENESS_TTL",

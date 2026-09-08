@@ -284,3 +284,90 @@ async def test_the_built_payload_normalises_domains_like_the_writer_does(monkeyp
     assert payload["official_domains"] == ["anua.com", "shop.anua.com"], (
         "sorted, lower-cased, dead excluded — exactly what record_basis stores"
     )
+
+
+# ---------------------------------------------------------------------------
+# NULL == NULL is not evidence of the same pinned set.
+# ---------------------------------------------------------------------------
+
+
+def _complete_basis(**overrides):
+    basis = {
+        "methodology_version": "2",
+        "providers_and_models": {"gemini": {"model_id": "g"}},
+        "primary_destination_version": 1,
+        "prompt_set_id": "p",
+        "selected_set_id": "s",
+        "official_domains": ["brand.com"],
+        "tier_mix": {"category": 10},
+        "market": "US",
+        "language": "en",
+    }
+    basis.update(overrides)
+    return basis
+
+
+def test_two_bases_with_no_set_identity_at_all_are_not_comparable():
+    """The set identity is the PAIR (selected_set_id, prompt_set_id) and
+    `audit_delta._basis_id` reads the stronger of the two, so "we know which
+    set was probed" means at least one is present. With neither, two bases
+    matched NULL against NULL on both fields and came back comparable on no
+    evidence. audit_delta gates this today, but that gate lives in another
+    module and this function's docstring already promised False."""
+    from db.audit_basis import bases_are_comparable
+
+    blank = _complete_basis(prompt_set_id=None, selected_set_id=None)
+    assert bases_are_comparable(blank, dict(blank)) is False
+    assert bases_are_comparable(
+        _complete_basis(prompt_set_id="", selected_set_id=""),
+        _complete_basis(prompt_set_id="", selected_set_id=""),
+    ) is False
+
+
+def test_a_pre_w2_1_run_carrying_only_a_prompt_set_id_is_still_comparable():
+    """`_pinned_set_ids` records the id it has on purpose: a run predating
+    W2.1 has a prompt_set_id and no selected_set_id. Requiring BOTH would make
+    every such run permanently non-comparable."""
+    from db.audit_basis import bases_are_comparable
+
+    w2 = _complete_basis(selected_set_id=None)
+    assert bases_are_comparable(w2, dict(w2)) is True
+    w2_1 = _complete_basis(prompt_set_id=None)
+    assert bases_are_comparable(w2_1, dict(w2_1)) is True
+
+
+async def test_the_writer_records_the_set_id_the_reader_resolves(monkeypatch):
+    """THE ASYMMETRY THAT MADE THE ABOVE REACHABLE. `_pinned_set_ids` read only
+    `per_sku_reports` rows while `audit_delta._prompt_set_id` also accepts a
+    root-level `prompt_basis` (the legacy build_structured_report shape) and
+    `per_product` rows — so for those shapes the writer stored NULL ids for a
+    run whose id the delta could read straight off the same report."""
+    import services.audit_evidence_builder as eb
+    import db.merchant_official_domains as mod
+    from services.audit_delta import measurement_basis_between
+
+    async def _domains(merchant_id):
+        return []
+
+    monkeypatch.setattr(mod, "list_official_domains", _domains)
+
+    shapes = {
+        "root": {"prompt_basis": {"selected_set_id": "sel_root"}},
+        "per_product": {"per_product": [
+            {"prompt_basis": {"selected_set_id": "sel_root"}}]},
+        "per_sku_reports": {"per_sku_reports": [
+            {"prompt_basis": {"selected_set_id": "sel_root"}}]},
+        "nested": {"brand_report": {"per_sku_reports": [
+            {"prompt_basis": {"selected_set_id": "sel_root"}}]}},
+    }
+    for name, report in shapes.items():
+        payload = await eb.record_audit_basis(
+            audit_run_id="", brand_report=report, merchant_id="m1",
+            persist=False,
+        )
+        assert payload["selected_set_id"] == "sel_root", name
+        # ...and it is the SAME id the delta side resolves for that report.
+        if name != "nested":
+            assert measurement_basis_between(
+                report, report, payload, payload,
+            )["prompt_set_id"] == "sel_root", name

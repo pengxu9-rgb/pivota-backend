@@ -355,3 +355,55 @@ def test_the_recovery_postgres_step_runs_after_the_gate_it_must_not_mask():
     # It keeps its own junit assertion: a SKIPPED recovery test is a failure.
     assert "pytest-recovery-postgres.xml" in step["run"]
     assert "did not execute" in step["run"]
+
+
+def test_an_observation_with_no_id_is_skipped_not_a_KeyError():
+    """`payload["observation_id"]` in _evidence_signature raised KeyError, and
+    persist_canonical_evidence computes the signature OUTSIDE the try that
+    guards the insert — so one malformed observation aborted the whole run's
+    evidence persistence rather than losing one row."""
+    from services.audit_evidence_builder import _evidence_signature
+
+    assert _evidence_signature(
+        {"evidence_type": "selection_response", "payload": {}}
+    ) == ""
+    assert _evidence_signature(
+        {"evidence_type": "selection_response", "payload": {"observation_id": "abc"}}
+    ) == "selection_response:abc"
+    # Every other evidence type still signs from its own fields.
+    assert _evidence_signature(
+        {"evidence_type": "grounding_chunk", "product_key": "p",
+         "payload": {"host": "h", "excerpt_text": "e", "matched_url": "u"}}
+    ) == "grounding_chunk|p|h|e|u"
+
+
+async def test_a_signature_less_evidence_row_is_counted_and_the_rest_persist(
+    monkeypatch,
+):
+    import services.audit_evidence_builder as eb
+
+    rows = [
+        {"evidence_type": "selection_response", "payload": {}, "confidence": 50},
+        {"evidence_type": "selection_response",
+         "payload": {"observation_id": "ok"}, "confidence": 50},
+    ]
+    inserted = []
+
+    async def fake_extract(brand_report, content_key_map=None):
+        return rows
+
+    async def fake_insert(**kw):
+        inserted.append(kw["payload"])
+        return "evidence-1"
+
+    monkeypatch.setattr(eb, "extract_evidence_items",
+                        lambda *a, **kw: rows)
+    monkeypatch.setattr("db.audit_evidence.insert_evidence_item", fake_insert)
+    monkeypatch.setattr(eb, "extract_findings", lambda *a, **kw: [])
+    monkeypatch.setattr(eb, "extract_actions", lambda *a, **kw: [])
+
+    summary = await eb.persist_canonical_evidence(
+        audit_run_id="r", merchant_id="m", brand_report={},
+    )
+    assert summary["evidence_items_skipped_unidentified"] == 1
+    assert [p.get("observation_id") for p in inserted] == ["ok"]

@@ -1221,7 +1221,19 @@ async def _resolve_content_keys(
 
 
 def _per_sku_reports(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The run's per-product report rows, in BOTH shapes they arrive in.
+
+    `per_sku_reports` is the per-SKU wedge shape; `per_product` is what
+    `build_structured_report` (the legacy lane, still live) produces. The
+    comparability reader on the other side of this contract —
+    `audit_delta._prompt_set_id` — has always tolerated both, so a writer that
+    saw only one of them recorded NULL set ids for every legacy run while the
+    delta happily resolved an id from the same report. Two such bases then
+    compared NULL == NULL on the pinned-set fields.
+    """
     reports = brand_report.get("per_sku_reports")
+    if not isinstance(reports, list):
+        reports = brand_report.get("per_product")
     if not isinstance(reports, list):
         return []
     return [r for r in reports if isinstance(r, Mapping)]
@@ -1295,6 +1307,34 @@ def build_tier_mix(brand_report: Mapping[str, Any]) -> Dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _prompt_basis_blocks(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """Every place a run's `prompt_basis` block can live, in reading order.
+
+    THE READER'S TOLERANCE, MIRRORED. `audit_delta._prompt_set_id` accepts the
+    per-product/per-SKU row shape AND a report carrying `prompt_basis` at its
+    root (what the legacy `build_structured_report` lane produces), and it
+    reaches through a nested `brand_report`. This writer read only
+    `per_sku_reports` rows, so for every other shape it recorded NULL set ids
+    while the delta resolved a real id from the very same report — leaving the
+    recorded basis without the one field that says WHICH set was probed.
+    """
+    blocks: List[Mapping[str, Any]] = []
+    containers = [brand_report]
+    nested = brand_report.get("brand_report")
+    if isinstance(nested, Mapping):
+        containers.append(nested)
+    for container in containers:
+        for row in _per_sku_reports(container):
+            basis = row.get("prompt_basis")
+            if isinstance(basis, Mapping):
+                blocks.append(basis)
+    for container in containers:
+        basis = container.get("prompt_basis")
+        if isinstance(basis, Mapping):
+            blocks.append(basis)
+    return blocks
+
+
 def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
     """The first non-empty `prompt_set_id` / `selected_set_id` across the run's
     per-SKU bases. Each is taken independently: a run whose SKUs predate W2.1
@@ -1302,10 +1342,7 @@ def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]
     strictly better than recording neither."""
     prompt_set_id: Optional[str] = None
     selected_set_id: Optional[str] = None
-    for sku_report in _per_sku_reports(brand_report):
-        basis = sku_report.get("prompt_basis")
-        if not isinstance(basis, Mapping):
-            continue
+    for basis in _prompt_basis_blocks(brand_report):
         if not prompt_set_id:
             prompt_set_id = str(basis.get("prompt_set_id") or "") or None
         if not selected_set_id:
@@ -1585,8 +1622,20 @@ async def persist_canonical_evidence(
     extracted_evidence = list(
         extract_evidence_items(brand_report, content_key_map)
     )
+    summary["evidence_items_skipped_unidentified"] = 0
     for ev in extracted_evidence:
         signature = _evidence_signature(ev)
+        if not signature:
+            # No stable identity => no idempotency key => a re-run would
+            # duplicate it. Counted so a systematic producer bug is visible
+            # rather than showing up as a quietly short evidence table.
+            summary["evidence_items_skipped_unidentified"] += 1
+            logger.warning(
+                "persist_canonical_evidence: evidence_type=%s carries no "
+                "identity for audit=%s; skipped",
+                ev.get("evidence_type"), audit_run_id,
+            )
+            continue
         idem_key = compute_canonical_idempotency_key(
             audit_run_id=audit_run_id,
             item_type="evidence",
@@ -1748,7 +1797,16 @@ def _evidence_signature(ev: Dict[str, Any]) -> str:
     """
     payload = ev.get("payload") or {}
     if ev.get("evidence_type") == "selection_response":
-        return "selection_response:" + str(payload["observation_id"])
+        # `.get`, not `[...]`. A KeyError here does not fail one row — it
+        # escapes this helper into persist_canonical_evidence's UNGUARDED
+        # signature line (the try starts at the insert), so one malformed
+        # observation would abort the whole run's evidence persistence. An
+        # observation with no id has no stable identity, so the caller skips
+        # and counts it instead.
+        observation_id = payload.get("observation_id")
+        if not observation_id:
+            return ""
+        return "selection_response:" + str(observation_id)
     excerpt = (payload.get("excerpt_text") or "")[:80]
     host = payload.get("host") or ""
     matched_url = payload.get("matched_url") or ""
