@@ -8,6 +8,8 @@ reached main. Each one is written so it fails if the fix is reverted.
 import collections
 import inspect
 import json
+import re
+import sys
 
 import pytest
 
@@ -295,3 +297,72 @@ def test_the_scan_is_ordered_so_limit_and_resume_are_reproducible():
     sql = _sql(SELECT_PRODUCTS_SQL)
     assert "order by cp.product_key" in sql
     assert "cp.product_key > :after" in sql
+
+
+# ---------------------------------------------------------------------------
+# The report has to survive the transport that carries it
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_is_printed_as_exactly_one_fenced_line():
+    """run_oneoff_job.sh reads the job's output from Cloud Logging, which drops lines. The
+    2026-09-08 pilot printed a pretty-printed report whose `offers` line was dropped, leaving
+    `skus: 78` visible and no offers count at all — which reads as the orphan-SKU state this
+    script exists to prevent. A single line cannot be partially dropped."""
+    src = inspect.getsource(backfill.main)
+    assert "indent=" not in src, "a multi-line report can arrive with keys silently missing"
+    assert "REPORT_BEGIN" in src and "REPORT_END" in src
+    assert backfill.REPORT_BEGIN and backfill.REPORT_END
+
+
+class _FakeDB:
+    """main() connects and disconnects; nothing here touches a database."""
+
+    async def connect(self):
+        pass
+
+    async def disconnect(self):
+        pass
+
+
+def test_main_prints_exactly_one_fenced_line(monkeypatch, capsys):
+    """Drive main() ITSELF.
+
+    A first version of this test built its own line and asserted the sentinels delimited it —
+    which tests the test. A mutant printing REPORT_BEGIN + "\n" + json + "\n" + REPORT_END has
+    no `indent=`, has both sentinels, and passed 31/31 while reproducing the 2026-09-08 failure
+    exactly: the report arriving with lines dropped and `offers` silently absent.
+    """
+    async def _fake_run(**kw):
+        return {"skus": 78, "offers": 78, "resume_after": "ext:z::a", "applied": 1}
+
+    monkeypatch.setattr(backfill, "database", _FakeDB())
+    monkeypatch.setattr(backfill, "run", _fake_run)
+    monkeypatch.setattr(sys, "argv", ["backfill"])
+
+    assert backfill.main() == 0
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, f"report spans {out.count(chr(10))} lines: {out!r}"
+    m = re.search(
+        re.escape(backfill.REPORT_BEGIN) + r"(\{.*\})" + re.escape(backfill.REPORT_END), out
+    )
+    assert m, f"the sentinels do not delimit the report: {out!r}"
+    assert json.loads(m.group(1))["offers"] == 78
+
+
+def test_the_two_fences_are_distinct_and_the_documented_strip_is_anchored():
+    """Pin the VALUES, not just their presence. With both fences equal to one token the
+    documented `sed 's/TOKEN//g'` strips every occurrence, so a report whose data contains the
+    token comes back corrupted; and a mutant renaming them to "RPT" leaves every documented
+    extraction command returning nothing while the shape assertions stay green."""
+    assert backfill.REPORT_BEGIN == "BFREPORT>>>"
+    assert backfill.REPORT_END == "<<<BFREPORT"
+    assert backfill.REPORT_BEGIN != backfill.REPORT_END
+
+    payload = {"resume_after": "ext::BFREPORT::x", "offers": 3}
+    line = backfill.REPORT_BEGIN + json.dumps(payload, sort_keys=True) + backfill.REPORT_END
+    recovered = re.sub(
+        re.escape(backfill.REPORT_END) + r"$", "",
+        re.sub(r"^" + re.escape(backfill.REPORT_BEGIN), "", line),
+    )
+    assert json.loads(recovered) == payload

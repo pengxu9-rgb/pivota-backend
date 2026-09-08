@@ -122,6 +122,19 @@ WRITER_NAME = "backfill_variant_identity_skus"
 #: a change would make an in-flight operator's command mean something different.
 CONTRACT = "backfill-v2-identity-index"
 
+#: Sentinels around the one-line report, so a caller can extract it from a log that has had
+#: other lines dropped:
+#:
+#:     ... | grep -o 'BFREPORT>>>{.*}<<<BFREPORT' \
+#:         | sed 's/^BFREPORT>>>//; s/<<<BFREPORT$//' | python3 -m json.tool
+#:
+#: DISTINCT, and the strip is ANCHORED. A first version used the same token for both fences and
+#: documented `sed 's/BFREPORT//g'`, which strips every occurrence anywhere in the line — so a
+#: report whose data contained the token (a product_key, a batch id) came back silently
+#: corrupted, and an unanchored global strip is the kind of thing nobody re-reads once it works.
+REPORT_BEGIN = "BFREPORT>>>"
+REPORT_END = "<<<BFREPORT"
+
 
 def _is_unique_violation(exc: Exception) -> bool:
     """True only for a Postgres unique violation (SQLSTATE 23505).
@@ -730,7 +743,16 @@ def main() -> int:
         finally:
             await database.disconnect()
 
-    print(json.dumps(asyncio.run(_go()), indent=2, sort_keys=True, default=str))
+    report = asyncio.run(_go())
+    # ONE LINE, and fenced. `scripts/ops/run_oneoff_job.sh` retrieves the job's output from
+    # Cloud Logging, which DROPS LINES — so a pretty-printed report arrives with arbitrary keys
+    # missing and no indication that anything is gone. The 2026-09-08 pilot printed `skus: 78`
+    # with the `offers` line silently absent, which reads as 78 SKUs written and 0 offers: the
+    # orphan-SKU state this script exists to avoid, and the operator's stated success signal.
+    # A single line cannot be partially dropped, and the sentinels let a caller extract it
+    # without depending on the surrounding log at all.
+    print(REPORT_BEGIN + json.dumps(report, sort_keys=True, default=str) + REPORT_END,
+          flush=True)
     return 0
 
 
