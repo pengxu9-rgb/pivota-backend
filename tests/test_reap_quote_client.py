@@ -67,12 +67,29 @@ def test_a_base_url_that_is_not_reap_is_refused_before_the_key_is_attached(url):
 
 
 @pytest.mark.parametrize("url", [
-    "https://reap.global/v1",
-    "https://sandbox.reap.global/v1",
-    "https://api.eu.reap.so/v2",
+    # The four hosts Reap's published OpenAPI lists under `servers`, confirmed 8 Sep. Earlier
+    # this list also carried an `api.eu.reap.so` case, which asserted that an allowlist entry I
+    # had GUESSED was correct. No Reap host uses that domain. A test written from the same guess
+    # as the code cannot catch the guess; these four came from the spec.
+    "https://sandbox.api.reap.global/v1",
+    "https://prod.api.reap.global/v1",
+    "https://mx.sandbox.api.reap.global/v1",
+    "https://mx.prod.api.reap.global/v1",
 ])
 def test_real_reap_hosts_are_accepted(url):
     assert rq.validate_base_url(url) == url
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.eu.reap.so/v2",
+    "https://api.reapfin.com/v1",
+])
+def test_domains_that_are_not_reaps_are_refused(url):
+    """Guards the correction itself. `reap.so` and `reapfin.com` were in the shipped allowlist and
+    are not Reap's; a widened allowlist is not a harmless guess, it is a set of extra hosts this
+    client would hand an API key to."""
+    with pytest.raises(rq.ReapConfigError):
+        rq.validate_base_url(url)
 
 
 def test_the_host_check_reads_the_environment_each_call(monkeypatch):

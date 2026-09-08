@@ -50,7 +50,14 @@ logger = logging.getLogger("reap_quote_client")
 
 #: Hosts a base URL may name. A suffix match, so sandbox/regional subdomains are covered without
 #: enumerating them, but an unrelated host is refused before the key is attached to a request.
-ALLOWED_HOST_SUFFIXES = ("reap.global", "reap.so", "reapfin.com")
+#:
+#: CONFIRMED 8 Sep against the published OpenAPI's `servers` and against live calls:
+#: sandbox.api.reap.global, prod.api.reap.global, mx.sandbox.api.reap.global,
+#: mx.prod.api.reap.global — all under reap.global, so the one suffix admits every real host.
+#: `reap.so` and `reapfin.com` were in an earlier version of this list and were INVENTED by me;
+#: no Reap host uses them. A guess in an allowlist is not harmless — it widens the set of hosts
+#: this client will hand an API key to, which is the one thing the list exists to narrow.
+ALLOWED_HOST_SUFFIXES = ("reap.global",)
 
 _DEFAULT_TIMEOUT_S = 12.0
 
