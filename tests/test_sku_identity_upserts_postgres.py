@@ -47,8 +47,15 @@ pytestmark = pytest.mark.skipif(
 
 MERCHANT = "m_sku_identity_gate"
 OTHER_MERCHANT = "m_sku_identity_other"
+#: The VERIFIED brand_claims tenant `_prepare_seller_of_record` step 3 attaches the
+#: plan's rows to — while `catalog_products.merchant_id` stays where it was.
+CLAIMED_MERCHANT = "m_sku_identity_claimed"
+CLAIM_DOMAIN = "brand.example"
 PLATFORM = "external_seed"
 PK = "ext:sku-identity-gate::0badc0de"
+#: A SECOND product. Used for the rows that hold a key derived from PK while
+#: belonging somewhere else — the heal must not follow a key across products.
+PK_OTHER = "ext:sku-identity-gate-other::0badc0de"
 SPID = "sku-identity-gate"
 DEST = "https://brand.example/products/sku-identity-gate"
 VID = "51234567890123"
@@ -135,7 +142,9 @@ _IDENTITY_INDEX = """
 
 
 async def _ddl(database):
+    from db.brand_claims import brand_claims
     from db.catalog import (
+        catalog_merchants,
         catalog_offers,
         catalog_products,
         catalog_skus,
@@ -144,7 +153,8 @@ async def _ddl(database):
     from tests.model_schema import ensure_model_tables
 
     await ensure_model_tables(
-        [catalog_products, catalog_skus, catalog_offers, writer_audit_log]
+        [catalog_products, catalog_skus, catalog_offers, writer_audit_log,
+         catalog_merchants, brand_claims]
     )
     for table, columns in _PATCH_COLUMNS.items():
         for name, coltype in columns:
@@ -167,10 +177,17 @@ async def _ddl(database):
 async def _clear(database):
     """Remove this fixture's ROWS. Never its tables — the gate shares one database
     and a dropped table poisons whichever file collects next."""
-    for pk in (PK, LONG_PK):
+    for pk in (PK, PK_OTHER, LONG_PK):
         await database.execute("DELETE FROM catalog_offers WHERE product_key = :pk", {"pk": pk})
         await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": pk})
         await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": pk})
+    await database.execute(
+        "DELETE FROM brand_claims WHERE brand_domain = :d", {"d": CLAIM_DOMAIN}
+    )
+    await database.execute(
+        "DELETE FROM catalog_merchants WHERE merchant_id = ANY(:m)",
+        {"m": [MERCHANT, OTHER_MERCHANT, CLAIMED_MERCHANT]},
+    )
     await database.execute(
         "DELETE FROM product_group_members WHERE product_group_id = ANY(:g)",
         {"g": [GROUP_ID, GROUP_ID_LONG]},
@@ -284,7 +301,7 @@ async def _seed_product(database, *, merchant=MERCHANT, payload=None, pk=PK, spi
 
 async def _seed_sku(
     database, *, sku_key, vid=VID, merchant=MERCHANT, payload, title="Ruby",
-    pk=PK, suppressed=False, readiness_tier="commerce_ready",
+    pk=PK, suppressed=False, readiness_tier="commerce_ready", platform=PLATFORM,
 ):
     await database.execute(
         """INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,
@@ -292,10 +309,75 @@ async def _seed_sku(
              readiness_tier, suppressed_at, updated_at)
            VALUES (:sk,:pk,:m,:p,:spid,:v,:t,CAST(:pl AS jsonb),
                    :rt,:sup,NOW())""",
-        {"sk": sku_key, "pk": pk, "m": merchant, "p": PLATFORM, "spid": SPID,
+        {"sk": sku_key, "pk": pk, "m": merchant, "p": platform, "spid": SPID,
          "v": vid, "t": title, "pl": json.dumps(payload), "rt": readiness_tier,
          "sup": datetime.now(timezone.utc) if suppressed else None},
     )
+
+
+async def _seed_verified_claim(database, *, merchant=CLAIMED_MERCHANT, domain=CLAIM_DOMAIN):
+    """A VERIFIED brand_claims tenant for the domain, WITH the catalog_merchants row
+    `_prepare_seller_of_record` insists on before it will attach (serving
+    INNER-JOINs it). Together these are the live claimed-attach path."""
+    import uuid
+
+    from db.brand_claims import STATUS_VERIFIED
+
+    await database.execute(
+        """INSERT INTO catalog_merchants (merchant_id, merchant_name, status)
+           VALUES (:m, 'Claimed Brand', 'active')
+           ON CONFLICT (merchant_id) DO NOTHING""",
+        {"m": merchant},
+    )
+    await database.execute(
+        """INSERT INTO brand_claims (claim_id, merchant_id, brand_domain,
+             claim_method, verification_status, verified_at, created_at)
+           VALUES (:cid,:m,:d,'dns',:s,NOW(),NOW())""",
+        {"cid": str(uuid.uuid4()), "m": merchant, "d": domain, "s": STATUS_VERIFIED},
+    )
+
+
+def _planned_pdp(*, merchant=MERCHANT, pk=PK):
+    import services.catalog_enrichment_agent.apply as apply_mod
+
+    return _full_row(
+        apply_mod._PDP_UPSERT_SQL,
+        product_key=pk,
+        merchant_id=merchant,
+        platform=PLATFORM,
+        source_product_id=SPID,
+        source_domain=CLAIM_DOMAIN,
+        title="Gate Lipstick (re-ingest)",
+        catalog_track="external_referral",
+        truth_tier="primary",
+        readiness_tier="referral_only",
+        source_system="ingest_v_test",
+        canonical_url=DEST,
+        # NOT NULL with a server default — an explicit NULL bind still violates it,
+        # and a failed PDP insert would leave this scenario running on the seeded
+        # product row alone.
+        pdp_scope="unverified",
+        pdp_scope_source="ingest_v_test",
+        product_payload=json.dumps({}),
+        tags=json.dumps([]),
+        use_case_tags=json.dumps([]),
+        lifestyle_tags=json.dumps([]),
+    )
+
+
+def _ensure_only_merchant(*, merchant=MERCHANT, domain=CLAIM_DOMAIN):
+    """The observed seller-of-record row a plan carries. `source_ref` is the
+    registrable domain `_prepare_seller_of_record` matches claims against."""
+    return {
+        "_ensure_only": True,
+        "merchant_id": merchant,
+        "merchant_name": "Observed Brand",
+        "primary_platform": PLATFORM,
+        "status": "observed",
+        "source_system": "ingest_v_test",
+        "source_ref": domain,
+        "metadata_json": json.dumps({}),
+    }
 
 
 async def _seed_backfill_offer(database, *, sku_key, price=24.0, dest=DEST):
@@ -337,9 +419,9 @@ async def _apply(plan, *, batch):
     )
 
 
-def _plan(skus, offers):
-    return {"merchants": [], "pdps": [], "skus": skus, "offers": offers,
-            "seeds": [], "incis": []}
+def _plan(skus, offers, *, pdps=None, merchants=None):
+    return {"merchants": merchants or [], "pdps": pdps or [], "skus": skus,
+            "offers": offers, "seeds": [], "incis": []}
 
 
 def _jsonb(value):
@@ -674,29 +756,148 @@ async def test_a_drifted_source_variant_id_is_healed_not_refused_forever(db):
     ) == key
 
 
-async def test_a_drifted_merchant_id_is_healed_too(db):
-    """The other drift the review named: `catalog_skus.merchant_id` no longer
-    agrees with its product's (a W2 re-resolution, a claimed-attach). The sku_key
-    is derived from the product_key, so a row holding it under a foreign merchant
-    is drift by construction — and the plan's merchant comes off the
-    catalog_products row itself."""
+async def test_a_claimed_attach_does_not_move_the_stored_skus_merchant(db):
+    """SCENARIO A — THE CORRUPTION THE HEAL EXECUTED, driven through the real
+    claimed-attach path rather than simulated.
+
+    `_prepare_seller_of_record` step 1 pins the plan's merchant to the
+    `catalog_products` row that exists, and step 3 then OVERRIDES it because a
+    VERIFIED `brand_claims` tenant owns the domain — while `_PDP_UPSERT_SQL` never
+    moves `catalog_products.merchant_id`. So after this plan is prepared, the plan's
+    merchant differs from the product's BY CONSTRUCTION, and that disagreement is
+    exactly what branch (b) triggers on. The unbounded heal therefore rewrote the
+    stored SKU's merchant to the claimed tenant on a routine content re-sync,
+    splitting a live SKU from its own product and reporting it as a heal.
+
+    The fix does not let a re-sync decide the merchant. The stored row is left
+    alone; the planned row collides with it on the PK (the arbiter is the identity
+    index, which is free) and is REFUSED — `skus_identity_conflict`, with its offers
+    dropped, which is a state a human can see. Adoption cannot rescue it either: no
+    live row holds the plan's (claimed-tenant) identity."""
+    key = _ingestion_key()
+    await _seed_verified_claim(db)
+    await _seed_product(db, merchant=MERCHANT)
+    await _seed_sku(db, sku_key=key, payload={"agent_version": "legacy"},
+                    title="Ruby (stored)")
+
+    planned = _planned_sku()
+    counts = await _apply(
+        _plan(
+            [planned],
+            [_planned_offer(sku_key=key)],
+            pdps=[_planned_pdp()],
+            merchants=[_ensure_only_merchant()],
+        ),
+        batch=False,
+    )
+
+    # THE PREMISE, ASSERTED. `_prepare_seller_of_record` mutates the plan's rows in
+    # place, so this is the claimed-attach actually firing — and the product row
+    # staying put is the split it opens. Without both, everything below is vacuous.
+    assert planned["merchant_id"] == CLAIMED_MERCHANT, "the claimed attach did not fire"
+    assert counts["pdps"] == 1, "the PDP write failed; this is not the re-ingest path"
+    assert await db.fetch_val(
+        "SELECT merchant_id FROM catalog_products WHERE product_key = :pk", {"pk": PK}
+    ) == MERCHANT, "catalog_products moved; the premise of this test is gone"
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1
+    sku = dict(rows[0])
+    assert sku["merchant_id"] == MERCHANT, (
+        "a content re-sync moved a stored SKU onto the claimed tenant, splitting it "
+        "from its product"
+    )
+    assert sku["title"] == "Ruby (stored)", "the refused row was written anyway"
+
+    assert counts["skus_identity_healed"] == 0
+    # WHERE IT LANDS INSTEAD: the residual conflict counter, via the PK collision
+    # `_note_sku_write_failure` classifies (adoption cannot apply — no live row
+    # holds the claimed tenant's identity).
+    assert counts["skus_identity_conflict"] == 1
+    assert counts["skus_adopted_existing_identity"] == 0
+    assert counts["skus"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    assert counts["offers"] == 0
+
+
+async def test_the_heal_repairs_the_variant_id_without_moving_the_merchant(db):
+    """The heal that DOES fire must still keep its hands off `merchant_id`. The
+    stored row carries a legacy `source_variant_id = 'default'` AND a foreign
+    merchant: one column is this lane's to repair, the other is not. The variant id
+    is healed; the merchant stays where it is, so the planned row is refused rather
+    than written onto a row whose ownership we just decided."""
     key = _ingestion_key()
     await _seed_product(db)
     await _seed_sku(
-        db, sku_key=key, merchant=OTHER_MERCHANT, payload={"agent_version": "drift"},
-        title="Ruby (stale)",
+        db, sku_key=key, vid="default", merchant=OTHER_MERCHANT,
+        payload={"agent_version": "legacy"}, title="Ruby (stale)",
     )
 
     counts = await _apply(_plan([_planned_sku()], []), batch=False)
 
+    sku = dict((await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK}))[0])
+    assert sku["merchant_id"] == OTHER_MERCHANT, "the heal moved the merchant"
+    assert sku["source_variant_id"] == VID, "the drift this heal exists for was left"
     assert counts["skus_identity_healed"] == 1
-    assert counts["skus"] == 1
-    assert counts["skus_identity_conflict"] == 0
-    rows = await db.fetch_all(
-        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
-    assert len(rows) == 1
-    assert dict(rows[0])["merchant_id"] == MERCHANT
-    assert dict(rows[0])["title"] == "Ruby (re-ingest)"
+    assert counts["skus_identity_conflict"] == 1
+    assert counts["skus"] == 0
+
+
+async def test_the_heal_does_not_follow_its_key_into_another_product(db):
+    """SCENARIO B. `_SKU_KEY_HOLDER_LOOKUP_SQL` finds the holder of our key by
+    `sku_key` ALONE, so the row it hands back can belong to a different product. An
+    unbounded heal STOLE it: the row's product_key, merchant and variant id were all
+    rewritten to this plan's, moving a live SKU (and every offer keyed on it) into a
+    product it was never part of."""
+    key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_product(db, pk=PK_OTHER, spid="sku-identity-gate-other")
+    await _seed_sku(
+        db, sku_key=key, pk=PK_OTHER, vid="default",
+        payload={"agent_version": "elsewhere"}, title="Belongs elsewhere",
+    )
+
+    counts = await _apply(
+        _plan([_planned_sku()], [_planned_offer(sku_key=key)]), batch=False
+    )
+
+    stolen = dict(await db.fetch_one(
+        "SELECT * FROM catalog_skus WHERE sku_key = :k", {"k": key}))
+    assert stolen["product_key"] == PK_OTHER, "the heal stole a row from another product"
+    assert stolen["source_variant_id"] == "default", "the heal rewrote a foreign row"
+    assert stolen["title"] == "Belongs elsewhere"
+
+    assert counts["skus_identity_healed"] == 0, "a heal that matched no row was counted"
+    assert counts["skus_identity_conflict"] == 1
+    assert counts["skus"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_skus WHERE product_key = :pk", {"pk": PK}
+    ) == 0
+
+
+async def test_the_heal_does_not_repoint_a_stored_rows_platform(db):
+    """SCENARIO C. `platform` was pinned by NOTHING — not by the product row, not by
+    anything in the plan's provenance — and the heal rewrote it to whatever the
+    ingesting lane happened to be. A shopify SKU re-pointed at `external_seed` is a
+    row every platform-scoped query then misses."""
+    key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=key, platform="shopify", payload={"agent_version": "shopify"},
+        title="Ruby (shopify)",
+    )
+
+    counts = await _apply(_plan([_planned_sku()], []), batch=False)
+
+    sku = dict(await db.fetch_one(
+        "SELECT * FROM catalog_skus WHERE sku_key = :k", {"k": key}))
+    assert sku["platform"] == "shopify", "a re-ingest re-pointed a stored row's platform"
+    assert counts["skus_identity_healed"] == 0
+    assert counts["skus_identity_conflict"] == 1
+    assert counts["skus"] == 0
 
 
 async def test_the_bulk_path_heals_the_same_drift(db):
@@ -725,14 +926,21 @@ async def test_the_bulk_path_heals_the_same_drift(db):
 
 async def test_a_suppressed_row_holding_the_identity_is_never_adopted(db):
     """A suppressed row is one a withdrawal took OUT of supply. Adopting its key
-    would resurrect it under a fresh title and hang live offers off it — and it
-    could not have worked anyway: both unique constraints cover suppressed rows, so
-    the INSERT is refused by the identity index regardless.
+    would resurrect it under a fresh title and hang live offers off it.
 
-    So the identity lookup excludes suppressed rows (`AND suppressed_at IS NULL`),
-    the planned row is refused and counted separately from a real identity
-    conflict, and its offers are dropped rather than left pointing at a withdrawn
-    SKU."""
+    AND THE WRITE WOULD SUCCEED IF NOTHING STOPPED IT. `_SKU_SUPPRESSED_IDENTITY_SQL`
+    is not a classifier that explains a doomed INSERT — it is the guard. Remove it
+    and the planned row reaches the upsert, whose
+    `ON CONFLICT (merchant_id, platform, product_key, source_variant_id) DO UPDATE`
+    lands ON the withdrawn row: title and payload refreshed, `updated_at` bumped,
+    `suppressed_at` left in place, and the write counted in `skus` as a success
+    (measured with the lookup stubbed to `[]`: `skus: 1`, title replaced). The
+    mutant that deletes that lookup is killed by this test and the bulk one below.
+
+    So the identity lookup excludes suppressed rows from ADOPTION
+    (`AND suppressed_at IS NULL`), the suppressed lookup refuses the WRITE, the
+    planned row is counted separately from a real identity conflict, and its offers
+    are dropped rather than left pointing at a withdrawn SKU."""
     promoter_key = _promoter_key()
     await _seed_product(db)
     await _seed_sku(
@@ -782,6 +990,52 @@ async def test_the_bulk_path_refuses_a_suppressed_identity_too(db):
     assert await db.fetch_val(
         "SELECT title FROM catalog_skus WHERE sku_key = :k", {"k": promoter_key}
     ) == "Ruby (withdrawn)"
+
+
+async def test_a_suppressed_key_holder_neither_refuses_the_adoption_nor_is_healed(db):
+    """`_SKU_KEY_HOLDER_LOOKUP_SQL`'s own `AND suppressed_at IS NULL`, which nothing
+    reached before. Two rows are in play at once:
+
+      - a LIVE row holding the plan's identity under the promoter's spelling — the
+        row this plan should adopt;
+      - a SUPPRESSED row holding the plan's KEY, under a DIFFERENT product. The
+        suppressed-identity lookup is scoped by `product_key`, so that row is
+        invisible to branch (d); the key-holder filter is the only thing that keeps
+        it out of the reconciliation.
+
+    Without the filter the suppressed row is read as a live key holder with a
+    foreign tuple, which is precondition (c) — "two existing rows, no move satisfies
+    both constraints" — and a perfectly good adoption is turned into a REFUSAL, the
+    SKU counted `skus_identity_conflict` and its offer dropped. And the row must not
+    be healed either: the heal is bounded to rows under THIS product_key, so a key
+    that wandered into another product is not ours to re-point."""
+    promoter_key = _promoter_key()
+    ingestion_key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_product(db, pk=PK_OTHER, spid="sku-identity-gate-other")
+    await _seed_sku(db, sku_key=promoter_key, payload=_backfill_payload())
+    await _seed_sku(
+        db, sku_key=ingestion_key, pk=PK_OTHER, vid="default", suppressed=True,
+        payload={"agent_version": "withdrawn"}, title="Withdrawn elsewhere",
+    )
+
+    planned = _planned_sku()
+    counts = await _apply(
+        _plan([planned], [_planned_offer(sku_key=planned["sku_key"])]), batch=False
+    )
+
+    assert counts["skus_adopted_existing_identity"] == 1, "the adoption was refused"
+    assert counts["skus_identity_conflict"] == 0
+    assert counts["skus_identity_healed"] == 0
+    assert counts["skus"] == 1 and counts["offers"] == 1
+    assert counts["offers_dropped_for_refused_sku"] == 0
+
+    withdrawn = dict(await db.fetch_one(
+        "SELECT * FROM catalog_skus WHERE sku_key = :k", {"k": ingestion_key}))
+    assert withdrawn["suppressed_at"] is not None, "a withdrawn row was resurrected"
+    assert withdrawn["product_key"] == PK_OTHER, "the heal moved a withdrawn row"
+    assert withdrawn["source_variant_id"] == "default", "the heal re-pointed it"
+    assert withdrawn["title"] == "Withdrawn elsewhere"
 
 
 # --- (i) readiness_tier ------------------------------------------------------
@@ -1047,8 +1301,79 @@ def test_a_promoter_sku_key_is_bounded_by_the_column():
     assert key.startswith(LONG_PK + "::v::")
     # stable across runs: the same id derives the same key
     assert key == _derive_sku_key(LONG_PK, LONG_VID)
-    # ...and distinct ids do not collapse onto one key
+    # ...and distinct ids do not collapse onto one key. NOTE this distinctness is
+    # only as real as the id it is handed: `source_variant_id` is varchar(128), so
+    # two ids that survive as distinct KEYS here can still be one IDENTITY once
+    # bound. That is why `build_variant_row` binds first and derives second — see
+    # the two tests below.
     assert key != _derive_sku_key(LONG_PK, LONG_VID + "7")
+
+
+#: Two merchant variant ids that differ only past `source_variant_id`'s varchar(128).
+VID_LONG_A = "8" * 128 + "-shade-a"
+VID_LONG_B = "8" * 128 + "-shade-b"
+
+
+def test_a_promoter_row_derives_its_key_from_the_id_it_will_store():
+    """KEY AND IDENTITY CANNOT BE ALLOWED TO DISAGREE. The upsert binds
+    `source_variant_id` to `[:128]` (the column's width); the key used to be derived
+    from the FULL id. Two ids sharing a 128-char prefix then produced ONE identity
+    tuple under TWO keys — and the identity index made the second row's INSERT a
+    silent `DO UPDATE` of the first."""
+    from services.catalog_variant_promoter import (
+        _SOURCE_VARIANT_ID_MAX,
+        _derive_sku_key,
+        build_variant_row,
+    )
+
+    primary = {"product_key": PK, "merchant_id": MERCHANT, "platform": PLATFORM,
+               "source_product_id": SPID}
+    row_a = build_variant_row(
+        variant={"variant_id": VID_LONG_A, "title": "Ruby"}, primary=primary)
+    row_b = build_variant_row(
+        variant={"variant_id": VID_LONG_B, "title": "Coral"}, primary=primary)
+
+    assert row_a.source_variant_id == VID_LONG_A[:_SOURCE_VARIANT_ID_MAX]
+    assert row_a.sku_key == _derive_sku_key(PK, row_a.source_variant_id)
+    # the two ids bind to one identity — so they must not carry two different keys
+    assert row_a.source_variant_id == row_b.source_variant_id
+    assert row_a.sku_key == row_b.sku_key
+    # and the merchant's full id is still on the row for anyone who needs it
+    assert row_a.sku_payload["variant_id"] == VID_LONG_A
+
+
+async def test_two_variant_ids_that_bind_to_one_identity_are_one_row_and_counted(db):
+    """EXECUTED. The group offers two shades whose ids differ only past the 128th
+    character. There is ONE `catalog_skus` row either way — the identity index says
+    so — and the question is only whether the promoter reports it. Before the fix
+    the second row carried a different `sku_key`, so its INSERT resolved through
+    `ON CONFLICT (merchant_id, platform, product_key, source_variant_id)` and
+    overwrote the first shade's title, while `variants_promoted` counted two."""
+    import services.catalog_variant_promoter as promoter
+
+    payload = {"variants": [
+        {"variant_id": VID_LONG_A, "title": "Ruby",
+         "options": [{"name": "Shade", "value": "Ruby"}]},
+        {"variant_id": VID_LONG_B, "title": "Coral",
+         "options": [{"name": "Shade", "value": "Coral"}]},
+    ]}
+    await _seed_product(db, payload=payload)
+    await _seed_group(db)
+
+    report = await promoter.promote_variants_all(apply=True, product_group_id=GROUP_ID)
+
+    assert report.skus_upserted_total == 1, "a collapsed identity was counted twice"
+    assert report.skus_deduped_same_identity_total == 1
+    assert report.skus_identity_conflict_total == 0
+    assert report.skus_write_failed_total == 0
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1
+    sku = dict(rows[0])
+    assert sku["title"] == "Ruby", "the second shade overwrote the first"
+    assert sku["source_variant_id"] == VID_LONG_A[:128]
+    assert sku["sku_key"] == _promoter_key(VID_LONG_A[:128])
 
 
 async def test_the_promoter_run_survives_an_over_long_variant_id(db):

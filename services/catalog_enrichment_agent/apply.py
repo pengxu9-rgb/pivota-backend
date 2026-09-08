@@ -209,11 +209,18 @@ _SKU_KEY_HOLDER_LOOKUP_SQL = """
                   AND suppressed_at IS NULL
                 """
 
-#: The rows the two lookups above deliberately cannot see. Read ONLY to classify:
-#: a planned row whose identity (or whose key) is held by a SUPPRESSED row cannot
-#: be written at all — both unique constraints cover suppressed rows — so it is
-#: counted as `skus_skipped_suppressed_identity` and its offers are dropped, rather
-#: than sent into a doomed INSERT and mis-reported as an identity conflict.
+#: The rows the two lookups above deliberately cannot see. THIS IS THE GUARD, not a
+#: classifier: it is the ONLY thing standing between a planned row and the
+#: suppressed row holding its identity. Delete it and the INSERT does not fail —
+#: `ON CONFLICT (merchant_id, platform, product_key, source_variant_id) DO UPDATE`
+#: lands ON the suppressed row, refreshing a SKU a withdrawal took out of supply:
+#: title, payload and `updated_at` rewritten, `suppressed_at` left in place, and the
+#: whole thing counted in `skus` as a successful write (measured with this lookup
+#: stubbed out: `skus: 1`, title replaced). Nothing downstream reports it.
+#: (When the suppressed row holds our KEY rather than our identity the INSERT does
+#: fail — a PK collision the identity arbiter cannot absorb — but that is the other
+#: half of the case, not the whole of it.) A planned row caught here is counted
+#: `skus_skipped_suppressed_identity` and its offers are dropped.
 _SKU_SUPPRESSED_IDENTITY_SQL = """
                 SELECT sku_key, merchant_id, platform, product_key, source_variant_id
                 FROM catalog_skus
@@ -221,21 +228,39 @@ _SKU_SUPPRESSED_IDENTITY_SQL = """
                   AND suppressed_at IS NOT NULL
                 """
 
-#: Heal a stored row whose IDENTITY TUPLE has drifted from the plan's, in place,
-#: keeping its primary key. The plan's tuple is the truth: `_prepare_seller_of_record`
-#: pins every plan row's merchant to the `catalog_products` row that already exists,
-#: and `product_key`/`platform`/`source_variant_id` come off the PDP being ingested.
-#: The stored row keeps its `sku_key`, so the live `catalog_offers` rows keyed on it
-#: (there is no FK) stay attached to a row that exists — which is the whole reason
-#: this is an UPDATE of the tuple rather than a re-key of the row.
+#: Heal ONE column of a stored row's identity — its `source_variant_id` — in place,
+#: keeping its primary key. This is the drift the heal exists for: a legacy
+#: `source_variant_id = 'default'` written before variant ids were captured, on the
+#: row INGESTION's own key names. The stored row keeps its `sku_key`, so the live
+#: `catalog_offers` rows keyed on it (there is no FK) stay attached to a row that
+#: exists — the whole reason this is an UPDATE rather than a re-key.
+#:
+#: WHAT THIS STATEMENT DELIBERATELY DOES NOT TOUCH: `merchant_id` and `platform`.
+#: A CONTENT RE-SYNC IS NOT ENTITLED TO DECIDE THEM, and the plan's copies of them
+#: are not the pinned values the previous revision of this comment claimed:
+#: `_prepare_seller_of_record` step 1 pins the plan's merchant to the existing
+#: `catalog_products` row, and then step 3 OVERRIDES it whenever a VERIFIED
+#: `brand_claims` tenant exists for the domain (the live claimed-attach path,
+#: flowerbeauty.com) — while `_PDP_UPSERT_SQL` never moves
+#: `catalog_products.merchant_id`. So on that path the plan's merchant differs from
+#: the product's BY CONSTRUCTION, this heal fired on exactly that disagreement, and
+#: an unbounded `SET merchant_id` silently moved the stored SKU to the claimed tenant
+#: — splitting it from its own product. `platform` was pinned by nothing at all: a
+#: shopify SKU could be re-pointed at external_seed by a re-ingest.
+#:
+#: `AND product_key = :product_key` IS THE OTHER HALF. `_SKU_KEY_HOLDER_LOOKUP_SQL`
+#: finds the holder of our key by `sku_key` ALONE, so the row it returns may sit
+#: under a DIFFERENT product; without this predicate the heal stole it.
+#: `RETURNING sku_key` is how the caller learns whether a row was actually repaired:
+#: `databases` + asyncpg returns no rowcount from `execute()`, so a silent no-match
+#: would otherwise be counted as a heal.
 _SKU_IDENTITY_HEAL_SQL = """
                 UPDATE catalog_skus
-                SET merchant_id = :merchant_id,
-                    platform = :platform,
-                    product_key = :product_key,
-                    source_variant_id = :source_variant_id,
+                SET source_variant_id = :source_variant_id,
                     updated_at = NOW()
                 WHERE sku_key = :sku_key
+                  AND product_key = :product_key
+                RETURNING sku_key
                 """
 
 _OFFER_UPSERT_SQL = """
@@ -461,21 +486,42 @@ async def _adopt_existing_sku_identities(
         catalog_offers has no foreign key to catalog_skus, so a `sku_key` rewrite
         would silently orphan the live offers hanging off the 4,286 rows the
         2026-09-08 variant-identity backfill adopted.
-    (d) the identity (or the key) is held by a SUPPRESSED row. Both unique
-        constraints cover suppressed rows, so the INSERT cannot land; and writing
-        onto a row a withdrawal took out of supply would resurrect it. The single
-        guard is `AND suppressed_at IS NULL` in `_SKU_IDENTITY_LOOKUP_SQL` — a
-        suppressed row is never a candidate for (a) — and
-        `_SKU_SUPPRESSED_IDENTITY_SQL` is read only to say WHY the identity came
-        back unheld, so the outcome is `skus_skipped_suppressed_identity` rather
-        than a mis-reported identity conflict.
-    (b) the identity is unheld and the plan's key is held by a live row with a
-        DIFFERENT tuple → HEAL that row's tuple to the plan's, in place, keeping
-        its key (`_SKU_IDENTITY_HEAL_SQL`). The plan's tuple is the truth: it is
-        pinned to the existing `catalog_products` row by `_prepare_seller_of_record`.
-        Without this the row 23505s on INSERT, is counted-and-skipped FOREVER, and
-        its offers are written onto a stale row — which is precisely what
-        `ON CONFLICT (sku_key) DO UPDATE` used to refresh for free.
+    (d) the identity (or the key) is held by a SUPPRESSED row. Writing onto a row a
+        withdrawal took out of supply would resurrect it under a fresh title and
+        hang live offers off it. THERE ARE TWO GUARDS AND THEY CLOSE DIFFERENT
+        DOORS: `AND suppressed_at IS NULL` in `_SKU_IDENTITY_LOOKUP_SQL` keeps a
+        suppressed row from ever being ADOPTED at (a), and
+        `_SKU_SUPPRESSED_IDENTITY_SQL` is THE GUARD ON THE WRITE — not a
+        classifier. Remove it and the planned row goes to the upsert, whose
+        `ON CONFLICT (merchant_id, platform, product_key, source_variant_id)
+        DO UPDATE` lands ON the suppressed row: a successful write, counted in
+        `skus`, that rewrites a withdrawn SKU's title, payload and `updated_at`
+        while leaving `suppressed_at` in place. (The claim that "both unique constraints cover suppressed rows so the
+        INSERT cannot land" is true only when the suppressed row holds our KEY —
+        that one is a PK collision the identity arbiter cannot absorb. When it
+        holds our IDENTITY the INSERT lands very happily.) The outcome is
+        `skus_skipped_suppressed_identity`, and its offers are dropped.
+    (b) the identity is unheld and the plan's key is held by a live row UNDER THIS
+        PRODUCT whose `source_variant_id` has drifted → re-point that one column,
+        in place, keeping the key (`_SKU_IDENTITY_HEAL_SQL`). The case this exists
+        for is the legacy `source_variant_id = 'default'`: without it the row 23505s
+        on INSERT, is counted-and-skipped FOREVER, and its offers are written onto a
+        stale row — precisely what `ON CONFLICT (sku_key) DO UPDATE` used to refresh
+        for free.
+
+        THE HEAL DOES NOT MOVE `merchant_id` OR `platform`, and does not reach a row
+        under another product_key. The plan's merchant is NOT the pinned truth the
+        first cut of this branch assumed: `_prepare_seller_of_record` step 1 pins it
+        to the `catalog_products` row, and step 3 then OVERRIDES it for a VERIFIED
+        `brand_claims` tenant while the product upsert leaves
+        `catalog_products.merchant_id` where it was. On that live claimed-attach
+        path the plan's merchant differs from the product's by construction, which
+        is exactly the disagreement this branch triggers on — so an unbounded heal
+        moved stored SKUs onto the claimed tenant, splitting them from their own
+        product, on a run that reported nothing but `skus_identity_healed`. A row
+        that disagrees on merchant or platform is therefore LEFT ALONE and refused
+        downstream (`skus_identity_conflict`, offers dropped), which is a state a
+        human can see.
 
     THE OFFER ID LANDS ON THE BACKFILL'S OWN. Both writers derive it from the same
     triple: `derive_offer_id(product_key, sku_key, destination)`. Ingestion stores
@@ -624,12 +670,13 @@ async def _adopt_existing_sku_identities(
             continue
 
         # (d) the identity looked UNHELD only because a SUPPRESSED row holds it (or
-        #     holds our key). Both unique constraints cover suppressed rows, so the
-        #     INSERT cannot land — and writing onto a row a withdrawal took out of
-        #     supply would resurrect it. The GUARD is the `suppressed_at IS NULL` in
-        #     `_SKU_IDENTITY_LOOKUP_SQL`, which is why this branch sits BELOW the
-        #     adoption above: `held_key` can only ever name a live row, and this
-        #     lookup exists to EXPLAIN the resulting hole, not to close it twice.
+        #     holds our key). THIS BRANCH IS THE GUARD ON THE WRITE: with the
+        #     identity held by a suppressed row the upsert does NOT fail, it
+        #     DO UPDATEs that row through the identity arbiter — the withdrawn row's
+        #     content is rewritten and counted in `skus` as a success. `_SKU_IDENTITY_LOOKUP_SQL`'s own
+        #     `suppressed_at IS NULL` closes a DIFFERENT door — it keeps the
+        #     suppressed row from being ADOPTED at (a) — which is why this branch
+        #     sits below the adoption: `held_key` can only ever name a live row.
         if identity in suppressed_identities or planned_key in suppressed_keys:
             counts["skus_skipped_suppressed_identity"] += 1
             refused.add(planned_key)
@@ -644,7 +691,11 @@ async def _adopt_existing_sku_identities(
             )
             continue
 
-        # (b) the identity is unheld and our key is held by a drifted row — heal it.
+        # (b) the identity is unheld and our key is held by a row whose
+        #     source_variant_id has drifted — re-point THAT ONE COLUMN. A holder
+        #     that disagrees on merchant_id/platform, or that sits under another
+        #     product, is left alone (see `_heal_drifted_sku_identity`) and the
+        #     planned row is refused by the upsert instead.
         if key_taken_by_another:
             healed = await _heal_drifted_sku_identity(
                 sku, planned_key, holder_identity, database=database
@@ -674,18 +725,41 @@ async def _heal_drifted_sku_identity(
     *,
     database: Any,
 ) -> bool:
-    """Point a stored row's identity tuple back at the plan's, keeping its key.
+    """Re-point a stored row's `source_variant_id` at the plan's, keeping its key.
+
+    SCOPE, deliberately one column. The drift this repairs is the legacy
+    `source_variant_id = 'default'` on the row ingestion's own key names. It does
+    NOT repair a `merchant_id` or a `platform` disagreement: the plan's merchant is
+    NOT pinned to `catalog_products` on the claimed-attach path (see
+    `_SKU_IDENTITY_HEAL_SQL`), so "the plan and the stored row disagree about the
+    merchant" is a state this lane MANUFACTURES at apply time, not evidence the
+    stored row is wrong. A row that disagrees on either of those columns is left
+    exactly as it is and falls through to the upsert, where the PK collision is
+    counted `skus_identity_conflict` and its offers are dropped — refused, not
+    silently rewritten.
 
     Best-effort: a failed UPDATE leaves the planned row alone, so the upsert's own
     23505 handling (counted, skipped, offers dropped) still applies — the same
     outcome as before this healing existed."""
+    planned_variant_id = str(sku.get("source_variant_id") or "")
+    if stored_identity[3] == planned_variant_id:
+        # The only column this heal may write already agrees; whatever else the
+        # stored row disagrees about is not ours to decide.
+        logger.warning(
+            "catalog_skus identity NOT healed: sku_key=%s carries %s and the plan "
+            "says (merchant_id=%s, platform=%s, product_key=%s, source_variant_id=%s)"
+            " — they agree on source_variant_id, and merchant_id/platform are not a "
+            "content re-sync's to move; leaving the row to the upsert's own conflict "
+            "handling",
+            planned_key, stored_identity, sku.get("merchant_id"),
+            sku.get("platform"), sku.get("product_key"), planned_variant_id,
+        )
+        return False
     try:
-        await database.execute(
+        healed_row = await database.fetch_one(
             _SKU_IDENTITY_HEAL_SQL,
             {
                 "sku_key": planned_key,
-                "merchant_id": sku.get("merchant_id"),
-                "platform": sku.get("platform"),
                 "product_key": sku.get("product_key"),
                 "source_variant_id": sku.get("source_variant_id"),
             },
@@ -701,13 +775,23 @@ async def _heal_drifted_sku_identity(
             sku.get("source_variant_id"), str(exc)[:200],
         )
         return False
+    if healed_row is None:
+        # The key holder is not under this product — `_SKU_KEY_HOLDER_LOOKUP_SQL`
+        # matches on `sku_key` alone, so it can name a row belonging to a different
+        # product. Not ours to move; the upsert refuses the planned row instead.
+        logger.warning(
+            "catalog_skus identity NOT healed: sku_key=%s is held by %s, which is "
+            "not a row under product_key=%s — the heal is bounded to this product; "
+            "leaving the row to the upsert's own conflict handling",
+            planned_key, stored_identity, sku.get("product_key"),
+        )
+        return False
     logger.warning(
-        "catalog_skus identity healed: sku_key=%s carried %s, re-pointed to the "
-        "plan's (merchant_id=%s, platform=%s, product_key=%s, source_variant_id=%s) "
-        "— the plan's tuple is pinned to catalog_products by "
-        "_prepare_seller_of_record, and the key is kept so live offers stay attached",
-        planned_key, stored_identity, sku.get("merchant_id"), sku.get("platform"),
-        sku.get("product_key"), sku.get("source_variant_id"),
+        "catalog_skus source_variant_id healed: sku_key=%s carried %s, its "
+        "source_variant_id re-pointed to the plan's %r (merchant_id and platform "
+        "left as stored — a content re-sync does not decide them). The key is kept "
+        "so live offers stay attached",
+        planned_key, stored_identity, planned_variant_id,
     )
     return True
 
@@ -890,6 +974,16 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
          catalog_merchants row; serving surfaces INNER-JOIN it, so remapping
          onto a missing row would silently hide the products. Missing ->
          attach is DEFERRED loudly and the observed identity stands.
+
+    STEP 3 OVERRIDES STEP 1, AND `catalog_products` DOES NOT FOLLOW. A claimed
+    attach rewrites `merchant_id` on the plan's pdps AND skus, on top of the pin
+    rule 1 just applied — while `_PDP_UPSERT_SQL` never updates
+    `catalog_products.merchant_id` (that is rule 1's whole premise). So on this
+    path a plan row's merchant is NOT the merchant of the product row it names, by
+    construction, until the R3 migration moves the products. Nothing downstream may
+    read a plan-vs-stored merchant disagreement as evidence that the STORED row is
+    wrong: `_heal_drifted_sku_identity` did, and silently moved live SKUs onto the
+    claimed tenant. Live case: flowerbeauty.com.
        - otherwise insert-if-missing (ON CONFLICT DO NOTHING). Never the
          clobbering upsert: its `status = EXCLUDED.status` would downgrade a
          merchant that has graduated beyond 'observed'. A transient insert

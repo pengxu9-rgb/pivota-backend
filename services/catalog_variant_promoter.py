@@ -119,7 +119,19 @@ class GroupOutcome:
     sample_variant_titles: List[str] = field(default_factory=list)
     #: Rows refused by the OTHER unique constraint — same sku_key, different
     #: identity tuple. Counted rather than fatal; see the upsert loop.
+    #:
+    #: NOT A HEALTHY ZERO, AND NOT A SELF-CLEARING NUMBER. This promoter has no
+    #: adoption or heal arbiter of the kind `apply._adopt_existing_sku_identities`
+    #: gives the ingest lane. A variant whose IDENTITY is free but whose derived
+    #: `sku_key` is already held under a different tuple is refused here on this run
+    #: and on every run after it, for ever, because nothing in this file ever
+    #: reconciles the planned key with the row that holds it. Read this counter as
+    #: "variants this lane can never write", not as "variants that failed once".
     skus_identity_conflict: int = 0
+    #: Variants dropped because an EARLIER variant in the same group already bound
+    #: to this identity — two merchant ids sharing a 128-char prefix. One stored row
+    #: either way; this says how many shades that cost.
+    skus_deduped_same_identity: int = 0
     #: Rows refused for any OTHER reason (22001 on an over-long id, 23502, a bad
     #: payload). Counted rather than fatal too: a re-raise here aborted every group
     #: still queued behind this one.
@@ -133,8 +145,11 @@ class PromoterReport:
     groups_skipped_no_real_variants: int = 0
     groups_skipped_no_primary: int = 0
     skus_upserted_total: int = 0
+    #: See `GroupOutcome.skus_identity_conflict` — these are permanent refusals, not
+    #: retriable ones.
     skus_identity_conflict_total: int = 0
     skus_write_failed_total: int = 0
+    skus_deduped_same_identity_total: int = 0
     per_group: List[GroupOutcome] = field(default_factory=list)
 
 
@@ -342,15 +357,26 @@ def build_variant_row(
     2,803 promotable products carry an id one of our own writers minted. As of that date no
     money path reads the stamp yet; the gateway's isRestatedProductId guard is what refuses
     a product-derived id at checkout."""
-    variant_id = str(variant.get("variant_id") or variant.get("id") or "").strip()
-    if not variant_id:
+    raw_variant_id = str(variant.get("variant_id") or variant.get("id") or "").strip()
+    if not raw_variant_id:
         return None
 
+    # THE KEY IS DERIVED FROM THE ID WE WILL ACTUALLY STORE. `source_variant_id` is
+    # varchar(128) and the upsert used to bind `variant_id[:128]` while the key came
+    # off the FULL id: two ids sharing a 128-char prefix then produced ONE identity
+    # tuple under TWO different sku_keys, so the second row's INSERT resolved through
+    # `ON CONFLICT (merchant_id, platform, product_key, source_variant_id)` and
+    # silently DO UPDATEd the first — one stored row, `promoted` counting two, and
+    # the second variant's title/options overwriting the first's. Bind first, derive
+    # second, and the key and the identity cannot disagree.
+    variant_id = raw_variant_id[:_SOURCE_VARIANT_ID_MAX]
     sku_key = _derive_sku_key(primary["product_key"], variant_id)
     options = variant.get("options")
     payload = dict(variant)
+    # Provenance is asked of the id the MERCHANT issued, not of our bound copy — a
+    # truncation must not be able to turn a restated product id into a clean one.
     payload["variant_id_provenance"] = variant_id_provenance(
-        variant_id,
+        raw_variant_id,
         product_id=primary.get("source_product_id"),
         product_key=primary.get("product_key"),
     )
@@ -525,11 +551,36 @@ async def promote_variants_for_group(
             skipped_reason="no_real_variants",
         )
 
+    # ONE ROW PER IDENTITY. `source_variant_id` is varchar(128), so two merchant
+    # variant ids that share a 128-char prefix bind to the SAME identity tuple. They
+    # are one row in `catalog_skus` whatever we do — the identity index says so — so
+    # the choice is between writing the second over the first and COUNTING two
+    # promotions, or dropping it and saying so. Counted, because a silent overwrite
+    # is how one shade's title ends up on another shade's row.
     rows_to_upsert: List[VariantRow] = []
+    identity_collisions = 0
+    seen_identities: set = set()
     for v in real_variants:
         row = build_variant_row(variant=v, primary=primary)
-        if row is not None:
-            rows_to_upsert.append(row)
+        if row is None:
+            continue
+        identity = (
+            row.merchant_id, row.platform, row.product_key, row.source_variant_id
+        )
+        if identity in seen_identities:
+            identity_collisions += 1
+            logger.warning(
+                "variant dropped (same identity as an earlier variant in this "
+                "group): sku_key=%s identity=(merchant_id=%s, platform=%s, "
+                "product_key=%s, source_variant_id=%s) — two merchant variant ids "
+                "bind to one source_variant_id (varchar(%d)); writing this row would "
+                "DO UPDATE the first through the identity index, not add a shade",
+                row.sku_key, row.merchant_id, row.platform, row.product_key,
+                row.source_variant_id, _SOURCE_VARIANT_ID_MAX,
+            )
+            continue
+        seen_identities.add(identity)
+        rows_to_upsert.append(row)
 
     sample_titles = [r.title for r in rows_to_upsert[:5]]
 
@@ -547,7 +598,10 @@ async def promote_variants_for_group(
                     "source_product_id": r.source_product_id,
                     # varchar(128). An over-long merchant variant id is a 22001,
                     # which is not a unique violation — before this bound it took
-                    # the whole run down rather than one variant.
+                    # the whole run down rather than one variant. The bound is
+                    # applied ONCE, in `build_variant_row`, so `r.sku_key` is derived
+                    # from this exact string; re-slicing here would be the return of
+                    # the key-vs-identity split. Kept as a defensive no-op.
                     "source_variant_id": str(r.source_variant_id or "")[
                         :_SOURCE_VARIANT_ID_MAX
                     ],
@@ -608,6 +662,7 @@ async def promote_variants_for_group(
         sample_variant_titles=sample_titles,
         skus_identity_conflict=identity_conflicts,
         skus_write_failed=write_failures,
+        skus_deduped_same_identity=identity_collisions,
     )
 
 
@@ -638,6 +693,14 @@ async def promote_variants_all(
     updates no identity column: a `sku_key = EXCLUDED.sku_key` here would rename
     primary keys out from under live supply, and a `sku_payload = EXCLUDED...`
     would erase the backfill's `variant_id_provenance` / `source_system` stamps.
+
+    THIS LANE STILL HAS NO ADOPTION/HEAL ARBITER, and this PR does not add one.
+    `apply._adopt_existing_sku_identities` reconciles a planned ingest row with the
+    rows already holding its key or its identity (adopt / heal / refuse); nothing
+    here does. So a variant whose identity is free while its derived `sku_key` is
+    held under a different tuple is refused on every run for ever, and
+    `skus_identity_conflict_total` is a standing backlog, not a transient. Do not
+    read it as healthy because it is stable.
     """
     report = PromoterReport()
 
@@ -671,5 +734,6 @@ async def promote_variants_all(
             report.skus_upserted_total += outcome.variants_promoted
         report.skus_identity_conflict_total += outcome.skus_identity_conflict
         report.skus_write_failed_total += outcome.skus_write_failed
+        report.skus_deduped_same_identity_total += outcome.skus_deduped_same_identity
 
     return report
