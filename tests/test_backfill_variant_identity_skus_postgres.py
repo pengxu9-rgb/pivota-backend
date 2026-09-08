@@ -415,6 +415,7 @@ async def test_a_reason_without_a_timestamp_is_not_a_target(_db) -> None:
     await _db.execute("UPDATE catalog_products SET suppression_reason = 'legacy_label' WHERE product_key = :pk", {"pk": pk})
     report = await _run()
     assert report.get("products_scanned", 0) == 0 and await _skus(_db, pk) == []
+    assert report["products_skipped_label_only"] == 1                         # filtered, not invisible
 
     # and a label-only SKU owning the identity on a live product
     pk2 = "ext:brand:label-only-sku"
@@ -458,9 +459,11 @@ async def test_a_suppressed_row_under_the_derived_key_with_a_foreign_tuple_gets_
     assert row["merchant_id"] == "merch_OTHER" and _payload(row["sku_payload"]) == {}
 
 
-async def test_the_on_conflict_arm_merges_the_existing_payload(_db) -> None:
-    """Reached only when a LIVE row with a foreign tuple sits under our derived key. The arm
-    must merge sku_payload, not replace it: a replace drops the promoter's own keys."""
+async def test_a_live_row_with_a_foreign_tuple_under_the_derived_key_is_skipped_untouched(_db) -> None:
+    """Round-4 review: the suppressed foreign-tuple row was skipped but the LIVE one fell through
+    to ON CONFLICT (sku_key), which keeps the row's merchant_id / currency / title and hung OUR
+    offer on it -- fetch_skus_for_keys then renders a variant whose SKU-level merchant contradicts
+    its own offer. Skipped, counted, and the row is byte-identical afterwards."""
     from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
 
     pk = "ext:brand:liveforeign"
@@ -474,13 +477,39 @@ async def test_the_on_conflict_arm_merges_the_existing_payload(_db) -> None:
         VALUES (:sk, :pk, 'merch_OTHER', 'external_seed', :epid, :vid, 'A',
                 '{"promoted_by": "someone", "agent_version": "v9"}'::jsonb)
         """, {"sk": key, "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
+    before = await _sku_snapshot(_db)
 
     report = await _run()
 
-    assert report["skus_inserted"] == 1 and report["offers_inserted"] == 1
-    payload = _payload((await _db.fetch_one("SELECT sku_payload FROM catalog_skus WHERE sku_key = :k", {"k": key}))["sku_payload"])
-    assert payload["promoted_by"] == "someone" and payload["agent_version"] == "v9"
-    assert payload["variant_id_provenance"] == "merchant_issued"
+    assert report["skipped_sku_key_foreign_tuple"] == 1
+    assert report.get("skus_inserted", 0) == 0 and report.get("offers_inserted", 0) == 0
+    assert [o["sku_key"] for o in await _offers(_db, pk)] == [f"{pk}::canonical"]
+    assert await _sku_snapshot(_db) == before
+
+
+async def test_a_label_only_row_with_a_foreign_tuple_under_the_derived_key_is_skipped(_db) -> None:
+    """The write-side guard's `suppression_reason` half: a reason-without-timestamp row under our
+    key, foreign merchant -- both identity probes miss, and only the key probe's reason check
+    stands between it and a live offer stamped merchant_issued."""
+    from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
+
+    pk = "ext:brand:labelforeign"
+    await _product(_db, pk, variants=[{"variant_id": REAL_VID, "title": "A", "price": "9.00"}])
+    await _canonical_offer(_db, pk)
+    key = derive_variant_sku_key(pk, REAL_VID)
+    await _db.execute(
+        """
+        INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,
+                                  source_variant_id, title, suppression_reason)
+        VALUES (:sk, :pk, 'merch_OTHER', 'external_seed', :epid, :vid, 'A', 'merged_loser')
+        """, {"sk": key, "pk": pk, "epid": f"brand:{pk}", "vid": REAL_VID})
+
+    report = await _run()
+
+    assert report["skipped_sku_suppressed"] == 1 and report.get("offers_inserted", 0) == 0
+    assert report.get("skipped_sku_key_foreign_tuple", 0) == 0                # suppression wins the label
+    row = await _db.fetch_one("SELECT sku_payload FROM catalog_skus WHERE sku_key = :k", {"k": key})
+    assert _payload(row["sku_payload"]) == {}
 
 
 async def test_an_orphan_foreign_offer_on_the_derived_key_is_not_counted_as_an_insert(_db) -> None:

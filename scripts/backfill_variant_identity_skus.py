@@ -175,8 +175,9 @@ SELECT_SKU_BY_IDENTITY_SQL = """
 #: BOTH suppression columns, as cross-merchant recall gates them (pivot_query_service, #1648):
 #: `suppressed_at` is the serving gate, and catalog_trust_policy tombstones on `suppression_reason`
 #: ALONE. A row with the label and no timestamp is a threshold-0 invariant violation
-#: (catalog_invariant_checks `suppression_reason_without_timestamp`, "Prod: 0 today") -- the one
-#: state in which a withdrawn row can keep serving. This script must never be the writer that
+#: (catalog_invariant_checks `suppression_reason_without_timestamp_skus`, "Prod: 0 today"; the
+#: products-level twin converged 2,332 such rows on 2026-07-30) -- the one state in which a
+#: withdrawn row can keep serving. This script must never be the writer that
 #: hangs a live offer off one.
 
 #: A suppressed row that owns the identity: we must neither insert beside it (index) nor
@@ -195,9 +196,18 @@ SELECT_ANY_SKU_BY_IDENTITY_SQL = """
 #: 60-char normalisation, so two long punctuated ids can collide). Re-identifying that row via
 #: ON CONFLICT would be silent data loss; the pick is skipped instead.
 SELECT_SKU_BY_KEY_SQL = """
-    SELECT source_variant_id, suppressed_at, suppression_reason
+    SELECT source_variant_id, merchant_id, platform, product_key, suppressed_at, suppression_reason
     FROM catalog_skus
     WHERE sku_key = :sku_key
+"""
+
+#: Label-only products are filtered out of the scan by design (see above); this counts them so a
+#: run's report can tell "none existed" from "some were filtered". Threshold-0 class: expect 0.
+COUNT_LABEL_ONLY_PRODUCTS_SQL = """
+    SELECT COUNT(*) FROM catalog_products
+    WHERE platform = 'external_seed'
+      AND suppressed_at IS NULL
+      AND suppression_reason IS NOT NULL
 """
 
 #: The skip path (another writer owns the offer) may touch ONLY identity: currency,
@@ -237,6 +247,10 @@ UPSERT_SKU_SQL = """
         sku_payload       = COALESCE(catalog_skus.sku_payload, '{}'::jsonb) || EXCLUDED.sku_payload,
         updated_at        = NOW()
 """
+#: The ON CONFLICT arm above is reachable only by a concurrent writer landing on the key between
+#: our probes and the INSERT (every same-tuple live row is found by the identity probe; every
+#: suppressed or foreign-tuple row is skipped by the key probe). It merges rather than replaces so
+#: even that race cannot drop the other writer's payload keys.
 
 UPSERT_OFFER_SQL = """
     INSERT INTO catalog_offers (
@@ -434,6 +448,15 @@ async def _write_product(
                 # this is the only probe that sees the row the INSERT would ON CONFLICT into.
                 counts["skipped_sku_suppressed"] += 1
                 continue
+            if owner is not None and (
+                str(owner["merchant_id"]), str(owner["platform"]), str(owner["product_key"])
+            ) != (identity["merchant_id"], identity["platform"], identity["product_key"]):
+                # A LIVE row under our derived key that belongs to another merchant / product:
+                # the identity probes missed it for exactly that reason, and ON CONFLICT would
+                # keep its merchant_id/currency/title while we hung OUR offer on it -- a PDP
+                # variant whose SKU-level merchant contradicts its own offer.
+                counts["skipped_sku_key_foreign_tuple"] += 1
+                continue
 
         labels, attrs = _option_labels(variant)
         title = str(variant.get("title") or "").strip() or row["title"]
@@ -535,6 +558,9 @@ async def run(
     *, apply: bool, limit: int, allow_inherited_price: bool, adopt_existing_offers: bool = False
 ) -> Dict[str, Any]:
     counts: collections.Counter = collections.Counter()
+    label_only = await database.fetch_val(COUNT_LABEL_ONLY_PRODUCTS_SQL)
+    if label_only:
+        counts["products_skipped_label_only"] = int(label_only)
     touched = 0
     after = ""
     done = False
