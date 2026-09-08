@@ -259,11 +259,21 @@ def _measurement_basis(
     # so tightened the materiality mask from 15 points to 5, which is the
     # direction that manufactures movement rather than hiding it.
     #
-    # Absent basis rows fall through to the prompt-set verdict unchanged: runs
-    # that predate audit_basis carry no evidence of a model change either way,
-    # and failing them closed would silently desensitise every merchant's next
-    # re-audit. This is strictly additive — it can only ever turn a True into a
-    # False, never the reverse.
+    # ABSENT BASIS ROWS ARE UNKNOWN, NOT "UNCHANGED". An earlier cut let them
+    # fall through to the prompt-set verdict, on the argument that a run
+    # predating audit_basis carries no evidence of a model change either way.
+    # That is true and it is the wrong conclusion: no evidence of a change is
+    # also no evidence of SAMENESS, and the fall-through spent that ignorance on
+    # the merchant-facing side, licensing "you moved X → Y" on a pair we cannot
+    # show was measured the same way. So a missing basis on either side answers
+    # None (see docs/audits/revenue-recovery-contract.md), and callers that read
+    # `same is not True` — build_reaudit_delta's movements, the outreach-outcome
+    # query claims, services/audit_stability_canary — degrade to "unknown"
+    # rather than asserting.
+    #
+    # CONSEQUENCE FOR CALLERS: a caller that does not PASS the two runs' bases
+    # gets None for every pair, forever, silently. audit_stability_canary reads
+    # them for exactly this reason.
     if not isinstance(current_basis, Mapping) or not isinstance(prior_basis, Mapping):
         return {"same": None, "prompt_set_id": current_id,
                 "note": "The full measurement basis is unavailable; improvement cannot be established."}

@@ -434,15 +434,13 @@ def bases_are_comparable(
     changed how we measure, so this isn't a like-for-like comparison", which is
     both true and useful.
 
-    NOTE FOR THE CALLER: services/audit_delta.py is where this belongs. Its
-    `_measurement_basis` currently decides comparability from the prompt set
-    ALONE (`_prompt_set_id`) and hands the verdict to `build_reaudit_delta`,
-    which uses it to pick between MATERIAL_SCORE_DELTA (15) and
-    MATERIAL_SCORE_DELTA_SAME_BASIS (5) — so today a model swap can tighten the
-    noise mask to 5 points and then report a 6-point swing as movement. The
-    fix is to AND this function into `_measurement_basis`'s `same`, which
-    requires audit_delta to receive the two runs' basis rows; that plumbing is
-    deliberately NOT part of this change.
+    THE CALLER. services/audit_delta.py `_measurement_basis` now ANDs this
+    function into its `same` verdict, and its callers pass the two runs' basis
+    rows in (`agent_center_bd_report_service._basis_pair_for_delta` for the
+    merchant-facing delta, `audit_stability_canary._bases_by_run_id` for the
+    W7 noise canary). A caller that passes nothing gets `same=None` — unknown,
+    never True — so this check cannot be bypassed by omission; it can only be
+    made permanently inconclusive, which is the safe direction.
     """
     if not isinstance(a, Mapping) or not isinstance(b, Mapping):
         return False
