@@ -419,3 +419,92 @@ def test_full_brand_report_shape_uses_first_per_product_report():
     )
 
     assert _movement(delta, "attribution")["direction"] == "improved"
+
+
+# ---------------------------------------------------------------------------
+# A not-comparable pair must not be narrated as a definite verdict.
+#
+# The degrade block turns every score movement into direction="unknown" /
+# verdict="not_comparable" — and then `_headline`, which has no
+# not-comparable branch, saw nothing material and said "No material change
+# since your last audit N days ago — keep the current plan running." Two
+# claims we cannot support (nothing moved; your plan is working), persisted
+# into report_jsonb, on the pair we had just refused to compare.
+# ---------------------------------------------------------------------------
+
+
+def _not_comparable_delta(**overrides):
+    """visibility 41 -> 63 (a 22-point move, well over the 15-point floor) on
+    a pair with NO recorded measurement basis."""
+    kwargs = {
+        "current_report": _report(visibility=63),
+        "prior_report": _report(visibility=41),
+        "prior_row": {"run_id": "prior"},
+        "days_since": 30,
+        "current_basis": None,
+        "prior_basis": None,
+    }
+    kwargs.update(overrides)
+    return build_reaudit_delta(**kwargs)
+
+
+def test_not_comparable_pair_headline_says_not_comparable():
+    delta = _not_comparable_delta()
+
+    assert delta["measurement_basis"]["same"] is None
+    assert all(m["direction"] == "unknown" for m in delta["movements"]
+               if m["signal"] in ("visibility", "attribution",
+                                  "category_visibility"))
+    headline = delta["headline"]
+    assert headline.startswith("Not comparable to your last audit 30 days ago")
+    # The exact sentence the pair cannot support, in either direction.
+    assert "keep the current plan running" not in headline
+    assert "No material change" not in headline
+    assert "Material change" not in headline
+
+
+def test_not_comparable_headline_names_the_reason_when_one_is_known():
+    from services.audit_delta import NOT_COMPARABLE_REASONS
+
+    missing = _not_comparable_delta()
+    assert NOT_COMPARABLE_REASONS["measurement_basis_missing"] in missing["headline"]
+
+    prompt_set_changed = _not_comparable_delta(
+        current_report=_report(visibility=63,
+                               prompt_basis={"selected_set_id": "sel_new"}),
+        prior_report=_report(visibility=41,
+                             prompt_basis={"selected_set_id": "sel_old"}),
+        current_basis=_basis(),
+        prior_basis=_basis(),
+    )
+    assert prompt_set_changed["measurement_basis"]["same"] is False
+    assert (NOT_COMPARABLE_REASONS["prompt_set_changed"]
+            in prompt_set_changed["headline"])
+
+    unpinned = _not_comparable_delta(
+        current_report=_report(visibility=63, prompt_basis={}),
+        prior_report=_report(visibility=41, prompt_basis={}),
+        current_basis=_basis(),
+        prior_basis=_basis(),
+    )
+    assert unpinned["measurement_basis"]["same"] is None
+    assert NOT_COMPARABLE_REASONS["prompt_basis_missing"] in unpinned["headline"]
+
+
+def test_a_comparable_pair_still_gets_the_ordinary_headline():
+    """The guard above must not swallow the real verdicts."""
+    moved = compare_pinned_runs(
+        current_report=_report(attribution=55),
+        prior_report=_report(attribution=35),
+        prior_row={"run_id": "prior"},
+        days_since=30,
+    )
+    assert "improved: First-party citation" in moved["headline"]
+
+    flat = compare_pinned_runs(
+        current_report=_report(),
+        prior_report=_report(),
+        prior_row={"run_id": "prior"},
+        days_since=30,
+    )
+    assert flat["headline"].startswith("No material change")

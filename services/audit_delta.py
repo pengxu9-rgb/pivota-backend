@@ -56,6 +56,65 @@ MATERIAL_SCORE_DELTA = 15
 MATERIAL_SCORE_DELTA_SAME_BASIS = MATERIAL_SCORE_DELTA
 
 
+# WHY A PAIR IS NOT COMPARABLE, IN THE MERCHANT'S WORDS.
+#
+# Keyed by the machine-readable `reason` `_measurement_basis` stamps on every
+# not-comparable verdict. The degrade block below already turns every score
+# movement into direction="unknown"/verdict="not_comparable" when
+# `basis["same"] is not True` — but the HEADLINE is the only line most readers
+# see, and `_headline` has no not-comparable branch: with nothing material left
+# to name it fell through to "No material change since your last audit N days
+# ago — keep the current plan running." That sentence is two false claims (we
+# measured no change; therefore your plan is working) on a pair we have just
+# said we cannot compare, and it is written into report_jsonb. A
+# METHODOLOGY_VERSION bump makes it every merchant's next re-audit.
+NOT_COMPARABLE_REASONS = {
+    "prompt_basis_missing": (
+        "no measurement basis was recorded for one of these two runs (one of "
+        "them predates basis pinning)"
+    ),
+    "measurement_basis_missing": (
+        "no measurement basis was recorded for the prior run"
+    ),
+    "prompt_set_changed": (
+        "the set of questions we asked changed between the two runs"
+    ),
+    "measurement_basis_changed": (
+        "how these audits were measured changed — the models, the "
+        "official-domain set, the question mix or the market"
+    ),
+}
+_NOT_COMPARABLE_FALLBACK = (
+    "we cannot show the two runs were measured the same way"
+)
+
+
+def not_comparable_headline(
+    basis: Optional[Mapping[str, Any]],
+    days_since: Optional[int],
+) -> str:
+    """The headline for a pair that cannot support a before/after claim.
+
+    SINGLE SOURCE. Both the producer (`build_reaudit_delta`) and the retained
+    report path (`services.report_summary_builder._since_last_audit`, which
+    rewrites the movements of an ALREADY PERSISTED delta) render this, so a
+    delta persisted as "improved" before the basis contract existed cannot be
+    re-served beside movements that all read `not_comparable`.
+
+    It names the reason when one was recorded, and it never advises the
+    merchant to keep or change a plan — the whole point is that this pair
+    licenses no conclusion about their store.
+    """
+    reason = None
+    if isinstance(basis, Mapping):
+        reason = NOT_COMPARABLE_REASONS.get(str(basis.get("reason") or ""))
+    return (
+        f"Not comparable to your last audit{_day_phrase(days_since)}: "
+        f"{reason or _NOT_COMPARABLE_FALLBACK}. No movement can be claimed "
+        "either way — read this run as a fresh baseline."
+    )
+
+
 def build_reaudit_delta(
     *,
     current_report: Mapping[str, Any],
@@ -121,7 +180,8 @@ def build_reaudit_delta(
             )
         )
 
-    if basis.get("same") is not True:
+    comparable = basis.get("same") is True
+    if not comparable:
         for movement in movements:
             movement.update(is_material=False, direction="unknown")
             movement["detection"]["verdict"] = "not_comparable"
@@ -140,7 +200,15 @@ def build_reaudit_delta(
     return {
         "is_first_audit": False,
         "days_since_last": days_since,
-        "headline": _headline(movements, days_since),
+        # A not-comparable pair gets a headline that SAYS not comparable.
+        # _headline only knows "material" / "no material change", and the
+        # second of those carries "keep the current plan running" — advice we
+        # have no basis for on a pair we just refused to compare.
+        "headline": (
+            _headline(movements, days_since)
+            if comparable
+            else not_comparable_headline(basis, days_since)
+        ),
         "movements": movements,
         # W2 pinned basis: is this delta measured against the SAME prompt set
         # as the prior run? same=True licenses "you moved X→Y" as a real
@@ -233,6 +301,10 @@ def _measurement_basis(
     if not current_id or not prior_id:
         return {
             "same": None,
+            # `reason` is the MACHINE-READABLE half of every not-comparable
+            # verdict; `note` is prose and must never be parsed. It keys
+            # NOT_COMPARABLE_REASONS so the headline can name WHY.
+            "reason": "prompt_basis_missing",
             "prompt_set_id": current_id,
             "note": (
                 "One of the compared runs predates prompt-basis pinning, so "
@@ -243,6 +315,7 @@ def _measurement_basis(
     if not same:
         return {
             "same": False,
+            "reason": "prompt_set_changed",
             "prompt_set_id": current_id,
             "note": (
                 "The prompt set changed between these runs (measurement basis "
@@ -275,24 +348,29 @@ def _measurement_basis(
     # gets None for every pair, forever, silently. audit_stability_canary reads
     # them for exactly this reason.
     if not isinstance(current_basis, Mapping) or not isinstance(prior_basis, Mapping):
-        return {"same": None, "prompt_set_id": current_id,
-                "note": "The full measurement basis is unavailable; improvement cannot be established."}
-    if isinstance(current_basis, Mapping) and isinstance(prior_basis, Mapping):
-        from db.audit_basis import bases_are_comparable
-
-        if not bases_are_comparable(current_basis, prior_basis):
-            return {
-                "same": False,
+        return {"same": None, "reason": "measurement_basis_missing",
                 "prompt_set_id": current_id,
-                "basis_divergence": "measurement_basis",
-                "note": (
-                    "The same questions were asked, but something else about "
-                    "how this audit was measured changed (the model, the "
-                    "official-domain set, the question mix or the market), so "
-                    "score movement partly reflects the new measurement rather "
-                    "than your store."
-                ),
-            }
+                "note": "The full measurement basis is unavailable; improvement cannot be established."}
+    # No `isinstance` re-check here: the guard above already returned for every
+    # non-Mapping input, so the old `if isinstance(...) and isinstance(...)`
+    # wrapper could only ever be True — dead syntax that read like a second,
+    # independent gate.
+    from db.audit_basis import bases_are_comparable
+
+    if not bases_are_comparable(current_basis, prior_basis):
+        return {
+            "same": False,
+            "reason": "measurement_basis_changed",
+            "prompt_set_id": current_id,
+            "basis_divergence": "measurement_basis",
+            "note": (
+                "The same questions were asked, but something else about "
+                "how this audit was measured changed (the model, the "
+                "official-domain set, the question mix or the market), so "
+                "score movement partly reflects the new measurement rather "
+                "than your store."
+            ),
+        }
 
     return {
         "same": True,

@@ -3270,3 +3270,65 @@ def test_legacy_markdown_uses_combined_verdict_display() -> None:
 
     assert "## Verdict: **Strong AI visibility, weak owned buyer path**" in md
     assert "## Verdict: **STRONG**" not in md
+
+
+@pytest.mark.asyncio
+async def test_legacy_attach_never_advises_keeping_the_plan_on_an_unpinned_pair(
+    monkeypatch,
+) -> None:
+    """THE LEGACY PATH IS LIVE AND IT STAMPS NO BASIS.
+
+    `build_structured_report` never writes `prompt_basis`, so every legacy
+    re-audit resolves `same=None` — not comparable — and every score movement
+    degrades to `unknown`. With nothing material left to name, the headline
+    fell through to "No material change since your last audit N days ago —
+    keep the current plan running": a measurement claim AND a recommendation,
+    both on a pair we just refused to compare, both written into report_jsonb.
+    """
+    from db import merchant_audit_runs as mar
+    import db.audit_basis as ab
+    from services.agent_center_bd_report_service import _attach_reaudit_delta
+
+    prior = _basic_report()
+    current = _basic_report()
+    # A 20-point move, well over the 15-point materiality floor — so the
+    # headline is not silent for want of movement, only for want of a basis.
+    prior["merchant_view"]["headline"]["scores"]["attribution"] = 35
+    prior["verdict"]["attribution_score"] = 35
+    current["merchant_view"]["headline"]["scores"]["attribution"] = 55
+    current["verdict"]["attribution_score"] = 55
+    assert "prompt_basis" not in current, (
+        "build_structured_report stamping a basis would change what this "
+        "test is about — re-point it at the stamped value instead"
+    )
+
+    async def fake_fetch(*, run_id: str) -> Dict[str, Any]:
+        return {"report_jsonb": {"per_product": [prior]}}
+
+    async def no_stored_basis(run_id: str):
+        return None
+
+    monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+    monkeypatch.setattr(ab, "get_basis_for_run", no_stored_basis)
+
+    await _attach_reaudit_delta(
+        current,
+        merchant_id="merchant_123",
+        prior_runs=[{
+            "run_id": "prior-run",
+            "status": "succeeded",
+            "requested_at": "2026-05-01T00:00:00+00:00",
+        }],
+    )
+
+    delta = current["merchant_view"]["reaudit_delta"]
+    assert delta["measurement_basis"]["same"] is not True
+    movement = next(
+        m for m in delta["movements"] if m["signal"] == "attribution"
+    )
+    assert movement["direction"] == "unknown"
+    headline = delta["headline"]
+    assert "keep the current plan running" not in headline
+    assert "No material change" not in headline
+    assert headline.startswith("Not comparable to your last audit")
+    assert "no measurement basis was recorded" in headline

@@ -750,14 +750,25 @@ def _share_of_voice(
 
 
 def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """Verbatim passthrough of the persisted reaudit_delta (wave-1 A1) —
-    movements already carry merchant-safe labels and the W2 materiality
-    verdicts; this layer never re-derives them. Absent on runs that predate
-    the per-SKU attach (presence-gated rendering, the 1.1/1.2 convention)."""
+    """Re-derive the persisted reaudit_delta's verdicts against the CURRENT
+    contract (wave-1 A1 + the W2/A3 measurement basis).
+
+    NOT a passthrough, and the docstring used to say it was. A delta persisted
+    into report_jsonb was decided by whatever contract was live when the run
+    completed, so a retained report can carry `is_material: True` /
+    `direction: "improved"` for a pair today's basis rule refuses to compare.
+    Movements are therefore recomputed here from `from`/`to` and the stored
+    `measurement_basis` — and, because they are, the HEADLINE has to be too:
+    passing `delta["headline"]` through verbatim rendered "Material change …
+    improved: AI visibility" directly beside movements that all read
+    `unknown` / `not_comparable`. Absent on runs that predate the per-SKU
+    attach (presence-gated rendering, the 1.1/1.2 convention)."""
     delta = report.get("reaudit_delta")
     if not isinstance(delta, dict):
         return None
-    from services.audit_delta import MATERIAL_SCORE_DELTA, SCORE_SIGNALS
+    from services.audit_delta import (
+        MATERIAL_SCORE_DELTA, SCORE_SIGNALS, not_comparable_headline,
+    )
     movements = [dict(m) for m in _as_list(delta.get("movements")) if isinstance(m, dict)]
     basis = _as_dict(delta.get("measurement_basis"))
     comparable = basis.get("contract_version") == "2" and basis.get("same") is True
@@ -771,10 +782,17 @@ def _since_last_audit(report: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         m["direction"] = ("improved" if after > before else "regressed") if resolved else "unknown"
         m["detection"] = {"verdict": "resolved" if resolved else "below_detection_floor" if comparable and numeric else "not_comparable", "threshold": MATERIAL_SCORE_DELTA}
 
+    # A first audit's headline ("Baseline established …") is already the
+    # honest one and has no pair to compare; every other non-comparable delta
+    # gets the shared not-comparable sentence rather than its persisted claim.
+    headline = delta.get("headline")
+    if not comparable and not delta.get("is_first_audit"):
+        headline = not_comparable_headline(basis, delta.get("days_since_last"))
+
     return {
         "is_first_audit": bool(delta.get("is_first_audit")),
         "days_since_last": delta.get("days_since_last"),
-        "headline": delta.get("headline"),
+        "headline": headline,
         "movements": movements,
         # Producer emits is_material (review P1: reading "material" made this
         # counter permanently zero on real passthrough data).
