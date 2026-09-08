@@ -5926,8 +5926,20 @@ async def _handle_offers_resolve(
         reason = "no_candidates"
     latency_ms = int((time.perf_counter() - started) * 1000)
 
+    _coverage = preflight_coverage_fields(_preflight_stats)
+    # The values ride in the MESSAGE as well as in `extra`: no formatter in this repo renders
+    # `extra`, so a record carrying them only there prints as the bare string
+    # "offers.resolve.summary". See preflight_coverage_fields' NOTE ON OBSERVABILITY.
+    _summary_msg = "offers.resolve.summary" + (
+        " preflight mode=%s cart_prefilled=%d asked=%d memo_hits=%d skipped_by_budget=%d"
+        " answered_fraction=%.3f" % (
+            _coverage["preflight_mode"], _coverage["preflight_cart_prefilled"],
+            _coverage["preflight_asked"], _coverage["preflight_memo_hits"],
+            _coverage["preflight_skipped_by_budget"], _coverage["preflight_answered_fraction"],
+        ) if _coverage else ""
+    )
     logger.info(
-        "offers.resolve.summary",
+        _summary_msg,
         extra={
             "event": "offers.resolve.summary",
             "product_id": product_id,
@@ -5942,7 +5954,7 @@ async def _handle_offers_resolve(
             # READ the counters. Without this they are increments with no reads — the round-3
             # finding. Folded into THIS record rather than a second line so coverage carries
             # the request's identity, mode and latency alongside it.
-            **preflight_coverage_fields(_preflight_stats),
+            **_coverage,
         },
     )
 
@@ -8370,10 +8382,18 @@ def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
     `offers.resolve.summary` record, which already carries the request's identity and latency. A
     second bare line would have had neither, and nothing to join it to.
 
-    NOTE ON DURABILITY. These counters are NOT in `checkout_preflight_observations` — that table
-    holds one row per ask and none of these numbers. An earlier version of this docstring claimed
-    otherwise, which mattered because Cloud Logging drops lines: today coverage is best-effort,
-    and persisting it is a named follow-up rather than something already done.
+    NOTE ON OBSERVABILITY -- read before trusting these numbers. (1) They are NOT in
+    `checkout_preflight_observations`; that table holds one row per ask and none of these
+    counters. An earlier docstring claimed otherwise. (2) The record they ride on is a
+    `logger.info` on this module's logger. In production (`uvicorn main:app`, no --log-config;
+    `setup_structured_logging()` is defined and NEVER called from main -- see
+    routes/scheduler_health.py, which exists because of exactly this) the root logger sits at
+    WARNING, so this INFO record is NOT EMITTED AT ALL until that changes. That is not
+    "best-effort sampling"; the record does not leave the process. (3) Even where it is emitted,
+    no formatter in this repo renders `extra`, so the values are also written into the message
+    text by the caller. Persisting the counters (a request-coverage row that `shadow_report`
+    can join) is the named follow-up; until it lands, the shadow report's would_block_rate has
+    no coverage denominator anyone can read in prod.
     """
     covered = stats.get("cart_prefilled", 0)
     if not covered:

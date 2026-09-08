@@ -4297,8 +4297,11 @@ def test_a_referral_only_offer_is_not_gated(
     assert asked == [], "the gate must not ask about a variant the redirect declined to use"
 
 
-def _preflight_harness(monkeypatch, *, rows, stamped=True):
-    """offers.resolve with N seed rows and a counting preflight. Returns the ask log."""
+def _preflight_harness(monkeypatch, *, rows, stamped=True, stamped_indices=None):
+    """offers.resolve with N seed rows and a counting preflight. Returns the ask log.
+
+    `stamped=False` builds referral-only rows (no cart variant) -- the population the gate is
+    blind to by design; `stamped_indices` stamps only those row indices, for a MIXED request."""
     import copy
 
     import routes.agent_shop_gateway as gateway
@@ -4320,7 +4323,7 @@ def _preflight_harness(monkeypatch, *, rows, stamped=True):
                 r["external_product_id"] = f"{r.get('external_product_id')}_{i}"
                 for _k in ("destination_url", "canonical_url"):
                     r[_k] = f"{r[_k]}-{i}"
-                if stamped:
+                if stamped and (stamped_indices is None or i in stamped_indices):
                     snap = r["seed_data"].setdefault("snapshot", {})
                     snap["storefront_platform"] = "shopify"
                     snap["variants"] = [{
@@ -4483,6 +4486,67 @@ def test_the_resolve_emits_its_preflight_coverage(
         "not exist")
     assert hasattr(rec, "preflight_answered_fraction")
     assert getattr(rec, "preflight_mode") == "shadow"
+
+
+def _summary_record(caplog):
+    return next((r for r in caplog.records
+                 if getattr(r, "event", None) == "offers.resolve.summary"), None)
+
+
+def _resolve(client):
+    return client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                          "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+
+
+def test_a_referral_only_request_attaches_no_coverage(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """The POPULATION pin. `cart_prefilled` must be counted inside `if _cart_vid:`; hoisting it
+    out made every referral-only resolve (the majority, blind by design) report
+    answered_fraction=0.000 -- the round-1 defect -- and passed 140/140 because no test ever
+    built referral-only rows. `_preflight_harness(stamped=False)` existed for this and was
+    never used."""
+    import logging
+
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 3, "variants_per_row": 4}, stamped=False)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    with caplog.at_level(logging.INFO):
+        assert _resolve(client).status_code == 200
+    assert asked == [], "a referral-only row must never be asked about"
+    rec = _summary_record(caplog)
+    assert rec is not None
+    assert not any(k.startswith("preflight_") for k in vars(rec)), (
+        "the gate applied to nothing on this request; a coverage field here is a 0.000 that "
+        "someone will read as 'the gate covers nothing'")
+    assert rec.getMessage() == "offers.resolve.summary"
+
+
+def test_a_mixed_request_counts_only_cart_prefilled_rows_in_the_denominator(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """candidates counts every seed offer; cart_prefilled only the ones the gate applies to."""
+    import logging
+
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 4, "variants_per_row": 3},
+                               stamped_indices={0, 2})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "50")
+    with caplog.at_level(logging.INFO):
+        assert _resolve(client).status_code == 200
+    rec = _summary_record(caplog)
+    assert rec is not None and asked
+    assert rec.preflight_candidates == 12
+    assert rec.preflight_cart_prefilled == 6
+    assert rec.preflight_candidates > rec.preflight_cart_prefilled
+    assert rec.preflight_answered_fraction == 1.0
+    # and the values are in the MESSAGE, not only in `extra`, which no formatter here renders
+    msg = rec.getMessage()
+    assert "cart_prefilled=6" in msg and "answered_fraction=1.000" in msg and "mode=shadow" in msg
 
 
 def test_no_coverage_line_when_the_preflight_is_off(
