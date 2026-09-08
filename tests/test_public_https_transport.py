@@ -3,7 +3,11 @@ import asyncio
 import httpx
 import pytest
 
-from services.public_https_transport import PublicHTTPSTransport, _BoundedStream
+from services.public_https_transport import (
+    DEFAULT_TOTAL_TIMEOUT_SECONDS,
+    PublicHTTPSTransport,
+    _BoundedStream,
+)
 
 
 @pytest.mark.asyncio
@@ -48,7 +52,9 @@ async def test_response_size_bounded():
 @pytest.mark.asyncio
 async def test_robots_transport_context_is_scoped_and_reset(monkeypatch):
     from services import crawl_politeness as cp
-    from services.official_domain_liveness import probe_host_liveness
+    from services.official_domain_liveness import (
+        HTTP_TOTAL_TIMEOUT_SECONDS, probe_host_liveness,
+    )
     seen = []
 
     async def deny(*args, **kwargs):
@@ -57,8 +63,22 @@ async def test_robots_transport_context_is_scoped_and_reset(monkeypatch):
 
     monkeypatch.setattr(cp, 'before_request', deny)
     await probe_host_liveness('example.com', resolver=lambda _: True)
-    assert seen == [PublicHTTPSTransport]
     assert cp.ROBOTS_TRANSPORT_FACTORY.get() is None
+
+    # crawl_politeness calls the factory with NO arguments, so what has to be
+    # right is the transport it BUILDS — asserting the factory IS the class
+    # said nothing about the budget that transport would carry.
+    factory, = seen
+    transport = factory()
+    assert isinstance(transport, PublicHTTPSTransport)
+    # The robots.txt fetch happens FIRST and shares the probe's wall clock.
+    # Handed the bare class it took the transport's own 30s default while this
+    # caller had chosen 25s for the apex GET, so the robots hop alone could
+    # outlast the budget the whole probe is bounded by — and that budget is
+    # what stops one slow host starving the 100 domains behind it in a sweep.
+    assert transport.total_timeout == HTTP_TOTAL_TIMEOUT_SECONDS
+    # The two numbers must actually differ, or this test proves nothing.
+    assert HTTP_TOTAL_TIMEOUT_SECONDS != DEFAULT_TOTAL_TIMEOUT_SECONDS
 
 
 # ---------------------------------------------------------------------------

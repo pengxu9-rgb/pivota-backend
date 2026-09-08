@@ -45,6 +45,7 @@ oversized response is unverifiable; it never establishes that a domain is dead.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -253,7 +254,19 @@ async def probe_host_liveness(
         return classify_host_liveness(dns_resolved=dns_resolved, transport_error="dns_only_http_not_checked")
 
     url = f"https://{normalized}/"
-    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(PublicHTTPSTransport)
+    # THE CHAIN BUDGET HAS TO TRAVEL WITH THE FACTORY. crawl_politeness calls
+    # whatever this ContextVar holds with NO arguments, so handing it the bare
+    # class gave the robots.txt fetch PublicHTTPSTransport's own default
+    # (DEFAULT_TOTAL_TIMEOUT_SECONDS = 30s) while this caller had chosen 25s
+    # for the apex GET two statements below — the robots fetch, which happens
+    # FIRST, could outlast the budget the whole probe was bounded by. The
+    # sweep's per-domain deadline is what keeps a slow host from starving the
+    # 100 domains behind it, so the looser number is the one that decides.
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(
+        functools.partial(
+            PublicHTTPSTransport, total_timeout=HTTP_TOTAL_TIMEOUT_SECONDS
+        )
+    )
     try:
         await crawl_politeness.before_request(url, user_agent=USER_AGENT, max_wait=max_wait)
     except crawl_politeness.RobotsDisallowed:
