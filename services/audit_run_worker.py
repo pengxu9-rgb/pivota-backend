@@ -2060,9 +2060,22 @@ async def _lease_heartbeat(
             )
 
 
-# The evidence counters whose failures are SURVIVABLE here.
+# The counters that mean canonical rows DID NOT LAND — survivable here (the
+# run completes and is not refunded), but they must all reach
+# `evidence_persistence_degraded` so a degraded run is visible.
+#
+# `evidence_items_skipped_unidentified` counts rows dropped BEFORE the insert
+# because the producer gave them no `observation_id`. It is a skip, not an
+# insert failure, which is why it was not in this tuple — and that is exactly
+# the shape of bug this dial exists to catch: a transient insert error is one
+# row out of hundreds, while a producer that stops stamping observation ids
+# drops EVERY selection_response in the run, silently, with every "failed"
+# counter still reading 0 and `evidence_persistence_degraded` reading False.
+# The loud-failure counter has to count the systematic case, not only the
+# flaky one.
 _URL_EVIDENCE_FAILURE_KEYS = (
     "evidence_items_failed", "findings_failed", "actions_failed",
+    "evidence_items_skipped_unidentified",
 )
 
 

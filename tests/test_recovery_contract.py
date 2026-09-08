@@ -128,6 +128,7 @@ async def test_url_persistence_happy_path_runs_both_halves(monkeypatch):
 
 @pytest.mark.parametrize("counter", [
     "evidence_items_failed", "findings_failed", "actions_failed",
+    "evidence_items_skipped_unidentified",
 ])
 async def test_one_failed_evidence_insert_does_not_fail_and_refund_the_run(
     monkeypatch, counter,
@@ -587,3 +588,33 @@ def test_a_retained_categorical_change_on_a_stale_basis_is_not_a_movement():
     assert out["movements"][0]["direction"] == "unknown"
     assert out["movements"][0]["detection"]["verdict"] == "not_comparable"
     assert out["headline"].startswith("Not comparable to your last audit")
+
+
+async def test_a_producer_that_stamps_no_observation_ids_flips_the_degraded_dial(
+    monkeypatch,
+):
+    """The SYSTEMATIC case, which is the one this dial exists for.
+
+    `evidence_items_skipped_unidentified` counts rows dropped BEFORE the
+    insert because the producer gave them no `observation_id`. It is a skip,
+    not an insert failure, so it was not one of the counters
+    `_persist_url_recovery` summed — and a transient insert error loses one
+    row out of hundreds while a producer bug that stops stamping observation
+    ids loses EVERY selection_response in the run. The quiet failure read
+    `evidence_persistence_failed_total: 0`, `degraded: False`, and completed
+    with no selection evidence at all.
+    """
+    from services.audit_run_worker import _persist_url_recovery
+
+    _url_persistence_stubs(monkeypatch, canonical={
+        "evidence_items_inserted": 0,
+        "evidence_items_failed": 0,
+        "findings_failed": 0,
+        "actions_failed": 0,
+        "evidence_items_skipped_unidentified": 412,
+    })
+    canonical, _ = await _persist_url_recovery(
+        run_id="r", merchant_id="m", brand_report={})
+
+    assert canonical["evidence_persistence_failed_total"] == 412
+    assert canonical["evidence_persistence_degraded"] is True
