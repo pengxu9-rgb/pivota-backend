@@ -1133,7 +1133,10 @@ async def start_scheduler() -> None:
         # official_domains is a comparability field, so it moves attribution
         # and makes the next re-audit of every merchant non-comparable.
         # Arm it after a dry run has sized the seed.
-        from jobs.official_domain_liveness import run_official_domain_liveness_tick
+        from jobs.official_domain_liveness import (
+            liveness_job_enabled,
+            run_official_domain_liveness_tick,
+        )
         _add_job(
             run_official_domain_liveness_tick, "interval", hours=6,
             id="official_domain_liveness", replace_existing=True,
@@ -1231,6 +1234,21 @@ async def start_scheduler() -> None:
             "+ merchant_order_create_reconcile (15min, flag-gated "
             "MERCHANT_ORDER_CREATE_RECONCILE_ENABLED) "
             "+ identity_reconcile_sweep (Mon 04:30 UTC, flag-gated ENABLE_IDENTITY_RECONCILE_SWEEP) "
+            # RAW VALUE AND PARSED POSTURE, both, for the same reason the
+            # drain line below carries a resolved posture — and one more.
+            # `liveness_job_enabled` arms on the LITERAL string "true", so
+            # OFFICIAL_DOMAIN_LIVENESS_ENABLED=1 (or "yes", or "True " with a
+            # stray space, which does strip and lower fine, or "TRUE" which
+            # also arms) is an operator who believes they armed a job that is
+            # still parked. Printing only the posture hides the typo; printing
+            # only the raw value makes every reader re-derive the rule. The
+            # first prod run of this job seeds merchant_official_domains for
+            # every merchant in the catalog and makes each of their next
+            # re-audits non-comparable, so "did I actually arm it?" has to be
+            # answerable from the boot line alone.
+            "+ official_domain_liveness (6h, DORMANT unless "
+            "OFFICIAL_DOMAIN_LIVENESS_ENABLED is literally 'true' — raw %r, "
+            "resolved now as %s) "
             # Both listed so a mistyped kill switch is not indistinguishable from
             # a working one: the drain resolves its flag per-run and returns
             # {"reason": "disabled"} silently, so this line is the one place an
@@ -1238,6 +1256,8 @@ async def start_scheduler() -> None:
             "+ catalog_import_drain_tick (30s, ON by default; kill switch "
             "CATALOG_IMPORT_DRAIN_ENABLED=false — resolved now as %s) "
             "+ catalog_import_stale_reaper (5min, ACTIVE, not flag-gated)",
+            os.getenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED"),
+            "ON" if liveness_job_enabled() else "OFF",
             "ON" if _catalog_import_drain_enabled() else "OFF",
         )
     except Exception as exc:  # noqa: BLE001

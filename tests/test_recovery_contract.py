@@ -618,3 +618,92 @@ async def test_a_producer_that_stamps_no_observation_ids_flips_the_degraded_dial
 
     assert canonical["evidence_persistence_failed_total"] == 412
     assert canonical["evidence_persistence_degraded"] is True
+
+
+def _boot_posture_log_call():
+    """The `logger.info(...)` node that writes audit_scheduler's boot line.
+
+    Located in the syntax tree rather than by grepping for a sentence: the
+    claim is about a specific CALL — its format string and the arguments that
+    fill it — and both halves have to be checked together or a placeholder can
+    drift away from its value and raise at boot.
+    """
+    import ast
+
+    import services.audit_scheduler as sched
+
+    tree = ast.parse(inspect.getsource(sched))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "info"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value.startswith("audit_scheduler: started with")
+    ]
+    assert len(calls) == 1, "expected exactly one scheduler boot-posture line"
+    return calls[0]
+
+
+@pytest.mark.parametrize("raw,posture", [
+    # The value an operator most plausibly sets believing it arms the job.
+    ("1", "OFF"),
+    ("yes", "OFF"),
+    ("True", "ON"),
+    ("true", "ON"),
+    (None, "OFF"),
+])
+def test_the_boot_line_shows_the_liveness_flag_raw_and_resolved(
+    monkeypatch, raw, posture,
+):
+    """The boot line is the ONE place an operator can see what posture the
+    process actually booted with, and this job's first prod run seeds
+    merchant_official_domains for every merchant in the catalog. It named
+    catalog_import_drain's resolved posture and said nothing at all about
+    OFFICIAL_DOMAIN_LIVENESS_ENABLED, which arms on the literal "true" — so
+    `=1` was an operator who believed they had armed a job that was still
+    parked, with nothing in the logs to say otherwise.
+
+    Rendered, not grepped: the format string is filled with the real argument
+    expressions, so a placeholder that drifts away from its value fails here
+    instead of raising at boot.
+    """
+    import ast
+    import os as _os
+    import re
+
+    import jobs.official_domain_liveness as job
+
+    if raw is None:
+        monkeypatch.delenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED", raw)
+
+    call = _boot_posture_log_call()
+    fmt = call.args[0].value
+    assert "OFFICIAL_DOMAIN_LIVENESS_ENABLED" in fmt
+
+    namespace = {
+        "os": _os,
+        "liveness_job_enabled": job.liveness_job_enabled,
+        # Not this test's subject; pinned in its own line of the same log.
+        "_catalog_import_drain_enabled": lambda: True,
+    }
+    values = tuple(
+        eval(ast.unparse(arg), namespace) for arg in call.args[1:]  # noqa: S307
+    )
+    assert len(re.findall(r"%[rsd]", fmt)) == len(values), (
+        "the boot line's placeholders and arguments have drifted apart — "
+        "this raises at boot, in the one log line that says what posture the "
+        "process started in"
+    )
+
+    line = fmt % values
+    assert f"raw {raw!r}" in line
+    assert f"OFFICIAL_DOMAIN_LIVENESS_ENABLED is literally 'true' — raw " \
+           f"{raw!r}, resolved now as {posture}" in line
+    # The parsed posture must agree with the job's own gate, not with a
+    # second reading of the environment written into the log line.
+    assert (posture == "ON") is job.liveness_job_enabled()
