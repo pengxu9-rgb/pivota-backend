@@ -37,59 +37,78 @@ VID = "43062643884185"
 _SUPPRESSED = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 
 
+_SEEDS_DDL = """
+    CREATE TABLE IF NOT EXISTS external_product_seeds (
+      external_product_id text, attached_product_key text, status text, seed_data jsonb)
+"""
+
+#: external_product_seeds has no db/ model object, so it cannot come from create_all. Twelve
+#: earlier gate files leave it behind narrower than this (one leaves it as `(id text)`), and
+#: CREATE TABLE IF NOT EXISTS then silently inherits whatever shape is already there — so patch
+#: the columns we read rather than assume our CREATE ran.
+_SEEDS_COLUMNS = (
+    ("external_product_id", "text"),
+    ("attached_product_key", "text"),
+    ("status", "text"),
+    ("seed_data", "jsonb"),
+)
+
+#: The two-unique-constraint shape is the whole point of B1, and create_all builds it from the
+#: model only if the model declares it. Asserted rather than assumed below.
+_IDENTITY_INDEX = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_skus_source_identity_v2
+    ON catalog_skus (merchant_id, platform, product_key, source_variant_id)
+"""
+
+_TABLES = ("catalog_offers", "catalog_skus", "catalog_products",
+           "external_product_seeds", "writer_audit_log")
+
+
 async def _ddl(database):
-    """Only the columns this script touches. Mirrors the prod shape that matters: TWO unique
-    constraints on catalog_skus, which is the whole point of B1."""
-    await database.execute("DROP TABLE IF EXISTS catalog_offers")
-    await database.execute("DROP TABLE IF EXISTS catalog_skus")
-    await database.execute("DROP TABLE IF EXISTS catalog_products")
-    await database.execute("DROP TABLE IF EXISTS external_product_seeds")
-    await database.execute("DROP TABLE IF EXISTS writer_audit_log")
-    await database.execute("""
-        CREATE TABLE catalog_products (
-          product_key text PRIMARY KEY, merchant_id text, platform text,
-          source_product_id text, source_domain text, title text,
-          product_payload jsonb, suppressed_at timestamptz, suppression_reason text)
-    """)
-    await database.execute("""
-        CREATE TABLE external_product_seeds (
-          external_product_id text, attached_product_key text, status text, seed_data jsonb)
-    """)
-    await database.execute("""
-        CREATE TABLE catalog_skus (
-          sku_key text PRIMARY KEY, product_key text, merchant_id text, platform text,
-          source_product_id text, source_variant_id varchar(128), source_domain text,
-          sku varchar(128), barcode varchar(128), title text, currency varchar(16),
-          image_url text, suppressed_at timestamptz, suppression_reason text,
-          visible_attributes jsonb, visible_option_labels jsonb, ingredient_ids jsonb,
-          sku_payload jsonb, readiness_tier text, updated_at timestamptz)
-    """)
-    await database.execute("""
-        CREATE UNIQUE INDEX idx_catalog_skus_source_identity_v2
-        ON catalog_skus (merchant_id, platform, product_key, source_variant_id)
-    """)
-    await database.execute("""
-        CREATE TABLE catalog_offers (
-          offer_id text PRIMARY KEY, sku_key text, product_key text, merchant_id text,
-          catalog_track text, truth_tier text, readiness_tier text, offer_mode text,
-          channel text, currency varchar(16), list_price numeric,
-          merchant_effective_price numeric, estimated_best_price numeric,
-          source_system text, source_domain text, source_ref text,
-          -- Mirror prod's real constraints so a passing test cannot hide a failing INSERT:
-          -- market and availability are NOT NULL there, is_first_party NOT NULL DEFAULT
-          -- false, and the varchar lengths are the ones the writer must fit.
-          market varchar(8) NOT NULL,
-          availability varchar(32) NOT NULL,
-          is_first_party boolean NOT NULL DEFAULT false,
-          offer_type text, why_buy_direct text,
-          offer_payload jsonb, suppressed_at timestamptz,
-          created_at timestamptz, updated_at timestamptz)
-    """)
-    await database.execute("""
-        CREATE TABLE writer_audit_log (
-          id serial PRIMARY KEY, writer_name text, batch_id text, dry_run_report_hash text,
-          applied_rows int, skipped_rows int, reasons jsonb, actor text)
-    """)
+    """Build the tables from the REAL db/ models, and never drop a shared one.
+
+    An earlier version of this fixture hand-wrote cut-down CREATE TABLEs and DROPPED the
+    shared ones. Both halves were wrong. The hand-written DDL declared `market` and
+    `availability` nullable when prod has them NOT NULL, so a passing test could have hidden a
+    failing INSERT; and the drops destroyed schema the next gate file needed —
+    test_connection_layer_postgres died on catalog_products.catalog_track, a column this
+    fixture has no reason to know about. The dialect gate runs every tests/test_*_postgres.py
+    against ONE database, so a fixture must patch or own its tables and must never assume its
+    own CREATE was the one that ran.
+
+    ensure_model_tables gives production's exact DDL — every NOT NULL, every default — and
+    patches an already-created narrow table column by column, derived from table.columns
+    rather than a hardcoded ALTER list.
+    """
+    from db.catalog import (
+        catalog_offers, catalog_products, catalog_skus, writer_audit_log,
+    )
+    from tests.model_schema import ensure_model_tables
+
+    await ensure_model_tables(
+        [catalog_products, catalog_skus, catalog_offers, writer_audit_log]
+    )
+    await database.execute(_SEEDS_DDL)
+    for name, coltype in _SEEDS_COLUMNS:
+        await database.execute(
+            f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {coltype}"
+        )
+    await database.execute(_IDENTITY_INDEX)
+
+
+async def _clear(database):
+    """Remove this fixture's ROWS. Never its tables — see _ddl."""
+    await database.execute(
+        "DELETE FROM catalog_offers WHERE product_key = :pk OR source_system = :ss",
+        {"pk": PK, "ss": "variant_identity_backfill_v1"},
+    )
+    await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": PK})
+    await database.execute(
+        "DELETE FROM external_product_seeds WHERE external_product_id = :e", {"e": SPID}
+    )
+    await database.execute("DELETE FROM writer_audit_log WHERE writer_name = :w",
+                           {"w": "backfill_variant_identity_skus"})
 
 
 async def _seed(database, *, variants, offers, suppressed=None):
@@ -131,41 +150,30 @@ def _variant(**kw):
     return v
 
 
-_SHARED_TABLES = (
-    "catalog_offers", "catalog_skus", "catalog_products",
-    "external_product_seeds", "writer_audit_log",
-)
-
-
-async def _drop_all(database):
-    for t in _SHARED_TABLES:
-        await database.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
-
-
 @pytest.fixture
 async def db():
-    """LEAVE THE SHARED DATABASE AS WE FOUND IT.
-
-    The dialect gate runs every tests/test_*_postgres.py against ONE Postgres, so a fixture
-    that creates cut-down tables and leaves them behind hands the next file a stunted schema.
-    This one did exactly that and broke `test_connection_layer_postgres.py`, whose INSERT
-    needs catalog_products.catalog_track — a column this fixture has no reason to declare.
-    Three review passes missed it because they ran this file alone; only the gate runs it
-    alongside the others.
-
-    Dropping on the way out is the precedent (test_external_seed_destination_liveness_postgres
-    does the same), and it is the right shape: the next file creates what it needs rather than
-    inheriting whatever the last one happened to declare.
-    """
     from db.database import database
-    await database.connect()
-    await _drop_all(database)
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
     await _ddl(database)
+    await _clear(database)
     try:
         yield database
     finally:
-        await _drop_all(database)
-        await database.disconnect()
+        await _clear(database)
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+async def test_the_identity_index_the_conflict_target_needs_actually_exists(db):
+    """B1 rests on catalog_skus carrying TWO unique constraints. If create_all ever stops
+    building the identity index, every adoption test would still pass by inserting a fresh
+    row and the conflict path would go untested."""
+    n = await db.fetch_val(
+        "SELECT count(*) FROM pg_indexes WHERE tablename='catalog_skus' "
+        "AND indexname='idx_catalog_skus_source_identity_v2'")
+    assert n == 1
 
 
 async def _run(**kw):
@@ -268,7 +276,7 @@ async def test_a_suppressed_product_and_an_all_suppressed_offer_set_are_left_alo
     await _seed(db, variants=[_variant()], offers=[{}], suppressed=_SUPPRESSED)
     assert (await _run())["skus"] == 0
 
-    await _ddl(db)
+    await _clear(db)   # rows, not tables — _ddl no longer drops anything
     await _seed(db, variants=[_variant()],
                 offers=[{"suppressed_at": _SUPPRESSED}])
     report = await _run()
