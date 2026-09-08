@@ -287,25 +287,84 @@ def _basis_id(basis: Mapping[str, Any]) -> Optional[str]:
     )
 
 
+def _basis_rows(container: Any) -> List[Mapping[str, Any]]:
+    """The per-product report rows of one container, in BOTH shapes they
+    arrive in: `per_product` (the legacy `build_structured_report` lane) and
+    `per_sku_reports` (the per-SKU wedge). Ordered as `_primary_report` reads
+    them, so "the first row" means the same thing on both sides."""
+    if not isinstance(container, Mapping):
+        return []
+    rows = container.get("per_product")
+    if not isinstance(rows, list):
+        rows = container.get("per_sku_reports")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, Mapping)]
+
+
+def prompt_basis_blocks(
+    full_report: Optional[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    """Every `prompt_basis` block a report carries, in ONE precedence.
+
+    THE WRITER AND THE READER SHARE THIS LIST, and that is the whole point.
+    `audit_evidence_builder._prompt_basis_blocks` (which records the run's
+    pinned set ids into the immutable basis row) had its own ordering: it took
+    per-product ROWS first from both containers, then container roots. This
+    reader took the PRIMARY report's own block first — and on a report
+    carrying a root `prompt_basis` beside a nested
+    `brand_report.per_sku_reports`, `_primary_report` returns the report
+    itself, so the writer recorded the nested row's id while the delta
+    resolved the root's. Two runs of that shape then compared a recorded id
+    against a resolved one and disagreed about whether they were the same
+    measurement.
+
+    Order:
+      1. the PRIMARY report's block — the first per_product/per_sku row when
+         the top-level report carries rows, else the report itself;
+      2. the remaining rows, top-level container then nested `brand_report`;
+      3. the container roots, last.
+
+    Deduplicated by identity, so the primary row is not visited twice.
+    """
+    report = full_report if isinstance(full_report, Mapping) else {}
+    ordered: List[Mapping[str, Any]] = []
+
+    def _add(candidate: Any) -> None:
+        if isinstance(candidate, Mapping) and not any(
+            candidate is block for block in ordered
+        ):
+            ordered.append(candidate)
+
+    containers: List[Mapping[str, Any]] = [report]
+    nested = report.get("brand_report")
+    if isinstance(nested, Mapping):
+        containers.append(nested)
+
+    top_rows = _basis_rows(report)
+    _add((top_rows[0] if top_rows else report).get("prompt_basis"))
+    for container in containers:
+        for row in _basis_rows(container):
+            _add(row.get("prompt_basis"))
+    for container in containers:
+        _add(container.get("prompt_basis"))
+    return ordered
+
+
 def _prompt_set_id(
     full_report: Optional[Mapping[str, Any]],
-    primary: Mapping[str, Any],
+    primary: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """The pinned basis identity for a report, tolerant of both shapes: the
-    per-product/primary report carrying `prompt_basis` directly, or the full
-    payload carrying it under brand_report.per_sku_reports[0]. Prefers the
-    W2.1 selected-set identity over the W2 LLM-list identity."""
-    from_primary = _basis_id(primary.get("prompt_basis"))
-    if from_primary:
-        return from_primary
-    report = full_report if isinstance(full_report, Mapping) else {}
-    brand = report.get("brand_report")
-    if isinstance(brand, Mapping):
-        report = brand
-    for sku_report in report.get("per_sku_reports") or []:
-        if not isinstance(sku_report, Mapping):
-            continue
-        basis_id = _basis_id(sku_report.get("prompt_basis"))
+    """The pinned basis identity for a report, tolerant of every shape
+    `prompt_basis_blocks` walks. Prefers the W2.1 selected-set identity over
+    the W2 LLM-list identity, and takes the first block that carries either.
+
+    `primary` is accepted and ignored: callers used to pass
+    `_primary_report(report)` alongside, and `prompt_basis_blocks` now derives
+    it from the report itself so the writer can share the same precedence
+    without also reproducing `_primary_report`."""
+    for basis in prompt_basis_blocks(full_report):
+        basis_id = _basis_id(basis)
         if basis_id:
             return basis_id
     return None

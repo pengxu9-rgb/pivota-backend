@@ -341,7 +341,18 @@ async def test_the_writer_records_the_set_id_the_reader_resolves(monkeypatch):
     `per_sku_reports` rows while `audit_delta._prompt_set_id` also accepts a
     root-level `prompt_basis` (the legacy build_structured_report shape) and
     `per_product` rows — so for those shapes the writer stored NULL ids for a
-    run whose id the delta could read straight off the same report."""
+    run whose id the delta could read straight off the same report.
+
+    THE ids ARE DISTINCT PER SHAPE, and the last two reports carry TWO blocks
+    each. The first cut of this test put the SAME id in every position, so it
+    could only catch a writer that found NOTHING — a writer that found the
+    WRONG block passed it. Both sides then had a precedence, they were written
+    independently, and they disagreed: on a report carrying a root
+    `prompt_basis` beside nested per-SKU rows the writer recorded the nested
+    id into an immutable basis row while the delta resolved the root's. Now
+    both come from `audit_delta.prompt_basis_blocks`, and a reversal in either
+    one moves the id the other reports.
+    """
     import services.audit_evidence_builder as eb
     import db.merchant_official_domains as mod
     from services.audit_delta import measurement_basis_between
@@ -351,23 +362,43 @@ async def test_the_writer_records_the_set_id_the_reader_resolves(monkeypatch):
 
     monkeypatch.setattr(mod, "list_official_domains", _domains)
 
+    def _block(set_id):
+        return {"prompt_basis": {"selected_set_id": set_id}}
+
     shapes = {
-        "root": {"prompt_basis": {"selected_set_id": "sel_root"}},
-        "per_product": {"per_product": [
-            {"prompt_basis": {"selected_set_id": "sel_root"}}]},
-        "per_sku_reports": {"per_sku_reports": [
-            {"prompt_basis": {"selected_set_id": "sel_root"}}]},
-        "nested": {"brand_report": {"per_sku_reports": [
-            {"prompt_basis": {"selected_set_id": "sel_root"}}]}},
+        # One block, one answer: the writer must find each shape at all.
+        "root": ({"prompt_basis": {"selected_set_id": "sel_root_only"}},
+                 "sel_root_only"),
+        "per_product": ({"per_product": [_block("sel_per_product")]},
+                        "sel_per_product"),
+        "per_sku_reports": ({"per_sku_reports": [_block("sel_per_sku")]},
+                            "sel_per_sku"),
+        "nested": ({"brand_report": {"per_sku_reports": [_block("sel_nested")]}},
+                   "sel_nested"),
+        # TWO blocks, one answer. The primary report is the report ITSELF
+        # (it carries no rows of its own), so its root block wins over the
+        # rows hanging off the nested brand_report.
+        "root_beside_nested_rows": (
+            {"prompt_basis": {"selected_set_id": "sel_the_root"},
+             "brand_report": {"per_sku_reports": [_block("sel_a_nested_row")]}},
+            "sel_the_root",
+        ),
+        # ...and the other way round: when the top-level report DOES carry
+        # rows, the first row is the primary report and its block wins over
+        # the root block beside it.
+        "rows_beside_root": (
+            {"prompt_basis": {"selected_set_id": "sel_the_root"},
+             "per_sku_reports": [_block("sel_the_first_row")]},
+            "sel_the_first_row",
+        ),
     }
-    for name, report in shapes.items():
+    for name, (report, expected) in shapes.items():
         payload = await eb.record_audit_basis(
             audit_run_id="", brand_report=report, merchant_id="m1",
             persist=False,
         )
-        assert payload["selected_set_id"] == "sel_root", name
+        assert payload["selected_set_id"] == expected, name
         # ...and it is the SAME id the delta side resolves for that report.
-        if name != "nested":
-            assert measurement_basis_between(
-                report, report, payload, payload,
-            )["prompt_set_id"] == "sel_root", name
+        assert measurement_basis_between(
+            report, report, payload, payload,
+        )["prompt_set_id"] == expected, name

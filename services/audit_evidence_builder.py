@@ -1310,29 +1310,24 @@ def build_tier_mix(brand_report: Mapping[str, Any]) -> Dict[str, int]:
 def _prompt_basis_blocks(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     """Every place a run's `prompt_basis` block can live, in reading order.
 
-    THE READER'S TOLERANCE, MIRRORED. `audit_delta._prompt_set_id` accepts the
-    per-product/per-SKU row shape AND a report carrying `prompt_basis` at its
-    root (what the legacy `build_structured_report` lane produces), and it
-    reaches through a nested `brand_report`. This writer read only
-    `per_sku_reports` rows, so for every other shape it recorded NULL set ids
-    while the delta resolved a real id from the very same report — leaving the
-    recorded basis without the one field that says WHICH set was probed.
+    THE READER'S PRECEDENCE, NOT A MIRROR OF IT. This used to be a
+    hand-matched second implementation of `audit_delta._prompt_set_id`'s
+    tolerance, and hand-matched is exactly what it stopped being: it took
+    per-product ROWS first from both containers, while the reader takes the
+    PRIMARY report's own block first. On a report carrying a root
+    `prompt_basis` beside a nested `brand_report.per_sku_reports` — the shape
+    `_primary_report` resolves to the report ITSELF — this writer recorded the
+    nested row's id into the immutable basis row while the delta resolved the
+    root's, so two runs of that shape compared a recorded id against a
+    resolved one.
+
+    So there is now ONE ordering, and it lives on the reader's side:
+    `audit_delta.prompt_basis_blocks`. A precedence change there moves both
+    sides of the contract together, which is the only way this can stay true.
     """
-    blocks: List[Mapping[str, Any]] = []
-    containers = [brand_report]
-    nested = brand_report.get("brand_report")
-    if isinstance(nested, Mapping):
-        containers.append(nested)
-    for container in containers:
-        for row in _per_sku_reports(container):
-            basis = row.get("prompt_basis")
-            if isinstance(basis, Mapping):
-                blocks.append(basis)
-    for container in containers:
-        basis = container.get("prompt_basis")
-        if isinstance(basis, Mapping):
-            blocks.append(basis)
-    return blocks
+    from services.audit_delta import prompt_basis_blocks
+
+    return list(prompt_basis_blocks(brand_report))
 
 
 def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
