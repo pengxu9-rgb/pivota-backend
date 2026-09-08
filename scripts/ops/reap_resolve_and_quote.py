@@ -108,6 +108,8 @@ def main() -> int:
     print(f"reap price      : {resolved.price}")
     print(f"reap available  : {resolved.available}")
     print(f"price disagrees : {resolved.price_disagrees}")
+    print(f"asked-for avail : {resolved.chosen_available}   (the value WE ASKED FOR)")
+    print(f"resolved at     : {resolved.resolved_at}")
     if resolved.warnings:
         print(f"warnings        : {resolved.warnings}")
     if resolved.candidates:
@@ -120,10 +122,15 @@ def main() -> int:
             "search": "Reap's index did not yield this merchant's product. Not a code bug --\n"
                       "  either the merchant is not indexed, or their display name does not\n"
                       "  contain our domain's stem and needs a stored mapping.",
-            "options": "The product was found; our variant TITLE did not determine every option\n"
-                       "  axis. This is the refusal that protects us: defaulting here is what\n"
-                       "  would substitute the $95 Mini for the $140 Standard.",
+            "options": ("The product was found. Two different refusals live here:\n"
+                        "  value_unavailable_at_reap — the variant EXISTS and our row is right;\n"
+                        "    Reap will not sell that value today, and asking /variant for it\n"
+                        "    returns 200 with an available sibling. The referral link still\n"
+                        "    works and nothing about our row should be corrected.\n"
+                        "  axes_not_determined_by_title — our title did not pin every axis.\n"
+                        "    That one is ours to fix."),
             "details": "The product id resolved but details refused it. The code above is Reap's.",
+            "options": "See below.",
             "variant": "Reap returned 200 for a DIFFERENT variant than the one we asked for.\n"
                        "  This is the silent substitution: an unavailable option resolves to an\n"
                        "  available sibling with no warning. The reason line names what we asked\n"
@@ -142,6 +149,11 @@ def main() -> int:
     if resolved.available is False:
         print("\nNOTE: Reap marks this variant unavailable. One third-party observation about a\n"
               "variant the merchant's own storefront may still list. Not a delisting.")
+
+    print("\nNOTE: Reap's `prd_`/`var_` ids are minted PER SEARCH — five searches for one product\n"
+          "in a day returned five different product ids, each with its own variant set. They stay\n"
+          "quotable for hours, so they are durable handles, but they are not an identity. Do not\n"
+          "store one on a catalog row: resolve fresh, quote, discard.")
 
     if not args.quote:
         print("\nResolved only. Re-run with --quote to ask for a quote.")

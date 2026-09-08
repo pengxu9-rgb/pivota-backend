@@ -45,6 +45,13 @@ checked against the request every time -- `variant_matches_request` -- and a sub
 refusal. Same family as `defaultVariant` being availability-ordered, and the reason nothing in
 this module reads a status code as an answer.
 
+REAP'S IDS ARE SESSION HANDLES, NOT IDENTITY. Five searches for the same product on one day
+returned five different `prd_...` ids, each with its own `var_...` set. All stayed resolvable and
+quotable for hours, so they are durable enough to carry through a checkout -- but a stored
+(domain, product, title) -> `var_...` mapping is a session handle in a column that reads like a
+foreign key. Resolve fresh, quote, discard; `VariantResolution.resolved_at` says how old a handle
+is. This is the second time on this integration that an id looked more permanent than it was.
+
 FAIL CLOSED, EVERYWHERE. Every ambiguity in the join refuses instead of guessing: more than one
 candidate product, a merchant whose name we cannot tie to our domain, an option axis with no
 matching label, a details response that reports the product under `errors`. The cost of refusing
@@ -59,6 +66,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -152,14 +160,34 @@ def validate_base_url(raw: Optional[str] = None) -> str:
     return url
 
 
-def idempotency_key(scope: str, body: Dict[str, Any]) -> str:
-    """Deterministic in the request body, so a retry after a timeout cannot create a second quote.
+#: Reap retains an idempotency key for 24 h, but a quote's `expiresAt` is roughly 5 minutes. A
+#: key derived from the body ALONE therefore replays a long-dead quote to the same cart the next
+#: day -- the caller gets a 200 carrying an expired `expiresAt` and prices that may have moved.
+#: Bucketing the key by time keeps the property we actually want (a retry after a lost response
+#: does not mint a second quote) without the one we do not (a request tomorrow is not a retry).
+#: Four minutes, so a replayed key can only ever return a quote that is still inside its window.
+_IDEMPOTENCY_BUCKET_S = 240
 
-    Derived from the body rather than a fresh uuid because the dangerous retry is the one where
-    we never saw the response: a new key there asks Reap for a second quote for the same cart.
+
+def idempotency_key(
+    scope: str,
+    body: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+    bucket_seconds: int = _IDEMPOTENCY_BUCKET_S,
+) -> str:
+    """Deterministic in the request body AND in a coarse time bucket.
+
+    The retry this protects against is the one where we never saw the response: a fresh key there
+    would ask Reap for a second quote for the same cart, and the body-derived part handles that.
+    The bucket handles the opposite error, which the first version of this function had -- the
+    same cart tomorrow is not a retry, and replaying yesterday's key returns yesterday's quote,
+    already expired, with a 200 on it.
     """
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    return f"pivota-{scope}-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    bucket = int((now if now is not None else time.time()) // max(1, int(bucket_seconds)))
+    material = f"{canonical}|{bucket}"
+    return f"pivota-{scope}-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 def _headers(key: str, path: str, body: Dict[str, Any]) -> Dict[str, str]:
@@ -283,6 +311,15 @@ class OptionMatch:
     chosen: Dict[str, str] = field(default_factory=dict)
     reason: Optional[str] = None
     unmatched_axes: List[str] = field(default_factory=list)
+    #: Axis name -> `available` on the value we chose, read from `options[].values[]`.
+    #: Carried because the previous version's docstring CLAIMED availability was "reported, not
+    #: enforced" while nothing anywhere reported it -- the flag was read and dropped. A docstring
+    #: describing a behaviour the code does not have is worse than silence: it is a false claim
+    #: that survives review.
+    chosen_available: Dict[str, Optional[bool]] = field(default_factory=dict)
+    #: Axes whose chosen value Reap marks unavailable. Non-empty means `/variant` MUST NOT be
+    #: called: it will substitute an available sibling and answer 200.
+    unavailable_axes: List[str] = field(default_factory=list)
 
 
 def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> OptionMatch:
@@ -293,10 +330,16 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
     is precisely the mistake that made Reap's $95 Mini look like our $140 Standard. So an
     unmatched axis is a refusal, and the axis is named in the result.
 
-    Availability is REPORTED, not enforced. `available: false` on the chosen value means Reap
-    believes that size is unbuyable today; that is one third-party observation about a variant
-    the merchant's own storefront may still list, and it belongs in the caller's decision, not
-    in a silent substitution here.
+    AVAILABILITY IS NOW ACTUALLY REPORTED. The previous version of this docstring said it was
+    "reported, not enforced" -- and nothing reported it: `values[].available` was read past and
+    dropped, so a caller had no way to know the value it asked for was unbuyable. Worse, the
+    `available` a caller then saw came from the SUBSTITUTED variant, so an unavailable Standard
+    surfaced as an available Mini. Both the flag and the list of unavailable axes are carried out
+    of here now.
+
+    An unavailable axis is fatal to the `/variant` call, not merely informational: measured, Reap
+    answers 200 with an available sibling rather than the id we asked for, so the id we want does
+    not exist to be fetched. `resolve_our_row` refuses before making that call.
     """
     product = detail_product if isinstance(detail_product, dict) else {}
     options = product.get("options")
@@ -311,8 +354,10 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
         return OptionMatch(ok=False, reason="no_variant_title_supplied")
 
     chosen: Dict[str, str] = {}
+    chosen_available: Dict[str, Optional[bool]] = {}
     option_ids: List[str] = []
     unmatched: List[str] = []
+    unavailable: List[str] = []
     for axis in options:
         axis = axis if isinstance(axis, dict) else {}
         axis_name = str(axis.get("name") or "").strip() or "?"
@@ -335,13 +380,18 @@ def select_option_ids(detail_product: Any, wanted_labels: Sequence[str]) -> Opti
             return OptionMatch(ok=False, reason=f"value_has_no_option_id:{axis_name}")
         option_ids.append(option_id)
         chosen[axis_name] = str(hit.get("label"))
+        availability = hit.get("available")
+        chosen_available[axis_name] = availability if isinstance(availability, bool) else None
+        if availability is False:
+            unavailable.append(axis_name)
 
     if unmatched:
         return OptionMatch(
             ok=False, reason="axes_not_determined_by_title",
-            unmatched_axes=unmatched, chosen=chosen,
+            unmatched_axes=unmatched, chosen=chosen, chosen_available=chosen_available,
         )
-    return OptionMatch(ok=True, option_ids=option_ids, chosen=chosen)
+    return OptionMatch(ok=True, option_ids=option_ids, chosen=chosen,
+                       chosen_available=chosen_available, unavailable_axes=unavailable)
 
 
 def variant_matches_request(variant: Any, chosen: Dict[str, str]) -> Optional[str]:
@@ -659,8 +709,17 @@ class VariantResolution:
 
     ok: bool
     #: Reap's `var_...`. The ONLY value that may be sent as `items[].variantId`.
+    #:
+    #: DO NOT PERSIST THIS ON A CATALOG ROW. Measured 8 Sep: five searches for the same product
+    #: on the same day returned five different `prd_...` ids, each with its own `var_...` set.
+    #: All of them stay resolvable and quotable for hours, so they are durable HANDLES -- but
+    #: they are not an identity, and a stored (domain, product, title) -> `var_...` mapping is
+    #: storing a session handle in a column that reads like a foreign key. Resolve fresh, quote,
+    #: discard. `resolved_at` is here so a caller can see how old a handle is.
     variant_id: Optional[str] = None
     product_id: Optional[str] = None
+    #: Epoch seconds at which the ids above were minted by Reap.
+    resolved_at: Optional[float] = None
     #: Reap's price for the variant we resolved, as `(amount, currency)`.
     price: Optional[Tuple[float, str]] = None
     #: Reap's availability for that variant. False is an observation about Reap's index, NOT
@@ -671,6 +730,8 @@ class VariantResolution:
     #: a difference is as likely to be our staleness as theirs, and the caller owns that call.
     price_disagrees: bool = False
     matched_options: Dict[str, str] = field(default_factory=dict)
+    #: Axis -> Reap's `available` flag on the value WE ASKED FOR, not on whatever came back.
+    chosen_available: Dict[str, Optional[bool]] = field(default_factory=dict)
     #: Why we refused, in the vocabulary of the step that refused.
     reason: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
@@ -744,6 +805,7 @@ async def resolve_our_row(
         return VariantResolution(
             ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
             available=default.get("available"), single_variant_product=True,
+            resolved_at=time.time(),
             price_disagrees=_disagrees(price, our_price), warnings=found.warnings,
         )
 
@@ -755,6 +817,22 @@ async def resolve_our_row(
         return VariantResolution(
             ok=False, reason=f"options:{options.reason}",
             matched_options=options.chosen, warnings=found.warnings,
+        )
+
+    if options.unavailable_axes:
+        # Do not call `/variant`. Reap does not return the id of an unavailable value; it answers
+        # 200 with an available sibling, and the previous version took that answer, relabelled it
+        # from its own request, and reported the sibling's lower price as drift on our row.
+        #
+        # This is a DIFFERENT refusal from "we could not resolve it", and the distinction is
+        # commercially real: the variant exists and our row is right, Reap just will not sell it
+        # today. The referral link still works, and nothing about our row should be corrected.
+        axis = options.unavailable_axes[0]
+        return VariantResolution(
+            ok=False,
+            reason=f"options:value_unavailable_at_reap:{axis}:{options.chosen.get(axis)}",
+            matched_options=options.chosen, chosen_available=options.chosen_available,
+            available=False, warnings=found.warnings,
         )
 
     resolved = await resolve_variant(
@@ -778,13 +856,17 @@ async def resolve_our_row(
     mismatch = variant_matches_request(variant, options.chosen)
     if mismatch:
         return VariantResolution(ok=False, reason=f"variant:{mismatch}",
-                                 matched_options=options.chosen, warnings=found.warnings)
+                                 matched_options=options.chosen,
+                                 chosen_available=options.chosen_available,
+                                 warnings=found.warnings)
 
     price = _price_of(variant)
     return VariantResolution(
         ok=True, variant_id=variant_id, product_id=match.product_id, price=price,
         available=variant.get("available"), price_disagrees=_disagrees(price, our_price),
-        matched_options=options.chosen, warnings=found.warnings,
+        resolved_at=time.time(),
+        matched_options=options.chosen, chosen_available=options.chosen_available,
+        warnings=found.warnings,
     )
 
 

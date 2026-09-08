@@ -93,6 +93,13 @@ FENTY_DETAILS = {
     "errors": [],
 }
 
+# The same product with Standard AVAILABLE. Needed because the real fixture above now stops at
+# `select_option_ids` -- Reap marks Standard unavailable, and calling /variant for an unavailable
+# value is what produces the substitution. The guards that live AFTER that call still have to be
+# exercised, so they get a product Reap would actually resolve.
+FENTY_DETAILS_STANDARD_AVAILABLE = json.loads(json.dumps(FENTY_DETAILS))
+FENTY_DETAILS_STANDARD_AVAILABLE["products"][0]["options"][0]["values"][0]["available"] = True
+
 STANDARD_VARIANT = {
     "id": "var_standard140", "name": "Standard",
     "options": [{"name": "Size", "value": "Standard"}],
@@ -258,7 +265,7 @@ def test_a_resolved_id_from_the_wrong_namespace_refuses(monkeypatch):
         if path.endswith("/search"):
             return rc.ReapResponse(ok=True, status=200, data=FENTY_SEARCH)
         if path.endswith("/details"):
-            return rc.ReapResponse(ok=True, status=200, data=FENTY_DETAILS)
+            return rc.ReapResponse(ok=True, status=200, data=FENTY_DETAILS_STANDARD_AVAILABLE)
         return rc.ReapResponse(ok=True, status=200, data={"id": "41669483823149"})
     monkeypatch.setattr(rc, "_post", fake)
     got = _run(rc.resolve_our_row(merchant_domain="fentybeauty.com",
@@ -392,7 +399,11 @@ def test_a_quote_carries_an_idempotency_key_and_a_search_does_not(wire):
     assert "Idempotency-Key" not in wire.calls[1]["headers"]
 
 
-def test_the_idempotency_key_is_stable_for_the_same_cart(wire):
+def test_the_idempotency_key_is_stable_for_the_same_cart(wire, monkeypatch):
+    # Time is frozen rather than left to the wall clock: the key is bucketed by time, so two real
+    # calls that straddle a bucket boundary would fail this test roughly once in every few
+    # thousand runs. A rare flake in a test about retries is worse than no test.
+    monkeypatch.setattr(rc.time, "time", lambda: 1_000_000.0)
     for _ in range(2):
         _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}], email="b@example.com"))
     assert wire.calls[0]["headers"]["Idempotency-Key"] == wire.calls[1]["headers"]["Idempotency-Key"]
@@ -476,7 +487,7 @@ def _chain(monkeypatch, *, variant=None, details=None, search=None):
 
 
 def test_the_chain_resolves_our_standard_row_to_reaps_standard_variant(monkeypatch):
-    fake = _chain(monkeypatch)
+    fake = _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE)
     got = _run(rc.resolve_our_row(
         merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
         variant_title="Standard", our_price=140.00,
@@ -485,6 +496,8 @@ def test_the_chain_resolves_our_standard_row_to_reaps_standard_variant(monkeypat
     assert got.variant_id == "var_standard140"
     assert got.price == (140.0, "USD")
     assert got.matched_options == {"Size": "Standard"}
+    assert got.chosen_available == {"Size": True}
+    assert got.resolved_at is not None
     # It asked for the option we matched, not for a default.
     assert fake.variant_body == {"productId": "prd_dfe0ceb2123640d496edcd7c21b94c0b",
                                  "optionIds": ["opt_standard"]}
@@ -494,17 +507,19 @@ def test_our_140_row_does_not_disagree_with_reaps_140_standard(monkeypatch):
     """The whole point of the rebuild's mapping rule. Naively comparing our row to what Reap
     SHOWS (`previewVariant` $95.00, availability-ordered) reads as 32% staleness on a row that is
     correct. Resolving the variant first makes the prices agree to the cent."""
-    _chain(monkeypatch)
+    _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE)
     got = _run(rc.resolve_our_row(
         merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
         variant_title="Standard", our_price=140.00,
     ))
     assert got.ok and got.price_disagrees is False
-    assert got.available is False  # Reap's view of that size. An observation, not a delisting.
+    # `available` is Reap's view of the variant WE ASKED FOR, taken from the response to a
+    # request we verified — not from whatever came back.
+    assert got.available is False
 
 
 def test_a_genuine_price_disagreement_is_reported_and_not_acted_on(monkeypatch):
-    _chain(monkeypatch)
+    _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE)
     got = _run(rc.resolve_our_row(
         merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
         variant_title="Standard", our_price=99.00,
@@ -567,7 +582,7 @@ def test_a_substituted_variant_is_refused_even_though_reap_returned_200(monkeypa
     """We ask for Standard ($140, unavailable). Reap answers 200 with Mini ($95). Trusting the
     status quotes the buyer a different physical object at a 32% lower price, with a clean
     success in hand and nothing in the response saying otherwise."""
-    _chain(monkeypatch, variant=MINI_SUBSTITUTED)
+    _chain(monkeypatch, variant=MINI_SUBSTITUTED, details=FENTY_DETAILS_STANDARD_AVAILABLE)
     got = _run(rc.resolve_our_row(
         merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
         variant_title="Standard", our_price=140.00,
@@ -772,3 +787,117 @@ def test_amounts_are_read_as_major_units_not_minor():
 def test_a_boolean_is_not_accepted_as_an_amount():
     """`isinstance(True, int)` is True in Python, so a bool would otherwise become 1.0."""
     assert rc._price_of({"price": {"amount": True, "currency": "USD"}}) is None
+
+
+# --- the unavailable option: refuse BEFORE /variant, and say why -------------------------------
+#
+# The real Fenty row. Reap marks Size=Standard `available: false`, and asking `/variant` for it
+# returns 200 with the Mini sibling. So the id we want cannot be fetched at all, and the correct
+# move is to stop before the call rather than to inspect what comes back.
+
+def test_an_unavailable_chosen_value_refuses_without_calling_variant(monkeypatch):
+    fake = _chain(monkeypatch)   # FENTY_DETAILS: Standard available=False, as measured
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard", our_price=140.00,
+    ))
+    assert not got.ok
+    assert got.reason == "options:value_unavailable_at_reap:Size:Standard"
+    assert fake.variant_body is None       # never asked — Reap would have substituted
+    assert got.variant_id is None
+
+
+def test_the_unavailable_refusal_is_distinguishable_from_a_failure_to_resolve(monkeypatch):
+    """Commercially these are different facts. "Reap will not sell this today" leaves our row
+    correct and the referral link working; "we could not match it" is our problem to fix. A
+    single generic refusal would collapse them and invite someone to 'correct' a right row."""
+    _chain(monkeypatch)
+    unavailable = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard"))
+    unmatchable = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="100ml"))
+    assert unavailable.reason.startswith("options:value_unavailable_at_reap")
+    assert unmatchable.reason == "options:axes_not_determined_by_title"
+    assert unavailable.available is False
+
+
+def test_the_availability_of_the_value_we_asked_for_is_carried_out(monkeypatch):
+    """The previous version's docstring claimed availability was "reported, not enforced" while
+    nothing reported it: the flag was read and dropped, and the `available` a caller saw came
+    from the SUBSTITUTED variant. An unavailable Standard surfaced as an available Mini."""
+    _chain(monkeypatch)
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard"))
+    assert got.chosen_available == {"Size": False}
+
+
+def test_select_option_ids_reports_availability_per_axis():
+    got = rc.select_option_ids(FENTY_DETAILS["products"][0], ["Standard"])
+    assert got.ok
+    assert got.chosen_available == {"Size": False}
+    assert got.unavailable_axes == ["Size"]
+
+
+def test_an_available_value_is_not_flagged():
+    got = rc.select_option_ids(FENTY_DETAILS["products"][0], ["Mini"])
+    assert got.ok and got.unavailable_axes == [] and got.chosen_available == {"Size": True}
+
+
+def test_a_value_with_no_availability_flag_is_not_treated_as_unavailable():
+    """Absent is not False. `available` is optional in the schema, and defaulting a missing flag
+    to unavailable would refuse every product that omits it."""
+    product = json.loads(json.dumps(FENTY_DETAILS["products"][0]))
+    product["options"][0]["values"][0].pop("available")
+    got = rc.select_option_ids(product, ["Standard"])
+    assert got.ok and got.unavailable_axes == [] and got.chosen_available == {"Size": None}
+
+
+# --- Reap's ids are session handles, not identity ------------------------------------------------
+
+def test_a_resolution_is_stamped_with_when_it_was_minted(monkeypatch):
+    """Five searches for the same product on one day returned five different `prd_...` ids, each
+    with its own `var_...` set. They stay quotable for hours, so they are durable handles — but
+    they are not an identity, and anything that stores one on a catalog row is storing a session
+    handle in a column that reads like a foreign key. The timestamp is what lets a caller see how
+    old a handle is."""
+    import time as _time
+    _chain(monkeypatch, details=FENTY_DETAILS_STANDARD_AVAILABLE)
+    before = _time.time()
+    got = _run(rc.resolve_our_row(
+        merchant_domain="fentybeauty.com", product_name="Fenty Eau de Parfum",
+        variant_title="Standard"))
+    assert got.ok and before <= got.resolved_at <= _time.time()
+
+
+# --- the idempotency key must not replay an EXPIRED quote -------------------------------------
+
+def test_a_retry_seconds_later_replays_the_same_quote():
+    """The property we want: a retry after a lost response must not mint a second quote."""
+    body = {"items": [{"variantId": "var_x", "quantity": 1}], "email": "b@example.com"}
+    assert rc.idempotency_key("quotes", body, now=1_000_000.0) == \
+           rc.idempotency_key("quotes", body, now=1_000_010.0)
+
+
+def test_the_same_cart_tomorrow_is_not_treated_as_a_retry():
+    """Reap retains a key for 24 h; a quote's `expiresAt` is about 5 minutes. A key derived from
+    the body ALONE replays a long-dead quote — the caller gets a 200 carrying an expired
+    `expiresAt` and prices that may have moved. This is the failure the first version had."""
+    body = {"items": [{"variantId": "var_x", "quantity": 1}], "email": "b@example.com"}
+    day = 24 * 60 * 60
+    assert rc.idempotency_key("quotes", body, now=1_000_000.0) != \
+           rc.idempotency_key("quotes", body, now=1_000_000.0 + day)
+
+
+def test_the_bucket_is_shorter_than_a_quotes_lifetime():
+    """A replayed key must only ever be able to return a quote still inside its ~5 minute
+    window, so the bucket has to be shorter than that — not merely shorter than 24 h."""
+    assert 0 < rc._IDEMPOTENCY_BUCKET_S < 300
+
+
+def test_different_carts_never_share_a_key():
+    a = {"items": [{"variantId": "var_x", "quantity": 1}], "email": "b@example.com"}
+    b = {"items": [{"variantId": "var_x", "quantity": 2}], "email": "b@example.com"}
+    assert rc.idempotency_key("quotes", a, now=1.0) != rc.idempotency_key("quotes", b, now=1.0)
