@@ -587,7 +587,7 @@ _DEAD_COMPONENT_SAMPLE_SQL = _DEAD_COMPONENT_CTE + """
 # 2026-09-08 and each with a writer-side fix landing in the same change:
 #
 #   offers_without_sku                         647 live  (writers now mint/refuse)
-#   duplicate_offers_per_sku_channel_market  1,636 rows  (reconciler + partial index)
+#   duplicate_offers_per_sku_channel_market  1,636 rows  (reconciler; no index — see below)
 #   suppressed_product_with_live_offer       2,171 rows  (cascade at the writers)
 #
 # ALL THREE ARE SCOPED TO LIVE OFFERS, and that is a decision rather than an
@@ -1636,12 +1636,19 @@ _CHECKS: List[Dict[str, Any]] = [
         # That is a silently wrong PRICE, not a duplicate row: the two rows do
         # not have to agree, and nothing makes them.
         #
-        # THE INDEX THAT WOULD MAKE THIS UNREACHABLE IS NOT IN THIS CHANGE, on
-        # purpose. A migration creating it would run at deploy against a database
-        # that still has the 1,636 and take the deploy down with it. The order is
-        # scripts/reconcile_catalog_offers.py --apply, then the same script's
-        # --create-unique-index, then a migration. Until the index is on prod
-        # this check is the only thing watching the tuple.
+        # A UNIQUE INDEX ON THE TUPLE IS UNBUILDABLE TODAY, and this check is the
+        # standing alarm precisely because of that. Every INSERT INTO
+        # catalog_offers in the repo arbitrates on `(offer_id)` alone, and the
+        # mirror, the US-market capture and the retailer attach write THE SAME
+        # SHELF under three different offer_id namespaces — which is what the 462
+        # groups are. With a unique index in place the second lane's ON CONFLICT
+        # (offer_id) would not fire and its INSERT would raise 23505 mid-batch
+        # (reproduced on real Postgres), so the index cannot land until those
+        # lanes converge on one offer_id namespace per shelf. That convergence is
+        # a change to the WRITERS, not something a reconciler can reach by
+        # draining rows. Threshold 0 here gives the same signal the index would
+        # — red the moment two lanes claim one shelf — without the failure mode.
+        # scripts/reconcile_catalog_offers.py drains the standing stock.
         "name": "duplicate_offers_per_sku_channel_market",
         "description": (
             "more than one LIVE offer on the same (sku_key, channel, market) — "

@@ -3,16 +3,23 @@
 WHY THIS FILE IS A POSTGRES GATE AND NOT A SQLITE SUITE. Every semantic that
 matters here is Postgres-only:
 
-  * `row_number() OVER (... ORDER BY updated_at DESC NULLS LAST, offer_id)` —
-    the keeper election. `NULLS LAST` is not SQLite's default ordering, so a
-    SQLite twin would pin a different winner than the one that ships.
+  * `row_number() OVER (PARTITION BY ... ORDER BY updated_at DESC, offer_id)` —
+    the keeper election. A window function, and the row it elects is the whole
+    point of the pass.
   * `RETURNING offer_id` from an UPDATE — the only way this repo can count rows
     it changed (`databases` + asyncpg returns NO rowcount from `execute()`;
     SQLite does, which is how a caller comes to believe it has one).
-  * `CREATE UNIQUE INDEX CONCURRENTLY ... WHERE suppressed_at IS NULL` — a
-    partial index, and one Postgres refuses to build inside a transaction.
+  * `NOT (offer_id = ANY(:excluded))` with an array bind, inside the statement
+    and therefore before the LIMIT.
   * `jsonb || jsonb` for the batch stamp, and `->>` to read it back in the
     revert.
+
+THERE IS NO UNIQUE-INDEX TEST HERE ANY MORE, because there is no
+`--create-unique-index`. The index is unbuildable until the mirror, capture and
+attach lanes stop writing one shelf under three offer_id namespaces — see the
+script's module docstring. `duplicate_offers_per_sku_channel_market` at threshold
+0 is the alarm in the meantime, and it is covered in
+tests/test_catalog_invariant_offer_checks_postgres.py.
 
 A string assertion about the SQL cannot tell a correct keeper election from a
 plausible-looking wrong one, and that is the defect this pass can actually have.
@@ -163,20 +170,11 @@ async def db():
         yield database
     finally:
         await _clear(database)
-        await database.execute(
-            f"DROP INDEX IF EXISTS {_index_name()}"
-        )
         if not was_connected and database.is_connected:
             await database.disconnect()
 
 
 PASSES_ALL = ("orphans", "duplicates", "cascade")
-
-
-def _index_name():
-    from scripts.reconcile_catalog_offers import UNIQUE_INDEX_NAME
-
-    return UNIQUE_INDEX_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +192,7 @@ async def test_orphan_pass_suppresses_offers_whose_sku_does_not_exist(db):
     await _offer(db, "o:healthy", sku_key=SKU_LIVE, product_key=PK_LIVE,
                  channel="native")
 
-    report = await run(apply=True, limit=0, passes=("orphans",),
-                       create_index=False)
+    report = await run(apply=True, limit=0, passes=("orphans",))
 
     assert report["orphans"]["found"] == 1
     assert report["orphans"]["suppressed"] == 1
@@ -213,8 +210,7 @@ async def test_dry_run_changes_nothing_and_still_reports_the_finding(db):
     await _product(db, PK_LIVE)
     await _offer(db, "o:orphan", sku_key=SKU_ORPHAN, product_key=PK_LIVE)
 
-    report = await run(apply=False, limit=0, passes=("orphans",),
-                       create_index=False)
+    report = await run(apply=False, limit=0, passes=("orphans",))
 
     assert report["orphans"]["found"] == 1
     assert report["orphans"]["suppressed"] == 0
@@ -244,8 +240,7 @@ async def test_duplicate_pass_keeps_the_newest_updated_at(db):
     await _offer(db, "o:fresh", sku_key=SKU_LIVE, product_key=PK_LIVE,
                  updated_at=_AT(2026, 9, 1))
 
-    report = await run(apply=True, limit=0, passes=("duplicates",),
-                       create_index=False)
+    report = await run(apply=True, limit=0, passes=("duplicates",))
 
     assert report["duplicates"]["excess_rows_found"] == 1
     assert report["duplicates"]["groups_found"] == 1
@@ -271,7 +266,7 @@ async def test_duplicate_tie_on_updated_at_keeps_the_lowest_offer_id(db):
         await _offer(db, oid, sku_key=SKU_LIVE, product_key=PK_LIVE,
                      updated_at=_AT(2026, 5, 5, 12))
 
-    await run(apply=True, limit=0, passes=("duplicates",), create_index=False)
+    await run(apply=True, limit=0, passes=("duplicates",))
 
     assert (await _state(db, "o:aaa"))["suppressed_at"] is None
     for oid in ("o:mmm", "o:zzz"):
@@ -293,8 +288,7 @@ async def test_channel_and_market_separate_shelves_not_duplicates(db):
     await _offer(db, "o:native", sku_key=SKU_LIVE, product_key=PK_LIVE,
                  channel="native")
 
-    report = await run(apply=True, limit=0, passes=("duplicates",),
-                       create_index=False)
+    report = await run(apply=True, limit=0, passes=("duplicates",))
 
     assert report["duplicates"]["excess_rows_found"] == 0
     for oid in ("o:us", "o:gb", "o:native"):
@@ -313,8 +307,7 @@ async def test_an_already_suppressed_row_is_not_a_duplicate(db):
     await _offer(db, "o:gone", sku_key=SKU_LIVE, product_key=PK_LIVE,
                  suppressed=True)
 
-    report = await run(apply=True, limit=0, passes=("duplicates",),
-                       create_index=False)
+    report = await run(apply=True, limit=0, passes=("duplicates",))
 
     assert report["duplicates"]["excess_rows_found"] == 0
     assert (await _state(db, "o:keep"))["suppressed_at"] is None
@@ -333,8 +326,7 @@ async def test_cascade_pass_gates_offers_of_a_suppressed_product(db):
     await _offer(db, "o:on_dead", sku_key=SKU_DEAD, product_key=PK_DEAD)
     await _offer(db, "o:on_live", sku_key=SKU_LIVE, product_key=PK_LIVE)
 
-    report = await run(apply=True, limit=0, passes=("cascade",),
-                       create_index=False)
+    report = await run(apply=True, limit=0, passes=("cascade",))
 
     assert report["cascade"]["found"] == 1
     dead = await _state(db, "o:on_dead")
@@ -366,8 +358,7 @@ async def test_all_three_passes_in_one_run_and_the_audit_row(db):
     await _offer(db, "o:dead_b", sku_key=SKU_DEAD, product_key=PK_DEAD)
 
     report = await run(apply=True, limit=0,
-                       passes=("orphans", "duplicates", "cascade"),
-                       create_index=False)
+                       passes=("orphans", "duplicates", "cascade"))
 
     assert report["orphans"]["suppressed"] == 1
     assert report["cascade"]["suppressed"] == 2
@@ -415,8 +406,8 @@ async def test_the_plan_equals_the_run_when_the_passes_overlap(db):
     await _offer(db, "o:on_dead", sku_key=SKU_LIVE, product_key=PK_DEAD,
                  updated_at=_AT(2026, 9, 1))
 
-    plan = await run(apply=False, limit=0, passes=PASSES_ALL, create_index=False)
-    applied = await run(apply=True, limit=0, passes=PASSES_ALL, create_index=False)
+    plan = await run(apply=False, limit=0, passes=PASSES_ALL)
+    applied = await run(apply=True, limit=0, passes=PASSES_ALL)
 
     assert plan["duplicates"]["excess_rows_found"] == 1
     assert applied["duplicates"]["excess_rows_found"] == 1
@@ -429,6 +420,30 @@ async def test_the_plan_equals_the_run_when_the_passes_overlap(db):
     assert (await _state(db, "o:dup_b"))["suppressed_at"] is None
 
 
+async def test_a_merely_suppressed_sku_is_not_an_orphan(db):
+    """`orphan_no_sku` names a row whose sku_key has NO catalog_skus row at all.
+    An offer whose SKU exists but is suppressed is a different thing — nobody's
+    writer misbehaved, the identity was withdrawn — and labelling it
+    `orphan_no_sku` would send an operator hunting a writer bug that is not
+    there. Pins the mutant `AND s.suppressed_at IS NULL` inside the NOT EXISTS,
+    which otherwise survives every other test in this file.
+    """
+    from scripts.reconcile_catalog_offers import run
+
+    await _product(db, PK_LIVE)
+    await _sku(db, SKU_LIVE, PK_LIVE)
+    await db.execute(
+        "UPDATE catalog_skus SET suppressed_at = NOW(), suppression_reason = 'fixture' "
+        "WHERE sku_key = :sk", {"sk": SKU_LIVE},
+    )
+    await _offer(db, "o:on_suppressed_sku", sku_key=SKU_LIVE, product_key=PK_LIVE)
+
+    report = await run(apply=True, limit=0, passes=("orphans",))
+
+    assert report["orphans"]["found"] == 0
+    assert (await _state(db, "o:on_suppressed_sku"))["suppressed_at"] is None
+
+
 async def test_limit_caps_each_pass(db):
     from scripts.reconcile_catalog_offers import run
 
@@ -436,8 +451,7 @@ async def test_limit_caps_each_pass(db):
     for i in range(4):
         await _offer(db, f"o:orph{i}", sku_key=SKU_ORPHAN, product_key=PK_LIVE)
 
-    report = await run(apply=True, limit=2, passes=("orphans",),
-                       create_index=False)
+    report = await run(apply=True, limit=2, passes=("orphans",))
 
     assert report["orphans"]["found"] == 2
     assert report["orphans"]["suppressed"] == 2
@@ -448,6 +462,41 @@ async def test_limit_caps_each_pass(db):
     assert live == 2
 
 
+async def test_the_plan_equals_the_run_under_limit_when_the_passes_overlap(db):
+    """UNDER --limit THE EXCLUSION HAS TO BE INSIDE THE SQL, and this is the case
+    that proves it. Three offers on one SUPPRESSED product; two of them are also
+    orphans, and they sort first.
+
+    With the earlier passes' claims filtered in PYTHON — after Postgres has
+    already applied the LIMIT — the cascade pass's `LIMIT 2` returned the two
+    rows the orphan pass had just claimed, the filter dropped both, and the plan
+    reported `cascade.found: 0`. Under --apply those two already carried
+    `suppressed_at`, so the same LIMIT returned the THIRD row and one offer
+    moved. Measured: plan 0, apply 1 — a dry run that says "nothing to do" for a
+    run that acts.
+
+    The two existing protective tests cannot see this: one runs `limit=0` (no
+    LIMIT, so nothing is cut off) and the other a single pass (no earlier claims).
+    """
+    from scripts.reconcile_catalog_offers import run
+
+    await _product(db, PK_DEAD, suppressed=True)
+    await _sku(db, SKU_DEAD, PK_DEAD)
+    # Sorted by offer_id, the two orphans come first and eat the LIMIT.
+    await _offer(db, "o:a_orphan", sku_key=SKU_ORPHAN, product_key=PK_DEAD)
+    await _offer(db, "o:b_orphan", sku_key=SKU_ORPHAN, product_key=PK_DEAD)
+    await _offer(db, "o:c_cascade", sku_key=SKU_DEAD, product_key=PK_DEAD)
+
+    passes = ("orphans", "cascade")
+    plan = await run(apply=False, limit=2, passes=passes)
+    applied = await run(apply=True, limit=2, passes=passes)
+
+    assert plan["orphans"]["found"] == applied["orphans"]["found"] == 2
+    assert plan["cascade"]["found"] == applied["cascade"]["found"] == 1
+    assert plan["cascade"]["sample"] == applied["cascade"]["sample"] == ["o:c_cascade"]
+    assert applied["cascade"]["suppressed"] == 1
+
+
 async def test_revert_batch_restores_only_that_batch(db):
     from scripts.reconcile_catalog_offers import run
 
@@ -456,93 +505,13 @@ async def test_revert_batch_restores_only_that_batch(db):
     await _offer(db, "o:other", sku_key=SKU_ORPHAN, product_key=PK_LIVE,
                  suppressed=True)
 
-    first = await run(apply=True, limit=0, passes=("orphans",), create_index=False)
-    reverted = await run(apply=True, limit=0, passes=(), create_index=False,
-                         revert=first["batch_id"])
+    first = await run(apply=True, limit=0, passes=("orphans",))
+    reverted = await run(apply=True, limit=0, passes=(), revert=first["batch_id"])
 
     assert reverted["revert"]["restored"] == 1
     assert (await _state(db, "o:orphan"))["suppressed_at"] is None
     # The row someone else tombstoned keeps its gate.
     assert (await _state(db, "o:other"))["suppressed_at"] is not None
-
-
-# ---------------------------------------------------------------------------
-# the partial unique index
-# ---------------------------------------------------------------------------
-async def test_index_creation_refuses_while_a_live_duplicate_group_remains(db):
-    """The whole reason this is a script flag and not a migration: attempting the
-    build against duplicated data fails, and at deploy time it takes the deploy
-    with it."""
-    from scripts.reconcile_catalog_offers import run
-
-    await _product(db, PK_LIVE)
-    await _sku(db, SKU_LIVE, PK_LIVE)
-    await _offer(db, "o:a", sku_key=SKU_LIVE, product_key=PK_LIVE)
-    await _offer(db, "o:b", sku_key=SKU_LIVE, product_key=PK_LIVE)
-
-    report = await run(apply=True, limit=0, passes=(), create_index=True)
-
-    assert report["unique_index"]["attempted"] is False
-    assert report["unique_index"]["reason"] == "live_duplicate_groups_remain"
-    assert report["unique_index"]["live_duplicate_groups"] >= 1
-    exists = await db.fetch_val(
-        "SELECT count(*) FROM pg_indexes WHERE indexname = :n", {"n": _index_name()}
-    )
-    assert exists == 0
-
-
-async def test_index_is_built_after_dedupe_and_is_partial_on_live_rows(db):
-    """The index MUST be partial. Pass (b) suppresses rather than deletes, so the
-    losing rows stay in the table — a full-table unique index on
-    (sku_key, channel, market) could never be built on this data, not after one
-    run and not after any number of them. This test proves both halves: the build
-    succeeds WITH a suppressed duplicate still present, and the resulting index
-    then rejects a second LIVE row on the same shelf."""
-    import asyncpg
-    from scripts.reconcile_catalog_offers import run
-
-    await _product(db, PK_LIVE)
-    await _sku(db, SKU_LIVE, PK_LIVE)
-    await _offer(db, "o:a", sku_key=SKU_LIVE, product_key=PK_LIVE,
-                 updated_at=_AT(2026, 1, 1))
-    await _offer(db, "o:b", sku_key=SKU_LIVE, product_key=PK_LIVE,
-                 updated_at=_AT(2026, 9, 1))
-
-    report = await run(apply=True, limit=0, passes=("duplicates",),
-                       create_index=True)
-
-    assert report["duplicates"]["suppressed"] == 1
-    assert report["unique_index"]["attempted"] is True
-    # "created" is not the claim; ENFORCING is. A CONCURRENTLY build that lost a
-    # race leaves an INVALID index that constrains nothing and reports no error.
-    assert report["unique_index"]["enforcing"] is True
-
-    definition = await db.fetch_val(
-        "SELECT indexdef FROM pg_indexes WHERE indexname = :n", {"n": _index_name()}
-    )
-    assert "UNIQUE" in definition
-    assert "suppressed_at IS NULL" in definition
-
-    with pytest.raises(asyncpg.exceptions.UniqueViolationError):
-        await _offer(db, "o:c", sku_key=SKU_LIVE, product_key=PK_LIVE)
-
-
-async def test_dry_run_never_builds_the_index(db):
-    from scripts.reconcile_catalog_offers import run
-
-    await _product(db, PK_LIVE)
-    await _sku(db, SKU_LIVE, PK_LIVE)
-    await _offer(db, "o:a", sku_key=SKU_LIVE, product_key=PK_LIVE)
-
-    report = await run(apply=False, limit=0, passes=(), create_index=True)
-
-    assert report["unique_index"] == {
-        "attempted": False, "reason": "dry_run", "live_duplicate_groups": 0,
-    }
-    exists = await db.fetch_val(
-        "SELECT count(*) FROM pg_indexes WHERE indexname = :n", {"n": _index_name()}
-    )
-    assert exists == 0
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +557,54 @@ async def test_revert_helper_leaves_another_lanes_tombstone_alone(db):
     assert restored == ["o:ours"]
     assert (await _state(db, "o:theirs"))["suppressed_at"] is not None
     assert (await _state(db, "o:theirs"))["suppression_reason"] == "duplicate_offer"
+
+
+async def test_the_service_revert_leaves_the_reconcilers_cascade_rows_alone(db):
+    """THE TWO LANES WRITE THE SAME LABEL, ON PURPOSE, so the reason cannot tell
+    them apart and the lane stamp has to.
+
+    `reconcile_catalog_offers`'s cascade pass gates every offer of every
+    suppressed product, table-wide, under `product_suppressed`.
+    `services/catalog_offer_suppression` cascades under the same label at five
+    writers. Scoped on the reason alone, `remediate_unpublished_crawl_rows
+    --revert` — which calls `revert_offer_suppression` for one seed's products —
+    would un-gate whatever the RECONCILER had decided about those same products,
+    silently, while the product itself is coming back for an unrelated reason.
+
+    Here both lanes gate an offer each on one suppressed product, and the
+    service's revert must restore exactly its own.
+    """
+    from scripts.reconcile_catalog_offers import REASON_PRODUCT_SUPPRESSED, run
+    from services.catalog_offer_suppression import (
+        CASCADE_LANE, CASCADE_LANE_KEY,
+        cascade_offer_suppression, revert_offer_suppression,
+    )
+
+    await _product(db, PK_DEAD, suppressed=True)
+    await _sku(db, SKU_DEAD, PK_DEAD)
+    await _offer(db, "o:by_service", sku_key=SKU_DEAD, product_key=PK_DEAD)
+    await _offer(db, "o:by_reconciler", sku_key=SKU_DEAD, product_key=PK_DEAD,
+                 channel="native")
+
+    # The reconciler takes the first offer (--limit 1, lowest offer_id), the
+    # service takes what is left. Both write `product_suppressed`.
+    report = await run(apply=True, limit=1, passes=("cascade",))
+    assert report["cascade"]["sample"] == ["o:by_reconciler"]
+    assert await cascade_offer_suppression([PK_DEAD]) == ["o:by_service"]
+    both = [await _state(db, oid) for oid in ("o:by_service", "o:by_reconciler")]
+    assert {row["suppression_reason"] for row in both} == {REASON_PRODUCT_SUPPRESSED}
+
+    restored = await revert_offer_suppression([PK_DEAD])
+
+    assert restored == ["o:by_service"]
+    # The stamp goes with the tombstone it belonged to.
+    assert CASCADE_LANE_KEY not in _jsonb(
+        (await _state(db, "o:by_service"))["suppression_metadata"])
+    theirs = await _state(db, "o:by_reconciler")
+    assert theirs["suppressed_at"] is not None
+    assert theirs["suppression_reason"] == REASON_PRODUCT_SUPPRESSED
+    assert _jsonb(theirs["suppression_metadata"])["reconcile_pass"] == "cascade"
+    assert _jsonb(theirs["suppression_metadata"]).get(CASCADE_LANE_KEY) != CASCADE_LANE
 
 
 async def test_cascade_helper_with_no_keys_touches_nothing(db):

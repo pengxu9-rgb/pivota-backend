@@ -18,6 +18,22 @@ choice SQLite cannot represent and a string assertion cannot check; `RETURNING
 sku_key` on the DO UPDATE path is what makes adoption possible at all; and the
 DO UPDATE's `WHERE ... suppressed_at IS NULL` yielding NO ROW is the refusal
 signal. A SQLite twin of this file would prove none of it.
+
+THE SECOND GATE COLUMN, added after review. The capture lane read
+`catalog_products.suppressed_at` NOWHERE — not in the candidate scan, not in the
+mint, not in the offer upsert — so a withdrawn product went through the whole
+lane and came out with a live US offer, re-creating exactly the
+`suppressed_product_with_live_offer` class the reconciler's cascade pass drains.
+And the SKU-side refusal turned out to depend on SPELLING: a suppressed row
+holding the derived `<pk>::canonical` key counted as `existing` and the offer was
+written, while the same row under another lane's key was refused. Both are
+covered below, at the layer that decides and at the statement that writes.
+
+WHAT A RE-RUN MAY UNDO is covered here too. After the reconciler tombstones this
+lane's orphans, a later capture run has to repoint `sku_key` and lift THAT
+tombstone — and only that one. The pair of tests around
+`test_a_refresh_does_not_lift_a_tombstone_it_did_not_cause` is what keeps a
+nightly writer from becoming a blanket un-suppressor.
 """
 
 import json
@@ -55,6 +71,15 @@ async def _ddl(database):
     await ensure_model_tables(
         [catalog_products, catalog_skus, catalog_offers, writer_audit_log]
     )
+    # `index_pipeline_state` has no SQLAlchemy model (migration 098 owns it), and
+    # this gate's database has no migrations. Created ADDITIVELY, exactly as a
+    # dozen other `*_postgres.py` gate files do — IF NOT EXISTS plus ADD COLUMN
+    # IF NOT EXISTS, never a DROP, because the gate runs every file against ONE
+    # database. `blocker_code` is the only column CANDIDATES_SQL reads.
+    await database.execute(
+        "CREATE TABLE IF NOT EXISTS index_pipeline_state (content_key text PRIMARY KEY)")
+    await database.execute(
+        "ALTER TABLE index_pipeline_state ADD COLUMN IF NOT EXISTS blocker_code text")
 
 
 async def _clear(database):
@@ -66,11 +91,14 @@ async def _clear(database):
     await database.execute(
         "DELETE FROM catalog_products WHERE product_key = :pk", {"pk": PK})
     await database.execute(
+        "DELETE FROM index_pipeline_state WHERE content_key = :ck", {"ck": CONTENT_KEY})
+    await database.execute(
         "DELETE FROM writer_audit_log WHERE writer_name = ANY(:w)",
         {"w": list(_WRITERS)})
 
 
-async def _product(database, *, merchant_id=MERCHANT, content_key=CONTENT_KEY):
+async def _product(database, *, merchant_id=MERCHANT, content_key=CONTENT_KEY,
+                   suppressed=False):
     """`content_key=None` keeps `attach_retailer_offer` from calling the PDP
     view assembler, whose own dependency chain (product_group_members and
     friends) is a dozen tables this file has no business building. The offer
@@ -78,10 +106,12 @@ async def _product(database, *, merchant_id=MERCHANT, content_key=CONTENT_KEY):
     await database.execute(
         """INSERT INTO catalog_products
              (product_key, merchant_id, platform, source_product_id, source_domain,
-              content_key, canonical_url, title)
-           VALUES (:pk,:m,:p,:spid,:dom,:ck,:url,'Precondition Fixture')""",
+              content_key, canonical_url, title, suppressed_at, suppression_reason)
+           VALUES (:pk,:m,:p,:spid,:dom,:ck,:url,'Precondition Fixture',
+                   CASE WHEN :sup THEN NOW() ELSE NULL END,
+                   CASE WHEN :sup THEN 'fixture' ELSE NULL END)""",
         {"pk": PK, "m": merchant_id, "p": PLATFORM, "spid": "spid-1",
-         "dom": DOMAIN, "ck": content_key,
+         "dom": DOMAIN, "ck": content_key, "sup": suppressed,
          "url": f"https://{DOMAIN}/products/fixture"},
     )
 
@@ -199,6 +229,11 @@ async def test_capture_adopts_an_existing_identity_under_another_spelling(db):
         [_planned()], apply=True, batch_id="batch-adopt")
 
     assert counts["skus_adopted_other_key"] == 1
+    # AN ADOPTION IS NOT A MINT. `skus_minted` incremented before this branch, so
+    # every adoption was reported as a row this writer created — a counter that
+    # cannot be reconciled against a COUNT of catalog_skus after a run, which is
+    # the only external check it has.
+    assert counts["skus_minted"] == 0
     assert [row["sku_key"] for row in writable] == ["other::lane::spelling"]
     # No rival row was minted.
     n = await db.fetch_val(
@@ -307,6 +342,282 @@ async def test_capture_offer_upsert_lands_a_non_orphan_row_end_to_end(db):
     assert orphaned == 0
 
 
+async def test_capture_refuses_the_offer_when_the_CANONICAL_spelling_is_suppressed(db):
+    """THE REFUSAL MUST NOT DEPEND ON WHICH SPELLING THE SUPPRESSED ROW CARRIES.
+
+    The sibling test above suppresses the identity under ANOTHER lane's sku_key,
+    so the derived `<pk>::canonical` key is absent, the mint runs, its DO UPDATE
+    finds a suppressed row and returns nothing, and the offer is refused. When the
+    SUPPRESSED row already holds the derived key, none of that happens: the
+    existence lookup counted it as `existing`, the mint never ran, and the offer
+    was written against a suppressed SKU — measured. `%::canonical` is 39.4% of
+    catalog_skus, so that was the majority case, and the two spellings had
+    opposite outcomes for one situation.
+    """
+    from scripts.capture_us_market_offers import ensure_skus_for_planned
+
+    await _product(db)
+    await _existing_sku(db, SKU, suppressed=True)
+
+    writable, counts = await ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-canonical-suppressed")
+
+    assert counts["skus_existing"] == 0
+    assert counts["offers_refused_no_sku"] == 1
+    assert writable == []
+
+
+async def test_capture_refuses_every_offer_of_a_suppressed_product(db):
+    """A SUPPRESSED PRODUCT IS THE THING THE CASCADE JUST GATED. Writing a live US
+    offer against it re-creates `suppressed_product_with_live_offer`, so the lane
+    would regrow the class the reconciler drained the night before. The refusal
+    has to be its own check and not a side effect of the mint, because the
+    already-has-a-SKU path never reaches the mint at all — which is the shape
+    used here.
+    """
+    from scripts.capture_us_market_offers import ensure_skus_for_planned
+
+    await _product(db, suppressed=True)
+    await _existing_sku(db, SKU)
+
+    writable, counts = await ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-product-suppressed")
+
+    assert counts["offers_refused_product_suppressed"] == 1
+    assert counts["skus_existing"] == 0
+    assert writable == []
+
+
+async def test_capture_dry_run_predicts_the_suppressed_product_refusal(db):
+    """The plan and the run must agree about this one too."""
+    from scripts.capture_us_market_offers import ensure_skus_for_planned
+
+    await _product(db, suppressed=True)
+
+    writable, counts = await ensure_skus_for_planned(
+        [_planned()], apply=False, batch_id="batch-product-suppressed-dry")
+
+    assert counts["offers_refused_product_suppressed"] == 1
+    assert counts["skus_to_mint"] == 0
+    assert writable == []
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_skus WHERE product_key = :pk", {"pk": PK}) == 0
+
+
+async def test_the_candidate_scan_never_offers_a_suppressed_product(db):
+    """The same refusal one layer up, EXECUTED. CANDIDATES_SQL selects the cohort
+    minutes before any write; leaving suppressed products in it means the lane
+    spends HTTP budget on rows it must then refuse, and means the only thing
+    standing between a withdrawn product and a live offer is the later check.
+    """
+    from scripts.capture_us_market_offers import CANDIDATES_SQL
+
+    await _product(db)
+    await db.execute(
+        "INSERT INTO index_pipeline_state (content_key, blocker_code) "
+        "VALUES (:ck, 'no_us_offer')", {"ck": CONTENT_KEY})
+    await db.execute(
+        """INSERT INTO catalog_offers
+             (offer_id, sku_key, product_key, merchant_id, catalog_track,
+              truth_tier, readiness_tier, offer_mode, channel, market,
+              availability, currency, list_price, source_system, source_domain)
+           VALUES ('o:foreign',:sk,:pk,:m,'external_referral','observed',
+                   'referral_only','redirect','external_referral','GB',
+                   'in_stock','GBP',19.0,'fixture',:dom)""",
+        {"sk": SKU, "pk": PK, "m": MERCHANT, "dom": DOMAIN},
+    )
+
+    live = [dict(r) for r in await db.fetch_all(CANDIDATES_SQL)]
+    assert [r["product_key"] for r in live if r["product_key"] == PK] == [PK]
+
+    await db.execute(
+        "UPDATE catalog_products SET suppressed_at = NOW(), "
+        "suppression_reason = 'fixture' WHERE product_key = :pk", {"pk": PK})
+
+    after = [dict(r) for r in await db.fetch_all(CANDIDATES_SQL)]
+    assert [r for r in after if r["product_key"] == PK] == []
+
+
+# ---------------------------------------------------------------------------
+# the reconciler's tombstone, and what a re-run of the writer may lift
+# ---------------------------------------------------------------------------
+async def _offer_state(database, offer_id):
+    row = await database.fetch_one(
+        "SELECT sku_key, list_price, suppressed_at, suppression_reason, "
+        "       suppression_metadata FROM catalog_offers WHERE offer_id = :oid",
+        {"oid": offer_id},
+    )
+    return dict(row) if row else None
+
+
+async def test_a_reconciled_orphan_comes_back_live_on_the_key_that_now_exists(db):
+    """THE WHOLE POINT OF THE RECONCILER PLUS THE WRITER FIX, END TO END.
+
+    The reconciler suppressed this lane's 529 orphans as `orphan_no_sku`. A later
+    capture run resolves the identity and refreshes the offer — and before this
+    change the `ON CONFLICT (offer_id) DO UPDATE` touched price and merchant
+    only: the row kept the DEAD sku_key and kept its tombstone, while the report
+    said `written: 1`. The offer was fixed everywhere except in the two columns
+    that decide whether anything can see it.
+
+    THE IDENTITY RESOLVES TO ANOTHER LANE'S SPELLING here, deliberately. With a
+    mint the derived key and the resolved key are equal, so a DO UPDATE that
+    never repoints `sku_key` still lands on the right row by accident and the
+    test would prove only half of what it claims. Under adoption the two differ,
+    and the refresh has to follow the identity.
+    """
+    from scripts.capture_us_market_offers import (
+        OFFER_UPSERT_SQL, derive_us_offer_id, ensure_skus_for_planned,
+    )
+    from scripts.reconcile_catalog_offers import REASON_ORPHAN, run as reconcile
+
+    offer_id = derive_us_offer_id(PK)
+    await _product(db)
+    # The identity exists, but under a key this lane does not derive.
+    await _existing_sku(db, "other::lane::spelling", source_variant_id=PK)
+    # The orphan exactly as the lane minted it: a live offer on a key with no
+    # catalog_skus row.
+    await db.execute(
+        """INSERT INTO catalog_offers
+             (offer_id, sku_key, product_key, merchant_id, catalog_track,
+              truth_tier, readiness_tier, offer_mode, channel, market,
+              availability, currency, list_price, source_system)
+           VALUES (:oid,:sk,:pk,:m,'external_referral','observed','referral_only',
+                   'redirect','external_referral','US','in_stock','USD',9.0,
+                   'us_market_capture')""",
+        {"oid": offer_id, "sk": SKU, "pk": PK, "m": MERCHANT},
+    )
+
+    report = await reconcile(apply=True, limit=0, passes=("orphans",))
+    assert report["orphans"]["suppressed"] == 1
+    gated = await _offer_state(db, offer_id)
+    assert gated["suppression_reason"] == REASON_ORPHAN
+    assert json.loads(gated["suppression_metadata"])["reconcile_pass"] == "orphans"
+
+    # The lane runs again; this time it resolves the identity first.
+    writable, counts = await ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-revive")
+    assert counts["skus_adopted_other_key"] == 1
+    assert [r["sku_key"] for r in writable] == ["other::lane::spelling"]
+    for row in writable:
+        await db.execute(OFFER_UPSERT_SQL,
+                         {k: v for k, v in row.items() if k != "content_key"})
+
+    healed = await _offer_state(db, offer_id)
+    assert healed["suppressed_at"] is None
+    assert healed["suppression_reason"] is None
+    assert healed["sku_key"] == "other::lane::spelling"
+    # The reconciler's stamp goes with the tombstone; leaving it would make
+    # `--revert-batch` count a row it can no longer restore.
+    assert "reconcile_pass" not in (json.loads(healed["suppression_metadata"] or "{}"))
+    assert float(healed["list_price"]) == 24.0
+    joined = await db.fetch_val(
+        """SELECT count(*) FROM catalog_offers co
+             JOIN catalog_skus s ON s.sku_key = co.sku_key
+            WHERE co.offer_id = :oid""", {"oid": offer_id})
+    assert joined == 1
+
+
+async def test_a_refresh_does_not_lift_a_tombstone_it_did_not_cause(db):
+    """`orphan_no_sku` IS THE ONLY LABEL THIS WRITE MAY CLEAR, because it is the
+    only one whose cause the write itself has just removed. A `product_suppressed`
+    row is a live decision by another lane, and a refresh that resurrected it
+    would make this writer a blanket un-suppressor — reachable nightly, with no
+    operator in the loop.
+
+    (Reaching this state at all takes a race: the product is suppressed here after
+    the plan was built. That is the case the CASE expression is for.)
+    """
+    from scripts.capture_us_market_offers import (
+        OFFER_UPSERT_SQL, derive_us_offer_id, ensure_skus_for_planned,
+    )
+    from services.catalog_offer_suppression import PRODUCT_SUPPRESSED_REASON
+
+    offer_id = derive_us_offer_id(PK)
+    await _product(db)
+    await _existing_sku(db, SKU)
+    writable, _ = await ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-tombstone")
+    params = {k: v for k, v in writable[0].items() if k != "content_key"}
+    await db.execute(OFFER_UPSERT_SQL, params)
+
+    await db.execute(
+        "UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = :r "
+        "WHERE offer_id = :oid",
+        {"oid": offer_id, "r": PRODUCT_SUPPRESSED_REASON},
+    )
+
+    await db.execute(OFFER_UPSERT_SQL, params)
+
+    state = await _offer_state(db, offer_id)
+    assert state["suppressed_at"] is not None
+    assert state["suppression_reason"] == PRODUCT_SUPPRESSED_REASON
+
+    # The label in the CASE is a LITERAL inside the statement (an f-string would
+    # drop the whole constant out of the repo-wide PREPARE sweep, which accepts
+    # only ast.Constant), so the coupling to the guard's vocabulary is asserted
+    # here instead of enforced by interpolation.
+    from scripts.capture_us_market_offers import OFFER_UPSERT_SQL as _sql
+    from services.catalog_offer_writer_guard import ORPHAN_NO_SKU
+
+    assert f"suppression_reason = '{ORPHAN_NO_SKU}'" in _sql
+    assert f"'{PRODUCT_SUPPRESSED_REASON}'" not in _sql
+
+
+async def test_the_upsert_writes_nothing_when_the_product_is_suppressed(db):
+    """The fail-closed backstop, and the count that goes with it. `execute()`
+    returns no rowcount through `databases` + asyncpg, so a writer that assumed
+    its INSERT landed would report `written: 1` for a statement whose SELECT
+    source yielded nothing."""
+    from scripts.capture_us_market_offers import (
+        OFFER_UPSERT_SQL, apply_offers, derive_us_offer_id, ensure_skus_for_planned,
+    )
+
+    await _product(db)
+    await _existing_sku(db, SKU)
+    writable, _ = await ensure_skus_for_planned(
+        [_planned()], apply=True, batch_id="batch-upsert-guard")
+    await db.execute(
+        "UPDATE catalog_products SET suppressed_at = NOW(), "
+        "suppression_reason = 'fixture' WHERE product_key = :pk", {"pk": PK})
+
+    summary = await apply_offers(writable)
+
+    assert summary["written"] == 0
+    assert summary["not_written"] == [PK]
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE offer_id = :oid",
+        {"oid": derive_us_offer_id(PK)}) == 0
+    assert OFFER_UPSERT_SQL.strip().endswith("RETURNING offer_id")
+
+
+# ---------------------------------------------------------------------------
+# the shared guard, asked the LIVE question
+# ---------------------------------------------------------------------------
+async def test_the_guard_refuses_a_suppressed_sku_only_when_asked_for_live_only(db):
+    """`live_only` is opt-in, and both answers are pinned. The existing callers
+    were written against "does a row exist"; flipping that under them would change
+    which rows they refuse without anyone deciding to, so the capture lane asks
+    for the live question explicitly and everyone else keeps the old one."""
+    from services.catalog_offer_writer_guard import (
+        ORPHAN_NO_SKU, guard_catalog_offer_rows,
+    )
+
+    await _product(db)
+    await _existing_sku(db, SKU, suppressed=True)
+    row = {"offer_id": "o:guarded", "sku_key": SKU, "list_price": 12.0}
+
+    accepted, _reasons, rejected = await guard_catalog_offer_rows([dict(row)])
+    assert [r["offer_id"] for r in accepted] == ["o:guarded"]
+    assert rejected == []
+
+    accepted, reasons, rejected = await guard_catalog_offer_rows(
+        [dict(row)], live_only=True)
+    assert accepted == []
+    assert reasons[ORPHAN_NO_SKU] == 1
+    assert rejected[0]["reasons"] == [ORPHAN_NO_SKU]
+
+
 # ---------------------------------------------------------------------------
 # attach_retailer_offer: REFUSE
 # ---------------------------------------------------------------------------
@@ -360,6 +671,65 @@ async def test_attach_writes_when_the_canonical_sku_is_there(db):
     # a second identity tuple for one product.
     assert written["merchant_id"] == "oliveyoung_global"
     assert written["offer_type"] == "retailer"
+
+
+async def test_attach_drive_exits_2_on_the_refusal_and_writes_no_offer(db):
+    """THE EXIT CODE IS THE SIGNAL A WRAPPER SCRIPT READS. A refusal that returned
+    0 reads as "offer attached" to every caller in a shell pipeline. Driven
+    against the real database with no catalog_skus row, so the 2 comes from the
+    refusal and not from a stub."""
+    import argparse
+
+    from scripts import attach_retailer_offer as mod
+
+    await _product(db, content_key=None)
+    args = argparse.Namespace(
+        product_key=PK, merchant_id="oliveyoung_global", merchant_name=None,
+        retailer_url="https://global.oliveyoung.com/product/detail?prdtNo=1",
+        market="US", currency="USD", price="25.9", availability="in_stock",
+        apply=True,
+    )
+
+    try:
+        assert await mod._drive(args) == 2
+    finally:
+        # `_drive` owns the connection lifecycle (connect/disconnect around its
+        # own work), so it leaves the shared handle CLOSED. Re-open it or the
+        # fixture's own teardown fails on a dead pool.
+        if not db.is_connected:
+            await db.connect()
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+
+
+async def test_attach_main_propagates_that_exit_code(db):
+    """`main()` is what `raise SystemExit(main())` runs. The `_drive` value has to
+    survive `asyncio.run` and the return — a bare `asyncio.run(...)` with no
+    `return`, or a `return 0`, throws the refusal away and nothing above would
+    notice. Run in a worker thread because `asyncio.run` refuses to start a loop
+    inside a running one; `_drive` is stubbed so this test is about the
+    propagation and about `_parse_args` accepting the argv, nothing else."""
+    import asyncio as _asyncio
+    import sys
+
+    from scripts import attach_retailer_offer as mod
+
+    async def refuse(_args):
+        return 2
+
+    original_drive, original_argv = mod._drive, sys.argv
+    mod._drive = refuse
+    sys.argv = [
+        "attach_retailer_offer.py",
+        "--product-key", PK,
+        "--merchant-id", "oliveyoung_global",
+        "--retailer-url", "https://global.oliveyoung.com/product/detail?prdtNo=1",
+        "--price", "25.9", "--apply",
+    ]
+    try:
+        assert await _asyncio.to_thread(mod.main) == 2
+    finally:
+        mod._drive, sys.argv = original_drive, original_argv
 
 
 async def test_attach_refusal_does_not_depend_on_the_price_being_present(db):

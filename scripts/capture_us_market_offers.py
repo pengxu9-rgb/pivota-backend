@@ -69,6 +69,15 @@ When the mint returns nothing the identity exists on a SUPPRESSED row, and the
 offer is REFUSED and counted as `offers_refused_no_sku` — attaching live supply
 to a gated identity creates supply nothing can surface.
 
+A SUPPRESSED PRODUCT IS REFUSED OUTRIGHT (added after review). The lane read
+`catalog_products.suppressed_at` nowhere: not in the candidate scan, not in the
+mint, not in the offer upsert. A product somebody had withdrawn therefore went
+all the way through — `skus_minted: 1`, live offer written — and re-created
+`suppressed_product_with_live_offer`, the class the reconciler's cascade pass had
+just drained. All three statements now carry `cp.suppressed_at IS NULL`, and a
+product retired during the minutes of HTTP probing is counted as
+`offers_refused_product_suppressed` rather than written.
+
 Usage
 -----
   python3 scripts/capture_us_market_offers.py                 # dry run
@@ -93,7 +102,7 @@ from db.database import database  # noqa: E402
 from services.catalog_offer_writer_guard import (  # noqa: E402
     ORPHAN_NO_SKU,
     WriterAuditAccumulator,
-    fetch_existing_catalog_sku_keys,
+    fetch_live_catalog_sku_keys,
     guard_catalog_offer_rows,
     make_batch_id,
     write_writer_audit_log,
@@ -121,6 +130,15 @@ SESSION_RECHECK_EVERY = 25
 
 # Blocked products with a foreign-priced offer, one row per (product, domain).
 # canonical_url supplies the Shopify handle (its final path segment).
+#
+# `cp.suppressed_at IS NULL` IS PART OF THE COHORT, not a tidy-up. A suppressed
+# product is one somebody withdrew; capturing a US price for it and writing a
+# LIVE offer against it re-creates `suppressed_product_with_live_offer` — the
+# exact class `services/catalog_offer_suppression` and the reconciler's cascade
+# pass exist to drain (2,171 rows on prod 2026-09-08). Measured before this
+# line existed: a suppressed product went through the whole lane and reported
+# `skus_minted: 1` with a live offer written, so the morning after the
+# reconciler drained the class it regrew from here.
 CANDIDATES_SQL = """
     SELECT DISTINCT ips.content_key, cp.product_key, cp.merchant_id,
            cp.canonical_url, co.source_domain
@@ -128,12 +146,25 @@ CANDIDATES_SQL = """
     JOIN catalog_products cp ON cp.content_key = ips.content_key
     JOIN catalog_offers co ON co.product_key = cp.product_key
     WHERE ips.blocker_code = 'no_us_offer'
+      AND cp.suppressed_at IS NULL
       AND co.suppressed_at IS NULL
       AND coalesce(co.merchant_effective_price, co.list_price) > 0
       AND upper(trim(coalesce(co.currency, ''))) <> 'USD'
       AND co.source_domain IS NOT NULL
       AND cp.canonical_url IS NOT NULL
     ORDER BY co.source_domain, cp.product_key
+"""
+
+#: The products among a planned batch that are SUPPRESSED. CANDIDATES_SQL
+#: already excludes them, but minutes of HTTP probing separate that scan from
+#: the write and a nightly retirement lane runs in between — the same race that
+#: produced the ADR-009 sentinel orphans. Read in BOTH modes so a plan cannot
+#: promise offers --apply then refuses.
+SUPPRESSED_PRODUCT_PROBE_SQL = """
+    SELECT cp.product_key
+      FROM catalog_products cp
+     WHERE cp.product_key = ANY(:product_keys)
+       AND cp.suppressed_at IS NOT NULL
 """
 
 # Same column set as the mirror/attach writers; ON CONFLICT refreshes only the
@@ -154,6 +185,23 @@ CANDIDATES_SQL = """
 # COMMIT time is what the offer carries. A product that vanished between the
 # scan and the write inserts nothing rather than inventing a seller — the
 # INSERT ... SELECT yields no row, which is the fail-closed direction.
+#
+# `cp.suppressed_at IS NULL` in the SELECT source is the FAIL-CLOSED backstop for
+# the cohort filter: a product retired between the scan and the write yields no
+# row and no offer, rather than a live offer on a withdrawn product. The write is
+# counted from `RETURNING offer_id`, never assumed — `databases` + asyncpg gives
+# no rowcount from `execute()`, so a caller that incremented a counter beside the
+# call would report `written: 1` for a statement that inserted nothing.
+#
+# THE DO UPDATE REPOINTS `sku_key` AND LIFTS EXACTLY ONE TOMBSTONE. Measured:
+# after the reconciler suppressed this lane's 529 orphans as `orphan_no_sku`, a
+# re-run refreshed price and reported `written: 1` while the row stayed gated on
+# the dead key — the offer was fixed everywhere except where it counts.
+# `orphan_no_sku` is the ONE label whose cause this very statement has just
+# removed (the SKU now exists; `ensure_skus_for_planned` proved it), so it is the
+# only one cleared. A `product_suppressed`, `duplicate_offer` or currency-
+# quarantine tombstone is somebody else's live decision and stays put — reviving
+# those would make this writer a blanket un-suppressor.
 OFFER_UPSERT_SQL = """
     INSERT INTO catalog_offers
       (offer_id, sku_key, product_key, merchant_id,
@@ -171,6 +219,7 @@ OFFER_UPSERT_SQL = """
        :source_system, :source_domain, CAST(:offer_payload AS jsonb)
       FROM catalog_products cp
      WHERE cp.product_key = CAST(:product_key AS text)
+       AND cp.suppressed_at IS NULL
     ON CONFLICT (offer_id) DO UPDATE SET
       availability = EXCLUDED.availability,
       list_price = EXCLUDED.list_price,
@@ -178,7 +227,27 @@ OFFER_UPSERT_SQL = """
       -- The seller follows the catalog on refresh too; without this an offer
       -- written before a re-key keeps the stale merchant forever.
       merchant_id = EXCLUDED.merchant_id,
+      -- The KEY the offer hangs on follows too: an adoption (or a mint after a
+      -- reconciler sweep) changes which catalog_skus row is correct, and a
+      -- refresh that left the old spelling in place would refresh an orphan.
+      sku_key = EXCLUDED.sku_key,
+      suppressed_at = CASE
+          WHEN catalog_offers.suppression_reason = 'orphan_no_sku'
+          THEN NULL ELSE catalog_offers.suppressed_at END,
+      suppression_reason = CASE
+          WHEN catalog_offers.suppression_reason = 'orphan_no_sku'
+          THEN NULL ELSE catalog_offers.suppression_reason END,
+      -- The reconciler's own stamp goes with the tombstone it belongs to; a
+      -- `reconcile_batch_id` left behind would make `--revert-batch` count a row
+      -- it can no longer restore.
+      suppression_metadata = CASE
+          WHEN catalog_offers.suppression_reason = 'orphan_no_sku'
+          THEN coalesce(catalog_offers.suppression_metadata, '{}'::jsonb)
+               - 'reconcile_batch_id' - 'reconcile_pass'
+               - 'reconcile_keeper_offer_id'
+          ELSE catalog_offers.suppression_metadata END,
       updated_at = NOW()
+    RETURNING offer_id
 """
 
 
@@ -194,6 +263,11 @@ OFFER_UPSERT_SQL = """
 # stale seller. `merchant_id`, `platform` and `source_product_id` are NOT NULL on
 # catalog_skus, so a bind-carried snapshot of them is exactly the ADR-009 orphan
 # this lane already produced once.
+#
+# `cp.suppressed_at IS NULL` for the same reason CANDIDATES_SQL carries it: a
+# product withdrawn between the scan and the write must mint NOTHING, so this
+# lane can never be the thing that re-creates a live SKU (and then a live offer)
+# under a tombstoned product.
 #
 # ON CONFLICT targets the 4-column identity index, never the sku_key primary key
 # — see the module docstring. DO UPDATE touches only `updated_at`: adopting
@@ -215,6 +289,7 @@ MINT_CANONICAL_SKU_SQL = """
        CAST(:sku_payload AS jsonb), 'referral_only', NOW()
       FROM catalog_products cp
      WHERE cp.product_key = CAST(:product_key AS text)
+       AND cp.suppressed_at IS NULL
     ON CONFLICT (merchant_id, platform, product_key, source_variant_id) DO UPDATE SET
        updated_at = NOW()
      WHERE catalog_skus.suppressed_at IS NULL
@@ -452,33 +527,63 @@ def _sku_payload(product_key: str, batch_id: str) -> str:
 async def ensure_skus_for_planned(
     planned: List[Dict[str, Any]], *, apply: bool, batch_id: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Guarantee every planned offer names an EXISTING catalog_skus row.
+    """Guarantee every planned offer names a LIVE catalog_skus row on a LIVE product.
 
     Returns the rows that may be written (with `sku_key` rewritten to whatever
     the identity actually resolved to) plus the counters.
 
-    THE ORDER IS: look, then mint only what is missing, then let the shared guard
-    have the last word.
+    THE ORDER IS: drop the suppressed products, look, then mint only what is
+    missing, then re-read at the shared guard.
 
-      1. `fetch_existing_catalog_sku_keys` — the planned key may already exist,
-         in which case there is nothing to mint. This also avoids the one case
+      0. `SUPPRESSED_PRODUCT_PROBE_SQL` — a suppressed product's offer must not be
+         written at all, whatever its SKU situation. CANDIDATES_SQL already
+         excludes them; this catches the ones retired during the minutes of HTTP
+         probing, and it has to be a refusal of its OWN and not a side effect of
+         the mint, because the `skus_existing` branch below never reaches the
+         mint.
+      1. `fetch_live_catalog_sku_keys` — the planned key may already exist, in
+         which case there is nothing to mint. LIVE, not merely existing: a
+         SUPPRESSED row holding the derived `<pk>::canonical` key counted as
+         `existing` here and the offer was written against it (measured). Only
+         the other-spelling case refused, and `%::canonical` is 39.4% of
+         catalog_skus — so the refusal was decided by which spelling the
+         suppressed row happened to carry. This also avoids the one case
          `ON CONFLICT` cannot help with: a row that already OWNS the sku_key
          under a DIFFERENT identity tuple (a re-key moved the merchant) would hit
          the sku_key PRIMARY KEY, which is not the arbiter, and raise.
       2. mint the rest, adopting the returned key.
-      3. `guard_catalog_offer_rows`, the shared chokepoint that already knows how
-         to say ORPHAN_NO_SKU. THIS LANE BYPASSED IT ENTIRELY — it builds and
-         executes its own INSERT and never went near the guard, which is why the
-         guard's existence did not stop 529 live orphans. Running it here as the
-         final gate means a future mint bug is refused rather than written, and
-         refused with the vocabulary every other writer already reports.
+      3. `guard_catalog_offer_rows(..., live_only=True)`, the shared chokepoint
+         that already knows how to say ORPHAN_NO_SKU. THIS LANE BYPASSED IT
+         ENTIRELY — it builds and executes its own INSERT and never went near the
+         guard, which is why the guard's existence did not stop 529 live orphans.
+         It is a BACKSTOP, not the gate that catches what nothing else does: when
+         steps 1-2 are correct it re-reads the same keys and refuses nothing, by
+         construction. What it buys is that a future mint bug is REFUSED rather
+         than written, and refused in the vocabulary every other writer already
+         reports. `live_only=True` so it asks the same question step 1 does.
     """
     counts = {"skus_existing": 0, "skus_to_mint": 0, "skus_minted": 0,
-              "skus_adopted_other_key": 0, "offers_refused_no_sku": 0}
+              "skus_adopted_other_key": 0, "offers_refused_no_sku": 0,
+              "offers_refused_product_suppressed": 0}
     if not planned:
         return [], counts
 
-    existing = await fetch_existing_catalog_sku_keys([r["sku_key"] for r in planned])
+    suppressed_products = {
+        str(row["product_key"]) for row in (await database.fetch_all(
+            SUPPRESSED_PRODUCT_PROBE_SQL,
+            {"product_keys": sorted({r["product_key"] for r in planned})},
+        ) or [])
+    }
+    if suppressed_products:
+        counts["offers_refused_product_suppressed"] = sum(
+            1 for r in planned if r["product_key"] in suppressed_products)
+        for key in sorted(suppressed_products):
+            print(f"  [SKIP] product suppressed: {key[:60]}", flush=True)
+        planned = [r for r in planned if r["product_key"] not in suppressed_products]
+    if not planned:
+        return [], counts
+
+    existing = await fetch_live_catalog_sku_keys([r["sku_key"] for r in planned])
     missing = [r for r in planned if r["sku_key"] not in existing]
     counts["skus_existing"] = len(planned) - len(missing)
     counts["skus_to_mint"] = len(missing)
@@ -515,16 +620,21 @@ async def ensure_skus_for_planned(
             print(f"  [SKIP] no live SKU identity for {row['product_key'][:60]}",
                   flush=True)
             continue
-        counts["skus_minted"] += 1
         if str(written_key) != row["sku_key"]:
             # The identity already existed under another lane's spelling. Adopt
             # it — writing our spelling would be a second identity row for one
-            # variant, which is what the 4-column index exists to forbid.
+            # variant, which is what the 4-column index exists to forbid. AN
+            # ADOPTION IS NOT A MINT: no catalog_skus row was created, and
+            # counting it as one overstates what this writer produced (and would
+            # make `skus_minted` disagree with a COUNT of the table after a run).
             counts["skus_adopted_other_key"] += 1
             row = dict(row, sku_key=str(written_key))
+        else:
+            counts["skus_minted"] += 1
         accepted.append(row)
 
-    guarded, reasons, rejected = await guard_catalog_offer_rows(accepted)
+    guarded, reasons, rejected = await guard_catalog_offer_rows(
+        accepted, live_only=True)
     if rejected:
         counts["offers_refused_no_sku"] += int(reasons.get(ORPHAN_NO_SKU, 0))
         for bad in rejected:
@@ -541,10 +651,21 @@ async def apply_offers(planned: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     written = 0
+    not_written: List[str] = []
     republish_failed: List[str] = []
     for row in planned:
         params = {k: v for k, v in row.items() if k != "content_key"}
-        await database.execute(OFFER_UPSERT_SQL, params)
+        # `fetch_val` for the RETURNING, not `execute`: the statement's SELECT
+        # source can legitimately yield NO ROW (the product was retired or
+        # re-keyed during the probe), and `databases` + asyncpg reports no
+        # rowcount, so an unconditional `written += 1` beside an `execute()` is a
+        # count of ATTEMPTS being reported as a count of WRITES.
+        landed = await database.fetch_val(OFFER_UPSERT_SQL, params)
+        if landed is None:
+            not_written.append(row["product_key"])
+            print(f"  [SKIP] no live product row at write time for "
+                  f"{row['product_key'][:60]}", flush=True)
+            continue
         written += 1
         try:
             await refresh_agent_pdp_view_for_content_key(
@@ -555,7 +676,8 @@ async def apply_offers(planned: List[Dict[str, Any]]) -> Dict[str, Any]:
             republish_failed.append(row["content_key"])
             print(f"  [WARN] republish failed for {row['content_key']}: "
                   f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
-    return {"written": written, "republish_failed": republish_failed}
+    return {"written": written, "republish_failed": republish_failed,
+            "not_written": not_written}
 
 
 async def _drive(apply: bool, only_domain: Optional[str],
@@ -620,20 +742,28 @@ async def _drive(apply: bool, only_domain: Optional[str],
         report["writable"] = len(writable)
         if not apply:
             report["written"] = 0
+            report["not_written"] = 0
             report["republish_failed"] = 0
         else:
             summary = await apply_offers(writable)
             report["written"] = summary["written"]
+            report["not_written"] = len(summary["not_written"])
             report["republish_failed"] = len(summary["republish_failed"])
             report["republish_failed_keys"] = summary["republish_failed"][:5]
             audit.record_applied(summary["written"])
+            # EVERY `offers_refused_*` counter is a SKIP, matched by prefix. A
+            # membership test against one name silently files the next refusal
+            # reason under `record_info`, where it stops counting toward
+            # `skipped_rows` and reads as progress.
             audit.record_skips({
                 k: v for k, v in sku_counts.items()
-                if k == "offers_refused_no_sku" and v > 0
+                if k.startswith("offers_refused_") and v > 0
             })
+            if summary["not_written"]:
+                audit.record_skips({"offers_not_written": len(summary["not_written"])})
             audit.record_info({
                 k: v for k, v in sku_counts.items()
-                if k != "offers_refused_no_sku" and v > 0
+                if not k.startswith("offers_refused_") and v > 0
             })
             audit.reasons["zero_counters"] = sorted(
                 k for k, v in sku_counts.items() if v == 0

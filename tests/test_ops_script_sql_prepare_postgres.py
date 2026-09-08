@@ -600,6 +600,38 @@ def _collect_us_market_capture() -> List[Tuple[str, str]]:
             # two columns of the same row inside `= ANY(:binds)` — both are
             # shapes Postgres can refuse to plan and SQLite types not at all.
             "MINT_CANONICAL_SKU_SQL", "SUPPRESSED_IDENTITY_PROBE_SQL",
+            # The suppressed-PRODUCT refusal. Separate from the SKU probe above
+            # and separately plannable: this one reads catalog_products, and the
+            # lane read that table's gate column nowhere until it was found
+            # writing live offers onto withdrawn products.
+            "SUPPRESSED_PRODUCT_PROBE_SQL",
+        )
+    ]
+
+
+def _collect_reconcile_catalog_offers() -> List[Tuple[str, str]]:
+    """The reconciler SUPPRESSES offers table-wide. An unplannable statement here
+    aborts a sweep partway through and leaves the table in a state no report
+    describes.
+
+    EVERY SQL CONSTANT THE MODULE DEFINES IS LISTED, and the completeness guard
+    below re-derives that list from the module so a new constant cannot be added
+    without either being driven here or being named as deliberately skipped. Three
+    of these reached Postgres only through a module-local `_fetch()` wrapper until
+    2026-09-08, which made them invisible to the repo-wide AST sweep in
+    tests/test_repo_sql_prepare_postgres.py — the sweep follows
+    `database.<accessor>(CONSTANT, ...)` and nothing else. The call sites now pass
+    the constant as the accessor's first positional argument, and they are driven
+    here as well.
+    """
+    import scripts.reconcile_catalog_offers as module
+
+    origin = "reconcile_catalog_offers"
+    return [
+        (f"{origin}.{name}", getattr(module, name)) for name in (
+            "ORPHAN_SELECT_SQL", "DUPLICATE_SELECT_SQL",
+            "DUPLICATE_GROUP_COUNT_SQL", "CASCADE_SELECT_SQL",
+            "SUPPRESS_OFFERS_SQL", "REVERT_BATCH_SQL", "REVERT_PREVIEW_SQL",
         )
     ]
 
@@ -744,6 +776,7 @@ _COVERED_SCRIPTS: Dict[str, Callable[[], List[Tuple[str, str]]]] = {
     "scripts/report_inci_ingestion_quality.py": _collect_inci_quality,
     "scripts/reattribute_orphaned_enrichment.py": _collect_reattribution,
     "scripts/capture_us_market_offers.py": _collect_us_market_capture,
+    "scripts/reconcile_catalog_offers.py": _collect_reconcile_catalog_offers,
     "scripts/dispose_sentinel_orphans.py": _collect_dispose_sentinel_orphans,
     "scripts/report_quality_scale_population.py": _collect_quality_scale_population,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": _collect_a9_4_quality_repair,
@@ -767,7 +800,8 @@ _MIN_STATEMENTS = {
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
-    "scripts/capture_us_market_offers.py": 4,
+    "scripts/capture_us_market_offers.py": 5,
+    "scripts/reconcile_catalog_offers.py": 7,
     "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,
     "scripts/repair_a9_4_orphaned_quality_snapshots.py": 3,
