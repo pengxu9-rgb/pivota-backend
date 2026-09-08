@@ -320,18 +320,68 @@ def test_a_failed_observation_stamp_does_not_take_run_facts_with_it():
     """STRUCTURAL, because the assembly path this guards is a single 400-line
     function with no seam. The selection-observation loop shared one try with
     the run_facts stamp; they have no dependency on each other, so a failure in
-    one must not erase the other. Pinned the way the charged-iff-delivered
-    refund exit is pinned — by the shape of the source."""
+    one must not erase the other.
+
+    PARSED, NOT GREPPED. The first cut of this test asserted that
+    "_selection_observation_failures += 1" appeared in the source text between
+    the observation loop and the run_facts stamp — and the INNER per-SKU
+    `except` supplies that string, so re-merging the OUTER try back into the
+    run_facts try left the substring exactly where it was and the test green.
+    The claim is about block structure, so it is made against the syntax tree:
+    no `try` that guards the observation call may also contain the run_facts
+    stamp.
+    """
+    import ast
+
     import services.agent_center_bd_report_service as acbd
 
-    source = inspect.getsource(acbd)
-    marker = 'brand_rollup["run_facts"] = aggregate_run_facts('
-    loop = '_r["selection_observations"] = response_observations('
-    assert marker in source and loop in source
-    # The observation loop's own except must sit BETWEEN the loop and the
-    # run_facts stamp — i.e. they are not in one try block any more.
-    between = source[source.index(loop):source.index(marker)]
-    assert "_selection_observation_failures += 1" in between
+    tree = ast.parse(inspect.getsource(acbd))
+    parent_of = {
+        child: node
+        for node in ast.walk(tree)
+        for child in ast.iter_child_nodes(node)
+    }
+
+    def enclosing_tries(node):
+        found = set()
+        while node in parent_of:
+            node = parent_of[node]
+            if isinstance(node, ast.Try):
+                found.add(node)
+        return found
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "response_observations"
+    ]
+    assert calls, "the selection-observation call is gone from the assembly path"
+
+    stamps = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "brand_rollup"
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "run_facts"
+            for target in node.targets
+        )
+    ]
+    assert len(stamps) == 1, "expected exactly one brand_rollup run_facts stamp"
+
+    observation_tries = set().union(*(enclosing_tries(c) for c in calls))
+    assert observation_tries, (
+        "the observation loop has no try of its own — one bad observation "
+        "would escape into whatever try encloses it"
+    )
+    shared = observation_tries & enclosing_tries(stamps[0])
+    assert not shared, (
+        "the run_facts stamp sits inside a try that also guards the "
+        "observation loop: one bad observation drops run_facts for the run"
+    )
 
 
 def test_the_recovery_postgres_step_runs_after_the_gate_it_must_not_mask():
