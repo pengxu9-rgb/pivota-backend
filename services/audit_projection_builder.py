@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # surfaces. Cached `report_projections` rows built at 1.0.0 still hold the
 # NO_FINDINGS all-clear and the bare headline_score, so they must be
 # re-rendered rather than served — the version is what lets a reader tell.
-_BUILDER_VERSION = "1.1.0"
+_BUILDER_VERSION = "1.2.0"
 
 
 # Audience constants (mirror db.audit_evidence values; kept as
@@ -453,7 +453,7 @@ def _is_meta_finding(finding: Optional[Dict[str, Any]]) -> bool:
 def _without_meta_findings(
     findings: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    return [f for f in (findings or []) if not _is_meta_finding(f)]
+    return [f for f in (findings or []) if not _is_meta_finding(f) and f.get("finding_type") != "recovery_measurement"]
 
 _STAGE_FOR_FINDING_TYPE = {
     # Not chosen for the category's queries at all.
@@ -614,6 +614,11 @@ def build_revenue_recovery_projection(
     with the reason, because a false all-clear is worse than an honest gap.
     """
     row = audit_run_row or {}
+    from services.selection_measurement import selection_measurement
+    measurement = {}
+    for finding in findings:
+        if finding.get("finding_type") == "recovery_measurement":
+            measurement = coerce_jsonb_to_dict(finding.get("payload_jsonb")) or finding.get("payload") or {}
     stages: Dict[str, Dict[str, Any]] = {
         name: {"stage": name, "findings": [], "actions": []}
         for name in _STAGES
@@ -649,6 +654,14 @@ def build_revenue_recovery_projection(
         )
         stages[stage]["actions"].append(_action_for_merchant(a))
 
+    # DB retrieval order is not a presentation contract (timestamps may tie).
+    # Keep retained-report rebuilds and persisted projections deterministic.
+    for stage_data in stages.values():
+        stage_data["findings"].sort(key=lambda f: (
+            _SEVERITY_ORDER.get(f.get("severity"), 99),
+            str(f.get("type") or ""), str(f.get("summary") or ""),
+        ))
+
     unreadable = any(_is_meta_finding(f) for f in (findings or []))
     for name in _STAGES:
         if not _stage_is_measurable(name):
@@ -673,6 +686,10 @@ def build_revenue_recovery_projection(
                 "MEASURED" if stages[name]["findings"] else "NO_FINDINGS"
             )
 
+    headline = _headline_distribution(findings)
+    if measurement.get("catalog_available") is False:
+        headline["dimensions"] = [d for d in headline.get("dimensions", []) if d.get("dimension") != "routability"]
+        headline["dimensions_considered"] = len(headline["dimensions"])
     return {
         "audience": AUDIENCE_REVENUE_RECOVERY,
         "builder_version": _BUILDER_VERSION,
@@ -683,7 +700,10 @@ def build_revenue_recovery_projection(
         # formula. Ours moves 5.6x on denominator choice." The §6 definition of
         # done asks this surface for a split "with `n` beside it", so a
         # distribution carrying its own counts is what belongs here.
-        "headline": _headline_distribution(findings),
+        "headline": headline,
+        "selection": measurement.get("selection") or selection_measurement([]),
+        "selection_gap": measurement.get("selection_gap"),
+        "catalog_available": measurement.get("catalog_available"),
         "stages": [stages[name] for name in _STAGES],
     }
 
@@ -797,7 +817,7 @@ def build_projection(
 
 
 async def build_and_persist_all_projections(
-    *, audit_run_id: str,
+    *, audit_run_id: str, strict: bool = False,
 ) -> Dict[str, int]:
     """Load canonical data + build + upsert every PERSISTED projection.
 
@@ -814,12 +834,27 @@ async def build_and_persist_all_projections(
     summary = {
         "projections_built": 0,
         "projections_failed": 0,
+        # Strict mode only. A read-back that does not match what we built is a
+        # DIFFERENT failure from "this audience's builder raised": it means the
+        # row we believe we wrote is not the row the database holds. Callers
+        # that treat a partial projection failure as survivable (the URL lane)
+        # must still treat this one as fatal, so it needs its own counter
+        # rather than being folded into projections_failed.
+        "readback_mismatches": 0,
     }
 
     audit_row = await fetch_audit_run_by_id(run_id=audit_run_id)
     evidence = await list_evidence_for_run(audit_run_id=audit_run_id)
     findings = await list_findings_for_run(audit_run_id=audit_run_id)
     actions = await list_actions_for_run(audit_run_id=audit_run_id)
+
+    if strict and (audit_row is None or not findings):
+        # Accessors swallow database failures into None/[]; writing an empty
+        # projection successfully must not turn that failed read into completion.
+        logger.warning("strict projection input unavailable for audit=%s", audit_run_id)
+        return {"projections_built": 0,
+                "projections_failed": len(VALID_AUDIENCES - {AUDIENCE_PUBLIC_ANONYMOUS}),
+                "readback_mismatches": 0}
 
     # PR-codex-review-followup: the per-audience builders include a
     # merchant_id field inside the payload, but the report_projections
@@ -858,6 +893,12 @@ async def build_and_persist_all_projections(
                 builder_version=_BUILDER_VERSION,
                 merchant_id=merchant_id_for_row,
             )
+            if strict:
+                from db.audit_evidence import fetch_projection, _json_safe
+                stored = await fetch_projection(audit_run_id=audit_run_id, audience=audience)
+                if not stored or coerce_jsonb_to_dict(stored.get("payload_jsonb")) != _json_safe(payload):
+                    summary["readback_mismatches"] += 1
+                    raise RuntimeError("Projection read-back did not match the built payload")
             summary["projections_built"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.warning(

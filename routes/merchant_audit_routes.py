@@ -1557,6 +1557,9 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         # Number of catalogue gaps found, so the locked panel can say "6 gaps"
         # instead of rendering as an empty section.
         "selection_gap": 0,
+        # First moves in the per-product strategic brief the /ask context
+        # carries under `product.plan` (see the ask-context branch below).
+        "plan_moves": 0,
     }
     teaser_headline = None
 
@@ -1698,6 +1701,64 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
                 counts["prioritized_actions"], len(stage_actions)
             )
             stage["actions"] = []
+
+    # THE /ask LLM CONTEXT is the fourth shape this helper is handed
+    # (`_build_ask_context` -> `_apply_actions_paywall`), and it carries the
+    # paid layer under two keys nothing above visits:
+    #
+    #   context["overview"]["top_actions"]        the prioritized-action
+    #                                             HEADLINES, verbatim
+    #   context["product"]["plan"]                the LLM strategic brief —
+    #                                             your_angle / the_call /
+    #                                             first_moves
+    #
+    # so /ask stamped `actions_locked: True` onto a context that still fed the
+    # entire plan to the model, which then answered the free-tier merchant's
+    # question out of it. The lock stamp is not the paywall; this is.
+    #
+    # The whole `plan` block goes, not three of its four keys. It exists only
+    # when `_ask_real_brief` accepted the run's REAL strategic brief (the
+    # deterministic fallback is already suppressed), so it is the paid
+    # artifact as a unit; keeping `why_you_lose` back out of it would leak the
+    # brief's framing of the fix while claiming the fix was locked.
+    #
+    # `product["what_ai_actually_said"]` STAYS FREE — a decision, not an
+    # oversight. `_ask_sku_slice` derives it from `opportunity.per_prompt`,
+    # and `opportunity` IS locked on the report envelope
+    # (_LOCKED_PER_SKU_ACTION_KEYS), so the asymmetry needs stating: the three
+    # fields the slice keeps are the buyer's QUERY TEXT, an EXCERPT of what
+    # the model answered, and the COMPETITOR it substituted. That is evidence
+    # — the same "what's wrong" layer this paywall leaves free everywhere else
+    # (scores, verdict, per-SKU findings, share-of-voice, revenue_recovery
+    # stage findings). None of it tells the merchant what to DO. `opportunity`
+    # is locked wholesale on the envelope because that object ALSO carries the
+    # derived recommendation the win plan is built from; the /ask slice
+    # already dropped that half and kept only the receipts. Locking the
+    # receipts too would paywall the diagnosis, which is the half we give away
+    # to sell the other one.
+    #
+    # And the whole /ask strip is DORMANT today: `_ACTIONS_PAYWALL_ENABLED`
+    # reads AUDIT_ACTIONS_PAYWALL_ENABLED and defaults to "false", and
+    # `_apply_actions_paywall` returns `shaped` untouched when the flag is
+    # off — so none of this runs until that env var is set to "true".
+    overview = shaped.get("overview")
+    if isinstance(overview, dict):
+        overview_actions = overview.get("top_actions")
+        if isinstance(overview_actions, list) and overview_actions:
+            counts["top_actions"] = max(
+                counts["top_actions"], len(overview_actions)
+            )
+            overview["top_actions"] = []
+
+    product = shaped.get("product")
+    if isinstance(product, dict):
+        plan = product.get("plan")
+        if isinstance(plan, dict) and plan:
+            counts["plan_moves"] = max(
+                counts["plan_moves"],
+                len([m for m in (plan.get("first_moves") or []) if m]),
+            )
+            product["plan"] = None
 
     shaped["actions_locked"] = True
     shaped["locked_counts"] = counts
@@ -4086,6 +4147,29 @@ def _build_ask_context(report: Dict[str, Any], product_key: Optional[str]) -> Di
     return ctx
 
 
+def _recovery_has_content(recovery: Any) -> bool:
+    """Does the recovery projection actually say anything about this merchant?
+
+    A projection is ALWAYS a populated dict — it carries its audience, builder
+    version and three stage scaffolds even for an empty report. So "is this
+    truthy" answers yes on a report with nothing in it, which is why the /ask
+    409 went dead. What makes it answerable is a finding or an action in some
+    stage; a selection measurement with no observations is the module's own
+    "unavailable" shape and grounds nothing.
+    """
+    if not isinstance(recovery, dict):
+        return False
+    for stage in recovery.get("stages") or []:
+        if isinstance(stage, dict) and (
+            stage.get("findings") or stage.get("actions")
+        ):
+            return True
+    selection = recovery.get("selection")
+    if isinstance(selection, dict) and selection.get("observations"):
+        return True
+    return False
+
+
 _ASK_SYSTEM_PROMPT = (
     "You are Pivota's AI-commerce-readiness assistant, helping a merchant "
     "understand their audit. Answer the QUESTION using ONLY the facts in "
@@ -4132,12 +4216,31 @@ async def answer_merchant_audit_question(
             detail="This audit doesn't have a report to answer from yet.",
         )
 
+    # The recovery projection is EXTRA grounding, not a replacement. It carries
+    # no narrative overview, no whats_working / where_youre_losing, no honest
+    # limits and no per-SKU slice, and it ignores product_key entirely — so
+    # swapping it in for _build_ask_context dropped everything the merchant's
+    # `product_key` selects while that key still keyed the debit. It also made
+    # `if not context` dead (a projection is always a populated dict), so an
+    # audit that used to 409 for free began charging a credit for a contentless
+    # context. Merge the two, and gate the 409 on what they actually contain.
+    from services.revenue_recovery_report import recovery_from_report
     context = _build_ask_context(report, body.product_key)
-    if not context:
+    recovery = recovery_from_report(
+        report, run_id=body.run_id,
+        catalog_available=False if run.get("subject_type") == "merchant_url" else None,
+    )
+    if not context and not _recovery_has_content(recovery):
         raise HTTPException(
             status_code=409,
             detail="This audit doesn't have enough detail to answer questions yet.",
         )
+    # Flat merge, not a nested key: _strip_actions_for_free_tier reads
+    # `stages[].actions` and `selection_gap` at the TOP level of what it is
+    # handed, so nesting the projection would hide the paid layer from the
+    # paywall it was just wired through.
+    context.update(recovery)
+    context = await _apply_actions_paywall(context, merchant_id)
 
     # Cost gate. Price one ungrounded Deepseek probe; gate free tiers up-front so
     # we never do the work for a merchant who can't pay. Paid tiers run on

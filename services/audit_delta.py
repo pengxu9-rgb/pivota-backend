@@ -56,6 +56,81 @@ MATERIAL_SCORE_DELTA = 15
 MATERIAL_SCORE_DELTA_SAME_BASIS = MATERIAL_SCORE_DELTA
 
 
+# WHY A PAIR IS NOT COMPARABLE, IN THE MERCHANT'S WORDS.
+#
+# Keyed by the machine-readable `reason` `_measurement_basis` stamps on every
+# not-comparable verdict. The degrade block below turns EVERY movement — score
+# and categorical alike — into direction="unknown"/verdict="not_comparable"
+# when `basis["same"] is not True` — but the HEADLINE is the only line most
+# readers see, and `_headline` has no not-comparable branch: with nothing
+# material left to name it fell through to "No material change since your last
+# audit N days ago — keep the current plan running." That sentence is two false
+# claims (we measured no change; therefore your plan is working) on a pair we
+# have just said we cannot compare, and it is written into report_jsonb. A
+# METHODOLOGY_VERSION bump makes it every merchant's next re-audit.
+NOT_COMPARABLE_REASONS = {
+    "prompt_basis_missing": (
+        "no measurement basis was recorded for one of these two runs (one of "
+        "them predates basis pinning)"
+    ),
+    "measurement_basis_missing": (
+        "no measurement basis was recorded for the prior run"
+    ),
+    "prompt_set_changed": (
+        "the set of questions we asked changed between the two runs"
+    ),
+    "measurement_basis_changed": (
+        "how these audits were measured changed — the models, the "
+        "official-domain set, the question mix or the market"
+    ),
+}
+_NOT_COMPARABLE_FALLBACK = (
+    "we cannot show the two runs were measured the same way"
+)
+
+
+def _not_comparable_reason(basis: Optional[Mapping[str, Any]]) -> str:
+    """The prose reason a pair cannot be compared, or the fallback when the
+    verdict carried no machine-readable `reason`. ONE lookup, shared by every
+    line that has to say WHY (the headline and the tracking read), so the two
+    can never name different reasons for the same refusal."""
+    reason = None
+    if isinstance(basis, Mapping):
+        reason = NOT_COMPARABLE_REASONS.get(str(basis.get("reason") or ""))
+    return reason or _NOT_COMPARABLE_FALLBACK
+
+
+def not_comparable_note(basis: Optional[Mapping[str, Any]]) -> str:
+    """The `tracked_metric_results` note for a pair we refused to compare."""
+    return (
+        f"Not comparable to your last audit: {_not_comparable_reason(basis)}. "
+        "No movement can be claimed either way."
+    )
+
+
+def not_comparable_headline(
+    basis: Optional[Mapping[str, Any]],
+    days_since: Optional[int],
+) -> str:
+    """The headline for a pair that cannot support a before/after claim.
+
+    SINGLE SOURCE. Both the producer (`build_reaudit_delta`) and the retained
+    report path (`services.report_summary_builder._since_last_audit`, which
+    rewrites the movements of an ALREADY PERSISTED delta) render this, so a
+    delta persisted as "improved" before the basis contract existed cannot be
+    re-served beside movements that all read `not_comparable`.
+
+    It names the reason when one was recorded, and it never advises the
+    merchant to keep or change a plan — the whole point is that this pair
+    licenses no conclusion about their store.
+    """
+    return (
+        f"Not comparable to your last audit{_day_phrase(days_since)}: "
+        f"{_not_comparable_reason(basis)}. No movement can be claimed "
+        "either way — read this run as a fresh baseline."
+    )
+
+
 def build_reaudit_delta(
     *,
     current_report: Mapping[str, Any],
@@ -97,8 +172,9 @@ def build_reaudit_delta(
         }
 
     # Resolve the measurement basis BEFORE diffing scores: if this run and the
-    # prior one were measured on the same pinned prompt set, a smaller move counts
-    # as material (W2). Categorical movements are exact-match and unaffected.
+    # prior one were measured on the same pinned prompt set, a smaller move
+    # counts as material (W2). Categorical movements are exact string matches,
+    # but that does NOT make them basis-free — see the degrade block below.
     basis = _measurement_basis(
         current_report, prior_report, current, prior, current_basis, prior_basis,
     )
@@ -132,10 +208,52 @@ def build_reaudit_delta(
             )
         )
 
+    # THE DEGRADE RUNS OVER EVERY MOVEMENT, categoricals included, and it runs
+    # AFTER they are appended. It used to sit above this loop, so the four
+    # categorical signals never reached it: a pair whose basis said
+    # "measurement_basis_changed" shipped `verdict: changed`, `is_material:
+    # True`, "Not yet visible -> Agent-ready" sitting directly beside three
+    # score movements reading `unknown` / `not_comparable`, and the
+    # `material_movements` counter on the summary contradicted the
+    # not-comparable headline above it.
+    #
+    # A CATEGORICAL LABEL IS NOT A BASIS-FREE OBSERVATION. Each of the four is
+    # derived from this run's model output under this run's methodology:
+    # `verdict` is a band label computed from the scores we have just refused
+    # to compare; `primary_gap` and `controller_archetype` come out of the
+    # next-best-action layer the LLM wrote; `top_controller` is the first host
+    # the models cited, which the 2026-09-01 model-generation change moved
+    # (multi-host 50% -> 86%) with no merchant behaviour change at all. So
+    # "the label changed" carries exactly the ambiguity the contract's "no
+    # numerical comparison without a complete basis" rule exists to refuse —
+    # we cannot tell the merchant's store from the measurement. Fail closed.
+    #
+    # A categorical read from a TABLE rather than from a model output (say
+    # "official domain verified") would be a real exception to this and could
+    # stay claimable; none of today's four is one, so there is no exception
+    # branch to write.
+    comparable = basis.get("same") is True
+    if not comparable:
+        for movement in movements:
+            movement.update(is_material=False, direction="unknown")
+            detection = movement.get("detection")
+            if not isinstance(detection, dict):
+                detection = {}
+                movement["detection"] = detection
+            detection["verdict"] = "not_comparable"
+
     return {
         "is_first_audit": False,
         "days_since_last": days_since,
-        "headline": _headline(movements, days_since),
+        # A not-comparable pair gets a headline that SAYS not comparable.
+        # _headline only knows "material" / "no material change", and the
+        # second of those carries "keep the current plan running" — advice we
+        # have no basis for on a pair we just refused to compare.
+        "headline": (
+            _headline(movements, days_since)
+            if comparable
+            else not_comparable_headline(basis, days_since)
+        ),
         "movements": movements,
         # W2 pinned basis: is this delta measured against the SAME prompt set
         # as the prior run? same=True licenses "you moved X→Y" as a real
@@ -144,9 +262,25 @@ def build_reaudit_delta(
         # (explicit refresh / generator version bump) and score movement partly
         # reflects the new questions; same=None means one side predates stamping.
         "measurement_basis": basis,
-        "tracked_metric_results": [
-            _tracked_metric_result(metric, movements) for metric in metrics
-        ],
+        # THE TRACKING READ IS THE SAME CLAIM ONE LAYER DOWN. Every tracked
+        # metric is derived from the movements the degrade block above just
+        # stamped direction="unknown"/verdict="not_comparable", but
+        # `_tracked_metric_result` only knows "moved" / "unchanged": with
+        # nothing material left it returned status="unchanged" with the note
+        # "…; no material movement" for every metric. Both renderers print
+        # that verbatim — "Tracking read: AI visibility rate: unchanged" —
+        # directly beneath the "Not comparable" headline, which is exactly the
+        # false no-change claim the headline branch above exists to refuse.
+        # So on a not-comparable pair the tracking read goes through the same
+        # `_not_measurable` the first-audit branch uses, naming the reason.
+        "tracked_metric_results": (
+            [_tracked_metric_result(metric, movements) for metric in metrics]
+            if comparable
+            else [
+                _not_measurable(metric, not_comparable_note(basis))
+                for metric in metrics
+            ]
+        ),
     }
 
 
@@ -185,25 +319,84 @@ def _basis_id(basis: Mapping[str, Any]) -> Optional[str]:
     )
 
 
+def _basis_rows(container: Any) -> List[Mapping[str, Any]]:
+    """The per-product report rows of one container, in BOTH shapes they
+    arrive in: `per_product` (the legacy `build_structured_report` lane) and
+    `per_sku_reports` (the per-SKU wedge). Ordered as `_primary_report` reads
+    them, so "the first row" means the same thing on both sides."""
+    if not isinstance(container, Mapping):
+        return []
+    rows = container.get("per_product")
+    if not isinstance(rows, list):
+        rows = container.get("per_sku_reports")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, Mapping)]
+
+
+def prompt_basis_blocks(
+    full_report: Optional[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    """Every `prompt_basis` block a report carries, in ONE precedence.
+
+    THE WRITER AND THE READER SHARE THIS LIST, and that is the whole point.
+    `audit_evidence_builder._prompt_basis_blocks` (which records the run's
+    pinned set ids into the immutable basis row) had its own ordering: it took
+    per-product ROWS first from both containers, then container roots. This
+    reader took the PRIMARY report's own block first — and on a report
+    carrying a root `prompt_basis` beside a nested
+    `brand_report.per_sku_reports`, `_primary_report` returns the report
+    itself, so the writer recorded the nested row's id while the delta
+    resolved the root's. Two runs of that shape then compared a recorded id
+    against a resolved one and disagreed about whether they were the same
+    measurement.
+
+    Order:
+      1. the PRIMARY report's block — the first per_product/per_sku row when
+         the top-level report carries rows, else the report itself;
+      2. the remaining rows, top-level container then nested `brand_report`;
+      3. the container roots, last.
+
+    Deduplicated by identity, so the primary row is not visited twice.
+    """
+    report = full_report if isinstance(full_report, Mapping) else {}
+    ordered: List[Mapping[str, Any]] = []
+
+    def _add(candidate: Any) -> None:
+        if isinstance(candidate, Mapping) and not any(
+            candidate is block for block in ordered
+        ):
+            ordered.append(candidate)
+
+    containers: List[Mapping[str, Any]] = [report]
+    nested = report.get("brand_report")
+    if isinstance(nested, Mapping):
+        containers.append(nested)
+
+    top_rows = _basis_rows(report)
+    _add((top_rows[0] if top_rows else report).get("prompt_basis"))
+    for container in containers:
+        for row in _basis_rows(container):
+            _add(row.get("prompt_basis"))
+    for container in containers:
+        _add(container.get("prompt_basis"))
+    return ordered
+
+
 def _prompt_set_id(
     full_report: Optional[Mapping[str, Any]],
-    primary: Mapping[str, Any],
+    primary: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """The pinned basis identity for a report, tolerant of both shapes: the
-    per-product/primary report carrying `prompt_basis` directly, or the full
-    payload carrying it under brand_report.per_sku_reports[0]. Prefers the
-    W2.1 selected-set identity over the W2 LLM-list identity."""
-    from_primary = _basis_id(primary.get("prompt_basis"))
-    if from_primary:
-        return from_primary
-    report = full_report if isinstance(full_report, Mapping) else {}
-    brand = report.get("brand_report")
-    if isinstance(brand, Mapping):
-        report = brand
-    for sku_report in report.get("per_sku_reports") or []:
-        if not isinstance(sku_report, Mapping):
-            continue
-        basis_id = _basis_id(sku_report.get("prompt_basis"))
+    """The pinned basis identity for a report, tolerant of every shape
+    `prompt_basis_blocks` walks. Prefers the W2.1 selected-set identity over
+    the W2 LLM-list identity, and takes the first block that carries either.
+
+    `primary` is accepted and ignored: callers used to pass
+    `_primary_report(report)` alongside, and `prompt_basis_blocks` now derives
+    it from the report itself so the writer can share the same precedence
+    without also reproducing `_primary_report`."""
+    for basis in prompt_basis_blocks(full_report):
+        basis_id = _basis_id(basis)
         if basis_id:
             return basis_id
     return None
@@ -228,6 +421,10 @@ def _measurement_basis(
     if not current_id or not prior_id:
         return {
             "same": None,
+            # `reason` is the MACHINE-READABLE half of every not-comparable
+            # verdict; `note` is prose and must never be parsed. It keys
+            # NOT_COMPARABLE_REASONS so the headline can name WHY.
+            "reason": "prompt_basis_missing",
             "prompt_set_id": current_id,
             "note": (
                 "One of the compared runs predates prompt-basis pinning, so "
@@ -238,6 +435,7 @@ def _measurement_basis(
     if not same:
         return {
             "same": False,
+            "reason": "prompt_set_changed",
             "prompt_set_id": current_id,
             "note": (
                 "The prompt set changed between these runs (measurement basis "
@@ -254,30 +452,49 @@ def _measurement_basis(
     # so tightened the materiality mask from 15 points to 5, which is the
     # direction that manufactures movement rather than hiding it.
     #
-    # Absent basis rows fall through to the prompt-set verdict unchanged: runs
-    # that predate audit_basis carry no evidence of a model change either way,
-    # and failing them closed would silently desensitise every merchant's next
-    # re-audit. This is strictly additive — it can only ever turn a True into a
-    # False, never the reverse.
-    if isinstance(current_basis, Mapping) and isinstance(prior_basis, Mapping):
-        from db.audit_basis import bases_are_comparable
-
-        if not bases_are_comparable(current_basis, prior_basis):
-            return {
-                "same": False,
+    # ABSENT BASIS ROWS ARE UNKNOWN, NOT "UNCHANGED". An earlier cut let them
+    # fall through to the prompt-set verdict, on the argument that a run
+    # predating audit_basis carries no evidence of a model change either way.
+    # That is true and it is the wrong conclusion: no evidence of a change is
+    # also no evidence of SAMENESS, and the fall-through spent that ignorance on
+    # the merchant-facing side, licensing "you moved X → Y" on a pair we cannot
+    # show was measured the same way. So a missing basis on either side answers
+    # None (see docs/audits/revenue-recovery-contract.md), and callers that read
+    # `same is not True` — build_reaudit_delta's movements, the outreach-outcome
+    # query claims, services/audit_stability_canary — degrade to "unknown"
+    # rather than asserting.
+    #
+    # CONSEQUENCE FOR CALLERS: a caller that does not PASS the two runs' bases
+    # gets None for every pair, forever, silently. audit_stability_canary reads
+    # them for exactly this reason.
+    if not isinstance(current_basis, Mapping) or not isinstance(prior_basis, Mapping):
+        return {"same": None, "reason": "measurement_basis_missing",
                 "prompt_set_id": current_id,
-                "basis_divergence": "measurement_basis",
-                "note": (
-                    "The same questions were asked, but something else about "
-                    "how this audit was measured changed (the model, the "
-                    "official-domain set, the question mix or the market), so "
-                    "score movement partly reflects the new measurement rather "
-                    "than your store."
-                ),
-            }
+                "note": "The full measurement basis is unavailable; improvement cannot be established."}
+    # No `isinstance` re-check here: the guard above already returned for every
+    # non-Mapping input, so the old `if isinstance(...) and isinstance(...)`
+    # wrapper could only ever be True — dead syntax that read like a second,
+    # independent gate.
+    from db.audit_basis import bases_are_comparable
+
+    if not bases_are_comparable(current_basis, prior_basis):
+        return {
+            "same": False,
+            "reason": "measurement_basis_changed",
+            "prompt_set_id": current_id,
+            "basis_divergence": "measurement_basis",
+            "note": (
+                "The same questions were asked, but something else about "
+                "how this audit was measured changed (the model, the "
+                "official-domain set, the question mix or the market), so "
+                "score movement partly reflects the new measurement rather "
+                "than your store."
+            ),
+        }
 
     return {
         "same": True,
+        "contract_version": "2",
         "prompt_set_id": current_id,
         "note": (
             "Measured on the same prompt set as your last audit — score "
@@ -445,6 +662,12 @@ def _categorical_movement(
     prior: Optional[str],
     current: Optional[str],
 ) -> Dict[str, Any]:
+    """The CLAIMABLE form of a categorical signal — what it says when the two
+    runs were measured the same way. Every caller must send the result through
+    the not-comparable degrade in `build_reaudit_delta` (or the equivalent in
+    `report_summary_builder._since_last_audit`) first: these labels are derived
+    from the run's own model output under the run's own methodology, so a
+    methodology change moves them for reasons that are not the merchant's."""
     changed = bool(prior and current and prior != current)
     return {
         "signal": signal,

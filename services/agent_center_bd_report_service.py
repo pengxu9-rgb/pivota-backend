@@ -13826,6 +13826,36 @@ async def run_brand_report(
         # rendered number reads from it yet (phase-2 cutover); W7 invariants
         # and parity logging do. Best-effort: a stamp failure must never sink
         # the report.
+        # The selection-observation loop gets its OWN try. Sharing the
+        # run_facts try meant one bad observation — a `_probe_run_id` that
+        # json.dumps could not serialize, say — dropped run_facts for the whole
+        # run, and the two have no dependency on each other. Counted so a
+        # partial stamp is visible instead of silent.
+        _selection_observation_failures = 0
+        try:
+            from services.selection_measurement import response_observations
+            for _r in per_sku_reports:
+                try:
+                    _r["selection_observations"] = response_observations(
+                        _flatten_probe_runs(probe_runs_by_sku.get(_r.get("sku_key"), [])),
+                        sku_key=_r.get("sku_key"), merchant_host=_merchant_host,
+                        merchant_brand=merchant_name, merchant_vendors=_merchant_vendors,
+                    )
+                except Exception:  # noqa: BLE001
+                    _selection_observation_failures += 1
+                    _r["selection_observations"] = []
+                    logger.warning(
+                        "selection observations failed for sku=%s",
+                        _r.get("sku_key"), exc_info=True,
+                    )
+        except Exception:  # noqa: BLE001
+            _selection_observation_failures += 1
+            logger.warning("selection observation stamp failed", exc_info=True)
+        if _selection_observation_failures:
+            brand_rollup["selection_observation_failures"] = (
+                _selection_observation_failures
+            )
+
         try:
             _facts_by_sku = {
                 _sku_key: compute_run_facts(

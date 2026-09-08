@@ -90,7 +90,7 @@ def wired(monkeypatch):
         return {"plan_tier": state["tier"]}
 
     async def fake_projection(*, audit_run_id, audience):
-        return {"payload_jsonb": state["projection"]} if state["projection"] else None
+        return {"payload_jsonb": state["projection"], "builder_version": "1.2.0"} if state["projection"] else None
 
     # Patched at the SOURCE modules: audit_runs_routes imports both names
     # locally inside the handler, so they are not attributes of `arr` and a
@@ -198,3 +198,90 @@ def test_the_generic_readers_exclude_the_funnel_lane():
         "recent_runs_for_merchant feeds the history list, the trend inputs "
         "and the tasks lookup — unscoped it must still exclude the funnel lane"
     )
+
+
+def test_legacy_recovery_rebuild_preserves_unknown_and_url_scope(wired):
+    res = _client().get('/api/audits/r-1?audience=revenue_recovery')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['historical_rebuild'] is True
+    assert data['catalog_available'] is False
+    assert data['selection']['tiers']['branded']['brand_mentioned']['rate'] is None
+    assert 'PAID-QUERY' not in _body(res)
+
+
+def test_recovery_cannot_rebuild_another_merchants_report(wired):
+    wired['row']['merchant_id'] = 'another-merchant'
+    assert _client().get('/api/audits/r-1?audience=revenue_recovery').status_code == 404
+
+
+def test_catalog_picker_query_is_tenant_scoped_and_paged(monkeypatch):
+    from db.database import database
+    from sqlalchemy.dialects import postgresql
+    seen = []
+
+    async def fetch_all(query):
+        compiled = query.compile(dialect=postgresql.dialect())
+        seen.append((str(compiled), compiled.params))
+        return [dict(product_key=f'url|{n}', platform='url', source_product_id=str(n), title=f'Product {n}') for n in range(3)]
+
+    monkeypatch.setattr(database, 'fetch_all', fetch_all)
+    res = _client().get('/api/audits/products?limit=2&offset=4')
+    assert res.status_code == 200
+    assert len(res.json()['products']) == 2 and res.json()['next_offset'] == 6
+    sql, params = seen[0]
+    assert 'catalog_products.merchant_id =' in sql
+    assert 'm-1' in params.values() and 4 in params.values() and 3 in params.values()
+    assert _client().get('/api/audits/products?limit=501').status_code == 422
+
+
+# ---- served iff delivered ---------------------------------------------------
+#
+# The read side of the W6 charged-iff-delivered invariant
+# (tests/test_billing_charged_iff_delivered.py). Projections are committed
+# DURING verifying; a run that then fails is transitioned to `failed` and its
+# launch debit refunded, but the committed report_projections rows survive.
+# This route served them to anyone who asked by audience — the merchant got
+# their money back AND kept the deliverable, and a strict projection read-back
+# mismatch is itself one of the two things that fails a URL run, so the rows
+# most likely to be left behind are the ones we could not prove we stored.
+
+
+def _recovery_projection() -> Dict[str, Any]:
+    return {
+        "audience": "revenue_recovery",
+        "stages": [{"stage": "get_selected", "status": "MEASURED",
+                    "findings": [{"type": "category_visibility_low",
+                                  "severity": "high",
+                                  "summary": "FREE-FINDING"}],
+                    "actions": []}],
+    }
+
+
+@pytest.mark.parametrize("stage", ["failed", "cancelled", "verifying"])
+def test_an_undelivered_run_does_not_serve_its_committed_projection(
+    wired, stage,
+):
+    """`failed` is the reported case; `cancelled` is refunded on the same
+    argument (_should_refund_cancelled_launch) and `verifying` has not been
+    delivered yet — which is exactly what this route's own 409 has always
+    claimed the rule was."""
+    wired["tier"] = "pro"  # the paywall must not be what hides this
+    wired["row"]["stage"] = stage
+    wired["projection"] = _recovery_projection()
+
+    res = _client().get("/api/audits/r-1?audience=revenue_recovery")
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["current_stage"] == stage
+    assert "FREE-FINDING" not in _body(res)
+
+
+def test_a_completed_run_still_serves_its_projection(wired):
+    """The positive counterpart: a gate that refused everything would pass
+    the test above."""
+    wired["tier"] = "pro"
+    wired["projection"] = _recovery_projection()
+    res = _client().get("/api/audits/r-1?audience=revenue_recovery")
+    assert res.status_code == 200
+    assert "FREE-FINDING" in _body(res)

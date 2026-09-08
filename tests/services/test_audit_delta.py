@@ -1,6 +1,23 @@
 from __future__ import annotations
 
-from services.audit_delta import build_reaudit_delta, measurement_basis_between
+from services.audit_delta import build_reaudit_delta, measurement_basis_between as _measurement_basis_between
+
+
+def _basis():
+    return {"methodology_version": "2", "providers_and_models": {"gemini": {"model_id": "g"}},
+            "primary_destination_version": 1, "prompt_set_id": "p", "selected_set_id": "s",
+            "official_domains": ["brand.com"], "tier_mix": {"category": 10}, "market": "US", "language": "en"}
+
+
+def compare_pinned_runs(**kwargs):
+    # Numerical movement tests have a full recorded basis; missing-basis
+    # behavior is covered independently in test_audit_delta_basis.
+    return build_reaudit_delta(**kwargs, current_basis=_basis(), prior_basis=_basis())
+
+
+def measurement_basis_between(current, prior):
+    return _measurement_basis_between(current, prior, _basis(), _basis())
+
 
 
 def _report(
@@ -48,8 +65,7 @@ def _report(
             },
         },
     }
-    if prompt_basis is not None:
-        report["prompt_basis"] = prompt_basis
+    report["prompt_basis"] = {"selected_set_id": "default"} if prompt_basis is None else prompt_basis
     return report
 
 
@@ -68,7 +84,7 @@ def test_probe_noise_does_not_create_material_movement():
     prior = _report(visibility=60, attribution=45, category_visibility=55)
     current = _report(visibility=68, attribution=52, category_visibility=60)
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -91,7 +107,7 @@ def test_band_boundary_jitter_is_not_material():
     prior = _report(attribution=38)
     current = _report(attribution=41)
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -112,7 +128,7 @@ def test_within_band_real_improvement_is_material():
     prior = _report(attribution=50)
     current = _report(attribution=66)
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -128,7 +144,7 @@ def test_band_crossing_score_improvement_is_material():
     prior = _report(attribution=35)
     current = _report(attribution=55)
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -170,7 +186,7 @@ def test_same_basis_does_not_buy_a_threshold_below_the_measured_floor():
     assert MATERIAL_SCORE_DELTA_SAME_BASIS == MATERIAL_SCORE_DELTA
 
     pinned = {"selected_set_id": "sel_abc"}
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=_report(attribution=53, prompt_basis=pinned),
         prior_report=_report(attribution=45, prompt_basis=pinned),
         prior_row={"run_id": "prior"},
@@ -191,7 +207,7 @@ def test_a_sub_threshold_move_is_reported_as_undetectable_not_as_stable():
     12-point drop that is false; what is true is that the move is smaller than
     this basis can resolve. The distinction is the whole point of the floor."""
     pinned = {"selected_set_id": "sel_abc"}
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=_report(attribution=40, prompt_basis=pinned),
         prior_report=_report(attribution=52, prompt_basis=pinned),
         prior_row={"run_id": "prior"},
@@ -208,7 +224,7 @@ def test_a_sub_threshold_move_is_reported_as_undetectable_not_as_stable():
 def test_a_move_clear_of_the_floor_is_reported_as_resolved():
     """The positive counterpart: the floor must not swallow everything."""
     pinned = {"selected_set_id": "sel_abc"}
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=_report(attribution=70, prompt_basis=pinned),
         prior_report=_report(attribution=45, prompt_basis=pinned),
         prior_row={"run_id": "prior"},
@@ -225,7 +241,7 @@ def test_a_move_clear_of_the_floor_is_reported_as_resolved():
 def test_a_signal_missing_on_one_side_is_not_called_stable():
     """No prior value is not a zero move."""
     pinned = {"selected_set_id": "sel_abc"}
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=_report(attribution=45, prompt_basis=pinned),
         prior_report=_report(attribution=None, prompt_basis=pinned),
         prior_row={"run_id": "prior"},
@@ -243,7 +259,7 @@ def test_different_basis_keeps_loose_threshold():
     prior = _report(attribution=45, prompt_basis={"selected_set_id": "sel_old"})
     current = _report(attribution=53, prompt_basis={"selected_set_id": "sel_new"})
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -252,17 +268,17 @@ def test_different_basis_keeps_loose_threshold():
 
     assert delta["measurement_basis"]["same"] is False
     movement = _movement(delta, "attribution")
-    assert movement["direction"] == "stable"
+    assert movement["direction"] == "unknown"
     assert movement["is_material"] is False
 
 
 def test_unknown_basis_keeps_loose_threshold():
     """W2: if one side predates prompt-basis pinning (same=None), stay conservative
     — an 8-point move is not asserted as material."""
-    prior = _report(attribution=45)  # no prompt_basis
+    prior = _report(attribution=45, prompt_basis={})  # no prompt basis
     current = _report(attribution=53, prompt_basis={"selected_set_id": "sel_new"})
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -277,7 +293,7 @@ def test_controller_archetype_flip_is_neutral_material_change():
     prior = _report(controller_strategy="leading_retailer_competition")
     current = _report(controller_strategy="source_authority_gap")
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -292,8 +308,8 @@ def test_controller_archetype_flip_is_neutral_material_change():
 
 
 def test_first_audit_establishes_baseline():
-    delta = build_reaudit_delta(
-        current_report=_report(),
+    delta = compare_pinned_runs(
+        current_report=_report(prompt_basis={}),
         prior_report=None,
         prior_row=None,
         days_since=None,
@@ -335,7 +351,7 @@ def test_tracked_metric_results_map_only_stored_signals():
     prior = _report(attribution=35, top_controller="walmart.com")
     current = _report(attribution=55, top_controller="target.com")
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -356,7 +372,7 @@ def test_measurement_basis_between_matches_build_reaudit_delta():
     prior = _report(prompt_basis={"selected_set_id": "sel_abc"})
     current = _report(prompt_basis={"selected_set_id": "sel_abc"})
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -395,7 +411,7 @@ def test_full_brand_report_shape_uses_first_per_product_report():
     prior = {"per_product": [_report(attribution=35)]}
     current = {"per_product": [_report(attribution=55)]}
 
-    delta = build_reaudit_delta(
+    delta = compare_pinned_runs(
         current_report=current,
         prior_report=prior,
         prior_row={"run_id": "prior"},
@@ -403,3 +419,140 @@ def test_full_brand_report_shape_uses_first_per_product_report():
     )
 
     assert _movement(delta, "attribution")["direction"] == "improved"
+
+
+# ---------------------------------------------------------------------------
+# A not-comparable pair must not be narrated as a definite verdict.
+#
+# The degrade block turns every score movement into direction="unknown" /
+# verdict="not_comparable" — and then `_headline`, which has no
+# not-comparable branch, saw nothing material and said "No material change
+# since your last audit N days ago — keep the current plan running." Two
+# claims we cannot support (nothing moved; your plan is working), persisted
+# into report_jsonb, on the pair we had just refused to compare.
+# ---------------------------------------------------------------------------
+
+
+def _not_comparable_delta(**overrides):
+    """visibility 41 -> 63 (a 22-point move, well over the 15-point floor) on
+    a pair with NO recorded measurement basis."""
+    kwargs = {
+        "current_report": _report(visibility=63),
+        "prior_report": _report(visibility=41),
+        "prior_row": {"run_id": "prior"},
+        "days_since": 30,
+        "current_basis": None,
+        "prior_basis": None,
+    }
+    kwargs.update(overrides)
+    return build_reaudit_delta(**kwargs)
+
+
+def test_not_comparable_pair_headline_says_not_comparable():
+    delta = _not_comparable_delta()
+
+    assert delta["measurement_basis"]["same"] is None
+    assert all(m["direction"] == "unknown" for m in delta["movements"]
+               if m["signal"] in ("visibility", "attribution",
+                                  "category_visibility"))
+    headline = delta["headline"]
+    assert headline.startswith("Not comparable to your last audit 30 days ago")
+    # The exact sentence the pair cannot support, in either direction.
+    assert "keep the current plan running" not in headline
+    assert "No material change" not in headline
+    assert "Material change" not in headline
+
+
+def test_not_comparable_headline_names_the_reason_when_one_is_known():
+    from services.audit_delta import NOT_COMPARABLE_REASONS
+
+    missing = _not_comparable_delta()
+    assert NOT_COMPARABLE_REASONS["measurement_basis_missing"] in missing["headline"]
+
+    prompt_set_changed = _not_comparable_delta(
+        current_report=_report(visibility=63,
+                               prompt_basis={"selected_set_id": "sel_new"}),
+        prior_report=_report(visibility=41,
+                             prompt_basis={"selected_set_id": "sel_old"}),
+        current_basis=_basis(),
+        prior_basis=_basis(),
+    )
+    assert prompt_set_changed["measurement_basis"]["same"] is False
+    assert (NOT_COMPARABLE_REASONS["prompt_set_changed"]
+            in prompt_set_changed["headline"])
+
+    unpinned = _not_comparable_delta(
+        current_report=_report(visibility=63, prompt_basis={}),
+        prior_report=_report(visibility=41, prompt_basis={}),
+        current_basis=_basis(),
+        prior_basis=_basis(),
+    )
+    assert unpinned["measurement_basis"]["same"] is None
+    assert NOT_COMPARABLE_REASONS["prompt_basis_missing"] in unpinned["headline"]
+
+
+def test_not_comparable_pair_tracking_read_is_not_measurable_not_unchanged():
+    """The headline branch above is only half the claim. `tracked_metric_results`
+    is derived from the SAME movements the degrade block stamped
+    `not_comparable`, and `_tracked_metric_result` only knows "moved" /
+    "unchanged": with nothing material left every metric came back
+    status="unchanged", note "…; no material movement". Both renderers print
+    that verbatim — "Tracking read: AI visibility rate: unchanged" — directly
+    beneath a "Not comparable" headline. Same false no-change claim, one layer
+    down."""
+    from services.audit_delta import NOT_COMPARABLE_REASONS
+
+    delta = _not_comparable_delta()
+    tracked = delta["tracked_metric_results"]
+
+    assert tracked, "the fixture's tracking metrics must survive the branch"
+    assert {row["status"] for row in tracked} == {"not_measurable"}
+    for row in tracked:
+        assert NOT_COMPARABLE_REASONS["measurement_basis_missing"] in row["note"]
+        assert "no material movement" not in row["note"]
+
+    # And the reason travels: a changed prompt set says so.
+    changed = _not_comparable_delta(
+        current_report=_report(visibility=63,
+                               prompt_basis={"selected_set_id": "sel_new"}),
+        prior_report=_report(visibility=41,
+                             prompt_basis={"selected_set_id": "sel_old"}),
+        current_basis=_basis(),
+        prior_basis=_basis(),
+    )
+    assert all(
+        NOT_COMPARABLE_REASONS["prompt_set_changed"] in row["note"]
+        and row["status"] == "not_measurable"
+        for row in changed["tracked_metric_results"]
+    )
+
+    # A COMPARABLE pair is untouched: the ordinary tracking read still reads
+    # "unchanged" with the mapped-signal note.
+    flat = compare_pinned_runs(
+        current_report=_report(),
+        prior_report=_report(),
+        prior_row={"run_id": "prior"},
+        days_since=30,
+    )
+    citation = _metric(flat, "First-party citation rate")
+    assert citation["status"] == "unchanged"
+    assert "no material movement" in citation["note"]
+
+
+def test_a_comparable_pair_still_gets_the_ordinary_headline():
+    """The guard above must not swallow the real verdicts."""
+    moved = compare_pinned_runs(
+        current_report=_report(attribution=55),
+        prior_report=_report(attribution=35),
+        prior_row={"run_id": "prior"},
+        days_since=30,
+    )
+    assert "improved: First-party citation" in moved["headline"]
+
+    flat = compare_pinned_runs(
+        current_report=_report(),
+        prior_report=_report(),
+        prior_row={"run_id": "prior"},
+        days_since=30,
+    )
+    assert flat["headline"].startswith("No material change")

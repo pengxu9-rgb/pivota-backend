@@ -66,7 +66,7 @@ def _inferred(monkeypatch, *hosts):
     """Pin the inferred tier. Patches the extracted inference function, so the
     onboarding/catalog queries never run."""
 
-    async def _hosts(merchant_id):
+    async def _hosts(merchant_id, **kwargs):
         return set(hosts)
 
     monkeypatch.setattr(svc, "_inferred_merchant_hosts", _hosts)
@@ -635,7 +635,7 @@ async def test_sweep_reports_an_empty_queue_distinctly_from_a_silent_one(
     _inferred(monkeypatch)
     summary = await live.refresh_official_domain_liveness(MERCHANT)
     assert summary == {
-        "due": 0, "checked": 0, "seeded": 0, "deadline_hit": False,
+        "due": 0, "checked": 0, "seeded": 0, "seed_failed": False, "deadline_hit": False,
         "verdicts": {live.LIVE: 0, live.DEAD: 0, live.UNVERIFIABLE: 0},
     }
     assert calls == []

@@ -803,13 +803,9 @@ async def _process_one_audit_run_inner(
             ):
                 return True
             if is_synthetic:
-                # URL-audit minimal completion: skip canonical-evidence,
-                # verifiers, audience projections, and verification-enqueue —
-                # all catalog-coupled, and the /url-readiness GET reads
-                # report_jsonb directly (no projection needed). Crucially, the
-                # post-processing block below FAILS the whole run if projection
-                # build or verification-enqueue raises (which they can on
-                # synthetic product_keys), so synthetic runs must not enter it.
+                brand_report["catalog_dimensions_available"] = False
+                # Persist URL evidence and projections before completion, while
+                # keeping catalog verifiers and their enqueue out of this lane.
                 await _record_final_report_fields(
                     run_id=run_id,
                     brand_report=brand_report,
@@ -826,9 +822,37 @@ async def _process_one_audit_run_inner(
                 cost_summary = await _aggregate_cost_summary_for_run(
                     run_id=run_id, brand_report=brand_report,
                 )
+                try:
+                    canonical, projections = await _persist_url_recovery(
+                        run_id=run_id, merchant_id=merchant_id, brand_report=brand_report,
+                    )
+                except Exception as exc:
+                    await _fail_run_and_refund(
+                        run_id=run_id, merchant_id=merchant_id, launch_options=launch_options,
+                        from_stage=mar.STAGE_VERIFYING, cost_summary_jsonb=cost_summary,
+                        error_jsonb={"stage": "url_recovery_persistence", "message": str(exc)[:200]},
+                        reason="verifying_post_processing",
+                    )
+                    return True
                 await mar.record_partial_result(
                     run_id=run_id, worker_id=WORKER_ID,
-                    partial_result_jsonb={"verifying": {"skipped": "url_audit"}},
+                    partial_result_jsonb={"verifying": {
+                        "canonical_evidence": canonical, "projections": projections,
+                        "catalog_verifiers": "skipped: no connected catalog",
+                        # Evidence persistence is best-effort (see
+                        # _persist_url_recovery); a degraded run completes, so
+                        # the degradation has to be legible in the run's own
+                        # facts rather than only in a log line.
+                        "evidence_persistence_degraded": bool(
+                            canonical.get("evidence_persistence_degraded")
+                        ),
+                        "evidence_persistence_failed_or_skipped_total": canonical.get(
+                            "evidence_persistence_failed_or_skipped_total", 0
+                        ),
+                        "projections_failed": projections.get(
+                            "projections_failed", 0
+                        ),
+                    }},
                 )
                 ok = await mar.transition_stage(
                     run_id=run_id,
@@ -2034,3 +2058,108 @@ async def _lease_heartbeat(
                 "_lease_heartbeat: extend raised for run_id=%s: %s; "
                 "continuing", run_id, str(exc)[:200],
             )
+
+
+# The counters that mean canonical rows DID NOT LAND — survivable here (the
+# run completes and is not refunded), but they must all reach
+# `evidence_persistence_degraded` so a degraded run is visible.
+#
+# `evidence_items_skipped_unidentified` counts rows dropped BEFORE the insert
+# because the producer gave them no `observation_id`. It is a skip, not an
+# insert failure, which is why it was not in this tuple — and that is exactly
+# the shape of bug this dial exists to catch: a transient insert error is one
+# row out of hundreds, while a producer that stops stamping observation ids
+# drops EVERY selection_response in the run, silently, with every "failed"
+# counter still reading 0 and `evidence_persistence_degraded` reading False.
+# The loud-failure counter has to count the systematic case, not only the
+# flaky one.
+_URL_EVIDENCE_FAILURE_KEYS = (
+    "evidence_items_failed", "findings_failed", "actions_failed",
+    "evidence_items_skipped_unidentified",
+)
+
+
+async def _persist_url_recovery(*, run_id, merchant_id, brand_report):
+    """URL reports have evidence too. Catalog verification remains a separate lane.
+
+    WHAT MAY FAIL THE RUN, AND WHY IT IS NOT "anything went wrong".
+
+    This function's caller runs `_fail_run_and_refund(...)` on any exception,
+    and it does so AFTER `_record_final_report_fields` has already persisted
+    the report. A raise here therefore marks a DELIVERED audit failed: the run
+    never reaches `completed`, `get_audit_run` (which requires the completed
+    stage) can no longer serve it, and the merchant is refunded for work they
+    actually received. That is a heavy hammer, and the first cut swung it at
+    every counter — including `evidence_items_failed`, which now increments
+    once per FAILED ROW. `response_observations` deposits one
+    `selection_response` row per product x provider x response, each its own
+    insert, so a single transient insert error out of hundreds destroyed the
+    whole audit. The catalog lane immediately below this one is best-effort
+    for exactly this reason.
+
+    So: evidence / findings / actions persistence is best-effort. Failures are
+    counted, logged loudly, and returned in the summary the caller writes into
+    the run's partial result, so a degraded run is VISIBLE rather than silent
+    — but it completes and it is not refunded.
+
+    Two things still fail the run, because in both the report we would serve is
+    not the report we believe we stored:
+      * TOTAL projection failure — not one projection row written, so there is
+        nothing for the recovery surface to read; and
+      * a strict read-back mismatch — the row the database holds is not the row
+        we built, which no retry-later can be assumed to reconcile.
+    Both are idempotent to retry.
+    """
+    from copy import deepcopy
+    from services.audit_evidence_builder import persist_canonical_evidence
+    from services.audit_projection_builder import build_and_persist_all_projections
+    report = deepcopy(brand_report)
+    report["catalog_dimensions_available"] = False
+    canonical = await persist_canonical_evidence(
+        audit_run_id=run_id, merchant_id=merchant_id, brand_report=report,
+    )
+    failures = {
+        key: int(canonical.get(key) or 0) for key in _URL_EVIDENCE_FAILURE_KEYS
+    }
+    # NAMED FOR WHAT IT COUNTS. This was `evidence_persistence_failed_total`
+    # while every key it summed was an insert FAILURE; it now also sums
+    # `evidence_items_skipped_unidentified`, which is a row dropped before the
+    # insert ever ran. A reader who took the old name literally would have
+    # concluded the inserts were fine. Renamed rather than commented because
+    # nothing in services/ or tests/ reads the old key. It IS persisted, into
+    # `partial_result_jsonb.verifying` below, so runs written before this
+    # change carry the old key there and a query over historical rows must
+    # accept both.
+    canonical["evidence_persistence_failed_or_skipped_total"] = sum(
+        failures.values()
+    )
+    canonical["evidence_persistence_degraded"] = bool(
+        canonical["evidence_persistence_failed_or_skipped_total"]
+    )
+    if canonical["evidence_persistence_degraded"]:
+        logger.warning(
+            "_persist_url_recovery: DEGRADED run_id=%s merchant=%s — canonical "
+            "rows failed to persist (%s); the run still completes and is not "
+            "refunded, but this audit's evidence is incomplete",
+            run_id, merchant_id, failures,
+        )
+    projections = await build_and_persist_all_projections(
+        audit_run_id=run_id, strict=True,
+    )
+    if projections.get("readback_mismatches", 0):
+        raise RuntimeError(
+            "URL audit projection read-back did not match what was built; "
+            "retry is idempotent"
+        )
+    if not projections.get("projections_built", 0):
+        raise RuntimeError(
+            "URL audit projection persistence wrote nothing; retry is idempotent"
+        )
+    if projections.get("projections_failed", 0):
+        logger.warning(
+            "_persist_url_recovery: %d projection(s) failed for run_id=%s but "
+            "%d were written; completing rather than refunding a delivered audit",
+            projections["projections_failed"], run_id,
+            projections["projections_built"],
+        )
+    return canonical, projections

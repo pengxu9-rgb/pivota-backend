@@ -74,18 +74,18 @@ def test_a_changed_tier_mix_is_not_your_movement():
     assert verdict["same"] is False
 
 
-def test_absent_bases_fall_through_to_todays_verdict():
+def test_absent_bases_are_unknown():
     """Runs predating audit_basis carry no evidence of a model change either
     way. Failing them closed would silently desensitise every merchant's next
     re-audit, so the change is strictly additive."""
-    assert ad.measurement_basis_between(_report("sel_1"), _report("sel_1"))["same"] is True
+    assert ad.measurement_basis_between(_report("sel_1"), _report("sel_1"))["same"] is None
     assert ad.measurement_basis_between(_report("sel_1"), _report("sel_2"))["same"] is False
 
 
-def test_one_sided_basis_also_falls_through():
+def test_one_sided_basis_is_unknown():
     assert ad.measurement_basis_between(
         _report("sel_1"), _report("sel_1"), _basis(), None
-    )["same"] is True
+    )["same"] is None
 
 
 def test_a_different_prompt_set_still_wins_and_keeps_its_own_note():
@@ -284,3 +284,121 @@ async def test_the_built_payload_normalises_domains_like_the_writer_does(monkeyp
     assert payload["official_domains"] == ["anua.com", "shop.anua.com"], (
         "sorted, lower-cased, dead excluded — exactly what record_basis stores"
     )
+
+
+# ---------------------------------------------------------------------------
+# NULL == NULL is not evidence of the same pinned set.
+# ---------------------------------------------------------------------------
+
+
+def _complete_basis(**overrides):
+    basis = {
+        "methodology_version": "2",
+        "providers_and_models": {"gemini": {"model_id": "g"}},
+        "primary_destination_version": 1,
+        "prompt_set_id": "p",
+        "selected_set_id": "s",
+        "official_domains": ["brand.com"],
+        "tier_mix": {"category": 10},
+        "market": "US",
+        "language": "en",
+    }
+    basis.update(overrides)
+    return basis
+
+
+def test_two_bases_with_no_set_identity_at_all_are_not_comparable():
+    """The set identity is the PAIR (selected_set_id, prompt_set_id) and
+    `audit_delta._basis_id` reads the stronger of the two, so "we know which
+    set was probed" means at least one is present. With neither, two bases
+    matched NULL against NULL on both fields and came back comparable on no
+    evidence. audit_delta gates this today, but that gate lives in another
+    module and this function's docstring already promised False."""
+    from db.audit_basis import bases_are_comparable
+
+    blank = _complete_basis(prompt_set_id=None, selected_set_id=None)
+    assert bases_are_comparable(blank, dict(blank)) is False
+    assert bases_are_comparable(
+        _complete_basis(prompt_set_id="", selected_set_id=""),
+        _complete_basis(prompt_set_id="", selected_set_id=""),
+    ) is False
+
+
+def test_a_pre_w2_1_run_carrying_only_a_prompt_set_id_is_still_comparable():
+    """`_pinned_set_ids` records the id it has on purpose: a run predating
+    W2.1 has a prompt_set_id and no selected_set_id. Requiring BOTH would make
+    every such run permanently non-comparable."""
+    from db.audit_basis import bases_are_comparable
+
+    w2 = _complete_basis(selected_set_id=None)
+    assert bases_are_comparable(w2, dict(w2)) is True
+    w2_1 = _complete_basis(prompt_set_id=None)
+    assert bases_are_comparable(w2_1, dict(w2_1)) is True
+
+
+async def test_the_writer_records_the_set_id_the_reader_resolves(monkeypatch):
+    """THE ASYMMETRY THAT MADE THE ABOVE REACHABLE. `_pinned_set_ids` read only
+    `per_sku_reports` rows while `audit_delta._prompt_set_id` also accepts a
+    root-level `prompt_basis` (the legacy build_structured_report shape) and
+    `per_product` rows — so for those shapes the writer stored NULL ids for a
+    run whose id the delta could read straight off the same report.
+
+    THE ids ARE DISTINCT PER SHAPE, and the last two reports carry TWO blocks
+    each. The first cut of this test put the SAME id in every position, so it
+    could only catch a writer that found NOTHING — a writer that found the
+    WRONG block passed it. Both sides then had a precedence, they were written
+    independently, and they disagreed: on a report carrying a root
+    `prompt_basis` beside nested per-SKU rows the writer recorded the nested
+    id into an immutable basis row while the delta resolved the root's. Now
+    both come from `audit_delta.prompt_basis_blocks`, and a reversal in either
+    one moves the id the other reports.
+    """
+    import services.audit_evidence_builder as eb
+    import db.merchant_official_domains as mod
+    from services.audit_delta import measurement_basis_between
+
+    async def _domains(merchant_id):
+        return []
+
+    monkeypatch.setattr(mod, "list_official_domains", _domains)
+
+    def _block(set_id):
+        return {"prompt_basis": {"selected_set_id": set_id}}
+
+    shapes = {
+        # One block, one answer: the writer must find each shape at all.
+        "root": ({"prompt_basis": {"selected_set_id": "sel_root_only"}},
+                 "sel_root_only"),
+        "per_product": ({"per_product": [_block("sel_per_product")]},
+                        "sel_per_product"),
+        "per_sku_reports": ({"per_sku_reports": [_block("sel_per_sku")]},
+                            "sel_per_sku"),
+        "nested": ({"brand_report": {"per_sku_reports": [_block("sel_nested")]}},
+                   "sel_nested"),
+        # TWO blocks, one answer. The primary report is the report ITSELF
+        # (it carries no rows of its own), so its root block wins over the
+        # rows hanging off the nested brand_report.
+        "root_beside_nested_rows": (
+            {"prompt_basis": {"selected_set_id": "sel_the_root"},
+             "brand_report": {"per_sku_reports": [_block("sel_a_nested_row")]}},
+            "sel_the_root",
+        ),
+        # ...and the other way round: when the top-level report DOES carry
+        # rows, the first row is the primary report and its block wins over
+        # the root block beside it.
+        "rows_beside_root": (
+            {"prompt_basis": {"selected_set_id": "sel_the_root"},
+             "per_sku_reports": [_block("sel_the_first_row")]},
+            "sel_the_first_row",
+        ),
+    }
+    for name, (report, expected) in shapes.items():
+        payload = await eb.record_audit_basis(
+            audit_run_id="", brand_report=report, merchant_id="m1",
+            persist=False,
+        )
+        assert payload["selected_set_id"] == expected, name
+        # ...and it is the SAME id the delta side resolves for that report.
+        assert measurement_basis_between(
+            report, report, payload, payload,
+        )["prompt_set_id"] == expected, name

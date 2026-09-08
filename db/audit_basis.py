@@ -61,7 +61,8 @@ logger = logging.getLogger(__name__)
 # v1: first cut. Components at this version — prompt_basis.PROMPT_BASIS_VERSION
 # = 3, primary_destination.PRIMARY_DESTINATION_VERSION = 1, official-domain set
 # from migration 207.
-METHODOLOGY_VERSION = "1"
+# v2: response-level selection contract and conservative comparison gating.
+METHODOLOGY_VERSION = "2"
 
 # The fields whose equality defines comparability. Named as data, not as a chain
 # of `and`s, so the set is greppable and a reviewer can COUNT the conjuncts
@@ -414,6 +415,23 @@ _EVIDENCE_REQUIRED_FIELDS = frozenset({
     "methodology_version", "providers_and_models", "primary_destination_version",
 })
 
+# The pinned-set identity, which is a PAIR and not two independent fields.
+# `audit_delta._basis_id` reads the stronger of the two (W2.1 selected_set_id,
+# else W2 prompt_set_id), so "we know which set was probed" means at least one
+# of them is present — a run predating W2.1 legitimately carries a
+# prompt_set_id and no selected_set_id, and `_pinned_set_ids` records the one
+# it has on purpose. Putting BOTH in _EVIDENCE_REQUIRED_FIELDS would therefore
+# make every pre-W2.1 run permanently non-comparable; putting NEITHER lets two
+# bases with no set identity at all compare NULL == NULL on these fields and
+# come back True on no evidence.
+#
+# Today that state is unreachable: audit_delta._measurement_basis resolves the
+# id first and answers same=None when either side lacks it, so such a pair
+# never gets here. That gate lives in another module and is one refactor from
+# moving, and this function's own docstring already promises False. So the
+# check is real rather than implied.
+_SET_IDENTITY_FIELDS = ("selected_set_id", "prompt_set_id")
+
 
 def bases_are_comparable(
     a: Optional[Mapping[str, Any]],
@@ -433,15 +451,13 @@ def bases_are_comparable(
     changed how we measure, so this isn't a like-for-like comparison", which is
     both true and useful.
 
-    NOTE FOR THE CALLER: services/audit_delta.py is where this belongs. Its
-    `_measurement_basis` currently decides comparability from the prompt set
-    ALONE (`_prompt_set_id`) and hands the verdict to `build_reaudit_delta`,
-    which uses it to pick between MATERIAL_SCORE_DELTA (15) and
-    MATERIAL_SCORE_DELTA_SAME_BASIS (5) — so today a model swap can tighten the
-    noise mask to 5 points and then report a 6-point swing as movement. The
-    fix is to AND this function into `_measurement_basis`'s `same`, which
-    requires audit_delta to receive the two runs' basis rows; that plumbing is
-    deliberately NOT part of this change.
+    THE CALLER. services/audit_delta.py `_measurement_basis` now ANDs this
+    function into its `same` verdict, and its callers pass the two runs' basis
+    rows in (`agent_center_bd_report_service._basis_pair_for_delta` for the
+    merchant-facing delta, `audit_stability_canary._bases_by_run_id` for the
+    W7 noise canary). A caller that passes nothing gets `same=None` — unknown,
+    never True — so this check cannot be bypassed by omission; it can only be
+    made permanently inconclusive, which is the safe direction.
     """
     if not isinstance(a, Mapping) or not isinstance(b, Mapping):
         return False
@@ -457,6 +473,9 @@ def bases_are_comparable(
         # two runs were measured the same way; it is the absence of evidence.
         if field in _EVIDENCE_REQUIRED_FIELDS and not left:
             return False
+    # Both sides are equal by here, so checking one is checking both.
+    if not any(_normalized_component(f, a) for f in _SET_IDENTITY_FIELDS):
+        return False
     return True
 
 

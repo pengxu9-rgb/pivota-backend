@@ -402,17 +402,56 @@ def test_report_stamp_reads_probe_runs_not_only_ctx():
 # ---- delta basis identity -----------------------------------------------------
 
 def _delta_report(prompt_set_id):
-    return {
+    # `provider_models` is not decoration: `providers_and_models` is an
+    # evidence-required comparability component, so a report without it builds
+    # a basis that can never support a comparison. It is stamped from the same
+    # resolver production uses.
+    from tests.basis_fixtures import with_provider_models
+
+    return with_provider_models({
         "per_product": [{
             "prompt_basis": {"prompt_set_id": prompt_set_id},
             "merchant_view": {"headline": {"scores": {
                 "visibility": 50, "attribution": 40, "category_visibility": 30,
             }}},
         }],
-    }
+    })
 
 
-def test_delta_states_same_basis():
+async def test_delta_states_same_basis():
+    """A re-run on the same pinned prompt set, with the same measurement basis.
+
+    The basis pair is REQUIRED here, not scenery: a comparison with no basis
+    now resolves to `same is None` by contract, so without it this test would
+    be asserting on the refusal rather than on the prompt-set verdict. It is
+    built by the writer (`record_audit_basis(persist=False)`) — the same call
+    the production attach makes — from the same report on both sides, which is
+    what "nothing about how we measure changed" actually looks like.
+    """
+    from services.audit_delta import build_reaudit_delta
+    from tests.basis_fixtures import comparable_writer_bases
+
+    current, prior = _delta_report("ps_x"), _delta_report("ps_x")
+    current_basis, prior_basis = await comparable_writer_bases(current, prior)
+    delta = build_reaudit_delta(
+        current_report=current,
+        prior_report=prior,
+        prior_row={}, days_since=7,
+        current_basis=current_basis, prior_basis=prior_basis,
+    )
+    basis = delta["measurement_basis"]
+    assert basis["same"] is True
+    assert basis["prompt_set_id"] == "ps_x"
+    assert "same prompt set" in basis["note"]
+
+
+async def test_delta_without_a_basis_pair_cannot_claim_the_same_basis():
+    """The negative counterpart, so the fixture above is load-bearing.
+
+    Identical reports, identical prompt set, no basis rows — the verdict is
+    `None`, never `True`. Two runs whose model or official-domain set moved
+    look exactly like this pair from the report alone.
+    """
     from services.audit_delta import build_reaudit_delta
 
     delta = build_reaudit_delta(
@@ -420,10 +459,7 @@ def test_delta_states_same_basis():
         prior_report=_delta_report("ps_x"),
         prior_row={}, days_since=7,
     )
-    basis = delta["measurement_basis"]
-    assert basis["same"] is True
-    assert basis["prompt_set_id"] == "ps_x"
-    assert "same prompt set" in basis["note"]
+    assert delta["measurement_basis"]["same"] is None
 
 
 def test_delta_states_changed_basis():
@@ -617,28 +653,41 @@ def test_probe_path_reprobes_pinned_selected_specs():
     assert '_selected_specs_out' in fn
 
 
-def test_delta_prefers_selected_set_id_over_prompt_set_id():
+async def test_delta_prefers_selected_set_id_over_prompt_set_id():
     """When the FULL probed set matches, the delta says same=True even if the
     LLM-list prompt_set_id differs; when the probed set differs, same=False even
-    if prompt_set_id matches."""
+    if prompt_set_id matches.
+
+    The subject here is `_prompt_set_id`'s PREFERENCE, so the run-level basis is
+    deliberately held constant across both sides: one writer-built payload,
+    handed to both runs. That is not a shortcut — it is the only way the
+    preference is the single variable. Vary the basis too and `same is False`
+    would pass for either reason, which is the confounding this suite already
+    got caught by once.
+    """
     from services.audit_delta import build_reaudit_delta
+    from tests.basis_fixtures import with_provider_models, writer_basis
 
     def rep(prompt_id, sel_id):
-        return {"per_product": [{
+        return with_provider_models({"per_product": [{
             "prompt_basis": {"prompt_set_id": prompt_id, "selected_set_id": sel_id},
             "merchant_view": {"headline": {"scores": {
                 "visibility": 50, "attribution": 40, "category_visibility": 30}}},
-        }]}
+        }]})
+
+    held = await writer_basis(rep("ps_A", "sel_X"))
 
     # same selected set, different LLM-list id -> same measurement
     d1 = build_reaudit_delta(
         current_report=rep("ps_A", "sel_X"), prior_report=rep("ps_B", "sel_X"),
-        prior_row={}, days_since=7)
+        prior_row={}, days_since=7, current_basis=held, prior_basis=held)
     assert d1["measurement_basis"]["same"] is True
     assert d1["measurement_basis"]["prompt_set_id"] == "sel_X"
 
-    # different selected set, same LLM-list id -> NOT the same measurement
+    # different selected set, same LLM-list id -> NOT the same measurement.
+    # The prompt-set verdict is reached BEFORE the run-level basis is consulted,
+    # so an identical basis on both sides cannot rescue it.
     d2 = build_reaudit_delta(
         current_report=rep("ps_A", "sel_X"), prior_report=rep("ps_A", "sel_Y"),
-        prior_row={}, days_since=7)
+        prior_row={}, days_since=7, current_basis=held, prior_basis=held)
     assert d2["measurement_basis"]["same"] is False

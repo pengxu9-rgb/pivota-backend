@@ -197,6 +197,11 @@ def extract_evidence_items(
                 "confidence": CONFIDENCE_EVIDENCE_HIGH,
             })
 
+    from services.selection_measurement import report_observations
+    for observation in report_observations(brand_report):
+        out.append({"evidence_type": "selection_response", "payload": observation,
+                    "product_key": observation.get("product_key"), "confidence": None})
+
     # P0.2: stamp the canonical entity key on every evidence dict that maps to
     # a depositable (resolved) content_key. Section-agnostic final pass so new
     # evidence sections inherit it for free. Unresolved / unmapped product_keys
@@ -575,12 +580,21 @@ def _findings_from_brand_rollup(
     comparison the report never made, which is how the /100-score-rendered-as-a-
     percentage defect got in next door.
     """
-    out: List[Dict[str, Any]] = []
+    from services.selection_measurement import report_observations, selection_measurement
+    out: List[Dict[str, Any]] = [{
+        "finding_type": "recovery_measurement", "severity": "low",
+        "payload": {"selection": selection_measurement(report_observations(brand_report)),
+                    "selection_gap": rollup.get("selection_gap"),
+                    "catalog_available": brand_report.get("catalog_dimensions_available") is not False},
+        "short_summary": "Response-level measurement basis", "confidence": None,
+    }]
     dims = rollup.get("dimensions")
     if not isinstance(dims, dict):
         return out
     for key, dim in dims.items():
         if not isinstance(dim, dict):
+            continue
+        if key == "routability" and brand_report.get("catalog_dimensions_available") is False:
             continue
         band = str(dim.get("band") or "").lower()
         severity = _ROLLUP_FINDING_BANDS.get(band)
@@ -1207,7 +1221,32 @@ async def _resolve_content_keys(
 
 
 def _per_sku_reports(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The run's per-product report rows, in BOTH shapes they arrive in.
+
+    `per_sku_reports` is the per-SKU wedge shape; `per_product` is what
+    `build_structured_report` (the legacy lane, still live) produces. The
+    comparability reader on the other side of this contract —
+    `audit_delta._prompt_set_id` — has always tolerated both, so a writer that
+    saw only one of them recorded NULL set ids for every legacy run while the
+    delta happily resolved an id from the same report. Two such bases then
+    compared NULL == NULL on the pinned-set fields.
+
+    PREFERENCE ORDER DIFFERS FROM `audit_delta._basis_rows`, DELIBERATELY NOT
+    CHANGED HERE. This reader takes `per_sku_reports` first and falls back to
+    `per_product`; `_basis_rows` takes `per_product` first and falls back to
+    `per_sku_reports`. On every shape either lane actually sees the two agree,
+    because a report carries one key or the other, never both — the orders can
+    only diverge on a hybrid report no writer emits. Aligning them is still
+    the right end state (one order, one place), but doing it inside this PR
+    would change which row a hybrid resolves from with no test able to prove
+    the change is inert, and this PR's whole point is that the writer and the
+    reader must not disagree. The set-id path is already converged:
+    `_prompt_basis_blocks` delegates to `audit_delta.prompt_basis_blocks`.
+    Follow-up: give `_per_sku_reports` and `_basis_rows` one shared helper.
+    """
     reports = brand_report.get("per_sku_reports")
+    if not isinstance(reports, list):
+        reports = brand_report.get("per_product")
     if not isinstance(reports, list):
         return []
     return [r for r in reports if isinstance(r, Mapping)]
@@ -1281,6 +1320,29 @@ def build_tier_mix(brand_report: Mapping[str, Any]) -> Dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _prompt_basis_blocks(brand_report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """Every place a run's `prompt_basis` block can live, in reading order.
+
+    THE READER'S PRECEDENCE, NOT A MIRROR OF IT. This used to be a
+    hand-matched second implementation of `audit_delta._prompt_set_id`'s
+    tolerance, and hand-matched is exactly what it stopped being: it took
+    per-product ROWS first from both containers, while the reader takes the
+    PRIMARY report's own block first. On a report carrying a root
+    `prompt_basis` beside a nested `brand_report.per_sku_reports` — the shape
+    `_primary_report` resolves to the report ITSELF — this writer recorded the
+    nested row's id into the immutable basis row while the delta resolved the
+    root's, so two runs of that shape compared a recorded id against a
+    resolved one.
+
+    So there is now ONE ordering, and it lives on the reader's side:
+    `audit_delta.prompt_basis_blocks`. A precedence change there moves both
+    sides of the contract together, which is the only way this can stay true.
+    """
+    from services.audit_delta import prompt_basis_blocks
+
+    return list(prompt_basis_blocks(brand_report))
+
+
 def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]:
     """The first non-empty `prompt_set_id` / `selected_set_id` across the run's
     per-SKU bases. Each is taken independently: a run whose SKUs predate W2.1
@@ -1288,10 +1350,7 @@ def _pinned_set_ids(brand_report: Mapping[str, Any]) -> Dict[str, Optional[str]]
     strictly better than recording neither."""
     prompt_set_id: Optional[str] = None
     selected_set_id: Optional[str] = None
-    for sku_report in _per_sku_reports(brand_report):
-        basis = sku_report.get("prompt_basis")
-        if not isinstance(basis, Mapping):
-            continue
+    for basis in _prompt_basis_blocks(brand_report):
         if not prompt_set_id:
             prompt_set_id = str(basis.get("prompt_set_id") or "") or None
         if not selected_set_id:
@@ -1571,8 +1630,20 @@ async def persist_canonical_evidence(
     extracted_evidence = list(
         extract_evidence_items(brand_report, content_key_map)
     )
+    summary["evidence_items_skipped_unidentified"] = 0
     for ev in extracted_evidence:
         signature = _evidence_signature(ev)
+        if not signature:
+            # No stable identity => no idempotency key => a re-run would
+            # duplicate it. Counted so a systematic producer bug is visible
+            # rather than showing up as a quietly short evidence table.
+            summary["evidence_items_skipped_unidentified"] += 1
+            logger.warning(
+                "persist_canonical_evidence: evidence_type=%s carries no "
+                "identity for audit=%s; skipped",
+                ev.get("evidence_type"), audit_run_id,
+            )
+            continue
         idem_key = compute_canonical_idempotency_key(
             audit_run_id=audit_run_id,
             item_type="evidence",
@@ -1733,6 +1804,17 @@ def _evidence_signature(ev: Dict[str, Any]) -> str:
     canonical truth (same type + product + host + excerpt prefix).
     """
     payload = ev.get("payload") or {}
+    if ev.get("evidence_type") == "selection_response":
+        # `.get`, not `[...]`. A KeyError here does not fail one row — it
+        # escapes this helper into persist_canonical_evidence's UNGUARDED
+        # signature line (the try starts at the insert), so one malformed
+        # observation would abort the whole run's evidence persistence. An
+        # observation with no id has no stable identity, so the caller skips
+        # and counts it instead.
+        observation_id = payload.get("observation_id")
+        if not observation_id:
+            return ""
+        return "selection_response:" + str(observation_id)
     excerpt = (payload.get("excerpt_text") or "")[:80]
     host = payload.get("host") or ""
     matched_url = payload.get("matched_url") or ""
