@@ -31,6 +31,15 @@ def _sql(text):
     return " ".join(text.lower().split())
 
 
+def _write_path_source():
+    """The whole module, not one function.
+
+    These ratchets used to call `inspect.getsource(backfill.run)`. Splitting the scan loop
+    into a helper then blinded every one of them at once while they stayed green — a text
+    ratchet aimed at a function name is only as stable as the refactor that moves it."""
+    return inspect.getsource(backfill)
+
+
 # ---------------------------------------------------------------------------
 # B1 — the conflict target
 # ---------------------------------------------------------------------------
@@ -115,7 +124,7 @@ def test_offer_id_is_derived_from_the_destination_not_the_chosen_offer_row():
     and asserted they matched — which tests that a hash is a function, not that the CALL SITE
     stopped hashing the chosen offer's id. A mutation reverting B4 survived it. This reads the
     source of the call instead, which is the only check available without a Postgres."""
-    src = inspect.getsource(backfill.run)
+    src = _write_path_source()
     call = src.split("derive_offer_id(", 1)[1].split(")", 1)[0]
     assert "destination" in call, f"offer_id no longer derives from the destination: {call!r}"
     assert "offer_id" not in call, (
@@ -135,7 +144,7 @@ def test_apply_refuses_to_run_without_the_contract_token():
     """A stale image runs the MERGED first draft, which has all four blockers and no such flag.
     argparse then refuses the command instead of silently running the broken version."""
     assert backfill.CONTRACT == "backfill-v2-identity-index"
-    src = inspect.getsource(backfill.main)
+    src = _write_path_source()
     assert "--expect-contract" in src
     assert "args.apply and args.expect_contract != CONTRACT" in src
 
@@ -259,7 +268,7 @@ def test_the_offer_is_attached_to_the_returned_key_not_the_computed_one():
     the key we computed: on the 4,287 rows that adopt the promoter's `::v::` spelling the offer
     would hang off a sku_key that does not exist. A mutation doing exactly that survived the
     original suite, because nothing read run()."""
-    src = inspect.getsource(backfill.run)
+    src = _write_path_source()
     body = src.split("offer_params = {", 1)[1]
     sku_key_line = [l for l in body.splitlines() if '"sku_key"' in l][0]
     assert "written_key" in sku_key_line, (
@@ -270,7 +279,7 @@ def test_the_offer_is_attached_to_the_returned_key_not_the_computed_one():
 def test_a_guard_rejection_rolls_the_sku_back_instead_of_orphaning_it():
     """The SKU is INSERTed before the guard runs. Committing when the guard rejects the offer
     leaves precisely the orphan SKU-without-offer state this backfill exists to remove."""
-    src = inspect.getsource(backfill.run)
+    src = _write_path_source()
     assert "raise _OfferRefused()" in src
     assert "rolled_back_offer_refused_by_guard" in src
 

@@ -123,8 +123,25 @@ WRITER_NAME = "backfill_variant_identity_skus"
 CONTRACT = "backfill-v2-identity-index"
 
 
+def _is_unique_violation(exc: Exception) -> bool:
+    """True only for a Postgres unique violation (SQLSTATE 23505).
+
+    Same shape as `routes/billing_routes._is_unique_violation`: read the driver's sqlstate
+    rather than importing asyncpg here, and fall back to the class name. Anything else —
+    a missing arbiter index (42P10), a statement timeout, a truncation — must escape.
+    """
+    code = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    if code == "23505":
+        return True
+    return "uniqueviolation" in type(exc).__name__.lower()
+
+
 class _OfferRefused(Exception):
     """The guard rejected this variant's offer, so its SKU must not be committed alone."""
+
+
+class _SkuSuppressed(Exception):
+    """The identity exists on a suppressed SKU; an offer there could never be served."""
 
 #: The closed vocabulary catalog_offers.availability actually uses on this track. Raw crawl text
 #: ("In Stock", "Out of Stock", "low stock") matches no reader in the repo, and the middle one is
@@ -164,6 +181,11 @@ SELECT_PRODUCTS_SQL = """
 SELECT_LIVE_OFFERS_SQL = """
     SELECT offer_id, merchant_id, catalog_track, truth_tier, readiness_tier,
            offer_mode, channel, availability, currency, source_domain, market,
+           -- Decision-grade fields. Dropping them left every new offer reading
+           -- "unknown seller / not official" beside a canonical sibling that reads
+           -- brand_direct/official: pivot_query_service treats a NULL offer_type on
+           -- external_referral as authoritative "unknown" and is_first_party false.
+           offer_type, is_first_party, why_buy_direct,
            coalesce(offer_payload->>'destination_url', source_ref) AS destination_url
     FROM catalog_offers
     WHERE product_key = :pk
@@ -186,6 +208,10 @@ UPSERT_SKU_SQL = """
         CAST(:visible_option_labels AS jsonb), CAST(:ingredient_ids AS jsonb),
         CAST(:sku_payload AS jsonb), :readiness_tier, NOW()
     )
+    -- WHERE on the DO UPDATE (F6): recall's candidate CTE filters
+    -- `s.suppressed_at IS NULL AND s.suppression_reason IS NULL`, so attaching a live offer
+    -- to a suppressed SKU creates supply nothing can ever surface. 0 of the 4,287 adopted
+    -- rows are suppressed today. RETURNING then yields NULL, which the caller counts.
     ON CONFLICT (merchant_id, platform, product_key, source_variant_id) DO UPDATE SET
         -- MERGE, never replace: the existing blob may carry agent_version / source_handle /
         -- canonical_url from whoever wrote the row first, and destroying those would both lose
@@ -197,6 +223,7 @@ UPSERT_SKU_SQL = """
         image_url   = coalesce(catalog_skus.image_url, EXCLUDED.image_url),
         barcode     = coalesce(catalog_skus.barcode, EXCLUDED.barcode),
         updated_at  = NOW()
+    WHERE catalog_skus.suppressed_at IS NULL
     RETURNING sku_key
 """
 
@@ -205,13 +232,16 @@ UPSERT_OFFER_SQL = """
         offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,
         readiness_tier, offer_mode, channel, availability, currency,
         list_price, merchant_effective_price, estimated_best_price,
-        source_system, source_domain, market, offer_payload, created_at, updated_at
+        source_system, source_domain, market, source_ref,
+        offer_type, is_first_party, why_buy_direct,
+        offer_payload, created_at, updated_at
     ) VALUES (
         :offer_id, :sku_key, :product_key, :merchant_id, :catalog_track, :truth_tier,
         :readiness_tier, :offer_mode, :channel, :availability, :currency,
         :list_price, :merchant_effective_price, :estimated_best_price,
-        :source_system, :source_domain, :market, CAST(:offer_payload AS jsonb),
-        NOW(), NOW()
+        :source_system, :source_domain, :market, :source_ref,
+        :offer_type, :is_first_party, :why_buy_direct,
+        CAST(:offer_payload AS jsonb), NOW(), NOW()
     )
     ON CONFLICT (offer_id) DO UPDATE SET
         list_price               = EXCLUDED.list_price,
@@ -296,7 +326,12 @@ def _option_labels(variant: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
     return labels, attrs
 
 
-def choose_offer(live_offers: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def choose_offer(
+    live_offers: List[Dict[str, Any]],
+    *,
+    want_currency: str = "",
+    source_domain: str = "",
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """The one live offer whose attribution every variant of this product will inherit.
 
     Refuses rather than guesses in the two cases where inheriting is a claim we cannot support:
@@ -311,7 +346,21 @@ def choose_offer(live_offers: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, 
     with_destination = [o for o in live_offers if str(o.get("destination_url") or "").strip()]
     if not with_destination:
         return None, "no_destination_url"
-    return with_destination[0], None
+    if len({str(o.get("destination_url") or "") for o in with_destination}) == 1:
+        return with_destination[0], None
+    # 168 prod products have several live same-merchant offers with DIFFERENT destinations.
+    # Taking [0] of an offer_id ordering makes the destination — and therefore offer_id,
+    # market and the availability fallback — depend on which row happens to sort first, so a
+    # new sibling offer changes the derived offer_id and a re-run writes a duplicate. That is
+    # B4 again, one level down. Prefer the variant's own currency, then the product's own
+    # domain, then the URL itself: all three are properties of the data, not of an ordering.
+    def _rank(o):
+        return (
+            0 if want_currency and str(o.get("currency") or "").upper() == want_currency else 1,
+            0 if source_domain and source_domain in str(o.get("destination_url") or "") else 1,
+            str(o.get("destination_url") or ""),
+        )
+    return sorted(with_destination, key=_rank)[0], None
 
 
 def plan_for_product(
@@ -361,6 +410,20 @@ async def run(
     touched = 0
     last_key = cursor
 
+    state = {"last_key": last_key}
+    try:
+        return await _scan(
+            counts, audit, apply=apply, limit=limit, page=page,
+            cursor=cursor, touched=touched, state=state,
+        )
+    except Exception:
+        # Seal the report and the audit row before the exception leaves, then let it leave.
+        # Committed pairs are already durable; losing the cursor is what made recovery manual.
+        await _finish(counts, audit, apply=apply, last_key=state["last_key"])
+        raise
+
+
+async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state):
     while True:
         rows = await database.fetch_all(
             SELECT_PRODUCTS_SQL, {"after": cursor, "page": int(page)}
@@ -378,7 +441,16 @@ async def run(
             live = [dict(o) for o in await database.fetch_all(
                 SELECT_LIVE_OFFERS_SQL, {"pk": row["product_key"]}
             ) or []]
-            chosen, refusal = choose_offer(live)
+            # The variant currencies present on this product, so the destination choice can
+            # prefer an offer the variants actually agree with instead of an arbitrary one.
+            _vcurs = {
+                str(p["variant"].get("currency") or "").strip().upper() for p in picks
+            } - {""}
+            chosen, refusal = choose_offer(
+                live,
+                want_currency=next(iter(_vcurs)) if len(_vcurs) == 1 else "",
+                source_domain=str(row.get("source_domain") or ""),
+            )
             if chosen is None:
                 counts["skipped_" + str(refusal)] += len(picks)
                 continue
@@ -430,18 +502,26 @@ async def run(
             counts["products_planned"] += 1
 
             for sku_params, meta in planned:
-                counts["skus"] += 1
                 if not apply:
+                    counts["skus"] += 1
                     counts["offers"] += 1
                     continue
+                # Counted AFTER the commit, not before. Incrementing here made a run whose
+                # every pair rolled back report `skus: N, offers: 0` and an audit row saying
+                # the same — indistinguishable from success to anyone reading the skus count.
                 try:
                     async with database.transaction():
                         written_key = await database.fetch_val(UPSERT_SKU_SQL, sku_params)
-                        written_key = str(written_key or sku_params["sku_key"])
-                        if written_key != sku_params["sku_key"]:
-                            # The identity already lived under another lane's spelling; we adopted
-                            # that row rather than minting a rival for the same variant.
-                            counts["adopted_existing_sku_row"] += 1
+                        if written_key is None:
+                            # The DO UPDATE's WHERE refused it: the identity exists on a
+                            # SUPPRESSED row. Nothing was written; do not invent a key.
+                            raise _SkuSuppressed()
+                        written_key = str(written_key)
+                        # The identity already lived under another lane's spelling; we adopt
+                        # that row rather than minting a rival for the same variant. Recorded
+                        # only once the pair is COMMITTED — counting it here made a rolled-back
+                        # pair still report itself as adopted.
+                        adopted = written_key != sku_params["sku_key"]
                         chosen = meta["chosen"]
                         destination = str(chosen.get("destination_url") or "").strip()
                         offer_params = {
@@ -468,6 +548,12 @@ async def run(
                             "source_system": SOURCE_SYSTEM,
                             "source_domain": row.get("source_domain") or chosen.get("source_domain"),
                             "market": chosen.get("market"),
+                            # ingestion.py:1014 stores the destination here too, and
+                            # SELECT_LIVE_OFFERS_SQL itself falls back to source_ref.
+                            "source_ref": destination,
+                            "offer_type": chosen.get("offer_type"),
+                            "is_first_party": chosen.get("is_first_party"),
+                            "why_buy_direct": chosen.get("why_buy_direct"),
                             "offer_payload": json.dumps({
                                 "source_system": SOURCE_SYSTEM,
                                 "batch_id": audit.batch_id,
@@ -493,13 +579,19 @@ async def run(
                             # offer is not a partial success, it is the bug.
                             raise _OfferRefused()
                         await database.execute(UPSERT_OFFER_SQL, accepted[0])
-                        counts["offers"] += 1
-                        # One SKU + one offer. record_applied(2) unconditionally charged 2 per
-                        # accepted offer and 0 for a SKU whose offer was rejected, so
-                        # writer_audit_log.applied_rows read 2 x offers rather than skus + offers.
-                        audit.record_applied(2)
+                    # Outside the transaction block: both rows are committed now.
+                    counts["skus"] += 1
+                    counts["offers"] += 1
+                    if adopted:
+                        counts["adopted_existing_sku_row"] += 1
+                    # One SKU + one offer, both committed. Charged here rather than beside the
+                    # offer insert, where it counted 2 per accepted offer and 0 for a SKU whose
+                    # offer was rejected — so applied_rows read 2 x offers, not skus + offers.
+                    audit.record_applied(2)
                 except _OfferRefused:
                     counts["rolled_back_offer_refused_by_guard"] += 1
+                except _SkuSuppressed:
+                    counts["skipped_suppressed_sku"] += 1
                 except Exception as exc:  # noqa: BLE001
                     # The one path ON CONFLICT still cannot cover: the supplied sku_key
                     # collides with the PK while the identity tuple does NOT match, so
@@ -508,14 +600,22 @@ async def run(
                     # (_normalize_token lowercases and collapses punctuation, so ABC_1 and
                     # abc-1 collide) or when a product's merchant_id is re-resolved. Counting
                     # and continuing beats killing a 6,090-row run on one row.
-                    if "unique" not in repr(exc).lower():
+                    #
+                    # MATCH THE SQLSTATE, NOT THE MESSAGE. A first version tested
+                    # `"unique" in repr(exc)`, which also swallows SQLSTATE 42P10 —
+                    # "there is no UNIQUE or exclusion constraint matching the ON CONFLICT
+                    # specification". That is the arbiter index being absent or renamed, i.e.
+                    # precisely the B1 failure this script exists to avoid, and it would have
+                    # been reported as row-level collisions while writing nothing and exiting
+                    # 0. Proven by dropping idx_catalog_skus_source_identity_v2 and running.
+                    if not _is_unique_violation(exc):
                         raise
                     counts["skipped_unique_violation"] += 1
                     logger.warning(
                         "unique violation on %s: %s", sku_params["sku_key"], repr(exc)[:200]
                     )
 
-            last_key = row["product_key"]
+            state["last_key"] = row["product_key"]
             touched += 1
             if limit and touched >= limit:
                 counts["stopped_at_limit"] = 1
@@ -523,10 +623,25 @@ async def run(
         if limit and touched >= limit:
             break
 
+    return await _finish(counts, audit, apply=apply, last_key=state["last_key"])
+
+
+async def _finish(counts, audit, *, apply: bool, last_key: str) -> Dict[str, Any]:
+    """Seal the report. Called on the way out however the run ends.
+
+    Without this, an exception mid-scan lost the report, the resume cursor AND the audit row
+    while committed pairs stayed in the table — recoverable only by hand, from
+    `SELECT max(product_key) FROM catalog_offers WHERE source_system = ...`.
+    """
     counts["applied"] = 1 if apply else 0
     counts["resume_after"] = last_key
     if apply:
-        audit.record_info({k: v for k, v in counts.items() if isinstance(v, int)})
+        # record_info drops <= 0, so a zero counter never reaches writer_audit_log.reasons
+        # even though it is in the JSON report. Send the zeros under an explicit key instead
+        # of leaving "measured zero" and "never measured" indistinguishable there.
+        ints = {k: v for k, v in counts.items() if isinstance(v, int) and not isinstance(v, bool)}
+        audit.record_info({k: v for k, v in ints.items() if v > 0})
+        audit.reasons["zero_counters"] = sorted(k for k, v in ints.items() if v == 0)
         await write_writer_audit_log(audit)
         counts["batch_id"] = audit.batch_id
     return dict(counts)

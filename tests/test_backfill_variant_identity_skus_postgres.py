@@ -58,8 +58,9 @@ async def _ddl(database):
     await database.execute("""
         CREATE TABLE catalog_skus (
           sku_key text PRIMARY KEY, product_key text, merchant_id text, platform text,
-          source_product_id text, source_variant_id text, source_domain text,
-          sku text, barcode text, title text, currency text, image_url text,
+          source_product_id text, source_variant_id varchar(128), source_domain text,
+          sku varchar(128), barcode varchar(128), title text, currency varchar(16),
+          image_url text, suppressed_at timestamptz, suppression_reason text,
           visible_attributes jsonb, visible_option_labels jsonb, ingredient_ids jsonb,
           sku_payload jsonb, readiness_tier text, updated_at timestamptz)
     """)
@@ -71,9 +72,16 @@ async def _ddl(database):
         CREATE TABLE catalog_offers (
           offer_id text PRIMARY KEY, sku_key text, product_key text, merchant_id text,
           catalog_track text, truth_tier text, readiness_tier text, offer_mode text,
-          channel text, availability text, currency text, list_price numeric,
+          channel text, currency varchar(16), list_price numeric,
           merchant_effective_price numeric, estimated_best_price numeric,
-          source_system text, source_domain text, market text, source_ref text,
+          source_system text, source_domain text, source_ref text,
+          -- Mirror prod's real constraints so a passing test cannot hide a failing INSERT:
+          -- market and availability are NOT NULL there, is_first_party NOT NULL DEFAULT
+          -- false, and the varchar lengths are the ones the writer must fit.
+          market varchar(8) NOT NULL,
+          availability varchar(32) NOT NULL,
+          is_first_party boolean NOT NULL DEFAULT false,
+          offer_type text, why_buy_direct text,
           offer_payload jsonb, suppressed_at timestamptz,
           created_at timestamptz, updated_at timestamptz)
     """)
@@ -102,12 +110,16 @@ async def _seed(database, *, variants, offers, suppressed=None):
             """INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,
                  catalog_track, truth_tier, readiness_tier, offer_mode, channel,
                  availability, currency, list_price, source_system, market,
+                 offer_type, is_first_party, why_buy_direct,
                  offer_payload, suppressed_at, created_at, updated_at)
                VALUES (:oid,:sk,:pk,:m,'external_referral','primary','referral_only',
-                 'external_referral','default','in_stock',:cur,10.0,'seed','US',
+                 'external_referral','default','in_stock',:cur,10.0,'seed',:mkt,
+                 :ot,:ifp,:wbd,
                  CAST(:pl AS jsonb),:sup,NOW(),NOW())""",
             {"oid": f"offer:pg:{i}", "sk": PK + "::canonical", "pk": PK,
              "m": o.get("merchant_id", "m_seller"), "cur": o.get("currency", "USD"),
+             "mkt": o.get("market", "US"), "ot": o.get("offer_type"),
+             "ifp": o.get("is_first_party", False), "wbd": o.get("why_buy_direct"),
              "pl": json.dumps({"destination_url": o.get("dest", DEST)}),
              "sup": o.get("suppressed_at")},
         )
@@ -281,3 +293,159 @@ async def test_the_run_is_recorded_in_writer_audit_log(db):
     assert row["writer_name"] == "backfill_variant_identity_skus"
     assert row["batch_id"] == report["batch_id"]
     assert row["applied_rows"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Round-3 review: 15 of 16 semantic mutations survived the suite above. These
+# close the ones that matter, executed rather than grepped.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_offer_is_attributed_to_the_seller_not_the_product_row(db):
+    """The highest-value survivor. `merchant_id` must come from the live OFFER (the seller of
+    record), not from catalog_products — those differ, and attributing 6,090 offers to the
+    wrong party is a commercial claim, not a cosmetic one."""
+    await _seed(db, variants=[_variant()], offers=[{"merchant_id": "m_the_seller"}])
+    await _run()
+    assert await db.fetch_val(
+        "SELECT merchant_id FROM catalog_offers WHERE source_system=:s",
+        {"s": "variant_identity_backfill_v1"}) == "m_the_seller"
+    assert MERCHANT != "m_the_seller"  # the product row's merchant, deliberately different
+
+
+async def test_market_and_the_decision_fields_are_carried_from_the_chosen_offer(db):
+    """F4. A NULL offer_type on external_referral reads as authoritative "unknown" and
+    is_first_party false, so a dropped field makes the new offer look like an unknown,
+    non-official seller beside a canonical sibling that reads brand_direct/official."""
+    await _seed(db, variants=[_variant()], offers=[{
+        "market": "GB", "offer_type": "brand_direct",
+        "is_first_party": True, "why_buy_direct": "official",
+    }])
+    await _run()
+    o = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
+                                {"s": "variant_identity_backfill_v1"}))
+    assert o["market"] == "GB"
+    assert o["offer_type"] == "brand_direct"
+    assert o["is_first_party"] is True
+    assert o["why_buy_direct"] == "official"
+    assert o["source_ref"] == DEST
+
+
+async def test_a_variant_currency_disagreement_is_refused_when_it_reaches_the_writer(db):
+    """The SQLite counterpart only checked a counter. This one proves no ROW is written."""
+    await _seed(db, variants=[_variant(currency="EUR")], offers=[{"currency": "USD"}])
+    await _run()
+    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:s",
+                              {"s": "variant_identity_backfill_v1"}) == 0
+    assert await db.fetch_val("SELECT count(*) FROM catalog_skus") == 0
+
+
+async def test_a_seed_attached_to_another_product_contributes_nothing(db):
+    """B3, executed. An id borrowed from the wrong product is a real merchant id and passes
+    every string check — only the join scoping refuses it."""
+    await _seed(db, variants=[], offers=[{}])
+    await db.execute(
+        """INSERT INTO external_product_seeds
+             (external_product_id, attached_product_key, status, seed_data)
+           VALUES (:spid,'ext:some-other-product::ffff','active',CAST(:sd AS jsonb))""",
+        {"spid": SPID, "sd": json.dumps({"snapshot": {"variants": [_variant()]}})},
+    )
+    report = await _run()
+    assert report["skus"] == 0
+    assert await db.fetch_val("SELECT count(*) FROM catalog_skus") == 0
+
+
+async def test_an_inactive_seed_contributes_nothing(db):
+    await _seed(db, variants=[], offers=[{}])
+    await db.execute(
+        """INSERT INTO external_product_seeds
+             (external_product_id, attached_product_key, status, seed_data)
+           VALUES (:spid,:pk,'archived',CAST(:sd AS jsonb))""",
+        {"spid": SPID, "pk": PK, "sd": json.dumps({"snapshot": {"variants": [_variant()]}})},
+    )
+    assert (await _run())["skus"] == 0
+
+
+async def test_a_run_whose_every_pair_is_refused_does_not_read_as_success(db):
+    """F2. `skus` counted planned rows, so a fully-rolled-back run reported skus: N and an
+    audit row saying the same — indistinguishable from success."""
+    import services.catalog_offer_writer_guard as guard
+    real = guard.validate_catalog_offer_rows
+    guard.validate_catalog_offer_rows = lambda rows, **kw: ([], {"zero_or_missing_price": 1}, [])
+    try:
+        await _seed(db, variants=[_variant()], offers=[{}])
+        report = await _run()
+    finally:
+        guard.validate_catalog_offer_rows = real
+    assert report["skus"] == 0, "a rolled-back pair must not be counted as written"
+    assert report["rolled_back_offer_refused_by_guard"] == 1
+    assert await db.fetch_val("SELECT count(*) FROM catalog_skus") == 0
+    assert dict(await db.fetch_one("SELECT * FROM writer_audit_log"))["applied_rows"] == 0
+
+
+async def test_an_offer_is_never_attached_to_a_suppressed_sku(db):
+    """F6. Recall filters suppressed SKUs, so an offer there is supply nothing can surface."""
+    await db.execute(
+        """INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,
+             source_product_id, source_variant_id, title, sku_payload, suppressed_at, updated_at)
+           VALUES (:sk,:pk,:m,:p,:spid,:v,'Ruby','{}'::jsonb,:sup,NOW())""",
+        {"sk": PK + "::v::" + VID, "pk": PK, "m": MERCHANT, "p": PLATFORM,
+         "spid": SPID, "v": VID, "sup": _SUPPRESSED},
+    )
+    await _seed(db, variants=[_variant()], offers=[{}])
+    report = await _run()
+    assert report["skipped_suppressed_sku"] == 1
+    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:s",
+                              {"s": "variant_identity_backfill_v1"}) == 0
+
+
+async def test_the_audit_row_and_cursor_survive_an_error_mid_run(db):
+    """F3. An exception used to lose the report, the resume cursor AND the audit row while
+    committed pairs stayed — recoverable only by hand."""
+    import scripts.backfill_variant_identity_skus as backfill
+    await _seed(db, variants=[_variant()], offers=[{}])
+    real = backfill.guard_catalog_offer_rows
+    calls = {"n": 0}
+
+    async def boom(rows, **kw):
+        calls["n"] += 1
+        raise RuntimeError("simulated mid-run failure")
+
+    backfill.guard_catalog_offer_rows = boom
+    try:
+        with pytest.raises(RuntimeError):
+            await _run()
+    finally:
+        backfill.guard_catalog_offer_rows = real
+    assert calls["n"] == 1
+    row = dict(await db.fetch_one("SELECT * FROM writer_audit_log"))
+    assert row["writer_name"] == "backfill_variant_identity_skus"
+
+
+async def test_a_missing_arbiter_index_is_not_swallowed_as_a_collision(db):
+    """F1. `"unique" in repr(exc)` also matched SQLSTATE 42P10 — "no unique or exclusion
+    constraint matching the ON CONFLICT specification", i.e. the arbiter index being gone.
+    That turned the exact B1 failure into a silent no-op reported as row-level collisions."""
+    await db.execute("DROP INDEX idx_catalog_skus_source_identity_v2")
+    await _seed(db, variants=[_variant()], offers=[{}])
+    with pytest.raises(Exception) as caught:
+        await _run()
+    assert "42P10" in str(getattr(caught.value, "sqlstate", "")) or "ON CONFLICT" in str(
+        caught.value
+    ), f"a missing arbiter index must not be swallowed: {caught.value!r}"
+
+
+async def test_a_destination_that_lives_only_in_source_ref_is_still_carried(db):
+    """R7. SELECT_LIVE_OFFERS_SQL coalesces offer_payload->>'destination_url' with source_ref.
+    Every fixture above sets the payload key, so dropping the coalesce changed nothing and the
+    mutation survived. Ingestion writes the destination to source_ref (ingestion.py:1014), so
+    this is a shape that genuinely occurs."""
+    await _seed(db, variants=[_variant()], offers=[{}])
+    await db.execute(
+        "UPDATE catalog_offers SET offer_payload='{}'::jsonb, source_ref=:d "
+        "WHERE source_system='seed'", {"d": DEST})
+    report = await _run()
+    assert report["skus"] == 1, "the destination in source_ref was not seen"
+    o = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
+                                {"s": "variant_identity_backfill_v1"}))
+    assert json.loads(o["offer_payload"])["destination_url"] == DEST
