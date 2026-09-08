@@ -478,35 +478,59 @@ def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_the_coverage_line_is_emitted_and_carries_the_asked_fraction(caplog):
-    """A first version only INCREMENTED the counters — five writes, zero reads, discarded at
-    function exit — while a comment claimed they gave the rate a denominator. A counter nobody
-    reads is indistinguishable from one that is always zero."""
-    import logging
+def test_coverage_is_measured_against_the_population_the_gate_applies_to():
+    """The denominator is `cart_prefilled`, NOT `candidates`.
 
-    from routes.agent_shop_gateway import _emit_preflight_coverage
+    Candidates counts every seed offer considered, including referral-only ones the gate is
+    blind to by design — and those are the majority. A first version divided by candidates and
+    also left memo hits out of the numerator, so a request whose six cart handoffs were all
+    answered (one ask + five memo hits) reported 0.333, and a referral-only request reported
+    0.000. Both errors push the same way: a working gate reads as absent, and week one of
+    shadow would have been dismissed on the strength of it.
+    """
+    from routes.agent_shop_gateway import preflight_coverage_fields
 
-    with caplog.at_level(logging.INFO):
-        _emit_preflight_coverage({"candidates": 40, "asked": 8, "memo_hits": 12,
-                                  "skipped_by_budget": 20, "degraded_to_referral": 3})
-    text = caplog.text
-    assert "candidates=40" in text and "asked=8" in text
-    assert "skipped_by_budget=20" in text and "memo_hits=12" in text
-    assert "asked_fraction=0.200" in text, (
-        "the rate is over ASKED questions; without the fraction, a request whose budget died "
-        "after 8 of 40 reports exactly like one where all 40 were checked")
+    f = preflight_coverage_fields({
+        "candidates": 40, "cart_prefilled": 6, "asked": 1, "memo_hits": 5,
+        "skipped_by_budget": 0, "degraded_to_referral": 2,
+    })
+    assert f["preflight_answered_fraction"] == 1.0, (
+        "six cart handoffs, all answered — dividing by candidates would say 0.15")
+    assert f["preflight_cart_prefilled"] == 6
+    assert f["preflight_candidates"] == 40, "the wider count is still reported, just not the base"
+    assert f["preflight_memo_hits"] == 5
 
 
-def test_no_coverage_line_when_the_lane_saw_nothing(caplog):
-    """Zero candidates is not a measurement; emitting it would put noise in every request that
-    resolved no external seeds."""
-    import logging
+def test_a_partly_covered_request_reports_the_shortfall():
+    """The number has to be able to say "the gate covered half of this request", or the budget
+    is invisible."""
+    from routes.agent_shop_gateway import preflight_coverage_fields
 
-    from routes.agent_shop_gateway import _emit_preflight_coverage
+    f = preflight_coverage_fields({
+        "candidates": 40, "cart_prefilled": 20, "asked": 8, "memo_hits": 2,
+        "skipped_by_budget": 10, "degraded_to_referral": 0,
+    })
+    assert f["preflight_answered_fraction"] == 0.5
+    assert f["preflight_skipped_by_budget"] == 10
 
-    with caplog.at_level(logging.INFO):
-        _emit_preflight_coverage({"candidates": 0, "asked": 0})
-    assert "[preflight]" not in caplog.text
+
+def test_a_referral_only_request_reports_no_coverage_at_all():
+    """Not 0.000 — nothing. The gate applied to no part of this request, and a fraction of zero
+    reads as "the gate failed" rather than "the gate did not apply". Keying the early return on
+    `candidates` put exactly that line on every referral-only resolve."""
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    assert preflight_coverage_fields(
+        {"candidates": 40, "cart_prefilled": 0, "asked": 0, "memo_hits": 0}) == {}
+
+
+def test_coverage_carries_the_mode_it_was_measured_under(monkeypatch):
+    """A coverage number without its mode cannot be compared across a rollout."""
+    from routes.agent_shop_gateway import preflight_coverage_fields
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    f = preflight_coverage_fields({"candidates": 2, "cart_prefilled": 2, "asked": 2})
+    assert f["preflight_mode"] == "shadow"
 
 
 def test_the_scope_says_the_rate_is_over_questions_asked():

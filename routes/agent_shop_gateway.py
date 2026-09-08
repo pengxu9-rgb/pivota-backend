@@ -4303,8 +4303,9 @@ async def _handle_offers_resolve(
     # INCREMENTED these — five writes, zero reads, discarded at function exit — while a comment
     # claimed they gave the rate a denominator. They did not, and a counter nobody reads is
     # indistinguishable from one that is always zero.
-    _preflight_stats: Dict[str, int] = {"candidates": 0, "asked": 0, "memo_hits": 0,
-                                        "skipped_by_budget": 0, "degraded_to_referral": 0}
+    _preflight_stats: Dict[str, int] = {"candidates": 0, "cart_prefilled": 0, "asked": 0,
+                                        "memo_hits": 0, "skipped_by_budget": 0,
+                                        "degraded_to_referral": 0}
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         for row in seed_rows:
@@ -4450,8 +4451,18 @@ async def _handle_offers_resolve(
                 # and silently shrink results, which is the "gate that deletes supply" shape
                 # this repo has been bitten by. So the offer ships as an honest referral.
                 _cart_vid = redirect_identity.get("cart_variant_id")
+                # `candidates` is every seed offer considered; `cart_prefilled` is the subset
+                # the gate applies to. Coverage MUST be measured against the second: dividing
+                # by the first mixes in referral-only offers the gate is blind to by design —
+                # the majority — so a request the gate covered 6-of-6 reported 0.333 and a
+                # referral-only one reported 0.000. Week one of shadow would have read "the
+                # gate covers almost nothing", which is a statement about the denominator.
                 _preflight_stats["candidates"] += 1
-                if _cart_vid:
+                # `is_enabled()` here, not only inside the helper. The helper short-circuits so
+                # no request is spent when off — but the COUNTERS still moved, so an off
+                # request attached coverage fields describing work nobody did.
+                if _cart_vid and checkout_preflight.is_enabled():
+                    _preflight_stats["cart_prefilled"] += 1
                     _q = (str(canonical_url or destination_url), str(_cart_vid))
                     if _q in _preflight_memo:
                         _preflight_stats["memo_hits"] += 1
@@ -5928,14 +5939,12 @@ async def _handle_offers_resolve(
             "latency_ms": latency_ms,
             "sources": source_status,
             "canonical_ref": canonical_ref,
+            # READ the counters. Without this they are increments with no reads — the round-3
+            # finding. Folded into THIS record rather than a second line so coverage carries
+            # the request's identity, mode and latency alongside it.
+            **preflight_coverage_fields(_preflight_stats),
         },
     )
-
-    # READ the counters before the request ends — see _emit_preflight_coverage. Without
-    # this call they are five increments and no reads, which is what the round-3 review
-    # found: a denominator promised in a comment and never produced.
-    if checkout_preflight.is_enabled():
-        _emit_preflight_coverage(_preflight_stats)
 
     return {
         "status": "success",
@@ -8347,31 +8356,42 @@ def resolve_cart_permalink(
     )
 
 
-def _emit_preflight_coverage(stats: Dict[str, int]) -> None:
-    """Emit what fraction of a request the gate actually covered.
+def preflight_coverage_fields(stats: Dict[str, int]) -> Dict[str, Any]:
+    """Coverage of the population the gate ACTUALLY applies to, or {} when it applied to none.
 
-    `shadow_report`'s `would_block_rate` is a rate over the questions we ASKED, and asked is
-    not the same as candidates: the memo collapses duplicates and the budget stops the gate
-    part-way through a wide result set. Without this line the rate has no relation to coverage,
-    and a request where the budget was exhausted after two of forty candidates reports exactly
-    like one where all forty were checked.
+    `answered_fraction` divides by `cart_prefilled`, not by `candidates`. A first version used
+    candidates, which counts every seed offer considered — including referral-only ones the gate
+    is deliberately blind to, and they are the majority. It also put memo hits in the denominator
+    and not the numerator, so a request whose six cart handoffs were all answered from one ask
+    plus five memo hits reported 0.333. Both errors push the same way: they make a working gate
+    look absent.
 
-    A log line rather than a response field, because shadow must not change what the buyer
-    sees — the payload is asserted byte-identical to mode=off. Cloud Logging drops lines, so
-    this is a convenience for watching a rollout; the durable record is
-    checkout_preflight_observations, and REPORT_SCOPE names the denominator in the report body
-    so nobody has to reconstruct it from logs.
+    Returned as fields rather than logged directly so they ride on the existing
+    `offers.resolve.summary` record, which already carries the request's identity and latency. A
+    second bare line would have had neither, and nothing to join it to.
+
+    NOTE ON DURABILITY. These counters are NOT in `checkout_preflight_observations` — that table
+    holds one row per ask and none of these numbers. An earlier version of this docstring claimed
+    otherwise, which mattered because Cloud Logging drops lines: today coverage is best-effort,
+    and persisting it is a named follow-up rather than something already done.
     """
-    if not stats.get("candidates"):
-        return
-    asked = stats.get("asked", 0)
-    logger.info(
-        "[offers.resolve][preflight] candidates=%d asked=%d memo_hits=%d "
-        "skipped_by_budget=%d degraded_to_referral=%d asked_fraction=%.3f",
-        stats.get("candidates", 0), asked, stats.get("memo_hits", 0),
-        stats.get("skipped_by_budget", 0), stats.get("degraded_to_referral", 0),
-        (asked / stats["candidates"]) if stats.get("candidates") else 0.0,
-    )
+    covered = stats.get("cart_prefilled", 0)
+    if not covered:
+        # Not "nothing happened" — the gate applied to nothing on this request, which is the
+        # normal case for a referral-only resolve. Keying this on `candidates` put a coverage
+        # line on every such request with a fraction of 0.000.
+        return {}
+    answered = stats.get("asked", 0) + stats.get("memo_hits", 0)
+    return {
+        "preflight_mode": checkout_preflight.mode(),
+        "preflight_candidates": stats.get("candidates", 0),
+        "preflight_cart_prefilled": covered,
+        "preflight_asked": stats.get("asked", 0),
+        "preflight_memo_hits": stats.get("memo_hits", 0),
+        "preflight_skipped_by_budget": stats.get("skipped_by_budget", 0),
+        "preflight_degraded_to_referral": stats.get("degraded_to_referral", 0),
+        "preflight_answered_fraction": round(answered / covered, 3),
+    }
 
 
 class _PreflightBudget:

@@ -4475,13 +4475,14 @@ def test_the_resolve_emits_its_preflight_coverage(
         )
     assert res.status_code == 200
     assert asked, "the harness must have produced at least one ask"
-    assert "[offers.resolve][preflight]" in caplog.text, (
+    rec = next((r for r in caplog.records
+                if getattr(r, "event", None) == "offers.resolve.summary"), None)
+    assert rec is not None, "the summary record is the carrier for coverage"
+    assert getattr(rec, "preflight_cart_prefilled", 0) > 0, (
         "the request ended without reading its own counters — the coverage denominator does "
         "not exist")
-    assert "asked_fraction=" in caplog.text
-    # candidates must exceed asked here (3 variants per row share one question), which is the
-    # whole reason the fraction is worth emitting.
-    assert "memo_hits=" in caplog.text
+    assert hasattr(rec, "preflight_answered_fraction")
+    assert getattr(rec, "preflight_mode") == "shadow"
 
 
 def test_no_coverage_line_when_the_preflight_is_off(
@@ -4502,4 +4503,7 @@ def test_no_coverage_line_when_the_preflight_is_off(
                   "metadata": {"source": "creator-agent-ui"}},
         )
     assert res.status_code == 200
-    assert "[offers.resolve][preflight]" not in caplog.text
+    rec = next((r for r in caplog.records
+                if getattr(r, "event", None) == "offers.resolve.summary"), None)
+    assert rec is None or not hasattr(rec, "preflight_answered_fraction"), (
+        "off must not attach coverage fields")
