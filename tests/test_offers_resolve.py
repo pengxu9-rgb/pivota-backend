@@ -4447,3 +4447,59 @@ def test_a_refused_cart_prefill_degrades_to_a_referral_rather_than_deleting_the_
     assert offers, "a refused cart prefill must not delete the offer"
     assert all(o.get("cart_prefilled") is False for o in offers), (
         "the refused offer must ship as a referral, not a cart")
+
+
+def test_the_resolve_emits_its_preflight_coverage(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """The CALL, not the emitter.
+
+    `_emit_preflight_coverage` has its own unit test, and that test passes with the call site
+    deleted — the third time in this PR that a helper was covered while nothing pinned that it
+    is invoked. The counters are useless unless the request actually reads them, so this drives
+    the real loop and asserts the line appears.
+    """
+    import logging
+
+    asked = _preflight_harness(monkeypatch, rows={"n_rows": 2, "variants_per_row": 3})
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "50")
+
+    with caplog.at_level(logging.INFO):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+    assert res.status_code == 200
+    assert asked, "the harness must have produced at least one ask"
+    assert "[offers.resolve][preflight]" in caplog.text, (
+        "the request ended without reading its own counters — the coverage denominator does "
+        "not exist")
+    assert "asked_fraction=" in caplog.text
+    # candidates must exceed asked here (3 variants per row share one question), which is the
+    # whole reason the fraction is worth emitting.
+    assert "memo_hits=" in caplog.text
+
+
+def test_no_coverage_line_when_the_preflight_is_off(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog
+) -> None:
+    """Off must not put a line in every resolve."""
+    import logging
+
+    _preflight_harness(monkeypatch, rows={"n_rows": 1, "variants_per_row": 2})
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+
+    with caplog.at_level(logging.INFO):
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 20,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+    assert res.status_code == 200
+    assert "[offers.resolve][preflight]" not in caplog.text

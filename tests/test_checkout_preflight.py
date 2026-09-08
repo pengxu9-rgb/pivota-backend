@@ -448,12 +448,19 @@ def test_the_budget_bounds_a_wide_result_set(monkeypatch):
 
 
 def test_the_budget_bounds_a_few_slow_merchants(monkeypatch):
-    """The other failure shape: few candidates, each slow. Zero seconds means the very first
-    check is already over budget."""
+    """The other failure shape: few candidates, each slow.
+
+    Asserted AFTER the first spend, not at construction. The clock now starts on the first
+    question, so a freshly built budget has spent no time by definition — an earlier version of
+    this test asserted `available() is False` straight after construction, which only held
+    because the clock was (wrongly) already running through the request's own DB lanes."""
     from routes.agent_shop_gateway import _PreflightBudget
 
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "0")
-    assert _PreflightBudget().available() is False
+    b = _PreflightBudget()
+    assert b.available() is True, "nothing asked yet, so no time spent on the gate"
+    b.spend()
+    assert b.available() is False, "a zero-second budget is spent by the first question"
 
 
 def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
@@ -464,3 +471,70 @@ def test_a_malformed_budget_falls_back_rather_than_raising(monkeypatch):
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "")
     b = _PreflightBudget()
     assert b.available() is True
+
+
+# ---------------------------------------------------------------------------
+# The coverage denominator has to actually exist
+# ---------------------------------------------------------------------------
+
+
+def test_the_coverage_line_is_emitted_and_carries_the_asked_fraction(caplog):
+    """A first version only INCREMENTED the counters — five writes, zero reads, discarded at
+    function exit — while a comment claimed they gave the rate a denominator. A counter nobody
+    reads is indistinguishable from one that is always zero."""
+    import logging
+
+    from routes.agent_shop_gateway import _emit_preflight_coverage
+
+    with caplog.at_level(logging.INFO):
+        _emit_preflight_coverage({"candidates": 40, "asked": 8, "memo_hits": 12,
+                                  "skipped_by_budget": 20, "degraded_to_referral": 3})
+    text = caplog.text
+    assert "candidates=40" in text and "asked=8" in text
+    assert "skipped_by_budget=20" in text and "memo_hits=12" in text
+    assert "asked_fraction=0.200" in text, (
+        "the rate is over ASKED questions; without the fraction, a request whose budget died "
+        "after 8 of 40 reports exactly like one where all 40 were checked")
+
+
+def test_no_coverage_line_when_the_lane_saw_nothing(caplog):
+    """Zero candidates is not a measurement; emitting it would put noise in every request that
+    resolved no external seeds."""
+    import logging
+
+    from routes.agent_shop_gateway import _emit_preflight_coverage
+
+    with caplog.at_level(logging.INFO):
+        _emit_preflight_coverage({"candidates": 0, "asked": 0})
+    assert "[preflight]" not in caplog.text
+
+
+def test_the_scope_says_the_rate_is_over_questions_asked():
+    """`would_block_rate` divides by asked, not by candidates. A reader who takes it as
+    "how often a cart handoff is stale" is wrong whenever the budget or the memo bit."""
+    assert "ASKED" in cp.REPORT_SCOPE
+    assert "not over candidates" in cp.REPORT_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# The budget clock must measure the gate, not the request
+# ---------------------------------------------------------------------------
+
+
+def test_the_clock_starts_at_the_first_question_not_at_construction(monkeypatch):
+    """The budget is built at the top of the resolve, and 0.7-1.1s of the request's own
+    fetch_all lanes run before the first preflight. A clock started at construction spent
+    itself on work the gate did not do — and biased the measurement against exactly the
+    population worth measuring, since a slow-DB request reached the retry lanes with the
+    budget gone and the gate silently absent."""
+    import time as _t
+
+    from routes.agent_shop_gateway import _PreflightBudget
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_REQUEST_BUDGET_SECONDS", "0.05")
+    b = _PreflightBudget()
+    _t.sleep(0.1)  # the request's own DB lanes, doing no preflight work
+    assert b.available() is True, "the clock must not have been running before the first ask"
+    b.spend()
+    _t.sleep(0.1)
+    assert b.available() is False, "once spent, the clock runs"

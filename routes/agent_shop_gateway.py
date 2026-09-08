@@ -4299,6 +4299,10 @@ async def _handle_offers_resolve(
     # so it also dedups across rows that resolve to the same product.
     _preflight_budget = _PreflightBudget()
     _preflight_memo: Dict[Tuple[str, str], bool] = {}
+    # READ at the end of the request by `_emit_preflight_coverage`. A first version only
+    # INCREMENTED these — five writes, zero reads, discarded at function exit — while a comment
+    # claimed they gave the rate a denominator. They did not, and a counter nobody reads is
+    # indistinguishable from one that is always zero.
     _preflight_stats: Dict[str, int] = {"candidates": 0, "asked": 0, "memo_hits": 0,
                                         "skipped_by_budget": 0, "degraded_to_referral": 0}
 
@@ -5926,6 +5930,12 @@ async def _handle_offers_resolve(
             "canonical_ref": canonical_ref,
         },
     )
+
+    # READ the counters before the request ends — see _emit_preflight_coverage. Without
+    # this call they are five increments and no reads, which is what the round-3 review
+    # found: a denominator promised in a comment and never produced.
+    if checkout_preflight.is_enabled():
+        _emit_preflight_coverage(_preflight_stats)
 
     return {
         "status": "success",
@@ -8337,6 +8347,33 @@ def resolve_cart_permalink(
     )
 
 
+def _emit_preflight_coverage(stats: Dict[str, int]) -> None:
+    """Emit what fraction of a request the gate actually covered.
+
+    `shadow_report`'s `would_block_rate` is a rate over the questions we ASKED, and asked is
+    not the same as candidates: the memo collapses duplicates and the budget stops the gate
+    part-way through a wide result set. Without this line the rate has no relation to coverage,
+    and a request where the budget was exhausted after two of forty candidates reports exactly
+    like one where all forty were checked.
+
+    A log line rather than a response field, because shadow must not change what the buyer
+    sees — the payload is asserted byte-identical to mode=off. Cloud Logging drops lines, so
+    this is a convenience for watching a rollout; the durable record is
+    checkout_preflight_observations, and REPORT_SCOPE names the denominator in the report body
+    so nobody has to reconstruct it from logs.
+    """
+    if not stats.get("candidates"):
+        return
+    asked = stats.get("asked", 0)
+    logger.info(
+        "[offers.resolve][preflight] candidates=%d asked=%d memo_hits=%d "
+        "skipped_by_budget=%d degraded_to_referral=%d asked_fraction=%.3f",
+        stats.get("candidates", 0), asked, stats.get("memo_hits", 0),
+        stats.get("skipped_by_budget", 0), stats.get("degraded_to_referral", 0),
+        (asked / stats["candidates"]) if stats.get("candidates") else 0.0,
+    )
+
+
 class _PreflightBudget:
     """Bounds how much of a single resolve the preflight may consume.
 
@@ -8346,7 +8383,14 @@ class _PreflightBudget:
     """
 
     def __init__(self) -> None:
-        self._started = time.monotonic()
+        # Started LAZILY, on the first question rather than at construction. The budget is
+        # built at the top of the resolve, and 0.7-1.1s of the request's own fetch_all lanes
+        # run between there and the first preflight — so a clock started here spent part of
+        # itself on work the gate did not do. Worse, it biased the measurement against exactly
+        # the population worth measuring: a slow-DB request reached the retry lanes with the
+        # budget already gone and the gate silently absent, so the slowest merchants were the
+        # least likely to be checked.
+        self._started: Optional[float] = None
         self._spent = 0
         try:
             self._max_calls = max(0, int(os.getenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST") or 8))
@@ -8360,9 +8404,14 @@ class _PreflightBudget:
     def available(self) -> bool:
         if self._spent >= self._max_calls:
             return False
+        if self._started is None:
+            # No question asked yet, so no time has been spent on this gate.
+            return True
         return (time.monotonic() - self._started) < self._budget_s
 
     def spend(self) -> None:
+        if self._started is None:
+            self._started = time.monotonic()
         self._spent += 1
 
 
