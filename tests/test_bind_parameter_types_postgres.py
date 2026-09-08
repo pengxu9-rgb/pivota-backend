@@ -130,7 +130,17 @@ async def test_the_verification_claim_runs_at_all(evidence_db):
     claimed = await claim_next_pending_verification(worker_id=f"w-{RUN}")
 
     assert claimed is not None, "the claim returned nothing — no row was locked"
-    assert claimed["verify_id"] == ANY_ID
+    # The default claim takes the OLDEST pending row in the whole table, so a
+    # pending row any earlier module left behind is claimed ahead of ours. Name
+    # it: the fix belongs in the module that wrote it (#2142), not here.
+    assert claimed["verify_id"] == ANY_ID, (
+        "claimed a pending row this test did not insert — a leftover from "
+        f"merchant_id={claimed.get('merchant_id')!r} "
+        f"verifier_id={claimed.get('verifier_id')!r} "
+        f"audit_run_id={claimed.get('audit_run_id')!r} "
+        f"idempotency_key={claimed.get('idempotency_key')!r}; that module "
+        "must delete what it writes"
+    )
 
     # The claim's own effect, which "it returned a row" does not reach: the row
     # must actually be marked, and marked for THIS worker. Without these the
