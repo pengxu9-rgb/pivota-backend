@@ -12,6 +12,8 @@ failure fails CLOSED), and the share-view interaction (lock markers survive
 the share allowlist; emptied arrays stay empty after redaction).
 """
 
+import json
+
 import pytest
 
 import routes.merchant_audit_routes as mar
@@ -147,6 +149,10 @@ def test_strip_empties_actions_and_stamps_lock():
         # One catalogue gap in the fixture — the count survives so the locked
         # panel can name a number without handing over the gap itself.
         "selection_gap": 1,
+        # The /ask context's per-product strategic brief; this envelope
+        # fixture carries none, and the key is still present so a consumer
+        # never has to distinguish "absent" from "zero".
+        "plan_moves": 0,
     }
     assert out["locked_teaser_headline"] == "Fix PDP variant clarity"
 
@@ -439,3 +445,101 @@ def test_the_locked_count_survives_a_section_with_no_matched_products():
     assert shaped["brand_rollup"]["selection_gap"] is None
     assert shaped["locked_counts"]["selection_gap"] == 1
 
+
+
+# ---- the /ask LLM context ---------------------------------------------------
+#
+# /ask builds its own context (`_build_ask_context`), merges the recovery
+# projection into it flat, and hands the result to `_apply_actions_paywall`.
+# That context carries the paid layer under `overview.top_actions` and
+# `product.plan` — two paths the strip never visited — so a free-tier ask
+# stamped `actions_locked: True` on a context that still fed the whole plan to
+# the model answering the merchant's question.
+
+
+def _ask_report() -> dict:
+    """A report in the shape `_ask_report_root` reads, whose per-SKU row
+    carries a REAL strategic brief (`brief_debug.outcome == "llm"`, which is
+    what `_ask_real_brief` requires before it will feed one to the model)."""
+    return {
+        "merchant_narrative": {
+            "headline_story": "Visible on Gemini, invisible on ChatGPT.",
+            "prioritized_actions": [
+                {"headline": "Fix PDP variant clarity"},
+                {"headline": "Get cited on droneblog"},
+            ],
+            "honest_limits": ["Two providers probed."],
+        },
+        "per_sku_reports": [{
+            "product_key": "sig_abc123",
+            "identity": {"name": "Drone X"},
+            "band_display": {"label": "Not yet visible"},
+            "next_best_action": {
+                "brief_debug": {"outcome": "llm"},
+                "strategic_brief": {
+                    "your_angle": "Own the beginner-drone question.",
+                    "why_you_lose": "No independent source cites you.",
+                    "core_decision": "Pitch droneblog before touching the PDP.",
+                    "first_moves": ["Send the droneblog pitch",
+                                    "Rewrite the PDP title"],
+                },
+            },
+        }],
+    }
+
+
+def _ask_paywall(monkeypatch, tier: str):
+    monkeypatch.setattr(mar, "_ACTIONS_PAYWALL_ENABLED", True)
+
+    async def fake_balance(merchant_id):
+        return {"plan_tier": tier, "credits": 0 if tier == "free" else 5000}
+
+    monkeypatch.setattr(mar, "get_balance", fake_balance)
+    return mar._build_ask_context(_ask_report(), "sig_abc123")
+
+
+@pytest.mark.asyncio
+async def test_the_ask_context_a_free_tier_merchant_gets_carries_no_plan(
+    monkeypatch,
+):
+    context = _ask_paywall(monkeypatch, "free")
+    # The unstripped context is the leak: assert the paid layer is really
+    # there before the paywall runs, or this test could pass on a typo.
+    assert context["overview"]["top_actions"]
+    assert context["product"]["plan"]["first_moves"]
+
+    out = await mar._apply_actions_paywall(context, "m1")
+
+    assert out["actions_locked"] is True
+    assert out["overview"]["top_actions"] == []
+    assert out["product"]["plan"] is None
+    # Nothing of the brief may survive anywhere in the string the model reads.
+    blob = json.dumps(out, default=str)
+    for secret in ("Own the beginner-drone question.",
+                   "Pitch droneblog before touching the PDP.",
+                   "Send the droneblog pitch",
+                   "Fix PDP variant clarity"):
+        assert secret not in blob, secret
+    # The counts say how much was locked without saying what.
+    assert out["locked_counts"]["top_actions"] == 2
+    assert out["locked_counts"]["plan_moves"] == 2
+    # The free "what's wrong" layer is untouched.
+    assert out["overview"]["headline"] == "Visible on Gemini, invisible on ChatGPT."
+    assert out["product"]["verdict"] == "Not yet visible"
+
+
+@pytest.mark.asyncio
+async def test_the_ask_context_a_paid_merchant_gets_keeps_the_plan(monkeypatch):
+    context = _ask_paywall(monkeypatch, "growth")
+    out = await mar._apply_actions_paywall(context, "m1")
+
+    assert "actions_locked" not in out
+    assert out["overview"]["top_actions"] == [
+        "Fix PDP variant clarity", "Get cited on droneblog",
+    ]
+    assert out["product"]["plan"]["first_moves"] == [
+        "Send the droneblog pitch", "Rewrite the PDP title",
+    ]
+    assert out["product"]["plan"]["the_call"] == (
+        "Pitch droneblog before touching the PDP."
+    )

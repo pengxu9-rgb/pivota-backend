@@ -1557,6 +1557,9 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
         # Number of catalogue gaps found, so the locked panel can say "6 gaps"
         # instead of rendering as an empty section.
         "selection_gap": 0,
+        # First moves in the per-product strategic brief the /ask context
+        # carries under `product.plan` (see the ask-context branch below).
+        "plan_moves": 0,
     }
     teaser_headline = None
 
@@ -1698,6 +1701,44 @@ def _strip_actions_for_free_tier(shaped: Dict[str, Any]) -> Dict[str, Any]:
                 counts["prioritized_actions"], len(stage_actions)
             )
             stage["actions"] = []
+
+    # THE /ask LLM CONTEXT is the fourth shape this helper is handed
+    # (`_build_ask_context` -> `_apply_actions_paywall`), and it carries the
+    # paid layer under two keys nothing above visits:
+    #
+    #   context["overview"]["top_actions"]        the prioritized-action
+    #                                             HEADLINES, verbatim
+    #   context["product"]["plan"]                the LLM strategic brief —
+    #                                             your_angle / the_call /
+    #                                             first_moves
+    #
+    # so /ask stamped `actions_locked: True` onto a context that still fed the
+    # entire plan to the model, which then answered the free-tier merchant's
+    # question out of it. The lock stamp is not the paywall; this is.
+    #
+    # The whole `plan` block goes, not three of its four keys. It exists only
+    # when `_ask_real_brief` accepted the run's REAL strategic brief (the
+    # deterministic fallback is already suppressed), so it is the paid
+    # artifact as a unit; keeping `why_you_lose` back out of it would leak the
+    # brief's framing of the fix while claiming the fix was locked.
+    overview = shaped.get("overview")
+    if isinstance(overview, dict):
+        overview_actions = overview.get("top_actions")
+        if isinstance(overview_actions, list) and overview_actions:
+            counts["top_actions"] = max(
+                counts["top_actions"], len(overview_actions)
+            )
+            overview["top_actions"] = []
+
+    product = shaped.get("product")
+    if isinstance(product, dict):
+        plan = product.get("plan")
+        if isinstance(plan, dict) and plan:
+            counts["plan_moves"] = max(
+                counts["plan_moves"],
+                len([m for m in (plan.get("first_moves") or []) if m]),
+            )
+            product["plan"] = None
 
     shaped["actions_locked"] = True
     shaped["locked_counts"] = counts
