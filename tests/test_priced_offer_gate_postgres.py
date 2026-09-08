@@ -31,7 +31,9 @@ Each predicate is proved to count BOTH ways. A check that only ever answers
 "clean" looks exactly like a healthy catalog.
 
 🚨 THESE GATE FILES SHARE ONE DATABASE. `metadata.create_all` + DELETE only —
-never hand-roll DDL for a table `db.catalog` owns.
+never hand-roll DDL for a table `db.catalog` owns — and every row this module
+writes is deleted BY KEY when its test ends (`_note`), because the last test's
+rows otherwise outlive the run and poison a neighbour's scan on the next one.
 """
 
 from __future__ import annotations
@@ -146,7 +148,15 @@ def pg_engine():
         for stmt in filter(None, (s.strip() for s in _LIGHTWEIGHT_DDL.split(";"))):
             conn.execute(text(stmt))
     yield engine
+    # Nothing this module wrote may outlive it — see the row-scoped teardown.
+    # `_reset` emptied these tables when each test began, so anything still in
+    # them now is a row written here without `_note`.
+    with engine.begin() as conn:
+        residue = {t: conn.execute(text(f"SELECT count(*) FROM {t}")).scalar()
+                   for t in _TABLES_TO_RESET}
     engine.dispose()
+    assert not any(residue.values()), (
+        f"this module left rows behind for the next gate run: {residue}")
 
 
 def _reset(conn):
@@ -154,6 +164,43 @@ def _reset(conn):
 
     for t in _TABLES_TO_RESET:
         conn.execute(text(f"DELETE FROM {t}"))
+
+
+# ---------------------------------------------------------------------------
+# Row-scoped teardown
+# ---------------------------------------------------------------------------
+# `_reset` empties these tables at the START of every test, so this module never
+# saw its own leftovers. Its NEIGHBOURS did: the gate files share one database,
+# and the last test here used to leave `pk_sample` (platform='external_seed')
+# behind. tests/test_backfill_variant_identity_skus_postgres.py scans every
+# external_seed catalog_products row, so a SECOND `pytest tests/test_*_postgres.py`
+# against the same database failed four of its tests. CI never sees that — it
+# provisions a fresh database per job — so it bit only local runs.
+#
+# Every helper that writes a row records (table, key column, key) here, and the
+# autouse fixture below deletes exactly those rows when the test ends. By KEY,
+# never `DROP`, never the whole table — the contract that file's `_clear` sets.
+# `pg_engine`'s teardown then asserts the tables are empty, so a new raw INSERT
+# that forgets to `_note` turns the module red instead of poisoning a neighbour.
+_WRITTEN: list = []   # (table, key column, key value)
+
+
+def _note(table, column, value):
+    _WRITTEN.append((table, column, value))
+
+
+@pytest.fixture(autouse=True)
+def _delete_what_this_test_wrote(pg_engine):
+    from sqlalchemy import text
+
+    _WRITTEN.clear()
+    yield
+    if not _WRITTEN:
+        return
+    with pg_engine.begin() as conn:
+        for table, column, value in reversed(_WRITTEN):
+            conn.execute(text(f"DELETE FROM {table} WHERE {column} = :v"), {"v": value})
+    _WRITTEN.clear()
 
 
 def _product(conn, *, pk, ck, sig=None, sync_status="live", merchant_id="external_seed"):
@@ -177,6 +224,8 @@ def _product(conn, *, pk, ck, sig=None, sync_status="live", merchant_id="externa
         {"pk": pk, "mid": merchant_id, "ck": ck, "ss": sync_status,
          "sig": sig or f"sig_{pk}"},
     )
+    _note("index_pipeline_state", "content_key", ck)
+    _note("catalog_products", "product_key", pk)
 
 
 def _offer(conn, *, pk, list_price=None, effective=None, suppressed=False,
@@ -194,6 +243,7 @@ def _offer(conn, *, pk, list_price=None, effective=None, suppressed=False,
         {"oid": f"offer:{pk}:{list_price}:{effective}:{suppressed}", "pk": pk,
          "lp": list_price, "mep": effective, "cur": currency},
     )
+    _note("catalog_offers", "product_key", pk)
 
 
 def _trust_blocked(conn, pk):
@@ -206,6 +256,7 @@ def _trust_blocked(conn, pk):
         ),
         {"pk": pk},
     )
+    _note("catalog_row_trust", "subject_key", pk)
 
 
 def _trust_public(conn, pk):
@@ -218,6 +269,7 @@ def _trust_public(conn, pk):
         ),
         {"pk": pk},
     )
+    _note("catalog_row_trust", "subject_key", pk)
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +536,7 @@ def _elect(conn, ck, sig):
              "SET canonical_sig_id = EXCLUDED.canonical_sig_id"),
         {"ck": ck, "sig": sig},
     )
+    _note("content_canonical_election", "content_key", ck)
 
 
 def _named(name):
@@ -651,6 +704,7 @@ def _score(conn, *, merchant_id="external_seed", source_product_id, score):
              "VALUES (:m, 'external_seed', :spid, :sc, CURRENT_DATE)"),
         {"m": merchant_id, "spid": source_product_id, "sc": score},
     )
+    _note("product_quality_snapshot", "platform_product_id", source_product_id)
 
 
 def _floor():
@@ -747,6 +801,7 @@ def _listing(conn, *, source_product_id, sig_group, merchant_id="external_seed")
         {"ref": f"{merchant_id}:{source_product_id}", "pid": source_product_id,
          "m": merchant_id, "sig": sig_group},
     )
+    _note("pdp_identity_listing", "source_listing_ref", f"{merchant_id}:{source_product_id}")
 
 
 def _domain(conn, pk, domain):
@@ -862,6 +917,7 @@ def test_fragmented_identity_uses_the_canonical_identity_join(pg_engine):
             "INSERT INTO external_product_seeds "
             "(external_product_id, attached_product_key, status, updated_at) "
             "VALUES ('ext_minted_seed', 'pk_minted', 'active', NOW())"))
+        _note("external_product_seeds", "external_product_id", "ext_minted_seed")
         _listing(conn, source_product_id="ext_minted_seed", sig_group="grp_minted")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer")
         _trust_public(conn, "pk_minted")
@@ -1035,6 +1091,8 @@ def test_fragmented_identity_minted_pick_prefers_a_seed_carrying_a_listing(pg_en
             "(external_product_id, attached_product_key, status, updated_at) VALUES "
             "('ext_no_listing', 'pk_minted', 'active', NOW()), "
             "('ext_has_listing', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        for e in ("ext_no_listing", "ext_has_listing"):
+            _note("external_product_seeds", "external_product_id", e)
         _listing(conn, source_product_id="ext_has_listing", sig_group="grp_minted")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer")
         _trust_public(conn, "pk_minted")
@@ -1063,6 +1121,8 @@ def test_fragmented_identity_minted_pick_skips_an_inactive_seed(pg_engine):
             "(external_product_id, attached_product_key, status, updated_at) VALUES "
             "('ext_stale', 'pk_minted', 'inactive', NOW()), "
             "('ext_active', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        for e in ("ext_stale", "ext_active"):
+            _note("external_product_seeds", "external_product_id", e)
         _listing(conn, source_product_id="ext_stale", sig_group="grp_stale")
         _listing(conn, source_product_id="ext_active", sig_group="grp_shared")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_shared")
@@ -1119,6 +1179,8 @@ def test_identity_leg_ignores_a_listing_at_another_merchant(pg_engine):
             "(external_product_id, attached_product_key, status, updated_at) VALUES "
             "('ext_zzz_rival', 'pk_minted', 'active', NOW()), "
             "('ext_aaa_right', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        for e in ("ext_zzz_rival", "ext_aaa_right"):
+            _note("external_product_seeds", "external_product_id", e)
         _listing(conn, source_product_id="ext_aaa_right", sig_group="grp_minted",
                  merchant_id="merch_m1")
         _listing(conn, source_product_id="ext_zzz_rival", sig_group="grp_foreign",
@@ -1167,6 +1229,8 @@ def test_identity_leg_still_prefers_the_seed_that_resolves_at_this_merchant(pg_e
             "(external_product_id, attached_product_key, status, updated_at) VALUES "
             "('ext_new', 'pk_minted', 'active', NOW()), "
             "('ext_old', 'pk_minted', 'active', NOW() - INTERVAL '10 days')"))
+        for e in ("ext_new", "ext_old"):
+            _note("external_product_seeds", "external_product_id", e)
         _listing(conn, source_product_id="ext_old", sig_group="grp_minted",
                  merchant_id="merch_m1")
         _listing(conn, source_product_id="pk_retailer", sig_group="grp_retailer",
