@@ -234,14 +234,39 @@ async def test_a_price_mismatch_is_informational_and_never_blocks(monkeypatch):
     assert v.price_verified is False, "price must never be claimed verified from this source"
 
 
-async def test_price_verified_is_never_true_while_the_source_cannot_carry_currency(monkeypatch):
-    """The positive counterpart: if a future change starts setting price_verified from this
-    source, this fails and the docstring's claim has to be revisited rather than quietly lost."""
+async def test_price_verified_is_never_true_even_when_the_search_checker_says_so(monkeypatch):
+    """The positive counterpart, and not a tautology: `_check_one` DOES set price_verified=True
+    when /meta.json's shop currency matches the offer's. That is a currency inference about a
+    minor-unit amount, not a quote from the merchant's checkout, so this module pins it False
+    at the pass-through. The first version of this test stubbed False and asserted False."""
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
     _stub_verdict(monkeypatch, status=lov.VERIFIED, reason="ok", in_stock=True,
-                  live_price=Decimal("24.00"), live_currency="USD", price_verified=False)
+                  live_price=Decimal("24.00"), live_currency="USD", price_verified=True)
     v = await cp.preflight(_offer())
     assert v.price_verified is False
+
+
+async def test_the_call_is_bounded_by_the_deadline_and_a_timeout_is_unverifiable(monkeypatch):
+    """`max_wait` bounds only the politeness stall inside `_check_one`; robots, pacing and a
+    redirect-chasing fetch each carry their own timeout, so a bare call could hold the money
+    path for 10-14 s. The whole call is wrapped in the deadline; a timeout is UNVERIFIABLE,
+    which blocks in enforce and is a would_block row in shadow."""
+    import asyncio as _asyncio
+    import time as _time
+
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_DEADLINE_SECONDS", "0.5")
+
+    async def _slow(offer, **_):
+        await _asyncio.sleep(5)
+        return lov.Verdict(status=lov.VERIFIED, reason="ok", in_stock=True)
+
+    monkeypatch.setattr(lov, "_check_one", _slow)
+    t0 = _time.monotonic()
+    v = await cp.preflight(_offer())
+    assert _time.monotonic() - t0 < 2.0, "the deadline must bound the whole call"
+    assert v.outcome == cp.UNVERIFIABLE and v.would_block is True
+    assert v.allows_checkout is False
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +287,43 @@ async def test_a_failed_observation_write_does_not_break_the_checkout(monkeypatc
     monkeypatch.setattr(cp, "database", _Broken())
     v = await cp.preflight_and_record(_offer())
     assert v.outcome == cp.OK and v.allows_checkout is True
+
+
+async def test_the_observation_records_the_mode_the_verdict_was_computed_under(monkeypatch):
+    """`record()` used to read `is_enabled()`/`mode()` from the live env. The env is re-read
+    per call by design (flip without a roll), so an off->shadow flip between computing and
+    recording wrote a `preflight_off` pass into the shadow report as if measured, and a
+    shadow->off flip dropped a real row."""
+    rows = []
+
+    class _Capture:
+        async def execute(self, sql, params):
+            rows.append(dict(params))
+
+    monkeypatch.setattr(cp, "database", _Capture())
+    _stub_verdict(monkeypatch, status=lov.GONE, reason="404")
+
+    # computed under shadow, env flipped to off before recording -> the row is still written, as shadow
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    v = await cp.preflight(_offer())
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "off")
+    await cp.record(v, _offer())
+    assert [r["mode"] for r in rows] == [cp.MODE_SHADOW]
+    assert rows[0]["would_block"] is True
+
+    # computed under off, env flipped to shadow before recording -> no fake pass is written
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "off")
+    v = await cp.preflight(_offer())
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    await cp.record(v, _offer())
+    assert len(rows) == 1
+
+    # computed under shadow, env flipped to enforce before recording -> labelled shadow, not enforce
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    v = await cp.preflight(_offer())
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    await cp.record(v, _offer())
+    assert [r["mode"] for r in rows] == [cp.MODE_SHADOW, cp.MODE_SHADOW]
 
 
 async def test_off_writes_no_observation(monkeypatch):

@@ -39,6 +39,7 @@ would look like the check had been done.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -203,8 +204,15 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
 
         # 3. Ask the merchant. Reuses the search path's checker so there is one crawler, one
         #    cache and one politeness budget — but the verdict is read with checkout's rules.
-        verdict = await live_offer_verification._check_one(
-            offer, max_wait=deadline_seconds()
+        # `max_wait` bounds only the politeness stall inside `_check_one`; the robots fetch
+        # (5 s), the pacing wait (4 s) and a redirect-chasing fetch (1.2 s per operation, up to
+        # 3 redirects) are each bounded separately, so together they could hold the money
+        # path for 10-14 s. The search lane never sees that because its batch `asyncio.wait`
+        # caps the whole call; calling `_check_one` bare dropped that bound. `TimeoutError`
+        # is an `Exception`, so it lands on UNVERIFIABLE below -- fail-closed.
+        budget = deadline_seconds()
+        verdict = await asyncio.wait_for(
+            live_offer_verification._check_one(offer, max_wait=budget), timeout=budget
         )
     except Exception as exc:  # noqa: BLE001
         # Fail-closed on our OWN failure too. An exception here means we did not establish the
@@ -217,7 +225,13 @@ async def preflight(offer: Dict[str, Any]) -> PreflightVerdict:
         "in_stock": verdict.in_stock,
         "live_price": verdict.live_price,
         "live_currency": verdict.live_currency,
-        "price_verified": verdict.price_verified,
+        # Pinned False at the pass-through, whatever `_check_one` said. The search checker sets
+        # it True when /meta.json's shop currency matches the offer's; that is a currency
+        # INFERENCE about `/products/<handle>.js`'s minor-unit amount, not a quote from the
+        # merchant's checkout, and this module's contract is that price is established only
+        # by a currency-bearing source (UCP create_checkout). Claiming it here would look like
+        # the check had been done.
+        "price_verified": False,
         "price_moved": bool(verdict.price_changed),
         "detail": {"source": verdict.source, "verify_reason": verdict.reason},
     }
@@ -260,12 +274,16 @@ async def record(verdict: PreflightVerdict, offer: Dict[str, Any]) -> None:
     backfill's entire report while the job exited 0, and a shadow mode that silently under-counts
     is the failure it exists to detect.
     """
-    if not is_enabled():
+    # From the VERDICT, not the live env: the flag is re-read on every call so it can be
+    # flipped without a roll, and an off->shadow flip between computing and recording wrote a
+    # `preflight_off` pass into the shadow report as if it had been measured -- deflating the
+    # one number the enforcement decision rests on; the reverse flip dropped a real row.
+    if verdict.mode == MODE_OFF:
         return
     try:
         await database.execute(INSERT_OBSERVATION_SQL, {
             "observation_id": uuid.uuid4().hex,
-            "mode": mode(),
+            "mode": verdict.mode,
             "outcome": verdict.outcome,
             "would_block": bool(verdict.would_block),
             "reason": verdict.reason,
