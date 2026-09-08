@@ -4110,3 +4110,74 @@ def test_host_diverse_head_treats_hostless_offers_as_distinct() -> None:
         {"offer_id": "of:e", "url": "https://three.example/p"},
     ]
     assert [o["offer_id"] for o in _host_diverse_head(mixed, 3)] == ["of:a", "of:b", "of:c"]
+
+
+def test_enforced_preflight_drops_the_seed_offer_from_the_resolve_lane(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The CALL SITE, not the helper.
+
+    `_preflight_allows_external_offer` is unit-tested, but a mutation deleting the `continue`
+    that consumes it at the seed lane's loop would survive those tests entirely — the decision
+    would be computed and thrown away, which is the shape of every "gate that does not gate" bug
+    in this repo. This drives the real loop: with the preflight enforcing and refusing, the seed
+    offer must disappear from the response, and with it in shadow it must still be published.
+
+    That offer is the one handed over as a PRE-FILLED CART keyed on the variant id the
+    2026-09-08 backfill wrote, so publishing one the merchant no longer sells puts the wrong
+    thing in a real cart rather than merely bouncing the buyer.
+    """
+    import routes.agent_shop_gateway as gateway
+    from services import checkout_preflight as cp
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            return [_CATALOG_OFFER_ROW]
+        return _sig_lane_fetch_all(query, values)
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=x"))
+
+    seen = {"n": 0}
+
+    async def refusing_preflight(offer):
+        seen["n"] += 1
+        return cp.PreflightVerdict(
+            outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+
+    def _seed_ids():
+        res = client.post(
+            "/agent/shop/v1/invoke",
+            json={"operation": "offers.resolve",
+                  "payload": {"product": {"product_id": "sig_test_mirror_1"}, "limit": 10,
+                              "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+                  "metadata": {"source": "creator-agent-ui"}},
+        )
+        assert res.status_code == 200
+        ids = [str(o.get("offer_id") or "") for o in (res.json().get("offers") or [])]
+        return [i for i in ids if i.startswith("of:external_seed:")]
+
+    # SHADOW: the verdict is computed and recorded, and the buyer sees the offer anyway.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
+    assert _seed_ids(), "shadow must not remove an offer"
+    assert seen["n"] > 0, "shadow must still ASK — otherwise it measures nothing"
+
+    # ENFORCE: the same verdict now removes it.
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    assert _seed_ids() == [], "an enforced refusal must remove the seed offer"
+
+    # OFF: no call at all, and the offer is published.
+    seen["n"] = 0
+    monkeypatch.delenv("CHECKOUT_PREFLIGHT_MODE", raising=False)
+    assert _seed_ids(), "off must leave the lane untouched"
+    assert seen["n"] == 0, "off must not spend a request"
