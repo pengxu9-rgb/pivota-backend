@@ -295,6 +295,26 @@ def test_a_bundle_app_page_with_the_product_name_interpolated_is_STILL_boilerpla
     # `-refill` behind an edition word is a different product, whichever side of `-kit`
     assert not bf._are_sibling_editions(("x", "X"), ("x-kit-refill", "[Kit] X Refill"))
     assert not bf._handles_are_editions("x", "x--set")
+    # ...and reordering the tokens must not reopen it: `kit`/`bundle`/`gwp` are not edition words
+    for h in ("x-refill-kit", "x-travel-kit", "x-value-bundle", "gwp-x"):
+        assert not bf._handles_are_editions("x", h), h
+    assert not (set(["bundle", "kit", "gwp"]) & bf._EDITION_WORDS)
+
+
+def test_an_app_page_that_bracket_tags_its_own_title_is_STILL_boilerplate():
+    """Review of #2128: a bundle app titling its page `[Bundle] Rosy Glow Lipstick` beside the
+    untagged base satisfied the one-base rule (one base, equal base titles, a tag). The one-base
+    rule reads a formatting convention the app controls; the app marker is the mechanism."""
+    meta = ("Buy the Rosy Glow Lipstick bundle and save 10% today at our store. Limited time offer, "
+            "while stocks last, free shipping on every bundle order.")
+    for title, handle in (("[Bundle] Rosy Glow Lipstick", "rosy-glow-lipstick-bundle"),
+                          ("[GWP] Rosy Glow Lipstick", "gwp-rosy-glow-lipstick_freegift"),
+                          ("[Special Set] Rosy Glow Lipstick", "gwp-rosy-glow-lipstick")):
+        kept = bf.drop_shared_boilerplate(
+            {"a": meta, "b": meta}, _BLURB,
+            handles={"a": "rosy-glow-lipstick", "b": handle},
+            titles={"a": "Rosy Glow Lipstick", "b": title})
+        assert kept == {}, (title, handle)
 
 
 def test_the_app_vendor_text_on_gwp_products_is_STILL_dropped():
