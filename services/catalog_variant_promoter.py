@@ -77,6 +77,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
+#: ONE definition of the column's width, not three. This module used to keep a private
+#: `_SOURCE_VARIANT_ID_MAX = 128` beside the copies in `catalog_enrichment_agent.ingestion`
+#: and `db/catalog.py`, and nothing tied any of them to the column — so a 127 mutant in one
+#: copy left the other lanes green while the two writers disagreed about which ids are one
+#: identity. `tests/test_catalog_enrichment_ingestion.py` now asserts the exported constant
+#: equals `catalog_skus.c.source_variant_id.type.length`, which makes this import the pin.
+from services.catalog_enrichment_agent.ingestion import (
+    SOURCE_VARIANT_ID_MAX as _SOURCE_VARIANT_ID_MAX,
+)
 from services.variant_identity import variant_id_provenance
 
 logger = logging.getLogger(__name__)
@@ -298,8 +307,10 @@ def filter_real_variants(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 #: unique violation, so the promoter used to re-raise it and abort the whole run
 #: on the first over-long merchant variant id. `derive_product_key` alone can
 #: reach 214 chars, which leaves 36 for the infix and the id.
+#: `_SOURCE_VARIANT_ID_MAX` is imported from `catalog_enrichment_agent.ingestion` at the top
+#: of this module rather than restated here; the two writers must agree on the width or they
+#: disagree about which merchant ids are one identity.
 _SKU_KEY_MAX = 255
-_SOURCE_VARIANT_ID_MAX = 128
 _VARIANT_INFIX = "::v::"
 
 

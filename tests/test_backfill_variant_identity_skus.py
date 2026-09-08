@@ -145,10 +145,35 @@ def test_offer_upsert_restamps_source_system_on_the_update_path():
 def test_apply_refuses_to_run_without_the_contract_token():
     """A stale image runs the MERGED first draft, which has all four blockers and no such flag.
     argparse then refuses the command instead of silently running the broken version."""
-    assert backfill.CONTRACT == "backfill-v2-identity-index"
+    assert backfill.CONTRACT == "backfill-v3-bound-identity"
     src = _write_path_source()
     assert "--expect-contract" in src
     assert "args.apply and args.expect_contract != CONTRACT" in src
+
+
+def test_the_docstring_command_names_the_current_contract_token():
+    """The token is only a stale-image tripwire if the command an operator COPIES carries it.
+    A bump that misses the docstring hands the operator a command that fails on the current
+    image — the opposite failure, and one that trains them to drop the flag."""
+    for line in backfill.__doc__.splitlines():
+        if "--expect-contract" in line:
+            assert backfill.CONTRACT in line, (
+                f"docstring command names a stale token: {line.strip()!r}"
+            )
+
+
+def test_apply_with_the_previous_contract_token_is_refused(monkeypatch):
+    """EXECUTED, not read. v2 promised a plan that did not dedupe on the bound
+    `source_variant_id`; v3 does. An operator whose command still says v2 must be refused at
+    argparse rather than reaching the writer — and argparse must refuse it BEFORE any event
+    loop or database connect, which is why this test can assert on a bare main()."""
+    monkeypatch.setattr(
+        sys, "argv",
+        ["backfill", "--apply", "--expect-contract", "backfill-v2-identity-index"],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        backfill.main()
+    assert excinfo.value.code == 2, "the stale token must fail the command, not run it"
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +281,29 @@ def test_plan_keeps_merchant_issued_priced_variants_only():
     assert [p["variant_id"] for p in picks] == ["43062643884185"]
     assert counts["skipped_not_merchant_issued"] == 1
     assert counts["skipped_no_variant_price"] == 1
+
+
+def test_plan_writes_one_row_per_identity_and_counts_the_other():
+    """`catalog_skus.source_variant_id` is varchar(128), so two merchant ids sharing a
+    128-char prefix are ONE identity tuple and one row. The planner used to hand both to
+    the writer, which bound `vid[:128]` while deriving `sku_key` from the full id: the
+    second INSERT resolved through the identity index as a DO UPDATE of the first and was
+    counted as a write (executed in the *_postgres twin). Bind once here, drop the
+    duplicate, and say so."""
+    counts = collections.Counter()
+    a, b = "8" * 128 + "1", "8" * 128 + "2"          # numeric, so MERCHANT_ISSUED
+    picks = plan_for_product(
+        _row([
+            {"variant_id": a, "title": "Peach", "price": "24.00"},
+            {"variant_id": b, "title": "Berry", "price": "31.00"},
+        ]),
+        counts,
+    )
+    assert [p["variant_id"] for p in picks] == [a], "the survivor is the first"
+    assert picks[0]["stored_variant_id"] == a[:128]
+    assert counts["skus_deduped_same_identity"] == 1
+    # provenance is still judged on the merchant's FULL id, not the bound copy
+    assert counts["skipped_not_merchant_issued"] == 0
 
 
 def test_plan_records_every_refusal_rather_than_dropping_silently():
