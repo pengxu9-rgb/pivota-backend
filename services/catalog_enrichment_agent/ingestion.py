@@ -959,11 +959,20 @@ def _build_sku_insert(
         "source_product_id": canonical_product_name(
             pdp_payload["brand"], pdp_payload["product_name"]
         ),
-        # Must be unique within (merchant_id, platform) per
-        # idx_catalog_skus_source_identity. All agent SKUs share
-        # merchant_id='external_seed' + platform='external_seed', so
-        # source_variant_id has to vary per PDP. Using product_key
-        # makes it deterministic across re-runs.
+        # The identity index is `idx_catalog_skus_source_identity_v2`
+        # (merchant_id, platform, product_key, source_variant_id).
+        # Migration 123 added `product_key` and DROPPED the 3-column
+        # `idx_catalog_skus_source_identity` this comment used to cite, so
+        # uniqueness no longer rests on source_variant_id varying per PDP —
+        # product_key already carries that.
+        #
+        # product_key stays anyway, and is the shape the rest of the system
+        # reads: `services/variant_identity.variant_id_provenance` classifies
+        # an id that restates the product key as PRODUCT_DERIVED, and the
+        # gateway's `isRestatedProductId` guard refuses to spend money against
+        # it. The mirror lane spells its canonical row the same way
+        # (scripts/mirror_external_seeds_to_catalog_products), so the two
+        # converge on one row rather than two rival spellings of one product.
         "source_variant_id": product_key,
         "source_domain": pdp_payload.get("source_domain") or None,
         "sku": None,
