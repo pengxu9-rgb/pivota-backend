@@ -8,17 +8,24 @@ names is therefore semantics, and it is semantics no SQLite test can see: the
 promoter's clause named an index migration 123 had DROPPED and Postgres refused
 it at PARSE time (42P10) for weeks while a string assertion stayed green.
 
-Commit f846ad546 moved BOTH sibling statements
+PR #2135 moves BOTH sibling statements
 (`catalog_enrichment_agent/apply._SKU_UPSERT_SQL`,
 `catalog_variant_promoter.UPSERT_SKU_SQL`) onto the identity index.
 `scripts/mirror_external_seeds_to_catalog_products._upsert_canonical_sku_for_mirror_row`
-deliberately did NOT move, and this file is the executable record of why:
+deliberately does NOT move, and this file is the executable record of why:
 
-  (a) for THIS writer the two arbiters address the same row. `merchant_id` and
-      `platform` are encoded inside `product_key`
-      (`prod::{merchant_id}::{platform}::{spid}`), `source_variant_id` IS
-      `product_key`, and `sku_key` is `product_key || '::canonical'` — so the
-      4-tuple and the PK are in bijection over every row the lane can emit.
+  (a) the PK is the only identity this lane's THREE callers agree on, and the
+      identity tuple is not. `sku_key` is `product_key || '::canonical'`, so
+      the PK is fixed by the one argument every caller supplies. The 4-tuple is
+      not: `merchant_id` is a separate parameter with a default, and `_apply`
+      passes the observed seller while
+      `scripts/repair_external_seed_offer_mainline.py` and
+      `scripts/backfill_canonical_chain_for_path_b_mirror.py` call positionally
+      and take the legacy singleton `'external_seed'`. One `sku_key`, two
+      identity tuples. Under the identity arbiter those are two rows for one
+      key, so whichever caller ran second would match no tuple, INSERT, and hit
+      the PRIMARY KEY — 23505 on every repaired row, forever. Executed below
+      through the real default path rather than asserted about the fixture.
 
   (b) the one shape in which they diverge is a FOREIGN row holding this tuple
       under a different `sku_key`. Under the PK arbiter that raises 23505 —
@@ -231,11 +238,10 @@ async def test_the_statement_executes_and_a_rerun_lands_on_its_own_row(db):
 
 
 async def test_the_pk_and_the_identity_tuple_select_the_same_row(db):
-    """THE REASON THE ARBITER DOES NOT NEED TO MOVE. `sku_key` is a total,
-    injective function of `product_key`, and `product_key` determines the whole
-    4-tuple — merchant_id and platform are encoded in it and source_variant_id
-    IS it. So the PK arbiter and the identity arbiter cannot pick different rows
-    for anything this writer emits."""
+    """For ONE caller's spelling the two arbiters address the same row: `sku_key`
+    is a total, injective function of `product_key`, `source_variant_id` IS
+    `product_key`, and `platform` is a module constant. Only `merchant_id` is
+    free — which the next test is about."""
     await _mirror_upsert()
 
     by_pk = await db.fetch_val(
@@ -249,10 +255,63 @@ async def test_the_pk_and_the_identity_tuple_select_the_same_row(db):
     )
     assert by_pk == by_identity == f"{PK}::canonical"
 
-    # And the tuple is recoverable from the key alone — the bijection, not a
-    # coincidence of this fixture's inputs.
-    assert PK.split("::")[1] == MERCHANT
-    assert PK.split("::")[2] == PLATFORM
+
+async def test_the_default_merchant_path_stores_a_different_identity_under_one_key(db):
+    """WHY THERE IS NO BIJECTION, and why only the PK is stable across callers.
+
+    `merchant_id` is a parameter with a default, NOT a value recovered from
+    `product_key`. `scripts/repair_external_seed_offer_mainline.py:287` and
+    `scripts/backfill_canonical_chain_for_path_b_mirror.py:161` both call with
+    two positional args and take that default, on product keys minted for an
+    observed seller. This drives the writer exactly as they do — no
+    `merchant_id=` — and shows the stored identity is the legacy singleton while
+    the key still encodes `merch_obs_…`.
+
+    An earlier version of this file asserted `PK.split('::')[1] == MERCHANT`,
+    which is true by fixture construction and executes nothing. The point is not
+    how the key is spelled; it is that two callers write two different identity
+    tuples under ONE key — so under the identity arbiter they would be two rows
+    for one PK, and the second caller would raise 23505 on the PRIMARY KEY on
+    every repaired row, forever."""
+    import scripts.mirror_external_seeds_to_catalog_products as mirror
+
+    canonical_key = f"{PK}::canonical"
+
+    # The repair scripts' call, verbatim in shape: positional only.
+    await mirror._upsert_canonical_sku_for_mirror_row(PK, _row_dict())
+
+    assert await _keys(db) == [canonical_key], (
+        "the default path must still be keyed on the PK, not on its merchant_id"
+    )
+    stored = dict(
+        await db.fetch_one(
+            "SELECT merchant_id, source_variant_id FROM catalog_skus "
+            "WHERE sku_key = :k",
+            {"k": canonical_key},
+        )
+    )
+    assert stored["merchant_id"] == mirror.MERCHANT_ID == "external_seed"
+    assert stored["source_variant_id"] == PK
+    # ...while the key it landed on encodes a DIFFERENT merchant. The tuple and
+    # the key disagree, which is precisely what a bijection would forbid.
+    assert PK.split("::")[1] == MERCHANT != mirror.MERCHANT_ID
+
+    # The forward mirror's call, with the observed seller passed explicitly,
+    # lands on the SAME row — the PK is the stable identity across both.
+    await _mirror_upsert(title="Written By The Forward Mirror")
+
+    assert await _keys(db) == [canonical_key]
+    stored_after = dict(
+        await db.fetch_one(
+            "SELECT merchant_id, title FROM catalog_skus WHERE sku_key = :k",
+            {"k": canonical_key},
+        )
+    )
+    assert stored_after["title"] == "Written By The Forward Mirror"
+    # Two identity tuples, one key: the DO UPDATE never rewrites merchant_id, so
+    # the row keeps whichever caller inserted it. Under the identity arbiter
+    # these would have been two rows colliding on the PK.
+    assert stored_after["merchant_id"] == mirror.MERCHANT_ID
 
 
 async def test_two_products_never_collide_on_either_constraint(db):
@@ -279,9 +338,12 @@ async def test_two_products_never_collide_on_either_constraint(db):
 
 async def test_a_foreign_row_on_this_tuple_fails_LOUDLY_under_the_pk_arbiter(db):
     """The divergence shape, half one. A rival spelling of the same identity makes
-    the insert violate the index the clause did NOT name. 23505 propagates, and
-    `_apply` logs 'chain write failed' — the SKU is stale but nothing is silently
-    wrong about it."""
+    the insert violate the index the clause did NOT name, so 23505 propagates to
+    the caller and the SKU is left stale rather than silently mis-keyed. How
+    loudly each caller then reports it differs: `repair_external_seed_offer_-
+    mainline` has no guard and stops, `backfill_canonical_chain_for_path_b_mirror`
+    counts a chain failure, and `_apply` prints one stderr WARNING with no
+    counter and no effect on its exit code."""
     rival_key = f"{PK}::v:{PK}"
     await _seed_rival(db, sku_key=rival_key, payload=FOREIGN_STAMP)
 
@@ -305,7 +367,7 @@ async def test_the_identity_arbiter_would_absorb_that_row_and_orphan_the_offer(
     existence — and `upsert_catalog_offer_from_seed_row` derives its `sku_key`
     from `derive_mirror_sku_key(product_key)`, not from anything this statement
     returns, so the offer written immediately afterwards points at a row that is
-    not there. The siblings could move only because f846ad546 gave them
+    not there. The siblings can move only because PR #2135 gives them
     `_adopt_existing_sku_identities` to re-key the offer first."""
     from services.external_offer_dual_write import derive_mirror_sku_key
 
@@ -357,6 +419,23 @@ async def test_a_canonical_key_carrying_a_foreign_identity_still_refreshes(db):
     assert await db.fetch_val(
         "SELECT title FROM catalog_skus WHERE sku_key = :k", {"k": canonical_key}
     ) == "Refreshed By The PK Arbiter"
+
+    # THE COALESCE, PINNED. The row above was inserted with no `sku_payload`, so
+    # the column is NULL — and `NULL || jsonb` is NULL in Postgres, silently.
+    # Without `COALESCE(catalog_skus.sku_payload, '{}')` the merge would erase
+    # the payload it is supposed to be writing, and every other assertion in
+    # this file would still pass: the merge tests all start from a row this lane
+    # inserted, which is never NULL. This is the only row shape that can tell
+    # the two apart, and it is a live one — a foreign writer's canonical row.
+    payload = await db.fetch_val(
+        "SELECT sku_payload FROM catalog_skus WHERE sku_key = :k", {"k": canonical_key}
+    )
+    assert payload is not None, (
+        "the merge dropped the payload on a NULL row — COALESCE is missing"
+    )
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+    assert payload.get("synthetic_canonical_variant") is True
+    assert payload.get("destination_url") == DEST
     # The DO UPDATE touches no identity column, so the row keeps the identity it
     # arrived with. Healing that is a backfill's job, not this statement's.
     assert await db.fetch_val(

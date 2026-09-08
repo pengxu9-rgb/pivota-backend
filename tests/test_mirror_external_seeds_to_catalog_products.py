@@ -338,10 +338,12 @@ async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) 
     assert "INSERT INTO catalog_skus" in sql
     # The PK, deliberately, and NOT `idx_catalog_skus_source_identity_v2`.
     # catalog_skus carries both, Postgres infers one and never falls through,
-    # and the two sibling upserts moved to the identity index in f846ad546. This
-    # one does not: for this writer the 4-tuple and the PK are in bijection (see
-    # the rationale block above the statement), and repointing it without an
-    # adoption helper would silently orphan the offer written right after it.
+    # and PR #2135 moves the two sibling upserts to the identity index. This
+    # one does not: the PK is the only identity this lane's three callers agree
+    # on, because `merchant_id` is a caller-supplied argument they do not pass
+    # alike (see the rationale block above the statement), and repointing it
+    # without an adoption helper would silently orphan the offer written right
+    # after it.
     # tests/test_mirror_canonical_sku_upsert_postgres.py executes both claims.
     assert "ON CONFLICT (sku_key) DO UPDATE" in sql
     # Never a rename: the DO UPDATE must not touch an identity column, or it

@@ -533,7 +533,7 @@ async def _upsert_canonical_sku_for_mirror_row(
         "destination_url": row_dict.get("destination_url"),
     }
     # WHY THE ARBITER STAYS ON THE PRIMARY KEY HERE, when the two sibling
-    # catalog_skus upserts moved to the identity index in f846ad546
+    # catalog_skus upserts move to the identity index in PR #2135
     # (`catalog_enrichment_agent/apply._SKU_UPSERT_SQL`,
     # `catalog_variant_promoter.UPSERT_SKU_SQL`).
     #
@@ -544,13 +544,36 @@ async def _upsert_canonical_sku_for_mirror_row(
     # arbiter from an ON CONFLICT clause and never falls through to the other, so
     # which one a statement names is semantics, not style.
     #
-    # For THIS writer the two name the same row. `merchant_id` and `platform` are
-    # already encoded in `product_key` (storage format
-    # `prod::{merchant_id}::{platform}::{source_product_id}`, see
-    # services/seller_identity.py), `source_variant_id` IS `product_key`, and
-    # `sku_key` is `product_key || '::canonical'`. The 4-tuple and the PK are
-    # therefore in bijection across every row this lane can emit: a re-run lands
-    # on its own row under either arbiter, and no two of its own rows collide.
+    # THE PK IS THE ONLY IDENTITY ALL THREE CALLERS AGREE ON. `sku_key` is
+    # `product_key || '::canonical'`, a total injective function of the one
+    # argument every caller supplies, so the PK is fixed by `product_key`
+    # alone. The identity 4-tuple is NOT: `source_variant_id` is `product_key`
+    # and `platform` is a module constant, but `merchant_id` is a separate
+    # parameter with a default, and the three callers do not pass the same
+    # thing —
+    #
+    #   * `_apply` (this file) derives `product_key` from `seller_merchant_id`
+    #     and passes that SAME id explicitly (ADR-009 D2), so its tuple carries
+    #     `merch_obs_…`;
+    #   * `scripts/repair_external_seed_offer_mainline.py` and
+    #     `scripts/backfill_canonical_chain_for_path_b_mirror.py` both call with
+    #     two positional args and TAKE THE DEFAULT, so their tuple carries the
+    #     legacy singleton `'external_seed'` — on rows whose `product_key`
+    #     encodes `merch_obs_…`, because they read existing keys out of the DB.
+    #
+    # So one `sku_key` can be written under two different identity tuples
+    # depending on which caller ran. `merchant_id` is not recoverable from the
+    # product key here; the storage format
+    # `prod::{merchant_id}::{platform}::{source_product_id}` (see
+    # services/seller_identity.py) records who MINTED the key, not what this
+    # statement stores beside it. There is no bijection to lean on.
+    #
+    # THAT IS THE STRONGEST REASON THE ARBITER STAYS ON THE PK. Under the
+    # identity arbiter the forward mirror's tuple and the repair scripts' tuple
+    # are two different rows for one `sku_key`: whichever ran second would match
+    # no tuple, attempt an INSERT, and hit the PRIMARY KEY — 23505 on every
+    # repaired row, on every run, forever. Under the PK arbiter all three
+    # callers address the same row and the second one simply refreshes it.
     #
     # The siblings moved because they had a MEASURED collision. The variant lanes
     # spell one identity two ways (`<pk>::v:<vid>` vs `<pk>::v::<vid>`), and
@@ -563,10 +586,13 @@ async def _upsert_canonical_sku_for_mirror_row(
     # Repointing here would make a failure silent rather than fix one. The only
     # shape in which the two arbiters diverge is a FOREIGN row holding this
     # tuple under a different `sku_key`. Under the PK arbiter that raises 23505,
-    # which every caller notices: `_apply` logs "chain write failed" and moves
-    # on, backfill_canonical_chain_for_path_b_mirror counts a chain failure, and
-    # repair_external_seed_offer_mainline has no guard at all so the run stops.
-    # Loud in all three. Under the identity arbiter it would instead upsert onto
+    # and each caller surfaces it — though not equally: repair_external_seed_-
+    # offer_mainline has no guard at all, so the run stops; backfill_canonical_-
+    # chain_for_path_b_mirror catches and counts a chain failure in its report;
+    # `_apply` catches, prints one WARNING line to stderr, and continues with no
+    # counter and no effect on the exit code, so an operator reading only the
+    # summary or the status would not see it. Under the identity arbiter it
+    # would instead upsert onto
     # the foreign row and keep THAT row's key, while the offer written one line
     # later is keyed on `derive_mirror_sku_key(product_key)`
     # (services/external_offer_dual_write.py) rather than on anything this
@@ -639,6 +665,30 @@ async def _upsert_canonical_sku_for_mirror_row(
           -- `catalog_enrichment_agent/apply._SKU_UPSERT_SQL`.
           sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
                         || EXCLUDED.sku_payload,
+          -- `readiness_tier` IS REFRESHED HERE, where the sibling
+          -- `catalog_enrichment_agent/apply._SKU_UPSERT_SQL` makes it
+          -- INSERT-ONLY (PR #2135). The difference is deliberate and the
+          -- reason is the population, not a style preference: the sibling
+          -- lands on merchant variant rows whose tier is EARNED — the
+          -- promoter may have proved a checkout and written 'commerce_ready'
+          -- — so re-asserting a plan's 'referral_only' there would downgrade
+          -- a purchasable SKU on every content re-sync. On THIS lane the tier
+          -- is a constant property of the lane (`READINESS_TIER`), not an
+          -- earned attribute: the row is a synthetic canonical SKU for a
+          -- redirect offer with no variant identity, so 'referral_only' is
+          -- the only tier it can truthfully hold, and
+          -- `scripts/backfill_audit_seed_tier_labels.py` demotes such rows in
+          -- the same direction.
+          --
+          -- It is also INERT today: `EXCLUDED.readiness_tier` is always the
+          -- module constant 'referral_only', and no lane promotes a
+          -- `<pk>::canonical` row on `platform='external_seed'` —
+          -- `index_graduation_ladder` writes catalog_products, not
+          -- catalog_skus. So this clause cannot currently change a value.
+          -- FLIP IT TO INSERT-ONLY the day one can: if merchant-UCP sourcing
+          -- (or anything else) ever supplies real variant identity for a
+          -- mirrored row and promotes it, this clause would silently demote
+          -- it back on the next mirror pass.
           readiness_tier = EXCLUDED.readiness_tier,
           updated_at = NOW()
         """,
