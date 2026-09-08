@@ -522,6 +522,43 @@ catalog_quote_snapshots = Table(
 )
 
 
+checkout_preflight_observations = Table(
+    "checkout_preflight_observations",
+    metadata,
+    Column("observation_id", String(64), primary_key=True),
+    # timezone=True, matching TIMESTAMPTZ in db/migrations/219. They must agree, and the MODEL
+    # is what decides: create_all runs BEFORE migrations, so it creates the table and the
+    # migration's CREATE TABLE IF NOT EXISTS then skips — a bare DateTime here would silently
+    # give production a naive column while the migration file claimed otherwise. Caught only by
+    # running the dialect gate in order, where another file's create_all builds this table
+    # first and a tz-aware bind then fails with "can't subtract offset-naive and offset-aware".
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column("mode", String(16), nullable=False),
+    Column("outcome", String(16), nullable=False),
+    # The decision the ENFORCING gate WOULD have made, recorded while it is not enforcing.
+    # `outcome` only ever says "allow" in shadow, so this is the column the refusal rate is
+    # measured from. See db/migrations/219_checkout_preflight_observations.sql.
+    Column("would_block", Boolean, nullable=False),
+    Column("reason", String(64), nullable=False),
+    Column("merchant_id", String(64), nullable=True, index=True),
+    Column("product_key", String(255), nullable=True),
+    Column("sku_key", String(255), nullable=True, index=True),
+    Column("offer_id", String(255), nullable=True),
+    Column("live_status", String(32), nullable=True),
+    Column("in_stock", Boolean, nullable=True),
+    # Kept separate from `live_status` deliberately, exactly as live_offer_verification.Verdict
+    # does: a check can establish STOCK without establishing PRICE, and folding the two into one
+    # flag is what produced the yen-as-dollars bug there.
+    Column("price_verified", Boolean, nullable=False, server_default=expression.false()),
+    Column("quoted_price", Numeric(12, 2), nullable=True),
+    Column("quoted_currency", String(16), nullable=True),
+    Column("live_price", Numeric(12, 2), nullable=True),
+    Column("live_currency", String(16), nullable=True),
+    Column("latency_ms", Integer, nullable=True),
+    Column("detail", JSONB_TYPE, nullable=True),
+)
+
+
 beauty_product_profiles = Table(
     "beauty_product_profiles",
     metadata,
