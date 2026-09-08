@@ -667,13 +667,50 @@ def _build_seed_inserts(
         # Cart prefill is unaffected: `sole_stamped_variant_id` reads
         # seed_data['snapshot']['variants'], which this lane never writes, so it
         # declines here exactly as it did before.
+        #
+        # A LONE variant rides too, when its id is the merchant's. This branch
+        # used to require two or more variants, on the same reasoning
+        # `_build_variant_sku_inserts` once used: one variant, the product is
+        # the variant, the synthetic canonical will do. #2113 lifted that gate
+        # for the SKU row and #2120 made the curated feed emit the id, so a
+        # one-variant product now gets `<pk>::v:<real id>` in catalog_skus and
+        # catalog_offers -- and, until this change, a seed row that still said
+        # `<epid>::canonical`, which is what the PDP renders. Measured in prod
+        # 2026-09-08 on Flower Beauty's Petal Pout Lip Color: SKU
+        # `…::v:17281773207622`, seed variant_ids
+        # ['flower-beauty:eb5ff15f3e267039::canonical'], served as
+        # source_quality_status=blocked / hidden_from_selector, while the three
+        # multi-variant Flower Beauty products carried 8-10 real ids.
+        #
+        # The gate is PROVENANCE, not count and not title. Forty real
+        # single-variant Shopify products in the corpus carry a variant title
+        # equal to the parent title, so a title test would drop them; and a
+        # lone id we minted ourselves (`<epid>-default`, a digest of the key)
+        # must still fall through to the synthetic canonical, because
+        # `services.external_referral_readiness` treats `zero_variants` as a
+        # blocker and a seed with no variant at all leaves recall entirely.
+        # Multi-variant products keep their admission rule (any non-empty id)
+        # for the reason the SKU writer states: those rows drive the shade
+        # selector, and tightening them would drop display data.
         seed_variants = [synthetic_variant]
         real_variants = pdp_payload.get("variants") or []
-        if len(real_variants) >= 2:
+        if real_variants:
+            single = len(real_variants) < 2
+            product_id = canonical_product_name(
+                pdp_payload["brand"], pdp_payload["product_name"]
+            )
             built: List[Dict[str, Any]] = []
             for v in real_variants[:MAX_SEED_VARIANTS]:
                 vid = str(v.get("variant_id") or "").strip()
                 if not vid:
+                    continue
+                provenance = variant_id_provenance(
+                    vid,
+                    product_id=product_id,
+                    product_key=product_key,
+                    handle=v.get("source_handle"),
+                )
+                if single and provenance != MERCHANT_ISSUED:
                     continue
                 v_in_stock = bool(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
@@ -698,6 +735,10 @@ def _build_seed_inserts(
                         v.get("option_name"),
                         pdp_payload["product_name"],
                     ),
+                    # Decided once here, as the SKU row's sku_payload is, so a
+                    # reader of this column can tell a merchant's id from one
+                    # of ours without re-sniffing the string.
+                    "variant_id_provenance": provenance,
                 })
             if built:
                 _drop_options_that_do_not_distinguish(built)
