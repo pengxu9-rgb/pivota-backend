@@ -579,6 +579,26 @@ async def test_a_page_that_rolls_back_counts_nothing_and_names_its_own_resume_po
     assert report["resume_after_to_recover_rollbacks"] == SCAN_FLOOR
     assert report["resume_after"] != report["resume_after_to_recover_rollbacks"]
 
+    # The audit row is the copy of all this that survives Cloud Logging dropping the printed
+    # line, so it must tell the same story. `applied_rows` is the number an auditor reads as
+    # "rows this batch changed": on a run whose only page rolled back that is ZERO, and a
+    # writer that adds the lost rows in (`stamped + rows_lost_to_page_rollback`) claims four
+    # writes that were rolled back — the exact confusion the report side of this test forbids,
+    # reproduced in the durable copy. Until this block existed that mutant survived.
+    row = dict(await db.fetch_one(
+        "SELECT * FROM writer_audit_log WHERE writer_name = :w ORDER BY id DESC LIMIT 1",
+        {"w": WRITER_NAME},
+    ))
+    assert row["applied_rows"] == 0, (
+        "applied_rows must count rows durably stamped; a rolled-back page stamped none"
+    )
+    reasons = json.loads(row["reasons"]) if isinstance(row["reasons"], str) else row["reasons"]
+    # Both cursors, in the row: the one the scan reached, and the one that recovers the loss.
+    assert reasons["resume_after"] == report["resume_after"]
+    assert reasons["resume_after_to_recover_rollbacks"] == SCAN_FLOOR
+    assert reasons["page_rollbacks"] == 1
+    assert reasons["rows_lost_to_page_rollback"] == 4
+
 
 async def test_one_bad_row_rolls_back_to_its_savepoint_and_its_page_still_commits(db):
     """The per-row `database.transaction()` must be a SAVEPOINT, not decoration.
@@ -772,7 +792,7 @@ async def test_a_handle_only_in_the_payload_is_measured_on_unstamped_rows_never_
     (d466bc6ee), so four days of rows carry a handle and no stamp — exactly this population.
 
     What is stamped stays the no-handle answer, because that is the question the money reader
-    `services/checkout_preflight.py:189` asks. The difference is COUNTED instead.
+    `services/checkout_preflight.preflight()` asks (:189). The difference is COUNTED instead.
     """
     # numeric id + numeric handle it restates by a 3-digit ordinal: merchant_issued without
     # the handle, product_derived with it. The `parent + a small ordinal` case
@@ -878,7 +898,12 @@ async def test_a_stamp_does_not_touch_updated_at(db):
 # ---------------------------------------------------------------------------
 
 
-def _cli(*args, expect_code=0):
+#: The subprocess entrypoint that injects a page-3 failure into a real `main()` run. See its
+#: module docstring for why it exists and why it is a file rather than an env-var hook.
+_FAULT_DRIVER = "tests/backfill_variant_id_provenance_stamps_fault_driver.py"
+
+
+def _cli(*args, expect_code=0, script="scripts/backfill_variant_id_provenance_stamps.py"):
     """Drive the script AS THE OPERATOR DOES: a real process, real stdout, real exit code.
 
     In-process is not an option for the run path — `main()` calls `asyncio.run()`, which
@@ -891,7 +916,7 @@ def _cli(*args, expect_code=0):
     import sys
 
     proc = subprocess.run(
-        [sys.executable, "-B", "scripts/backfill_variant_id_provenance_stamps.py", *args],
+        [sys.executable, "-B", script, *args],
         cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300,
         env={**os.environ},
     )
@@ -1015,3 +1040,54 @@ async def test_main_still_prints_a_fenced_report_when_the_run_dies(db):
     report = _one_fenced_report(proc.stdout)
     assert report["mode"] == "failed"
     assert report["error"]
+    # This run never entered `run()`, so there is no sealed report and main()'s fallback is the
+    # RIGHT output here. That is also why this test alone cannot pin the sealed branch — see the
+    # next test, which reaches it.
+    assert report["resume_after"] is None
+    assert report["sealed"] is False
+
+
+async def test_main_prints_the_sealed_report_with_the_cursor_when_the_run_dies_mid_scan(db):
+    """The branch the previous test cannot reach: `run()` DID seal a report onto the exception,
+    and main() must print THAT — with `resume_after` naming the last committed key — rather than
+    its `{"resume_after": None, "sealed": False}` fallback.
+
+    Before this test, `report = getattr(exc, "stamp_report", None)` mutated to `report = None`
+    left all 32 tests green: the only main()-level failure test drove an unresolvable
+    DATABASE_URL, where the fallback is correct. The in-process sibling
+    (`test_the_audit_row_and_the_resume_cursor_survive_an_error_mid_run`) proves run() seals the
+    report; nothing proved main() reads it. An operator recovering a Cloud Run job reads ONLY
+    what main() printed, so the cursor being on the exception is worth nothing until it is on
+    stdout.
+
+    The failure is injected by `_FAULT_DRIVER` (a subprocess entrypoint that patches the page
+    fetch to raise on page 3 after two pages committed) because main() cannot be driven
+    in-process and the script has no injection hook — see that file's docstring.
+    """
+    keys = [await _sku(db, vid=f"{MERCHANT_VID}{i}") for i in range(9)]
+
+    report = _one_fenced_report(_cli(
+        "--apply", "--expect-contract", "stamp-v1-sku-key-cursor",
+        "--after", SCAN_FLOOR, "--page", "3",
+        expect_code=1, script=_FAULT_DRIVER,
+    ))
+
+    # 1. The printed line is the SEALED report, not the fallback.
+    assert "sealed" not in report, (
+        "main() printed its no-report fallback although run() sealed one onto the exception"
+    )
+    assert report["mode"] == "failed"
+    assert report["mode_attempted"] == "apply"
+    assert "simulated mid-run failure" in report["error"]
+
+    # 2. It carries the cursor an operator resumes from: the last key of the last COMMITTED
+    #    page, which is the number this whole failure path exists to deliver.
+    assert report["resume_after"] == keys[5]
+    assert report["stamped"] == 6, "only durably committed rows may be reported as stamped"
+    assert "resume_after_to_recover_rollbacks" not in report, "no page rolled back here"
+
+    # 3. And the database agrees with the line: two pages durable, the third never written.
+    for key in keys[:6]:
+        assert (await _payload(db, key))["variant_id_provenance"] == "merchant_issued", key
+    for key in keys[6:]:
+        assert await _payload(db, key) is None, key
