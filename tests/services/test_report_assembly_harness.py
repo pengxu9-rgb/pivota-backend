@@ -230,8 +230,16 @@ def _basis(**over):
     real current basis field for field, which makes the control below assert
     True and the model swap the ONLY thing that moves it.
     """
+    from db.audit_basis import METHODOLOGY_VERSION
+
     row = {
-        "methodology_version": "1",
+        # From the writer's constant, never a literal. A pinned "1" here stopped
+        # matching the current run's in-memory basis the moment
+        # METHODOLOGY_VERSION went to "2" — and because a mismatch reads as
+        # `same is False`, the swap test below would have kept passing for
+        # entirely the wrong reason. That is the confound this control exists
+        # to catch, so it must not be reintroduced by the control itself.
+        "methodology_version": METHODOLOGY_VERSION,
         "providers_and_models": {
             "chatgpt": {"model_id": "chat-latest", "temperature": None},
             "gemini": {"model_id": "gemini-2.5-flash", "temperature": None},

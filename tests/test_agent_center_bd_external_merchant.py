@@ -2210,8 +2210,17 @@ async def test_attach_reaudit_delta_fetches_full_prior_report(monkeypatch) -> No
     from db import merchant_audit_runs as mar
     from services.agent_center_bd_report_service import _attach_reaudit_delta
 
-    prior = _basic_report()
-    current = _basic_report()
+    from tests.basis_fixtures import with_provider_models, writer_basis
+
+    prior = with_provider_models(_basic_report())
+    current = with_provider_models(_basic_report())
+    # A PINNED pair. audit_delta._prompt_set_id supports the primary report
+    # carrying `prompt_basis` directly, and without it these two runs predate
+    # prompt-basis pinning entirely — a state in which naming a direction at
+    # all would be the defect this contract closes. The fixture was written
+    # before pinning existed; the movement claim below needs a pinned run.
+    for _report in (prior, current):
+        _report["prompt_basis"] = {"selected_set_id": "sel_bd"}
     prior["merchant_view"]["headline"]["scores"]["attribution"] = 35
     prior["verdict"]["attribution_score"] = 35
     current["merchant_view"]["headline"]["scores"]["attribution"] = 55
@@ -2222,6 +2231,25 @@ async def test_attach_reaudit_delta_fetches_full_prior_report(monkeypatch) -> No
         return {"report_jsonb": {"per_product": [prior]}}
 
     monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
+
+    # The prior run's STORED basis. A 20-point movement is only nameable when
+    # both runs carry a complete, matching measurement basis — with no stored
+    # row the delta answers "unknown", which is the contract working, not a
+    # thing to assert around. The row is built by the writer from the prior
+    # report and under the SAME merchant id, because record_audit_basis
+    # snapshots that merchant's official-domain set into the payload.
+    import db.audit_basis as ab
+
+    prior_basis = await writer_basis(
+        {"per_product": [prior], "provider_models": prior["provider_models"]},
+        merchant_id="merchant_123",
+    )
+
+    async def fake_basis(run_id: str):
+        assert run_id == "prior-run"
+        return prior_basis
+
+    monkeypatch.setattr(ab, "get_basis_for_run", fake_basis)
 
     await _attach_reaudit_delta(
         current,
@@ -2236,7 +2264,14 @@ async def test_attach_reaudit_delta_fetches_full_prior_report(monkeypatch) -> No
     )
 
     delta = current["merchant_view"]["reaudit_delta"]
+    assert delta["measurement_basis"]["same"] is True, (
+        "the basis pair must reach build_reaudit_delta, else the movement "
+        f"below is 'unknown' for a reason this test is not about: {delta['measurement_basis']}"
+    )
     movement = next(m for m in delta["movements"] if m["signal"] == "attribution")
+    # from/to is the direct evidence that the PRIOR REPORT (not just its row)
+    # was fetched and read — the thing this test is named for.
+    assert (movement["from"], movement["to"]) == (35, 55)
     assert movement["direction"] == "improved"
     assert movement["is_material"] is True
 
@@ -2384,7 +2419,9 @@ async def test_attach_outreach_outcomes_per_sku_classifies_prior_targets(
         _attach_outreach_outcomes_per_sku,
     )
 
-    prior_report = _per_sku_brand_report()
+    from tests.basis_fixtures import with_provider_models, writer_basis
+
+    prior_report = with_provider_models(_per_sku_brand_report())
     prior_report["win_plan"] = {
         "sku_plans": [
             {
@@ -2405,7 +2442,8 @@ async def test_attach_outreach_outcomes_per_sku_classifies_prior_targets(
         "endorsement_hosts": [],
         "endorsement_category_hosts": [],
     }
-    current = _per_sku_brand_report()  # same basis id → same-basis comparison
+    # same basis id AND same run-level basis → same-basis comparison
+    current = with_provider_models(_per_sku_brand_report())
 
     async def fake_fetch(*, run_id: str) -> Dict[str, Any]:
         assert run_id == "prior-per-sku-run"
@@ -2414,8 +2452,22 @@ async def test_attach_outreach_outcomes_per_sku_classifies_prior_targets(
     async def fake_tasks(**kwargs) -> list:
         return []
 
+    # The prior run's STORED basis, built by the writer from the prior report
+    # under the same merchant id. A query-level "won" claim is licensed only on
+    # a same-basis pair, and the pinned selected_set_id alone no longer
+    # establishes one: without the run-level basis the verdict is `None` and
+    # `comparable` below is None, not True.
+    import db.audit_basis as ab
+
+    prior_basis = await writer_basis(prior_report, merchant_id="merchant_123")
+
+    async def fake_basis(run_id: str):
+        assert run_id == "prior-per-sku-run"
+        return prior_basis
+
     monkeypatch.setattr(mar, "fetch_audit_run_by_id", fake_fetch)
     monkeypatch.setattr(mt, "list_tasks_for_merchant", fake_tasks)
+    monkeypatch.setattr(ab, "get_basis_for_run", fake_basis)
 
     await _attach_outreach_outcomes_per_sku(
         current,
