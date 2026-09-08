@@ -779,6 +779,52 @@ async def fetch_shop_description(
         return None
 
 
+async def fetch_shop_description_from_meta(
+    domain: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout_s: float = 15.0,
+) -> Optional[str]:
+    """The storefront's OWN blurb again, read from Shopify's `/meta.json` `description`.
+
+    THE SAME STRING AS THE HOMEPAGE META, from a different door. Measured on jsmbeauty.sg
+    2026-09-08: the homepage meta description and `/meta.json` `description` are the identical
+    135 characters. The homepage is a 700 KB themed page that a Cloudflare-fronted store starts
+    refusing after a run has fetched sixty product pages from the same egress, while the JSON
+    endpoints keep answering — which is exactly the moment the description backfill asks for the
+    blurb. This is the fallback for that moment, not a replacement: `fetch_shop_description`
+    stays first because a theme can override `shop.description` on the homepage, and it is the
+    HOMEPAGE string a PDP without its own SEO copy repeats. Returns None on any failure.
+    """
+    host = _clean_domain(domain)
+    if not host:
+        return None
+    url = f"https://{host}/meta.json"
+    timeout = httpx.Timeout(timeout_s, connect=5.0)
+    headers = {"User-Agent": _UA, "Accept": "application/json"}
+    try:
+        await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+        if client is not None:
+            resp = await client.get(url)
+        else:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout, headers=headers
+            ) as c:
+                resp = await c.get(url)
+        crawl_politeness.note_response(
+            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        desc = data.get("description") if isinstance(data, dict) else None
+        desc = " ".join(str(desc or "").split())
+        return desc or None
+    except Exception as exc:  # noqa: BLE001 — same contract as fetch_shop_description
+        logger.debug("fetch_shop_description_from_meta failed for %s: %s", host, str(exc)[:160])
+        return None
+
+
 async def fetch_pdp_inci(
     domain: str,
     handle: str,

@@ -790,7 +790,9 @@ _GATED_CRAWL_LANES = {
     # homepage's own blurb (added 2026-09-06, one request per DOMAIN, so a theme substituting
     # shop.description into a product's og tag can be recognised by comparison, not by guessing
     # at the theme's markup).
-    "services/curated_brand_feed.py": 5,
+    # 6 since fetch_shop_description_from_meta (2026-09-08): the /meta.json blurb door, gated
+    # exactly like the homepage one it falls back from.
+    "services/curated_brand_feed.py": 6,
     "services/bd_cold_start_service.py": 2,      # Shopify .json + the generic PDP-HTML fallback
     "services/executor_agents/sitemap_freshness.py": 2,  # sitemap + child indexes
 }

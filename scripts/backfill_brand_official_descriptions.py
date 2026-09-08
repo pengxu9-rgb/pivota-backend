@@ -60,6 +60,7 @@ from services.curated_brand_feed import (  # noqa: E402
     body_html_to_text,
     fetch_pdp_description,
     fetch_shop_description,
+    fetch_shop_description_from_meta,
     fetch_shopify_products,
 )
 from services.pdp_lifecycle import compute_lifecycle_stage  # noqa: E402
@@ -191,6 +192,15 @@ async def _load_shop_blurb(domain: str, attempts: int = 3) -> Optional[str]:
             return blurb
         if attempt < attempts:
             await asyncio.sleep(0.5 * attempt)
+    # THE JSON DOOR WHEN THE HTML DOOR IS SHUT. Measured 2026-09-08 on jsmbeauty.sg: three runs
+    # in a row reported `blurb_unavailable` (60 candidates refused, fill=0) while a cold job
+    # fetched the same homepage and parsed the same 135-char blurb — the homepage is refused
+    # once the run has pulled dozens of product pages from the host, the JSON endpoints are not.
+    # `/meta.json` `description` IS `shop.description`, the string a theme substitutes for a
+    # missing product SEO description, so the comparison it arms is the same comparison.
+    meta_blurb = await fetch_shop_description_from_meta(domain)
+    if meta_blurb and len(meta_blurb) >= MIN_DESC_LEN:
+        return meta_blurb
     return None
 
 
@@ -544,6 +554,15 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
                   f"of the storefront, so the PDP fallback is skipped here. Re-run with a higher "
                   f"--max-products.")
             domain_pdp_fallback = False
+        # THE BLURB IS THE FIRST HTML REQUEST TO THE HOST, NOT THE LAST. It used to be fetched
+        # after every PDP in the domain, i.e. as the sixty-first or hundredth page from one
+        # egress — the point at which a Cloudflare-fronted store stops answering the 700 KB
+        # homepage while still serving product pages. Measured 2026-09-08 on jsmbeauty.sg: three
+        # consecutive runs `blurb_unavailable` with 60 candidates refused, a cold job fine. An
+        # unavailable blurb does not merely lose mechanism 1; it disarms the fallback for every
+        # singleton, so the whole PDP pass silently fills nothing. Asked for only when the PDP
+        # fallback can use it, so a body-only run still costs the host nothing extra.
+        blurb: Optional[str] = (await _load_shop_blurb(domain)) if domain_pdp_fallback else None
         for r in drows:
             body = body_map.get(r["_handle"])
             if body is None:
@@ -558,7 +577,6 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
             (candidates if from_pdp_row else resolved)[str(r["product_key"])] = body
 
         if candidates:
-            blurb = await _load_shop_blurb(domain)
             if not blurb:
                 # Not a warning to skim past: with mechanism 1 off, every singleton candidate is
                 # dropped below, so this line explains a sudden `boilerplate` spike.
