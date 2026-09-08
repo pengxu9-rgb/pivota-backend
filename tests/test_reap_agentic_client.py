@@ -1197,3 +1197,62 @@ def test_no_two_entries_share_a_prefix_relationship_in_the_wrong_order():
 def test_an_unknown_reason_says_so_rather_than_guessing():
     assert "Unrecognised" in rc.explain_refusal("something_new_we_have_not_seen")
     assert "Unrecognised" in rc.explain_refusal(None)
+
+
+# --- the third phrasing is the recall play, and it must not need a category ----------------------
+#
+# Measured on our real tier-A row. flowerbeauty.com / "Petal Pout Lip Color": the brand-led and
+# bare-name phrasings BOTH missed the merchant, and only "Flower Beauty lip color" surfaced it.
+# An earlier version generated that slot only when the caller supplied `category` — so a caller
+# without one (most of them) lost the phrasing most likely to work, and a resolver holding the
+# right rule refused the row anyway.
+
+def test_the_third_phrasing_falls_back_to_the_brand_alone_without_a_category():
+    queries = rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty")
+    assert len(queries) == 3
+    assert queries[-1] == "Flower Beauty"
+
+
+def test_a_category_still_wins_the_third_slot_when_given():
+    queries = rc.search_queries(product_name="Petal Pout Lip Color", brand="Flower Beauty",
+                                category="lip color")
+    assert queries[-1] == "Flower Beauty lip color"
+
+
+def test_no_brand_means_no_broad_phrasing():
+    """A bare category or a lone product name gives nothing to broaden with, and sending the
+    product name twice spends a ~9 s search slot to learn nothing."""
+    assert rc.search_queries(product_name="Petal Pout Lip Color") == ["Petal Pout Lip Color"]
+    assert rc.search_queries(product_name="Petal Pout Lip Color", category="lip color") \
+        == ["Petal Pout Lip Color"]
+
+
+def test_the_brand_only_phrasing_actually_reaches_the_resolver(monkeypatch):
+    """The seam. A strategy that generates the right third query proves nothing if the resolver
+    stops at two — and the measured failure was exactly a row refused with the winning phrasing
+    never sent."""
+    seen = []
+
+    async def fake(path, body, **kw):
+        if path.endswith("/search"):
+            seen.append(body["query"])
+            if body["query"] != "Flower Beauty":
+                return rc.ReapResponse(ok=True, status=200, data={"products": [], "warnings": []})
+            return rc.ReapResponse(ok=True, status=200, data=FLOWER_SEARCH)
+        if path.endswith("/details"):
+            return rc.ReapResponse(ok=True, status=200, data=FLOWER_DETAILS)
+        return rc.ReapResponse(ok=True, status=200, data=FLOWER_VARIANT)
+    monkeypatch.setattr(rc, "_post", fake)
+
+    got = _run(rc.resolve_our_row(
+        merchant_domain="flowerbeauty.com", product_name="Petal Pout Lip Color",
+        brand="Flower Beauty", variant_title="Flamingo Flirt", our_price=8.00,
+    ))
+    assert got.ok and got.variant_id == "var_flamingo"
+    assert seen == ["Flower Beauty Petal Pout Lip Color", "Petal Pout Lip Color", "Flower Beauty"]
+    assert got.queries_tried == seen
+
+
+def test_the_default_budget_is_large_enough_for_all_three_phrasings():
+    """A three-phrasing strategy behind a two-attempt cap is a strategy that does not exist."""
+    assert rc.MAX_SEARCH_ATTEMPTS >= 3

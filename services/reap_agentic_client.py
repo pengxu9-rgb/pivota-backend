@@ -45,11 +45,14 @@ checked against the request every time -- `variant_matches_request` -- and a sub
 refusal. Same family as `defaultVariant` being availability-ordered, and the reason nothing in
 this module reads a status code as an answer.
 
-SEARCH IS QUERY-SENSITIVE, AND THAT BITES BEFORE ANY MATCHER RUNS. For one product: the
+SEARCH IS QUERY-SENSITIVE AND NON-DETERMINISTIC, AND THAT BITES BEFORE ANY MATCHER RUNS. For one product: the
 brand-led phrasing returns the merchant, the bare product name returns other merchants' listings
 and not ours, and the fully specific phrasing returns nothing. `resolve_our_row` therefore tries
 several phrasings, brand-led first, and records what it tried. On the strength of a single
 bare-name search I previously reported that flowerbeauty.com was not in Reap's index. It is.
+The identical query is also not repeatable -- it returned nothing for that merchant twice and
+then returned the product half an hour later -- so no single pass, however many phrasings it
+tries, can establish that something is ABSENT from the index. Refusals here are provisional.
 
 REAP'S IDS ARE SESSION HANDLES, NOT IDENTITY. Five searches for the same product on one day
 returned five different `prd_...` ids, each with its own `var_...` set. All stayed resolvable and
@@ -504,16 +507,34 @@ def search_queries(
     name I previously concluded flowerbeauty.com was not indexed by Reap at all, and it is.
 
     Brand-led first, because that is the phrasing that worked. Deduplicated, order preserved.
+
+    THE THIRD SLOT IS THE RECALL PLAY, and it is the one that found the merchant. Measured on
+    flowerbeauty.com's "Petal Pout Lip Color": the brand-led and bare-name phrasings both missed
+    the merchant entirely, and only "Flower Beauty lip color" surfaced it. An earlier version
+    generated that phrasing ONLY when a caller supplied `category` -- so a caller without a
+    category (most of them) lost the phrasing most likely to work, and a resolver that had the
+    right rule refused the row anyway. When there is no category, the brand alone takes the slot:
+    Reap answers it with a slice of that merchant's catalogue, which `match_product` then filters
+    on exact name, so it is a broader net rather than a looser match.
+
+    AND THE SAME PHRASING IS NOT REPEATABLE. Reap's search is non-deterministic: the identical
+    query returned zero hits for this merchant twice at ~19:15 and ~19:20 and then returned the
+    product at ~19:45. `queries_tried` records which phrasings were sent, but it cannot promise
+    that re-sending one gets the same answer -- so no single pass, however many phrasings it
+    tries, establishes that something is absent from the index.
     """
     name = str(product_name or "").strip()
     brand_text = str(brand or "").strip()
     category_text = str(category or "").strip()
     if not name and not brand_text:
         raise ReapRequestError("a search needs at least a product name or a brand")
+    broad = ""
+    if brand_text:
+        broad = f"{brand_text} {category_text}".strip() if category_text else brand_text
     ordered = [
         f"{brand_text} {name}".strip() if brand_text else "",
         name,
-        f"{brand_text} {category_text}".strip() if brand_text and category_text else "",
+        broad,
     ]
     out: List[str] = []
     for query in ordered:
@@ -1050,8 +1071,11 @@ REFUSAL_EXPLANATIONS: List[Tuple[str, str]] = [
      "above). Reap's search is QUERY-SENSITIVE: the bare product name is measured to miss\n"
      "products the brand-led phrasing finds, so this is evidence about the QUERY at least as\n"
      "much as about the index. DO NOT conclude the merchant is unindexed from it -- that is\n"
-     "exactly how flowerbeauty.com got written off. If `merchant.name` carries a subdomain\n"
-     "(8 of 78 do), pass it via `also_accept_domains` rather than loosening the comparison."),
+     "exactly how flowerbeauty.com got written off. Reap's search is also NON-DETERMINISTIC:\n"
+     "the identical query returned nothing for that merchant twice and then returned the\n"
+     "product half an hour later, so a single pass establishes nothing about absence. If\n"
+     "`merchant.name` carries a subdomain (8 of 78 do), pass it via `also_accept_domains`\n"
+     "rather than loosening the comparison."),
     ("search:ambiguous_name_match",
      "More than one product on the right merchant has exactly our product name. Refusing beats\n"
      "picking: the candidates are listed above."),

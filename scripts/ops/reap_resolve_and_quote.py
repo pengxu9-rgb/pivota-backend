@@ -52,6 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 # sending our id was the central defect of the client this replaces.
 MERCHANT_DOMAIN = "fentybeauty.com"
 BRAND = "Fenty Beauty"
+CATEGORY = "perfume"
 PRODUCT_NAME = "Fenty Eau de Parfum"
 VARIANT_TITLE = "Standard"
 OUR_PRICE = 140.00
@@ -97,6 +98,7 @@ def main() -> int:
 
     resolved = asyncio.run(rc.resolve_our_row(
         merchant_domain=MERCHANT_DOMAIN, product_name=PRODUCT_NAME, brand=BRAND,
+        category=CATEGORY,
         variant_title=VARIANT_TITLE, our_price=OUR_PRICE, country="US", currency="USD",
     ))
 
