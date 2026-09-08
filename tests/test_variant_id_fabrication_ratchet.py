@@ -68,7 +68,9 @@ DISPLAY_ONLY = {
         "Mints a synthetic default variant so the readiness gate does not score the seed "
         "`zero_variants` and drop it from recall (live incident 2026-07-11: 2,151 seeds "
         "invisible to find_products_multi). Stamped variant_id_provenance=product_derived "
-        "and purchasable=False so no consumer has to sniff the string."
+        "and purchasable=False so a consumer can filter on a declared fact instead of "
+        "sniffing the string -- none does yet (2026-09-07); the gateway's "
+        "isRestatedProductId guard is the live refusal."
     ): {
         ("scripts/onboard_external_brand_from_crawl.py", "variant_id"),
         ("services/catalog_enrichment_agent/ingestion.py", "variant_id"),

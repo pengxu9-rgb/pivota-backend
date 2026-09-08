@@ -1,0 +1,1541 @@
+{
+ "merchants": [
+  {
+   "merchant_id": "merch_obs_e65708e6dc609674",
+   "merchant_name": "Stila Cosmetics",
+   "status": "observed",
+   "indexable": true,
+   "primary_platform": "external_seed",
+   "products": 124
+  },
+  {
+   "merchant_id": "agent_seed::stila-cosmetics",
+   "merchant_name": "Stila Cosmetics",
+   "status": "active",
+   "indexable": true,
+   "primary_platform": "external_seed",
+   "products": 0
+  }
+ ],
+ "stila_census": [
+  {
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "supp_at": false,
+   "supp_reason": false,
+   "no_category_path": false,
+   "has_sig": true,
+   "n": 87
+  },
+  {
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "candidate",
+   "pdp_scope": "multi_merchant_canonical",
+   "supp_at": false,
+   "supp_reason": false,
+   "no_category_path": false,
+   "has_sig": true,
+   "n": 36
+  },
+  {
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "supp_at": true,
+   "supp_reason": true,
+   "no_category_path": false,
+   "has_sig": true,
+   "n": 1
+  }
+ ],
+ "stila_suppression_reasons": [
+  {
+   "reason": "(null)",
+   "script": "(none)",
+   "n": 123,
+   "first_at": null,
+   "last_at": null
+  },
+  {
+   "reason": "token_price_promo",
+   "script": "withdraw_catalog_rows",
+   "n": 1,
+   "first_at": "2026-09-05 01:51:09.651172+00:00",
+   "last_at": "2026-09-05 01:51:09.651172+00:00"
+  }
+ ],
+ "stila_category_paths": [
+  {
+   "category_path": "beauty/makeup",
+   "n": 124
+  }
+ ],
+ "stila_titles": [
+  {
+   "product_key": "ext:stila-cosmetics-deluxe-mini-stay-all-day-liquid-eye-liner-in-intense-black::76f08db3",
+   "content_key": "ck_d9b505e57fd9bc1c6b508b84342bcb0c",
+   "title": "Deluxe Mini Stay All Day\u00ae Liquid Eye Liner in Intense Black",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_452a57ad75557a98d67dbafd9178b965",
+   "updated_at": "2026-09-05 01:50:34.199417",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-eye-love-this-stay-all-day-eye-liner-duo-47-value::da403de1",
+   "content_key": "ck_18aaa92e68fca58062f081c4c1e0c2e2",
+   "title": "Eye Love This Stay All Day\u00ae Eye Liner Duo ($47 Value)",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_62567348f43865ec733d3fc15d71421e",
+   "updated_at": "2026-09-05 01:50:34.131017",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-free-travel-stay-all-day-liquid-eye-liner-in-intense-black-tiktok-shop::841db8be",
+   "content_key": "ck_397e3a092d33ccc5bb42381aa47e396b",
+   "title": "Free Travel Stay All Day\u00ae Liquid Eye Liner in Intense Black (TikTok Shop)",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": "2026-09-05 01:51:09.651172+00:00",
+   "suppression_reason": "token_price_promo",
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_d087d7fd96b9dce2933a585df1838583",
+   "updated_at": "2026-09-05 01:51:09.651172",
+   "skus": 1,
+   "live_skus": 0,
+   "offers": 1,
+   "live_offers": 0
+  },
+  {
+   "product_key": "ext:stila-cosmetics-kisses-make-me-happy-stay-all-day-liquid-lipstick-duo-48-value::871b1bd6",
+   "content_key": "ck_e42aa8f738004138c228c0b8b8166b14",
+   "title": "Kisses Make Me Happy Stay All Day\u00ae Liquid Lipstick Duo ($48 Value)",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_69b5faa4fc8392dc26d264b5b2a64fe8",
+   "updated_at": "2026-09-05 01:50:34.124055",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-mini-stay-all-day-liquid-lipstick::bc07d968",
+   "content_key": "ck_5e4a38c30b6580d2baf67e2717ccdf1f",
+   "title": "Mini Stay All Day\u00ae Liquid Lipstick",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_2131b1cd99353c95c8769a3ed0359ed2",
+   "updated_at": "2026-09-05 01:50:34.150392",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-mini-stay-all-day-liquid-lipstick-patina::60703874",
+   "content_key": "ck_ff1c364ebdcf3139695c5816c72ce83d",
+   "title": "Mini Stay All Day\u00ae Liquid Lipstick - Patina",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_dfed0ced8dc0d5f653335c05c4c020fe",
+   "updated_at": "2026-09-05 01:50:34.278765",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-artistix-graphic-liner::90e2b841",
+   "content_key": "ck_a5ba39b4ca7565cb44744f760dd7e6eb",
+   "title": "Stay All Day\u00ae ArtiStix Graphic Liner",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_882eb3be6cd8d110e98e1e4b2a86a9c1",
+   "updated_at": "2026-09-05 01:50:34.271576",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-artistix-graphic-liner-last-chance::fa2944cf",
+   "content_key": "ck_f348beff16db46c6b8249a15072ab8cf",
+   "title": "Stay All Day\u00ae ArtiStix Graphic Liner - Last Chance",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_73243f247f83e62574fd1b95210f3048",
+   "updated_at": "2026-09-05 01:50:33.893133",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-artistix-graphic-liner-last-chance-shades::f8a795ed",
+   "content_key": "ck_ae8fc446f40caacf5825ef119f98b938",
+   "title": "Stay All Day\u00ae ArtiStix Graphic Liner - Last Chance Shades",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_d64ec9ac186ca0570b72fbc32343a4ff",
+   "updated_at": "2026-09-05 01:50:34.137383",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-chroma-flash-liquid-eye-liner::0edc93f3",
+   "content_key": "ck_a12810378b48818f07025f700b549556",
+   "title": "Stay All Day\u00ae Chroma-Flash Liquid Eye Liner",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_7d91d7e7c174075ed7cbd044512efc58",
+   "updated_at": "2026-09-05 01:50:34.050878",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-dual-ended-liquid-eye-liner-amber-dark-brown-last-chance-shade::adb1001b",
+   "content_key": "ck_fbe38807517d2d2a40a8a3bb17dd73fe",
+   "title": "Stay All Day\u00ae Dual-Ended Liquid Eye Liner: Amber/Dark Brown - Last Chance Shade",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_28fbff3e96d3a436e916186421219467",
+   "updated_at": "2026-09-05 01:50:34.292310",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-dual-ended-liquid-eye-liner-shimmer-micro-tip-last-chance::de6f7c67",
+   "content_key": "ck_283c9eeb96f0b00948df00154aca91f3",
+   "title": "Stay All Day\u00ae Dual-Ended Liquid Eye Liner: Shimmer Micro Tip - Last Chance",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_b5690243f07e391e3e65e119462f8f30",
+   "updated_at": "2026-09-05 01:50:34.348842",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-dual-ended-liquid-eye-liner-two-colors::28131b9a",
+   "content_key": "ck_100f36e9c159cc2cd2ef3401775a5ded",
+   "title": "Stay All Day\u00ae Dual-Ended Liquid Eye Liner: Two Colors",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_0042e9e14ebb8f38c74cd3cbe46314bb",
+   "updated_at": "2026-09-05 01:50:34.342937",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-dual-ended-liquid-eye-liner-two-colors-last-chance::418e4f17",
+   "content_key": "ck_8fb1c612146ee441302055f77a93e3db",
+   "title": "Stay All Day\u00ae Dual-Ended Liquid Eye Liner: Two Colors - Last Chance",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_a4d80f5d7e5be378f7ed62d45e0a18a0",
+   "updated_at": "2026-09-05 01:50:33.886703",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-dual-ended-waterproof-liquid-eye-liner::b3ff02ad",
+   "content_key": "ck_b662c774d2e73354fddf010bcb3c6a35",
+   "title": "Stay All Day\u00ae Dual-Ended Waterproof Liquid Eye Liner",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_0cc6c493cd5e497dafb787a48646b481",
+   "updated_at": "2026-09-05 01:50:34.409362",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-foundation-concealer::245f8dff",
+   "content_key": "ck_cbafa5f0e93e42dc78a183ba94c68574",
+   "title": "Stay All Day\u00ae Foundation & Concealer",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_05d569268f53d7e52b94387abeaae374",
+   "updated_at": "2026-09-05 01:50:34.436665",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-inkwear-liquid-eye-liner::48506eb3",
+   "content_key": "ck_e58cf3a3ca431248a5e16cb650f6bcf6",
+   "title": "Stay All Day\u00ae InkWear\u2122 Liquid Eye Liner",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_9123a00a6a493e2a92e44d9bbcb5f37b",
+   "updated_at": "2026-09-05 01:50:34.179357",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-inkwear-liquid-eye-liner-electric-sky::51d9a80c",
+   "content_key": "ck_43b8074b74ef1ea7c180af3017e5ee08",
+   "title": "Stay All Day\u00ae InkWear\u2122 Liquid Eye Liner - Electric Sky",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_e5f8c494f90b2afa26aefae97a5d2139",
+   "updated_at": "2026-09-05 01:50:33.695807",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-liquid-lipstick::22343be3",
+   "content_key": "ck_6ff3ef07ffccb95cee8174c5faca861d",
+   "title": "Stay All Day\u00ae Liquid Lipstick",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_afd62a5e2b02dbd8fc350728a78d2d73",
+   "updated_at": "2026-09-05 01:50:34.224625",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-liquid-lipstick-fiery::5e745a8c",
+   "content_key": "ck_d72e6eeaceff47e63646ab3c12dc3266",
+   "title": "Stay All Day\u00ae Liquid Lipstick - Fiery",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_e06a9498f4bbee422ac270cf12fb8444",
+   "updated_at": "2026-09-05 01:50:33.688548",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-liquid-lipstick-shimmer-sheer::44c198ef",
+   "content_key": "ck_7d5a7c577db08f91164d6817dd3f2a88",
+   "title": "Stay All Day\u00ae Liquid Lipstick Shimmer & Sheer",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_3b20da2327204661f575a6572f7da8a5",
+   "updated_at": "2026-09-05 01:50:34.231552",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-matte-lip-liner-last-chance-shades::8ec2ef63",
+   "content_key": "ck_af837def7066599c0bed0a04e6ff17c1",
+   "title": "Stay All Day\u00ae Matte Lip Liner - Last Chance Shades",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_1048376d3d07eac30afecf8e2247548b",
+   "updated_at": "2026-09-05 01:50:34.044315",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-smudge-set-waterproof-gel-eye-liner::2d439aaa",
+   "content_key": "ck_90c4b8f8c66b5e2f55ad0b52bbbf3ab3",
+   "title": "Stay All Day\u00ae Smudge & Set Waterproof Gel Eye Liner",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_ea3ee720854e7fee743153412cfd4710",
+   "updated_at": "2026-09-05 01:50:34.165436",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-smudge-set-waterproof-gel-eye-liner-copper::4fd7a738",
+   "content_key": "ck_4d1011577e1b73508ee3171d92999456",
+   "title": "Stay All Day\u00ae Smudge & Set\u2122 Waterproof Gel Eye Liner - Copper",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_d0080c14faa8b2622ba840046583ca75",
+   "updated_at": "2026-09-05 01:50:33.672024",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-smudge-set-waterproof-gel-eye-liner-last-chance-shades::879896de",
+   "content_key": "ck_ee0974741cc0f927d90256851f6f4fac",
+   "title": "Stay All Day\u00ae Smudge & Set Waterproof Gel Eye Liner - Last Chance Shades",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_965bba2e3a89f2a84182ee7bd334e4cd",
+   "updated_at": "2026-09-05 01:50:33.880071",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-waterproof-brow-color::8b39707d",
+   "content_key": "ck_40f4c302bcee302acd5d413c38c798c9",
+   "title": "Stay All Day\u00ae Waterproof Brow Color",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_481ff8a013b372fcbd8c70c7dc0982c6",
+   "updated_at": "2026-09-05 01:50:34.264584",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-waterproof-liquid-eye-liner::84ca8b17",
+   "content_key": "ck_aba3836cbb86588a04e6a106080540af",
+   "title": "Stay All Day\u00ae Waterproof Liquid Eye Liner",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_a4393ab1839e51cbceb5cb0522eb6e46",
+   "updated_at": "2026-09-05 01:50:34.324547",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-waterproof-liquid-eye-liner-intense-labradorite::f6e08b45",
+   "content_key": "ck_7ec4818126aaf6d16d4d33884d4792a6",
+   "title": "Stay All Day\u00ae Waterproof Liquid Eye Liner - Intense Labradorite",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_89a808bf9a14a7a4cf2862bf62bf4133",
+   "updated_at": "2026-09-05 01:50:33.630083",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-waterproof-liquid-eye-liner-last-chance-shades::cad19057",
+   "content_key": "ck_b50cd55e29df1eecd31e19c6401711e7",
+   "title": "Stay All Day\u00ae Waterproof Liquid Eye Liner - Last Chance Shades",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_297b127281d545e530ba96696957f265",
+   "updated_at": "2026-09-05 01:50:33.900309",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  },
+  {
+   "product_key": "ext:stila-cosmetics-stay-all-day-waterproof-liquid-eye-liner-micro-tip::28a6dc68",
+   "content_key": "ck_362e591fe1767d7c359c22dfaa9d970f",
+   "title": "Stay All Day\u00ae Waterproof Liquid Eye Liner - Micro Tip",
+   "brand": "Stila Cosmetics",
+   "product_type": "makeup",
+   "category_path": "beauty/makeup",
+   "sync_status": "live",
+   "pdp_lifecycle_stage": "published",
+   "pdp_scope": "multi_merchant_canonical",
+   "suppressed_at": null,
+   "suppression_reason": null,
+   "source_domain": "stilacosmetics.com",
+   "source_system": "catalog_enrichment_agent_v1",
+   "pivota_signature_id": "sig_0a302f3d68577736787421c4777add2b",
+   "updated_at": "2026-09-05 01:50:34.430185",
+   "skus": 1,
+   "live_skus": 1,
+   "offers": 1,
+   "live_offers": 1
+  }
+ ],
+ "stila_sku_offer_totals": [
+  {
+   "products": 124,
+   "skus": 124,
+   "live_skus": 123,
+   "offers": 125,
+   "live_offers": 124,
+   "priced_live_offers": 124
+  }
+ ],
+ "stila_ips": [
+  {
+   "pipeline_stage": "public_indexed",
+   "blocker_code": "none",
+   "serving_eligible": true,
+   "index_eligible": true,
+   "n": 87,
+   "avg_q": "83.3"
+  },
+  {
+   "pipeline_stage": "shadow_indexed",
+   "blocker_code": "none",
+   "serving_eligible": true,
+   "index_eligible": true,
+   "n": 36,
+   "avg_q": "83.3"
+  },
+  {
+   "pipeline_stage": "extracted",
+   "blocker_code": "suppressed",
+   "serving_eligible": false,
+   "index_eligible": false,
+   "n": 1,
+   "avg_q": "66.7"
+  }
+ ],
+ "stila_ips_missing": [
+  {
+   "content_keys_total": 124,
+   "content_keys_without_ips": 0
+  }
+ ],
+ "stila_trust": [
+  {
+   "serving_decision": "shadow",
+   "reasons": "{IDENTITY_LIVE_READ_DISABLED}",
+   "n": 123
+  },
+  {
+   "serving_decision": "blocked",
+   "reasons": "{ROW_TOMBSTONED}",
+   "n": 1
+  }
+ ],
+ "stila_apv": {
+  "error": "UndefinedColumnError: column v.updated_at does not exist\nHINT:  Perhaps you meant to reference the column \"p.updated_at\"."
+ },
+ "withdraw_blast_catalog_products": [
+  {
+   "reason": "token_price_promo",
+   "n": 1,
+   "first_at": "2026-09-05 01:51:09.651172+00:00",
+   "last_at": "2026-09-05 01:51:09.651172+00:00"
+  }
+ ],
+ "withdraw_blast_catalog_skus": [
+  {
+   "reason": "token_price_promo",
+   "n": 1,
+   "first_at": "2026-09-05 01:51:09.660298+00:00",
+   "last_at": "2026-09-05 01:51:09.660298+00:00"
+  }
+ ],
+ "withdraw_blast_catalog_offers": [
+  {
+   "reason": "token_price_promo",
+   "n": 1,
+   "first_at": "2026-09-05 01:51:09.665005+00:00",
+   "last_at": "2026-09-05 01:51:09.665005+00:00"
+  }
+ ],
+ "withdraw_products_detail": [
+  {
+   "product_key": "ext:stila-cosmetics-free-travel-stay-all-day-liquid-eye-liner-in-intense-black-tiktok-shop::841db8be",
+   "title": "Free Travel Stay All Day\u00ae Liquid Eye Liner in Intense Black (TikTok Shop)",
+   "brand": "Stila Cosmetics",
+   "source_domain": "stilacosmetics.com",
+   "suppressed_at": "2026-09-05 01:51:09.651172+00:00",
+   "suppression_reason": "token_price_promo"
+  }
+ ],
+ "control_brands": [
+  {
+   "brand": "fenty beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "candidate",
+   "n": 767,
+   "with_category_path": 767,
+   "lip_category": 127,
+   "suppressed": 66
+  },
+  {
+   "brand": "pixi beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "candidate",
+   "n": 243,
+   "with_category_path": 243,
+   "lip_category": 5,
+   "suppressed": 16
+  },
+  {
+   "brand": "kylie cosmetics",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "candidate",
+   "n": 172,
+   "with_category_path": 172,
+   "lip_category": 22,
+   "suppressed": 16
+  },
+  {
+   "brand": "tarte",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 161,
+   "with_category_path": 161,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "pixi beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 97,
+   "with_category_path": 97,
+   "lip_category": 0,
+   "suppressed": 14
+  },
+  {
+   "brand": "stila cosmetics",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 88,
+   "with_category_path": 88,
+   "lip_category": 0,
+   "suppressed": 1
+  },
+  {
+   "brand": "fenty beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 81,
+   "with_category_path": 81,
+   "lip_category": 4,
+   "suppressed": 5
+  },
+  {
+   "brand": "tarte cosmetics",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 70,
+   "with_category_path": 70,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "kylie cosmetics",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 48,
+   "with_category_path": 48,
+   "lip_category": 0,
+   "suppressed": 6
+  },
+  {
+   "brand": "flower beauty",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 48,
+   "with_category_path": 48,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "stila cosmetics",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "candidate",
+   "n": 36,
+   "with_category_path": 36,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "tarte",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "draft",
+   "n": 15,
+   "with_category_path": 15,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "fenty beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "draft",
+   "n": 11,
+   "with_category_path": 11,
+   "lip_category": 1,
+   "suppressed": 2
+  },
+  {
+   "brand": "mac",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 10,
+   "with_category_path": 10,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "tarte",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 10,
+   "with_category_path": 10,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "pixi beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "candidate",
+   "n": 6,
+   "with_category_path": 6,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "tarte",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "draft",
+   "n": 4,
+   "with_category_path": 4,
+   "lip_category": 0,
+   "suppressed": 4
+  },
+  {
+   "brand": "kylie cosmetics",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "published",
+   "n": 4,
+   "with_category_path": 4,
+   "lip_category": 0,
+   "suppressed": 2
+  },
+  {
+   "brand": "clarins",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 4,
+   "with_category_path": 4,
+   "lip_category": 4,
+   "suppressed": 0
+  },
+  {
+   "brand": "mac",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "live",
+   "stage": "draft",
+   "n": 3,
+   "with_category_path": 3,
+   "lip_category": 3,
+   "suppressed": 2
+  },
+  {
+   "brand": "tarte cosmetics",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "draft",
+   "n": 3,
+   "with_category_path": 3,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "pixi beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "published",
+   "n": 3,
+   "with_category_path": 3,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "lord & berry",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "published",
+   "n": 2,
+   "with_category_path": 2,
+   "lip_category": 2,
+   "suppressed": 0
+  },
+  {
+   "brand": "pixi beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "draft",
+   "n": 2,
+   "with_category_path": 2,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "fenty beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "candidate",
+   "n": 2,
+   "with_category_path": 2,
+   "lip_category": 0,
+   "suppressed": 1
+  },
+  {
+   "brand": "kylie cosmetics",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "candidate",
+   "n": 2,
+   "with_category_path": 2,
+   "lip_category": 2,
+   "suppressed": 1
+  },
+  {
+   "brand": "fenty beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "draft",
+   "n": 1,
+   "with_category_path": 1,
+   "lip_category": 1,
+   "suppressed": 0
+  },
+  {
+   "brand": "flower beauty",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "candidate",
+   "n": 1,
+   "with_category_path": 1,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "fenty beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sync_status": "stale",
+   "stage": "published",
+   "n": 1,
+   "with_category_path": 1,
+   "lip_category": 0,
+   "suppressed": 0
+  },
+  {
+   "brand": "lord & berry",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sync_status": "live",
+   "stage": "draft",
+   "n": 1,
+   "with_category_path": 1,
+   "lip_category": 1,
+   "suppressed": 0
+  }
+ ],
+ "stila_recall_doors": [
+  {
+   "stila_sku_rows": 124,
+   "door_phrase": 0,
+   "door_category": 0,
+   "door_brand_admit_identity_only": 0,
+   "score_anchor_would_match": 0,
+   "gate_sync_live": 124,
+   "gate_lifecycle": 88,
+   "gate_prod_unsuppressed": 123,
+   "gate_sku_unsuppressed": 123,
+   "gate_merchant_active": 124,
+   "gate_merchant_indexable": 124,
+   "gate_has_live_offer": 123
+  }
+ ],
+ "stila_survivors_all_gates": [
+  {
+   "title": "All About The Blur Blurring & Smoothing Primer",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "All Fire\u2122 Liquid Eye Shadow / Kajal Eye Liner Duo",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Blue Eye Bundle (Travel Edition)",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Blush & Bronze Hydro-Blur Cheek Duo",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Blush & Glimmer Duo: Patina + Silverlake",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Blush & Glimmer Duo: Poppy + Silverlake",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Blush & Glimmer Duo: Primrose + Silverlake",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Buff & Blur Lip Enzyme Exfoliator",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Calligraphy Lip Stain",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Calligraphy Lip Stain - Last Chance Shade",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Calligraphy Lip Stain - The Nudes",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Champagne Veil Bundle",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Champagne Veil Eye Bundle (Any Eye Color) - Limited Time Exclusive",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Complete Harmony Lip & Cheek Stick",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Complete Harmony Lip & Cheek Stick - Last Chance Shade",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Convertible Color\u2122 Dual Lip & Cheek Cream",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Correct & Perfect All-in-One Color Correcting Palette",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Deluxe Mini Stay All Day\u00ae Liquid Eye Liner in Intense Black",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Double-Ended Blending Sponge",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Double-Ended Complexion Brush",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Easy Wing (Crema Matte) Bundle",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Easy Wing (Sandy Matte) Bundle",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Envy After Dark Bundle (Travel Edition)",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Eye Love This Stay All Day\u00ae Eye Liner Duo ($47 Value)",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Eye Shadow - Fauna",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "FREE Calligraphy Lip Stain in Michelle (see details in description)",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Glisten & Glow Liquid Eye Shadow - Last Chance Shades",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Glitter & Glow Liquid Eye Shadow",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "Glitter & Glow Liquid Eye Shadow - Last Chance Shades",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  },
+  {
+   "title": "#30 Double-Ended Shadow Brush",
+   "brand": "Stila Cosmetics",
+   "category_path": "beauty/makeup",
+   "pdp_lifecycle_stage": "published",
+   "sku_rows": 1
+  }
+ ],
+ "live_recall_top": [
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Oil Luminizing Lip Oil 'N Gloss \u2014 Miss Jellyfish",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lip-oil",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Oil Luminizing Lip Oil 'N Gloss \u2014 Razzberry Jamz",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lip-oil",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Swirl Twisted Lip Luminizer \u2014 Fu$$y Chocolit",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Swirl Twisted Lip Luminizer \u2014 Fu$$y Chocolit",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "fenty beauty",
+   "title": "Gloss Bomb Universal Lip Luminizer \u2014 Glass Slipper",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "fenty beauty",
+   "title": "Gloss Bomb Universal Lip Luminizer \u2014 Glass Slipper",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "fenty beauty",
+   "title": "Gloss Bomb Universal Lip Luminizer \u2014 Glass Slipper",
+   "merchant_name": "Fenty Beauty",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Joli Rouge",
+   "merchant_name": "Clarins",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Joli Rouge Shine",
+   "merchant_name": "Clarins",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Lip Comfort Oil",
+   "merchant_name": "Clarins",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lip_oil",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Lip Perfector Peptide-Plumping + Hydrating Lip Gloss",
+   "merchant_name": "Clarins",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lip_gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "OILUJ",
+   "title": "OIL\u00d9J, \"Lip Life\"",
+   "merchant_name": "OILUJ",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 350
+  },
+  {
+   "brand": "Lord & Berry",
+   "title": "Timeless Kissproof Lipstick",
+   "merchant_name": "Lord & Berry",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "Lord & Berry",
+   "title": "Vogue Matte Lipstick",
+   "merchant_name": "Lord & Berry",
+   "pdp_lifecycle_stage": "published",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "TOCOBO US",
+   "title": "Glow & Glass Tinted Lip Balm",
+   "merchant_name": "TOCOBO US",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 310
+  },
+  {
+   "brand": "Heart Percent",
+   "title": "Heart Percent Commas On Life Essential Lip Essence #101 Lulluaby, 6g",
+   "merchant_name": "Heart Percent",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 310
+  },
+  {
+   "brand": "Heart Percent",
+   "title": "Heart Percent Dote On Mood Blurry Fog Tint",
+   "merchant_name": "Heart Percent",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 310
+  },
+  {
+   "brand": "Heart Percent",
+   "title": "Heart Percent Dote On Mood Pure Glow Tint, 6.8g",
+   "merchant_name": "Heart Percent",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 310
+  },
+  {
+   "brand": "TOCOBO US",
+   "title": "Juicy Berry Plumping Lip Oil",
+   "merchant_name": "TOCOBO US",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 310
+  },
+  {
+   "brand": "GOONGBE",
+   "title": "Kids' Moisture Lip Balm, 0.1oz.",
+   "merchant_name": "GOONGBE",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 310
+  },
+  {
+   "brand": "Miss Nella",
+   "title": "Lav Kids Skincare by Miss Nella Moisturising Lip Butter",
+   "merchant_name": "Miss Nella",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 310
+  },
+  {
+   "brand": "Linhart Smile Care",
+   "title": "Lip Balm SPF 15",
+   "merchant_name": "Linhart Smile Care",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 310
+  },
+  {
+   "brand": "Comfortzone",
+   "title": "Lip Care Bag",
+   "merchant_name": "comfortzone",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 310
+  },
+  {
+   "brand": "Miss Nella",
+   "title": "Lip Gloss",
+   "merchant_name": "Miss Nella",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 310
+  },
+  {
+   "brand": "HOLIKA HOLIKA STORE",
+   "title": "Liplief Glowy Lip Oil",
+   "merchant_name": "HOLIKA HOLIKA STORE",
+   "pdp_lifecycle_stage": "validated",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 310
+  }
+ ],
+ "category_door_size": [
+  {
+   "sku_rows": 859,
+   "products": 341
+  }
+ ]
+}

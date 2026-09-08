@@ -236,6 +236,82 @@ def _is_title_echo(value: str, title: Optional[str]) -> bool:
     return len(remainder) < _ECHO_REMAINDER_MIN
 
 
+# A leading bracketed tag is how this storefront family labels an EDITION of a product, not a
+# different product: "[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION Metal Serum Gloss",
+# "[Special Set] New Classic Glaze Lipstick", "[SUMMER EDITION] ...", "[9.9 EXCLUSIVE] ...".
+_EDITION_PREFIX = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
+# Words that mark a handle affix as an EDITION of the same product: `-special-set`,
+# `summer-edition-`, `-9-9-exclusive`. Deliberately a short list, and an affix must be short
+# (`_MAX_AFFIX_TOKENS`) and contain one of them: a handle that differs by any other word alone
+# ("-refill", "-brush", "-mini") or by the bare "-1" Shopify appends to de-duplicate a handle is
+# a different product. The cost of missing an edition word is a row that stays blocked, which
+# is where it already was.
+_EDITION_WORDS = frozenset({
+    "set", "edition", "exclusive", "limited", "special", "collab", "collaboration", "bundle",
+    "kit", "gwp",
+})
+_MAX_AFFIX_TOKENS = 3
+# An edition family is a handful of pages. Twenty pages sharing one string is a MECHANISM (app
+# vendor, theme template), whatever their titles say, and the title/handle test above must not
+# be the only thing standing between it and auto-publication.
+_MAX_EDITION_FAMILY = 4
+
+
+def _base_title(title: Optional[str]) -> str:
+    """The product's title with every leading bracketed edition tag removed, normalized."""
+    return _norm_copy(_EDITION_PREFIX.sub("", str(title or "")))
+
+
+def _is_edition_affix(tokens: list) -> bool:
+    """A short affix carrying an edition word: `special-set`, `summer-edition`, `9-9-exclusive`;
+    not `refill`, not `1`, and not a six-word collaboration name (the title rule covers that)."""
+    return 0 < len(tokens) <= _MAX_AFFIX_TOKENS and any(t in _EDITION_WORDS for t in tokens)
+
+
+def _handles_are_editions(a: str, b: str) -> bool:
+    """Is one handle the other plus an edition affix -- `x-special-set`, `summer-edition-x`?"""
+    a, b = (a or "").strip().casefold(), (b or "").strip().casefold()
+    if not a or not b or a == b:
+        return False
+    short, long_ = sorted((a, b), key=len)
+    if long_.startswith(short + "-"):
+        return _is_edition_affix(long_[len(short) + 1:].split("-"))
+    if long_.endswith("-" + short):
+        return _is_edition_affix(long_[: -len(short) - 1].split("-"))
+    return False
+
+
+def _are_sibling_editions(a: tuple, b: tuple) -> bool:
+    """Do these two (handle, title) pairs name editions of ONE product?
+
+    NARROW ON PURPOSE. Two pages are siblings only if their titles agree once a leading
+    bracketed edition tag is stripped, or one handle is the other plus an edition affix. Two
+    palettes that share family copy have different base titles and different handle stems, so
+    they stay "shared" and are dropped, as before.
+    """
+    (ha, ta), (hb, tb) = a, b
+    base_a, base_b = _base_title(ta), _base_title(tb)
+    # At least one title must actually have CARRIED an edition tag: two products that merely
+    # have the same name (and handles "x" / "x-1") are not editions of each other.
+    tagged = base_a != _norm_copy(ta) or base_b != _norm_copy(tb)
+    if base_a and base_a == base_b and tagged:
+        return True
+    return _handles_are_editions(ha, hb)
+
+
+def _is_one_product_family(pages: Dict[str, tuple]) -> bool:
+    """Are ALL these pages (handle -> (handle, title)) editions of one product?
+
+    Every pair must be siblings -- not merely connected through a chain -- so that a base
+    product cannot vouch for two unrelated things that each happen to look like its edition.
+    """
+    if not 1 < len(pages) <= _MAX_EDITION_FAMILY:
+        return False
+    members = list(pages.values())
+    return all(_are_sibling_editions(members[i], members[j])
+               for i in range(len(members)) for j in range(i + 1, len(members)))
+
+
 def drop_shared_boilerplate(
     candidates: Dict[str, str],
     shop_blurb: Optional[str] = None,
@@ -258,7 +334,14 @@ def drop_shared_boilerplate(
       2. APP-VENDOR TEXT. Apps write operational strings into the name tag --
          "This product is used for the app BOGOS.io ... Please do not delete/edit it". 231
          characters, over the floor, on 20+ `gwp-*_freegift` products of jsmbeauty.sg. No
-         shop-blurb comparison reaches it; repetition does.
+         shop-blurb comparison reaches it; repetition does. ONE EXCEPTION, and a narrow one:
+         copy shared only among SIBLING EDITIONS of a single product ("LIP-PRESSION Metal
+         Serum Gloss" and "[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION Metal Serum
+         Gloss"; "New Classic Glaze Lipstick" and "[Special Set] New Classic Glaze Lipstick")
+         is that product's copy, not boilerplate, and passes on to mechanisms 1 and 3 like a
+         singleton. See `_are_sibling_editions` for what "sibling" means; measured 2026-09-08
+         on jsmbeauty.sg, this exception was the whole difference between two Meitu Tier-A lip
+         lines staying blocked `low_quality` (9- and 8-char descriptions) and serving.
       3. A TITLE ECHO from a themed name-tag template -- see `_is_title_echo`. Per-product, not
          the blurb, invisible to both of the above.
 
@@ -278,7 +361,9 @@ def drop_shared_boilerplate(
     description onto another, and the second kit's own real copy is lost with it. We take that
     knowingly: a rejected row keeps its description and stays blocked exactly where it was, and
     routes to the LLM enrichment lane, whereas a false ACCEPT auto-publishes boilerplate as
-    brand-official copy (`is_published_ready`).
+    brand-official copy (`is_published_ready`). The sibling-edition exception recovers only the
+    part of that cost where the sharing IS one product; the palettes and the brush kits are
+    still dropped, and a family of more than `_MAX_EDITION_FAMILY` pages is never a family.
 
     KNOWN LIMIT, not closed here: the census covers the candidates of THIS run. The population
     query excludes rows already at >= 50 chars, so if another lane fills one member of a shared
@@ -288,9 +373,12 @@ def drop_shared_boilerplate(
     handles = handles or {}
     titles = titles or {}
     # Count DISTINCT product pages per value, so one product behind two rows is not "shared".
-    seen: Dict[str, set] = {}
+    # Each page keeps its (handle, title) so a shared value can be asked whether its pages are
+    # editions of ONE product.
+    seen: Dict[str, Dict[str, tuple]] = {}
     for pk, v in candidates.items():
-        seen.setdefault(_norm_copy(v), set()).add(handles.get(pk, pk))
+        h = handles.get(pk, pk)
+        seen.setdefault(_norm_copy(v), {}).setdefault(h, (h, titles.get(pk)))
     # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
     # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
     blurb = _norm_copy(shop_blurb) if len(shop_blurb or "") >= MIN_DESC_LEN else ""
@@ -298,13 +386,17 @@ def drop_shared_boilerplate(
     kept = {}
     for pk, v in candidates.items():
         n = _norm_copy(v)
-        if len(seen[n]) > 1:                       # (2) shared across product pages
-            continue
+        if len(seen[n]) > 1 and not _is_one_product_family(seen[n]):
+            continue                               # (2) shared across UNRELATED product pages
         if blurb and n == blurb:                   # (1) the storefront's own blurb
             continue
         if not blurb:                              # (1) unavailable -> nothing guards a singleton
             continue
-        if _is_title_echo(v, titles.get(pk)):      # (3) the title with a brand bolted on
+        # (3) the title with a brand bolted on. A value admitted as ONE product's copy is judged
+        # against every name that product goes by: the base product's echo, rendered again on
+        # its edition page, is still nothing but the title.
+        family_titles = [t for _h, t in seen[n].values()] or [titles.get(pk)]
+        if any(_is_title_echo(v, t) for t in family_titles):
             continue
         kept[pk] = v
     return kept

@@ -859,6 +859,290 @@ def test_a_single_variant_record_with_a_fabricated_id_still_writes_no_variant_sk
     assert len(result["offers"]) == 1
 
 
+# --- a variant offer carries the variant's OWN positive price or is not written ---------
+
+
+def _lone_real_variant_record(**variant_overrides):
+    """One variant with a real 14-digit id -- the shape #2113 admits -- whose price
+    fields are whatever the test says, and nothing else."""
+    record = _variant_record(1)
+    v = record["pdp"]["variants"][0]
+    v.pop("price", None)
+    v.update(variant_overrides)
+    return record
+
+
+def test_a_lone_variant_without_a_price_of_its_own_gets_a_sku_but_no_offer():
+    """Post-merge review of #2113: a single-variant record could not reach the variant
+    offer loop before the count gate was lifted, so lifting it projected a None-priced
+    catalog_offers row (list/effective/estimated all NULL, price_confidence NULL) for
+    every recovered product whose variant carried no price key. The invariant is the one
+    the PR's own backfill enforces: never inherit, never project None."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record())
+    assert [s["source_variant_id"] for s in result["variant_skus"]] == ["54057345745090"]
+    offers = result["offers"]
+    assert len(offers) == 1                                   # canonical only
+    assert offers[0]["sku_key"] == result["sku"]["sku_key"]
+    assert offers[0]["list_price"] == 24.0
+    assert all(o["list_price"] is not None for o in offers)
+
+
+def test_a_zero_priced_variant_is_not_projected_as_an_offer():
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record(price=0))
+    assert len(result["variant_skus"]) == 1
+    assert len(result["offers"]) == 1
+    assert all((o["list_price"] or 0) > 0 for o in result["offers"])
+
+
+def test_a_variant_priced_under_price_amount_is_still_priced():
+    """The seed writer emits `price_amount` beside `price`; a crawler that emits only the
+    former used to yield a NULL-priced offer because the loop read `price` alone."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record(price_amount="27.50"))
+    vsku = result["variant_skus"][0]
+    by_sku = {o["sku_key"]: o for o in result["offers"]}
+    assert len(by_sku) == 2
+    assert by_sku[vsku["sku_key"]]["list_price"] == 27.5
+    assert by_sku[vsku["sku_key"]]["merchant_effective_price"] == 27.5
+    assert by_sku[vsku["sku_key"]]["price_confidence"] == 0.7
+
+
+def test_a_variant_never_inherits_the_canonical_price():
+    """Mutant f2 from the review survived: nothing pinned that a priceless variant does not
+    silently take the product's price. Canonical is 24.0; if a variant offer existed it
+    could only have got 24.0 by inheritance."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record(price=None))
+    vkey = result["variant_skus"][0]["sku_key"]
+    assert vkey not in {o["sku_key"] for o in result["offers"]}
+
+
+def test_multi_variant_records_skip_only_the_unpriced_variant_offer():
+    """The rule is per variant, not per record: two priced shades keep their offers, the
+    unpriced third keeps its SKU and loses only its offer."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(3)
+    record["pdp"]["variants"][2]["price"] = ""
+    result = ing.ingest_validated_record(record)
+    vskus = result["variant_skus"]
+    assert len(vskus) == 3
+    offered = {o["sku_key"] for o in result["offers"]}
+    assert vskus[0]["sku_key"] in offered and vskus[1]["sku_key"] in offered
+    assert vskus[2]["sku_key"] not in offered
+    assert len(result["offers"]) == 3                         # canonical + 2
+
+
+def test_variant_own_price_is_the_one_rule_the_backfill_uses_too():
+    from services.catalog_enrichment_agent import ingestion as ing
+    from scripts import backfill_variant_identity_skus as bf
+
+    for v, expected in [
+        ({"price": "24.00"}, 24.0), ({"price_amount": 24}, 24.0), ({"list_price": "1,024.50"}, 1024.5),
+        ({"price": 0}, None), ({"price": "0.00"}, None), ({"price": None}, None), ({"price": ""}, None),
+        ({"price": "n/a"}, None), ({}, None), ({"price": -5, "price_amount": 3}, 3.0),
+        # ORDER, not just the key set: price_amount wins over price, price over list_price,
+        # as the four other readers of these dicts already do.
+        ({"price": "24.00", "price_amount": 19.99}, 19.99),
+        ({"price": "24.00", "list_price": 30.0}, 24.0),
+        ({"price_amount": 19.99, "list_price": 30.0}, 19.99),
+    ]:
+        assert ing.variant_own_price(v) == expected, v
+        assert bf._price_of(v) == expected, v
+    # The backfill DELEGATES; a re-inlined copy would drift the day the rule changes.
+    assert bf._price_of.__code__.co_names and "variant_own_price" in bf._price_of.__code__.co_names
+
+
+def test_the_seed_row_prices_a_real_variant_by_the_same_rule_as_its_offer():
+    """The PDP reads seed_data['variants'] directly while search prices from
+    catalog_offers; a shade priced only under `price_amount` used to be 26.00 in one
+    and None in the other."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(3)
+    v = record["pdp"]["variants"][2]
+    v.pop("price"); v["price_amount"] = "26.00"
+    record["pdp"]["variants"][1]["price"] = 0
+    result = ing.ingest_validated_record(record)
+    seed_variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    by_vid = {sv["variant_id"]: sv for sv in seed_variants}
+    assert by_vid["54057345745092"]["price_amount"] == 26.0
+    assert by_vid["54057345745091"]["price_amount"] is None        # 0 is not a price
+    offered = {o["sku_key"]: o["list_price"] for o in result["offers"]}
+    vskus = {s["source_variant_id"]: s["sku_key"] for s in result["variant_skus"]}
+    assert offered[vskus["54057345745092"]] == 26.0
+    assert vskus["54057345745091"] not in offered
+
+
+def test_the_synthetic_seed_variant_is_stamped_as_minted():
+    """tests/test_variant_id_fabrication_ratchet.py exempts this writer on the strength of
+    the stamp; the stamp has to exist."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_record())
+    variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
+    assert len(variants) == 1
+    assert variants[0]["variant_id_provenance"] == "product_derived"
+    assert variants[0]["purchasable"] is False
+
+
+# --- the SEED row keeps a lone merchant-issued variant too (the PDP reads the seed) ------
+
+
+def _seed_variants_of(result):
+    return json.loads(result["seeds"][0]["seed_data"])["variants"]
+
+
+def test_a_lone_merchant_issued_variant_reaches_the_seed_and_the_synthetic_does_not():
+    """#2113 kept a one-variant product's real id in catalog_skus and #2120 made the curated
+    feed emit it, but this writer still required two variants before it would put a real
+    id on the seed row -- and the seed row is what the PDP renders. Measured in prod
+    2026-09-08 on Flower Beauty's Petal Pout Lip Color: SKU `…::v:17281773207622`, seed
+    variant_ids ['flower-beauty:…::canonical'] (blocked, hidden from the selector), while
+    the brand's three multi-variant products carried 8-10 real ids on their seeds."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_variant_record(1))
+    variants = _seed_variants_of(result)
+    assert [v["variant_id"] for v in variants] == ["54057345745090"]
+    assert not any(v["variant_id"].endswith("::canonical") for v in variants)
+    # The same id the SKU row carries -- one identity, two surfaces.
+    assert result["variant_skus"][0]["source_variant_id"] == variants[0]["variant_id"]
+    # The keys the seed-variant readers depend on, in the writer's shape.
+    v = variants[0]
+    assert v["id"] == "54057345745090"
+    assert v["title"] == "Ruby Woo"
+    assert v["price_amount"] == 24.0 and v["price"] == 24.0
+    assert v["price_currency"] == "USD" and v["currency"] == "USD"
+    assert v["availability"] == "in_stock" and v["in_stock"] is True
+    assert v["image_url"] == "https://cdn.x/0.jpg"
+    assert v["sku"] == "M0N900" and v["barcode"] == "773602049360"
+    assert v["variant_id_provenance"] == "merchant_issued"
+    # Stays servable: the readiness audit must not see zero variants.
+    import asyncio as _asyncio
+    from services.external_referral_readiness import evaluate_external_referral_seed
+
+    status = _asyncio.run(evaluate_external_referral_seed(
+        result["seeds"][0], matched_via="test", allowed_domains=["maccosmetics.com"]
+    ))
+    assert "zero_variants" not in set(status.blocker_anomaly_types or [])
+
+
+def test_a_lone_variant_with_no_price_of_its_own_leaves_the_priced_synthetic_on_the_seed():
+    """Review of #2123: the offer writer refuses to project a None-priced variant offer, but
+    the seed writer wrote `price_amount: null` for the same variant where the synthetic
+    canonical had carried the offer price. Same guard, same outcome: SKU lands, seed keeps
+    the priced synthetic."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    result = ing.ingest_validated_record(_lone_real_variant_record())
+    assert [s["source_variant_id"] for s in result["variant_skus"]] == ["54057345745090"]
+    variants = _seed_variants_of(result)
+    assert len(variants) == 1 and variants[0]["variant_id"].endswith("::canonical")
+    assert variants[0]["price_amount"] == 24.0
+    assert all(v["price_amount"] is not None for v in variants)
+    # The RULE is variant_own_price, not `price is None` (mutant C of the review survived):
+    # priced only under `price_amount` -> real id kept; `price: 0` -> synthetic.
+    kept = _seed_variants_of(ing.ingest_validated_record(_lone_real_variant_record(price_amount="27.50")))
+    assert [(v["variant_id"], v["price_amount"]) for v in kept] == [("54057345745090", 27.5)]
+    zero = _seed_variants_of(ing.ingest_validated_record(_lone_real_variant_record(price=0)))
+    assert len(zero) == 1 and zero[0]["variant_id"].endswith("::canonical")
+
+
+def test_an_unpriced_lone_variant_beside_an_unpriced_offer_keeps_the_real_id():
+    """The fall-through only trades identity for a PRICED synthetic; when the offer carries no
+    price either, a null-priced synthetic would be strictly worse than a null-priced real id.
+    Unreachable from the curated feed (MIN_SELLABLE_PRICE), pinned for hand-authored JSONL."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _lone_real_variant_record()
+    record["offers"][0]["price"] = None
+    variants = _seed_variants_of(ing.ingest_validated_record(record))
+    assert [v["variant_id"] for v in variants] == ["54057345745090"]
+
+
+def test_a_lone_variant_with_an_axis_publishes_a_one_entry_option_and_a_titleless_one_none():
+    """`_drop_options_that_do_not_distinguish` was written for n >= 2; with one variant the
+    all-or-nothing rule holds trivially. Pin both outcomes so the picker shape is a decision:
+    an axis the fold named survives as a one-choice selector (Petal Pout's case -- its lone
+    variant is the named shade `Flamingo Flirt - Cream`); a variant titled like its parent,
+    and the literal Shopify `Default Title` placeholder, get no axis at all and stay hidden
+    from the selector -- the seed still gains the real id, which is what the money path
+    needed."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    with_axis = _variant_record(1)
+    with_axis["pdp"]["variants"][0]["option_name"] = "Color"
+    v = _seed_variants_of(ing.ingest_validated_record(with_axis))[0]
+    assert v["options"] == [{"name": "Color", "value": "Ruby Woo"}]
+
+    titleless = _variant_record(1)
+    titleless["pdp"]["variants"][0]["title"] = titleless["pdp"]["product_name"]
+    v = _seed_variants_of(ing.ingest_validated_record(titleless))[0]
+    assert v["variant_id"] == "54057345745090" and v["options"] == []
+
+    placeholder = _variant_record(1)
+    placeholder["pdp"]["variants"][0]["title"] = "Default Title"
+    placeholder["pdp"]["variants"][0]["option_name"] = ""
+    v = _seed_variants_of(ing.ingest_validated_record(placeholder))[0]
+    assert v["variant_id"] == "54057345745090" and v["options"] == []
+
+
+def test_a_lone_variant_titled_like_its_parent_is_still_kept_when_the_id_is_the_merchants():
+    """The gate is provenance, not title: forty real single-variant Shopify products in the
+    corpus carry a variant title equal to the parent title. A title test would drop them."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(1)
+    record["pdp"]["variants"][0]["title"] = record["pdp"]["product_name"]
+    variants = _seed_variants_of(ing.ingest_validated_record(record))
+    assert [v["variant_id"] for v in variants] == ["54057345745090"]
+    assert variants[0]["title"] == "Retro Matte Lipstick"
+
+
+@pytest.mark.parametrize("fabricated", [
+    "{epid}-default",          # scripts/onboard_external_brand_from_crawl.py's shape
+    "{epid}",                  # the product id restated
+    "{product_key}",           # the storage token the canonical SKU uses
+    "seed-variant-default",    # a bare placeholder
+    "shade-ruby-woo",          # unplaceable: not the merchant's, not ours -- no evidence
+])
+def test_a_lone_variant_whose_id_is_not_the_merchants_still_yields_the_synthetic_canonical(fabricated):
+    """The other half, kept: a seed needs SOME variant or
+    services.external_referral_readiness blocks it on zero_variants and it leaves recall;
+    and an id we minted (or cannot place) must not masquerade as identity on the PDP."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    record = _variant_record(1)
+    pdp = record["pdp"]
+    epid = ing.canonical_product_name(pdp["brand"], pdp["product_name"])
+    product_key = ing.derive_product_key(pdp["brand"], pdp["product_name"])
+    pdp["variants"][0]["variant_id"] = fabricated.format(epid=epid, product_key=product_key)
+    result = ing.ingest_validated_record(record)
+    variants = _seed_variants_of(result)
+    assert len(variants) == 1
+    assert variants[0]["variant_id"].endswith("::canonical")
+    assert variants[0]["variant_id_provenance"] == "product_derived"
+    assert variants[0]["purchasable"] is False
+    assert result["variant_skus"] == []
+
+
+def test_two_real_variants_reach_the_seed_exactly_as_before():
+    """Multi-variant admission is unchanged: any non-empty id, no synthetic beside them."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    variants = _seed_variants_of(ing.ingest_validated_record(_variant_record(2)))
+    assert [v["variant_id"] for v in variants] == ["54057345745090", "54057345745091"]
+    assert [v["title"] for v in variants] == ["Ruby Woo", "Bronx"]
+    assert not any(v["variant_id"].endswith("::canonical") for v in variants)
+
+
 def test_plan_counts_variant_skus():
     from services.catalog_enrichment_agent import ingestion as ing
 
@@ -905,10 +1189,17 @@ def test_seed_data_carries_every_real_variant_for_the_pdp():
 
 def test_a_single_variant_record_still_writes_the_synthetic_canonical_variant():
     """Byte-identical for every lane that does not fold: one synthetic variant,
-    named for the product, keyed on the canonical id."""
+    named for the product, keyed on the canonical id.
+
+    The lone variant here carries an id WE minted (`<epid>-default`). A lone variant
+    whose id is the merchant's now reaches the seed instead -- see
+    test_a_lone_merchant_issued_variant_reaches_the_seed_and_the_synthetic_does_not."""
     from services.catalog_enrichment_agent import ingestion as ing
 
-    result = ing.ingest_validated_record(_variant_record(1))
+    record = _variant_record(1)
+    pdp = record["pdp"]
+    pdp["variants"][0]["variant_id"] = ing.canonical_product_name(pdp["brand"], pdp["product_name"]) + "-default"
+    result = ing.ingest_validated_record(record)
     variants = json.loads(result["seeds"][0]["seed_data"])["variants"]
     assert len(variants) == 1
     assert variants[0]["variant_id"].endswith("::canonical")
@@ -1350,13 +1641,18 @@ def test_a_shade_equal_to_the_product_name_yields_no_option_pair():
 
 def test_the_synthetic_canonical_variant_gains_no_options():
     """The non-folding lanes must stay byte-identical: one synthetic variant
-    named for the product, carrying no axis."""
+    named for the product, carrying no axis. (A lone variant with a real merchant
+    id is no longer this case; a lone id of our own minting still is.)"""
     from services.catalog_enrichment_agent import ingestion as ing
 
+    record = _variant_record(1)
+    pdp = record["pdp"]
+    pdp["variants"][0]["variant_id"] = ing.canonical_product_name(pdp["brand"], pdp["product_name"]) + "-default"
     variants = json.loads(
-        ing.ingest_validated_record(_variant_record(1))["seeds"][0]["seed_data"]
+        ing.ingest_validated_record(record)["seeds"][0]["seed_data"]
     )["variants"]
     assert len(variants) == 1
+    assert variants[0]["variant_id"].endswith("::canonical")
     assert "options" not in variants[0]
 
 

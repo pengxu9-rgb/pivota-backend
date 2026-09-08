@@ -140,8 +140,15 @@ on:
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
 
+# Cancel a SUPERSEDED run on a PR branch only. On main every push is a merge commit whose
+# gate result deploy-prod REQUIRES on that exact SHA (`require a green test sweep`): keying
+# the group on `github.ref` made two merges inside one gate window cancel the first commit's
+# gate, and deploy-prod then refused that deploy as "cancelled before it reached a verdict" --
+# #2115 (cancelled by #2112, 2026-09-07) and #2118 (cancelled by #2123 nine seconds later,
+# 2026-09-08), both green changes. Same key the Backend Test Sweep already uses: a PR number
+# on pull_request, the run id on push, so main runs never share a group.
 concurrency:
-  group: postgres-dialect-gate-${{ github.ref }}
+  group: postgres-dialect-gate-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:

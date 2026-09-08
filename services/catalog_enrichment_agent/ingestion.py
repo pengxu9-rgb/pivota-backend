@@ -58,7 +58,35 @@ from services.strong_identifier import (
     extract_strong_identifier,
 )
 from services.text_normalization.brand_case import proper_case_brand
-from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+from services.variant_identity import MERCHANT_ISSUED, PRODUCT_DERIVED, variant_id_provenance
+
+
+def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
+    """The variant's OWN positive price, or None.
+
+    One rule for every writer of a variant offer (ingest here, the backfill in
+    scripts/backfill_variant_identity_skus.py): a variant is priced only when it
+    carries a parseable amount > 0 under one of the keys this repo's variant
+    dicts use. `price_amount` is read first, as beauty_external_ranking,
+    external_seed_audit, employee_products and source_pdp_offer_image_repair
+    already do, so every lane prices the same row the same way. The product's
+    price is never substituted -- variants differ precisely in the things that
+    carry price (30 ml vs 50 ml, a set vs a single) -- and a 0 or missing amount
+    is never projected as an offer, because the serving price gate and recall
+    both read catalog_offers and a priceless row there is at best inert and at
+    worst a 0.00 on a PDP.
+    """
+    for key in ("price_amount", "price", "list_price"):
+        raw = variant.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
 
 logger = logging.getLogger("catalog_enrichment_agent.ingestion")
 
@@ -324,9 +352,10 @@ def _build_variant_sku_inserts(
             "sku_payload": json.dumps({
                 "agent_version": AGENT_VERSION,
                 "variant_id": vid,
-                # Where this id came from, decided once at write time. The money
-                # path reads THIS rather than re-sniffing the string, so a
-                # storage token can never be mistaken for merchant identity.
+                # Where this id came from, decided once at write time, so a money
+                # path can read THIS rather than re-sniff the string. As of
+                # 2026-09-07 no consumer reads it yet; the ingest-time gate above
+                # (single-variant admission on MERCHANT_ISSUED only) is the guard.
                 "variant_id_provenance": provenance,
                 "source_handle": v.get("source_handle"),
                 "canonical_url": canonical_url,
@@ -618,6 +647,11 @@ def _build_seed_inserts(
             "price": price,
             "availability": availability,
             "in_stock": in_stock,
+            # The id above is minted from the product; say so on the row, as
+            # scripts/onboard_external_brand_from_crawl.py does for its default
+            # variant, so the ratchet's exemption rests on a stamp that is written.
+            "variant_id_provenance": PRODUCT_DERIVED,
+            "purchasable": False,
         }
         # REAL variants when the record carries them. Every external-seed lane
         # builds its variant list from seed_data['variants'], NOT from
@@ -633,13 +667,63 @@ def _build_seed_inserts(
         # Cart prefill is unaffected: `sole_stamped_variant_id` reads
         # seed_data['snapshot']['variants'], which this lane never writes, so it
         # declines here exactly as it did before.
+        #
+        # A LONE variant rides too, when its id is the merchant's. This branch
+        # used to require two or more variants, on the same reasoning
+        # `_build_variant_sku_inserts` once used: one variant, the product is
+        # the variant, the synthetic canonical will do. #2113 lifted that gate
+        # for the SKU row and #2120 made the curated feed emit the id, so a
+        # one-variant product now gets `<pk>::v:<real id>` in catalog_skus and
+        # catalog_offers -- and, until this change, a seed row that still said
+        # `<epid>::canonical`, which is what the PDP renders. Measured in prod
+        # 2026-09-08 on Flower Beauty's Petal Pout Lip Color: SKU
+        # `…::v:17281773207622`, seed variant_ids
+        # ['flower-beauty:eb5ff15f3e267039::canonical'], served as
+        # source_quality_status=blocked / hidden_from_selector, while the three
+        # multi-variant Flower Beauty products carried 8-10 real ids.
+        #
+        # The gate is PROVENANCE, not count and not title. Forty real
+        # single-variant Shopify products in the corpus carry a variant title
+        # equal to the parent title, so a title test would drop them; and a
+        # lone id we minted ourselves (`<epid>-default`, a digest of the key)
+        # must still fall through to the synthetic canonical, because
+        # `services.external_referral_readiness` treats `zero_variants` as a
+        # blocker and a seed with no variant at all leaves recall entirely.
+        # Multi-variant products keep their admission rule (any non-empty id)
+        # for the reason the SKU writer states: those rows drive the shade
+        # selector, and tightening them would drop display data.
         seed_variants = [synthetic_variant]
         real_variants = pdp_payload.get("variants") or []
-        if len(real_variants) >= 2:
+        if real_variants:
+            single = len(real_variants) < 2
+            # The lone-variant fall-through below trades the real id for the synthetic
+            # only when the synthetic actually carries a price; a null-priced synthetic
+            # is strictly worse than a null-priced real variant.
+            synthetic_priced = variant_own_price({"price": price}) is not None
+            product_id = canonical_product_name(
+                pdp_payload["brand"], pdp_payload["product_name"]
+            )
             built: List[Dict[str, Any]] = []
             for v in real_variants[:MAX_SEED_VARIANTS]:
                 vid = str(v.get("variant_id") or "").strip()
                 if not vid:
+                    continue
+                provenance = variant_id_provenance(
+                    vid,
+                    product_id=product_id,
+                    product_key=product_key,
+                    handle=v.get("source_handle"),
+                )
+                if single and provenance != MERCHANT_ISSUED:
+                    continue
+                if single and synthetic_priced and variant_own_price(v) is None:
+                    # Mirror of the offer writer's guard: a lone variant with no price
+                    # of its own would put `price_amount: null` on the seed the PDP
+                    # reads, where the synthetic canonical carries the offer price.
+                    # The SKU row still lands (its identity is real); the seed keeps
+                    # the priced synthetic, exactly as before #2123. Multi-variant
+                    # seeds still carry a null for an unpriced shade: there is no
+                    # per-shade substitute, and dropping it would delete selector data.
                     continue
                 v_in_stock = bool(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
@@ -652,8 +736,10 @@ def _build_seed_inserts(
                     "title": shade or pdp_payload["product_name"],
                     "currency": _currency_of(pdp_payload),
                     "price_currency": _currency_of(pdp_payload),
-                    "price_amount": v.get("price"),
-                    "price": v.get("price"),
+                    # Same rule as the offer writer, or the PDP (which reads this
+                    # column directly) and search would price one shade differently.
+                    "price_amount": variant_own_price(v),
+                    "price": variant_own_price(v),
                     "availability": "in_stock" if v_in_stock else "out_of_stock",
                     "in_stock": v_in_stock,
                     "image_url": image_url,
@@ -662,6 +748,10 @@ def _build_seed_inserts(
                         v.get("option_name"),
                         pdp_payload["product_name"],
                     ),
+                    # Decided once here, as the SKU row's sku_payload is, so a
+                    # reader of this column can tell a merchant's id from one
+                    # of ours without re-sniffing the string.
+                    "variant_id_provenance": provenance,
                 })
             if built:
                 _drop_options_that_do_not_distinguish(built)
@@ -726,10 +816,11 @@ def _seed_variant_options(
     TOLD about. The mapper's fallback title is the product name, and
     "Default Title" is what a shop with no axis returns; either would render as a
     selector entry naming no choice. An absent `option_name` is not a shade
-    signal either — `_build_seed_inserts` runs on any record with two or more
-    variants, including hand-validated JSONL for a lane that never folded
-    anything, and guessing "Shade" there published a volume axis as
-    "Shade: 30 ml". Only the fold knows the axis, and it always names it.
+    signal either — `_build_seed_inserts` runs on any record carrying a real
+    variant (two or more, or one the merchant issued and priced, since #2123/#2124), including
+    hand-validated JSONL for a lane that never folded anything, and guessing
+    "Shade" there published a volume axis as "Shade: 30 ml". Only the fold knows
+    the axis, and it always names it.
     """
     value = (shade or "").strip()
     if not value:
@@ -1100,10 +1191,17 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         by_vid = {str(v.get("variant_id") or ""): v for v in (pdp_payload.get("variants") or [])}
         for vsku in variant_sku_rows:
             v = by_vid.get(str(vsku["source_variant_id"])) or {}
+            price = variant_own_price(v)
+            if price is None:
+                # The SKU still lands (its identity is real); the offer does not. Before
+                # #2113 a single-variant record could not reach this loop at all, so
+                # lifting the count gate would have projected a None/0-priced offer for
+                # every recovered product whose variant carried no price of its own.
+                continue
             variant_offer_rows.extend(_build_offer_inserts(
                 product_key=pdp_row["product_key"],
                 sku_key=vsku["sku_key"],
-                offers=[dict(primary, price=v.get("price"), in_stock=bool(v.get("in_stock")))],
+                offers=[dict(primary, price=price, in_stock=bool(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
                 # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
                 # created an eighth CALL that silently took the default -- so a shade line landed

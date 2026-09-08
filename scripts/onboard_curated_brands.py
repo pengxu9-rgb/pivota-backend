@@ -65,7 +65,19 @@ async def _run(args: argparse.Namespace) -> int:
             brand=b.get("brand"),
             max_products=args.max_products,
             base_listings_only=args.base_listings_only,
+            emit_real_variants=args.emit_real_variants,
+            # Per-brand rows win over the flags: a --file run mixes a single-brand
+            # storefront with a retailer feed, and only the row knows which is which.
+            only_vendors=b.get("only_vendors") or args.only_vendor or None,
+            require_currency=b.get("require_currency") or args.require_currency,
         )
+        vendor_report = getattr(records_for_brand, "last_vendor_filter_report", None)
+        if vendor_report and vendor_report.get("vendors"):
+            print(
+                f"    vendor filter {vendor_report['vendors']}: "
+                f"{vendor_report['before']} -> {vendor_report['after']} products"
+            )
+            records_for_brand.last_vendor_filter_report = None  # type: ignore[attr-defined]
         print(f"  {b['domain']}: {len(recs)} products")
         fold = getattr(records_for_brand, "last_fold_report", None) if args.base_listings_only else None
         if fold:
@@ -120,6 +132,41 @@ def main(argv: Optional[List[str]] = None) -> int:
             "fold single-variant '<base> - <shade>' listings into the base listing's variants "
             "(maccosmetics.com publishes one product per shade; as-is that mints one PDP per shade). "
             "The base keeps one PDP; each shade becomes a SKU + offer of it."
+        ),
+    )
+    p.add_argument(
+        "--emit-real-variants",
+        dest="emit_real_variants",
+        action="store_true",
+        help=(
+            "emit the merchant's OWN variants for natively multi-variant products, one "
+            "purchasable SKU + priced offer each (flowerbeauty.com publishes 29 such products "
+            "carrying 185 real Shopify variant ids; without this the brand ingests 49 SKUs whose "
+            "source_variant_id is the product key, which no checkout can spend). Ids that "
+            "services/variant_identity cannot place as merchant-issued are dropped, not minted."
+        ),
+    )
+    p.add_argument(
+        "--only-vendor",
+        action="append",
+        default=[],
+        metavar="VENDOR",
+        help=(
+            "keep only products whose Shopify `vendor` is this (repeatable). For a "
+            "MULTI-BRAND RETAILER feed — cocomo.sg lists 224 vendors and 1,000 products, "
+            "of which 24 are VELY VELY. Note --brand is an override that RENAMES every "
+            "product; this one SELECTS. Matching is exact after case/whitespace "
+            "normalisation, and a filter matching nothing is an error, not an empty run."
+        ),
+    )
+    p.add_argument(
+        "--require-currency",
+        metavar="ISO4217",
+        help=(
+            "refuse the brand unless its /meta.json proves this currency (e.g. SGD). "
+            "Without it an unreadable /meta.json — a 429 bot-check reads exactly like a "
+            "missing one — leaves the record currency-less and the ingest lane stamps USD. "
+            "Never converts: it refuses."
         ),
     )
     p.add_argument("--apply", action="store_true", help="ingest (else dry-run plan)")

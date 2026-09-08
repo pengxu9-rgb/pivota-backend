@@ -165,3 +165,59 @@ def test_non_gated_category_has_no_attribute_gate():
         evaluate_agent_decision_gates(_FULL_ROW, gates_enabled=True, evidence_gates=True)
         is None
     )
+
+
+# --- the priced-offer gate reads the SERVED regions, not the US alone --------
+#
+# Measured on prod 2026-09-07: this gate is ENABLED and `no_us_offer` blocks 398 of
+# cocomo.sg's 399 rows and the residual 12 of jsmbeauty.sg's 170 -- correctly-ingested
+# SGD rows from Singapore storefronts whose UCP checkout reaches ready_for_complete.
+
+
+def test_the_gate_reads_the_served_region_column_when_it_is_present():
+    """An SGD row: no USD offer, but a real offer in a currency a served region
+    expects. It must stop being blocked -- WITHOUT anything converting the amount."""
+    row = {"has_us_offer": False, "has_serving_region_offer": True}
+    assert evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=False) is None
+
+
+def test_the_served_region_column_still_blocks_a_row_priced_in_nothing_we_serve():
+    row = {"has_us_offer": False, "has_serving_region_offer": False}
+    result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=False)
+    assert result is not None and result[0] == BLOCKER_NO_US_OFFER
+
+
+def test_the_served_region_column_wins_over_a_stale_us_answer():
+    """Both keys present and disagreeing: the configured one decides. Otherwise
+    widening the region list would be silently undone by the older column."""
+    row = {"has_us_offer": True, "has_serving_region_offer": False}
+    result = evaluate_agent_decision_gates(row, gates_enabled=True, evidence_gates=False)
+    assert result is not None and result[0] == BLOCKER_NO_US_OFFER
+
+
+def test_a_row_without_the_new_column_falls_back_to_has_us_offer():
+    """A caller that computed only the older column keeps its old verdict. Reading an
+    ABSENT key as False would block every row such a caller ever fetched -- the failure
+    mode `priced_offer_sql` uses EXISTS (never NULL) specifically to keep distinguishable."""
+    assert (
+        evaluate_agent_decision_gates(
+            {"has_us_offer": True}, gates_enabled=True, evidence_gates=False
+        )
+        is None
+    )
+    blocked = evaluate_agent_decision_gates(
+        {"has_us_offer": False}, gates_enabled=True, evidence_gates=False
+    )
+    assert blocked is not None and blocked[0] == BLOCKER_NO_US_OFFER
+
+
+def test_the_blocker_detail_names_currency_and_not_the_market_column():
+    """The old text said "market='US'". The SQL has never asked that -- it asks
+    `currency = 'USD'`, and was moved off `market` because `market` is a NOT NULL
+    DEFAULT 'US' no writer sets. On this cohort every blocked row IS market='US',
+    so the old wording sent a reader to the one column that carries no signal."""
+    _, detail = evaluate_agent_decision_gates(
+        {"has_serving_region_offer": False}, gates_enabled=True, evidence_gates=False
+    )
+    assert "currency" in detail
+    assert "market='US'" not in detail

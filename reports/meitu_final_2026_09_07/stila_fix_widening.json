@@ -1,0 +1,152 @@
+{
+ "ancestor_predicate_by_path": [
+  {
+   "category_path": "beauty",
+   "n": 1385,
+   "is_ancestor": true
+  },
+  {
+   "category_path": "beauty/makeup",
+   "n": 1746,
+   "is_ancestor": true
+  },
+  {
+   "category_path": "beauty/makeup/eye",
+   "n": 34,
+   "is_ancestor": false
+  },
+  {
+   "category_path": "beauty/makeup/lip",
+   "n": 73,
+   "is_ancestor": true
+  },
+  {
+   "category_path": "beauty/makeup/lip/lip_oil",
+   "n": 1,
+   "is_ancestor": false
+  },
+  {
+   "category_path": "beauty/makeup/lip/lipstick",
+   "n": 249,
+   "is_ancestor": false
+  },
+  {
+   "category_path": "beauty/skincare",
+   "n": 1694,
+   "is_ancestor": false
+  }
+ ],
+ "widening_brands": [
+  {
+   "brand": "MAC Cosmetics",
+   "path": "beauty/makeup",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sku_rows": 111,
+   "products": 7
+  },
+  {
+   "brand": "Stila Cosmetics",
+   "path": "beauty/makeup",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sku_rows": 6,
+   "products": 6
+  },
+  {
+   "brand": "fenty beauty",
+   "path": "beauty/makeup/lip",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 6,
+   "products": 3
+  },
+  {
+   "brand": "Charlotte Tilbury",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 3,
+   "products": 3
+  },
+  {
+   "brand": "Dior",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 2,
+   "products": 2
+  },
+  {
+   "brand": "NARS",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 2,
+   "products": 2
+  },
+  {
+   "brand": "kylie cosmetics",
+   "path": "beauty/makeup/lip",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 2,
+   "products": 1
+  },
+  {
+   "brand": "Bobbi Brown",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "Tarte Cosmetics",
+   "path": "beauty/makeup",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "Clinique",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "FLOWER Beauty",
+   "path": "beauty/makeup",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "ILIA",
+   "path": "beauty/makeup",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "L'Oreal Paris",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "MAC",
+   "path": "beauty",
+   "source_system": "external_product_seeds_mirror_v1",
+   "sku_rows": 1,
+   "products": 1
+  },
+  {
+   "brand": "Merit",
+   "path": "beauty/makeup",
+   "source_system": "catalog_enrichment_agent_v1",
+   "sku_rows": 1,
+   "products": 1
+  }
+ ],
+ "anchor_match_after_glyph_fix": [
+  {
+   "stila_rows": 30,
+   "all_rows": 30
+  }
+ ]
+}
