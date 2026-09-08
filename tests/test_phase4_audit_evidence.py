@@ -33,6 +33,7 @@ def test_evidence_taxonomy_constants_match_valid_set():
         EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
         EVIDENCE_TYPE_COMMERCE_RETURN_POLICY,
         EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW,
+        EVIDENCE_TYPE_SELECTION_RESPONSE,
         EVIDENCE_TYPE_CUSTOM,
     )
     assert EVIDENCE_TYPE_GROUNDING_CHUNK in VALID_EVIDENCE_TYPES
@@ -48,7 +49,18 @@ def test_evidence_taxonomy_constants_match_valid_set():
     assert EVIDENCE_TYPE_COMMERCE_RETURN_POLICY in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW in VALID_EVIDENCE_TYPES
     assert EVIDENCE_TYPE_CUSTOM in VALID_EVIDENCE_TYPES
-    assert len(VALID_EVIDENCE_TYPES) == 13
+    # 14th type: `selection_response`, the response-level selection observation
+    # (product x provider x query x response). It is a REGISTERED type, not a
+    # test-only constant: services/audit_evidence_builder.extract_evidence_items
+    # emits one per observation returned by
+    # services.selection_measurement.report_observations, and
+    # _evidence_signature gives it its own `selection_response:<observation_id>`
+    # branch. Leaving it out of VALID_EVIDENCE_TYPES would not have failed here
+    # — _coerce_evidence_type would silently rewrite every one of them to
+    # `custom`, which is why this count is asserted at all.
+    assert EVIDENCE_TYPE_SELECTION_RESPONSE in VALID_EVIDENCE_TYPES
+    assert EVIDENCE_TYPE_SELECTION_RESPONSE == "selection_response"
+    assert len(VALID_EVIDENCE_TYPES) == 14
 
 
 def test_severity_constants_canonicalized():

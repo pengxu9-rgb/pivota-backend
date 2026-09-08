@@ -4,7 +4,7 @@ This change connects retained reports and new URL audits to the merchant recover
 
 ## Measurement
 
-`selection.version=1`; methodology version 2. The unit is a product × provider × query × response, including replicate attempts. Identical observation IDs are deduplicated only within a report. Observation IDs are stable for the retained response ordering, not cross-run join keys.
+`selection.version=1`; methodology version 2. Each response observation is deposited as one canonical evidence row of the registered type `selection_response` (`db/audit_evidence.py`, the 14th member of `VALID_EVIDENCE_TYPES`), keyed by its `observation_id`; an unregistered type would be silently rewritten to `custom`. The unit is a product × provider × query × response, including replicate attempts. Identical observation IDs are deduplicated only within a report. Observation IDs are stable for the retained response ordering, not cross-run join keys.
 
 Three disjoint tiers: dupe/alternative first, branded next, then recognized category intents; unfamiliar/custom axes remain unclassified. Failed responses never become negative answers. Missing answer evidence is unknown. Counts expose attempts, failures, eligible denominator, positives, unknowns and providers. Wilson 95% intervals describe eligible observed responses under an independence assumption. Provider and repeated-query correlation limits their interpretation; these intervals do not establish improvement.
 
