@@ -581,6 +581,200 @@ _DEAD_COMPONENT_SAMPLE_SQL = _DEAD_COMPONENT_CTE + """
     LIMIT 5
 """
 
+# ── offer-grain structural invariants (2026-09-08 inventory) ─────────────────
+#
+# Three states `catalog_offers` must never be in, each measured on prod
+# 2026-09-08 and each with a writer-side fix landing in the same change:
+#
+#   offers_without_sku                         647 live  (writers now mint/refuse)
+#   duplicate_offers_per_sku_channel_market  1,636 rows  (reconciler; no index — see below)
+#   suppressed_product_with_live_offer       2,171 rows  (cascade at the writers)
+#
+# ALL THREE ARE SCOPED TO LIVE OFFERS, and that is a decision rather than an
+# oversight. `scripts/reconcile_catalog_offers.py` remediates by SUPPRESSING,
+# never deleting — an orphan offer is the only surviving record of the writer
+# defect that produced it — so the suppressed rows stay in the table forever. A
+# check counting them too would ship permanently red at the pre-remediation
+# number and could never reach its threshold, which is the "deaf alarm" this
+# module's threshold convention warns about. The question each check asks is
+# "does the SERVED surface contradict itself", and a suppressed row is not on the
+# served surface.
+_OFFERS_WITHOUT_SKU_WHERE = """
+    FROM catalog_offers co
+    WHERE co.suppressed_at IS NULL
+      AND NOT EXISTS (
+            SELECT 1 FROM catalog_skus s WHERE s.sku_key = co.sku_key
+          )
+"""
+
+_OFFERS_WITHOUT_SKU_COUNT_SQL = "SELECT count(*) AS c " + _OFFERS_WITHOUT_SKU_WHERE
+
+_OFFERS_WITHOUT_SKU_SAMPLE_SQL = (
+    "SELECT co.offer_id AS subject_key " + _OFFERS_WITHOUT_SKU_WHERE + " LIMIT 5"
+)
+
+# EXCESS ROWS, not groups. A group of three live offers on one shelf is one
+# index violation and TWO rows that must move, and the remediation is row-grain,
+# so the alarm counts what has to be fixed. The sample projects the sku_key (the
+# shelf), because an offer_id alone would not tell an operator which group it is
+# in. The tuple is (sku_key, channel, market): channel and market are what make
+# two offers different SHELVES rather than duplicates of one.
+_DUPLICATE_OFFERS_CTE = """
+    WITH live_groups AS (
+        SELECT co.sku_key, co.channel, co.market, count(*) AS n
+        FROM catalog_offers co
+        WHERE co.suppressed_at IS NULL
+        GROUP BY co.sku_key, co.channel, co.market
+        HAVING count(*) > 1
+    )
+"""
+
+_DUPLICATE_OFFERS_COUNT_SQL = _DUPLICATE_OFFERS_CTE + """
+    SELECT coalesce(sum(n - 1), 0) AS c FROM live_groups
+"""
+
+_DUPLICATE_OFFERS_SAMPLE_SQL = _DUPLICATE_OFFERS_CTE + """
+    SELECT sku_key AS subject_key
+    FROM live_groups
+    ORDER BY n DESC, sku_key
+    LIMIT 5
+"""
+
+# The cascade check. Anchored on the PRODUCT's gate column and the OFFER's,
+# because they are different columns and nothing propagates between them — there
+# is no trigger, which is the entire reason `services/catalog_offer_suppression`
+# exists.
+_SUPPRESSED_PRODUCT_LIVE_OFFER_WHERE = """
+    FROM catalog_offers co
+    JOIN catalog_products cp ON cp.product_key = co.product_key
+    WHERE co.suppressed_at IS NULL
+      AND cp.suppressed_at IS NOT NULL
+"""
+
+_SUPPRESSED_PRODUCT_LIVE_OFFER_COUNT_SQL = (
+    "SELECT count(*) AS c " + _SUPPRESSED_PRODUCT_LIVE_OFFER_WHERE
+)
+
+_SUPPRESSED_PRODUCT_LIVE_OFFER_SAMPLE_SQL = (
+    "SELECT co.offer_id AS subject_key "
+    + _SUPPRESSED_PRODUCT_LIVE_OFFER_WHERE
+    + " LIMIT 5"
+)
+
+# ── variant identity provenance, per lane ────────────────────────────────────
+# `sku_payload->>'variant_id_provenance'` is the marker
+# `services/variant_identity` defines: merchant_issued (an id we can positively
+# place as the merchant's own), product_derived (one we minted from the product
+# key — never buyable), unverifiable, absent. Live SKUs only, for the same
+# served-surface reason as the three checks above.
+_SKU_PROVENANCE_BY_LANE_SQL = """
+    SELECT s.platform AS lane,
+           count(*) AS skus,
+           count(*) FILTER (
+               WHERE s.sku_payload->>'variant_id_provenance' = 'merchant_issued'
+           ) AS merchant_issued,
+           count(*) FILTER (
+               WHERE s.sku_payload IS NULL
+                  OR s.sku_payload->>'variant_id_provenance' IS NULL
+           ) AS unstamped
+    FROM catalog_skus s
+    WHERE s.suppressed_at IS NULL
+      AND s.suppression_reason IS NULL
+    GROUP BY s.platform
+    ORDER BY count(*) DESC, s.platform
+"""
+
+
+def summarize_identity_provenance(rows: Any) -> Dict[str, Any]:
+    """Per-lane merchant-issued share, WITH the unstamped count beside it.
+
+    THE SHARE ON ITS OWN IS A LIE WHILE THE BACKFILL IS OUTSTANDING, and this is
+    the whole reason the function exists rather than a bare ratio in SQL. Most
+    rows carry no `variant_id_provenance` key at all today — the marker is
+    written by `scripts/backfill_variant_identity_skus.py` and by the writers
+    updated since, so an unstamped row is one nobody has classified, NOT one
+    known to be product-derived. Two shares are therefore reported per lane and
+    neither is allowed to stand alone:
+
+        share_of_all      merchant_issued / skus        — the pessimistic read
+        share_of_stamped  merchant_issued / stamped     — flatters, and is the
+                                                          number a reader will
+                                                          quote unless the
+                                                          denominator is next
+                                                          to it
+
+    `unstamped` is reported per lane so the gap between the two is legible. A
+    lane that is 100% `share_of_stamped` on 12 stamped rows out of 9,000 has told
+    you nothing, and that must be visible in the output rather than inferred.
+
+    `count` — the number the threshold reads — is the LIVE SKUs not positively
+    placed as merchant-issued, which is the honest headline: an id we cannot
+    place is treated exactly as a missing id by everything that spends money.
+    """
+    lanes: List[Dict[str, Any]] = []
+    total = 0
+    total_merchant_issued = 0
+    total_unstamped = 0
+    for row in rows or []:
+        data = dict(row)
+        skus = int(data.get("skus") or 0)
+        merchant_issued = int(data.get("merchant_issued") or 0)
+        unstamped = int(data.get("unstamped") or 0)
+        stamped = skus - unstamped
+        total += skus
+        total_merchant_issued += merchant_issued
+        total_unstamped += unstamped
+        lanes.append({
+            "lane": str(data.get("lane") or "(null)"),
+            "skus": skus,
+            "merchant_issued": merchant_issued,
+            "unstamped": unstamped,
+            "stamped": stamped,
+            "share_of_all": round(merchant_issued / skus, 4) if skus else None,
+            # None, never 0.0, when nothing in the lane is stamped: a lane with
+            # no evidence has no share, and printing 0.0 would read as "measured
+            # and bad" rather than "not measured".
+            "share_of_stamped": (
+                round(merchant_issued / stamped, 4) if stamped else None
+            ),
+        })
+    return {
+        "count": total - total_merchant_issued,
+        "detail": {
+            "lanes": lanes,
+            "skus_live": total,
+            "merchant_issued": total_merchant_issued,
+            "unstamped": total_unstamped,
+            "stamped": total - total_unstamped,
+            "share_of_all": (
+                round(total_merchant_issued / total, 4) if total else None
+            ),
+        },
+    }
+
+
+async def _run_identity_provenance_share(db: Any) -> Dict[str, Any]:
+    rows = await db.fetch_all(_SKU_PROVENANCE_BY_LANE_SQL)
+    outcome = summarize_identity_provenance(rows)
+    lanes = outcome["detail"]["lanes"]
+    # Sample keys are the WORST lanes by share_of_all, so the entry names which
+    # lane to look at rather than five arbitrary sku_keys. A lane with no
+    # share (nothing stamped) sorts worst, which is correct: it is the least
+    # known, not the best.
+    ranked = sorted(
+        lanes,
+        key=lambda lane: (
+            lane["share_of_all"] if lane["share_of_all"] is not None else -1.0,
+            -lane["skus"],
+        ),
+    )
+    return {
+        "count": outcome["count"],
+        "sample_keys": [lane["lane"] for lane in ranked[:_SAMPLE_LIMIT]],
+        "detail": outcome["detail"],
+    }
+
+
 _CHECKS: List[Dict[str, Any]] = [
     {
         # P1a (#1648). `suppressed_at` is THE gate column — every SQL lane, IPS
@@ -1403,6 +1597,129 @@ _CHECKS: List[Dict[str, Any]] = [
             WHERE crt.subject_key IS NULL
             LIMIT 5
         """,
+    },
+    {
+        # 2,139 offers (6.5% of the table), 647 of them LIVE, named a sku_key
+        # with no catalog_skus row on prod 2026-09-08 — all external-referral,
+        # all `<product_key>::canonical`, all from two writers
+        # (`us_market_capture` 529 live, `retailer_offer_attach_v1` 118 live)
+        # that build and execute their own INSERT and so never reached
+        # `services/catalog_offer_writer_guard.guard_catalog_offer_rows`, which
+        # has known how to say ORPHAN_NO_SKU the whole time.
+        #
+        # WHY IT MATTERS RATHER THAN BEING UNTIDY: `pivot_query_service` INNER
+        # JOINs catalog_skus, so an orphan offer is invisible to the read lanes —
+        # while remaining fully visible to everything that reads catalog_offers
+        # alone (the price gate, the PDP assembler's offer fetch). It is supply
+        # that both exists and does not, depending on which door asks.
+        #
+        # Threshold 0: both writers now either mint the canonical SKU (capture)
+        # or refuse the offer (attach), so there is no acceptable number here.
+        # LIVE offers only — see the note above the SQL for why counting
+        # suppressed ones would ship a permanently red check.
+        "name": "offers_without_sku",
+        "description": (
+            "a LIVE catalog_offers row names a sku_key with no catalog_skus row "
+            "— invisible to every sku-joined read lane, still counted as supply "
+            "by every offer-only one"
+        ),
+        "env": "CATALOG_INVARIANT_ORPHAN_OFFER_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": _OFFERS_WITHOUT_SKU_COUNT_SQL,
+        "sample_sql": _OFFERS_WITHOUT_SKU_SAMPLE_SQL,
+    },
+    {
+        # 1,636 duplicate offers across 462 (sku_key, channel, market) groups on
+        # prod 2026-09-08. There is no unique index on that tuple, so two
+        # writers — or one writer under two offer_id namespaces — can both claim
+        # one shelf, and whichever surface reads "the offer" picks by sort order.
+        # That is a silently wrong PRICE, not a duplicate row: the two rows do
+        # not have to agree, and nothing makes them.
+        #
+        # A UNIQUE INDEX ON THE TUPLE IS UNBUILDABLE TODAY, and this check is the
+        # standing alarm precisely because of that. Every INSERT INTO
+        # catalog_offers in the repo arbitrates on `(offer_id)` alone, and the
+        # mirror, the US-market capture and the retailer attach write THE SAME
+        # SHELF under three different offer_id namespaces — which is what the 462
+        # groups are. With a unique index in place the second lane's ON CONFLICT
+        # (offer_id) would not fire and its INSERT would raise 23505 mid-batch
+        # (reproduced on real Postgres), so the index cannot land until those
+        # lanes converge on one offer_id namespace per shelf. That convergence is
+        # a change to the WRITERS, not something a reconciler can reach by
+        # draining rows. Threshold 0 here gives the same signal the index would
+        # — red the moment two lanes claim one shelf — without the failure mode.
+        # scripts/reconcile_catalog_offers.py drains the standing stock.
+        "name": "duplicate_offers_per_sku_channel_market",
+        "description": (
+            "more than one LIVE offer on the same (sku_key, channel, market) — "
+            "counted as EXCESS ROWS, the number that must move, not as groups"
+        ),
+        "env": "CATALOG_INVARIANT_DUPLICATE_OFFER_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": _DUPLICATE_OFFERS_COUNT_SQL,
+        "sample_sql": _DUPLICATE_OFFERS_SAMPLE_SQL,
+    },
+    {
+        # 2,171 suppressed products carried unsuppressed offers on prod
+        # 2026-09-08. `catalog_products.suppressed_at` gates the PRODUCT;
+        # `catalog_offers.suppressed_at` is a DIFFERENT column and is the one
+        # every offer-grain read lane filters on (priced_offer_sql,
+        # fetch_offers_for_keys, the recall candidate CTE). Nothing propagates
+        # between them — there is no trigger — so a writer that tombstones a
+        # product and stops leaves live, priced supply behind for a row nothing
+        # else will serve.
+        #
+        # `services/catalog_offer_suppression` now cascades at five writers, so
+        # this counts REGROWTH: a sixth writer, or a new one, that suppresses a
+        # product without going through it.
+        "name": "suppressed_product_with_live_offer",
+        "description": (
+            "the product is suppressed and one of its offers is not — the "
+            "product's gate column and the offer's are different columns and "
+            "nothing propagates between them"
+        ),
+        "env": "CATALOG_INVARIANT_SUPPRESSION_CASCADE_THRESHOLD",
+        "default_threshold": 0,
+        "count_sql": _SUPPRESSED_PRODUCT_LIVE_OFFER_COUNT_SQL,
+        "sample_sql": _SUPPRESSED_PRODUCT_LIVE_OFFER_SAMPLE_SQL,
+    },
+    {
+        # WARN-ONLY, AND THAT IS NOT THE SAME AS OFF. Threshold 0 with
+        # `warn_only` is this module's honest pair when the true count is far
+        # from zero for a REASON THAT IS ALREADY BEING WORKED: the variant
+        # identity provenance backfill (#2113: 11,811 SKUs restate the product
+        # id, 1,473 are `<epid>-default`, 2,546 recoverable / 6,148 need a
+        # crawl). Enforcing at 0 today ships permanently red; raising the
+        # threshold to the current count blesses exactly the rows the arc exists
+        # to fix and buys that many rows of head-room for the next writer that
+        # fabricates identity. So it reports its count, its per-lane detail and
+        # its samples exactly as an enforcing check does, and produces no
+        # verdict. PROMOTION IS ONE DELETED KEY — remove `warn_only` when the
+        # backfill lands.
+        #
+        # THE SHARE IS PER LANE and the UNSTAMPED COUNT IS REPORTED BESIDE IT.
+        # A corpus-wide share hides the lane structure (the same mistake
+        # `dead_quality_component` had to be re-cut for on 2026-09-02, when one
+        # Wix store's 1,960 snapshots were read as the corpus), and a share
+        # computed over stamped rows alone climbs toward 100% simply because
+        # most rows are unclassified. `summarize_identity_provenance` reports
+        # share_of_all, share_of_stamped and unstamped together for exactly that
+        # reason; read them together.
+        "name": "skus_without_merchant_issued_identity_share",
+        "description": (
+            "live SKUs whose sku_payload->>'variant_id_provenance' is not "
+            "'merchant_issued', per lane, with the UNSTAMPED count beside the "
+            "share so it cannot be read as a measured 100%"
+        ),
+        "env": "CATALOG_INVARIANT_IDENTITY_PROVENANCE_THRESHOLD",
+        "default_threshold": 0,
+        "warn_only": True,
+        # No count_sql/sample_sql: the two shares and their denominators are
+        # Python and must not be restated in SQL. Same shape as
+        # market_currency_disagreement — see the banner above _CHECKS.
+        "count_sql": None,
+        "sample_sql": None,
+        "runner": _run_identity_provenance_share,
     },
 ]
 

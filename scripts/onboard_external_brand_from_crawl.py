@@ -80,6 +80,7 @@ if str(ROOT) not in sys.path:
 from db.database import database
 from scripts.mirror_external_seeds_to_catalog_products import _apply as mirror_apply
 from services.brand_claim_service import normalize_host
+from services.catalog_offer_suppression import cascade_offer_suppression
 from services.catalog_sync_service import make_catalog_product_key
 from services.crawled_inci_ingest import ingest_crawled_inci_items
 from services.external_seed_servability import (
@@ -569,12 +570,23 @@ async def _suppress_dropped_listings(
             "WHERE id=:id AND status='active'",
             {"id": sid},
         )
-        await database.execute(
+        # RETURNING product_key (no rowcount from `databases`+asyncpg), so the
+        # offer cascade below acts on exactly the rows this statement gated.
+        gated = await database.fetch_all(
             "UPDATE catalog_products SET suppression_reason=:reason, "
             "suppressed_at=COALESCE(suppressed_at, NOW()), updated_at=NOW() "
-            "WHERE source_ref=:id AND suppression_reason IS NULL",
+            "WHERE source_ref=:id AND suppression_reason IS NULL "
+            "RETURNING product_key",
             {"id": sid, "reason": reason},
         )
+        # Suppressing the product does NOT gate its offers: catalog_offers has
+        # its own suppressed_at and that is what every offer-grain read lane
+        # filters on. Without this, a duplicate listing or an ad landing page is
+        # withdrawn as a product while its offer keeps pricing the page — 2,171
+        # such rows measured on prod 2026-09-08. The mirror runs right after this
+        # for ACTIVE seeds only, so a cascaded offer is not re-minted.
+        await cascade_offer_suppression(
+            [str(r["product_key"]) for r in (gated or [])], db=database)
         suppressed += 1
     return suppressed
 

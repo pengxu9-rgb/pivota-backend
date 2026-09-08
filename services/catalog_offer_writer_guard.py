@@ -104,19 +104,63 @@ def validate_catalog_offer_rows(
     return accepted, reasons, rejected
 
 
-async def fetch_existing_catalog_sku_keys(sku_keys: Iterable[str], *, db: Any = None) -> Set[str]:
-    normalized = sorted({str(sku_key or "").strip() for sku_key in sku_keys if str(sku_key or "").strip()})
-    if not normalized:
-        return set()
-    read_db = db or database
-    rows = await read_db.fetch_all(
-        """
+EXISTING_SKU_KEYS_SQL = """
         SELECT sku_key
         FROM catalog_skus
         WHERE sku_key = ANY(:sku_keys)
-        """,
-        {"sku_keys": normalized},
-    )
+        """
+
+#: EXISTING is not the same question as LIVE, and for an offer it is the wrong
+#: one. A suppressed `catalog_skus` row is excluded by the recall candidate CTE
+#: and by every sku-joined read lane, so an offer written against it is supply
+#: nothing can surface — the same end state as the orphan this module refuses,
+#: reached by a different route. Measured: `capture_us_market_offers` refused a
+#: suppressed identity only when it sat under ANOTHER lane's spelling; when the
+#: suppressed row already held the derived `<pk>::canonical` key it counted as
+#: `existing` and the offer was written. `%::canonical` is 39.4% of catalog_skus,
+#: so that was the majority spelling.
+#:
+#: BOTH columns are checked. A row carrying `suppression_reason` without
+#: `suppressed_at` is a state rows actually reach — it is what the
+#: `suppression_reason_without_timestamp` invariant counts — and reading only the
+#: timestamp would call such a row live.
+LIVE_SKU_KEYS_SQL = """
+        SELECT sku_key
+        FROM catalog_skus
+        WHERE sku_key = ANY(:sku_keys)
+          AND suppressed_at IS NULL
+          AND suppression_reason IS NULL
+        """
+
+
+def _normalized_sku_keys(sku_keys: Iterable[str]) -> List[str]:
+    return sorted({str(sku_key or "").strip() for sku_key in sku_keys if str(sku_key or "").strip()})
+
+
+async def fetch_existing_catalog_sku_keys(sku_keys: Iterable[str], *, db: Any = None) -> Set[str]:
+    """Which of these sku_keys have a `catalog_skus` row AT ALL, suppressed or not."""
+    normalized = _normalized_sku_keys(sku_keys)
+    if not normalized:
+        return set()
+    read_db = db or database
+    # The constant is the FIRST POSITIONAL ARG of the accessor, deliberately.
+    # tests/test_repo_sql_prepare_postgres.py's AST sweep follows exactly that
+    # shape; a statement handed through a shared `_fetch(sql, ...)` wrapper is
+    # invisible to it and never gets planned by Postgres.
+    rows = await read_db.fetch_all(EXISTING_SKU_KEYS_SQL, {"sku_keys": normalized})
+    return {str(row["sku_key"]) for row in rows or []}
+
+
+async def fetch_live_catalog_sku_keys(sku_keys: Iterable[str], *, db: Any = None) -> Set[str]:
+    """Which of these sku_keys have an UNSUPPRESSED `catalog_skus` row.
+
+    The set a writer deciding "may I hang a live offer on this key" must ask for.
+    """
+    normalized = _normalized_sku_keys(sku_keys)
+    if not normalized:
+        return set()
+    read_db = db or database
+    rows = await read_db.fetch_all(LIVE_SKU_KEYS_SQL, {"sku_keys": normalized})
     return {str(row["sku_key"]) for row in rows or []}
 
 
@@ -124,9 +168,19 @@ async def guard_catalog_offer_rows(
     offer_rows: Iterable[Mapping[str, Any]],
     *,
     db: Any = None,
+    live_only: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[Dict[str, Any]]]:
+    """Reject offer rows with no price and offer rows with no SKU behind them.
+
+    `live_only=True` makes ORPHAN_NO_SKU also cover a SKU that exists but is
+    suppressed. It is OPT-IN rather than the default because the existing callers
+    were written against the existence question and flipping it under them would
+    change which rows they refuse without anyone deciding to; `capture_us_market_offers`
+    asks for it explicitly.
+    """
     rows = [dict(row) for row in offer_rows or []]
-    existing_sku_keys = await fetch_existing_catalog_sku_keys(
+    fetch = fetch_live_catalog_sku_keys if live_only else fetch_existing_catalog_sku_keys
+    existing_sku_keys = await fetch(
         [row.get("sku_key") or row.get("sku_id") for row in rows],
         db=db,
     )

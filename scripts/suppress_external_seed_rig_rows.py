@@ -70,6 +70,7 @@ from scripts.backfill_seller_of_record import (  # noqa: E402
     _is_excluded_rig_row,
     assert_sig_frozen_sql,
 )
+from services.catalog_offer_suppression import cascade_offer_suppression  # noqa: E402
 from services.test_merchant_policy import static_test_merchant_ids  # noqa: E402
 
 SUPPRESSION_REASON = "step5_test_rig_retirement"  # the precedent's reason, on purpose
@@ -212,9 +213,19 @@ async def _run(apply: bool) -> int:
             "prior_tombstones": prior,
         }, default=str)
         pgm_totals = {"moved": 0, "retired": 0}
+        offers_cascaded = 0
         async with database.transaction():
             await database.execute(TOMBSTONE_SQL, {"reason": SUPPRESSION_REASON, "meta": meta,
                                                    "pks": pks, "banned": BANNED_BUCKET_MERCHANT_ID})
+            # Cascade the tombstone to the products' OFFERS. TOMBSTONE_SQL is
+            # sig-frozen, so this is a second statement rather than an edit to
+            # it — and it has to exist, because catalog_offers carries its own
+            # `suppressed_at` and that is the column every offer-grain read lane
+            # filters on. A retired rig row whose offers stay live is still
+            # priced supply; 2,171 products were in exactly that state on prod
+            # 2026-09-08. Keyed on `pks` (not on merchant_id) because REKEY_SQL
+            # on the next line moves these rows off the sentinel bucket.
+            offers_cascaded = len(await cascade_offer_suppression(pks, db=database))
             await database.execute(REKEY_SQL, {"rig": rig, "pks": pks,
                                                "banned": BANNED_BUCKET_MERCHANT_ID,
                                                "reason": SUPPRESSION_REASON})
@@ -244,7 +255,8 @@ async def _run(apply: bool) -> int:
             "SELECT count(*) AS c FROM catalog_products WHERE merchant_id = :banned",
             {"banned": BANNED_BUCKET_MERCHANT_ID}))["c"])
         print(json.dumps({"run_id": run_id, "rows_retired": len(pks), "rekeyed_to": rig,
-                          "pgm": pgm_totals, "residue": residue,
+                          "pgm": pgm_totals, "offers_cascaded": offers_cascaded,
+                          "residue": residue,
                           "sentinel_rows_remaining_total": post},
                          indent=2, default=str))
         # The bucket must be EMPTY — asserted, not printed. Non-zero here is a

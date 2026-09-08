@@ -93,6 +93,10 @@ from scripts.onboard_external_brand_from_crawl import (
     TOOL,
     UNPUBLISHED_SUPPRESSION_REASON,
 )
+from services.catalog_offer_suppression import (
+    cascade_offer_suppression,
+    revert_offer_suppression,
+)
 from services.index_pipeline_state_service import recompute_serving_eligibility
 from services.shopify_publication_signal import (
     PUBLISHED,
@@ -243,10 +247,22 @@ async def _withdraw(rows: List[Dict[str, Any]]) -> Dict[str, str]:
             "WHERE source_ref=:id AND suppression_reason IS NULL",
             {"id": sid, "reason": UNPUBLISHED_SUPPRESSION_REASON},
         )
-        await database.execute(
+        # RETURNING product_key: `databases` + asyncpg yields no rowcount, and the
+        # keys are what the offer cascade needs. Taken from the UPDATE itself so
+        # the cascade covers exactly the products THIS call gated (the WHERE is
+        # `suppressed_at IS NULL`), never a row somebody else had already gated.
+        suppressed = await database.fetch_all(
             "UPDATE catalog_products SET suppressed_at=NOW(), updated_at=NOW() "
-            "WHERE source_ref=:id AND suppressed_at IS NULL",
+            "WHERE source_ref=:id AND suppressed_at IS NULL "
+            "RETURNING product_key",
             {"id": sid},
+        )
+        # The product's offers are gated by their OWN suppressed_at, which no
+        # amount of product suppression touches. Withdrawing the row and leaving
+        # the offer live is how 2,171 suppressed products came to carry live
+        # offers on prod (2026-09-08).
+        await cascade_offer_suppression(
+            [str(r["product_key"]) for r in (suppressed or [])], db=database
         )
     keys = sorted({r["content_key"] for r in rows if r.get("content_key")})
     return await _recompute_and_verify(keys, UNPUBLISHED_SUPPRESSION_REASON)
@@ -267,10 +283,21 @@ async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
             except ValueError:
                 meta = {}
         prior = (meta or {}).get("prior_seed_status")
-        await database.execute(
+        restored = await database.fetch_all(
             "UPDATE catalog_products SET suppressed_at=NULL, updated_at=NOW() "
-            "WHERE source_ref=:id AND suppressed_at IS NOT NULL",
+            "WHERE source_ref=:id AND suppressed_at IS NOT NULL "
+            "RETURNING product_key",
             {"id": sid},
+        )
+        # The mirror of the cascade above. Without it, this revert un-gates the
+        # PRODUCT and leaves its offers tombstoned forever — "a revert that
+        # silently does not revert", the same defect the
+        # suppression_timestamp_without_reason invariant was written for.
+        # `revert_offer_suppression` clears only offers carrying OUR
+        # `product_suppressed` label, so an offer the merge lane or the
+        # reconciler's duplicate pass tombstoned keeps both of its columns.
+        await revert_offer_suppression(
+            [str(r["product_key"]) for r in (restored or [])], db=database
         )
         # Only fill the reason back in if it is OURS — a row that carried
         # step5's reason keeps it.

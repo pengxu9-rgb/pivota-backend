@@ -27,14 +27,34 @@ from services.shopify_publication_signal import UNKNOWN, UNPUBLISHED  # noqa: E4
 
 
 class _FakeDB:
+    """Records EVERY accessor, not just `execute`.
+
+    It used to record `execute` alone and return `[]` from `fetch_all`, and that
+    made it blind in both directions the moment the withdrawal switched to
+    `RETURNING product_key` (which it had to: `databases` + asyncpg yields no
+    rowcount, and the offer cascade needs the keys). The two read-back tests
+    below went from asserting a real statement to asserting nothing, and the
+    cascade the withdrawal now performs was invisible. A fake that watches one
+    method is a fake that stops watching the day a writer changes method.
+    """
+
     def __init__(self, serving_by_key=None):
         self.executed = []
         self._serving = serving_by_key or {}
 
-    async def execute(self, query, values=None):
+    def _record(self, query, values):
         self.executed.append((" ".join(str(query).split()), values or {}))
 
+    async def execute(self, query, values=None):
+        self._record(query, values)
+
     async def fetch_all(self, query, values=None):
+        self._record(query, values)
+        # A RETURNING statement must hand back rows or the caller cannot act on
+        # them; both projections used by this path are supplied, so the fake does
+        # not have to guess which statement it is answering.
+        if "RETURNING" in str(query).upper():
+            return [{"product_key": "prod::s1", "offer_id": "offer::s1"}]
         return []
 
     async def fetch_one(self, query, values=None):
@@ -75,6 +95,19 @@ async def test_withdraw_sets_suppressed_at_not_just_a_reason(monkeypatch):
     assert db.touching("suppressed_at=NOW()")
     assert db.touching("status='inactive'")
     assert db.touching("suppression_reason=:reason")
+    # AND the product's OFFERS. catalog_offers has its own suppressed_at, and
+    # every offer-grain read lane filters on THAT column — withdrawing the row
+    # while leaving its offer live is how 2,171 suppressed products came to
+    # carry live offers on prod (2026-09-08).
+    assert db.touching("RETURNING product_key"), (
+        "the product UPDATE must project the keys the cascade consumes; a "
+        "separate SELECT would race its own `suppressed_at IS NULL` filter"
+    )
+    cascaded = db.touching("catalog_offers")
+    assert cascaded, "product suppression did not cascade to catalog_offers"
+    sql, params = cascaded[0]
+    assert "suppressed_at = NOW()" in sql and "suppression_reason" in sql
+    assert params["reason"] == "product_suppressed"
 
 
 @pytest.mark.asyncio
@@ -178,6 +211,15 @@ async def test_revert_restores_both_halves(monkeypatch):
     await remediate._revert([row])
 
     assert db.touching("suppressed_at=NULL")
+    # The mirror of the cascade. Clearing the PRODUCT's gate and leaving the
+    # offers tombstoned is a revert that silently does not revert.
+    restored = [c for c in db.touching("catalog_offers")
+                if "suppressed_at = NULL" in c[0]]
+    assert restored, "the revert did not restore the cascaded offers"
+    # ...and only OURS: an offer the merge lane or the reconciler's duplicate
+    # pass tombstoned keeps both of its columns.
+    assert "suppression_reason = CAST(:reason AS text)" in restored[0][0]
+    assert restored[0][1]["reason"] == "product_suppressed"
     assert db.touching("status='active'")
 
 

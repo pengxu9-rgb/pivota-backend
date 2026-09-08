@@ -396,10 +396,21 @@ class TestReportOnlyTier:
             "live cohort from failing the build"
         )
 
-    def test_it_is_the_only_warn_only_check(self):
-        # If `warn_only` ever leaks onto another check, the module quietly
-        # stops enforcing something it used to enforce.
-        assert [c["name"] for c in _CHECKS if c.get("warn_only")] == [CHECK_NAME]
+    def test_the_warn_only_tier_holds_exactly_the_checks_listed_here(self):
+        # If `warn_only` ever leaks onto another check, the module quietly stops
+        # enforcing something it used to enforce. So the tier is an EXPLICIT
+        # list: adding a check to it is a deliberate edit here, with the reason
+        # written down, not a key that appears in a diff nobody reads.
+        #
+        #   market_currency_disagreement                — the 433-EUR-as-US
+        #       cohort's disposition is a human decision (see this class).
+        #   skus_without_merchant_issued_identity_share — the variant identity
+        #       provenance backfill (#2113) is outstanding; most live SKUs carry
+        #       no provenance marker at all, so an enforcing check would ship
+        #       permanently red and a threshold raised to today's count would
+        #       bless the exact rows that arc exists to fix.
+        expected = [CHECK_NAME, "skus_without_merchant_issued_identity_share"]
+        assert [c["name"] for c in _CHECKS if c.get("warn_only")] == expected
 
     @pytest.mark.asyncio
     async def test_violations_are_reported_but_do_not_fail_the_build(self):
