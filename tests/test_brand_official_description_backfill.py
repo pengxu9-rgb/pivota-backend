@@ -217,6 +217,154 @@ def test_a_real_description_that_merely_MENTIONS_the_title_survives():
     assert bf.drop_shared_boilerplate({"pk1": real}, _BLURB, titles={"pk1": title}) == {"pk1": real}
 
 
+# --- Mechanism 2's one exception: copy shared only among SIBLING EDITIONS of one product --------
+
+_GLOSS = ("A lip gloss with rich colour density and a cooling metal tip that glides on, layering "
+          "serum-like shine over a vivid wash of colour that lasts through the day.")
+_GLAZE = ("A classic high shine glossy lipstick that melts onto the lips with a single swipe, "
+          "leaving a glass-like finish and a comfortable, non-sticky feel that lasts.")
+
+
+def test_copy_shared_by_a_bracketed_edition_of_the_SAME_product_survives():
+    """Measured in prod 2026-09-08 after two `--pdp-fallback --apply` runs on jsmbeauty.sg:
+    `LIP-PRESSION Metal Serum Gloss` and `[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION
+    Metal Serum Gloss` render the same 149-char meta, and `New Classic Glaze Lipstick` shares
+    its 153-char meta with `[Special Set] New Classic Glaze Lipstick`. Both base lines are Meitu
+    Tier-A and both stayed blocked `low_quality` (9- and 8-char descriptions) because the
+    repetition rule counted a sibling edition as a second product. It is one product's copy."""
+    kept = bf.drop_shared_boilerplate(
+        {"g": _GLOSS, "g_dwp": _GLOSS, "l": _GLAZE, "l_set": _GLAZE},
+        _BLURB,
+        handles={"g": "lip-pression-metal-serum-gloss",
+                 "g_dwp": "devil-wears-prada-ii-x-jungsaemmool-lip-pression-metal-serum-gloss",
+                 "l": "new-classic-glaze-lipstick",
+                 "l_set": "special-set-new-classic-glaze-lipstick"},
+        titles={"g": "LIP-PRESSION Metal Serum Gloss",
+                "g_dwp": "[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION Metal Serum Gloss",
+                "l": "New Classic Glaze Lipstick",
+                "l_set": "[Special Set] New Classic Glaze Lipstick"},
+    )
+    assert kept == {"g": _GLOSS, "g_dwp": _GLOSS, "l": _GLAZE, "l_set": _GLAZE}
+
+
+@pytest.mark.parametrize("tag", ["[SUMMER EDITION] ", "[9.9 EXCLUSIVE] ", "[Special Set] "])
+def test_every_observed_edition_tag_is_stripped_the_same_way(tag):
+    base = "New Classic Glaze Lipstick"
+    kept = bf.drop_shared_boilerplate(
+        {"a": _GLAZE, "b": _GLAZE}, _BLURB,
+        handles={"a": "new-classic-glaze-lipstick", "b": "some-other-handle"},
+        titles={"a": base, "b": tag + base},
+    )
+    assert kept == {"a": _GLAZE, "b": _GLAZE}
+
+
+def test_a_handle_that_is_the_other_plus_an_edition_affix_is_a_sibling_even_without_titles():
+    """The second signal, for rows whose title is missing or was rewritten upstream."""
+    for other in ("new-classic-glaze-lipstick-special-set", "summer-edition-new-classic-glaze-lipstick",
+                  "new-classic-glaze-lipstick-9-9-exclusive"):
+        kept = bf.drop_shared_boilerplate(
+            {"a": _GLAZE, "b": _GLAZE}, _BLURB,
+            handles={"a": "new-classic-glaze-lipstick", "b": other})
+        assert kept == {"a": _GLAZE, "b": _GLAZE}, other
+
+
+def test_the_app_vendor_text_on_gwp_products_is_STILL_dropped():
+    """The case mechanism 2 exists for. 20+ `gwp-*_freegift` products of jsmbeauty.sg carry
+    BOGOS.io's "do not delete/edit it"; their handles share a stem and their titles are free
+    text. None of that makes them editions of one product, and even if their titles all agreed,
+    a family that size is a mechanism, not a product."""
+    cands = {f"pk{i}": _BOGOS for i in range(22)}
+    handles = {f"pk{i}": f"gwp-item-{i}_freegift" for i in range(22)}
+    titles = {f"pk{i}": f"[GWP] Free Gift {i}" for i in range(22)}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, handles=handles, titles=titles) == {}
+    # ...and with IDENTICAL tagged titles, the family cap still refuses it.
+    same = {f"pk{i}": "[GWP] Free Gift" for i in range(22)}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, handles=handles, titles=same) == {}
+
+
+def test_a_family_over_the_cap_is_not_a_family_even_at_the_boundary():
+    cands = {f"pk{i}": _GLAZE for i in range(bf._MAX_EDITION_FAMILY + 1)}
+    handles = {k: f"tag-{k}-new-classic-glaze-lipstick" for k in cands}
+    titles = {k: f"[TAG {k}] New Classic Glaze Lipstick" for k in cands}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, handles=handles, titles=titles) == {}
+    within = {k: v for k, v in list(cands.items())[: bf._MAX_EDITION_FAMILY]}
+    assert bf.drop_shared_boilerplate(within, _BLURB, handles=handles, titles=titles) == within
+
+
+def test_the_shop_blurb_is_STILL_dropped_when_siblings_share_it():
+    """Mechanism 1 is untouched: a base product and its edition both serving the storefront's
+    blurb is the blurb twice, not a description."""
+    kept = bf.drop_shared_boilerplate(
+        {"a": _BLURB, "b": _BLURB}, _BLURB,
+        handles={"a": "x", "b": "x-special-set"}, titles={"a": "X", "b": "[Special Set] X"})
+    assert kept == {}
+
+
+def test_two_unrelated_palettes_sharing_family_copy_are_STILL_dropped():
+    """The measured 17% cost on jsmbeauty.sg was accepted knowingly; this exception recovers only
+    the part of it that is one product. Different base titles, different handle stems."""
+    family = ("Nine buttery mattes and shimmers built around one colour story, pressed to blend "
+              "without fallout and wear all day on bare or primed lids.")
+    kept = bf.drop_shared_boilerplate(
+        {"a": family, "b": family}, _BLURB,
+        handles={"a": "artist-eyeshadow-palette-rose", "b": "artist-eyeshadow-palette-mauve"},
+        titles={"a": "Artist Eyeshadow Palette - Rose", "b": "Artist Eyeshadow Palette - Mauve"})
+    assert kept == {}
+
+
+def test_a_handle_that_differs_by_a_NON_edition_word_is_a_different_product():
+    """`-refill`, `-brush`, `-mini` name other products that a merchant copy-pasted onto; the
+    bare `-1` Shopify appends to de-duplicate a handle is not an edition either; and a long
+    affix that happens to contain an edition word is a different product with 'set' in its
+    name, not an edition (the bracketed-title rule is how a long collab name gets in)."""
+    for other in ("lip-balm-refill", "lip-balm-brush", "lip-balm-mini", "lip-balm-1",
+                  "lip-balm-travel-brush-and-mirror-set"):
+        kept = bf.drop_shared_boilerplate(
+            {"a": _GLAZE, "b": _GLAZE}, _BLURB,
+            handles={"a": "lip-balm", "b": other}, titles={"a": "Lip Balm", "b": "Lip Balm"})
+        assert kept == {}, other
+
+
+def test_identical_titles_with_no_edition_tag_are_not_siblings():
+    """Same name, neither tagged: two listings, not one product and its edition."""
+    kept = bf.drop_shared_boilerplate(
+        {"a": _GLAZE, "b": _GLAZE}, _BLURB,
+        handles={"a": "glaze-lipstick", "b": "glaze-lipstick-2024"},
+        titles={"a": "Glaze Lipstick", "b": "Glaze Lipstick"})
+    assert kept == {}
+
+
+def test_a_chain_through_a_base_product_does_not_vouch_for_two_unrelated_editions():
+    """Every PAIR must be siblings. `x` relates to `x-special-set` by handle and to
+    `[Set] Y` by nothing; if the group were judged by connectivity the stranger would ride in."""
+    kept = bf.drop_shared_boilerplate(
+        {"a": _GLAZE, "b": _GLAZE, "c": _GLAZE}, _BLURB,
+        handles={"a": "x", "b": "x-special-set", "c": "y-set"},
+        titles={"a": "X", "b": "[Special Set] X", "c": "[Set] Y"})
+    assert kept == {}
+
+
+def test_a_sibling_pair_is_STILL_refused_when_the_blurb_is_unavailable():
+    """Siblings are judged as ONE product, and one product with nothing checking it fails closed
+    exactly like a singleton does."""
+    kept = bf.drop_shared_boilerplate(
+        {"a": _GLAZE, "b": _GLAZE}, None,
+        handles={"a": "x", "b": "x-special-set"}, titles={"a": "X", "b": "[Special Set] X"})
+    assert kept == {}
+
+
+def test_a_title_echo_shared_by_siblings_is_STILL_an_echo():
+    """Mechanism 3 is untouched: the base product's brand-plus-title tag, echoed on its edition,
+    is still nothing but the title."""
+    echo = "Kylie Cosmetics - Glossy Pink Makeup Bag + Deluxe Samples"
+    kept = bf.drop_shared_boilerplate(
+        {"a": echo, "b": echo}, _BLURB,
+        handles={"a": "glossy-pink-makeup-bag", "b": "glossy-pink-makeup-bag-special-set"},
+        titles={"a": "Glossy Pink Makeup Bag + Deluxe Samples",
+                "b": "[Special Set] Glossy Pink Makeup Bag + Deluxe Samples"})
+    assert kept == {}
+
+
 # ---------------------------------------------------------------------------
 # The delivery path. resolve_description is only a decision; run() is what writes.
 # ---------------------------------------------------------------------------
