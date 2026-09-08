@@ -834,6 +834,13 @@ async def build_and_persist_all_projections(
     summary = {
         "projections_built": 0,
         "projections_failed": 0,
+        # Strict mode only. A read-back that does not match what we built is a
+        # DIFFERENT failure from "this audience's builder raised": it means the
+        # row we believe we wrote is not the row the database holds. Callers
+        # that treat a partial projection failure as survivable (the URL lane)
+        # must still treat this one as fatal, so it needs its own counter
+        # rather than being folded into projections_failed.
+        "readback_mismatches": 0,
     }
 
     audit_row = await fetch_audit_run_by_id(run_id=audit_run_id)
@@ -846,7 +853,8 @@ async def build_and_persist_all_projections(
         # projection successfully must not turn that failed read into completion.
         logger.warning("strict projection input unavailable for audit=%s", audit_run_id)
         return {"projections_built": 0,
-                "projections_failed": len(VALID_AUDIENCES - {AUDIENCE_PUBLIC_ANONYMOUS})}
+                "projections_failed": len(VALID_AUDIENCES - {AUDIENCE_PUBLIC_ANONYMOUS}),
+                "readback_mismatches": 0}
 
     # PR-codex-review-followup: the per-audience builders include a
     # merchant_id field inside the payload, but the report_projections
@@ -889,6 +897,7 @@ async def build_and_persist_all_projections(
                 from db.audit_evidence import fetch_projection, _json_safe
                 stored = await fetch_projection(audit_run_id=audit_run_id, audience=audience)
                 if not stored or coerce_jsonb_to_dict(stored.get("payload_jsonb")) != _json_safe(payload):
+                    summary["readback_mismatches"] += 1
                     raise RuntimeError("Projection read-back did not match the built payload")
             summary["projections_built"] += 1
         except Exception as exc:  # noqa: BLE001
