@@ -340,6 +340,29 @@ async def test_promote_apply_upserts_per_real_variant(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_promote_does_not_claim_commerce_ready_off_the_money_lane(monkeypatch) -> None:
+    """`readiness_tier` is BOUND now, not the literal 'commerce_ready' this lane
+    used to write on every product it touched.
+
+    The candidate query filters on `product_group_id LIKE 'pg_%'` and nothing else,
+    so external-seed products are promoted here too; #2139 measured 5,083
+    external-seed SKU rows holding 'commerce_ready' that should hold
+    'referral_only', and names this writer. This fixture's primary carries no
+    `catalog_track` at all, which `promoted_readiness_tier` treats as the redirect
+    lane on purpose: over-claiming a tier fabricates a purchasable SKU, while
+    under-claiming one only understates a row another lane can still promote.
+
+    A behavioural pin on the params, not a string check on the SQL — the executing
+    proof of the tier's UPWARD-ONLY move is
+    tests/test_sku_identity_upserts_postgres.py, which needs a real Postgres."""
+    executed = _install_fake_db(monkeypatch)
+    await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
+    upserts = [e for e in executed if "INSERT INTO catalog_skus" in e["sql"]]
+    assert upserts, "nothing was written; this test would be vacuous"
+    assert {e["params"]["readiness_tier"] for e in upserts} == {"referral_only"}
+
+
+@pytest.mark.asyncio
 async def test_promote_skips_when_no_real_variants(monkeypatch) -> None:
     """A group whose primary has only Default-Title placeholder
     variants → skipped, no upserts. MOYU's case."""

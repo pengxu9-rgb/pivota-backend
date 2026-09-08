@@ -163,14 +163,18 @@ _SKU_UPSERT_SQL = """
                       -- because `NULL || jsonb` is NULL and the column is nullable.
                       sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
                                     || EXCLUDED.sku_payload,
-                      -- `readiness_tier` IS INSERT-ONLY, deliberately (the promoter
-                      -- writes it the same way). This lane's plan rows carry
-                      -- 'referral_only', and the row we now land on may be one the
-                      -- promoter or the variant-identity backfill wrote as
-                      -- 'commerce_ready'; a `readiness_tier = EXCLUDED.readiness_tier`
-                      -- here would DOWNGRADE a purchasable SKU on every content
-                      -- re-sync. A tier is promoted by the lane that can prove the
-                      -- checkout, never by a description refresh.
+                      -- `readiness_tier` IS INSERT-ONLY HERE, deliberately, and it
+                      -- stays that way now that the promoter's DO UPDATE moves the
+                      -- tier UPWARD. This lane's plan rows carry 'referral_only',
+                      -- the FLOOR of that ladder, and the row we land on may be one
+                      -- the promoter or the variant-identity backfill wrote as
+                      -- 'commerce_ready'. Adding `readiness_tier = EXCLUDED...`
+                      -- would DOWNGRADE a purchasable SKU on every content re-sync;
+                      -- adding the promoter's upward-only CASE would be a no-op,
+                      -- because a floor value can never advance anything. Dropping
+                      -- the column entirely is the honest spelling of both: a tier
+                      -- is promoted by the lane that can prove the checkout, never
+                      -- by a description refresh.
                       updated_at = NOW()
                     """
 
@@ -472,7 +476,7 @@ async def _adopt_existing_sku_identities(
     and stored rows carry tuples that have since drifted from their product's
     (a legacy `source_variant_id = 'default'`, a `merchant_id` re-resolved by W2).
 
-    FOUR OUTCOMES, in this precedence:
+    FIVE OUTCOMES, in this precedence:
 
     (c) the plan's key is held by a row with a DIFFERENT tuple **and** the plan's
         identity is held by ANOTHER row. Two real rows, and no move satisfies both
@@ -501,6 +505,38 @@ async def _adopt_existing_sku_identities(
         that one is a PK collision the identity arbiter cannot absorb. When it
         holds our IDENTITY the INSERT lands very happily.) The outcome is
         `skus_skipped_suppressed_identity`, and its offers are dropped.
+    (b0) the identity is unheld and the plan's key is held by a live row UNDER THIS
+        PRODUCT that agrees on `platform` and `source_variant_id` and differs ONLY
+        on `merchant_id` → THE PLANNED ROW FOLLOWS THE STORED ONE. The plan's
+        merchant is re-pointed at the stored row's (sku AND its offers), so the
+        upsert resolves through the identity index onto that very row and refreshes
+        it. Counted `skus_adopted_stored_merchant`. NOTHING ABOUT THE STORED ROW IS
+        MOVED — this is a re-point of the PLAN, not of the database.
+
+        This is the same reasoning `_heal_drifted_sku_identity` states and it has to
+        reach the WRITE, not just the heal: on the live claimed-attach path
+        (flowerbeauty.com) `_prepare_seller_of_record` step 3 rewrites the plan's
+        `merchant_id` to the verified `brand_claims` tenant while `_PDP_UPSERT_SQL`
+        never moves `catalog_products.merchant_id`, so the plan and the stored SKU
+        disagree about the merchant BY CONSTRUCTION, on every nightly run, for ever.
+        If that disagreement is "manufactured at apply time, not evidence the stored
+        row is wrong" — and it is — then refusing the write is not conservatism, it
+        is a permanent refusal: the row 23505s on the PK, is counted
+        `skus_identity_conflict`, its offer is dropped, and the SKU's title, image,
+        payload and its offer's price and availability stop refreshing FOREVER,
+        with only a log line. Before the identity arbiter, `ON CONFLICT (sku_key)
+        DO UPDATE` refreshed exactly this row for free and left its merchant alone;
+        adopting the stored merchant restores that outcome by the one move that is
+        consistent with the heal's own premise.
+
+        Adopting the merchant does NOT smuggle a write past the ADR-009 D2 tripwire
+        in `_prepare_seller_of_record` step 2: that refuses the CREATION of a row
+        under the banned 'external_seed' bucket, and this branch only ever lands on
+        a row that already exists there — which is rule 1 ("existing rows win") one
+        table further down. The sibling case is exactly that: a `<pk>::canonical`
+        row `scripts/repair_external_seed_offer_mainline.py` wrote under
+        `merchant_id='external_seed'` while Path C's plan carries the per-brand
+        `merch_obs_…` for the same product and platform.
     (b) the identity is unheld and the plan's key is held by a live row UNDER THIS
         PRODUCT whose `source_variant_id` has drifted → re-point that one column,
         in place, keeping the key (`_SKU_IDENTITY_HEAL_SQL`). The case this exists
@@ -542,12 +578,15 @@ async def _adopt_existing_sku_identities(
     """
     counts = {
         "skus_adopted_existing_identity": 0,
+        "skus_adopted_stored_merchant": 0,
         "offers_rekeyed_to_adopted_sku": 0,
+        "offers_rekeyed_to_stored_merchant": 0,
         "skus_identity_healed": 0,
         "skus_identity_conflict": 0,
         "skus_skipped_suppressed_identity": 0,
         "skus_deduped_same_identity": 0,
         "offers_dropped_for_refused_sku": 0,
+        "offers_deduped_after_rekey": 0,
     }
     if not skus:
         return skus, offers, counts
@@ -555,6 +594,11 @@ async def _adopt_existing_sku_identities(
     #: planned sku_key -> the key the row will actually be written under. Chained,
     #: because a de-duplicated row's survivor may itself go on to adopt another key.
     remap: Dict[str, str] = {}
+    #: planned sku_key -> the merchant_id the row will actually be written under,
+    #: for the (b0) rows that follow their stored SKU's merchant. The offers of
+    #: such a row follow it, so the offer never names a seller its own SKU is not
+    #: filed under.
+    merchant_adoptions: Dict[str, str] = {}
     #: planned sku_keys whose row will NOT be written at all.
     refused: set = set()
 
@@ -592,7 +636,7 @@ async def _adopt_existing_sku_identities(
         str(row.get("sku_key") or "") for row in skus if row.get("sku_key")
     })
     if not product_keys:
-        return skus, _resolve_offer_keys(offers, remap, refused, counts), counts
+        return skus, _resolve_offer_keys(offers, remap, merchant_adoptions, refused, counts), counts
 
     try:
         identity_rows = await database.fetch_all(
@@ -609,7 +653,7 @@ async def _adopt_existing_sku_identities(
             "sku identity pre-resolve failed for %d product_key(s) — writing planned "
             "keys unchanged: %s", len(product_keys), str(exc)[:200],
         )
-        return skus, _resolve_offer_keys(offers, remap, refused, counts), counts
+        return skus, _resolve_offer_keys(offers, remap, merchant_adoptions, refused, counts), counts
 
     held_by_identity: Dict[tuple, str] = {}
     for row in identity_rows or []:
@@ -691,12 +735,38 @@ async def _adopt_existing_sku_identities(
             )
             continue
 
-        # (b) the identity is unheld and our key is held by a row whose
-        #     source_variant_id has drifted — re-point THAT ONE COLUMN. A holder
-        #     that disagrees on merchant_id/platform, or that sits under another
-        #     product, is left alone (see `_heal_drifted_sku_identity`) and the
-        #     planned row is refused by the upsert instead.
         if key_taken_by_another:
+            # (b0) the holder is THIS product's row and the ONLY thing it disagrees
+            #      about is the merchant — the disagreement `_prepare_seller_of_record`
+            #      step 3 manufactures on every claimed-attach run. The PLAN follows
+            #      the stored row. Nothing about the stored row moves; the re-pointed
+            #      plan simply resolves through the identity index onto it, so the
+            #      content re-sync lands instead of 23505ing on the PK for ever.
+            stored_merchant = _stored_merchant_to_adopt(sku, holder_identity)
+            if stored_merchant is not None:
+                logger.info(
+                    "apply_ingest_plan: sku_key=%s is stored under merchant_id=%s "
+                    "while this plan carries %s — same product_key=%s, platform=%s "
+                    "and source_variant_id=%s, so the disagreement is the one "
+                    "_prepare_seller_of_record manufactures at apply time, not "
+                    "evidence the stored row is wrong. The PLANNED row (and its "
+                    "offers) adopt the stored merchant and refresh that row; the "
+                    "stored row's merchant_id is NOT moved",
+                    planned_key, stored_merchant, sku.get("merchant_id"),
+                    sku.get("product_key"), sku.get("platform"),
+                    sku.get("source_variant_id"),
+                )
+                sku["merchant_id"] = stored_merchant
+                merchant_adoptions[planned_key] = stored_merchant
+                counts["skus_adopted_stored_merchant"] += 1
+                kept.append(sku)
+                continue
+
+            # (b) the identity is unheld and our key is held by a row whose
+            #     source_variant_id has drifted — re-point THAT ONE COLUMN. A holder
+            #     that disagrees on merchant_id/platform, or that sits under another
+            #     product, is left alone (see `_heal_drifted_sku_identity`) and the
+            #     planned row is refused by the upsert instead.
             healed = await _heal_drifted_sku_identity(
                 sku, planned_key, holder_identity, database=database
             )
@@ -704,7 +774,7 @@ async def _adopt_existing_sku_identities(
                 counts["skus_identity_healed"] += 1
         kept.append(sku)
 
-    return kept, _resolve_offer_keys(offers, remap, refused, counts), counts
+    return kept, _resolve_offer_keys(offers, remap, merchant_adoptions, refused, counts), counts
 
 
 def _identity_tuple(row: Dict[str, Any]) -> tuple:
@@ -716,6 +786,50 @@ def _identity_tuple(row: Dict[str, Any]) -> tuple:
         str(row.get("product_key") or ""),
         str(row.get("source_variant_id") or ""),
     )
+
+
+def _stored_merchant_to_adopt(
+    sku: Dict[str, Any], stored_identity: tuple
+) -> Optional[str]:
+    """The stored row's `merchant_id`, when following it is the ONLY move needed.
+
+    Returns the merchant to re-point the PLANNED row at when the row already
+    holding the plan's `sku_key` sits under THIS product_key, agrees on `platform`
+    and on `source_variant_id`, and differs from the plan on `merchant_id` alone.
+    `None` in every other shape — anything else needs a second decision (which
+    variant, which product, which platform) that a content re-sync is not entitled
+    to make, and those keep falling through to the heal or to the refusal.
+
+    WHY FOLLOWING IS RIGHT HERE, and refusing is not. The disagreement this admits
+    is one this lane MANUFACTURES: `_prepare_seller_of_record` step 3 rewrites the
+    plan's `merchant_id` to a VERIFIED `brand_claims` tenant while
+    `_PDP_UPSERT_SQL` never moves `catalog_products.merchant_id`, so on the live
+    claimed-attach path the plan's merchant differs from the stored SKU's on EVERY
+    run, by construction, until the R3 migration moves the products.
+    `_heal_drifted_sku_identity` already says so and declines to move the stored
+    row for it — but declining there sent the row to the upsert, where the identity
+    index is free, the PK is not, and the 23505 is a PERMANENT refusal: content and
+    offer frozen, one log line, no end state. Following the stored merchant is the
+    only move that keeps the heal's premise (the stored row is not wrong) and still
+    writes: the re-pointed plan resolves through the identity index onto that exact
+    row, whose `merchant_id` the DO UPDATE does not touch.
+
+    Bounded on purpose. `_SKU_KEY_HOLDER_LOOKUP_SQL` matches on `sku_key` ALONE, so
+    the holder it returns can belong to a different product — the `product_key`
+    check is what stops this adopting a foreign row's merchant, the same bound
+    `_SKU_IDENTITY_HEAL_SQL` carries. `platform` and `source_variant_id` must agree
+    because a row differing on those is a different variant or a different lane, not
+    the same SKU under another seller."""
+    stored_merchant, stored_platform, stored_product, stored_variant = stored_identity
+    if stored_product != str(sku.get("product_key") or ""):
+        return None
+    if stored_platform != str(sku.get("platform") or ""):
+        return None
+    if stored_variant != str(sku.get("source_variant_id") or ""):
+        return None
+    if not stored_merchant or stored_merchant == str(sku.get("merchant_id") or ""):
+        return None
+    return stored_merchant
 
 
 async def _heal_drifted_sku_identity(
@@ -797,11 +911,15 @@ async def _heal_drifted_sku_identity(
 
 
 def _resolve_offer_keys(
-    offers: list, remap: Dict[str, str], refused: set, counts: Dict[str, int]
+    offers: list,
+    remap: Dict[str, str],
+    merchant_adoptions: Dict[str, str],
+    refused: set,
+    counts: Dict[str, int],
 ) -> list:
-    """Point every offer at the key its SKU was actually written under, and drop the
-    offers of SKUs that were not written at all."""
-    if not remap and not refused:
+    """Point every offer at the key AND the merchant its SKU was actually written
+    under, and drop the offers of SKUs that were not written at all."""
+    if not remap and not merchant_adoptions and not refused:
         return offers
     kept: list = []
     for offer in offers:
@@ -827,8 +945,55 @@ def _resolve_offer_keys(
                 str(offer.get("source_ref") or ""),
             )
             counts["offers_rekeyed_to_adopted_sku"] += 1
+        # (b0): the offer follows its SKU's adopted merchant. `merchant_id` is not
+        # one of `derive_offer_id`'s three terms, so this never changes the id — it
+        # keeps a NEW offer from being filed under a seller its own SKU is not
+        # filed under. (`_OFFER_UPSERT_SQL`'s DO UPDATE never moves an EXISTING
+        # offer's merchant_id, so on a re-ingest this is a no-op either way.)
+        adopted_merchant = merchant_adoptions.get(planned_key)
+        if adopted_merchant and str(offer.get("merchant_id") or "") != adopted_merchant:
+            offer["merchant_id"] = adopted_merchant
+            counts["offers_rekeyed_to_stored_merchant"] += 1
         kept.append(offer)
-    return kept
+    return _dedupe_offers_by_id(kept, counts)
+
+
+def _dedupe_offers_by_id(offers: list, counts: Dict[str, int]) -> list:
+    """ONE ROW PER `offer_id`, after the re-keying above.
+
+    `ingest_validated_jsonl` de-duplicates its offer rows by `offer_id` — but that
+    happens BEFORE this function re-derives the id from the ADOPTED `sku_key`. Two
+    planned SKUs that were de-duplicated onto one identity, or that adopted the
+    same stored key, carry offers whose destinations (`source_ref`) are the same,
+    so `derive_offer_id(product_key, adopted_key, destination)` collapses them onto
+    one id AFTER the plan's own dedupe has run. Left alone, the per-row executor
+    upserts the same id twice and counts two offers where one row exists, and the
+    bulk executor's multi-row VALUES raises 21000 ("ON CONFLICT DO UPDATE command
+    cannot affect row a second time") and falls back to a row-by-row replay that
+    reports the same inflated number. Keep the first, count the rest."""
+    by_id: Dict[str, Any] = {}
+    dropped = 0
+    for offer in offers:
+        offer_id = str(offer.get("offer_id") or "")
+        if not offer_id:
+            # No id to collapse on; leave it to the writer's own error handling.
+            by_id[f"__no_id__{len(by_id)}"] = offer
+            continue
+        if offer_id in by_id:
+            dropped += 1
+            logger.info(
+                "catalog_offers row dropped as a duplicate: offer_id=%s is already "
+                "carried by this plan after re-keying (sku_key=%s, source_ref=%s) "
+                "— one destination on one SKU is one offer",
+                offer_id, offer.get("sku_key"), offer.get("source_ref"),
+            )
+            continue
+        by_id[offer_id] = offer
+    if dropped:
+        counts["offers_deduped_after_rekey"] = (
+            counts.get("offers_deduped_after_rekey", 0) + dropped
+        )
+    return list(by_id.values())
 
 
 def _drop_offers_of_refused_skus(
@@ -1215,7 +1380,16 @@ async def apply_ingest_plan(
         # 4. catalog_offers — INSERT one row per validated retailer offer.
         for offer in accepted_offers:
             try:
-                await database.execute(_OFFER_UPSERT_SQL, offer)
+                # SAVEPOINT per row, for the SAME reason the SKU loop above has
+                # one. This loop runs INSIDE the transaction opened at the top of
+                # this stage; an error inside a Postgres transaction ABORTS it, so
+                # without the nested transaction one bad offer turned every later
+                # statement into a 25P02 and degraded the enclosing COMMIT to a
+                # ROLLBACK — throwing away the SKUs and the offers that had already
+                # succeeded, while `counts` went on reporting them as written. The
+                # nested transaction rolls back this offer alone.
+                async with database.transaction():
+                    await database.execute(_OFFER_UPSERT_SQL, offer)
                 counts["offers"] += 1
                 audit.record_applied(1)
             except Exception as exc:  # noqa: BLE001

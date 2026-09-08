@@ -408,6 +408,7 @@ SELECT_GROUP_PRIMARY_SQL = """
            cp.merchant_id,
            cp.platform,
            cp.source_product_id,
+           cp.catalog_track,
            cp.title AS parent_title,
            cp.product_payload AS product_payload,
            eps.seed_data AS seed_data
@@ -435,6 +436,41 @@ SELECT_GROUPS_TO_PROCESS_SQL = """
 """
 
 
+#: The track a redirect row carries — `ingestion.DEFAULT_CATALOG_TRACK`,
+#: `mirror_external_seeds_to_catalog_products.CATALOG_TRACK`,
+#: `index_graduation_ladder._OBSERVED_CATALOG_TRACK` all spell it this way.
+_EXTERNAL_REFERRAL_TRACK = "external_referral"
+
+
+def promoted_readiness_tier(catalog_track: Optional[str]) -> str:
+    """The `readiness_tier` a promoted variant may claim, from its PRODUCT's track.
+
+    THE PROMOTER RUNS ON EXTERNAL-SEED PRODUCTS. `SELECT_GROUPS_TO_PROCESS_SQL`
+    filters on `product_group_id LIKE 'pg_%'` and nothing else — no track, no
+    platform — and `SELECT_GROUP_PRIMARY_SQL` LEFT JOINs `external_product_seeds`
+    precisely so Path B (external_seed scrape) variants can be promoted. So the
+    literal `'commerce_ready'` this used to write was minted on the redirect lane
+    as readily as on the money lane, and #2139 measured the result: 5,083
+    `catalog_skus` rows on external-seed products holding 'commerce_ready' that
+    should hold 'referral_only'. #2139 repairs that data and names this writer as
+    the one that produces it. Making the tier UPWARD-ONLY without this gate would
+    have turned the promoter into the writer that RE-MINTS the leak the moment
+    #2139's repair landed — a `<pk>::v:` key on an external_seed product, healed to
+    'referral_only', promoted straight back to 'commerce_ready' on the next run.
+
+    `commerce_ready` means a checkout can be proved. An `external_referral` product
+    is a redirect to somebody else's storefront, which is exactly what
+    `ingestion.OFFER_READINESS_TIER` says by writing 'referral_only' for the same
+    lane. An UNKNOWN track (no column in the row handed to this function) is
+    treated as the redirect lane too: over-claiming a tier fabricates a purchasable
+    SKU, under-claiming one only understates a row another lane can still promote.
+    """
+    track = str(catalog_track or "").strip().lower()
+    if not track or track == _EXTERNAL_REFERRAL_TRACK:
+        return "referral_only"
+    return "commerce_ready"
+
+
 # THE 3-COLUMN INDEX THIS USED TO NAME NO LONGER EXISTS. Migration 123
 # (`db/migrations/123_catalog_skus_4col_unique_index.sql`) created
 # `idx_catalog_skus_source_identity_v2 (merchant_id, platform, product_key,
@@ -458,7 +494,11 @@ UPSERT_SKU_SQL = """
         CAST(:visible_option_labels AS jsonb),
         CAST(:visible_attributes AS jsonb),
         CAST(:sku_payload AS jsonb),
-        'commerce_ready', NOW()
+        -- WAS THE LITERAL 'commerce_ready', ON EVERY LANE. `promoted_readiness_tier`
+        -- now decides it from the PRODUCT's `catalog_track`: an external_referral
+        -- row is a redirect, not a checkout, so it gets 'referral_only'. See that
+        -- function for the #2139 leak this closes.
+        :readiness_tier, NOW()
     )
     ON CONFLICT (merchant_id, platform, product_key, source_variant_id)
     DO UPDATE SET
@@ -482,6 +522,34 @@ UPSERT_SKU_SQL = """
         -- NULL and the column is nullable.
         sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
                       || EXCLUDED.sku_payload,
+        -- `readiness_tier` WAS INSERT-ONLY, and with the identity arbiter that made
+        -- the promoter's headline count a lie. An ingest-spelled `<pk>::v:<vid>` row
+        -- sits at 'referral_only' (that is what `apply._SKU_UPSERT_SQL` inserts);
+        -- the promoter resolves onto it through the identity index, DO UPDATEs the
+        -- content, counts `variants_promoted`, and leaves the tier exactly where it
+        -- was — measured `promoted=1, tier_after='referral_only'`, on 4,474 such
+        -- rows. "Promoted" has to mean the tier moved.
+        --
+        -- UPWARD-ONLY, on `services.index_graduation_ladder.OBSERVED_READINESS_LADDER`
+        -- (referral_only -> knowledge_ready -> commerce_ready). A tier is never
+        -- lowered here, and a value OFF that ladder (a first-party 'vertical_ready')
+        -- is left untouched — the same monotonic rule, and the same treatment of
+        -- off-ladder values, that `index_graduation_ladder._tiers_below` expresses
+        -- one table up. The ladder is repeated as a literal rather than interpolated
+        -- because this statement has to stay a top-level constant the repo PREPARE
+        -- gate can collect;
+        -- `test_the_promoters_tier_move_is_the_repos_ladder_and_only_upward` drives
+        -- every (stored, offered) pair through this CASE and checks it against that
+        -- module's list.
+        readiness_tier = CASE
+            WHEN catalog_skus.readiness_tier = 'referral_only'
+                 AND EXCLUDED.readiness_tier IN ('knowledge_ready', 'commerce_ready')
+              THEN EXCLUDED.readiness_tier
+            WHEN catalog_skus.readiness_tier = 'knowledge_ready'
+                 AND EXCLUDED.readiness_tier = 'commerce_ready'
+              THEN EXCLUDED.readiness_tier
+            ELSE catalog_skus.readiness_tier
+        END,
         updated_at = NOW()
 """
 
@@ -584,6 +652,12 @@ async def promote_variants_for_group(
 
     sample_titles = [r.title for r in rows_to_upsert[:5]]
 
+    # The tier every row in this group may claim, decided ONCE from the primary
+    # product's track (they are all rows of that product). See
+    # `promoted_readiness_tier`: the promoter runs on external-seed products too,
+    # and a redirect is not a checkout.
+    readiness_tier = promoted_readiness_tier(primary.get("catalog_track"))
+
     promoted = 0
     identity_conflicts = 0
     write_failures = 0
@@ -591,6 +665,7 @@ async def promote_variants_for_group(
         async with database.transaction():
             for r in rows_to_upsert:
                 params = {
+                    "readiness_tier": readiness_tier,
                     "sku_key": r.sku_key,
                     "product_key": r.product_key,
                     "merchant_id": r.merchant_id,
@@ -701,6 +776,14 @@ async def promote_variants_all(
     held under a different tuple is refused on every run for ever, and
     `skus_identity_conflict_total` is a standing backlog, not a transient. Do not
     read it as healthy because it is stable.
+
+    AND `variants_promoted` NO LONGER MEANS 'commerce_ready'. The tier a promoted
+    row may claim comes from its PRODUCT's `catalog_track`
+    (`promoted_readiness_tier`): this entry point's candidate query admits
+    external-seed products, so on the redirect lane a promotion writes
+    'referral_only'. On the money lane the tier now MOVES — upward only — where it
+    was INSERT-only before, and a promotion could leave a 'referral_only' row
+    exactly where it found it while counting itself.
     """
     report = PromoterReport()
 
