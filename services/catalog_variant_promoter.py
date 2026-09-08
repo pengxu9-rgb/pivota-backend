@@ -70,6 +70,7 @@ Variant data shape (real-world examples):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -119,6 +120,10 @@ class GroupOutcome:
     #: Rows refused by the OTHER unique constraint — same sku_key, different
     #: identity tuple. Counted rather than fatal; see the upsert loop.
     skus_identity_conflict: int = 0
+    #: Rows refused for any OTHER reason (22001 on an over-long id, 23502, a bad
+    #: payload). Counted rather than fatal too: a re-raise here aborted every group
+    #: still queued behind this one.
+    skus_write_failed: int = 0
 
 
 @dataclass
@@ -129,6 +134,7 @@ class PromoterReport:
     groups_skipped_no_primary: int = 0
     skus_upserted_total: int = 0
     skus_identity_conflict_total: int = 0
+    skus_write_failed_total: int = 0
     per_group: List[GroupOutcome] = field(default_factory=list)
 
 
@@ -247,11 +253,43 @@ def filter_real_variants(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 # ---------------------------------------------------------------------------
 
 
+#: `catalog_skus.sku_key` is varchar(255) and `catalog_skus.source_variant_id` is
+#: varchar(128). A key or a variant id longer than its column does not fail one
+#: row — Postgres raises 22001 (string_data_right_truncation), which is NOT a
+#: unique violation, so the promoter used to re-raise it and abort the whole run
+#: on the first over-long merchant variant id. `derive_product_key` alone can
+#: reach 214 chars, which leaves 36 for the infix and the id.
+_SKU_KEY_MAX = 255
+_SOURCE_VARIANT_ID_MAX = 128
+_VARIANT_INFIX = "::v::"
+
+
 def _derive_sku_key(primary_product_key: str, variant_id: str) -> str:
     """Stable, debuggable: <primary_product_key>::v::<variant_id>.
     Distinct from the existing `::canonical` synthetic SKU so the two
-    coexist without conflict on the catalog_skus PK."""
-    return f"{primary_product_key}::v::{variant_id}"
+    coexist without conflict on the catalog_skus PK.
+
+    A key that already FITS is returned byte-for-byte unchanged — this is the
+    primary key of 4,286 live rows the 2026-09-08 variant-identity backfill
+    adopted and hung `catalog_offers` on (no FK to catch a rename), so the
+    truncation below must be reachable ONLY by the keys that could never have
+    been written in the first place. Over the limit it mirrors
+    `ingestion.derive_variant_sku_key`: truncate the id, and fall back to a sha1
+    digest of the FULL id when even the truncation does not fit, which keeps the
+    key stable across re-runs (the whole point of deriving it from the merchant's
+    own variant id)."""
+    key = f"{primary_product_key}{_VARIANT_INFIX}{variant_id}"
+    if len(key) <= _SKU_KEY_MAX:
+        return key
+    token = str(variant_id)[:60]
+    budget = _SKU_KEY_MAX - len(primary_product_key) - len(_VARIANT_INFIX)
+    if budget < len(token):
+        digest = hashlib.sha1(str(variant_id).encode("utf-8")).hexdigest()[:16]
+        token = digest if budget >= len(digest) else digest[: max(budget, 0)]
+    # Last resort: a product_key that alone overruns the column. Nothing keeps a
+    # variant of it distinct, but a truncated key is a row that lands and can be
+    # found, where an over-long one is a 22001 that used to take the run down.
+    return f"{primary_product_key}{_VARIANT_INFIX}{token}"[:_SKU_KEY_MAX]
 
 
 def _visible_option_labels(options: Any) -> List[str]:
@@ -497,6 +535,7 @@ async def promote_variants_for_group(
 
     promoted = 0
     identity_conflicts = 0
+    write_failures = 0
     if apply and rows_to_upsert:
         async with database.transaction():
             for r in rows_to_upsert:
@@ -506,7 +545,12 @@ async def promote_variants_for_group(
                     "merchant_id": r.merchant_id,
                     "platform": r.platform,
                     "source_product_id": r.source_product_id,
-                    "source_variant_id": r.source_variant_id,
+                    # varchar(128). An over-long merchant variant id is a 22001,
+                    # which is not a unique violation — before this bound it took
+                    # the whole run down rather than one variant.
+                    "source_variant_id": str(r.source_variant_id or "")[
+                        :_SOURCE_VARIANT_ID_MAX
+                    ],
                     "sku": r.sku,
                     "barcode": r.barcode,
                     "title": r.title,
@@ -528,7 +572,23 @@ async def promote_variants_for_group(
                     promoted += 1
                 except Exception as exc:  # noqa: BLE001
                     if not _is_unique_violation(exc):
-                        raise
+                        # ONE BAD VARIANT IS NOT A BAD RUN. This used to re-raise,
+                        # so any non-23505 write error — a 22001 from an over-long
+                        # id, a 23502, a 22P02 on a malformed payload — aborted
+                        # `promote_variants_for_group` and, with it, every group
+                        # still queued in `promote_variants_all`. The savepoint has
+                        # already rolled this row back; count it, log it loudly, and
+                        # let the remaining variants land.
+                        write_failures += 1
+                        logger.exception(
+                            "catalog_skus upsert failed (%s) for sku_key=%s "
+                            "identity=(merchant_id=%s, platform=%s, product_key=%s, "
+                            "source_variant_id=%s) — variant skipped, group "
+                            "continues: %s",
+                            type(exc).__name__, r.sku_key, r.merchant_id, r.platform,
+                            r.product_key, r.source_variant_id, str(exc)[:200],
+                        )
+                        continue
                     identity_conflicts += 1
                     logger.error(
                         "catalog_skus upsert refused (unique violation, SQLSTATE "
@@ -547,6 +607,7 @@ async def promote_variants_for_group(
         variants_promoted=promoted if apply else len(rows_to_upsert),
         sample_variant_titles=sample_titles,
         skus_identity_conflict=identity_conflicts,
+        skus_write_failed=write_failures,
     )
 
 
@@ -609,5 +670,6 @@ async def promote_variants_all(
             report.groups_promoted += 1
             report.skus_upserted_total += outcome.variants_promoted
         report.skus_identity_conflict_total += outcome.skus_identity_conflict
+        report.skus_write_failed_total += outcome.skus_write_failed
 
     return report

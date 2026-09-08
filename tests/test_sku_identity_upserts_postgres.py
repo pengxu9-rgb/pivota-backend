@@ -36,6 +36,7 @@ a narrower table behind.
 import json
 import os
 import re
+from datetime import datetime, timezone
 
 import pytest
 
@@ -53,6 +54,14 @@ DEST = "https://brand.example/products/sku-identity-gate"
 VID = "51234567890123"
 VID2 = "51234567890999"
 GROUP_ID = "pg_sku_identity_gate"
+GROUP_ID_LONG = "pg_sku_identity_gate_long"
+
+#: The widest key `ingestion.derive_product_key` can mint: 'ext:' + canonical[:200]
+#: + '::' + 8 hex = 214 chars, leaving 41 for the promoter's '::v::' + a variant id.
+#: catalog_skus.sku_key is varchar(255), so a merchant variant id of any real length
+#: overruns it — and an over-long bind is a 22001, NOT a unique violation.
+LONG_PK = "ext:" + ("sku-identity-long-" + "z" * 200)[:200] + "::0badc0de"
+LONG_VID = "9" * 140
 
 #: What the 2026-09-08 variant-identity backfill stamps on a row it adopts. These
 #: two keys are the ones a replacing `sku_payload = EXCLUDED.sku_payload` erases.
@@ -107,6 +116,7 @@ _PATCH_COLUMNS = {
         ("sku_payload", "jsonb"), ("ingredient_ids", "jsonb"),
         ("visible_attributes", "jsonb"), ("visible_option_labels", "jsonb"),
         ("currency", "varchar(16)"), ("sku", "varchar(128)"),
+        ("suppressed_at", "timestamptz"), ("suppression_reason", "text"),
     ),
     "catalog_offers": (
         ("source_ref", "varchar(255)"), ("source_system", "varchar(64)"),
@@ -157,11 +167,13 @@ async def _ddl(database):
 async def _clear(database):
     """Remove this fixture's ROWS. Never its tables — the gate shares one database
     and a dropped table poisons whichever file collects next."""
-    await database.execute("DELETE FROM catalog_offers WHERE product_key = :pk", {"pk": PK})
-    await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
-    await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": PK})
+    for pk in (PK, LONG_PK):
+        await database.execute("DELETE FROM catalog_offers WHERE product_key = :pk", {"pk": pk})
+        await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": pk})
+        await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": pk})
     await database.execute(
-        "DELETE FROM product_group_members WHERE product_group_id = :g", {"g": GROUP_ID}
+        "DELETE FROM product_group_members WHERE product_group_id = ANY(:g)",
+        {"g": [GROUP_ID, GROUP_ID_LONG]},
     )
     await database.execute(
         "DELETE FROM writer_audit_log WHERE writer_name LIKE :w",
@@ -259,26 +271,30 @@ def _planned_offer(*, sku_key, price=19.0, dest=DEST):
     )
 
 
-async def _seed_product(database, *, merchant=MERCHANT, payload=None):
+async def _seed_product(database, *, merchant=MERCHANT, payload=None, pk=PK, spid=SPID):
     await database.execute(
         """INSERT INTO catalog_products (product_key, merchant_id, platform,
              source_product_id, source_domain, title, product_payload)
            VALUES (:pk,:m,:p,:spid,'brand.example','Gate Lipstick',
                    CAST(:pl AS jsonb))""",
-        {"pk": PK, "m": merchant, "p": PLATFORM, "spid": SPID,
+        {"pk": pk, "m": merchant, "p": PLATFORM, "spid": spid,
          "pl": json.dumps(payload or {})},
     )
 
 
-async def _seed_sku(database, *, sku_key, vid=VID, merchant=MERCHANT, payload, title="Ruby"):
+async def _seed_sku(
+    database, *, sku_key, vid=VID, merchant=MERCHANT, payload, title="Ruby",
+    pk=PK, suppressed=False, readiness_tier="commerce_ready",
+):
     await database.execute(
         """INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,
              source_product_id, source_variant_id, title, sku_payload,
-             readiness_tier, updated_at)
+             readiness_tier, suppressed_at, updated_at)
            VALUES (:sk,:pk,:m,:p,:spid,:v,:t,CAST(:pl AS jsonb),
-                   'commerce_ready',NOW())""",
-        {"sk": sku_key, "pk": PK, "m": merchant, "p": PLATFORM, "spid": SPID,
-         "v": vid, "t": title, "pl": json.dumps(payload)},
+                   :rt,:sup,NOW())""",
+        {"sk": sku_key, "pk": pk, "m": merchant, "p": PLATFORM, "spid": SPID,
+         "v": vid, "t": title, "pl": json.dumps(payload), "rt": readiness_tier,
+         "sup": datetime.now(timezone.utc) if suppressed else None},
     )
 
 
@@ -483,23 +499,33 @@ async def test_catalog_skus_title_is_not_null_here(db):
     assert nullable == "NO"
 
 
-async def test_the_same_key_under_a_different_identity_is_counted_and_the_batch_continues(db):
-    """The trap the arbiter swap does NOT close, from the other direction: this
-    row's `sku_key` is already held by a DIFFERENT identity tuple (a product whose
-    merchant_id was re-resolved). Neither constraint can be satisfied, so the row
-    is classified by SQLSTATE, counted, logged, and skipped — and the rows behind
-    it in the same batch still land.
+async def _seed_case_c(db):
+    """Case (c): TWO existing rows, one holding the plan's KEY under a foreign
+    tuple, the other holding the plan's IDENTITY under a foreign key. No move
+    satisfies both unique constraints — adopting the identity holder leaves the key
+    holder still claiming a key this product derives, healing the key holder's
+    tuple collides with the identity holder."""
+    await _seed_product(db)
+    # holds the plan's sku_key, under another merchant's tuple
+    await _seed_sku(
+        db, sku_key=_ingestion_key(), merchant=OTHER_MERCHANT,
+        payload={"agent_version": "key-holder"},
+    )
+    # holds the plan's identity tuple, under the promoter's key
+    await _seed_sku(
+        db, sku_key=_promoter_key(), payload=_backfill_payload(), title="Ruby (held)",
+    )
+
+
+async def test_the_residual_conflict_is_counted_and_the_batch_continues(db):
+    """The trap NEITHER remedy closes. The row is counted, logged with both rows,
+    and skipped — and the rows behind it in the same batch still land.
 
     With `ON CONFLICT (sku_key)` this row would SILENTLY succeed, updating a row
     whose merchant_id disagrees with the plan's."""
-    await _seed_product(db)
-    # same sku_key ingestion would derive, but under another merchant
-    await _seed_sku(
-        db, sku_key=_ingestion_key(), merchant=OTHER_MERCHANT,
-        payload={"agent_version": "other"},
-    )
+    await _seed_case_c(db)
 
-    trapped = _planned_sku()                      # merchant MERCHANT, key already taken
+    trapped = _planned_sku()                      # key held by one row, identity by another
     clean = _planned_sku(vid=VID2)                # must still land
     counts = await _apply(
         _plan([trapped, clean], [_planned_offer(sku_key=clean["sku_key"])]),
@@ -508,16 +534,362 @@ async def test_the_same_key_under_a_different_identity_is_counted_and_the_batch_
 
     assert counts["skus_identity_conflict"] == 1
     assert counts["skus"] == 1
-    # the batch CONTINUED: the offer stage ran after the failure, inside the same
-    # transaction the 23505 would otherwise have aborted (25P02).
+    assert counts["skus_identity_healed"] == 0, "healing here would collide"
+    assert counts["skus_adopted_existing_identity"] == 0
+    # the batch CONTINUED: the offer stage ran after the refusal, inside the same
+    # transaction a 23505 would otherwise have aborted (25P02).
     assert counts["offers"] == 1
     landed = await db.fetch_val(
-        "SELECT count(*) FROM catalog_skus WHERE product_key = :pk AND merchant_id = :m",
-        {"pk": PK, "m": MERCHANT})
+        "SELECT count(*) FROM catalog_skus WHERE sku_key = :k AND merchant_id = :m",
+        {"k": _ingestion_key(vid=VID2), "m": MERCHANT})
     assert landed == 1
     assert await db.fetch_val(
         "SELECT merchant_id FROM catalog_skus WHERE sku_key = :k",
-        {"k": _ingestion_key()}) == OTHER_MERCHANT, "the trapped row was overwritten"
+        {"k": _ingestion_key()}) == OTHER_MERCHANT, "the key holder was overwritten"
+    assert await db.fetch_val(
+        "SELECT title FROM catalog_skus WHERE sku_key = :k",
+        {"k": _promoter_key()}) == "Ruby (held)", "the identity holder was overwritten"
+
+
+async def test_a_refused_sku_leaves_no_offer_behind_on_the_per_row_path(db):
+    """catalog_offers has NO foreign key to catalog_skus, so an offer written for a
+    SKU the write refused is not a pending offer — it is a fake one, indexed and
+    servable, pointing at a sku_key that does not exist. Pre-fix the conflict was
+    counted and the offers went in anyway."""
+    await _seed_case_c(db)
+
+    trapped = _planned_sku()
+    counts = await _apply(
+        _plan([trapped], [_planned_offer(sku_key=trapped["sku_key"])]), batch=False
+    )
+
+    assert counts["skus_identity_conflict"] == 1
+    assert counts["offers"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+
+
+async def test_a_refused_sku_leaves_no_offer_behind_on_the_bulk_path(db):
+    """Same rule through `bulk_upsert`."""
+    await _seed_case_c(db)
+
+    trapped = _planned_sku()
+    counts = await _apply(
+        _plan([trapped], [_planned_offer(sku_key=trapped["sku_key"])]), batch=True
+    )
+
+    assert counts["skus_identity_conflict"] == 1
+    assert counts["offers"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+
+
+async def test_an_offer_is_dropped_when_the_sku_write_ITSELF_fails_per_row(db):
+    """The refusal the pre-resolve cannot foresee: the SKU row is fine by both
+    unique constraints and fails at write time anyway (here a NOT NULL violation).
+    The per-row path collects the refused keys from the loop; without that filter
+    the offer lands against a sku_key nothing wrote."""
+    await _seed_product(db)
+
+    broken = _planned_sku(title=None)
+    counts = await _apply(
+        _plan([broken], [_planned_offer(sku_key=broken["sku_key"])]), batch=False
+    )
+
+    assert counts["skus"] == 0
+    assert counts["offers"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}) == 0
+
+
+async def test_an_offer_is_dropped_when_the_sku_write_ITSELF_fails_bulk(db):
+    """Same, through `bulk_upsert`'s THIRD return (`skipped_rows`) — the same
+    channel the PDP stage already feeds into `_filter_children_of_skipped`."""
+    await _seed_product(db)
+
+    broken = _planned_sku(title=None)
+    clean = _planned_sku(vid=VID2)
+    counts = await _apply(
+        _plan(
+            [broken, clean],
+            [_planned_offer(sku_key=broken["sku_key"]),
+             _planned_offer(sku_key=clean["sku_key"], dest=DEST + "?v=2")],
+        ),
+        batch=True,
+    )
+
+    assert counts["skus"] == 1
+    assert counts["offers"] == 1
+    assert counts["offers_dropped_for_refused_sku"] == 1
+    keys = [dict(r)["sku_key"] for r in await db.fetch_all(
+        "SELECT sku_key FROM catalog_offers WHERE product_key = :pk", {"pk": PK})]
+    assert keys == [clean["sku_key"]]
+
+
+# --- (g) the drifted stored tuple -------------------------------------------
+
+
+async def test_a_drifted_source_variant_id_is_healed_not_refused_forever(db):
+    """THE REGRESSION THIS PR INTRODUCED, executed. The stored row is the one
+    INGESTION's own key names, but its identity tuple has drifted — a legacy
+    `source_variant_id = 'default'` from before variant ids were captured. Pre-PR
+    `ON CONFLICT (sku_key) DO UPDATE` refreshed it whatever its tuple said. With
+    the identity arbiter and no healing the INSERT hits the PK, raises 23505, and
+    the row is counted-and-skipped on EVERY run for ever, while its offers are
+    written onto the stale row.
+
+    The plan's tuple is the truth (`_prepare_seller_of_record` pins it to the
+    catalog_products row that exists), so the stored row's tuple is re-pointed at
+    it IN PLACE — key kept, so the live offers keyed on it stay attached."""
+    key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=key, vid="default", payload={"agent_version": "legacy"},
+        title="Ruby (stale)",
+    )
+    offer_id = await _seed_backfill_offer(db, sku_key=key)
+
+    counts = await _apply(
+        _plan([_planned_sku()], [_planned_offer(sku_key=key)]), batch=False
+    )
+
+    assert counts["skus_identity_healed"] == 1
+    assert counts["skus"] == 1
+    assert counts["skus_identity_conflict"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 0
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1, "a rival row was inserted beside the drifted one"
+    sku = dict(rows[0])
+    assert sku["sku_key"] == key, "the healed row was re-keyed"
+    assert sku["source_variant_id"] == VID, "the identity tuple was not healed"
+    assert sku["title"] == "Ruby (re-ingest)", "the row was not refreshed"
+    # the offer that was already hanging off that key is still attached to it
+    assert await db.fetch_val(
+        "SELECT sku_key FROM catalog_offers WHERE offer_id = :o", {"o": offer_id}
+    ) == key
+
+
+async def test_a_drifted_merchant_id_is_healed_too(db):
+    """The other drift the review named: `catalog_skus.merchant_id` no longer
+    agrees with its product's (a W2 re-resolution, a claimed-attach). The sku_key
+    is derived from the product_key, so a row holding it under a foreign merchant
+    is drift by construction — and the plan's merchant comes off the
+    catalog_products row itself."""
+    key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=key, merchant=OTHER_MERCHANT, payload={"agent_version": "drift"},
+        title="Ruby (stale)",
+    )
+
+    counts = await _apply(_plan([_planned_sku()], []), batch=False)
+
+    assert counts["skus_identity_healed"] == 1
+    assert counts["skus"] == 1
+    assert counts["skus_identity_conflict"] == 0
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1
+    assert dict(rows[0])["merchant_id"] == MERCHANT
+    assert dict(rows[0])["title"] == "Ruby (re-ingest)"
+
+
+async def test_the_bulk_path_heals_the_same_drift(db):
+    """ONE helper, both executors."""
+    key = _ingestion_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=key, vid="default", payload={"agent_version": "legacy"},
+        title="Ruby (stale)",
+    )
+
+    counts = await _apply(
+        _plan([_planned_sku()], [_planned_offer(sku_key=key)]), batch=True
+    )
+
+    assert counts["skus_identity_healed"] == 1
+    assert counts["skus"] == 1 and counts["offers"] == 1
+    sku = dict((await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK}))[0])
+    assert sku["sku_key"] == key and sku["source_variant_id"] == VID
+    assert sku["title"] == "Ruby (re-ingest)"
+
+
+# --- (h) suppressed rows -----------------------------------------------------
+
+
+async def test_a_suppressed_row_holding_the_identity_is_never_adopted(db):
+    """A suppressed row is one a withdrawal took OUT of supply. Adopting its key
+    would resurrect it under a fresh title and hang live offers off it — and it
+    could not have worked anyway: both unique constraints cover suppressed rows, so
+    the INSERT is refused by the identity index regardless.
+
+    So the identity lookup excludes suppressed rows (`AND suppressed_at IS NULL`),
+    the planned row is refused and counted separately from a real identity
+    conflict, and its offers are dropped rather than left pointing at a withdrawn
+    SKU."""
+    promoter_key = _promoter_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=promoter_key, payload=_backfill_payload(),
+        title="Ruby (withdrawn)", suppressed=True,
+    )
+
+    planned = _planned_sku()
+    counts = await _apply(
+        _plan([planned], [_planned_offer(sku_key=planned["sku_key"])]), batch=False
+    )
+
+    assert counts["skus_skipped_suppressed_identity"] == 1
+    assert counts["skus_adopted_existing_identity"] == 0, "a suppressed row was adopted"
+    assert counts["skus_identity_conflict"] == 0, "misreported as an identity conflict"
+    assert counts["skus"] == 0
+    assert counts["offers"] == 0
+    assert counts["offers_dropped_for_refused_sku"] == 1
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1, "a rival row was inserted beside the suppressed one"
+    sku = dict(rows[0])
+    assert sku["sku_key"] == promoter_key
+    assert sku["title"] == "Ruby (withdrawn)", "the suppressed row was refreshed"
+    assert sku["suppressed_at"] is not None, "the suppressed row was resurrected"
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE product_key = :pk", {"pk": PK}
+    ) == 0, "an offer was re-keyed onto a withdrawn SKU"
+
+
+async def test_the_bulk_path_refuses_a_suppressed_identity_too(db):
+    promoter_key = _promoter_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=promoter_key, payload=_backfill_payload(),
+        title="Ruby (withdrawn)", suppressed=True,
+    )
+
+    planned = _planned_sku()
+    counts = await _apply(
+        _plan([planned], [_planned_offer(sku_key=planned["sku_key"])]), batch=True
+    )
+
+    assert counts["skus_skipped_suppressed_identity"] == 1
+    assert counts["skus"] == 0 and counts["offers"] == 0
+    assert await db.fetch_val(
+        "SELECT title FROM catalog_skus WHERE sku_key = :k", {"k": promoter_key}
+    ) == "Ruby (withdrawn)"
+
+
+# --- (i) readiness_tier ------------------------------------------------------
+
+
+async def test_adoption_never_downgrades_the_readiness_tier(db):
+    """`readiness_tier` is INSERT-only. This lane's plan rows carry
+    'referral_only'; the row it now lands on may be a promoter/backfill row written
+    'commerce_ready'. A `readiness_tier = EXCLUDED.readiness_tier` in the DO UPDATE
+    downgrades a purchasable SKU on every content re-sync — a tier is promoted by
+    the lane that can prove the checkout, never by a description refresh."""
+    promoter_key = _promoter_key()
+    await _seed_product(db)
+    await _seed_sku(
+        db, sku_key=promoter_key, payload=_backfill_payload(),
+        readiness_tier="commerce_ready",
+    )
+
+    planned = _planned_sku(readiness_tier="referral_only")
+    counts = await _apply(_plan([planned], []), batch=False)
+
+    assert counts["skus"] == 1
+    assert counts["skus_adopted_existing_identity"] == 1
+    assert await db.fetch_val(
+        "SELECT readiness_tier FROM catalog_skus WHERE sku_key = :k",
+        {"k": promoter_key}) == "commerce_ready"
+    # ...and the descriptive columns still refresh, so this is not a dead DO UPDATE
+    assert await db.fetch_val(
+        "SELECT title FROM catalog_skus WHERE sku_key = :k",
+        {"k": promoter_key}) == "Ruby (re-ingest)"
+
+
+# --- (j) two planned rows, one identity --------------------------------------
+
+
+async def test_two_planned_rows_with_one_identity_are_deduped_and_counted_once(db):
+    """`counts["skus"]` is what an operator reads to decide the lane is healthy. Two
+    planned rows carrying the SAME identity tuple are one SKU: through the identity
+    arbiter the second silently UPDATEs the first, so the count reported two writes
+    where one row exists. The duplicate is dropped and its offers follow the
+    survivor's key (same identity == same row, so they are not orphans)."""
+    await _seed_product(db)
+
+    first = _planned_sku()                                   # `<pk>::v:<vid>`
+    dup = _planned_sku(sku_key=_promoter_key(), title="Ruby (dup)")  # `<pk>::v::<vid>`
+    counts = await _apply(
+        _plan(
+            [first, dup],
+            [_planned_offer(sku_key=first["sku_key"]),
+             _planned_offer(sku_key=_promoter_key(), dest=DEST + "?v=2")],
+        ),
+        batch=False,
+    )
+
+    assert counts["skus_deduped_same_identity"] == 1
+    assert counts["skus"] == 1, "counts['skus'] overstated the rows written"
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
+    assert len(rows) == 1
+    assert dict(rows[0])["sku_key"] == first["sku_key"], "the survivor is the first"
+    assert dict(rows[0])["title"] == "Ruby (re-ingest)"
+    # both offers survive, keyed on the row that actually exists
+    keys = sorted(dict(r)["sku_key"] for r in await db.fetch_all(
+        "SELECT sku_key FROM catalog_offers WHERE product_key = :pk", {"pk": PK}))
+    assert keys == [first["sku_key"], first["sku_key"]]
+    assert counts["offers"] == 2
+
+
+# --- (k) the SQLSTATE classifier ---------------------------------------------
+
+
+def test_is_unique_violation_keys_on_the_sqlstate_not_the_class_name():
+    """The classifier decides whether a failure is reported to operators as "the
+    two lanes are still fighting over a key" or as a plain write failure. It must
+    read the driver's SQLSTATE — a class-name-only test misses every wrapper, and
+    a message-text test folds every other constraint failure into this bucket."""
+    import services.catalog_variant_promoter as promoter
+    from services.catalog_enrichment_agent.apply import (
+        _is_unique_violation as apply_is_uv,
+    )
+
+    class SomeDriverError(Exception):
+        """A name no substring match would ever catch."""
+
+    class UniqueViolationError(Exception):
+        """asyncpg's own class, with no sqlstate attribute set."""
+
+    class NotNullViolationError(Exception):
+        pass
+
+    tagged = SomeDriverError("duplicate key value violates unique constraint")
+    tagged.sqlstate = "23505"
+    by_class = UniqueViolationError("no sqlstate here")
+    not_null = NotNullViolationError("null value in column")
+    not_null.sqlstate = "23502"
+    # a message that LOOKS like a unique violation, under a code that is not one
+    liar = SomeDriverError("duplicate key value violates unique constraint")
+    liar.sqlstate = "23502"
+
+    for is_uv in (apply_is_uv, promoter._is_unique_violation):
+        assert is_uv(tagged) is True, "SQLSTATE 23505 must classify on the code"
+        assert is_uv(by_class) is True, "the class-name fallback was dropped"
+        assert is_uv(not_null) is False
+        assert is_uv(liar) is False, "classified on the message text"
+        # the driver error hidden behind a wrapper is still found
+        wrapped = RuntimeError("query failed")
+        wrapped.__cause__ = tagged
+        assert is_uv(wrapped) is True
 
 
 async def test_a_non_unique_failure_is_not_counted_as_an_identity_conflict(db):
@@ -532,16 +904,12 @@ async def test_a_non_unique_failure_is_not_counted_as_an_identity_conflict(db):
     assert counts["skus_identity_conflict"] == 0
 
 
-async def test_the_bulk_path_classifies_the_same_trap_rather_than_failing_the_chunk(db):
-    """`bulk_upsert` treats a 23505 as a DATA error (not transport), so the chunk
-    replays row by row and only the bad row is skipped. `on_row_error` is what
-    lets the caller classify it — without the hook the exception never leaves
-    bulk_writer and the count could only be inferred."""
-    await _seed_product(db)
-    await _seed_sku(
-        db, sku_key=_ingestion_key(), merchant=OTHER_MERCHANT,
-        payload={"agent_version": "other"},
-    )
+async def test_the_bulk_path_refuses_the_same_residual_and_keeps_the_chunk(db):
+    """The residual conflict on the batched executor: the refused row does not take
+    the chunk (or the offers stage) with it, and `bulk_upsert` still classifies a
+    write-time 23505 through `on_row_error` — the hook exists because the exception
+    never leaves bulk_writer otherwise."""
+    await _seed_case_c(db)
     counts = await _apply(
         _plan([_planned_sku(), _planned_sku(vid=VID2)], []), batch=True
     )
@@ -552,12 +920,12 @@ async def test_the_bulk_path_classifies_the_same_trap_rather_than_failing_the_ch
 # --- (d) the promoter --------------------------------------------------------
 
 
-async def _seed_group(database):
+async def _seed_group(database, *, group_id=GROUP_ID, spid=SPID):
     await database.execute(
         """INSERT INTO product_group_members
              (product_group_id, merchant_id, platform, platform_product_id, is_primary)
            VALUES (:g,:m,:p,:spid,TRUE)""",
-        {"g": GROUP_ID, "m": MERCHANT, "p": PLATFORM, "spid": SPID},
+        {"g": group_id, "m": MERCHANT, "p": PLATFORM, "spid": spid},
     )
 
 
@@ -653,6 +1021,90 @@ async def test_the_promoter_counts_the_residual_trap_and_keeps_going(db):
         {"pk": PK, "m": MERCHANT}) == 1
 
 
+# --- (d2) the promoter's own column limits -----------------------------------
+
+
+def test_a_promoter_sku_key_that_already_fits_is_byte_identical():
+    """The truncation below must be unreachable for any key that could already have
+    been written. `<pk>::v::<vid>` is the PRIMARY KEY of the 4,286 rows the
+    2026-09-08 backfill adopted and hung catalog_offers on — with no FK to catch a
+    rename, changing a short key renames live supply out from under its offers."""
+    from services.catalog_variant_promoter import _derive_sku_key
+
+    assert _derive_sku_key(PK, VID) == f"{PK}::v::{VID}"
+    assert _derive_sku_key("pk_short", "1") == "pk_short::v::1"
+
+
+def test_a_promoter_sku_key_is_bounded_by_the_column():
+    """catalog_skus.sku_key is varchar(255) and product_key alone reaches 214, so a
+    real merchant variant id overruns it. An over-long bind is SQLSTATE 22001, not
+    a unique violation — it used to be re-raised and abort the whole run."""
+    from services.catalog_variant_promoter import _derive_sku_key
+
+    assert len(LONG_PK) == 214
+    key = _derive_sku_key(LONG_PK, LONG_VID)
+    assert len(key) <= 255
+    assert key.startswith(LONG_PK + "::v::")
+    # stable across runs: the same id derives the same key
+    assert key == _derive_sku_key(LONG_PK, LONG_VID)
+    # ...and distinct ids do not collapse onto one key
+    assert key != _derive_sku_key(LONG_PK, LONG_VID + "7")
+
+
+async def test_the_promoter_run_survives_an_over_long_variant_id(db):
+    """END TO END on the real column widths: a 214-char product_key and a 140-char
+    variant id. Pre-fix the first such variant raised 22001 and `promote_variants_all`
+    aborted — every group still queued behind it went unpromoted."""
+    import services.catalog_variant_promoter as promoter
+
+    payload = {"variants": [
+        {"variant_id": LONG_VID, "title": "Ruby",
+         "options": [{"name": "Shade", "value": "Ruby"}]},
+    ]}
+    await _seed_product(db, payload=payload, pk=LONG_PK, spid=SPID)
+    await _seed_group(db, group_id=GROUP_ID_LONG, spid=SPID)
+
+    report = await promoter.promote_variants_all(
+        apply=True, product_group_id=GROUP_ID_LONG
+    )
+
+    assert report.skus_write_failed_total == 0
+    assert report.skus_upserted_total == 1
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": LONG_PK})
+    assert len(rows) == 1, "the over-long variant never landed"
+    sku = dict(rows[0])
+    assert len(sku["sku_key"]) <= 255
+    # source_variant_id is varchar(128) and the id is 140 chars
+    assert sku["source_variant_id"] == LONG_VID[:128]
+
+
+async def test_one_unwritable_variant_does_not_abort_the_promoter_run(db):
+    """A NON-unique write error on one variant used to be re-raised, taking the
+    group — and, through `promote_variants_all`, every group behind it — down. Here
+    an over-long `sku` (varchar(128)) raises 22001; the savepoint has already rolled
+    that row back, so it is counted and the run finishes."""
+    import services.catalog_variant_promoter as promoter
+
+    payload = {"variants": [
+        {"variant_id": VID, "title": "Ruby", "sku": "S" * 300,
+         "options": [{"name": "Shade", "value": "Ruby"}]},
+        {"variant_id": VID2, "title": "Coral", "sku": "SKU-CORAL",
+         "options": [{"name": "Shade", "value": "Coral"}]},
+    ]}
+    await _seed_product(db, payload=payload)
+    await _seed_group(db)
+
+    report = await promoter.promote_variants_all(apply=True, product_group_id=GROUP_ID)
+
+    assert report.skus_write_failed_total == 1
+    assert report.skus_identity_conflict_total == 0, "22001 is not a unique violation"
+    assert report.skus_upserted_total == 1
+    keys = [dict(r)["sku_key"] for r in await db.fetch_all(
+        "SELECT sku_key FROM catalog_skus WHERE product_key = :pk", {"pk": PK})]
+    assert keys == [_promoter_key(VID2)]
+
+
 # --- (f) the PREPARE gate ----------------------------------------------------
 
 
@@ -674,6 +1126,9 @@ def test_both_statements_are_collected_by_the_repo_prepare_gate():
     for label, sql in (
         ("apply._SKU_UPSERT_SQL", apply_mod._SKU_UPSERT_SQL),
         ("apply._SKU_IDENTITY_LOOKUP_SQL", apply_mod._SKU_IDENTITY_LOOKUP_SQL),
+        ("apply._SKU_KEY_HOLDER_LOOKUP_SQL", apply_mod._SKU_KEY_HOLDER_LOOKUP_SQL),
+        ("apply._SKU_SUPPRESSED_IDENTITY_SQL", apply_mod._SKU_SUPPRESSED_IDENTITY_SQL),
+        ("apply._SKU_IDENTITY_HEAL_SQL", apply_mod._SKU_IDENTITY_HEAL_SQL),
         ("promoter.UPSERT_SKU_SQL", promoter.UPSERT_SKU_SQL),
     ):
         assert _norm(sql) in collected, f"{label} is not collected by the PREPARE gate"
