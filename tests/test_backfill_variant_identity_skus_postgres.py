@@ -33,6 +33,14 @@ PK = "ext:pgtest-lipstick::deadbeef"
 SPID = "pgtest-lipstick"
 DEST = "https://brand.example/products/pgtest-lipstick"
 VID = "43062643884185"
+#: The widest key `ingestion.derive_product_key` can mint (214 chars). At this width
+#: `derive_variant_sku_key` falls back to a sha1 of the variant id, which is where a key
+#: derived from the FULL id and one derived from the STORED id stop agreeing.
+LONG_PK = "ext:" + ("pgtest-long-" + "z" * 200)[:200] + "::deadbeef"
+#: Two merchant ids that differ only past the 128th character: numeric (so
+#: MERCHANT_ISSUED), and one `catalog_skus` identity between them.
+VID_LONG_A = "8" * 128 + "1"
+VID_LONG_B = "8" * 128 + "2"
 #: asyncpg binds timestamptz from a datetime, never a string.
 _SUPPRESSED = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
 
@@ -98,12 +106,14 @@ async def _ddl(database):
 
 async def _clear(database):
     """Remove this fixture's ROWS. Never its tables — see _ddl."""
-    await database.execute(
-        "DELETE FROM catalog_offers WHERE product_key = :pk OR source_system = :ss",
-        {"pk": PK, "ss": "variant_identity_backfill_v1"},
-    )
-    await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": PK})
-    await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": PK})
+    for pk in (PK, LONG_PK):
+        await database.execute(
+            "DELETE FROM catalog_offers WHERE product_key = :pk OR source_system = :ss",
+            {"pk": pk, "ss": "variant_identity_backfill_v1"},
+        )
+        await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": pk})
+        await database.execute(
+            "DELETE FROM catalog_products WHERE product_key = :pk", {"pk": pk})
     await database.execute(
         "DELETE FROM external_product_seeds WHERE external_product_id = :e", {"e": SPID}
     )
@@ -111,18 +121,18 @@ async def _clear(database):
                            {"w": "backfill_variant_identity_skus"})
 
 
-async def _seed(database, *, variants, offers, suppressed=None):
+async def _seed(database, *, variants, offers, suppressed=None, pk=PK):
     await database.execute(
         """INSERT INTO catalog_products (product_key, merchant_id, platform,
              source_product_id, source_domain, title, suppressed_at)
            VALUES (:pk,:m,:p,:spid,'brand.example','PGTest Lipstick',:sup)""",
-        {"pk": PK, "m": MERCHANT, "p": PLATFORM, "spid": SPID, "sup": suppressed},
+        {"pk": pk, "m": MERCHANT, "p": PLATFORM, "spid": SPID, "sup": suppressed},
     )
     await database.execute(
         """INSERT INTO external_product_seeds
              (external_product_id, attached_product_key, status, seed_data)
            VALUES (:spid,:pk,'active',CAST(:sd AS jsonb))""",
-        {"spid": SPID, "pk": PK, "sd": json.dumps({"snapshot": {"variants": variants}})},
+        {"spid": SPID, "pk": pk, "sd": json.dumps({"snapshot": {"variants": variants}})},
     )
     for i, o in enumerate(offers):
         await database.execute(
@@ -135,7 +145,7 @@ async def _seed(database, *, variants, offers, suppressed=None):
                  'external_referral','default','in_stock',:cur,10.0,'seed',:mkt,
                  :ot,:ifp,:wbd,
                  CAST(:pl AS jsonb),:sup,NOW(),NOW())""",
-            {"oid": f"offer:pg:{i}", "sk": PK + "::canonical", "pk": PK,
+            {"oid": f"offer:pg:{i}", "sk": pk + "::canonical", "pk": pk,
              "m": o.get("merchant_id", "m_seller"), "cur": o.get("currency", "USD"),
              "mkt": o.get("market", "US"), "ot": o.get("offer_type"),
              "ifp": o.get("is_first_party", False), "wbd": o.get("why_buy_direct"),
@@ -199,6 +209,54 @@ async def test_it_writes_the_pair_and_the_offer_carries_the_variants_own_price(d
     assert float(offer["list_price"]) == 24.0          # the VARIANT's price, not the product's 10.0
     assert offer["availability"] == "in_stock"
     assert json.loads(offer["offer_payload"])["destination_url"] == DEST   # M4
+
+
+async def test_two_variant_ids_that_bind_to_one_identity_are_one_pair_and_counted_once(db):
+    """EXECUTED. The seed offers two shades whose merchant ids differ only past the 128th
+    character. `catalog_skus.source_variant_id` is varchar(128), so they are ONE row
+    whatever this script does — the identity index says so. Before the fix the writer
+    bound `vid[:128]` while deriving `sku_key` from the FULL id (at this product_key width
+    that is the sha1 fallback, so the two keys differed); the second INSERT resolved through
+    `ON CONFLICT (merchant_id, platform, product_key, source_variant_id)` as a DO UPDATE of
+    the first, `RETURNING` the first's key, and the offer derived from that key was then
+    DO UPDATEd with the SECOND shade's price. `skus: 2, offers: 2` for one row carrying
+    the wrong price."""
+    from services.catalog_enrichment_agent.ingestion import derive_variant_sku_key
+
+    await _seed(
+        db, pk=LONG_PK,
+        variants=[
+            _variant(variant_id=VID_LONG_A, title="Ruby", price_amount="24.00"),
+            _variant(variant_id=VID_LONG_B, title="Coral", price_amount="31.00"),
+        ],
+        offers=[{}],
+    )
+    report = await _run()
+
+    assert report["skus_deduped_same_identity"] == 1
+    assert report["skus"] == 1, "a collapsed identity was counted twice"
+    assert report["offers"] == 1
+    assert report["skipped_unique_violation"] == 0
+
+    rows = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": LONG_PK})
+    assert len(rows) == 1
+    sku = dict(rows[0])
+    assert sku["title"] == "Ruby", "the survivor is the first shade"
+    assert sku["source_variant_id"] == VID_LONG_A[:128]
+    # the key names the id the row STORES — re-deriving it from the row finds the row
+    assert sku["sku_key"] == derive_variant_sku_key(LONG_PK, sku["source_variant_id"])
+    # ... and the merchant's full id is still on the row for anyone who needs it
+    payload = sku["sku_payload"]
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+    assert payload["variant_id"] == VID_LONG_A
+
+    offers = [dict(o) for o in await db.fetch_all(
+        "SELECT * FROM catalog_offers WHERE product_key = :pk AND source_system = :s",
+        {"pk": LONG_PK, "s": "variant_identity_backfill_v1"})]
+    assert len(offers) == 1
+    assert offers[0]["sku_key"] == sku["sku_key"]
+    assert float(offers[0]["list_price"]) == 24.0, "the second shade's price overwrote the first's offer"
 
 
 async def test_it_adopts_the_promoter_row_instead_of_colliding_with_it(db):

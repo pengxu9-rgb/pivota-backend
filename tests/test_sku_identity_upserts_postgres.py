@@ -1489,6 +1489,46 @@ async def test_one_unwritable_variant_does_not_abort_the_promoter_run(db):
 # --- (f) the PREPARE gate ----------------------------------------------------
 
 
+# --- (n) the ingest writer stores the id its key was derived from ----------------
+
+
+async def test_the_ingest_row_stores_the_id_its_key_was_derived_from(db):
+    """EXECUTED, through the real writer and the real apply. Two ids that differ only past
+    the 128th character are one `catalog_skus` identity. `_build_variant_sku_inserts`
+    used to plan them as TWO rows, each keyed off its FULL id (the sha1 fallback at this
+    product_key width), and `_adopt_existing_sku_identities` folded the pair — so the
+    count was right and the stored KEY was wrong: it encoded characters the row does not
+    hold, and re-deriving the key from the row that exists could never find it. Now the
+    writer derives the key from the bound id and drops the duplicate itself, and the
+    arbiter has nothing to fold."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    await _seed_product(db, pk=LONG_PK, spid="sku-identity-long")
+    rows = ing._build_variant_sku_inserts(
+        product_key=LONG_PK,
+        pdp_payload={"brand": "Gate", "product_name": "Lipstick",
+                     "source_domain": "brand.example",
+                     "variants": [{"variant_id": VID_LONG_A, "title": "Ruby"},
+                                  {"variant_id": VID_LONG_B, "title": "Coral"}]},
+        seller={"merchant_id": MERCHANT},
+        canonical_url=None,
+    )
+    counts = await _apply(_plan(rows, []), batch=False)
+
+    assert counts["skus"] == 1
+    assert counts["skus_deduped_same_identity"] == 0, \
+        "the writer, not the apply-time arbiter, owns this collision"
+    stored = await db.fetch_all(
+        "SELECT * FROM catalog_skus WHERE product_key = :pk", {"pk": LONG_PK})
+    assert len(stored) == 1
+    sku = dict(stored[0])
+    assert sku["title"] == "Ruby"
+    assert sku["source_variant_id"] == VID_LONG_A[:128]
+    assert sku["sku_key"] == ing.derive_variant_sku_key(LONG_PK, sku["source_variant_id"]), \
+        "the key encodes an id the row does not store"
+    assert _jsonb(sku["sku_payload"])["variant_id"] == VID_LONG_A
+
+
 def test_both_statements_are_collected_by_the_repo_prepare_gate():
     """The statements must be SEEN by `tests/test_repo_sql_prepare_postgres.py`,
     which only follows module-level literal constants passed by name to a

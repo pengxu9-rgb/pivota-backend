@@ -49,9 +49,11 @@ and never read.
 ── WHAT IT STILL REFUSES TO DO ─────────────────────────────────────────────────────────────────
 It will not promote an id we minted ourselves (`services/variant_identity`), will not let a variant
 inherit the product's price, will not touch a suppressed product or offer, will not write a variant
-whose currency disagrees with the offer it attaches to, and will not guess a seller for a product
-whose live offers come from more than one merchant. Every refusal is counted in the report and in
-`writer_audit_log`; none is silent.
+whose currency disagrees with the offer it attaches to, will not guess a seller for a product
+whose live offers come from more than one merchant, and will not write a second variant whose id
+binds to the same 128-char `source_variant_id` as an earlier one (one identity is one row; the
+second would DO UPDATE the first through the identity index and be counted as a write). Every
+refusal is counted in the report and in `writer_audit_log`; none is silent.
 
     python3 scripts/backfill_variant_identity_skus.py                    # dry run, no token needed
     python3 scripts/backfill_variant_identity_skus.py --apply --limit 50 \
@@ -82,6 +84,7 @@ from services.catalog_enrichment_agent.ingestion import (  # noqa: E402
     OFFER_MODE,
     OFFER_READINESS_TIER,
     OFFER_TRUTH_TIER,
+    SOURCE_VARIANT_ID_MAX,
     derive_offer_id,
     derive_variant_sku_key,
     variant_own_price,
@@ -403,8 +406,14 @@ def plan_for_product(
         {"snapshot": {"variants": _as_list(row["seed_variants"])}}
     ) or _extract_variants_from_payload({"variants": _as_list(row["payload_variants"])})
     out: List[Dict[str, Any]] = []
+    #: The identity tuple's other three columns are constant across one product, so
+    #: within a product the STORED variant id alone decides whether two picks are one
+    #: catalog_skus row.
+    seen_stored_ids: set = set()
     for variant in filter_real_variants(variants):
         vid = str(variant.get("variant_id") or variant.get("id") or "").strip()
+        # Provenance is asked of the id the MERCHANT issued, never of the bound copy: a
+        # truncation must not be able to turn a restated product id into a clean one.
         if variant_id_provenance(
             vid, product_id=row["source_product_id"], product_key=product_key
         ) != MERCHANT_ISSUED:
@@ -414,7 +423,31 @@ def plan_for_product(
         if price is None:
             counts["skipped_no_variant_price"] += 1
             continue
-        out.append({"variant_id": vid, "variant": variant, "price": price})
+        # ONE ROW PER IDENTITY. `catalog_skus.source_variant_id` is varchar(128), so two
+        # merchant ids sharing a 128-char prefix bind to ONE identity tuple. The writer used
+        # to bind `vid[:128]` while deriving `sku_key` from the FULL id, so that pair planned
+        # as two rows under two keys; the second INSERT then resolved through
+        # `ON CONFLICT (merchant_id, platform, product_key, source_variant_id)` and silently
+        # DO UPDATEd the first — one stored row, `skus` counting two, the second variant's
+        # offer upserted over the first's. Same shape as the promoter's fix (PR #2135): bind
+        # first, derive from the bound id, and drop-and-count the same-identity duplicate.
+        stored_vid = vid[:SOURCE_VARIANT_ID_MAX]
+        if stored_vid in seen_stored_ids:
+            counts["skus_deduped_same_identity"] += 1
+            logger.warning(
+                "variant dropped (same identity as an earlier variant of %s): merchant "
+                "variant id %r binds to source_variant_id=%r (varchar(%d)) already planned; "
+                "writing it would DO UPDATE the earlier row, not add a variant",
+                product_key, vid, stored_vid, SOURCE_VARIANT_ID_MAX,
+            )
+            continue
+        seen_stored_ids.add(stored_vid)
+        out.append({
+            "variant_id": vid,
+            "stored_variant_id": stored_vid,
+            "variant": variant,
+            "price": price,
+        })
     return out
 
 
@@ -434,7 +467,7 @@ async def run(
         "skipped_no_destination_url", "skipped_currency_disagrees_with_offer",
         "skipped_offer_owned_by_other_writer", "skipped_suppressed_sku",
         "adopted_existing_sku_row", "rolled_back_offer_refused_by_guard",
-        "skipped_unique_violation",
+        "skipped_unique_violation", "skus_deduped_same_identity",
     ):
         counts[_k] = 0
     audit = WriterAuditAccumulator(
@@ -495,6 +528,10 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state,
             planned: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             for pick in picks:
                 vid, variant, price = pick["variant_id"], pick["variant"], pick["price"]
+                # THE KEY IS DERIVED FROM THE ID WE WILL ACTUALLY STORE (bound once, in
+                # plan_for_product). Deriving it from `vid` here is the key-vs-identity
+                # split described there; `sku_payload.variant_id` keeps the full id.
+                stored_vid = pick["stored_variant_id"]
                 vcur = str(variant.get("currency") or "").strip().upper()
                 if vcur and offer_currency and vcur != offer_currency:
                     # The offer's market came from the chosen offer; a different currency means
@@ -505,12 +542,12 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state,
                 currency = vcur or offer_currency or "USD"
                 labels, attrs = _option_labels(variant)
                 sku_params = {
-                    "sku_key": derive_variant_sku_key(row["product_key"], vid),
+                    "sku_key": derive_variant_sku_key(row["product_key"], stored_vid),
                     "product_key": row["product_key"],
                     "merchant_id": row["merchant_id"],
                     "platform": row["platform"],
                     "source_product_id": row["source_product_id"],
-                    "source_variant_id": vid[:128],
+                    "source_variant_id": stored_vid,
                     "source_domain": row.get("source_domain"),
                     "sku": str(variant.get("sku") or "").strip() or None,
                     "barcode": str(variant.get("barcode") or "").strip() or None,

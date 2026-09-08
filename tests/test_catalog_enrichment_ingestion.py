@@ -1164,6 +1164,39 @@ def test_variant_sku_key_fits_the_column_for_a_long_product_key():
     assert key == ing.derive_variant_sku_key(long_pk, "5405734574509012345678901234567890")
 
 
+def test_a_variant_sku_key_is_derived_from_the_id_the_row_stores():
+    """`catalog_skus.source_variant_id` is varchar(128). The writer bound `vid[:128]` on
+    the row while deriving `sku_key` from the FULL id, so at a product_key width where
+    `derive_variant_sku_key` falls back to a sha1 of the id, the key encoded an id the
+    row does not hold — and two ids sharing a 128-char prefix (one identity tuple)
+    planned as two rows under two keys, left for `apply._adopt_existing_sku_identities`
+    to fold. Same fix as the promoter's (PR #2135): bind first, derive second."""
+    from services.catalog_enrichment_agent import ingestion as ing
+
+    long_pk = "ext:" + ("a" * 200) + "::deadbeef"          # 214 chars, the real ceiling
+    a, b = "8" * 128 + "1", "8" * 128 + "2"
+    rows = ing._build_variant_sku_inserts(
+        product_key=long_pk,
+        pdp_payload={"brand": "MAC Cosmetics", "product_name": "Retro Matte Lipstick",
+                     "source_domain": "maccosmetics.com",
+                     "variants": [{"variant_id": a, "title": "Ruby Woo"},
+                                  {"variant_id": b, "title": "Bronx"}]},
+        seller={"merchant_id": "m_test"},
+        canonical_url=None,
+    )
+    assert len(rows) == 1, "two ids that bind to one source_variant_id are one row"
+    row = rows[0]
+    assert row["title"] == "Ruby Woo", "the survivor is the first"
+    assert row["source_variant_id"] == a[:ing.SOURCE_VARIANT_ID_MAX]
+    assert row["sku_key"] == ing.derive_variant_sku_key(long_pk, row["source_variant_id"])
+    # this width is the sha1 path, where the full-id key really did differ — proof the
+    # test reaches the split rather than a width where the two derivations coincide
+    assert row["sku_key"] != ing.derive_variant_sku_key(long_pk, a)
+    assert len(row["sku_key"]) <= 255
+    # the merchant's full id stays on the row
+    assert json.loads(row["sku_payload"])["variant_id"] == a
+
+
 # --- the seed carries the real variants the PDP renders from --------------------
 
 

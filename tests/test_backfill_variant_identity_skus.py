@@ -258,6 +258,29 @@ def test_plan_keeps_merchant_issued_priced_variants_only():
     assert counts["skipped_no_variant_price"] == 1
 
 
+def test_plan_writes_one_row_per_identity_and_counts_the_other():
+    """`catalog_skus.source_variant_id` is varchar(128), so two merchant ids sharing a
+    128-char prefix are ONE identity tuple and one row. The planner used to hand both to
+    the writer, which bound `vid[:128]` while deriving `sku_key` from the full id: the
+    second INSERT resolved through the identity index as a DO UPDATE of the first and was
+    counted as a write (executed in the *_postgres twin). Bind once here, drop the
+    duplicate, and say so."""
+    counts = collections.Counter()
+    a, b = "8" * 128 + "1", "8" * 128 + "2"          # numeric, so MERCHANT_ISSUED
+    picks = plan_for_product(
+        _row([
+            {"variant_id": a, "title": "Peach", "price": "24.00"},
+            {"variant_id": b, "title": "Berry", "price": "31.00"},
+        ]),
+        counts,
+    )
+    assert [p["variant_id"] for p in picks] == [a], "the survivor is the first"
+    assert picks[0]["stored_variant_id"] == a[:128]
+    assert counts["skus_deduped_same_identity"] == 1
+    # provenance is still judged on the merchant's FULL id, not the bound copy
+    assert counts["skipped_not_merchant_issued"] == 0
+
+
 def test_plan_records_every_refusal_rather_than_dropping_silently():
     counts = collections.Counter()
     plan_for_product(_row([{"variant_id": "brand-thing", "title": "x", "price": "1"}]), counts)
